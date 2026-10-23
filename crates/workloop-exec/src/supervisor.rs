@@ -381,6 +381,27 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(())
         })?;
 
+        // Launch only for a freshly admitted Execution. A request consumed
+        // while the Execution wants stop (or is uncertain, waiting, or
+        // terminal) must not produce a writer — the invocation is
+        // abandoned so `drive_stops` can settle the Execution instead of
+        // leaving it blocked on a writer that never existed.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+        if exec_state != Some(ExecutionState::Ready) {
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            return Ok(());
+        }
+
         let work_id = request.work_id.clone();
         let workspace = self.workspace_of(&work_id);
         std::fs::create_dir_all(&workspace)?;
@@ -608,12 +629,59 @@ impl<P: ProcessControlPort> Supervisor<P> {
             if !wants_stop {
                 continue;
             }
-            for invocation in store
-                .transact(|tx| tx.invocations_for_execution(&execution.id))?
-                .into_iter()
+            let invocations = store.transact(|tx| tx.invocations_for_execution(&execution.id))?;
+            let unresolved: Vec<_> = invocations
+                .iter()
                 .filter(|i| i.state.is_unresolved_writer())
-            {
+                .cloned()
+                .collect();
+            if unresolved.is_empty() {
+                // Every recorded writer is already resolved (or none ever
+                // ran): the writer is gone by definition. Reporting the
+                // exit fact lets `work` settle the stopping/uncertain
+                // Execution — without this it would wait forever for a
+                // process-exit observation that can never arrive.
+                if let Some(latest) = invocations.last()
+                    && let Some(request) = store.transact(|tx| tx.request(&latest.request_id))?
+                {
+                    self.report_tagged(
+                        store,
+                        &request,
+                        "stop-settle",
+                        ObservationFact::ProcessState {
+                            invocation_id: latest.id.clone(),
+                            process_identity: latest
+                                .process_identity
+                                .as_ref()
+                                .map(|i| format!("{}@{}", i.pid, i.started_at))
+                                .unwrap_or_default(),
+                            state: ProcessStateFact::Exited,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
+                continue;
+            }
+            for invocation in unresolved {
                 let Some(identity) = invocation.process_identity.clone() else {
+                    // Unresolved but unidentifiable: nothing can be
+                    // signalled or proven — report it; `work` surfaces
+                    // uncertainty rather than declaring a stop it cannot
+                    // verify.
+                    if let Some(request) =
+                        store.transact(|tx| tx.request(&invocation.request_id))?
+                    {
+                        self.report(
+                            store,
+                            &request,
+                            ObservationFact::ProcessState {
+                                invocation_id: invocation.id.clone(),
+                                process_identity: String::new(),
+                                state: ProcessStateFact::Unknown,
+                            },
+                            now_unix_seconds,
+                        )?;
+                    }
                     continue;
                 };
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
@@ -855,9 +923,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
         fact: ObservationFact,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        self.report_tagged(store, request, "auto", fact, now_unix_seconds)
+    }
+
+    /// `tag` distinguishes delivery contexts that legitimately re-report
+    /// the same fact (e.g. a stop-settle proof repeating an earlier
+    /// process exit) from plain duplicate deliveries.
+    fn report_tagged(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        tag: &str,
+        fact: ObservationFact,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         request.request_id.hash(&mut h);
+        tag.hash(&mut h);
         serde_json::to_string(&fact)
             .unwrap_or_default()
             .hash(&mut h);

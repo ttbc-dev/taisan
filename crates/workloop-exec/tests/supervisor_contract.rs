@@ -552,6 +552,66 @@ fn clean_exit_records_artifact_and_publish_intent() {
     assert_eq!(intents.len(), 1);
 }
 
+// ---- Stop settle when the writer is already (or never) resolved ----
+
+#[test]
+fn cancel_while_waiting_settles_once_no_writer_remains() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("waitcancel");
+    let (w, eid) = submit_and_admit(&store, "k-w1");
+    let sup = supervisor("clean-exit", root);
+    // The writer exits cleanly: Exited -> Waiting(GithubWrite) with the
+    // Invocation already Done — no unresolved writer remains.
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting
+            && e.waiting_reason == Some(WaitingReason::GithubWrite)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Waiting);
+    cancel(&store, &w, "k-w2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    // With no unresolved writer, stop is proven immediately — the
+    // Execution settles instead of waiting for an exit that already
+    // happened.
+    sup.run_once(&store, NOW).unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Cancelled, "stopping settles");
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!((slots, reservations), (0, 0), "terminal release");
+}
+
+#[test]
+fn cancel_on_ready_settles_without_ever_spawning() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("readycancel");
+    let (w, eid) = submit_and_admit(&store, "k-rc1");
+    let sup = supervisor("clean-exit", root);
+    // Cancel between admission and the consumer seeing the request.
+    cancel(&store, &w, "k-rc2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    sup.run_once(&store, NOW).unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Cancelled, "stopping settles");
+    // The durable request was consumed without ever spawning a writer.
+    let invs = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap();
+    assert_eq!(invs.len(), 1);
+    assert!(
+        !invs[0].state.is_unresolved_writer(),
+        "invocation resolved: {:?}",
+        invs[0].state
+    );
+    assert!(invs[0].process_identity.is_none(), "no process ever ran");
+}
+
 // ---- Store-level: an inserted Unknown observation marks uncertain ----
 
 #[test]

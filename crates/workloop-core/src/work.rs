@@ -41,12 +41,6 @@ pub fn handle_command(
             if stored_digest == digest {
                 return Ok(decision);
             }
-            let decision = rejected(
-                tx,
-                RejectionCode::IdempotencyConflict,
-                req.body.work_id().cloned(),
-                vec!["same idempotency key with a different payload".into()],
-            )?;
             // The original decision keeps the bare key for replay; the
             // conflict is durable under a payload-derived key. An identical
             // conflict replayed returns the saved decision.
@@ -54,6 +48,12 @@ pub fn handle_command(
             if let Some((_, saved)) = tx.stored_decision(&req.origin, &req.actor, &conflict_key)? {
                 return Ok(saved);
             }
+            let decision = rejected(
+                tx,
+                RejectionCode::IdempotencyConflict,
+                req.body.work_id().cloned(),
+                vec!["same idempotency key with a different payload".into()],
+            )?;
             tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
             return Ok(decision);
         }
@@ -1089,14 +1089,14 @@ pub fn admit_queued(
     }
 
     let seq = tx.alloc_seq()?;
-    let role = InvocationRole::Coding;
     let request = InvocationRequest {
         // One durable request per recorded attempt; the attempt counter
-        // makes re-admission ids unique.
+        // makes re-admission ids unique. Coding-only: review requests are
+        // allocated by the review/fix path, not admission.
         request_id: format!("{}:inv:{}", execution.id.0, execution.invocations_used),
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
-        role: role.clone(),
+        role: InvocationRole::Coding,
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
     };
     let mut next = execution.clone();
@@ -1108,9 +1108,6 @@ pub fn admit_queued(
         next.started_unix_seconds = Some(now_unix_seconds);
     }
     next.invocations_used += 1;
-    if role == InvocationRole::Review {
-        next.review_rounds_used += 1;
-    }
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
         expected_state: ExecutionState::Queued,
@@ -1199,6 +1196,24 @@ fn assess(
     obs: &Observation,
     now_unix_seconds: i64,
 ) -> Result<(), StoreError> {
+    // Outbox reconciliation is delivery-bound, not execution-bound: the
+    // intent's result must be recorded even when no active Execution can
+    // be resolved (e.g. the Execution already went terminal), otherwise a
+    // pending intent blocks the outbox forever.
+    if let ObservationFact::PrActionResult {
+        action_id, result, ..
+    } = &obs.fact
+    {
+        let status = match result {
+            ActionResult::Applied => PrActionStatus::Applied,
+            ActionResult::Failed => PrActionStatus::Failed,
+            ActionResult::Unknown => PrActionStatus::Unknown,
+        };
+        tx.apply(&Effect::UpdateActionIntent {
+            action_id: action_id.clone(),
+            status,
+        })?;
+    }
     let Some(execution_id) = &obs.subject_execution_id else {
         return Ok(());
     };
@@ -1237,18 +1252,9 @@ fn assess(
         ObservationFact::Artifact { state, .. } => {
             assess_artifact(tx, config, &execution, state, now_unix_seconds)
         }
-        ObservationFact::PrActionResult {
-            action_id, result, ..
-        } => {
-            let status = match result {
-                ActionResult::Applied => PrActionStatus::Applied,
-                ActionResult::Failed => PrActionStatus::Failed,
-                ActionResult::Unknown => PrActionStatus::Unknown,
-            };
-            tx.apply(&Effect::UpdateActionIntent {
-                action_id: action_id.clone(),
-                status,
-            })?;
+        ObservationFact::PrActionResult { result, .. } => {
+            // The intent status was already updated above; only the
+            // execution-facing transitions remain.
             if result == &ActionResult::Applied && execution.state == ExecutionState::Waiting {
                 let mut next = execution.clone();
                 next.waiting_reason = Some(WaitingReason::Ci);
@@ -1357,6 +1363,20 @@ fn assess_process(
                 next.state = ExecutionState::Uncertain;
                 next.desired_action = Some(DesiredAction::Continue);
                 next.uncertain_since_unix_seconds = Some(now_unix_seconds);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })
+            }
+            // An unverifiable writer during a stop: the requested outcome
+            // cannot be proven, so the Execution is uncertain — keeping
+            // the recorded desired action — until attention resolves it.
+            ExecutionState::Stopping => {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Uncertain;
+                if next.uncertain_since_unix_seconds.is_none() {
+                    next.uncertain_since_unix_seconds = Some(now_unix_seconds);
+                }
                 tx.apply(&Effect::UpdateExecution {
                     execution: next,
                     expected_state: execution.state.clone(),
