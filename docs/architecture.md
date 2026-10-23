@@ -12,6 +12,39 @@
 
 The initial deployment may place these in one process and one local database. The boundaries are behavioral; v0.1 does not require a distributed service or dynamic plugin loader.
 
+## Module map
+
+This is the intended module boundary, not the current layout of the private implementations. The `work` module owns decisions about a Work item. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. Devin, Claude Code, and the existing `coding-worker` CLI are possible implementations of these roles.
+
+```mermaid
+flowchart LR
+    CLI[CLI] -->|Command| W
+    COMMENTS[GitHub comment adapter] -->|Command| W
+    GITHUB[GitHub integration] -->|Observation| W
+
+    subgraph CORE[Workloop core]
+        W[work: decisions and Outcomes]
+        E[execution: Invocations and ownership]
+        P[projection: Queries and Attention]
+        STORE[(State store)]
+        W -->|Invocation request| E
+        E -->|Observation| W
+        W -->|state and evidence| STORE
+        E -->|Invocation records| STORE
+        STORE -->|saved state| P
+    end
+
+    E -->|coding task| CODING[CodingWorker role]
+    E -->|review task| REVIEW[ReviewWorker role]
+    CODING -->|result and evidence| E
+    REVIEW -->|findings and evidence| E
+    W -->|PR action| GITHUB
+    CLI -->|Query| P
+    COMMENTS -->|Query| P
+```
+
+GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The execution-ownership mechanism is [still under study](glossary.md#execution-ownership-terminology-under-study).
+
 ## Command contract
 
 The core exposes commands such as `submit`, `retry`, `resume`, `cancel`, and `acknowledge`, plus read-only queries for status, evidence, and current attention. A command contains:
