@@ -35,20 +35,32 @@ type FindingRef = { finding_id: string; reviewed_revision: string;
 type CheckResult = "pending" | "passed" | "failed" | "unknown";
 type RejectionCode = "invalid_request" | "unauthorized" | "stale_work_version"
 	| "stale_pr_head" | "ineligible" | "ownership_uncertain"
-	| "capacity_exhausted" | "source_unavailable" | "idempotency_conflict";
+	| "capacity_exhausted" | "source_unavailable" | "idempotency_conflict"
+	| "resource_conflict";
 
 type Actor = { kind: "human" | "automation"; external_id: string };
 type CommandMeta = { actor: Actor; origin: string; idempotency_key: string };
 type ExistingWork = { work_id: WorkId; expected_work_version: WorkVersion };
 type FindingDecision = { finding_id: string; choice: "fix" | "dismiss" | "accept" | "wait" };
+type WriteResource =
+	| { kind: "workspace"; workspace_id: string }
+	| { kind: "branch"; repository: string; branch: string };
+type ResourceReservation = { resources: WriteResource[]; holder:
+	| { kind: "execution"; execution_id: ExecutionId }
+	| { kind: "external"; actor_id: string };
+	expires_at?: string };
 type CommandEffect =
 	| { kind: "work_created"; execution_id: ExecutionId }
 	| { kind: "execution_created"; execution_id: ExecutionId }
+	| { kind: "resources_claimed"; expires_at?: string }
+	| { kind: "resources_released" }
 	| { kind: "state_changed" };
 
 type CommandRequest = CommandMeta & (
 	| { kind: "submit"; intent: string; issue_refs: GitHubIssueRef[];
 	    constraints: string[]; verification_argv: string[][] }
+	| { kind: "claim_resources"; resources: WriteResource[]; ttl_seconds: number }
+	| { kind: "release_resources"; resources: WriteResource[] }
 	| (ExistingWork & (
 		| { kind: "retry"; expected_execution_id: ExecutionId }
 		| { kind: "resume"; execution_id: ExecutionId }
@@ -60,8 +72,8 @@ type CommandRequest = CommandMeta & (
 );
 
 type CommandDecision =
-	| { kind: "accepted"; command_id: CommandId; work_id: WorkId;
-	    work_version: WorkVersion; effect: CommandEffect;
+	| { kind: "accepted"; command_id: CommandId; work_id?: WorkId;
+	    work_version?: WorkVersion; effect: CommandEffect;
 	    committed_at: EventSequence }
 	| { kind: "rejected"; command_id: CommandId; reason: RejectionCode;
 	    current_work_id?: WorkId; current_version?: WorkVersion;
@@ -72,6 +84,7 @@ type Query =
 	    phase?: WorkPhase; cursor?: string }
 	| { kind: "work_detail"; work_id: WorkId }
 	| { kind: "attention"; work_id?: WorkId }
+	| { kind: "capacity" }
 	| { kind: "command_result"; lookup:
 	    | { kind: "id"; command_id: CommandId }
 	    | { kind: "replay_key"; origin: string; actor: Actor; idempotency_key: string } };
@@ -86,7 +99,9 @@ type ActionPreview = { availability: "available" | "blocked" | "unknown";
 	observed_work_version?: WorkVersion; observed_pr_head?: PrHeadSha;
 	reasons: RejectionCode[]; evidence: EvidenceRef[] };
 type AttentionView = { attention_id: string; work_id: WorkId;
-	reason: string; evidence: EvidenceRef[] };
+	reason: string; evidence: EvidenceRef[];
+	investigation_threshold_seconds?: number;
+	next_actor?: Actor; next_action?: string };
 type WorkPhase = "queued" | "implementing" | "reviewing"
 	| "converging" | "waiting" | "paused" | "stopping"
 	| "completed" | "stopped" | "unknown";
@@ -122,11 +137,22 @@ type WorkDetail = { work_id: WorkId; version: WorkVersion;
 	current_pr?: { ref: GitHubPrRef; head?: PrHeadSha };
 	findings: FindingRef[]; outcome?: OutcomeView;
 	attention: AttentionView[]; evidence: EvidenceRef[] };
+type CapacityView = {
+	slots: { used: number; limit: number;
+	    holders: { execution_id: ExecutionId; state: ExecutionStateKind;
+	               since: EventSequence }[] };
+	reservations: (ResourceReservation & { since: EventSequence })[];
+	deferred: { execution_id: ExecutionId; reason: RejectionCode;
+	            diagnostic: string; since: EventSequence }[] };
 ```
 
 `submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection.
 
+`claim_resources` and `release_resources` let a manual or unmanaged writer register on the same reservation store that Execution admission uses; they carry no Work ID. An Execution's reservation is declared as `{workspace: <id derived from the Work ID>}` plus `{repository, branch}` with the branch fixed as `work/<work_id>`, is acquired in its `queued → ready` commit, and is held until the Execution reaches a terminal state. An external claim names only `(repository, branch)` pairs, carries a TTL renewed by repeating `claim_resources` from the same actor, and conflicts with any held row are rejected as `resource_conflict` with the current holder returned in evidence. Claim expiry forfeits the exclusion guarantee; it is not evidence that the writer stopped. `release_resources` frees the claimer's own rows; an operator force-release is recorded as an override decision.
+
 `work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes GitHub or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
+
+The `capacity` Query returns a `CapacityView`: which Executions hold slots and why, all held resource reservations including external claims, and queued Executions deferred by a diagnostic such as a conflicting claim or an unavailable source. It is the explanation surface for queue stalls — no separate reservation bookkeeping exists for it to disagree with. `AttentionView` carries the investigation threshold that produced it and the next responsible actor/action; acknowledgement marks the displayed version as seen, and a new version is the only thing that resurfaces it.
 
 `WorkList` is the Kanban-style management view; its `queued` items have current Executions awaiting capacity. Phase, Outcome, and Attention count are derived from saved Work, Execution, and Observation records; there is no separate card status or card ID. `waiting` means an external check or automatic step is pending, `paused` means a safe stop awaits a decision, `stopping` means stop is not confirmed, `stopped` has a failed or cancelled Outcome, and `unknown` means evidence is insufficient. A stopped Work does not return to `queued` without an accepted Command. Pagination uses a stable order over committed enqueue sequences and the snapshot sequence. `submit` creates E1 `queued`; `retry` creates E2 `queued`; `resume` requeues the same E. Internal dispatch later reserves capacity and records an Invocation request in one commit. `WorkDetail.findings` contains findings actionable for the current review target, which is the PR head when a PR exists. Findings for earlier revisions remain in evidence history. An empty list with an unavailable review source is not evidence that review found no issues; `QueryResult.sources` carries that distinction.
 
@@ -241,6 +267,12 @@ type CommitReceipt =
 	| { kind: "constraint_conflict"; constraint: "active_execution" | "capacity";
 	    current_version: WorkVersion };
 
+type ClaimReceipt =
+	| { kind: "claimed"; expires_at?: string; as_of: EventSequence }
+	| { kind: "released"; as_of: EventSequence }
+	| { kind: "conflict"; holder: ResourceReservation["holder"]; as_of: EventSequence }
+	| { kind: "not_held"; as_of: EventSequence };
+
 type SafeOwnership = { kind: "safe_to_start"; evidence: EvidenceRef[] };
 type OwnershipAssessment =
 	| SafeOwnership
@@ -266,7 +298,7 @@ type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertai
 
 `review` and `check` facts always include the head they examined. A delayed webhook is a signal to fetch the current PR head, not authority to replace it with the event's old head. The old event remains evidence for its own revision. `ProcessEvidence.unknown` is the execution supervisor's observation when a worker cannot be reached; the worker does not claim that status for itself. A worker report is a claim with evidence, not an Outcome. The verification commands accepted by `submit` become part of the bounded coding task; the control adapter cannot replace them when dispatching a worker.
 
-`ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
+`ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. Inspection reads process state, not mere presence: an unreaped zombie still lists in the process table but cannot write, and `execution` reaps the processes it spawned. Stop proof covers the descendant snapshot recorded with the stop intent — a `setsid`-escaped child survives a process-group signal and becomes invisible to the process tree once its leader exits. Before signaling any recorded identity the port re-verifies its recorded start time so a reused PID is never signaled. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
 
 `AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied. Exact Work states, retry limits, and GitHub operation payloads can be refined without changing these ownership rules.
 
@@ -289,6 +321,7 @@ These are behavioral ports, not separate processes. Delivery can use a local cal
 | `work` → `execution` | durable `InvocationRequest → DispatchReceipt` | Verify the request and ownership before creating an Invocation. |
 | `execution` → `work` | `ingest(Observation) → IngestReceipt` | Assess worker and process facts; do not copy a worker's claimed Outcome. |
 | `work` → state store | `commitWorkDecision(WorkCommit) → CommitReceipt` | Atomically enforce Work version, one nonterminal Execution, reservation changes derived from state transitions, Command result, and outgoing intents. Observation assessment uses the same port without inventing a Command. |
+| `work` → state store | `claimResources(ResourceReservation) → ClaimReceipt` | Enforce per-resource uniqueness across execution reservations and external claims in one write. A repeat claim from the same actor renews the expiry; a conflicting holder yields `resource_conflict`. |
 | `execution` → state store | `appendInvocation(InvocationWrite) → IngestReceipt` | Persist identity before launch; append process, checkpoint, and result evidence without overwriting history. Save the pending Work Observation with its Invocation fact. |
 | State store → `work` | `listQueuedExecutions(cursor) → PendingExecutionPage` | Return queued Executions in committed enqueue order with the Work version seen; `work` rechecks eligibility in the dispatch transaction. |
 | State store → `execution` | approved `InvocationRequest` by durable request ID | Start or reconcile the approved request; never infer permission from a visible queue phase. |
@@ -332,7 +365,7 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 
 1. The CLI or TUI queries `W1`. The Projection shows `E1`'s Outcome, evidence, current Attention, and whether process ownership is still uncertain.
 2. The operator submits `retry` with `work_id=W1`, `expected_execution_id=E1`, the displayed Work version, and an idempotency key.
-3. `work` checks the confirmed failure, retry budget, current Work version, and proof that the old writer stopped or cannot write. Expiry of a claim alone is insufficient. If ownership remains uncertain, `work` does not authorize `E2`.
+3. `work` checks the confirmed failure, retry budget, current Work version, and proof that the old writer stopped or cannot write. Expiry of a claim alone is insufficient. It also checks that no other holder owns the `work/<work_id>` branch or a conflicting workspace; a held reservation rejects the retry with `resource_conflict` naming the current holder. If ownership remains uncertain, `work` does not authorize `E2`.
 4. On acceptance, the state store records the Command result and creates `E2` as `queued` in one transaction. Capacity shortage does not reject the accepted retry. Internal dispatch later rechecks gates, reserves capacity, and saves E2's first Invocation request. The worker result cannot create `E2` on its own.
 5. A concurrent retry with another key sees the changed Work version or nonterminal `E2` and receives a rejection. Replaying the accepted key returns the recorded `E2` result without creating `E3`.
 
@@ -350,7 +383,7 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 
 - Choose the concrete store constraints and process supervisor that enforce the [lifecycle transitions](lifecycle.md), including cancellation racing with launch.
 - Define how a PR action checks its expected head and how reconciliation handles a head change between judgment acceptance and the external write.
-- Define the execution-ownership mechanism that prevents an old process from writing after ownership changes. The [Lease name remains undecided](glossary.md#execution-ownership-terminology-under-study).
+- Choose the concrete process supervisor implementing `ProcessControlPort`: descendant snapshotting, state-checked inspection including zombies, PID-reuse-safe signaling, and child reaping. The [ownership mechanism is specified without the name Lease](glossary.md#execution-ownership); whether it is one or a fence is resolved by "no replacement while unproven".
 - Define how long idempotency keys and Command results are retained, and how each adapter keeps the same actor identity across process restarts.
 
 Once these contracts are settled, directories can follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, TUI, GitHub, and worker adapters. The layout does not decide the contracts.

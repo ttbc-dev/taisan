@@ -28,7 +28,7 @@ GitHub issues / human intent -> Work -> Execution(s) -> PR and review -> Outcome
 - **Outcome** is a verified result or a specific reason to stop and request action.
 - **Attention** is a current, evidence-backed need for human intervention, not an accumulated list of old alerts.
 
-The core owns Work identity, state transitions, capacity, retry and resume decisions, evidence, and outcomes. The execution-ownership mechanism is still under study. Interfaces submit commands and project state; they do not become the authority for execution. GitHub remains the source for issues, pull requests, and their revisions. See the [glossary](docs/glossary.md) for the terms and their lifetimes.
+The core owns Work identity, state transitions, capacity, retry and resume decisions, evidence, and outcomes. Execution ownership combines store-enforced resource reservations, TTL-bounded external claims for manual writers, and stop proof over recorded process identities. Interfaces submit commands and project state; they do not become the authority for execution. GitHub remains the source for issues, pull requests, and their revisions. See the [glossary](docs/glossary.md) for the terms and their lifetimes.
 
 The repository will implement its own development queue. Pending Work, execution requests, and capacity reservations live in the same state store as Work and Execution; the Kanban-style list is a Projection, not a second card database. A Hermes installation is not required. The existing Hermes console is a reference for operator interaction, not the queue's backend.
 

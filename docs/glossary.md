@@ -44,9 +44,9 @@ GitHub / process / worker → Observation → saved state and decisions → Proj
 
 For example, an Observation that a PR head was `abc123` remains in history. If a later Observation reports a different head, the current review Projection must not present a review of `abc123` as current. A Query reads that Projection; a separate monitor or reconciliation step gathers and records new Observations.
 
-## Execution ownership: terminology under study
+## Execution ownership
 
-The workloop needs a way to grant one actor permission to start or continue an Execution and to prevent an old actor from causing a conflicting effect. The exact mechanism and the name **Lease** are not decided.
+The workloop needs a way to grant one actor permission to start or continue an Execution and to prevent an old actor from causing a conflicting effect. v0.1 composes three mechanisms — a resource reservation, an external claim, and stop proof — and does not use the name **Lease** for any of them.
 
 Existing systems use several different protections:
 
@@ -58,7 +58,9 @@ Existing systems use several different protections:
 | Process-liveness check | An Observation about whether the recorded process still exists. It is evidence, not permission. |
 | Capacity reservation | A limit on how much work may run, not proof of who owns a particular Execution. |
 
-These protections have different scopes and authorities. Do not call their combination a Lease. Consider that name only after the design specifies one authoritative owner for an Execution, validity or renewal rules, and how a former owner is stopped or prevented from writing before ownership transfers. If termination or write prevention cannot be established, the Execution remains uncertain and conflicting work does not start.
+v0.1 adds two more mechanisms to this list: a **resource reservation** keyed on a workspace ID and a `(repository, branch)` pair, and **stop proof** — state-checked inspection of every recorded process identity, including a descendant snapshot taken at stop-intent time. An Execution holds its reservation from `queued → ready` until its terminal commit; a manual writer holds a TTL-bounded external claim on the same store. The external claim has a lease-like shape — bounded validity, renewal, expiry — but expiry only forfeits exclusion and is never stop evidence.
+
+**Lease is not adopted as a name.** The ownership mechanism splits across the reservation, the claim, and stop proof; no single entity carries validity, renewal, and fencing together, and v0.1 adopts no separate write fence — a replacement does not start while a writer is unproven. If termination or write prevention cannot be established, the Execution remains uncertain and conflicting work does not start.
 
 ## External identities
 
