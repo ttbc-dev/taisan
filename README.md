@@ -15,17 +15,18 @@ The initial target is one operator or a small team running a single self-hosted 
 ```text
 GitHub issues / human intent -> Work -> Execution(s) -> PR and review -> Outcome
                                 |          |
-                                +-- state, lease, evidence --+
+                                +-- state, ownership, evidence --+
                                       |
                          CLI / GitHub / optional UI adapters
 ```
 
 - **Work** is a durable, meaningful development unit. It may include multiple related issues; an issue is not automatically a job.
-- **Execution** is one attempt to implement or converge a Work item. Retries and resumes create traceable attempts rather than overwriting history.
+- **Execution** is one logical attempt to complete a Work item. An explicit retry creates a new Execution; a resume continues the same one.
+- **Invocation** is one worker-process start within an Execution.
 - **Outcome** is a verified result or a specific reason to stop and request action.
 - **Attention** is a current, evidence-backed need for human intervention, not an accumulated list of old alerts.
 
-The core owns Work identity, state transitions, leases, capacity, retry and resume decisions, evidence, and outcomes. Interfaces submit commands and project state; they do not become the authority for execution. GitHub remains the source for issues, pull requests, and their revisions.
+The core owns Work identity, state transitions, capacity, retry and resume decisions, evidence, and outcomes. The execution-ownership mechanism is still under study. Interfaces submit commands and project state; they do not become the authority for execution. GitHub remains the source for issues, pull requests, and their revisions. See the [glossary](docs/glossary.md) for the terms and their lifetimes.
 
 ## Scope and boundaries
 
@@ -43,6 +44,7 @@ The system can make routine implementation decisions within the supplied intent 
 
 - [Principles](docs/principles.md) — product and operational rules.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
+- [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 

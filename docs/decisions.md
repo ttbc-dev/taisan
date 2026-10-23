@@ -6,7 +6,7 @@
 - Deliver a self-hosted, single-instance deployment first.
 - Keep Work identity and execution authority in the core; interfaces translate commands and project state.
 - Use a CLI as the required interface and GitHub as the first independent adapter.
-- Model one Work to many issues and one Work to many sequential execution attempts.
+- Model one Work to many issues and one Work to many sequential Executions; a resumed Execution may have multiple Invocations.
 - Make commands idempotent, version-aware, and auditable.
 - Keep planning and prioritization human-led in v0.1.
 - Treat a board integration as optional, with no special authority over execution.
@@ -14,7 +14,7 @@
 ## Questions to resolve through a spike
 
 1. Which minimal Work states and transition reasons make recovery clear without encoding an interface's card vocabulary?
-2. What is the simplest durable lease and fencing mechanism for a single-instance deployment, including process crashes and delayed writes?
+2. What execution-ownership mechanism prevents conflicting work in a single-instance deployment, including process crashes and delayed writes? Does it meet the requirements for a Lease?
 3. Should the first GitHub command surface use issue comments, PR comments, or both? How is a multi-issue Work linked without implying one issue equals one job?
 4. What review signals are sufficient to declare a specific PR head ready, and what remains a human decision?
 5. What evidence must be retained to diagnose failures while keeping engagement data isolated and exports safe?
