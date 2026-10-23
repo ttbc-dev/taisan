@@ -9,8 +9,51 @@
 | Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work or declaring a PR reviewed on a newer head |
 | Control adapter | Command translation, status projection, external identity mapping | State transitions or independent retry policy |
 | CLI | Reference implementation of the control interface | A separate state model |
+| TUI management console | Interactive Work, Attention, and evidence views; typed Command submission | Its own Work state, Attention classification, or retry policy |
 
 The initial deployment may place these in one process and one local database. The boundaries are behavioral; v0.1 does not require a distributed service or dynamic plugin loader.
+
+## Module map
+
+This is the intended module boundary, not the current layout of the private implementations. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. Devin, Claude Code, and the existing `coding-worker` CLI are possible implementations of these roles.
+
+```mermaid
+flowchart LR
+    subgraph REPO[agent-workloop repository]
+        CLI[CLI]
+        TUI[TUI management console]
+        COMMENTS[GitHub comment adapter]
+        GITHUB[GitHub integration]
+
+        subgraph CORE[Workloop core]
+            W[work: decisions and Outcomes]
+            E[execution: Invocations and ownership]
+            P[projection: Queries and Attention]
+            STORE[(State store)]
+            W -->|Invocation request| E
+            E -->|Observation| W
+            W -->|state and evidence| STORE
+            E -->|Invocation records| STORE
+            STORE -->|saved state| P
+        end
+
+        CLI -->|Command| W
+        CLI -->|Query| P
+        TUI -->|Command| W
+        TUI -->|Query| P
+        COMMENTS -->|Command| W
+        COMMENTS -->|Query| P
+        GITHUB -->|Observation| W
+        W -->|PR action| GITHUB
+    end
+
+    E -->|coding task| CODING[CodingWorker role]
+    E -->|review task| REVIEW[ReviewWorker role]
+    CODING -->|result and evidence| E
+    REVIEW -->|findings and evidence| E
+```
+
+GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The TUI reads Work, Attention, and evidence through Queries, then submits typed Commands for operator decisions. It does not classify state or write the store itself. The execution-ownership mechanism is [still under study](glossary.md#execution-ownership-terminology-under-study).
 
 ## Command contract
 
@@ -38,7 +81,9 @@ An adapter implements a narrow protocol:
 3. Render the returned decision and current state.
 4. Reconcile its projection after delayed, duplicated, or lost events.
 
-Candidate adapters are a GitHub issue-comment interface, a GitHub Projects projection, and an optional board integration. The CLI is the baseline and must work with every optional adapter disconnected. GitHub Projects offers project item/field APIs, but its fields are presentation and control input, not execution authority.
+The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request. The [hermes-setup console PR](https://github.com/shimpeiws/hermes-setup/pull/386) is the current reference for this interaction pattern; its Python projections and action paths remain private implementation details, not additional core authorities.
+
+Candidate external adapters are a GitHub issue-comment interface, a GitHub Projects projection, and an optional board integration. GitHub Projects offers project item/field APIs, but its fields are presentation and control input, not execution authority.
 
 ## Recovery rules
 
