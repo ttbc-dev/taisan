@@ -1,18 +1,256 @@
-# Module contracts through three flows
+# Module contracts
 
-This document turns the [module map](architecture.md#module-map) into three example interactions. It is a design proposal, not an implemented API. Names such as `judge_findings` describe operations; their final spelling and transport are open. The terms and lifetimes come from the [glossary](glossary.md).
+This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against three interactions. It is a design proposal, not an implemented API or a choice of programming language. The type notation is illustrative; names such as `judge_findings` and the exact state codes remain open. The terms and lifetimes come from the [glossary](glossary.md).
 
-## Common boundary
+## Caller view
 
-| Message | Producer → consumer | Minimum information | Authority |
-| --- | --- | --- | --- |
-| Command | CLI, TUI, or another control adapter → `work` | Work ID, operation, actor, origin, idempotency key, and expected state or revision | `work` accepts or rejects the transition. The adapter cannot infer acceptance from a timeout. |
-| Command result | `work` → control adapter | Command ID, accepted or rejected decision, reason, and current Work version | The saved result answers a repeated request with the same key. |
-| Invocation request | `work` → `execution` | Work ID, Execution ID, requested worker role, bounded task, and budget | `work` chooses the task. `execution` chooses how to invoke the worker safely. |
-| Observation | `execution` or GitHub integration → `work` | Subject identity, source, observed time, revision when relevant, result, and evidence reference | The source reports a fact. `work` assesses its effect on Work. |
-| Projection | Saved state → `projection` → Query caller | Work version, status, current Attention, evidence references, and freshness or unknown markers | A Projection is a view of recorded facts, not a second state store. |
+The CLI, TUI, and GitHub comment adapter use the same Command and Query contracts. For example, the TUI queries `work_detail(W1)`, asks `work` for a read-only preflight of a judgment, then submits that Command with the displayed Work version and PR head. If the submit response disappears, it asks for the result by Command ID or replays the same key and payload. An accepted result means the decision is durable; it does not mean a worker or GitHub write has finished.
 
-A Query reads saved state. It does not contact GitHub or start a worker. A monitor or a Command handler may obtain a new Observation and record it before a later Query sees the change. The state store keeps the Command decision, Work transition, and any outgoing request together so a lost response cannot make an accepted operation disappear. A repeated idempotency key returns the saved result only when the payload matches; reuse with a different payload is rejected. An external PR write still needs reconciliation because it cannot share that transaction.
+## Type sketch
+
+IDs are distinct opaque types even if an implementation stores each as a string. `WorkVersion` is a version of one Work item. `EventSequence` identifies a committed position in one installation's history. `PrHeadSha` identifies the revision used for a review or check.
+
+```ts
+type OpaqueId<T extends string> = string & { readonly tag: T };
+type OpaqueNumber<T extends string> = number & { readonly tag: T };
+type WorkId = OpaqueId<"work">;
+type ExecutionId = OpaqueId<"execution">;
+type InvocationId = OpaqueId<"invocation">;
+type CommandId = OpaqueId<"command">;
+type ObservationId = OpaqueId<"observation">;
+type ActionId = OpaqueId<"external_action">;
+type WorkVersion = OpaqueNumber<"work_version">;
+type EventSequence = OpaqueNumber<"event_sequence">;
+type PrHeadSha = OpaqueId<"pr_head_sha">;
+type EvidenceRef = { id: string; digest: string; subject_revision?: string };
+type GitHubIssueRef = { repository: string; number: number };
+type GitHubPrRef = { repository: string; number: number };
+type SubjectRef =
+	| { kind: "work"; work_id: WorkId; execution_id?: ExecutionId;
+	    invocation_id?: InvocationId; pr?: GitHubPrRef }
+	| { kind: "candidate"; issue: GitHubIssueRef };
+type FindingRef = { finding_id: string; reviewed_revision: string;
+	summary: string; location?: { path: string; line?: number };
+	evidence: EvidenceRef[] };
+type CheckResult = "pending" | "passed" | "failed" | "unknown";
+type RejectionCode = "invalid_request" | "unauthorized" | "stale_work_version"
+	| "stale_pr_head" | "ineligible" | "ownership_uncertain"
+	| "capacity_exhausted" | "source_unavailable" | "idempotency_conflict";
+
+type Actor = { kind: "human" | "automation"; external_id: string };
+type CommandMeta = { actor: Actor; origin: string; idempotency_key: string };
+type ExistingWork = { work_id: WorkId; expected_work_version: WorkVersion };
+type FindingDecision = { finding_id: string; choice: "fix" | "dismiss" | "accept" | "wait" };
+type CommandEffect =
+	| { kind: "work_created" }
+	| { kind: "execution_created"; execution_id: ExecutionId }
+	| { kind: "state_changed" };
+
+type CommandRequest = CommandMeta & (
+	| { kind: "submit"; intent: string; issue_refs: GitHubIssueRef[];
+	    constraints: string[]; verification_argv: string[][] }
+	| (ExistingWork & (
+		| { kind: "retry"; expected_execution_id: ExecutionId }
+		| { kind: "resume"; execution_id: ExecutionId }
+		| { kind: "cancel"; execution_id?: ExecutionId }
+		| { kind: "acknowledge"; attention_id: string }
+		| { kind: "judge_findings"; expected_pr_head: PrHeadSha; decisions: FindingDecision[] }
+		| { kind: "release_judgment"; expected_pr_head: PrHeadSha }
+	))
+);
+
+type CommandDecision =
+	| { kind: "accepted"; command_id: CommandId; work_id: WorkId;
+	    work_version: WorkVersion; effect: CommandEffect;
+	    committed_at: EventSequence }
+	| { kind: "rejected"; command_id: CommandId; reason: RejectionCode;
+	    current_work_id?: WorkId; current_version?: WorkVersion;
+	    evidence: EvidenceRef[]; committed_at: EventSequence };
+
+type Query =
+	| { kind: "work_detail"; work_id: WorkId }
+	| { kind: "attention"; work_id?: WorkId }
+	| { kind: "command_result"; lookup:
+	    | { kind: "id"; command_id: CommandId }
+	    | { kind: "replay_key"; origin: string; actor: Actor; idempotency_key: string } };
+
+type QueryResult<T> =
+	| { kind: "found"; value: T; as_of: EventSequence;
+	    sources: { source: string; observed_at?: string;
+	               availability: "known" | "unknown" | "unavailable" }[] }
+	| { kind: "not_found" | "forbidden" | "store_unavailable" };
+
+type ActionPreview = { availability: "available" | "blocked" | "unknown";
+	observed_work_version?: WorkVersion; observed_pr_head?: PrHeadSha;
+	reasons: RejectionCode[]; evidence: EvidenceRef[] };
+type AttentionView = { attention_id: string; work_id: WorkId;
+	reason: string; evidence: EvidenceRef[] };
+type OutcomeView = { subject:
+	| { kind: "work"; id: WorkId }
+	| { kind: "execution"; id: ExecutionId };
+	kind: "completed" | "failed" | "paused" | "needs_action";
+	evidence: EvidenceRef[] };
+type ExecutionView = { execution_id: ExecutionId;
+	activity: "active" | "settled" | "uncertain";
+	ownership: "confirmed" | "uncertain";
+	invocation_ids: InvocationId[]; outcome?: OutcomeView };
+type WorkDetail = { work_id: WorkId; version: WorkVersion;
+	executions: ExecutionView[]; current_pr?: { ref: GitHubPrRef; head?: PrHeadSha };
+	findings: FindingRef[]; outcome?: OutcomeView;
+	attention: AttentionView[]; evidence: EvidenceRef[] };
+```
+
+`submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection.
+
+`work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes GitHub or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
+
+`WorkDetail.findings` contains findings actionable for the current review target, which is the PR head when a PR exists. Findings for earlier revisions remain in evidence history. An empty list with an unavailable review source is not evidence that review found no issues; `QueryResult.sources` carries that distinction.
+
+```ts
+type ObservationBase = { id: ObservationId;
+	source_event_id?: string; subject: SubjectRef; observed_at: string;
+	evidence: EvidenceRef[] };
+type UnknownFact = { kind: "unknown"; reason: string };
+type Observation = ObservationBase & (
+	| { source: "github"; fact: GitHubFact | UnknownFact }
+	| { source: "execution"; fact: InvocationFact | UnknownFact }
+);
+
+type GitHubFact =
+	| { kind: "issue"; issue: GitHubIssueRef; source_revision: string }
+	| { kind: "pr_head"; pr: GitHubPrRef; head: PrHeadSha }
+	| { kind: "check"; pr: GitHubPrRef; head: PrHeadSha; conclusion: CheckResult }
+	| { kind: "review"; pr: GitHubPrRef; head: PrHeadSha; findings: FindingRef[] }
+	| { kind: "pr_action_result"; action_id: ActionId; status: "applied" | "failed" | "unknown" };
+
+type InvocationRequest = { request_id: string; work_id: WorkId;
+	execution_id: ExecutionId; input_revision: string; budget: Budget } & (
+	| { role: "coding"; task: CodingTask }
+	| { role: "review"; task: ReviewTask }
+);
+type WorkerTask = InvocationRequest & { invocation_id: InvocationId;
+	workspace: WorkspaceRef; allowed_effects: AllowedEffects };
+type WorkerStartReceipt =
+	| { kind: "started"; process_identity: string }
+	| { kind: "rejected"; reason: string }
+	| { kind: "unknown"; reason: string };
+type TaskBase = { goal: string; input_artifacts: EvidenceRef[];
+	acceptance_criteria: string[]; verification_argv: string[][] };
+type CodingTask = TaskBase & { kind: "coding"; issue_refs: GitHubIssueRef[] };
+type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: string };
+type Budget = { deadline?: string; max_invocations?: number;
+	max_review_rounds?: number };
+type ExecutionSpec = { execution_id: ExecutionId; work_id: WorkId;
+	input_revision: string; intent_digest: string; budget: Budget };
+type WorkspaceRef = { workspace_id: string; path: string };
+type AllowedEffects = { workspace_write: boolean; local_git_write: boolean;
+	github_write: false };
+type WorkerReport =
+	| { kind: "coding"; invocation_id: InvocationId;
+	    status: "completed" | "failed" | "waiting";
+	    artifacts: EvidenceRef[]; checks: EvidenceRef[] }
+	| { kind: "review"; invocation_id: InvocationId; reviewed_revision: string;
+	    status: "completed" | "failed" | "waiting";
+	    findings: FindingRef[]; evidence: EvidenceRef[] };
+type ProcessEvidence =
+	| { state: "alive"; process_identity: string; observed_at: string }
+	| { state: "stopped"; process_identity: string; observed_at: string;
+	    exit_code?: number }
+	| { state: "unknown"; reason: string; observed_at: string };
+type InvocationFact = { kind: "invocation"; execution_id: ExecutionId;
+	invocation_id: InvocationId; process: ProcessEvidence;
+	worker_report?: WorkerReport };
+
+type PrActionIntent = { action_id: ActionId; work_id: WorkId;
+	repository: string; payload_digest: string } & (
+	| { operation: { kind: "publish_pr"; branch: string; base: string;
+	    change_artifact: EvidenceRef } }
+	| { pr: GitHubPrRef; expected_head: PrHeadSha;
+	    operation: { kind: "update_pr"; change_artifact: EvidenceRef }
+	      | { kind: "post_pr_comment"; body: EvidenceRef } }
+);
+
+type WorkChange =
+	| { kind: "none" }
+	| { kind: "transition"; outcome?: OutcomeView;
+	    attention: AttentionView[]; new_execution?: ExecutionSpec;
+	    judgments?: { head: PrHeadSha; decisions: FindingDecision[] };
+	    capacity_delta: number; requests: InvocationRequest[];
+	    pr_actions: PrActionIntent[] };
+type WorkCommit =
+	| { kind: "work"; work_id: WorkId; expected_version?: WorkVersion;
+	    cause:
+	      | { kind: "command"; request: CommandRequest;
+	          decision: { kind: "accepted"; effect: CommandEffect }
+	            | { kind: "rejected"; reason: RejectionCode } }
+	      | { kind: "observation"; observation: Observation };
+	    change: WorkChange }
+	| { kind: "intake_rejection"; request: CommandRequest & { kind: "submit" };
+	    reason: RejectionCode; change: { kind: "none" } };
+type CommitReceipt =
+	| { kind: "committed_work"; work_version: WorkVersion;
+	    as_of: EventSequence; command_decision?: CommandDecision }
+	| { kind: "recorded_rejection"; as_of: EventSequence;
+	    command_decision: Extract<CommandDecision, { kind: "rejected" }> }
+	| { kind: "version_conflict"; current_version: WorkVersion }
+	| { kind: "constraint_conflict"; constraint: "active_execution" | "capacity";
+	    current_version: WorkVersion };
+
+type SafeOwnership = { kind: "safe_to_start"; evidence: EvidenceRef[] };
+type OwnershipAssessment =
+	| SafeOwnership
+	| { kind: "uncertain"; reason: string; evidence: EvidenceRef[] };
+type InvocationRecord = { invocation_id: InvocationId;
+	request_id: string; execution_id: ExecutionId; role: "coding" | "review";
+	input_revision: string; ownership: SafeOwnership };
+type InvocationWrite =
+	| { kind: "created"; record: InvocationRecord }
+	| { kind: "observed"; fact: InvocationFact;
+	    pending_work_observation: Observation };
+type StoredSnapshot = { as_of: EventSequence; work?: WorkDetail;
+	attention: AttentionView[]; command_decision?: CommandDecision;
+	observations: Observation[];
+	sources: { source: string; observed_at?: string;
+	           availability: "known" | "unknown" | "unavailable" }[] };
+type IngestReceipt = { kind: "recorded" | "duplicate" | "rejected";
+	as_of?: EventSequence; reason?: RejectionCode };
+type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertain";
+	request_id: string };
+```
+
+`review` and `check` facts always include the head they examined. A delayed webhook is a signal to fetch the current PR head, not authority to replace it with the event's old head. The old event remains evidence for its own revision. `ProcessEvidence.unknown` is the execution supervisor's observation when a worker cannot be reached; the worker does not claim that status for itself. A worker report is a claim with evidence, not an Outcome. The verification commands accepted by `submit` become part of the bounded coding task; the control adapter cannot replace them when dispatching a worker.
+
+`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied. Exact Work states, retry limits, and GitHub operation payloads can be refined without changing these ownership rules.
+
+`SafeOwnership` records the evidence that permits an Invocation to start. It does not name or prescribe a Lease mechanism. An uncertain assessment cannot produce an `InvocationRecord`. If the state store reports a version or constraint conflict, `work` rereads state and evaluates the Command or Observation again; it does not retry the proposed write unchanged.
+
+## Ports and all module connections
+
+These are behavioral ports, not separate processes. Delivery can use a local call or a durable queue. The state store owns atomic writes and uniqueness checks; `work` and `execution` own the policy behind those writes.
+
+| Diagram edge | Port and message | Receiver's obligation |
+| --- | --- | --- |
+| CLI → `work` | `submit(CommandRequest) → CommandDecision` | Validate identity, version, policy, and idempotency. |
+| CLI → `projection` | `query(Query) → QueryResult<T>` | Read saved state, including a Command result after lost response. |
+| TUI → `work` | `preview(CommandRequest) → ActionPreview`; `submit(CommandRequest) → CommandDecision` | Apply the same rules as CLI; preflight gives no extra authority. |
+| TUI → `projection` | `query(Query) → QueryResult<T>` | Return Work detail, Attention, Command results, and source availability. |
+| GitHub comment adapter → `work` | `submit(CommandRequest) → CommandDecision` | Map external actor and delivery ID; reject duplicate effects. |
+| GitHub comment adapter → `projection` | `query(Query) → QueryResult<T>` | Read the status to render; a comment is not the state store. |
+| GitHub integration → `work` | `ingest(Observation) → IngestReceipt` | Deduplicate source events and assess facts against the current Work revision. |
+| `work` → GitHub integration | `PrActionIntent → action result Observation` | Apply only the recorded intent; reconcile an unknown response. |
+| `work` → `execution` | durable `InvocationRequest → DispatchReceipt` | Verify the request and ownership before creating an Invocation. |
+| `execution` → `work` | `ingest(Observation) → IngestReceipt` | Assess worker and process facts; do not copy a worker's claimed Outcome. |
+| `work` → state store | `commitWorkDecision(WorkCommit) → CommitReceipt` | Atomically enforce Work version, active Execution uniqueness, capacity reservation, Command result, and outgoing intents. Observation assessment uses the same port without inventing a Command. |
+| `execution` → state store | `appendInvocation(InvocationWrite) → IngestReceipt` | Persist identity before launch; append process, checkpoint, and result evidence without overwriting history. Save the pending Work Observation with its Invocation fact. |
+| State store → `projection` | `readSnapshot(Query) → StoredSnapshot` | Return records with event sequence and source availability; projection only shapes the view. |
+| `execution` → CodingWorker | `start(WorkerTask) → WorkerStartReceipt` | Run the bounded coding task under the permitted workspace and effects. |
+| `execution` → ReviewWorker | `start(WorkerTask) → WorkerStartReceipt` | Review the specified patch or PR head under the given budget. |
+| CodingWorker → `execution` | coding `WorkerReport` and evidence | Correlate by Invocation ID; report artifacts and checks, not Work completion. |
+| ReviewWorker → `execution` | review `WorkerReport` and evidence | Correlate by Invocation ID and reviewed revision; report findings, not final acceptance. |
+
+`IngestReceipt` reports recorded, duplicate, or rejected input. `DispatchReceipt` reports queued, already queued, or refused because safe ownership cannot be established. Delivery of a durable `InvocationRequest` is at least once; its request ID prevents a second Invocation for the same request. When a Command creates an Execution, the same transaction records the decision, Execution, capacity reservation, and request or outbox intent. A process crash after acceptance therefore leaves work for a dispatcher to resume. `execution` records an Invocation before launch, and a lost start response becomes `ProcessEvidence.unknown` until reconciled. GitHub writes cannot share this transaction and require reconciliation.
+
+The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; adapting a private worker that currently performs such writes will require separating that behavior.
 
 ## TUI review judgment
 
@@ -44,7 +282,7 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 1. `execution` records an Invocation before starting a CodingWorker or ReviewWorker role. Its request names the Execution, input revision, task, and budget. Devin, Claude Code, or another provider can fill the role.
 2. The worker returns artifacts and evidence to `execution`. `execution` records the Invocation result and reports an Observation to `work`. A worker saying "done" is evidence to assess, not a Work Outcome.
 3. GitHub integration records separate Observations for the PR head, checks, and review events. Each review conclusion is bound to the head SHA it examined. `work` assesses the worker and GitHub Observations together, then records an Outcome or requests another Invocation within the same Execution.
-4. A later PR-head Observation makes a prior head's review conclusion stale. `work` cannot mark the new head reviewed from the old result. `projection` shows the current head and the missing review evidence in the next Query.
+4. A later PR-head Observation makes a prior head's review conclusion stale. A delayed webhook for the old head triggers a current GitHub read; it cannot move the recorded current head backward. `work` cannot mark the new head reviewed from the old result. `projection` shows the current head and the missing review evidence in the next Query.
 5. When `work` requests a PR action, it records the outgoing intent before GitHub integration performs the write. Reconciliation records the actual GitHub result as an Observation. An accepted internal decision alone does not prove that the PR changed.
 
 ## Decisions needed before a directory layout
@@ -52,6 +290,6 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 - Define the minimal Work and Execution states, transition reasons, and Outcome codes used by these flows.
 - Define how a PR action checks its expected head and how reconciliation handles a head change between judgment acceptance and the external write.
 - Define the execution-ownership mechanism that prevents an old process from writing after ownership changes. The [Lease name remains undecided](glossary.md#execution-ownership-terminology-under-study).
-- Define the scope and retention of idempotency keys and Command results, including repeated requests after a process restart.
+- Define how long idempotency keys and Command results are retained, and how each adapter keeps the same actor identity across process restarts.
 
 Once these contracts are settled, directories can follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, TUI, GitHub, and worker adapters. The layout does not decide the contracts.

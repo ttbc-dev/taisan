@@ -39,7 +39,7 @@ flowchart LR
 
         CLI -->|Command| W
         CLI -->|Query| P
-        TUI -->|Command| W
+        TUI -->|Command and preflight| W
         TUI -->|Query| P
         COMMENTS -->|Command| W
         COMMENTS -->|Query| P
@@ -59,7 +59,7 @@ GitHub review events and worker results arrive as Observations. The `work` modul
 
 The core exposes commands such as `submit`, `retry`, `resume`, `cancel`, and `acknowledge`, plus read-only queries for status, evidence, and current attention. A command contains:
 
-- a stable Work ID and an idempotency key;
+- a stable Work ID for an existing Work item, or an intent for `submit` so the core can allocate the ID, plus an idempotency key;
 - actor and origin (CLI, GitHub, or another adapter);
 - expected state/version, where relevant;
 - optional reason and target Execution.
