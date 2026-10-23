@@ -31,6 +31,7 @@ Reinvoking a worker after a temporary `pending` result continues E1. Once E1 has
 | **Query** | A read-only request for recorded information, such as Work status or current Attention. It does not refresh an external service or change workloop state. |
 | **Observation** | A fact obtained from a worker, process, or external service, with its source and observation time. It may say that a value is unknown. A PR head SHA, process liveness result, or check status is an Observation. |
 | **Projection** | A current view derived from saved state and Observations, such as Work status or an Attention list. It can change when new evidence arrives; it is not an independent execution authority. |
+| **Work queue** | Accepted Work awaiting admission or an approved Invocation request awaiting execution. It uses the Work/Execution state store, not a separate card database. The Kanban-style Work list is a Projection of pending, active, and completed records. |
 | **Outcome** | An evidence-backed assessment at a Work or Execution decision point. It states what completed, failed, paused, or needs action. A pause or human gate is not Work completion. Later decisions may supersede an earlier assessment without erasing it. |
 | **Attention** | A current, evidence-backed action or decision required from a person. It disappears when the underlying need is resolved; acknowledging it only records that someone saw it. Automated waiting and recovery are not human Attention. |
 | **Evidence** | Retained records or artifact references supporting an Observation, decision, or Outcome. Evidence includes enough identity and revision information to avoid treating an old PR-head review as current. |
@@ -61,4 +62,4 @@ These protections have different scopes and authorities. Do not call their combi
 
 ## External identities
 
-GitHub issues and PRs remain external records. Their numbers and head revisions are references and Observations, not substitutes for `work_id` or `execution_id`. CLI, GitHub comments, and optional boards submit Commands or display Projections; none defines a separate Work state.
+GitHub issues and PRs remain external records. Their numbers and head revisions are references and Observations, not substitutes for `work_id` or `execution_id`. The CLI and TUI submit Commands and display Projections of the built-in queue. GitHub comments may provide another control surface; none defines a separate Work state. Existing Hermes Kanban card IDs are not used for new Work identity.
