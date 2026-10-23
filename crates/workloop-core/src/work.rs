@@ -8,8 +8,11 @@ use crate::command::{
     RejectionCode, WorkVersion, payload_digest,
 };
 use crate::domain::*;
-use crate::observation::Outcome;
-use crate::store::{Effect, ReadView, Store, StoreError, TxView};
+use crate::observation::{
+    ActionResult, ArtifactFact, CheckConclusion, Observation, ObservationFact, Outcome,
+    ProcessStateFact, ReviewVerdict,
+};
+use crate::store::{Effect, PrActionIntent, PrActionStatus, ReadView, Store, StoreError, TxView};
 
 /// Installation-level configuration supplied by the composition root.
 #[derive(Debug, Clone)]
@@ -1043,4 +1046,566 @@ pub fn admit_queued(
         execution_id: execution_id.clone(),
     })?;
     Ok(Some(next))
+}
+
+/// What happened to an ingested Observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestReceipt {
+    Recorded,
+    /// A source event delivered twice; the store's dedupe index caught it.
+    Duplicate,
+    Rejected(String),
+}
+
+/// Slice-0 completion policy: a coding Invocation's required artifacts,
+/// an applied `publish_pr` intent, and check + review evidence covering
+/// the same current head produce `succeeded`.
+pub fn handle_observation(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    obs: &Observation,
+    now_unix_seconds: i64,
+) -> Result<IngestReceipt, StoreError> {
+    store.transact(|tx| {
+        tx.apply(&Effect::InsertObservation {
+            observation: obs.clone(),
+        })?;
+        assess(tx, config, obs, now_unix_seconds)?;
+        Ok(IngestReceipt::Recorded)
+    })
+    .or_else(|e| match e {
+        StoreError::ConstraintConflict { detail }
+            if detail.contains("observations_dedupe") || detail.contains("UNIQUE") =>
+        {
+            Ok(IngestReceipt::Duplicate)
+        }
+        other => Err(other),
+    })
+}
+
+/// A committed observation may move the Execution; every transition here is
+/// evidence-driven — a worker claim is never an Outcome by itself.
+fn assess(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    obs: &Observation,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let Some(execution_id) = &obs.subject_execution_id else {
+        return Ok(());
+    };
+    let Some(execution) = tx.execution(execution_id)? else {
+        return Ok(());
+    };
+    match &obs.fact {
+        ObservationFact::ProcessState {
+            invocation_id,
+            state,
+            ..
+        } => assess_process(tx, config, &execution, invocation_id, state, now_unix_seconds),
+        ObservationFact::LaunchRefused { invocation_id, .. } => {
+            mark_invocation(tx, invocation_id, InvocationState::Abandoned)?;
+            // Definitely no process exists: release the slot, keep the
+            // reservation for a repair, and park the Execution.
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("repair: launch refused before spawn".into());
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state.clone(),
+            })?;
+            tx.apply(&Effect::ReleaseSlot {
+                execution_id: execution.id.clone(),
+            })?;
+            Ok(())
+        }
+        ObservationFact::Artifact { state, .. } => {
+            assess_artifact(tx, config, &execution, state, now_unix_seconds)
+        }
+        ObservationFact::PrActionResult {
+            action_id, result, ..
+        } => {
+            let status = match result {
+                ActionResult::Applied => PrActionStatus::Applied,
+                ActionResult::Failed => PrActionStatus::Failed,
+                ActionResult::Unknown => PrActionStatus::Unknown,
+            };
+            tx.apply(&Effect::UpdateActionIntent {
+                action_id: action_id.clone(),
+                status,
+            })?;
+            if result == &ActionResult::Applied && execution.state == ExecutionState::Waiting {
+                let mut next = execution.clone();
+                next.waiting_reason = Some(WaitingReason::Ci);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })?;
+            }
+            if result == &ActionResult::Failed && execution.state == ExecutionState::Waiting {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Paused;
+                next.pause_reason = Some("repair: GitHub action failed after head recheck".into());
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })?;
+                tx.apply(&Effect::ReleaseSlot {
+                    execution_id: execution.id.clone(),
+                })?;
+            }
+            Ok(())
+        }
+        ObservationFact::PrChecks { .. } | ObservationFact::PrReview { .. } => {
+            assess_completion(tx, &execution)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn mark_invocation(
+    tx: &mut dyn TxView,
+    invocation_id: &InvocationId,
+    state: InvocationState,
+) -> Result<(), StoreError> {
+    for exec in tx.nonterminal_executions()? {
+        for inv in tx.invocations_for_execution(&exec.id)? {
+            if inv.id == *invocation_id && inv.state != state {
+                let mut next = inv.clone();
+                next.state = state;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: inv.state.clone(),
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assess_process(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    invocation_id: &InvocationId,
+    state: &ProcessStateFact,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    match state {
+        ProcessStateFact::Running => match execution.state {
+            ExecutionState::Ready => {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Running;
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })
+            }
+            // A writer re-confirmed alive resolves `uncertain(continue)`.
+            ExecutionState::Uncertain
+                if execution.desired_action == Some(DesiredAction::Continue) =>
+            {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Running;
+                next.desired_action = None;
+                next.uncertain_since_unix_seconds = None;
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })
+            }
+            _ => Ok(()),
+        },
+        ProcessStateFact::Exited => {
+            mark_invocation(tx, invocation_id, InvocationState::Done)?;
+            match execution.state {
+                ExecutionState::Running => {
+                    let mut next = execution.clone();
+                    next.state = ExecutionState::Waiting;
+                    next.waiting_reason = Some(WaitingReason::Reconciliation);
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: execution.state.clone(),
+                    })?;
+                    maybe_publish(tx, config, execution, now_unix_seconds)
+                }
+                ExecutionState::Stopping | ExecutionState::Uncertain => {
+                    settle_after_writer_gone(tx, config, execution, now_unix_seconds)
+                }
+                _ => Ok(()),
+            }
+        }
+        ProcessStateFact::Unknown => match execution.state {
+            ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Uncertain;
+                next.desired_action = Some(DesiredAction::Continue);
+                next.uncertain_since_unix_seconds = Some(now_unix_seconds);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The writer is gone: resolve `stopping`/`uncertain` to the recorded
+/// desired action — terminal states release slot and reservation, a
+/// recoverable pause releases only the slot.
+fn settle_after_writer_gone(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let desired = execution.desired_action.clone().unwrap_or(DesiredAction::Fail);
+    let mut next = execution.clone();
+    let seq = tx.alloc_seq()?;
+    let release_reservations = match desired {
+        DesiredAction::Cancel => {
+            next.state = ExecutionState::Cancelled;
+            next.terminal_code = Some("cancelled".into());
+            next.outcome = Some(Outcome {
+                state: ExecutionState::Cancelled,
+                code: Some("cancelled".into()),
+                detail: Some("writer stop proven".into()),
+                evidence_refs: vec![],
+                recorded_seq: seq,
+            });
+            true
+        }
+        DesiredAction::Fail => {
+            next.state = ExecutionState::Failed;
+            next.terminal_code = Some("stopped".into());
+            next.outcome = Some(Outcome {
+                state: ExecutionState::Failed,
+                code: Some("stopped".into()),
+                detail: Some("writer stop proven; recorded failure".into()),
+                evidence_refs: vec![],
+                recorded_seq: seq,
+            });
+            true
+        }
+        DesiredAction::Continue => {
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("recoverable_stop".into());
+            false
+        }
+    };
+    next.desired_action = None;
+    next.uncertain_since_unix_seconds = None;
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: execution.state.clone(),
+    })?;
+    tx.apply(&Effect::ReleaseSlot {
+        execution_id: execution.id.clone(),
+    })?;
+    if release_reservations {
+        let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
+        tx.apply(&Effect::DeleteReservations {
+            resource_keys: resources_keys_of(tx, &work, execution)?,
+            holder: ReservationHolder::Execution {
+                execution_id: execution.id.clone(),
+            },
+        })?;
+    }
+    let _ = config;
+    let _ = now_unix_seconds;
+    Ok(())
+}
+
+fn assess_artifact(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    state: &ArtifactFact,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    match state {
+        // Required evidence missing after a confirmed exit → bounded
+        // recovery. The deadline is durable from the first transition in.
+        ArtifactFact::Missing | ArtifactFact::Corrupt
+            if execution.state == ExecutionState::Waiting
+                || execution.state == ExecutionState::Running =>
+        {
+            let mut next = execution.clone();
+            next.state = ExecutionState::Waiting;
+            next.waiting_reason = Some(WaitingReason::ArtifactRecovery);
+            if next.recovery_deadline_unix_seconds.is_none() {
+                next.recovery_deadline_unix_seconds =
+                    Some(now_unix_seconds + execution.budget.artifact_recovery_seconds as i64);
+            }
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state.clone(),
+            })
+        }
+        ArtifactFact::Present
+            if execution.state == ExecutionState::Waiting
+                || execution.state == ExecutionState::Running =>
+        {
+            maybe_publish(tx, config, execution, now_unix_seconds)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Once the coding Invocation's evidence is complete, record the publish
+/// intent — the outbox row exists before any GitHub write is attempted.
+fn maybe_publish(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    _now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    if execution.state != ExecutionState::Waiting {
+        return Ok(());
+    }
+    if matches!(
+        execution.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery)
+    ) {
+        // Recovery only proceeds once every required artifact is present.
+        let invocations = tx.invocations_for_execution(&execution.id)?;
+        let complete = invocations
+            .iter()
+            .rev()
+            .find(|i| i.state == InvocationState::Done || i.state == InvocationState::Abandoned)
+            .map(|i| {
+                crate::projection::artifacts_complete(tx, &execution.id, i)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !complete {
+            return Ok(());
+        }
+    } else {
+        let invocations = tx.invocations_for_execution(&execution.id)?;
+        let latest = invocations.last();
+        let complete = match latest {
+            Some(i) if i.state == InvocationState::Done => {
+                crate::projection::artifacts_complete(tx, &execution.id, i)?
+            }
+            _ => false,
+        };
+        if !complete {
+            return Ok(());
+        }
+    }
+    let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
+    if !outstanding.is_empty() {
+        return Ok(());
+    }
+    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
+        detail: "execution without work".into(),
+    })?;
+    let repository = work
+        .issue_refs
+        .first()
+        .map(|r| r.repository.clone())
+        .unwrap_or_else(|| config.default_repository.clone());
+    let action_id = tx.alloc_id("act")?;
+    tx.apply(&Effect::InsertPrActionIntent {
+        intent: PrActionIntent {
+            action_id,
+            work_id: work.id.clone(),
+            repository,
+            action: crate::store::PrAction::PublishPr {
+                branch: format!("work/{}", work.id.0),
+                title: work.intent.chars().take(70).collect(),
+                body: String::new(),
+            },
+            status: PrActionStatus::Pending,
+        },
+    })?;
+    let mut next = execution.clone();
+    next.waiting_reason = Some(WaitingReason::GithubWrite);
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: execution.state.clone(),
+    })
+}
+
+/// `succeeded` requires check + review evidence covering the same current
+/// head and no unresolved writer, gate, or outgoing action.
+fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), StoreError> {
+    if execution.state != ExecutionState::Waiting {
+        return Ok(());
+    }
+    let observations = tx.observations_for_work(&execution.work_id)?;
+    let head = observations.iter().rev().find_map(|o| match &o.fact {
+        ObservationFact::PrHead { head_sha, .. } => Some(head_sha.clone()),
+        _ => None,
+    });
+    let Some(head) = head else { return Ok(()) };
+    let checks_ok = observations.iter().any(|o| {
+        matches!(
+            &o.fact,
+            ObservationFact::PrChecks {
+                head_sha,
+                conclusion: CheckConclusion::Success,
+                ..
+            } if head_sha == &head
+        )
+    });
+    let review_ok = observations.iter().any(|o| {
+        matches!(
+            &o.fact,
+            ObservationFact::PrReview {
+                head_sha,
+                verdict: ReviewVerdict::Approve,
+                ..
+            } if head_sha == &head
+        )
+    });
+    if !(checks_ok && review_ok) {
+        return Ok(());
+    }
+    if !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty() {
+        return Ok(());
+    }
+    let seq = tx.alloc_seq()?;
+    let mut next = execution.clone();
+    next.state = ExecutionState::Succeeded;
+    next.terminal_code = Some("succeeded".into());
+    next.outcome = Some(Outcome {
+        state: ExecutionState::Succeeded,
+        code: Some("succeeded".into()),
+        detail: Some(format!("verified head {head}")),
+        evidence_refs: vec![],
+        recorded_seq: seq,
+    });
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: execution.state.clone(),
+    })?;
+    tx.apply(&Effect::ReleaseSlot {
+        execution_id: execution.id.clone(),
+    })?;
+    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
+        detail: "execution without work".into(),
+    })?;
+    tx.apply(&Effect::DeleteReservations {
+        resource_keys: resources_keys_of(tx, &work, execution)?,
+        holder: ReservationHolder::Execution {
+            execution_id: execution.id.clone(),
+        },
+    })?;
+    Ok(())
+}
+
+/// The internal dispatch scan: queued Executions in committed enqueue
+/// order. A deferred head never blocks later items; each deferral is
+/// recorded for the `capacity` Query.
+pub fn dispatch_once(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    now_unix_seconds: i64,
+) -> Result<Vec<ExecutionId>, StoreError> {
+    let mut admitted = Vec::new();
+    for execution in tx.queued_executions()? {
+        if admit_queued(tx, config, &execution.id, now_unix_seconds)?.is_some() {
+            admitted.push(execution.id);
+        }
+    }
+    Ok(admitted)
+}
+
+/// Timed decisions the loop owes the store: runtime limits, recovery
+/// bounds, and budget exhaustion. Each is a committed decision checked
+/// against the stored limit and the observed clock — never silent.
+pub fn sweep(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    store.transact(|tx| {
+        for execution in tx.nonterminal_executions()? {
+            match execution.state {
+                ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
+                    // Recovery bound is separate from the runtime budget.
+                    if matches!(
+                        execution.waiting_reason,
+                        Some(WaitingReason::ArtifactRecovery)
+                    ) {
+                        let exhausted = execution.recovery_attempts_used
+                            >= execution.budget.artifact_recovery_attempts
+                            || execution
+                                .recovery_deadline_unix_seconds
+                                .is_some_and(|d| now_unix_seconds > d);
+                        if exhausted {
+                            fail_terminal(
+                                tx,
+                                &execution,
+                                "artifact_recovery_exhausted",
+                                "bounded artifact recovery exhausted; WIP preserved",
+                            )?;
+                            continue;
+                        }
+                    }
+                    let over_runtime = execution.started_unix_seconds.is_some_and(|s| {
+                        now_unix_seconds - s > execution.budget.runtime_limit_seconds as i64
+                    });
+                    if over_runtime {
+                        let mut next = execution.clone();
+                        next.state = ExecutionState::Stopping;
+                        next.desired_action = Some(DesiredAction::Fail);
+                        tx.apply(&Effect::UpdateExecution {
+                            execution: next,
+                            expected_state: execution.state.clone(),
+                        })?;
+                    }
+                }
+                ExecutionState::Queued => {
+                    // An absolute deadline would be checked here; v0.1 has
+                    // none configured. Queue time never consumes runtime.
+                }
+                _ => {}
+            }
+        }
+        let _ = config;
+        Ok(())
+    })
+}
+
+fn fail_terminal(
+    tx: &mut dyn TxView,
+    execution: &Execution,
+    code: &str,
+    detail: &str,
+) -> Result<(), StoreError> {
+    let seq = tx.alloc_seq()?;
+    let mut next = execution.clone();
+    next.state = ExecutionState::Failed;
+    next.terminal_code = Some(code.into());
+    next.outcome = Some(Outcome {
+        state: ExecutionState::Failed,
+        code: Some(code.into()),
+        detail: Some(detail.into()),
+        evidence_refs: vec![],
+        recorded_seq: seq,
+    });
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: execution.state.clone(),
+    })?;
+    tx.apply(&Effect::ReleaseSlot {
+        execution_id: execution.id.clone(),
+    })?;
+    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
+        detail: "execution without work".into(),
+    })?;
+    tx.apply(&Effect::DeleteReservations {
+        resource_keys: resources_keys_of(tx, &work, execution)?,
+        holder: ReservationHolder::Execution {
+            execution_id: execution.id.clone(),
+        },
+    })?;
+    Ok(())
 }

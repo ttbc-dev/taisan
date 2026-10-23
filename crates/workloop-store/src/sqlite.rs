@@ -9,7 +9,10 @@ use std::sync::Mutex;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::store::{Effect, ReadView, Store, StoreError, TxView};
+use workloop_core::observation::Observation;
+use workloop_core::store::{
+    Deferral, Effect, PrActionIntent, ReadView, Store, StoreError, TxView,
+};
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -200,6 +203,42 @@ const EXECUTION_COLS: &str = "id, work_id, ordinal, state, waiting_reason, \
     allowed_effects, input, budget, invocations_used, review_rounds_used, \
     started_seq, started_unix_seconds, recovery_attempts_used, \
     recovery_deadline_unix_seconds, uncertain_since_unix_seconds";
+
+const INVOCATION_COLS: &str = "id, request_id, execution_id, role, state, \
+    process_identity, required_artifacts, evidence_refs";
+
+fn invocation_from_row(row: &rusqlite::Row<'_>) -> Result<Invocation, rusqlite::Error> {
+    Ok(Invocation {
+        id: InvocationId(row.get::<_, String>(0)?),
+        request_id: row.get(1)?,
+        execution_id: ExecutionId(row.get::<_, String>(2)?),
+        role: untag(&row.get::<_, String>(3)?)?,
+        state: untag(&row.get::<_, String>(4)?)?,
+        process_identity: opt_de_row(row.get::<_, Option<String>>(5)?)?,
+        required_artifacts: de_row(&row.get::<_, String>(6)?)?,
+        evidence_refs: de_row(&row.get::<_, String>(7)?)?,
+    })
+}
+
+fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqlite::Error> {
+    Ok(InvocationRequest {
+        request_id: row.get(0)?,
+        work_id: WorkId(row.get::<_, String>(1)?),
+        execution_id: ExecutionId(row.get::<_, String>(2)?),
+        role: untag(&row.get::<_, String>(3)?)?,
+        payload: de_row(&row.get::<_, String>(4)?)?,
+    })
+}
+
+fn observation_from_row(row: &rusqlite::Row<'_>) -> Result<Observation, rusqlite::Error> {
+    Ok(Observation {
+        source_event_id: row.get(0)?,
+        subject_work_id: row.get::<_, Option<String>>(1)?.map(WorkId),
+        subject_execution_id: row.get::<_, Option<String>>(2)?.map(ExecutionId),
+        fact: de_row(&row.get::<_, String>(3)?)?,
+        observed_unix_seconds: row.get(4)?,
+    })
+}
 
 fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     tx.exec(
@@ -448,27 +487,170 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
+        self.query_opt(
+            "SELECT request_id, work_id, execution_id, role, payload \
+             FROM invocation_requests WHERE request_id=?1",
+            params![request_id],
+            request_from_row,
+        )
+    }
+
     fn invocations_for_execution(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Vec<Invocation>, StoreError> {
         self.query_all(
-            "SELECT id, request_id, execution_id, role, state, \
-             process_identity, required_artifacts, evidence_refs \
-             FROM invocations WHERE execution_id=?1 ORDER BY rowid",
+            &format!("SELECT {INVOCATION_COLS} FROM invocations \
+                      WHERE execution_id=?1 ORDER BY rowid"),
             params![execution_id.0],
+            invocation_from_row,
+        )
+    }
+
+    fn invocation_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Invocation>, StoreError> {
+        self.query_opt(
+            &format!("SELECT {INVOCATION_COLS} FROM invocations WHERE request_id=?1"),
+            params![request_id],
+            invocation_from_row,
+        )
+    }
+
+    fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
+        self.query_all(
+            &format!("SELECT {INVOCATION_COLS} FROM invocations \
+                      WHERE state IN ('prepared','running','unknown') ORDER BY rowid"),
+            [],
+            invocation_from_row,
+        )
+    }
+
+    fn works(&self) -> Result<Vec<Work>, StoreError> {
+        self.query_all(
+            "SELECT id, version, revision, intent, issue_refs, constraints_, \
+             verification_argv, created_seq FROM works ORDER BY created_seq",
+            [],
             |row| {
-                Ok(Invocation {
-                    id: InvocationId(row.get::<_, String>(0)?),
-                    request_id: row.get(1)?,
-                    execution_id: ExecutionId(row.get::<_, String>(2)?),
-                    role: untag(&row.get::<_, String>(3)?)?,
-                    state: untag(&row.get::<_, String>(4)?)?,
-                    process_identity: opt_de_row(row.get::<_, Option<String>>(5)?)?,
-                    required_artifacts: de_row(&row.get::<_, String>(6)?)?,
-                    evidence_refs: de_row(&row.get::<_, String>(7)?)?,
+                Ok(Work {
+                    id: WorkId(row.get::<_, String>(0)?),
+                    version: row.get::<_, u64>(1)?,
+                    revision: row.get(2)?,
+                    intent: row.get(3)?,
+                    issue_refs: de_row(&row.get::<_, String>(4)?)?,
+                    constraints: de_row(&row.get::<_, String>(5)?)?,
+                    verification_argv: de_row(&row.get::<_, String>(6)?)?,
+                    created_seq: row.get(7)?,
                 })
             },
+        )
+    }
+
+    fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError> {
+        self.query_all(
+            &format!("SELECT {EXECUTION_COLS} FROM executions \
+                      WHERE state NOT IN ('succeeded','failed','cancelled') \
+                      ORDER BY enqueued_seq"),
+            [],
+            execution_from_row,
+        )
+    }
+
+    fn stop_intent(
+        &self,
+        invocation_id: &InvocationId,
+    ) -> Result<Option<StopIntent>, StoreError> {
+        self.query_opt(
+            "SELECT invocation_id, identities, recorded_seq \
+             FROM stop_intents WHERE invocation_id=?1",
+            params![invocation_id.0],
+            |row| {
+                Ok(StopIntent {
+                    invocation_id: InvocationId(row.get::<_, String>(0)?),
+                    identities: de_row(&row.get::<_, String>(1)?)?,
+                    recorded_seq: row.get(2)?,
+                })
+            },
+        )
+    }
+
+    fn deferrals(&self) -> Result<Vec<Deferral>, StoreError> {
+        self.query_all(
+            "SELECT execution_id, reason, diagnostic, since_seq FROM deferrals",
+            [],
+            |row| {
+                Ok(Deferral {
+                    execution_id: ExecutionId(row.get::<_, String>(0)?),
+                    reason: row.get(1)?,
+                    diagnostic: row.get(2)?,
+                    since_seq: row.get(3)?,
+                })
+            },
+        )
+    }
+
+    fn attention_acks(&self, work_id: &WorkId) -> Result<Vec<String>, StoreError> {
+        self.query_all(
+            "SELECT attention_id FROM attention_acks WHERE work_id=?1",
+            params![work_id.0],
+            |row| row.get(0),
+        )
+    }
+
+    fn observations_for_execution(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<Observation>, StoreError> {
+        self.query_all(
+            "SELECT source_event_id, subject_work_id, subject_execution_id, \
+             fact, observed_unix_seconds FROM observations \
+             WHERE subject_execution_id=?1 ORDER BY id",
+            params![execution_id.0],
+            observation_from_row,
+        )
+    }
+
+    fn observations_for_work(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<Observation>, StoreError> {
+        self.query_all(
+            "SELECT source_event_id, subject_work_id, subject_execution_id, \
+             fact, observed_unix_seconds FROM observations \
+             WHERE subject_work_id=?1 ORDER BY id",
+            params![work_id.0],
+            observation_from_row,
+        )
+    }
+
+    fn action_intents(&self) -> Result<Vec<PrActionIntent>, StoreError> {
+        self.query_all(
+            "SELECT action_id, work_id, repository, action, status \
+             FROM pr_action_intents ORDER BY rowid",
+            [],
+            |row| {
+                Ok(PrActionIntent {
+                    action_id: row.get(0)?,
+                    work_id: WorkId(row.get::<_, String>(1)?),
+                    repository: row.get(2)?,
+                    action: de_row(&row.get::<_, String>(3)?)?,
+                    status: untag(&row.get::<_, String>(4)?)?,
+                })
+            },
+        )
+    }
+
+    fn judgments(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<(String, Vec<workloop_core::command::FindingDecision>)>, StoreError> {
+        self.query_all(
+            "SELECT expected_pr_head, decisions FROM judgments \
+             WHERE work_id=?1 ORDER BY seq",
+            params![work_id.0],
+            |row| Ok((row.get(0)?, de_row(&row.get::<_, String>(1)?)?)),
         )
     }
 
@@ -724,15 +906,39 @@ impl TxView for Tx<'_> {
             Effect::InsertPrActionIntent { intent } => {
                 self.exec(
                     "INSERT INTO pr_action_intents \
-                     (action_id, work_id, repository, action) \
-                     VALUES (?1,?2,?3,?4)",
+                     (action_id, work_id, repository, action, status) \
+                     VALUES (?1,?2,?3,?4,?5)",
                     params![
                         intent.action_id,
                         intent.work_id.0,
                         intent.repository,
                         json(&intent.action)?,
+                        tag(&intent.status),
                     ],
                 )?;
+            }
+            Effect::MarkRequestConsumed { request_id } => {
+                let n = self.exec(
+                    "UPDATE invocation_requests SET consumed=1 \
+                     WHERE request_id=?1 AND consumed=0",
+                    params![request_id],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("request {request_id} already consumed or missing"),
+                    });
+                }
+            }
+            Effect::UpdateActionIntent { action_id, status } => {
+                let n = self.exec(
+                    "UPDATE pr_action_intents SET status=?2 WHERE action_id=?1",
+                    params![action_id, tag(status)],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("unknown action_id {action_id}"),
+                    });
+                }
             }
             Effect::RecordDeferral {
                 execution_id,

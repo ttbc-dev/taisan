@@ -1,0 +1,590 @@
+//! Contract tests for the supervisor ProcessControlPort and the launch /
+//! stop / recovery paths over real processes (`docs/v0.1.md`: Launch,
+//! Stop proof, Recovery rows).
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use workloop_core::command::*;
+use workloop_core::domain::*;
+use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact};
+use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
+use workloop_core::store::{Effect, Store};
+use workloop_core::work::{WorkloopConfig, admit_queued, handle_command, handle_observation, sweep};
+use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
+use workloop_store::sqlite::SqliteStore;
+
+const NOW: i64 = 1_700_000_000;
+
+fn fixture_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-worker")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "workloop-test-{}-{}",
+        tag,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn config() -> WorkloopConfig {
+    WorkloopConfig {
+        default_repository: "local/repo".into(),
+        allowed_effects: AllowedEffects {
+            workspace_write: true,
+            github_write: false,
+            network: false,
+        },
+        budget: ExecutionBudget {
+            artifact_recovery_attempts: 3,
+            artifact_recovery_seconds: 60,
+            ..ExecutionBudget::default()
+        },
+    }
+}
+
+fn actor() -> Actor {
+    Actor {
+        kind: ActorKind::Human,
+        external_id: "op".into(),
+    }
+}
+
+fn req(key: &str, body: CommandBody) -> CommandRequest {
+    CommandRequest {
+        actor: actor(),
+        origin: Origin("cli".into()),
+        idempotency_key: key.into(),
+        body,
+    }
+}
+
+fn submit(key: &str) -> CommandRequest {
+    req(
+        key,
+        CommandBody::Submit {
+            intent: "do the thing".into(),
+            issue_refs: vec![GitHubIssueRef {
+                repository: "local/repo".into(),
+                number: 1,
+            }],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    )
+}
+
+fn supervisor(mode: &str, root: PathBuf) -> Supervisor<PosixProcessControl> {
+    Supervisor::new(
+        PosixProcessControl,
+        root,
+        vec![fixture_bin(), mode.to_string()],
+        config(),
+    )
+}
+
+fn execution(store: &SqliteStore, id: &ExecutionId) -> Execution {
+    store
+        .transact(|tx| tx.execution(id))
+        .unwrap()
+        .expect("execution")
+}
+
+fn submit_and_admit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    let d = handle_command(store, &config(), &submit(key), NOW).unwrap();
+    let (work_id, eid) = match d {
+        CommandDecision::Accepted {
+            work_id, effect, ..
+        } => {
+            let eid = match effect {
+                CommandEffect::WorkCreated { execution_id } => execution_id,
+                other => panic!("unexpected effect {other:?}"),
+            };
+            (work_id.unwrap(), eid)
+        }
+        other => panic!("submit rejected: {other:?}"),
+    };
+    let admitted = store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW))
+        .unwrap();
+    assert!(admitted.is_some(), "execution admitted");
+    (work_id, eid)
+}
+
+fn wait_for(mut pred: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if pred() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn cancel(store: &SqliteStore, work_id: &WorkId, key: &str) {
+    let version = store
+        .transact(|tx| tx.work(work_id))
+        .unwrap()
+        .map(|w| w.version)
+        .expect("work exists");
+    let d = handle_command(
+        store,
+        &config(),
+        &req(
+            key,
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "cancel: {d:?}");
+}
+
+// ---- ProcessControlPort (#7) ----
+
+#[test]
+fn spawn_records_identity_in_own_process_group() {
+    let root = tmp_root("spawn");
+    let port = PosixProcessControl;
+    let identity = port
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+        )
+        .expect("spawn");
+    assert_eq!(identity.pgid, Some(identity.pid));
+    assert!(!identity.started_at.is_empty());
+    assert!(matches!(
+        port.inspect(&identity),
+        ProcessEvidence::Alive { .. }
+    ));
+    port.signal_verified(&identity, libc::SIGKILL);
+}
+
+#[test]
+fn signal_reverified_never_hits_a_reused_pid() {
+    let root = tmp_root("reverify");
+    let port = PosixProcessControl;
+    let identity = port
+        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .expect("spawn");
+    // Corrupt the recorded verifier: a stale identity must not be signaled.
+    let stale = ProcessIdentity {
+        started_at: "bogus".into(),
+        ..identity.clone()
+    };
+    assert_eq!(
+        port.signal_verified(&stale, libc::SIGKILL),
+        SignalOutcome::SkippedStale
+    );
+    assert!(matches!(
+        port.inspect(&identity),
+        ProcessEvidence::Alive { .. }
+    ));
+    // The real identity still verifies and is signaled.
+    assert_eq!(
+        port.signal_verified(&identity, libc::SIGKILL),
+        SignalOutcome::Sent
+    );
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "stopped after signal",
+    );
+}
+
+#[test]
+fn zombie_counts_as_stopped() {
+    let root = tmp_root("zombie");
+    let port = PosixProcessControl;
+    let leader = port
+        .spawn(&[fixture_bin(), "zombie".into()], &root)
+        .expect("spawn");
+    // The fixture holds an unreaped child; find it via the snapshot.
+    wait_for(
+        || {
+            port.snapshot_descendants(leader.pid)
+                .iter()
+                .any(|i| i.pid != leader.pid)
+        },
+        "zombie child to appear",
+    );
+    let descendants = port.snapshot_descendants(leader.pid);
+    let zombie = descendants
+        .iter()
+        .find(|i| i.pid != leader.pid)
+        .expect("a descendant");
+    assert!(matches!(
+        port.inspect(zombie),
+        ProcessEvidence::Stopped { .. }
+    ));
+    port.signal_verified(&leader, libc::SIGKILL);
+}
+
+#[test]
+fn setsid_escapee_is_in_the_snapshot_and_signaled() {
+    let root = tmp_root("setsid");
+    let port = PosixProcessControl;
+    let leader = port
+        .spawn(
+            &[fixture_bin(), "setsid-escape".into(), "--interval-ms".into(), "50".into()],
+            &root,
+        )
+        .expect("spawn");
+    wait_for(
+        || root.join("heartbeat.log").exists(),
+        "escaped writer heartbeat",
+    );
+    let snapshot = port.snapshot_descendants(leader.pid);
+    let escapee = snapshot
+        .iter()
+        .find(|i| i.pid != leader.pid)
+        .expect("snapshot includes the escapee while leader lives");
+    // It escaped the leader's group: a group signal cannot reach it.
+    assert_ne!(escapee.pgid, leader.pgid);
+    // Verified per-identity signaling does.
+    assert_eq!(
+        port.signal_verified(escapee, libc::SIGKILL),
+        SignalOutcome::Sent
+    );
+    port.signal_verified(&leader, libc::SIGKILL);
+    wait_for(
+        || matches!(port.inspect(escapee), ProcessEvidence::Stopped { .. }),
+        "escapee stopped",
+    );
+}
+
+#[test]
+fn persist_failure_sends_no_signal() {
+    let root = tmp_root("nopersist");
+    let port = PosixProcessControl;
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.clone(),
+        vec![fixture_bin()],
+        config(),
+    );
+    let leader = port
+        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .expect("spawn");
+    let invocation = Invocation {
+        id: InvocationId("inv-test".into()),
+        request_id: "req-test".into(),
+        execution_id: ExecutionId("e-test".into()),
+        role: InvocationRole::Coding,
+        state: InvocationState::Running,
+        process_identity: Some(leader.clone()),
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+    };
+    let receipt = sup
+        .stop_unless_persisted(&invocation, &leader, |_| {
+            Err(workloop_core::store::StoreError::Internal {
+                detail: "injected persist failure".into(),
+            })
+        })
+        .unwrap();
+    assert!(matches!(receipt, StopReceipt::Unknown { .. }));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        matches!(port.inspect(&leader), ProcessEvidence::Alive { .. }),
+        "no signal may be sent when the intent is not durable"
+    );
+    port.signal_verified(&leader, libc::SIGKILL);
+}
+
+// ---- Launch (#9) ----
+
+#[test]
+fn crash_after_ready_replays_the_request_exactly_once() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("replay");
+    let (_w, eid) = submit_and_admit(&store, "k-launch1");
+    let sup = supervisor("hang", root);
+    // Two consumption passes — as if the supervisor restarted after the
+    // ready commit — must produce one Invocation and one writer.
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocations = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap();
+    assert_eq!(invocations.len(), 1, "at most one Invocation per request");
+    assert!(invocations[0].process_identity.is_some());
+    // Cleanup: cancel and drive the stop to proof.
+    let work_id = invocations[0].execution_id.clone();
+    let _ = work_id;
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-launch2");
+    for _ in 0..20 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+}
+
+#[test]
+fn crash_near_spawn_leaves_uncertain_with_no_second_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("nearspawn");
+    let (_w, eid) = submit_and_admit(&store, "k-near1");
+    let sup = supervisor("hang", root);
+    // Simulate: the request was consumed and an Invocation recorded, then
+    // the supervisor died before identity capture — the spawn outcome is
+    // simply not provable.
+    let request = store
+        .transact(|tx| {
+            let reqs = tx.pending_requests()?;
+            Ok(reqs.into_iter().next().expect("one request"))
+        })
+        .unwrap();
+    store
+        .transact(|tx| {
+            let inv_id = tx.alloc_id("inv")?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(inv_id),
+                    request_id: request.request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Prepared,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Uncertain);
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&eid))
+            .unwrap()
+            .len(),
+        1,
+        "no second writer while the start is unproven"
+    );
+}
+
+#[test]
+fn launch_refused_pauses_and_releases_the_slot() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("refused");
+    let (_w, eid) = submit_and_admit(&store, "k-ref1");
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root,
+        vec!["/nonexistent/workloop-worker".to_string()],
+        config(),
+    );
+    sup.run_once(&store, NOW).unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert!(
+        e.pause_reason.as_deref().unwrap_or("").contains("repair"),
+        "repair pause recorded"
+    );
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!(slots, 0, "slot released");
+    assert_eq!(reservations, 2, "reservation kept while paused");
+}
+
+// ---- Stop proof / cancel path ----
+
+#[test]
+fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("cancelrun");
+    let (_w, eid) = submit_and_admit(&store, "k-c1");
+    let sup = supervisor("hang", root);
+    sup.run_once(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-c2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    // First pass persists the intent and signals; the terminal commit only
+    // lands after every recorded identity inspects as stopped.
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+    let intent = store
+        .transact(|tx| {
+            Ok(tx
+                .invocations_for_execution(&eid)?
+                .first()
+                .map(|i| tx.stop_intent(&i.id))
+                .transpose()?
+                .flatten())
+        })
+        .unwrap();
+    assert!(intent.is_some(), "stop intent was durable before signals");
+}
+
+// ---- Artifact recovery (#10) ----
+
+#[test]
+fn missing_artifact_runs_bounded_recovery_then_fails() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("recovery");
+    let (work_id, eid) = submit_and_admit(&store, "k-rec1");
+    let sup = supervisor("exit-no-artifact", root.clone());
+    // Worker exits without the artifact → confirmed exit, then
+    // waiting(artifact_recovery).
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting
+            && e.waiting_reason == Some(WaitingReason::ArtifactRecovery)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Waiting);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "bounded recovery entered after confirmed exit"
+    );
+    assert!(e.recovery_deadline_unix_seconds.is_some());
+    // Bounded attempts are durable; the sweep fails the Execution at the
+    // stored bound with WIP preserved.
+    for _ in 0..4 {
+        sup.run_once(&store, NOW).unwrap();
+        sweep(&store, &config(), NOW).unwrap();
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("artifact_recovery_exhausted")
+    );
+    assert!(root.join(format!("ws-{}", work_id.0)).exists(), "WIP preserved");
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!(slots, 0);
+    assert_eq!(reservations, 0, "slot and reservation released");
+    // A retry claims the same workspace and branch.
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "k-rec2",
+            CommandBody::Retry {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                expected_execution_id: eid.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }));
+    let e2 = store
+        .transact(|tx| tx.active_execution(&work_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(e2.state, ExecutionState::Queued);
+}
+
+// ---- Clean exit drives the publish intent ----
+
+#[test]
+fn clean_exit_records_artifact_and_publish_intent() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("clean");
+    let (_w, eid) = submit_and_admit(&store, "k-cl1");
+    let sup = supervisor("clean-exit", root);
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting
+            && e.waiting_reason == Some(WaitingReason::GithubWrite)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::GithubWrite),
+        "publish intent outstanding"
+    );
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    assert_eq!(intents.len(), 1);
+}
+
+// ---- Store-level: an inserted Unknown observation marks uncertain ----
+
+#[test]
+fn unknown_inspection_maps_to_uncertain() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, eid) = submit_and_admit(&store, "k-u1");
+    let root = tmp_root("unk");
+    let sup = supervisor("hang", root);
+    sup.consume_requests(&store, NOW).unwrap();
+    let inv = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let obs = Observation {
+        source_event_id: None,
+        subject_work_id: Some(w.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact: ObservationFact::ProcessState {
+            invocation_id: inv.id.clone(),
+            process_identity: String::new(),
+            state: ProcessStateFact::Unknown,
+        },
+        observed_unix_seconds: NOW,
+    };
+    // Wait for running first so the transition applies.
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    handle_observation(&store, &config(), &obs, NOW).unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Uncertain);
+    // Cleanup the real process.
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-u2");
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state.is_terminal() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

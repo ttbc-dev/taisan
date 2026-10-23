@@ -29,6 +29,12 @@ pub enum ObservationFact {
         required_artifact: String,
         state: ArtifactFact,
     },
+    /// The worker runtime definitely refused the launch before any
+    /// process existed — distinct from `ProcessState::Unknown`.
+    LaunchRefused {
+        invocation_id: InvocationId,
+        reason: String,
+    },
     PrHead {
         repository: String,
         number: u64,
