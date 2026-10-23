@@ -17,7 +17,7 @@ GitHub issues / human intent -> Work -> Execution(s) -> PR and review -> Outcome
                                 |          |
                                 +-- state, ownership, evidence --+
                                       |
-                         CLI / GitHub / optional UI adapters
+                         CLI / TUI / GitHub adapters
 ```
 
 - **Work** is a durable, meaningful development unit. It may include multiple related issues; an issue is not automatically a job.
@@ -35,7 +35,7 @@ The core owns Work identity, state transitions, capacity, retry and resume decis
 | GitHub-based intake, PRs, and review signals | Other source-control hosts |
 | Single-instance self-hosted operation | Hosted multi-tenant service |
 | Bounded implementation and review-fix cycles | Fully autonomous product planning |
-| CLI as the baseline control surface | A required web dashboard |
+| CLI as the baseline control surface; TUI management console for state inspection and operator actions | A required web dashboard |
 | Optional adapters, including a GitHub interface | Broad workflow-platform integrations |
 
 The system can make routine implementation decisions within the supplied intent and constraints. It must expose consequential uncertainty and a clear intervention path. It does not merge or deploy by default.
@@ -50,7 +50,7 @@ The system can make routine implementation decisions within the supplied intent 
 
 ## Proposed first milestone
 
-Run one Work item from intake through PR, review, a bounded fix cycle, and completion using only the core and CLI. Add one external control adapter and verify that duplicate commands, stale views, process loss, and adapter outages cannot create duplicate executions or false success. The design is proven only after the same Work can be observed and controlled through two independent interfaces.
+Run one Work item from intake through PR, review, a bounded fix cycle, and completion using only the core and CLI. Add one external control adapter and verify that duplicate commands, stale views, process loss, and adapter outages cannot create duplicate executions or false success. The design is proven only after the same Work can be observed and controlled through two independent interfaces. The TUI management console is an implementation target in this repository after that initial validation slice.
 
 ## License
 
