@@ -1,6 +1,9 @@
 //! Fixture worker: a real process the contract tests spawn. Behavior is
 //! driven by argv so tests can model every writer shape the supervisor
 //! must handle. The managed workspace is the process's cwd.
+// Unreaped children are the point of this binary: `zombie`, `setsid-escape`,
+// and `orphan-writer` deliberately never wait on their spawned children.
+#![allow(clippy::zombie_processes)]
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -27,11 +30,8 @@ fn parse() -> Args {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--interval-ms" => {
-                interval = Duration::from_millis(
-                    it.next()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(100),
-                );
+                interval =
+                    Duration::from_millis(it.next().and_then(|v| v.parse().ok()).unwrap_or(100));
             }
             "--file" => {
                 if let Some(v) = it.next() {

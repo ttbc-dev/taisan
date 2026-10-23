@@ -10,7 +10,9 @@ use workloop_core::domain::*;
 use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
 use workloop_core::store::{Effect, Store};
-use workloop_core::work::{WorkloopConfig, admit_queued, handle_command, handle_observation, sweep};
+use workloop_core::work::{
+    WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
+};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
@@ -24,11 +26,7 @@ fn fixture_bin() -> String {
 }
 
 fn tmp_root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "workloop-test-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("workloop-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -149,7 +147,10 @@ fn cancel(store: &SqliteStore, work_id: &WorkId, key: &str) {
         NOW,
     )
     .unwrap();
-    assert!(matches!(d, CommandDecision::Accepted { .. }), "cancel: {d:?}");
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "cancel: {d:?}"
+    );
 }
 
 // ---- ProcessControlPort (#7) ----
@@ -159,10 +160,7 @@ fn spawn_records_identity_in_own_process_group() {
     let root = tmp_root("spawn");
     let port = PosixProcessControl;
     let identity = port
-        .spawn(
-            &[fixture_bin(), "hang".into()],
-            &root,
-        )
+        .spawn(&[fixture_bin(), "hang".into()], &root)
         .expect("spawn");
     assert_eq!(identity.pgid, Some(identity.pid));
     assert!(!identity.started_at.is_empty());
@@ -238,7 +236,12 @@ fn setsid_escapee_is_in_the_snapshot_and_signaled() {
     let port = PosixProcessControl;
     let leader = port
         .spawn(
-            &[fixture_bin(), "setsid-escape".into(), "--interval-ms".into(), "50".into()],
+            &[
+                fixture_bin(),
+                "setsid-escape".into(),
+                "--interval-ms".into(),
+                "50".into(),
+            ],
             &root,
         )
         .expect("spawn");
@@ -489,7 +492,10 @@ fn missing_artifact_runs_bounded_recovery_then_fails() {
         e.terminal_code.as_deref(),
         Some("artifact_recovery_exhausted")
     );
-    assert!(root.join(format!("ws-{}", work_id.0)).exists(), "WIP preserved");
+    assert!(
+        root.join(format!("ws-{}", work_id.0)).exists(),
+        "WIP preserved"
+    );
     let (slots, reservations) = store
         .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
         .unwrap();

@@ -35,30 +35,23 @@ pub fn handle_command(
     let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);
 
     store.transact(|tx| {
-        match tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)? {
-            Some((stored_digest, decision)) => {
-                if stored_digest == digest {
-                    return Ok(decision);
-                }
-                let decision = rejected(
-                    tx,
-                    RejectionCode::IdempotencyConflict,
-                    req.body.work_id().cloned(),
-                    vec!["same idempotency key with a different payload".into()],
-                )?;
-                // The original decision keeps the bare key for replay; the
-                // conflict is durable under a payload-derived key.
-                let conflict_key = format!("{}#{digest}", req.idempotency_key);
-                tx.save_decision(
-                    &req.origin,
-                    &req.actor,
-                    &conflict_key,
-                    &digest,
-                    &decision,
-                )?;
+        if let Some((stored_digest, decision)) =
+            tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)?
+        {
+            if stored_digest == digest {
                 return Ok(decision);
             }
-            None => {}
+            let decision = rejected(
+                tx,
+                RejectionCode::IdempotencyConflict,
+                req.body.work_id().cloned(),
+                vec!["same idempotency key with a different payload".into()],
+            )?;
+            // The original decision keeps the bare key for replay; the
+            // conflict is durable under a payload-derived key.
+            let conflict_key = format!("{}#{digest}", req.idempotency_key);
+            tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
+            return Ok(decision);
         }
 
         // Re-decide passes let a constraint conflict resolve against fresh
@@ -85,7 +78,7 @@ pub fn handle_command(
                                     RejectionCode::Ineligible,
                                     req.body.work_id().cloned(),
                                     vec![e.to_string()],
-                                )
+                                );
                             }
                         }
                     }
@@ -97,7 +90,13 @@ pub fn handle_command(
             }
         };
 
-        tx.save_decision(&req.origin, &req.actor, &req.idempotency_key, &digest, &decision)?;
+        tx.save_decision(
+            &req.origin,
+            &req.actor,
+            &req.idempotency_key,
+            &digest,
+            &decision,
+        )?;
         Ok(decision)
     })
 }
@@ -151,9 +150,7 @@ fn rejected_now(
     work_id: Option<WorkId>,
     evidence: Vec<String>,
 ) -> CommandDecision {
-    let current = work_id
-        .as_ref()
-        .and_then(|w| tx.work(w).ok().flatten());
+    let current = work_id.as_ref().and_then(|w| tx.work(w).ok().flatten());
     CommandDecision::Rejected {
         command_id: CommandId(
             tx.alloc_id("cmd")
@@ -228,7 +225,14 @@ fn decide(
             issue_refs,
             constraints,
             verification_argv,
-        } => decide_submit(tx, config, intent, issue_refs, constraints, verification_argv),
+        } => decide_submit(
+            tx,
+            config,
+            intent,
+            issue_refs,
+            constraints,
+            verification_argv,
+        ),
         CommandBody::ClaimResources {
             resources,
             ttl_seconds,
@@ -238,7 +242,14 @@ fn decide(
             work_id,
             expected_work_version,
             expected_execution_id,
-        } => decide_retry(tx, config, work_id, *expected_work_version, expected_execution_id, now_unix_seconds),
+        } => decide_retry(
+            tx,
+            config,
+            work_id,
+            *expected_work_version,
+            expected_execution_id,
+            now_unix_seconds,
+        ),
         CommandBody::Resume {
             work_id,
             expected_work_version,
@@ -259,7 +270,13 @@ fn decide(
             expected_work_version,
             expected_pr_head,
             decisions,
-        } => decide_judge(tx, work_id, *expected_work_version, expected_pr_head, decisions),
+        } => decide_judge(
+            tx,
+            work_id,
+            *expected_work_version,
+            expected_pr_head,
+            decisions,
+        ),
         CommandBody::ReleaseJudgment {
             work_id,
             expected_work_version,
@@ -421,7 +438,8 @@ fn decide_claim(
 }
 
 fn is_expired(res: &ResourceReservation, now_unix_seconds: i64) -> bool {
-    res.expires_at_unix_seconds.is_some_and(|e| e <= now_unix_seconds)
+    res.expires_at_unix_seconds
+        .is_some_and(|e| e <= now_unix_seconds)
 }
 
 fn decide_release(
@@ -433,18 +451,18 @@ fn decide_release(
         actor_id: req.actor.external_id.clone(),
     };
     for res in resources {
-        if let Some(existing) = tx.reservation(&res.key())? {
-            if existing.holder != holder {
-                return Ok((
-                    rejected_now(
-                        tx,
-                        RejectionCode::Unauthorized,
-                        None,
-                        vec![serde_json::to_string(&existing).unwrap_or_default()],
-                    ),
-                    vec![],
-                ));
-            }
+        if let Some(existing) = tx.reservation(&res.key())?
+            && existing.holder != holder
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::Unauthorized,
+                    None,
+                    vec![serde_json::to_string(&existing).unwrap_or_default()],
+                ),
+                vec![],
+            ));
         }
     }
     let command_id = CommandId(tx.alloc_id("cmd")?);
@@ -510,18 +528,18 @@ fn decide_retry(
     // Acceptance-time reservation pre-check; dispatch rechecks atomically.
     let resources = work_resources(&work, config);
     for res in &resources {
-        if let Some(existing) = tx.reservation(&res.key())? {
-            if !is_expired(&existing, now_unix_seconds) {
-                return Ok((
-                    rejected_now(
-                        tx,
-                        RejectionCode::ResourceConflict,
-                        Some(work_id.clone()),
-                        vec![serde_json::to_string(&existing).unwrap_or_default()],
-                    ),
-                    vec![],
-                ));
-            }
+        if let Some(existing) = tx.reservation(&res.key())?
+            && !is_expired(&existing, now_unix_seconds)
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::ResourceConflict,
+                    Some(work_id.clone()),
+                    vec![serde_json::to_string(&existing).unwrap_or_default()],
+                ),
+                vec![],
+            ));
         }
     }
     let seq = tx.alloc_seq()?;
@@ -589,17 +607,23 @@ fn decide_resume(
     };
     let Some(execution) = tx.active_execution(work_id)? else {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "no active Execution to resume".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no active Execution to resume".into()],
+            ),
             vec![],
         ));
     };
     if &execution.id != execution_id || execution.state != ExecutionState::Paused {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "resume requires the named Execution to be paused".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["resume requires the named Execution to be paused".into()],
+            ),
             vec![],
         ));
     }
@@ -662,15 +686,18 @@ fn decide_cancel(
             vec![],
         ));
     };
-    if let Some(named) = execution_id {
-        if named != &execution.id {
-            return Ok((
-                rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                    "execution_id is not the active Execution".into(),
-                ]),
-                vec![],
-            ));
-        }
+    if let Some(named) = execution_id
+        && named != &execution.id
+    {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["execution_id is not the active Execution".into()],
+            ),
+            vec![],
+        ));
     }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);
@@ -841,9 +868,12 @@ fn decide_judge(
     };
     if decisions.is_empty() {
         return Ok((
-            rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![
-                "judge_findings requires at least one decision".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::InvalidRequest,
+                Some(work_id.clone()),
+                vec!["judge_findings requires at least one decision".into()],
+            ),
             vec![],
         ));
     }
@@ -851,18 +881,29 @@ fn decide_judge(
     for d in decisions {
         if !seen.insert(&d.finding_id) {
             return Ok((
-                rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![
-                    format!("duplicate finding_id {}", d.finding_id),
-                ]),
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!("duplicate finding_id {}", d.finding_id)],
+                ),
                 vec![],
             ));
         }
         if !matches!(
             d.choice,
-            FindingChoice::Fix | FindingChoice::Dismiss | FindingChoice::Accept | FindingChoice::Wait
+            FindingChoice::Fix
+                | FindingChoice::Dismiss
+                | FindingChoice::Accept
+                | FindingChoice::Wait
         ) {
             return Ok((
-                rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![]),
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![],
+                ),
                 vec![],
             ));
         }
@@ -908,17 +949,23 @@ fn decide_release_judgment(
     };
     let Some(execution) = tx.active_execution(work_id)? else {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "no active Execution".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no active Execution".into()],
+            ),
             vec![],
         ));
     };
     if execution.state != ExecutionState::Paused {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "release_judgment requires a paused Execution".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["release_judgment requires a paused Execution".into()],
+            ),
             vec![],
         ));
     }
@@ -1066,21 +1113,22 @@ pub fn handle_observation(
     obs: &Observation,
     now_unix_seconds: i64,
 ) -> Result<IngestReceipt, StoreError> {
-    store.transact(|tx| {
-        tx.apply(&Effect::InsertObservation {
-            observation: obs.clone(),
-        })?;
-        assess(tx, config, obs, now_unix_seconds)?;
-        Ok(IngestReceipt::Recorded)
-    })
-    .or_else(|e| match e {
-        StoreError::ConstraintConflict { detail }
-            if detail.contains("observations_dedupe") || detail.contains("UNIQUE") =>
-        {
-            Ok(IngestReceipt::Duplicate)
-        }
-        other => Err(other),
-    })
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertObservation {
+                observation: obs.clone(),
+            })?;
+            assess(tx, config, obs, now_unix_seconds)?;
+            Ok(IngestReceipt::Recorded)
+        })
+        .or_else(|e| match e {
+            StoreError::ConstraintConflict { detail }
+                if detail.contains("observations_dedupe") || detail.contains("UNIQUE") =>
+            {
+                Ok(IngestReceipt::Duplicate)
+            }
+            other => Err(other),
+        })
 }
 
 /// A committed observation may move the Execution; every transition here is
@@ -1102,7 +1150,14 @@ fn assess(
             invocation_id,
             state,
             ..
-        } => assess_process(tx, config, &execution, invocation_id, state, now_unix_seconds),
+        } => assess_process(
+            tx,
+            config,
+            &execution,
+            invocation_id,
+            state,
+            now_unix_seconds,
+        ),
         ObservationFact::LaunchRefused { invocation_id, .. } => {
             mark_invocation(tx, invocation_id, InvocationState::Abandoned)?;
             // Definitely no process exists: release the slot, keep the
@@ -1261,7 +1316,10 @@ fn settle_after_writer_gone(
     execution: &Execution,
     now_unix_seconds: i64,
 ) -> Result<(), StoreError> {
-    let desired = execution.desired_action.clone().unwrap_or(DesiredAction::Fail);
+    let desired = execution
+        .desired_action
+        .clone()
+        .unwrap_or(DesiredAction::Fail);
     let mut next = execution.clone();
     let seq = tx.alloc_seq()?;
     let release_reservations = match desired {
@@ -1305,9 +1363,11 @@ fn settle_after_writer_gone(
         execution_id: execution.id.clone(),
     })?;
     if release_reservations {
-        let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
-            detail: "execution without work".into(),
-        })?;
+        let work = tx
+            .work(&execution.work_id)?
+            .ok_or_else(|| StoreError::Internal {
+                detail: "execution without work".into(),
+            })?;
         tx.apply(&Effect::DeleteReservations {
             resource_keys: resources_keys_of(tx, &work, execution)?,
             holder: ReservationHolder::Execution {
@@ -1377,10 +1437,7 @@ fn maybe_publish(
             .iter()
             .rev()
             .find(|i| i.state == InvocationState::Done || i.state == InvocationState::Abandoned)
-            .map(|i| {
-                crate::projection::artifacts_complete(tx, &execution.id, i)
-                    .unwrap_or(false)
-            })
+            .map(|i| crate::projection::artifacts_complete(tx, &execution.id, i).unwrap_or(false))
             .unwrap_or(false);
         if !complete {
             return Ok(());
@@ -1402,9 +1459,11 @@ fn maybe_publish(
     if !outstanding.is_empty() {
         return Ok(());
     }
-    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
-        detail: "execution without work".into(),
-    })?;
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
     let repository = work
         .issue_refs
         .first()
@@ -1488,9 +1547,11 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     tx.apply(&Effect::ReleaseSlot {
         execution_id: execution.id.clone(),
     })?;
-    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
-        detail: "execution without work".into(),
-    })?;
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
     tx.apply(&Effect::DeleteReservations {
         resource_keys: resources_keys_of(tx, &work, execution)?,
         holder: ReservationHolder::Execution {
@@ -1598,9 +1659,11 @@ fn fail_terminal(
     tx.apply(&Effect::ReleaseSlot {
         execution_id: execution.id.clone(),
     })?;
-    let work = tx.work(&execution.work_id)?.ok_or_else(|| StoreError::Internal {
-        detail: "execution without work".into(),
-    })?;
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
     tx.apply(&Effect::DeleteReservations {
         resource_keys: resources_keys_of(tx, &work, execution)?,
         holder: ReservationHolder::Execution {

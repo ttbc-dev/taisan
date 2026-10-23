@@ -72,7 +72,9 @@ impl CommandBody {
     /// The Work a Command targets, if it names one.
     pub fn work_id(&self) -> Option<&WorkId> {
         match self {
-            Self::Submit { .. } | Self::ClaimResources { .. } | Self::ReleaseResources { .. } => None,
+            Self::Submit { .. } | Self::ClaimResources { .. } | Self::ReleaseResources { .. } => {
+                None
+            }
             Self::Retry { work_id, .. }
             | Self::Resume { work_id, .. }
             | Self::Cancel { work_id, .. }
@@ -85,7 +87,9 @@ impl CommandBody {
     /// The caller's observed Work version, required for existing-Work Commands.
     pub fn expected_work_version(&self) -> Option<WorkVersion> {
         match self {
-            Self::Submit { .. } | Self::ClaimResources { .. } | Self::ReleaseResources { .. } => None,
+            Self::Submit { .. } | Self::ClaimResources { .. } | Self::ReleaseResources { .. } => {
+                None
+            }
             Self::Retry {
                 expected_work_version,
                 ..

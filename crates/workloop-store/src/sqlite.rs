@@ -10,9 +10,7 @@ use std::sync::Mutex;
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
 use workloop_core::observation::Observation;
-use workloop_core::store::{
-    Deferral, Effect, PrActionIntent, ReadView, Store, StoreError, TxView,
-};
+use workloop_core::store::{Deferral, Effect, PrActionIntent, ReadView, Store, StoreError, TxView};
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -274,7 +272,11 @@ fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn update_execution(tx: &Tx<'_>, e: &Execution, expected: &ExecutionState) -> Result<(), StoreError> {
+fn update_execution(
+    tx: &Tx<'_>,
+    e: &Execution,
+    expected: &ExecutionState,
+) -> Result<(), StoreError> {
     let n = tx.exec(
         "UPDATE executions SET state=?4, waiting_reason=?5, desired_action=?6, \
          terminal_code=?7, pause_reason=?8, outcome=?9, enqueued_seq=?10, \
@@ -340,12 +342,7 @@ impl ReadView for Tx<'_> {
             "SELECT payload_digest, decision FROM commands \
              WHERE origin=?1 AND actor_kind=?2 AND actor_id=?3 AND idempotency_key=?4",
             params![origin.0, actor_kind, actor.external_id, idempotency_key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    de_row(&row.get::<_, String>(1)?)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, de_row(&row.get::<_, String>(1)?)?)),
         )
     }
 
@@ -401,9 +398,7 @@ impl ReadView for Tx<'_> {
 
     fn executions_for_work(&self, work_id: &WorkId) -> Result<Vec<Execution>, StoreError> {
         self.query_all(
-            &format!(
-                "SELECT {EXECUTION_COLS} FROM executions WHERE work_id=?1 ORDER BY ordinal"
-            ),
+            &format!("SELECT {EXECUTION_COLS} FROM executions WHERE work_id=?1 ORDER BY ordinal"),
             params![work_id.0],
             execution_from_row,
         )
@@ -501,17 +496,16 @@ impl ReadView for Tx<'_> {
         execution_id: &ExecutionId,
     ) -> Result<Vec<Invocation>, StoreError> {
         self.query_all(
-            &format!("SELECT {INVOCATION_COLS} FROM invocations \
-                      WHERE execution_id=?1 ORDER BY rowid"),
+            &format!(
+                "SELECT {INVOCATION_COLS} FROM invocations \
+                      WHERE execution_id=?1 ORDER BY rowid"
+            ),
             params![execution_id.0],
             invocation_from_row,
         )
     }
 
-    fn invocation_for_request(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<Invocation>, StoreError> {
+    fn invocation_for_request(&self, request_id: &str) -> Result<Option<Invocation>, StoreError> {
         self.query_opt(
             &format!("SELECT {INVOCATION_COLS} FROM invocations WHERE request_id=?1"),
             params![request_id],
@@ -521,8 +515,10 @@ impl ReadView for Tx<'_> {
 
     fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
         self.query_all(
-            &format!("SELECT {INVOCATION_COLS} FROM invocations \
-                      WHERE state IN ('prepared','running','unknown') ORDER BY rowid"),
+            &format!(
+                "SELECT {INVOCATION_COLS} FROM invocations \
+                      WHERE state IN ('prepared','running','unknown') ORDER BY rowid"
+            ),
             [],
             invocation_from_row,
         )
@@ -550,18 +546,17 @@ impl ReadView for Tx<'_> {
 
     fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError> {
         self.query_all(
-            &format!("SELECT {EXECUTION_COLS} FROM executions \
+            &format!(
+                "SELECT {EXECUTION_COLS} FROM executions \
                       WHERE state NOT IN ('succeeded','failed','cancelled') \
-                      ORDER BY enqueued_seq"),
+                      ORDER BY enqueued_seq"
+            ),
             [],
             execution_from_row,
         )
     }
 
-    fn stop_intent(
-        &self,
-        invocation_id: &InvocationId,
-    ) -> Result<Option<StopIntent>, StoreError> {
+    fn stop_intent(&self, invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError> {
         self.query_opt(
             "SELECT invocation_id, identities, recorded_seq \
              FROM stop_intents WHERE invocation_id=?1",
@@ -612,10 +607,7 @@ impl ReadView for Tx<'_> {
         )
     }
 
-    fn observations_for_work(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Vec<Observation>, StoreError> {
+    fn observations_for_work(&self, work_id: &WorkId) -> Result<Vec<Observation>, StoreError> {
         self.query_all(
             "SELECT source_event_id, subject_work_id, subject_execution_id, \
              fact, observed_unix_seconds FROM observations \
@@ -870,10 +862,7 @@ impl TxView for Tx<'_> {
                 )?;
                 if n == 0 {
                     return Err(StoreError::ConstraintConflict {
-                        detail: format!(
-                            "invocation {} not in expected state",
-                            invocation.id.0
-                        ),
+                        detail: format!("invocation {} not in expected state", invocation.id.0),
                     });
                 }
             }
@@ -886,7 +875,10 @@ impl TxView for Tx<'_> {
                     params![
                         observation.source_event_id,
                         observation.subject_work_id.as_ref().map(|w| w.0.clone()),
-                        observation.subject_execution_id.as_ref().map(|e| e.0.clone()),
+                        observation
+                            .subject_execution_id
+                            .as_ref()
+                            .map(|e| e.0.clone()),
                         json(&observation.fact)?,
                         observation.observed_unix_seconds,
                     ],

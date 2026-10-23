@@ -9,3 +9,4 @@ workloop-exec = { path = "../workloop-exec" }
 workloop-github = { path = "../workloop-github" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }

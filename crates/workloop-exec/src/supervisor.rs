@@ -34,13 +34,21 @@ fn ps_output(args: &[&str]) -> std::io::Result<String> {
 fn lstart_of(pid: i32) -> Option<String> {
     let out = ps_output(&["-o", "lstart=", "-p", &pid.to_string()]).ok()?;
     let s = out.trim();
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 fn stat_of(pid: i32) -> Option<String> {
     let out = ps_output(&["-o", "stat=", "-p", &pid.to_string()]).ok()?;
     let s = out.trim();
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 impl ProcessControlPort for PosixProcessControl {
@@ -85,13 +93,18 @@ impl ProcessControlPort for PosixProcessControl {
             if f.len() < 8 {
                 continue;
             }
-            let (Ok(pid), Ok(ppid), Ok(pgid)) =
-                (f[0].parse::<i32>(), f[1].parse::<i32>(), f[2].parse::<i32>())
-            else {
+            let (Ok(pid), Ok(ppid), Ok(pgid)) = (
+                f[0].parse::<i32>(),
+                f[1].parse::<i32>(),
+                f[2].parse::<i32>(),
+            ) else {
                 continue;
             };
             let lstart = f[3..].join(" ");
-            by_ppid.entry(ppid).or_default().push((pid, pgid, lstart.clone()));
+            by_ppid
+                .entry(ppid)
+                .or_default()
+                .push((pid, pgid, lstart.clone()));
             all.insert(pid, (pgid, lstart));
         }
         let leader_pgid = all.get(&leader_pid).map(|(g, _)| *g).unwrap_or(leader_pid);
@@ -313,7 +326,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     // uncertain and blocks a replacement.
                     self.report(
                         store,
-                        &request,
+                        request,
                         ObservationFact::ProcessState {
                             invocation_id: invocation.id.clone(),
                             process_identity: String::new(),
@@ -456,30 +469,26 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Prepared but never identified: a crash near spawn left no
                 // provable answer — report unknown; `work` keeps the
                 // Execution uncertain rather than starting a second writer.
-                if invocation.state == InvocationState::Prepared {
-                    if let Some(request) =
+                if invocation.state == InvocationState::Prepared
+                    && let Some(request) =
                         store.transact(|tx| tx.request(&invocation.request_id))?
-                    {
-                        self.report(
-                            store,
-                            &request,
-                            ObservationFact::ProcessState {
-                                invocation_id: invocation.id.clone(),
-                                process_identity: String::new(),
-                                state: ProcessStateFact::Unknown,
-                            },
-                            now_unix_seconds,
-                        )?;
-                    }
+                {
+                    self.report(
+                        store,
+                        &request,
+                        ObservationFact::ProcessState {
+                            invocation_id: invocation.id.clone(),
+                            process_identity: String::new(),
+                            state: ProcessStateFact::Unknown,
+                        },
+                        now_unix_seconds,
+                    )?;
                 }
                 continue;
             };
             // Stopping Executions are driven by drive_stops, not here.
             let exec_state = store.transact(|tx| {
-                Ok::<_, StoreError>(
-                    tx.execution(&invocation.execution_id)?
-                        .map(|e| e.state),
-                )
+                Ok::<_, StoreError>(tx.execution(&invocation.execution_id)?.map(|e| e.state))
             })?;
             if matches!(exec_state, Some(ExecutionState::Stopping)) {
                 continue;
@@ -572,11 +581,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// Executions in `stopping` (and `uncertain` wanting stop) need the
     /// durable-intent → signal → inspect loop. A `requested` stop is never
     /// proof; only inspecting every recorded identity settles the state.
-    pub fn drive_stops(
-        &self,
-        store: &impl Store,
-        now_unix_seconds: i64,
-    ) -> Result<(), ExecError> {
+    pub fn drive_stops(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
             let wants_stop = match execution.state {
@@ -601,16 +606,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
                 let identities = match intent {
                     Some(recorded) => recorded.identities,
-                    None => {
-                        match self.request_stop(store, &invocation, &identity)? {
-                            StopReceipt::Requested | StopReceipt::AlreadyStopped => {
-                                store.transact(|tx| tx.stop_intent(&invocation.id))?
-                                    .map(|i| i.identities)
-                                    .unwrap_or_default()
-                            }
-                            StopReceipt::Unknown { .. } => continue,
-                        }
-                    }
+                    None => match self.request_stop(store, &invocation, &identity)? {
+                        StopReceipt::Requested | StopReceipt::AlreadyStopped => store
+                            .transact(|tx| tx.stop_intent(&invocation.id))?
+                            .map(|i| i.identities)
+                            .unwrap_or_default(),
+                        StopReceipt::Unknown { .. } => continue,
+                    },
                 };
                 // Stop proof = inspecting every recorded identity.
                 let mut all_stopped = true;
@@ -780,9 +782,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // Recover from workspace + checkpoints + worker-runtime store.
             let workspace = self.workspace_of(&execution.work_id);
             let mut recovered: Vec<(String, String)> = Vec::new();
-            for invocation in store
-                .transact(|tx| tx.invocations_for_execution(&execution.id))?
-            {
+            for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 for required in &invocation.required_artifacts {
                     if let Some(dir) = find_artifact(&workspace, required) {
                         recovered.push((required.clone(), dir));
@@ -799,9 +799,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 })?;
                 Ok(())
             })?;
-            for invocation in store
-                .transact(|tx| tx.invocations_for_execution(&execution.id))?
-            {
+            for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 let request = match store.transact(|tx| tx.request(&invocation.request_id))? {
                     Some(r) => r,
                     None => continue,
@@ -810,10 +808,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     if invocation.required_artifacts.contains(required) {
                         // Promote into the workspace root so downstream
                         // evidence paths are uniform.
-                        let _ = std::fs::copy(
-                            Path::new(dir).join(required),
-                            workspace.join(required),
-                        );
+                        let _ =
+                            std::fs::copy(Path::new(dir).join(required), workspace.join(required));
                         self.report(
                             store,
                             &request,
@@ -846,12 +842,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             fact,
             observed_unix_seconds: now_unix_seconds,
         };
-        workloop_core::work::handle_observation(
-            store,
-            &self.config,
-            &obs,
-            now_unix_seconds,
-        )?;
+        workloop_core::work::handle_observation(store, &self.config, &obs, now_unix_seconds)?;
         Ok(())
     }
 
@@ -872,11 +863,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             ProcessEvidence::Alive { .. } => Ok(()),
             ProcessEvidence::Unknown { .. } => {
-                let id = invocation.process_identity.clone().unwrap_or(ProcessIdentity {
-                    pid: -1,
-                    started_at: String::new(),
-                    pgid: None,
-                });
+                let id = invocation
+                    .process_identity
+                    .clone()
+                    .unwrap_or(ProcessIdentity {
+                        pid: -1,
+                        started_at: String::new(),
+                        pgid: None,
+                    });
                 self.report(
                     store,
                     request,
@@ -890,7 +884,6 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
     }
-
 }
 
 fn required_artifacts(request: &InvocationRequest) -> Vec<String> {

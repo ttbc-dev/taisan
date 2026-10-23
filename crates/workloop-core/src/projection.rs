@@ -202,7 +202,12 @@ fn derive_attention(
                 .pause_reason
                 .clone()
                 .unwrap_or_else(|| "paused".into());
-            push("paused_judgment", anchor, None, "submit a judgment or resume");
+            push(
+                "paused_judgment",
+                anchor,
+                None,
+                "submit a judgment or resume",
+            );
         }
         ExecutionState::Failed => {
             let anchor = execution
@@ -219,7 +224,9 @@ fn derive_attention(
         }
         ExecutionState::Uncertain => {
             let threshold = execution.budget.uncertain_threshold_seconds;
-            let since = execution.uncertain_since_unix_seconds.unwrap_or(now_unix_seconds);
+            let since = execution
+                .uncertain_since_unix_seconds
+                .unwrap_or(now_unix_seconds);
             if now_unix_seconds - since >= threshold as i64 {
                 push(
                     "uncertain_beyond_threshold",
@@ -247,7 +254,12 @@ pub fn work_list(
             Some(e) => {
                 let invs = tx.invocations_for_execution(&e.id)?;
                 let att = derive_attention(tx, &work.id, e, now_unix_seconds)?.len();
-                (phase_of(e, &invs), Some(e.id.clone()), e.outcome.clone(), att)
+                (
+                    phase_of(e, &invs),
+                    Some(e.id.clone()),
+                    e.outcome.clone(),
+                    att,
+                )
             }
             None => (WorkPhase::Unknown, None, None, 0),
         };
@@ -313,21 +325,19 @@ pub fn work_detail(
     let mut findings = Vec::new();
     let mut sources = vec![store_source()];
     for obs in &observations {
-        match &obs.fact {
-            ObservationFact::PrHead {
-                repository,
-                number,
-                head_sha,
-            } => {
-                current_pr = Some((
-                    PrRef {
-                        repository: repository.clone(),
-                        number: *number,
-                    },
-                    Some(head_sha.clone()),
-                ));
-            }
-            _ => {}
+        if let ObservationFact::PrHead {
+            repository,
+            number,
+            head_sha,
+        } = &obs.fact
+        {
+            current_pr = Some((
+                PrRef {
+                    repository: repository.clone(),
+                    number: *number,
+                },
+                Some(head_sha.clone()),
+            ));
         }
     }
     if let Some((_, Some(head))) = &current_pr {
@@ -339,13 +349,10 @@ pub fn work_detail(
                 verdict,
                 ..
             } = &obs.fact
+                && head_sha == head
             {
-                if head_sha == head {
-                    has_review_for_head = true;
-                    findings.push(format!(
-                        "review by {reviewer} at {head_sha}: {verdict:?}"
-                    ));
-                }
+                has_review_for_head = true;
+                findings.push(format!("review by {reviewer} at {head_sha}: {verdict:?}"));
             }
         }
         sources.push(SourceStatus {
@@ -488,10 +495,7 @@ pub enum CommandResultLookup {
 
 /// Outstanding (unreconciled) outbox effects for a Work — `pending` and
 /// `unknown` intents are effects the terminal states must account for.
-pub fn outstanding_actions(
-    tx: &dyn ReadView,
-    work_id: &WorkId,
-) -> Result<Vec<String>, StoreError> {
+pub fn outstanding_actions(tx: &dyn ReadView, work_id: &WorkId) -> Result<Vec<String>, StoreError> {
     Ok(tx
         .action_intents()?
         .into_iter()

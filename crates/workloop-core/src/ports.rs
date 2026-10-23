@@ -12,12 +12,16 @@ use crate::domain::ProcessIdentity;
 /// cannot be completed reports `Unknown` — never a silent `Stopped`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessEvidence {
-    Alive { identity: ProcessIdentity },
+    Alive {
+        identity: ProcessIdentity,
+    },
     Stopped {
         identity: ProcessIdentity,
         exit_code: Option<i32>,
     },
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
 }
 
 /// Why a spawn could not produce a recorded identity.

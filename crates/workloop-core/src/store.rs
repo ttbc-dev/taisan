@@ -167,16 +167,23 @@ pub struct Deferral {
 pub enum StoreError {
     /// A uniqueness or check constraint fired (reservation, request ID,
     /// nonterminal Execution, unresolved writer, slot, dedupe).
-    ConstraintConflict { detail: String },
+    ConstraintConflict {
+        detail: String,
+    },
     /// `UPDATE ... WHERE version = expected` matched no row.
-    VersionConflict { work_id: WorkId, current_version: u64 },
+    VersionConflict {
+        work_id: WorkId,
+        current_version: u64,
+    },
     /// `UPDATE ... WHERE state = expected` matched no row.
     StateConflict {
         execution_id: ExecutionId,
         current_state: ExecutionState,
     },
     NoFreeSlot,
-    Internal { detail: String },
+    Internal {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -186,7 +193,11 @@ impl std::fmt::Display for StoreError {
             Self::VersionConflict {
                 work_id,
                 current_version,
-            } => write!(f, "version conflict on {}: now {current_version}", work_id.0),
+            } => write!(
+                f,
+                "version conflict on {}: now {current_version}",
+                work_id.0
+            ),
             Self::StateConflict {
                 execution_id,
                 current_state,
@@ -213,8 +224,10 @@ pub trait ReadView {
         idempotency_key: &str,
     ) -> Result<Option<(String, CommandDecision)>, StoreError>;
 
-    fn command_decision(&self, command_id: &CommandId)
-        -> Result<Option<CommandDecision>, StoreError>;
+    fn command_decision(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<CommandDecision>, StoreError>;
 
     fn work(&self, work_id: &WorkId) -> Result<Option<Work>, StoreError>;
     fn execution(&self, execution_id: &ExecutionId) -> Result<Option<Execution>, StoreError>;
@@ -239,18 +252,14 @@ pub trait ReadView {
     ) -> Result<Vec<Invocation>, StoreError>;
     /// The Invocation recorded for a durable request, if any — the
     /// at-most-once reconciliation key.
-    fn invocation_for_request(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<Invocation>, StoreError>;
+    fn invocation_for_request(&self, request_id: &str) -> Result<Option<Invocation>, StoreError>;
     /// Invocations that may still write (prepared/running/unknown).
     fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError>;
 
     fn works(&self) -> Result<Vec<Work>, StoreError>;
     fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError>;
 
-    fn stop_intent(&self, invocation_id: &InvocationId)
-        -> Result<Option<StopIntent>, StoreError>;
+    fn stop_intent(&self, invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError>;
 
     /// Recorded dispatch deferrals, keyed by Execution — the `capacity`
     /// Query's explanation of queue stalls.
@@ -265,8 +274,7 @@ pub trait ReadView {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Vec<Observation>, StoreError>;
-    fn observations_for_work(&self, work_id: &WorkId)
-        -> Result<Vec<Observation>, StoreError>;
+    fn observations_for_work(&self, work_id: &WorkId) -> Result<Vec<Observation>, StoreError>;
 
     /// All outbox rows; `pending`/`unknown` are outstanding effects.
     fn action_intents(&self) -> Result<Vec<PrActionIntent>, StoreError>;
