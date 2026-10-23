@@ -49,7 +49,8 @@ The system can make routine implementation decisions within the supplied intent 
 
 - [Principles](docs/principles.md) — product and operational rules.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
-- [Module contracts](docs/module-contracts.md) — typed messages for every module connection and three representative flows.
+- [Module contracts](docs/module-contracts.md) — typed messages for every module connection and representative flows.
+- [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
