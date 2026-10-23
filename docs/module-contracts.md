@@ -1,10 +1,10 @@
 # Module contracts
 
-This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against three interactions. It is a design proposal, not an implemented API or a choice of programming language. The type notation is illustrative; names such as `judge_findings` and the exact state codes remain open. The terms and lifetimes come from the [glossary](glossary.md).
+This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against four interactions. It is a design proposal, not an implemented API or a choice of programming language. The type notation is illustrative; names such as `judge_findings` and the exact state codes remain open. The terms and lifetimes come from the [glossary](glossary.md).
 
 ## Caller view
 
-The CLI, TUI, and GitHub comment adapter use the same Command and Query contracts. For example, the TUI queries `work_detail(W1)`, asks `work` for a read-only preflight of a judgment, then submits that Command with the displayed Work version and PR head. If the submit response disappears, it asks for the result by Command ID or replays the same key and payload. An accepted result means the decision is durable; it does not mean a worker or GitHub write has finished.
+The CLI, TUI, and GitHub comment adapter use the same Command and Query contracts. The TUI lists the built-in queue with `work_list`, then queries `work_detail(W1)`, asks `work` for a read-only preflight of a judgment, and submits that Command with the displayed Work version and PR head. If the submit response disappears, it asks for the result by Command ID or replays the same key and payload. An accepted result means the decision is durable; it does not mean a worker or GitHub write has finished.
 
 ## Type sketch
 
@@ -68,6 +68,8 @@ type CommandDecision =
 	    evidence: EvidenceRef[]; committed_at: EventSequence };
 
 type Query =
+	| { kind: "work_list"; repository?: string;
+	    phase?: WorkPhase; cursor?: string }
 	| { kind: "work_detail"; work_id: WorkId }
 	| { kind: "attention"; work_id?: WorkId }
 	| { kind: "command_result"; lookup:
@@ -85,10 +87,16 @@ type ActionPreview = { availability: "available" | "blocked" | "unknown";
 	reasons: RejectionCode[]; evidence: EvidenceRef[] };
 type AttentionView = { attention_id: string; work_id: WorkId;
 	reason: string; evidence: EvidenceRef[] };
+type WorkPhase = "queued" | "implementing" | "reviewing"
+	| "converging" | "waiting" | "completed" | "stopped" | "unknown";
+type WorkSummary = { work_id: WorkId; version: WorkVersion;
+	phase: WorkPhase; current_execution_id?: ExecutionId;
+	attention_count: number; outcome?: OutcomeView; evidence: EvidenceRef[] };
+type WorkList = { items: WorkSummary[]; next_cursor?: string };
 type OutcomeView = { subject:
 	| { kind: "work"; id: WorkId }
 	| { kind: "execution"; id: ExecutionId };
-	kind: "completed" | "failed" | "paused" | "needs_action";
+	kind: "completed" | "failed" | "paused" | "needs_action" | "cancelled";
 	evidence: EvidenceRef[] };
 type ExecutionView = { execution_id: ExecutionId;
 	activity: "active" | "settled" | "uncertain";
@@ -104,7 +112,7 @@ type WorkDetail = { work_id: WorkId; version: WorkVersion;
 
 `work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes GitHub or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
 
-`WorkDetail.findings` contains findings actionable for the current review target, which is the PR head when a PR exists. Findings for earlier revisions remain in evidence history. An empty list with an unavailable review source is not evidence that review found no issues; `QueryResult.sources` carries that distinction.
+`WorkList` is the Kanban-style management view; its `queued` items form the pending Work queue. Its phase, Outcome, and Attention count are derived from saved Work, Execution, and Observation records; there is no separate card status or card ID. `waiting` means an external check or automatic step is pending, `stopped` has a recorded failed, paused, needs-action, or cancelled Outcome, and `unknown` means evidence is insufficient. A stopped Work does not return to `queued` without an accepted Command. Pagination uses a stable order over accepted Work and the snapshot sequence. `submit` can accept Work into `queued` before capacity is available. An internal dispatch decision later creates its Execution, reserves capacity, and records an Invocation request in one commit. `WorkDetail.findings` contains findings actionable for the current review target, which is the PR head when a PR exists. Findings for earlier revisions remain in evidence history. An empty list with an unavailable review source is not evidence that review found no issues; `QueryResult.sources` carries that distinction.
 
 ```ts
 type ObservationBase = { id: ObservationId;
@@ -183,10 +191,15 @@ type WorkCommit =
 	      | { kind: "command"; request: CommandRequest;
 	          decision: { kind: "accepted"; effect: CommandEffect }
 	            | { kind: "rejected"; reason: RejectionCode } }
-	      | { kind: "observation"; observation: Observation };
+	      | { kind: "observation"; observation: Observation }
+	      | { kind: "dispatch"; request_id: string };
 	    change: WorkChange }
 	| { kind: "intake_rejection"; request: CommandRequest & { kind: "submit" };
 	    reason: RejectionCode; change: { kind: "none" } };
+type PendingWork = { work_id: WorkId; expected_work_version: WorkVersion;
+	accepted_at: EventSequence };
+type PendingWorkPage = { items: PendingWork[]; next_cursor?: string;
+	as_of: EventSequence };
 type CommitReceipt =
 	| { kind: "committed_work"; work_version: WorkVersion;
 	    as_of: EventSequence; command_decision?: CommandDecision }
@@ -208,6 +221,7 @@ type InvocationWrite =
 	| { kind: "observed"; fact: InvocationFact;
 	    pending_work_observation: Observation };
 type StoredSnapshot = { as_of: EventSequence; work?: WorkDetail;
+	work_list?: WorkList;
 	attention: AttentionView[]; command_decision?: CommandDecision;
 	observations: Observation[];
 	sources: { source: string; observed_at?: string;
@@ -231,9 +245,9 @@ These are behavioral ports, not separate processes. Delivery can use a local cal
 | Diagram edge | Port and message | Receiver's obligation |
 | --- | --- | --- |
 | CLI → `work` | `submit(CommandRequest) → CommandDecision` | Validate identity, version, policy, and idempotency. |
-| CLI → `projection` | `query(Query) → QueryResult<T>` | Read saved state, including a Command result after lost response. |
+| CLI → `projection` | `query(Query) → QueryResult<T>` | Read the queue, Work detail, and a Command result after lost response. |
 | TUI → `work` | `preview(CommandRequest) → ActionPreview`; `submit(CommandRequest) → CommandDecision` | Apply the same rules as CLI; preflight gives no extra authority. |
-| TUI → `projection` | `query(Query) → QueryResult<T>` | Return Work detail, Attention, Command results, and source availability. |
+| TUI → `projection` | `query(Query) → QueryResult<T>` | Return the queue, Work detail, Attention, Command results, and source availability. |
 | GitHub comment adapter → `work` | `submit(CommandRequest) → CommandDecision` | Map external actor and delivery ID; reject duplicate effects. |
 | GitHub comment adapter → `projection` | `query(Query) → QueryResult<T>` | Read the status to render; a comment is not the state store. |
 | GitHub integration → `work` | `ingest(Observation) → IngestReceipt` | Deduplicate source events and assess facts against the current Work revision. |
@@ -242,7 +256,9 @@ These are behavioral ports, not separate processes. Delivery can use a local cal
 | `execution` → `work` | `ingest(Observation) → IngestReceipt` | Assess worker and process facts; do not copy a worker's claimed Outcome. |
 | `work` → state store | `commitWorkDecision(WorkCommit) → CommitReceipt` | Atomically enforce Work version, active Execution uniqueness, capacity reservation, Command result, and outgoing intents. Observation assessment uses the same port without inventing a Command. |
 | `execution` → state store | `appendInvocation(InvocationWrite) → IngestReceipt` | Persist identity before launch; append process, checkpoint, and result evidence without overwriting history. Save the pending Work Observation with its Invocation fact. |
-| State store → `projection` | `readSnapshot(Query) → StoredSnapshot` | Return records with event sequence and source availability; projection only shapes the view. |
+| State store → `work` | `listPendingWork(cursor) → PendingWorkPage` | Return pending Work in stable order with the version seen; `work` rechecks eligibility in the dispatch transaction. |
+| State store → `execution` | approved `InvocationRequest` by durable request ID | Start or reconcile the approved request; never infer permission from a visible queue phase. |
+| State store → `projection` | `readSnapshot(Query) → StoredSnapshot` | Return Work and pending request records with event sequence and source availability; projection only shapes the queue and other views. |
 | `execution` → CodingWorker | `start(WorkerTask) → WorkerStartReceipt` | Run the bounded coding task under the permitted workspace and effects. |
 | `execution` → ReviewWorker | `start(WorkerTask) → WorkerStartReceipt` | Review the specified patch or PR head under the given budget. |
 | CodingWorker → `execution` | coding `WorkerReport` and evidence | Correlate by Invocation ID; report artifacts and checks, not Work completion. |
@@ -250,7 +266,18 @@ These are behavioral ports, not separate processes. Delivery can use a local cal
 
 `IngestReceipt` reports recorded, duplicate, or rejected input. `DispatchReceipt` reports queued, already queued, or refused because safe ownership cannot be established. Delivery of a durable `InvocationRequest` is at least once; its request ID prevents a second Invocation for the same request. When a Command creates an Execution, the same transaction records the decision, Execution, capacity reservation, and request or outbox intent. A process crash after acceptance therefore leaves work for a dispatcher to resume. `execution` records an Invocation before launch, and a lost start response becomes `ProcessEvidence.unknown` until reconciled. GitHub writes cannot share this transaction and require reconciliation.
 
+The internal dispatch loop reads `PendingWorkPage` from the same store; it does not consume Hermes cards. It may propose a start, but `work` decides eligibility and the store atomically reserves capacity with the new Execution and Invocation request. `work` derives the next Execution ordinal and request ID from the Work history it read; the commit checks that Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: a TUI action uses a typed Command, and moving a row on screen has no lifecycle effect.
+
 The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; adapting a private worker that currently performs such writes will require separating that behavior.
+
+## Built-in queue admission
+
+1. The CLI submits a Work item. `work` records its identity, accepted intent, and Command result. The Work appears as `queued` in `work_list` even if the executor is busy.
+2. The internal dispatch loop selects pending Work in a stable order and proposes a start using its observed Work version. This selection is only a proposal; a stale list does not confer execution permission.
+3. `work` rechecks Work version, eligibility, capacity, and ownership evidence. One state-store transaction creates the Execution, reserves capacity, and saves the Invocation request. A competing dispatch sees the existing request or a version/capacity conflict.
+4. `execution` reads that approved request and records the Invocation before launch. If launch outcome is unknown, it inspects the recorded process identity before trying another start. The Work list shows `unknown` when evidence is insufficient, rather than silently returning it to `queued`.
+
+No Hermes card is created in this flow. The TUI's queue row and the CLI's Work detail come from the same state-store snapshot.
 
 ## TUI review judgment
 
