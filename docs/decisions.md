@@ -26,6 +26,11 @@
 - Acknowledgement is scoped to an Attention version; Attention resurfaces only when the version changes (new evidence, escalation, or a different required decision), never on a timer.
 - A dedicated `capacity` Query explains queue stalls: slot holders, held reservations including external claims, and deferred Executions with their diagnostics.
 - Slice 0 (core-truth harness): Rust, SQLite store, real fixture worker processes, a fixture GitHub adapter, CLI only. Contract tests covering the crash-recovery conditions are written before the implementation; real GitHub and the TUI come after.
+- v0.1 store model: hybrid — current-state SQLite tables enforce every expressible structural invariant (unique command keys, request/action/observation IDs, one nonterminal Execution per Work and one unresolved writer per Execution via partial unique indexes, a normalized resource-key space, N fixed `capacity_slots` rows, optimistic Work versions), while an append-only `event_log` carries audit and ordering (`EventSequence`). The store never evaluates transition legality, budgets, or gates; `work` does.
+- Module delivery is in-process: the store is the durable handoff for approved requests, and `execution` reconciles by scanning on wake and after restart. Wakeups are at-least-once signals, not evidence.
+- PR actions re-read the head immediately before writing. A mismatch aborts the write, records `pr_action_result: failed` plus a fresh `pr_head` Observation, and returns judgment to `work`; v0.1 never re-issues an action automatically. `publish_pr` carries no expected head and reconciles by branch or PR existence.
+- Command keys and decisions are retained indefinitely in v0.1 — a lost response must always be recoverable. Each adapter's actor identity comes from the installation config and stays stable across restarts.
+- Slice 0 layout: a Cargo workspace whose crates follow the ownership boundaries — `workloop-core` (domain, `work`, `projection`, port traits; I/O-free), `workloop-store` (SQLite), `workloop-exec` (supervisor, POSIX `ProcessControlPort`), `workloop-github` (fixture adapter), `workloop-cli` (binary, composition root), `workloop-fixture-worker` (real fixture process). Interface crates share the Command/Query contracts so the later TUI adds no new boundary.
 
 ## Questions to resolve through a spike
 
