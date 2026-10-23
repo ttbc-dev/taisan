@@ -15,7 +15,7 @@ The initial deployment may place these in one process and one local database. Th
 
 ## Module map
 
-This is the intended module boundary, not the current layout of the private implementations. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its persisted pending Work and Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. Devin, Claude Code, and the existing `coding-worker` CLI are possible implementations of these roles.
+This is the intended module boundary, not the current layout of the private implementations. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. Devin, Claude Code, and the existing `coding-worker` CLI are possible implementations of these roles.
 
 ```mermaid
 flowchart LR
@@ -34,7 +34,7 @@ flowchart LR
             E -->|Observation| W
             W -->|state and evidence| STORE
             E -->|Invocation records| STORE
-            STORE -->|pending Work and current state| W
+            STORE -->|queued Executions and current state| W
             STORE -->|approved Invocation requests| E
             STORE -->|saved state| P
         end
@@ -70,13 +70,13 @@ The core returns an accepted/rejected decision, canonical state version, and com
 
 ## Work and execution
 
-Work has its own identity independent of an issue number or board card. Store GitHub issue references as source links, not primary keys. Each Execution has an execution ID, defined input and budget, zero or more Invocations, process/workspace evidence, checkpoints, and recorded Outcomes. A Work item may have multiple Executions but no more than one active, authoritative Execution. Capacity is reserved atomically with the decision to start work. The mechanism for execution ownership remains to be specified; [Lease is not yet an adopted term](glossary.md#execution-ownership-terminology-under-study).
+Work has its own identity independent of an issue number or board card. Store GitHub issue references as source links, not primary keys. Each accepted Work starts with one queued Execution; an explicit retry creates the next queued Execution under the same Work. Each Execution has an execution ID, defined input and budget, zero or more Invocations, process/workspace evidence, checkpoints, and recorded Outcomes. A Work item may have multiple sequential Executions but no more than one nonterminal, authoritative Execution, including queued and paused ones. Capacity is reserved atomically when a queued Execution is admitted for its first Invocation, not when `submit` or `retry` is accepted. The [lifecycle contract](lifecycle.md) defines the transitions and release points. The mechanism for execution ownership remains to be specified; [Lease is not yet an adopted term](glossary.md#execution-ownership-terminology-under-study).
 
-The state store is the authority for commands, queue eligibility, reservations, and transitions. Queue entries are Work and pending execution requests in that store, not separately synchronized cards. An append-only event or decision history supports audit and reconstruction; snapshots may accelerate queries. External updates use an outbox and reconciliation so a database commit does not pretend a GitHub write or notification succeeded atomically. Webhooks are deduplicated on delivery identity and checked against current Work state.
+The state store is the authority for commands, queue eligibility, reservations, and transitions. Queue entries are queued Executions and approved Invocation requests in that store, not separately synchronized cards. An append-only event or decision history supports audit and reconstruction; snapshots may accelerate queries. External updates use an outbox and reconciliation so a database commit does not pretend a GitHub write or notification succeeded atomically. Webhooks are deduplicated on delivery identity and checked against current Work state.
 
 ## Built-in work queue
 
-This repository implements the development queue needed to accept Work, select eligible pending Work within capacity, and hold uncertain ownership. The management views also show active and completed Work and human Attention. A queue row is a Projection of the same Work, Execution, and Invocation records that Commands change; moving a row in the TUI does not itself change state. A scheduler may propose Candidates, but only an accepted `submit` creates Work. The internal dispatch loop proposes a pending Work item; `work` rechecks eligibility and reserves capacity while saving an Execution and durable Invocation request in one transaction. `execution` consumes only that approved request. A crash or lost response must be reconciled against its request ID and process evidence before another start is permitted.
+This repository implements the development queue needed to accept Work, select eligible queued Executions within capacity, and hold uncertain ownership. The management views also show active and completed Work and human Attention. A queue row is a Projection of the same Work, Execution, and Invocation records that Commands change; moving a row in the TUI does not itself change state. A scheduler may propose Candidates, but only an accepted `submit` creates Work and E1. The internal dispatch loop proposes a queued Execution; `work` rechecks eligibility and reserves capacity while saving its first durable Invocation request in one transaction. `execution` consumes only that approved request. A crash or lost response must be reconciled against its request ID and process evidence before another start is permitted. Resume requeues the same Execution; retry creates a new queued Execution. All three commands can be accepted while capacity is full.
 
 The first implementation is a single-instance, single-host development queue. It does not reproduce Hermes Kanban's general-purpose boards, card dependencies, comments, attachments, arbitrary assignees, or generic worker dispatcher. It can use a local database; it does not require a Hermes installation. Existing Hermes cards and their history are outside the new store, and no ongoing card synchronization or migration layer is planned for the initial personal-use deployment.
 
@@ -96,7 +96,7 @@ Candidate external adapters are a GitHub issue-comment interface and a GitHub Pr
 ## Recovery rules
 
 - A heartbeat failure leaves process liveness `unknown` until process evidence is reconciled; it is not immediately `dead`.
-- An expired claim does not allow a replacement Execution or Invocation while an old process could still write; recovery must prevent the old owner from writing or establish its termination.
+- A missed heartbeat or elapsed ownership deadline does not allow a replacement Invocation while an old process could still write; recovery must prevent the old owner from writing or establish its termination.
 - An external comment or notification can lag behind the core. Reconciliation records its delivery; it never changes core state just to match a stale external view.
 - A new PR head invalidates review conclusions tied to the previous head.
 - An adapter outage records a pending projection/notification and leaves execution progressing when policy allows.
