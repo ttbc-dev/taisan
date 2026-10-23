@@ -33,7 +33,7 @@ type ExecutionBudget = { deadline?: string; max_invocations?: number;
 type ProcessIdentity = { host_id: string; pid: number;
   started_at: string; process_group_id: number; invocation_id: InvocationId };
 type ContinuationRef = { evidence: EvidenceRef[]; checkpoint?: EvidenceRef };
-type ExternalWait = { kind: "checks" | "review" | "github_action"; ref: string };
+type ExternalWait = { kind: "checks" | "review" | "github_action" | "artifact_recovery"; ref: string };
 type PauseReason = { kind: "human_judgment" | "recoverable_stop" | "repair";
   evidence: EvidenceRef[] };
 type VerifiedCompletion = { pr: GitHubPrRef; head: PrHeadSha;
@@ -83,17 +83,19 @@ type Invocation = {
 
 `queued` means accepted but without a capacity reservation or approved Invocation request. `ready`, `running`, `waiting`, `uncertain`, and `stopping` hold one Execution capacity slot. `paused` and the three terminal states hold none. v0.1 keeps the slot during automatic CI or review waiting, even if the last process has exited. This avoids a second capacity acquisition path between stages. A later version can change that policy without adding a card state.
 
-`paused` requires durable continuation input and proof that earlier writers have stopped or cannot write. `uncertain` is evidence of an unresolved start or process identity, not a synonym for failure. It retains capacity until reconciliation establishes a safe transition. A worker report claiming completion is evidence; only `work` can record `succeeded` or `failed` after checking it.
+`paused` requires durable continuation input and proof that earlier writers have stopped or cannot write. A pause for `repair` records the failed precondition, the required repair, and evidence that the condition was revalidated before `resume`; repeatedly resuming unchanged configuration is not an eligible transition. `uncertain` is evidence of an unresolved start or process identity, not a synonym for failure. It retains capacity until reconciliation establishes a safe transition. A worker report claiming completion is evidence; only `work` can record `succeeded` or `failed` after checking it.
 
 ## Queue admission
 
-The pending queue consists of current Executions in `queued`, ordered by their committed `enqueued_at` sequence and then Execution ID. A duplicate Command replay keeps the original sequence. v0.1 has no manual ordering, priority lanes, or separate queue table.
+The pending queue consists of current Executions in `queued`, ordered by their committed `enqueued_at` sequence and then Execution ID. A duplicate Command replay keeps the original sequence. Dispatch scans in that order for the oldest currently eligible Execution; a blocked or unavailable source does not prevent later independent work from being considered. It records a retryable diagnostic for the blocked item and does not silently change its input or target. v0.1 has no manual ordering, priority lanes, or separate queue table.
 
 The internal dispatch loop reads a queued Execution and its observed Work version. Selection grants no permission. `work` rechecks the current state, input revision, human gates, ownership, and capacity. One state-store transaction moves `queued → ready`, reserves one slot, and saves the first `InvocationRequest`. The request ID is derived from the Execution ID and its next durable Invocation sequence; the store enforces uniqueness. If the Work version, capacity, or request ID conflicts, the loop rereads and decides again. `execution` consumes only an approved request and records an Invocation before asking a worker to start.
 
 After coding, `work` may request review or fix within the same Execution. When that Execution already holds a slot, `ready` for the next Invocation saves a new request without reserving a second slot. An Invocation is never started merely because a TUI row says `running`.
 
 The input revision and PR head used for an Invocation are checked when its request is saved. A judgment accepted while E waited in the queue is not applied to a newer head. A changed head that needs a new human judgment moves E to `paused` without reserving capacity. An unavailable source leaves E `queued` with a retryable diagnostic; it never silently substitutes a different review target.
+
+Eligibility includes writer-resource exclusion across Work records. A Work-level rule prevents two active Executions under one Work, but it is not sufficient to protect shared workspaces, branches, or other write targets. Before admitting a writer, `work` must reserve its declared write resources atomically and reject or defer a conflicting Work. Issue overlap is a separate policy: shared Issue references alone do not imply a shared workspace, while a shared branch/worktree does imply a writer conflict. Every supported writer entry point for a managed resource must use this ownership path; unmanaged/manual commands must use isolated resources or be disallowed from writing managed resources. The v0.1 deployment does not claim protection from arbitrary external processes that bypass this contract.
 
 ## Transition rules
 
@@ -112,6 +114,7 @@ The input revision and PR head used for an Invocation are checked when its reque
 | `uncertain` | Correlated old process confirmed alive | `running`, or `stopping` if stop was requested; keep the same request and slot. |
 | `uncertain` | Old process confirmed stopped and no effect remains unknown | `paused`, `failed`, or `cancelled` according to the saved cause and desired action; release slot. |
 | `running` | Worker exits; external check/action is pending | `waiting`; keep the Execution slot. |
+| `running` | Worker exits; required artifact/evidence is missing but a durable source may recover it | `waiting` for `artifact_recovery`; retain ownership until recovery is complete or bounded recovery is exhausted. |
 | `waiting` | Fresh evidence permits the next coding/review/fix step | `ready` with a new request under the same Execution and reservation. |
 | `running` or `waiting` | Human decision or recoverable interruption; writers safe | `paused`; record continuation and release slot. |
 | `paused` | Valid `resume` or `release_judgment` | Same Execution `queued` with a new enqueue sequence and unchanged budget. |
@@ -128,23 +131,24 @@ The input revision and PR head used for an Invocation are checked when its reque
 
 The table names allowed transitions, not all policy checks. A Command also checks actor, Work version, idempotency key, target Execution, and budget. `retry` requires a confirmed `failed` current Execution; `resume` requires `paused`. Neither is accepted from `uncertain`, `stopping`, `succeeded`, or `cancelled`. Budget exhaustion is an internal timed decision that checks the stored limit against the observed clock in the commit; it is not a reason to reject `cancel`. `cancel` acceptance may mean that stopping is requested; it is not a claim that the process or external action has stopped. A second cancellation with a different key against an already cancelled Work is an accepted no-op with no new version.
 
-Execution budget counts accumulated Invocations and review/fix rounds. The first dispatch starts its runtime budget; queue time does not consume that budget. Resume retains the original counters and deadline. Retry creates a new Execution with the policy's next budget; it cannot change the accepted Work intent. An absolute Work deadline, if configured, is separate and continues while queued.
+Execution budget counts every durably recorded Invocation attempt, including a definite `not_started` result, and review/fix rounds. The first dispatch starts its runtime budget; queue time does not consume that budget. Resume retains the original counters and deadline. Retry creates a new Execution with the policy's next budget; it cannot change the accepted Work intent. An absolute Work deadline, if configured, is separate and continues while queued. Artifact recovery has its own bounded attempt/deadline policy and does not count as a new Invocation. If recovery is exhausted, preserve available workspace/WIP evidence and require a recorded repair or retry decision; missing artifacts alone do not prove that a writer is still alive or that it stopped.
 
 ## Completion, review, and Attention
 
 For v0.1, completion means that the change has been published as one PR, the required verification and review evidence covers its current head, and no writer, human gate, or outgoing GitHub action remains unresolved. Merge is a separate human or future policy action. `succeeded` stores the PR and verified head. A later head change does not rewrite that historical Outcome or automatically reopen the Execution. The current PR-readiness Projection must show that the newer head has no valid review; follow-up work requires a new Work item.
 
-Attention is derived from a human decision that can be made now: a paused judgment, a confirmed failure with an eligible retry or repair decision, or a prolonged uncertain condition requiring investigation. Queue/capacity wait, automatic CI wait, and ordinary reconciliation are not Attention. `acknowledge` records that the operator saw an item; it does not release the gate. Findings and checks are always tied to a PR head. A delayed webhook for an older head remains evidence for that head and cannot move the current head backward.
+Attention is derived from a human decision that can be made now: a paused judgment, a confirmed failure with an eligible retry or repair decision, or an uncertain condition that has exceeded its investigation threshold. The Projection exposes the threshold and the next responsible actor/action. Acknowledgement records that the operator saw the current Attention version; it does not release a gate or hide a newly actionable condition. Queue/capacity wait, automatic CI wait, and ordinary reconciliation are not Attention. Findings and checks are always tied to a PR head. A delayed webhook for an older head remains evidence for that head and cannot move the current head backward.
 
 ## Crash and concurrency rules
 
 1. Command identity, payload digest, result, Work version, and E creation/requeue are saved together. The same key and payload replay the original decision; a changed payload under that key is rejected.
-2. Capacity changes follow the Execution state transition in the same transaction. A caller cannot supply an arbitrary capacity delta. At most one nonterminal Execution exists per Work, including `queued` and `paused`; at most one Invocation may be an unresolved writer for an Execution.
+2. Capacity and write-resource reservations change with the corresponding state transition in the same transaction. A caller cannot supply an arbitrary capacity delta. At most one nonterminal Execution exists per Work, including `queued` and `paused`; at most one Invocation may be an unresolved writer for an Execution. Write-resource exclusion spans Work records and all supported entry points.
 3. A crash after `ready` commits leaves an approved request to replay. A crash after Invocation preparation but near process spawn requires `execution` to use its process-control port to inspect the stable Invocation identity. Merely finding no response does not prove that no process started. An uncertain start blocks another writer.
-4. The supervisor checks durable cancellation immediately before launch and serializes start/stop for the request. If a cancelled request could still launch, the Execution remains `stopping` or `uncertain` until its process is ruled out or stopped.
-5. Heartbeat expiry, a missing PID alone, and a worker's own `done` claim do not release capacity. The old process must be confirmed stopped or prevented from writing to the workspace and GitHub before a replacement Invocation or Execution may write.
+4. A stop/cancel/fail intent is durably recorded before sending a signal. If persisting that intent fails, the supervisor must not signal and then report a durable stopping state. Start and stop are serialized for the request. If a cancelled request could still launch, the Execution remains `stopping` or `uncertain` until its process is ruled out or stopped.
+5. Heartbeat expiry, a missing PID alone, and a worker's own `done` claim do not release capacity. Stop proof covers the process group and any known write-capable child processes, or provides an equivalent fence preventing their writes. Unknown inspection is not proof of stopped. The old process must be confirmed stopped or prevented from writing to the workspace and GitHub before a replacement Invocation or Execution may write.
 6. An unknown GitHub write remains an outstanding effect. Cancellation does not erase it or undo a published PR. Reconcile the action ID with GitHub before recording a terminal cancellation or completion that depends on it.
+7. Artifact recovery and writer liveness are separate facts. A missing export cannot cause unbounded collection retries, and successful artifact retrieval cannot by itself prove the writer stopped. Recovery attempts and deadlines are durable and bounded.
 
 ## Deliberately deferred
 
-The exact process fencing mechanism and whether it deserves the name Lease remain open. So do multiple hosts, multiple concurrent Executors for one Work, arbitrary Kanban cards, automatic priority changes, history import from Hermes, and completion across multiple PRs. None is required to define the v0.1 lifecycle above.
+The exact process fencing mechanism and whether it deserves the name Lease remain open. The exact writer-resource key and host-level enforcement mechanism must be settled by the vertical slice. Also deferred are multiple hosts, multiple concurrent Executors for one Work, arbitrary Kanban cards, automatic priority changes, history import from Hermes, and completion across multiple PRs. None is required to define the v0.1 lifecycle above.
