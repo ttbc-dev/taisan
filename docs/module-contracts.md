@@ -146,7 +146,7 @@ type CapacityView = {
 	            diagnostic: string; since: EventSequence }[] };
 ```
 
-`submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection.
+`submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection. v0.1 retains command keys and decisions indefinitely — a lost response must always be recoverable — and each adapter's actor identity comes from the installation config and stays stable across restarts.
 
 `claim_resources` and `release_resources` let a manual or unmanaged writer register on the same reservation store that Execution admission uses; they carry no Work ID. An Execution's reservation is declared as `{workspace: <id derived from the Work ID>}` plus `{repository, branch}` with the branch fixed as `work/<work_id>`, is acquired in its `queued → ready` commit, and is held until the Execution reaches a terminal state. An external claim names only `(repository, branch)` pairs, carries a TTL renewed by repeating `claim_resources` from the same actor, and conflicts with any held row are rejected as `resource_conflict` with the current holder returned in evidence. Claim expiry forfeits the exclusion guarantee; it is not evidence that the writer stopped. `release_resources` frees the claimer's own rows; an operator force-release is recorded as an override decision.
 
@@ -300,13 +300,13 @@ type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertai
 
 `ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. Inspection reads process state, not mere presence: an unreaped zombie still lists in the process table but cannot write, and `execution` reaps the processes it spawned. Stop proof covers the descendant snapshot recorded with the stop intent — a `setsid`-escaped child survives a process-group signal and becomes invisible to the process tree once its leader exits. Before signaling any recorded identity the port re-verifies its recorded start time so a reused PID is never signaled. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
 
-`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied. Exact Work states, retry limits, and GitHub operation payloads can be refined without changing these ownership rules.
+`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied. `publish_pr` carries no expected head and reconciles by branch or PR existence. `update_pr` and `post_pr_comment` carry `expected_head`, and the integration re-reads the head immediately before writing; a mismatch aborts the write, records `pr_action_result: failed` and a fresh `pr_head` Observation, and `work` re-evaluates. v0.1 never re-issues an action automatically — a retry requires evidence that covers the new head. Exact Work states, retry limits, and GitHub operation payloads can be refined without changing these ownership rules.
 
 `SafeOwnership` records the evidence that permits an Invocation to start. It does not name or prescribe a Lease mechanism. An uncertain assessment cannot produce an `InvocationRecord`. If the state store reports a version or constraint conflict, `work` rereads state and evaluates the Command or Observation again; it does not retry the proposed write unchanged.
 
 ## Ports and all module connections
 
-These are behavioral ports, not separate processes. Delivery can use a local call or a durable queue. The state store owns atomic writes and uniqueness checks; `work` and `execution` own the policy behind those writes.
+These are behavioral ports, not separate processes. Delivery between `work`, `execution`, and the dispatch loop is in-process in v0.1; the store itself is the durable handoff — an approved request persists until consumed, and `execution` reconciles by scanning it on wake and after restart. Wakeups are at-least-once signals, never evidence. The state store owns atomic writes and uniqueness checks; `work` and `execution` own the policy behind those writes.
 
 | Diagram edge | Port and message | Receiver's obligation |
 | --- | --- | --- |
@@ -379,11 +379,29 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 4. A later PR-head Observation makes a prior head's review conclusion stale. A delayed webhook for the old head triggers a current GitHub read; it cannot move the recorded current head backward. `work` cannot mark the new head reviewed from the old result. `projection` shows the current head and the missing review evidence in the next Query.
 5. When `work` requests a PR action, it records the outgoing intent before GitHub integration performs the write. Reconciliation records the actual GitHub result as an Observation. An accepted internal decision alone does not prove that the PR changed.
 
-## Remaining decisions before a directory layout
+## State store model
 
-- Choose the concrete store constraints and process supervisor that enforce the [lifecycle transitions](lifecycle.md), including cancellation racing with launch.
-- Define how a PR action checks its expected head and how reconciliation handles a head change between judgment acceptance and the external write.
-- Choose the concrete process supervisor implementing `ProcessControlPort`: descendant snapshotting, state-checked inspection including zombies, PID-reuse-safe signaling, and child reaping. The [ownership mechanism is specified without the name Lease](glossary.md#execution-ownership); whether it is one or a fence is resolved by "no replacement while unproven".
-- Define how long idempotency keys and Command results are retained, and how each adapter keeps the same actor identity across process restarts.
+v0.1 uses a hybrid schema on SQLite: current-state tables that enforce structural invariants, plus an append-only `event_log` for audit and reconstruction. `EventSequence` is the log's committed position — it orders the queue, marks snapshot `as_of`, and anchors resume positions.
 
-Once these contracts are settled, directories can follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, TUI, GitHub, and worker adapters. The layout does not decide the contracts.
+Tables: `works`, `executions`, `invocations`, `invocation_requests`, `commands`, `resource_reservations`, `capacity_slots`, `observations`, `pr_action_intents`, `stop_intents` (holding descendant snapshots), `attention_acks`, `event_log`.
+
+The store enforces, atomically inside the caller's transaction:
+
+- `(origin, actor, idempotency_key)` unique, with the payload digest recorded — a replay returns the saved decision, a changed payload yields `idempotency_conflict`.
+- `request_id`, `action_id`, and `source_event_id` unique — at-most-once requests, outbox actions, and deduplicated Observations.
+- `UNIQUE(work_id)` over nonterminal Executions and `UNIQUE(execution_id)` over unresolved writers — partial unique indexes; a competing admission returns `constraint_conflict`.
+- `resource_reservations.resource_key` unique over a normalized key space (`workspace:<id>`, `branch:<repo>:<name>`) covering execution reservations and external claims alike.
+- `capacity_slots` holds N fixed rows; claiming a free row in the same transaction reserves the slot, and no free row yields `constraint_conflict("capacity")`.
+- Work version by optimistic check in the commit (`WHERE version = expected`); a mismatch returns `version_conflict`.
+
+The store does not evaluate transition legality, budgets, or gates — that stays in `work`. Every commit records its cause and appends to `event_log` in the same transaction, so a crash cannot leave a decision recorded without its effect or vice versa.
+
+## Remaining decisions before implementation
+
+The contract-level choices are settled above: store shape and constraint placement, in-process delivery with the store as durable handoff, the expected-head write contract, and command retention and actor identity. What remains is implementation-facing, not contract-facing:
+
+- The concrete DDL that realizes the store constraints, including the transaction boundaries for the `queued → ready` commit racing with `cancel`.
+- The concrete process supervisor implementing `ProcessControlPort`: descendant snapshotting, state-checked inspection including zombies, PID-reuse-safe signaling, and child reaping. The [ownership mechanism is specified without the name Lease](glossary.md#execution-ownership); whether it is one or a fence is resolved by "no replacement while unproven".
+- The Rust module and crate layout itself, which follows the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, GitHub, and worker adapters.
+
+Directories follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, TUI, GitHub, and worker adapters. The layout does not decide the contracts.
