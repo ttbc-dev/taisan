@@ -1,0 +1,8 @@
+[package]
+name = "workloop-github"
+edition.workspace = true
+
+[dependencies]
+workloop-core = { path = "../workloop-core" }
+workloop-store = { path = "../workloop-store" }
+serde_json = "1"

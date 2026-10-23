@@ -1,0 +1,6 @@
+[package]
+name = "workloop-fixture-worker"
+edition.workspace = true
+
+[dependencies]
+serde_json = "1"
