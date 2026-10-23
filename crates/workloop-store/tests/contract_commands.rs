@@ -446,3 +446,113 @@ fn earlier_external_claim_defers_queued_execution() {
         .unwrap();
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
 }
+
+#[test]
+fn repeated_idempotency_conflict_replays_the_saved_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    handle_command(&store, &config(), &submit("k9"), NOW).unwrap();
+    let mut other = submit("k9");
+    if let CommandBody::Submit { intent, .. } = &mut other.body {
+        *intent = "different intent".into();
+    }
+    let first = handle_command(&store, &config(), &other, NOW).unwrap();
+    assert_eq!(reject_reason(&first), RejectionCode::IdempotencyConflict);
+    // The identical conflict delivered again must replay the durable
+    // conflict decision, not hit the decision-table uniqueness index.
+    let second = handle_command(&store, &config(), &other, NOW).unwrap();
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap()
+    );
+}
+
+#[test]
+fn resumed_execution_reuses_its_own_reservations() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rr1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    // A paused Execution retains its workspace/branch claims and its
+    // invocation counter; resume requeues the same Execution.
+    force_state(&store, &e1, ExecutionState::Paused);
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "rr2",
+                CommandBody::Resume {
+                    work_id,
+                    expected_work_version: 1,
+                    execution_id: e1.clone(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some(),
+                "self-held reservations must not defer re-admission"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Ready);
+    assert_eq!(e.invocations_used, 2);
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(requests.len(), 2, "one durable request per attempt");
+    assert_ne!(requests[0].request_id, requests[1].request_id);
+}
+
+#[test]
+fn invocation_budget_exhaustion_is_a_committed_failure() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.budget.max_invocations = 1;
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &cfg, &submit("b1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &cfg, &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Paused);
+    accepted(
+        &handle_command(
+            &store,
+            &cfg,
+            &req(
+                "b2",
+                CommandBody::Resume {
+                    work_id,
+                    expected_work_version: 1,
+                    execution_id: e1.clone(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &cfg, &e1, NOW)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+}

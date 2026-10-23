@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::projection::{self, CommandResultLookup, QueryResult};
+use workloop_core::projection::{self, CommandResultLookup};
 use workloop_core::store::Store;
 use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command, sweep};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
@@ -439,12 +439,16 @@ fn run(cli: Cli) -> Result<(), String> {
             );
         }
         Commands::RunOnce => {
-            run_tick(&store, &config, &installation)?;
+            let supervisor = build_supervisor(&config, &installation);
+            run_tick(&store, &config, &installation, supervisor.as_ref())?;
         }
         Commands::Run { ticks, interval_ms } => {
+            // One Supervisor across ticks: the per-request start/stop locks
+            // live on it, so recreating it would drop serialization.
+            let supervisor = build_supervisor(&config, &installation);
             let mut remaining = ticks;
             loop {
-                run_tick(&store, &config, &installation)?;
+                run_tick(&store, &config, &installation, supervisor.as_ref())?;
                 if remaining == 1 {
                     break;
                 }
@@ -505,24 +509,34 @@ fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+fn build_supervisor(
+    config: &WorkloopConfig,
+    installation: &Installation,
+) -> Option<Supervisor<PosixProcessControl>> {
+    if installation.worker_argv.is_empty() {
+        return None;
+    }
+    Some(Supervisor::new(
+        PosixProcessControl,
+        PathBuf::from(&installation.workspace_root),
+        installation.worker_argv.clone(),
+        config.clone(),
+    ))
+}
+
 /// One pass of the run loop: dispatch scan, execution consumer, GitHub
 /// outbox, timed sweep — every decision committed through the same ports.
 fn run_tick(
     store: &SqliteStore,
     config: &WorkloopConfig,
-    installation: &Installation,
+    _installation: &Installation,
+    supervisor: Option<&Supervisor<PosixProcessControl>>,
 ) -> Result<(), String> {
     let now = now();
     store
         .transact(|tx| dispatch_once(tx, config, now).map(|_| ()))
         .map_err(|e| e.to_string())?;
-    if !installation.worker_argv.is_empty() {
-        let supervisor = Supervisor::new(
-            PosixProcessControl,
-            PathBuf::from(&installation.workspace_root),
-            installation.worker_argv.clone(),
-            config.clone(),
-        );
+    if let Some(supervisor) = supervisor {
         supervisor.run_once(store, now).map_err(|e| e.to_string())?;
     }
     let mut github = FixtureGithub::new();
@@ -530,19 +544,11 @@ fn run_tick(
         .apply_outbox(store, config, now)
         .map_err(|e| e.to_string())?;
     sweep(store, config, now).map_err(|e| e.to_string())?;
-    let outstanding = store
-        .transact(|tx| {
-            Ok(QueryResult::Found {
-                value: tx
-                    .nonterminal_executions()?
-                    .into_iter()
-                    .map(|e| (e.id.0, format!("{:?}", e.state)))
-                    .collect::<Vec<_>>(),
-                as_of: tx.last_seq()?,
-                sources: vec![],
-            })
-        })
+    // Status output goes through the same read-only projection as the
+    // query subcommands — never a raw store read.
+    let list = store
+        .transact(|tx| projection::work_list(tx, now))
         .map_err(|e| e.to_string())?;
-    print(&outstanding);
+    print(&list);
     Ok(())
 }

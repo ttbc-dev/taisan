@@ -48,8 +48,12 @@ pub fn handle_command(
                 vec!["same idempotency key with a different payload".into()],
             )?;
             // The original decision keeps the bare key for replay; the
-            // conflict is durable under a payload-derived key.
+            // conflict is durable under a payload-derived key. An identical
+            // conflict replayed returns the saved decision.
             let conflict_key = format!("{}#{digest}", req.idempotency_key);
+            if let Some((_, saved)) = tx.stored_decision(&req.origin, &req.actor, &conflict_key)? {
+                return Ok(saved);
+            }
             tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
             return Ok(decision);
         }
@@ -1029,10 +1033,31 @@ pub fn admit_queued(
             detail: format!("execution {} has no work", execution.id.0),
         })?;
 
-    // Atomic recheck: another writer may have claimed since acceptance.
+    // Invocation budget is a committed decision checked at request
+    // creation — resume keeps the counters, so an exhausted budget must
+    // fail the Execution rather than spin a deferred queue head.
+    if execution.invocations_used >= execution.budget.max_invocations {
+        fail_terminal(
+            tx,
+            &execution,
+            "invocation_budget_exhausted",
+            "recorded Invocation attempts reached the stored budget",
+        )?;
+        return Ok(None);
+    }
+
+    // Atomic recheck: another writer may have claimed since acceptance. A
+    // reservation this Execution itself holds (a paused/resumed Execution
+    // retains its claims) is already-held, not a conflict.
     let resources = work_resources(&work, config);
     for res in &resources {
         if let Some(existing) = tx.reservation(&res.key())? {
+            if matches!(
+                &existing.holder,
+                ReservationHolder::Execution { execution_id: holder } if holder == execution_id
+            ) {
+                continue;
+            }
             if !is_expired(&existing, now_unix_seconds) {
                 tx.apply(&Effect::RecordDeferral {
                     execution_id: execution_id.clone(),
@@ -1048,7 +1073,13 @@ pub fn admit_queued(
             })?;
         }
     }
-    if tx.slot_holders()?.len() >= tx.slot_limit()? as usize {
+    // A paused/resumed Execution also retains its capacity slot; only a
+    // fresh admission must find a free one.
+    let holds_slot = tx
+        .slot_holders()?
+        .iter()
+        .any(|(holder, _)| holder == execution_id);
+    if !holds_slot && tx.slot_holders()?.len() >= tx.slot_limit()? as usize {
         tx.apply(&Effect::RecordDeferral {
             execution_id: execution_id.clone(),
             reason: "capacity_exhausted".into(),
@@ -1058,25 +1089,42 @@ pub fn admit_queued(
     }
 
     let seq = tx.alloc_seq()?;
+    let role = InvocationRole::Coding;
     let request = InvocationRequest {
-        request_id: format!("{}:inv:0", execution.id.0),
+        // One durable request per recorded attempt; the attempt counter
+        // makes re-admission ids unique.
+        request_id: format!("{}:inv:{}", execution.id.0, execution.invocations_used),
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
-        role: InvocationRole::Coding,
+        role: role.clone(),
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
-    next.started_seq = Some(seq);
-    next.started_unix_seconds = Some(now_unix_seconds);
+    // The runtime budget anchors at first dispatch; a resumed Execution
+    // keeps its original anchor and counters.
+    if next.started_seq.is_none() {
+        next.started_seq = Some(seq);
+        next.started_unix_seconds = Some(now_unix_seconds);
+    }
+    next.invocations_used += 1;
+    if role == InvocationRole::Review {
+        next.review_rounds_used += 1;
+    }
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
         expected_state: ExecutionState::Queued,
     })?;
-    tx.apply(&Effect::ClaimSlot {
-        execution_id: execution_id.clone(),
-    })?;
+    if !holds_slot {
+        tx.apply(&Effect::ClaimSlot {
+            execution_id: execution_id.clone(),
+        })?;
+    }
     for res in resources {
+        // Resources this Execution already holds stay held.
+        if tx.reservation(&res.key())?.is_some() {
+            continue;
+        }
         tx.apply(&Effect::InsertReservation {
             reservation: ResourceReservation {
                 resource_key: res.key(),
@@ -1121,14 +1169,26 @@ pub fn handle_observation(
             assess(tx, config, obs, now_unix_seconds)?;
             Ok(IngestReceipt::Recorded)
         })
-        .or_else(|e| match e {
-            StoreError::ConstraintConflict { detail }
-                if detail.contains("observations_dedupe") || detail.contains("UNIQUE") =>
-            {
+        .or_else(|e| {
+            if is_dedupe_conflict(&e) {
                 Ok(IngestReceipt::Duplicate)
+            } else {
+                Err(e)
             }
-            other => Err(other),
         })
+}
+
+/// Only the observations dedupe index classifies an insert as a replay;
+/// every other uniqueness violation is a real invariant breach and must
+/// propagate instead of being mistaken for a duplicate delivery. SQLite
+/// reports the violated columns (`observations.source_event_id`), not
+/// the index name.
+pub fn is_dedupe_conflict(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::ConstraintConflict { detail }
+            if detail.contains("observations.source_event_id")
+    )
 }
 
 /// A committed observation may move the Execution; every transition here is

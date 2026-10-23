@@ -29,15 +29,21 @@ fn ps_output(args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// `ps` lstart prints five fields (`Sat Oct 24 06:14:00 2026`); everything
-/// after the fixed leading columns is kept verbatim as the verifier.
+/// `ps` lstart prints five fields (`Sat Oct 24 06:14:00 2026`). The ctime
+/// day field is space-padded for single-digit days (`Oct  4`), so the
+/// stored verifier is whitespace-normalized — every identity path
+/// (spawn, snapshot, re-verify) must produce the same string.
+fn normalize_lstart(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn lstart_of(pid: i32) -> Option<String> {
     let out = ps_output(&["-o", "lstart=", "-p", &pid.to_string()]).ok()?;
     let s = out.trim();
     if s.is_empty() {
         None
     } else {
-        Some(s.to_string())
+        Some(normalize_lstart(s))
     }
 }
 
@@ -100,7 +106,7 @@ impl ProcessControlPort for PosixProcessControl {
             ) else {
                 continue;
             };
-            let lstart = f[3..].join(" ");
+            let lstart = normalize_lstart(&f[3..].join(" "));
             by_ppid
                 .entry(ppid)
                 .or_default()
@@ -138,7 +144,7 @@ impl ProcessControlPort for PosixProcessControl {
                 exit_code: None,
             };
         };
-        if lstart != identity.started_at {
+        if normalize_lstart(&lstart) != normalize_lstart(&identity.started_at) {
             // Reused pid: the recorded process is gone.
             return ProcessEvidence::Stopped {
                 identity: identity.clone(),
@@ -162,7 +168,9 @@ impl ProcessControlPort for PosixProcessControl {
     fn signal_verified(&self, identity: &ProcessIdentity, signal: i32) -> SignalOutcome {
         match lstart_of(identity.pid) {
             None => SignalOutcome::AlreadyGone,
-            Some(now) if now != identity.started_at => SignalOutcome::SkippedStale,
+            Some(now) if normalize_lstart(&now) != normalize_lstart(&identity.started_at) => {
+                SignalOutcome::SkippedStale
+            }
             Some(_) => {
                 let rc = unsafe { libc::kill(identity.pid, signal) };
                 if rc == 0 {
@@ -272,6 +280,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    #[doc(hidden)]
+    pub fn locks_len(&self) -> usize {
+        self.locks.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn workspace_of(&self, work_id: &WorkId) -> PathBuf {
@@ -632,6 +645,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                 }
                 if all_stopped {
+                    // The leader is our child: reap it so a killed writer
+                    // does not linger as a zombie of this supervisor.
+                    self.port.reap(identity.pid);
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?
                         .ok_or(ExecError::Store(StoreError::Internal {
@@ -696,7 +712,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         leader: &ProcessIdentity,
         persist: impl FnOnce(StopIntent) -> Result<(), StoreError>,
     ) -> Result<StopReceipt, ExecError> {
-        let lock = self.lock_for(&invocation.id.0);
+        // Same key as the start path: start and stop for one request are
+        // serialized through a single per-request lock.
+        let lock = self.lock_for(&invocation.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut identities = self.port.snapshot_descendants(leader.pid);
         if !identities.iter().any(|i| i.pid == leader.pid) {
@@ -827,7 +845,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
-    /// Emit an Observation to `work`. Duplicates dedupe in the store.
+    /// Emit an Observation to `work`. A deterministic delivery id derived
+    /// from the request and the fact makes a repeated identical report a
+    /// store-level duplicate instead of unbounded growth.
     fn report(
         &self,
         store: &impl Store,
@@ -835,8 +855,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
         fact: ObservationFact,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        request.request_id.hash(&mut h);
+        serde_json::to_string(&fact)
+            .unwrap_or_default()
+            .hash(&mut h);
         let obs = Observation {
-            source_event_id: None,
+            source_event_id: Some(format!("sup:{:x}", h.finish())),
             subject_work_id: Some(request.work_id.clone()),
             subject_execution_id: Some(request.execution_id.clone()),
             fact,

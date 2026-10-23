@@ -65,6 +65,10 @@ impl FixtureGithub {
         config: &WorkloopConfig,
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
+        // Attempts are tracked so an intent that cannot make progress
+        // (e.g. its Observation cannot be assessed against any active
+        // Execution) terminates the pass instead of looping forever.
+        let mut attempted = std::collections::HashSet::new();
         loop {
             let next = store.transact(|tx| {
                 Ok(tx
@@ -73,6 +77,9 @@ impl FixtureGithub {
                     .find(|i| i.status == PrActionStatus::Pending))
             })?;
             let Some(intent) = next else { return Ok(()) };
+            if !attempted.insert(intent.action_id.clone()) {
+                return Ok(());
+            }
             self.attempt(store, config, intent, now_unix_seconds)?;
         }
     }
