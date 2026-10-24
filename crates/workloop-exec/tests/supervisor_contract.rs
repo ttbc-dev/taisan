@@ -389,6 +389,148 @@ fn crash_near_spawn_leaves_uncertain_with_no_second_writer() {
 }
 
 #[test]
+fn live_process_is_rereported_running_after_a_lost_running_observation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("rerun");
+    let (w, eid) = submit_and_admit(&store, "k-rerun1");
+    let sup = supervisor("hang", root);
+    let request = store
+        .transact(|tx| {
+            let reqs = tx.pending_requests()?;
+            Ok(reqs.into_iter().next().expect("one request"))
+        })
+        .unwrap();
+    // Simulate the crash window: the Invocation's running identity is
+    // durable, but the supervisor died before the ProcessState::Running
+    // observation committed — the Execution is still Ready.
+    let port = PosixProcessControl;
+    let workspace = sup.workspace_of(&w);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let identity = port
+        .spawn(&[fixture_bin(), "hang".into()], &workspace)
+        .expect("spawn");
+    store
+        .transact(|tx| {
+            let inv_id = tx.alloc_id("inv")?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(inv_id),
+                    request_id: request.request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(identity.clone()),
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Ready);
+    // The next scan inspects the live writer and must re-report Running.
+    sup.run_once(&store, NOW).unwrap();
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Running,
+        "a verified-live writer moves Ready→running even after a lost report"
+    );
+    // A second pass must not disturb the settled state (the repeated
+    // identical report is a store-level duplicate).
+    sup.run_once(&store, NOW).unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Running);
+    // Cleanup: stop the writer through the proven-stop path.
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-rerun2");
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+}
+
+#[test]
+fn exited_writer_on_a_ready_execution_enters_reconciliation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("readyexit");
+    let (w, eid) = submit_and_admit(&store, "k-re1");
+    let sup = supervisor("clean-exit", root);
+    let request = store
+        .transact(|tx| {
+            let reqs = tx.pending_requests()?;
+            Ok(reqs.into_iter().next().expect("one request"))
+        })
+        .unwrap();
+    // The writer ran to completion and exited before any Running report
+    // was recorded — the same lost-report window, but the process is gone
+    // by the time the supervisor scans again.
+    let port = PosixProcessControl;
+    let workspace = sup.workspace_of(&w);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let identity = port
+        .spawn(&[fixture_bin(), "clean-exit".into()], &workspace)
+        .expect("spawn");
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "worker exit",
+    );
+    store
+        .transact(|tx| {
+            let inv_id = tx.alloc_id("inv")?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(inv_id),
+                    request_id: request.request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(identity.clone()),
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    // The proven exit must not be ignored for a Ready Execution: the
+    // Exited and artifact facts drive the normal reconciliation path
+    // instead of stranding the Execution until the runtime sweep.
+    sup.poll_invocations(&store, NOW).unwrap();
+    let exited = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ProcessState {
+                    state: ProcessStateFact::Exited,
+                    ..
+                }
+            )
+        });
+    assert!(exited, "the proven exit is recorded as evidence");
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Waiting);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::GithubWrite),
+        "artifact evidence queued the publish intent"
+    );
+    assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
+    port.reap(identity.pid);
+}
+
+#[test]
 fn launch_refused_pauses_and_releases_the_slot() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("refused");

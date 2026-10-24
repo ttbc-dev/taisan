@@ -59,12 +59,20 @@ impl FixtureGithub {
     /// Each action's result — `applied`, `failed`, or `unknown` — is
     /// recorded as a `pr_action_result` Observation keyed by action ID;
     /// `unknown` stays outstanding until reconciled.
+    ///
+    /// The drain is gated by `allowed_effects.github_write`: when the
+    /// installation denies GitHub writes (the CLI default), no intent is
+    /// attempted — rows stay `pending` rather than being mutated or
+    /// reclassified.
     pub fn apply_outbox(
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
+        if !config.allowed_effects.github_write {
+            return Ok(());
+        }
         // Attempts are tracked so an intent that cannot make progress is
         // skipped for the rest of this pass — it neither loops the pass
         // forever nor blocks later independent intents (a retried stuck

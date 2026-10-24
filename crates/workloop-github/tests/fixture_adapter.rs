@@ -428,6 +428,43 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
 }
 
 #[test]
+fn github_write_denied_leaves_the_outbox_pending() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "k-g8");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        PrAction::PublishPr {
+            branch: "work/w-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    // The installation default: GitHub writes are not granted.
+    let read_only = WorkloopConfig {
+        default_repository: "local/repo".into(),
+        allowed_effects: AllowedEffects {
+            workspace_write: true,
+            github_write: false,
+            network: false,
+        },
+        budget: ExecutionBudget::default(),
+    };
+    let mut gh = FixtureGithub::new();
+    gh.apply_outbox(&store, &read_only, NOW).unwrap();
+    assert!(
+        gh.applied().is_empty(),
+        "no GitHub mutation while github_write is denied"
+    );
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    // The same recorded intent applies once the installation grants the
+    // write — denial defers, it never reclassifies.
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+}
+
+#[test]
 fn superseded_head_evidence_does_not_complete_the_work() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "k-g7");

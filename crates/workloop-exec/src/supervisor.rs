@@ -532,7 +532,29 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     self.port.reap(identity.pid);
                     self.finish_invocation(store, &invocation, now_unix_seconds)?;
                 }
-                ProcessEvidence::Alive { .. } => {}
+                ProcessEvidence::Alive { .. } => {
+                    // Re-assert liveness. A crash (or failed observation
+                    // commit) between persisting the running identity and
+                    // reporting ProcessState::Running would otherwise
+                    // leave the Execution in Ready forever while the
+                    // writer lives; the deterministic delivery id makes a
+                    // repeated identical report a store-level duplicate.
+                    let request = store
+                        .transact(|tx| tx.request(&invocation.request_id))?
+                        .ok_or(ExecError::Store(StoreError::Internal {
+                            detail: "invocation without request".into(),
+                        }))?;
+                    self.report(
+                        store,
+                        &request,
+                        ObservationFact::ProcessState {
+                            invocation_id: invocation.id.clone(),
+                            process_identity: format!("{}@{}", identity.pid, identity.started_at),
+                            state: ProcessStateFact::Running,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
                 ProcessEvidence::Unknown { .. } => {
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?
@@ -983,7 +1005,25 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
                 self.finish_invocation(store, invocation, now_unix_seconds)
             }
-            ProcessEvidence::Alive { .. } => Ok(()),
+            ProcessEvidence::Alive { .. } => {
+                // Same re-assertion as the poll path: a reconciled
+                // request whose Running report was lost must still move
+                // the Execution Ready→Running while the writer lives.
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: invocation.id.clone(),
+                        process_identity: invocation
+                            .process_identity
+                            .as_ref()
+                            .map(|i| format!("{}@{}", i.pid, i.started_at))
+                            .unwrap_or_default(),
+                        state: ProcessStateFact::Running,
+                    },
+                    now_unix_seconds,
+                )
+            }
             ProcessEvidence::Unknown { .. } => {
                 let id = invocation
                     .process_identity

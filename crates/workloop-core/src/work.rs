@@ -128,7 +128,12 @@ fn conflict_rejection(
         StoreError::ConstraintConflict { .. }
         | StoreError::StateConflict { .. }
         | StoreError::NoFreeSlot => None,
-        StoreError::Internal { .. } => None,
+        // An internal store fault is not a decision about the work.
+        // Retrying it and then persisting an Ineligible rejection would
+        // harden a transient failure into a durable, forever-replayed
+        // answer under the caller's idempotency key; it must reach the
+        // caller instead.
+        StoreError::Internal { .. } => return Err(err.clone()),
     };
     match code {
         Some(c) => Ok(Some(rejected_now(
@@ -1423,7 +1428,11 @@ fn assess_process(
         ProcessStateFact::Exited => {
             mark_invocation(tx, invocation_id, InvocationState::Done)?;
             match execution.state {
-                ExecutionState::Running => {
+                // A proven exit for a still-`ready` Execution is the
+                // lost-Running-report case: the writer ran and is gone,
+                // so it follows the same reconciliation path instead of
+                // holding the slot until a sweep fails the completed work.
+                ExecutionState::Ready | ExecutionState::Running => {
                     let mut next = execution.clone();
                     next.state = ExecutionState::Waiting;
                     next.waiting_reason = Some(WaitingReason::Reconciliation);
