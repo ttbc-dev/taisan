@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::command::{CommandDecision, CommandId};
+use crate::command::{CommandDecision, CommandId, PrHeadSha};
 use crate::domain::*;
 use crate::observation::Observation;
 
@@ -209,6 +209,12 @@ pub trait ReadView {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Vec<Invocation>, StoreError>;
+
+    /// The Work's most recent recorded judgment: its PR head and decisions.
+    fn latest_judgment(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Option<(PrHeadSha, Vec<crate::command::FindingDecision>)>, StoreError>;
 
     fn last_seq(&self) -> Result<EventSequence, StoreError>;
 }

@@ -3,7 +3,7 @@
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::observation::Outcome;
-use workloop_core::store::{Effect, Store, StoreError, TxView};
+use workloop_core::store::{Effect, Store};
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_store::sqlite::SqliteStore;
 
@@ -424,15 +424,10 @@ fn earlier_external_claim_defers_queued_execution() {
         accepted_with_execution(&handle_command(&store, &config(), &submit("x1"), NOW).unwrap());
     // An external writer claims the work branch before dispatch.
     let claim = CommandBody::ClaimResources {
-        resources: vec![
-            WriteResource::Branch {
-                repository: "local/repo".into(),
-                branch: format!("work/{}", work_id.0),
-            },
-            WriteResource::Workspace {
-                workspace_id: format!("ws-{}", work_id.0),
-            },
-        ],
+        resources: vec![WriteResource::Branch {
+            repository: "local/repo".into(),
+            branch: format!("work/{}", work_id.0),
+        }],
         ttl_seconds: 300,
     };
     accepted(&handle_command(&store, &config(), &req("x2", claim), NOW).unwrap());
@@ -445,4 +440,211 @@ fn earlier_external_claim_defers_queued_execution() {
         })
         .unwrap();
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+}
+
+// ---- Regression: review findings on slice-0 decision core ----
+
+#[test]
+fn conflicting_payload_replays_the_conflict_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    handle_command(&store, &config(), &submit("f1"), NOW).unwrap();
+    let mut other = submit("f1");
+    if let CommandBody::Submit { intent, .. } = &mut other.body {
+        *intent = "different intent".into();
+    }
+    let first = handle_command(&store, &config(), &other, NOW).unwrap();
+    assert_eq!(reject_reason(&first), RejectionCode::IdempotencyConflict);
+    // The same conflicting payload replays the stored conflict decision.
+    let second = handle_command(&store, &config(), &other, NOW).unwrap();
+    assert_eq!(reject_reason(&second), RejectionCode::IdempotencyConflict);
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap(),
+        "conflict replay returns the stored decision"
+    );
+}
+
+#[test]
+fn external_claim_names_only_branch_pairs() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let ws = WriteResource::Workspace {
+        workspace_id: "ws-w-1".into(),
+    };
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "w1",
+            CommandBody::ClaimResources {
+                resources: vec![ws.clone()],
+                ttl_seconds: 60,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::InvalidRequest);
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "w2",
+            CommandBody::ReleaseResources {
+                resources: vec![ws],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::InvalidRequest);
+}
+
+#[test]
+fn cancel_noop_reports_the_current_version() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("n1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Stopping);
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "n2",
+            CommandBody::Cancel {
+                work_id,
+                expected_work_version: 1,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    match d {
+        CommandDecision::Accepted { work_version, .. } => {
+            assert_eq!(
+                work_version,
+                Some(1),
+                "an accepted no-op carries no new version"
+            );
+        }
+        other => panic!("expected accepted, got {other:?}"),
+    }
+}
+
+#[test]
+fn release_judgment_requires_a_matching_recorded_judgment() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("j1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Paused);
+    let release = |head: &str, version: u64| CommandBody::ReleaseJudgment {
+        work_id: work_id.clone(),
+        expected_work_version: version,
+        expected_pr_head: head.into(),
+    };
+
+    // Nothing recorded yet.
+    let d = handle_command(&store, &config(), &req("j2", release("h1", 1)), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::Ineligible);
+
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "j3",
+                CommandBody::JudgeFindings {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    expected_pr_head: "h1".into(),
+                    decisions: vec![FindingDecision {
+                        finding_id: "f1".into(),
+                        choice: FindingChoice::Fix,
+                    }],
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+
+    // A stale head cannot release the recorded judgment.
+    let d = handle_command(&store, &config(), &req("j4", release("h2", 2)), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
+
+    let d = handle_command(&store, &config(), &req("j5", release("h1", 2)), NOW).unwrap();
+    accepted(&d);
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+}
+
+#[test]
+fn resume_readmission_keeps_reservations_sequence_and_budget_anchor() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("m1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    let first = read_execution(&store, &e1);
+
+    // Pause per the lifecycle contract: release the slot, keep reservations.
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "m2",
+            CommandBody::Resume {
+                work_id,
+                expected_work_version: 1,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 10)?.is_some(),
+                "own retained reservations must not conflict"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.invocations_used, 2);
+    assert_eq!(
+        e.started_seq, first.started_seq,
+        "the first dispatch anchors the runtime budget"
+    );
+    assert_eq!(e.started_unix_seconds, first.started_unix_seconds);
+
+    let (reservations, request_ids) = store
+        .transact(|tx| {
+            Ok((
+                tx.reservations()?.len(),
+                tx.pending_requests()?
+                    .into_iter()
+                    .map(|r| r.request_id)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(reservations, 2, "workspace + branch, no duplicates");
+    assert_eq!(
+        request_ids,
+        vec![format!("{}:inv:0", e1.0), format!("{}:inv:1", e1.0),]
+    );
 }

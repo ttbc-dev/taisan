@@ -37,15 +37,23 @@ pub fn handle_command(
                 if stored_digest == digest {
                     return Ok(decision);
                 }
+                // The original decision keeps the bare key for replay; the
+                // conflict is durable under a payload-derived key. A replay
+                // of the same conflicting payload returns that stored
+                // conflict decision.
+                let conflict_key = format!("{}#{digest}", req.idempotency_key);
+                if let Some((conflict_digest, conflict_decision)) =
+                    tx.stored_decision(&req.origin, &req.actor, &conflict_key)?
+                    && conflict_digest == digest
+                {
+                    return Ok(conflict_decision);
+                }
                 let decision = rejected(
                     tx,
                     RejectionCode::IdempotencyConflict,
                     req.body.work_id().cloned(),
                     vec!["same idempotency key with a different payload".into()],
                 )?;
-                // The original decision keeps the bare key for replay; the
-                // conflict is durable under a payload-derived key.
-                let conflict_key = format!("{}#{digest}", req.idempotency_key);
                 tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
                 return Ok(decision);
             }
@@ -120,7 +128,9 @@ fn conflict_rejection(
         StoreError::ConstraintConflict { .. }
         | StoreError::StateConflict { .. }
         | StoreError::NoFreeSlot => None,
-        StoreError::Internal { .. } => None,
+        // A transient I/O failure must not become a durable rejection under
+        // the caller's key: abort the transaction and let them retry.
+        StoreError::Internal { .. } => return Err(err.clone()),
     };
     match code {
         Some(c) => Ok(Some(rejected_now(
@@ -351,6 +361,12 @@ fn decide_submit(
     ))
 }
 
+/// An external claim names only `(repository, branch)` pairs; the managed
+/// workspace root is reserved for `execution`.
+fn external_claimable(res: &WriteResource) -> bool {
+    matches!(res, WriteResource::Branch { .. })
+}
+
 fn decide_claim(
     tx: &mut dyn TxView,
     req: &CommandRequest,
@@ -358,7 +374,8 @@ fn decide_claim(
     ttl_seconds: u64,
     now_unix_seconds: i64,
 ) -> Verdict {
-    if resources.is_empty() || ttl_seconds == 0 {
+    if resources.is_empty() || ttl_seconds == 0 || resources.iter().any(|r| !external_claimable(r))
+    {
         return Ok((
             rejected_now(tx, RejectionCode::InvalidRequest, None, vec![]),
             vec![],
@@ -445,6 +462,12 @@ fn decide_release(
     req: &CommandRequest,
     resources: &[WriteResource],
 ) -> Verdict {
+    if resources.iter().any(|r| !external_claimable(r)) {
+        return Ok((
+            rejected_now(tx, RejectionCode::InvalidRequest, None, vec![]),
+            vec![],
+        ));
+    }
     let holder = ReservationHolder::External {
         actor_id: req.actor.external_id.clone(),
     };
@@ -705,11 +728,16 @@ fn decide_cancel(
         next: work.version + 1,
     };
     let accept = |effects: Vec<Effect>| {
+        // The reported version must agree with the emitted bump: an accepted
+        // no-op carries no new version.
+        let bumped = effects
+            .iter()
+            .any(|e| matches!(e, Effect::BumpWorkVersion { .. }));
         (
             CommandDecision::Accepted {
                 command_id: command_id.clone(),
                 work_id: Some(work_id.clone()),
-                work_version: Some(work.version + 1),
+                work_version: Some(work.version + u64::from(bumped)),
                 effect: CommandEffect::StateChanged,
                 committed_at: seq,
             },
@@ -935,7 +963,7 @@ fn decide_release_judgment(
     tx: &mut dyn TxView,
     work_id: &WorkId,
     expected_version: WorkVersion,
-    _expected_pr_head: &str,
+    expected_pr_head: &str,
 ) -> Verdict {
     // Releases the human gate: valid on a paused Execution, requeues it.
     let work = match check_work(tx, work_id, expected_version)? {
@@ -963,6 +991,30 @@ fn decide_release_judgment(
                 RejectionCode::Ineligible,
                 Some(work_id.clone()),
                 vec!["release_judgment requires a paused Execution".into()],
+            ),
+            vec![],
+        ));
+    }
+    // The gate releases only against a recorded judgment for the head the
+    // caller expects; a stale-head release must not requeue the work.
+    let Some((recorded_head, _decisions)) = tx.latest_judgment(work_id)? else {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no recorded judgment to release".into()],
+            ),
+            vec![],
+        ));
+    };
+    if recorded_head != expected_pr_head {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec![recorded_head],
             ),
             vec![],
         ));
@@ -1027,10 +1079,20 @@ pub fn admit_queued(
             detail: format!("execution {} has no work", execution.id.0),
         })?;
 
-    // Atomic recheck: another writer may have claimed since acceptance.
+    // Atomic recheck: another writer may have claimed since acceptance. A
+    // resumed Execution retains its own reservations; only a foreign holder
+    // conflicts.
+    let self_holder = ReservationHolder::Execution {
+        execution_id: execution_id.clone(),
+    };
     let resources = work_resources(&work, config);
+    let mut held = std::collections::BTreeSet::new();
     for res in &resources {
         if let Some(existing) = tx.reservation(&res.key())? {
+            if existing.holder == self_holder {
+                held.insert(res.key());
+                continue;
+            }
             if !is_expired(&existing, now_unix_seconds) {
                 tx.apply(&Effect::RecordDeferral {
                     execution_id: execution_id.clone(),
@@ -1056,8 +1118,9 @@ pub fn admit_queued(
     }
 
     let seq = tx.alloc_seq()?;
+    // The request ID derives from the next durable Invocation sequence.
     let request = InvocationRequest {
-        request_id: format!("{}:inv:0", execution.id.0),
+        request_id: format!("{}:inv:{}", execution.id.0, execution.invocations_used),
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
         role: InvocationRole::Coding,
@@ -1065,8 +1128,12 @@ pub fn admit_queued(
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
-    next.started_seq = Some(seq);
-    next.started_unix_seconds = Some(now_unix_seconds);
+    next.invocations_used += 1;
+    // The first dispatch anchors the runtime budget; re-admission retains it.
+    if next.started_seq.is_none() {
+        next.started_seq = Some(seq);
+        next.started_unix_seconds = Some(now_unix_seconds);
+    }
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
         expected_state: ExecutionState::Queued,
@@ -1075,6 +1142,9 @@ pub fn admit_queued(
         execution_id: execution_id.clone(),
     })?;
     for res in resources {
+        if held.contains(&res.key()) {
+            continue;
+        }
         tx.apply(&Effect::InsertReservation {
             reservation: ResourceReservation {
                 resource_key: res.key(),

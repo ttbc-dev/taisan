@@ -7,7 +7,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
 
-use workloop_core::command::{CommandDecision, CommandId};
+use workloop_core::command::{CommandDecision, CommandId, FindingDecision, PrHeadSha};
 use workloop_core::domain::*;
 use workloop_core::store::{Effect, ReadView, Store, StoreError, TxView};
 
@@ -466,6 +466,18 @@ impl ReadView for Tx<'_> {
                     evidence_refs: de_row(&row.get::<_, String>(7)?)?,
                 })
             },
+        )
+    }
+
+    fn latest_judgment(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Option<(PrHeadSha, Vec<FindingDecision>)>, StoreError> {
+        self.query_opt(
+            "SELECT expected_pr_head, decisions FROM judgments \
+             WHERE work_id=?1 ORDER BY seq DESC LIMIT 1",
+            params![work_id.0],
+            |row| Ok((row.get::<_, String>(0)?, de_row(&row.get::<_, String>(1)?)?)),
         )
     }
 
