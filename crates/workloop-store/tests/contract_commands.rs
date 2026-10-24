@@ -126,6 +126,44 @@ fn force_state(store: &SqliteStore, id: &ExecutionId, to: ExecutionState) {
     );
 }
 
+/// Drive one Command through `handle_command` twice and prove the second
+/// call is served from the stored decision: identical decision JSON, no new
+/// event sequence, and the same decision recoverable via `command_result`.
+/// `now` is the original attempt's clock; `replay_now` lets a test replay
+/// after time has passed (e.g. past a claim's TTL midpoint).
+fn assert_replay_locked(
+    store: &SqliteStore,
+    request: &CommandRequest,
+    now: i64,
+    replay_now: i64,
+) -> CommandDecision {
+    let first = handle_command(store, &config(), request, now).expect("first handle_command");
+    let first_json = serde_json::to_string(&first).expect("decision serializes");
+    let seq_before = store.transact(|tx| tx.last_seq()).expect("read last_seq");
+    let second =
+        handle_command(store, &config(), request, replay_now).expect("replay handle_command");
+    assert_eq!(
+        first_json,
+        serde_json::to_string(&second).expect("decision serializes"),
+        "replay returns the saved decision"
+    );
+    let seq_after = store.transact(|tx| tx.last_seq()).expect("read last_seq");
+    assert_eq!(
+        seq_before, seq_after,
+        "replay allocates no new sequence and applies no effect"
+    );
+    let recovered = store
+        .transact(|tx| tx.command_decision(first.command_id()))
+        .expect("command_result read")
+        .expect("command_result recovers the decision");
+    assert_eq!(
+        first_json,
+        serde_json::to_string(&recovered).expect("decision serializes"),
+        "command_result returns the same decision"
+    );
+    first
+}
+
 // ---- Commands: idempotency ----
 
 #[test]
@@ -646,5 +684,375 @@ fn resume_readmission_keeps_reservations_sequence_and_budget_anchor() {
     assert_eq!(
         request_ids,
         vec![format!("{}:inv:0", e1.0), format!("{}:inv:1", e1.0),]
+    );
+}
+
+// ---- Converge round 2: shadow-review regression coverage ----
+
+#[test]
+fn workspace_claim_cannot_block_dispatch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ws1"), NOW).unwrap());
+    // An external actor names the Work's own managed workspace key.
+    let ws = WriteResource::Workspace {
+        workspace_id: format!("ws-{}", work_id.0),
+    };
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "ws2",
+            CommandBody::ClaimResources {
+                resources: vec![ws.clone()],
+                ttl_seconds: 60,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::InvalidRequest);
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "ws3",
+            CommandBody::ReleaseResources {
+                resources: vec![ws],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::InvalidRequest);
+    assert!(
+        store.transact(|tx| tx.reservations()).unwrap().is_empty(),
+        "no external claim may hold a workspace: key"
+    );
+
+    // Dispatch is not blocked: the Execution reserves both keys itself.
+    store
+        .transact(|tx| {
+            let admitted = workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?;
+            assert!(admitted.is_some(), "workspace squat cannot defer dispatch");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Ready);
+    let (reservations, requests) = store
+        .transact(|tx| Ok((tx.reservations()?.len(), tx.pending_requests()?.len())))
+        .unwrap();
+    assert_eq!(
+        reservations, 2,
+        "workspace + branch, both held by the Execution"
+    );
+    assert_eq!(requests, 1);
+}
+
+#[test]
+fn resume_replays_and_readmits_once() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rp1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    let first_dispatch = read_execution(&store, &e1);
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+
+    let resume = req(
+        "rp2",
+        CommandBody::Resume {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: e1.clone(),
+        },
+    );
+    let d = assert_replay_locked(&store, &resume, NOW, NOW);
+    accepted(&d);
+    let committed_at = match &d {
+        CommandDecision::Accepted { committed_at, .. } => *committed_at,
+        other => panic!("expected accepted, got {other:?}"),
+    };
+
+    // The replay must not re-decide against the now-stale version 1.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "replay must not bump the version again");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Queued);
+    assert_eq!(
+        e.enqueued_seq, committed_at,
+        "replay must not requeue with a fresh sequence"
+    );
+
+    // Re-admission reuses the retained reservations instead of conflicting.
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 10)?.is_some(),
+                "own retained reservations must not conflict"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.invocations_used, 2);
+    assert_eq!(
+        e.started_seq, first_dispatch.started_seq,
+        "the first dispatch anchors the runtime budget"
+    );
+    assert_eq!(e.started_unix_seconds, first_dispatch.started_unix_seconds);
+
+    let (reservations, request_ids) = store
+        .transact(|tx| {
+            Ok((
+                tx.reservations()?.len(),
+                tx.pending_requests()?
+                    .into_iter()
+                    .map(|r| r.request_id)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(reservations, 2, "workspace + branch, no duplicates");
+    assert_eq!(
+        request_ids,
+        vec![format!("{}:inv:0", e1.0), format!("{}:inv:1", e1.0)]
+    );
+}
+
+#[test]
+fn retry_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("tr1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Failed);
+    let retry = req(
+        "tr2",
+        CommandBody::Retry {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            expected_execution_id: e1.clone(),
+        },
+    );
+    let d = assert_replay_locked(&store, &retry, NOW, NOW);
+    accepted(&d);
+    // A re-decision would be StaleWorkVersion (the Work is now version 2)
+    // or would create a third Execution.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "replay must not bump the version again");
+    let ordinals = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.ordinal)
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, vec![0, 1], "no third Execution on replay");
+}
+
+#[test]
+fn cancel_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ca1"), NOW).unwrap());
+    let cancel = req(
+        "ca2",
+        CommandBody::Cancel {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: None,
+        },
+    );
+    let d = assert_replay_locked(&store, &cancel, NOW, NOW);
+    accepted(&d);
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Cancelled);
+    // A re-decision would be StaleWorkVersion or a second version bump.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "replay must not bump the version again");
+}
+
+#[test]
+fn claim_resources_replays_without_renewing() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let claim = req(
+        "cpr1",
+        CommandBody::ClaimResources {
+            resources: vec![branch_res()],
+            ttl_seconds: 60,
+        },
+    );
+    // Replay after the TTL midpoint: re-deciding would renew to NOW + 90.
+    let d = assert_replay_locked(&store, &claim, NOW, NOW + 30);
+    accepted(&d);
+    let reservations = store.transact(|tx| tx.reservations()).unwrap();
+    assert_eq!(reservations.len(), 1, "one reservation row survives replay");
+    assert_eq!(
+        reservations[0].expires_at_unix_seconds,
+        Some(NOW + 60),
+        "replay must not renew the TTL"
+    );
+}
+
+#[test]
+fn release_resources_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let claim = CommandBody::ClaimResources {
+        resources: vec![branch_res()],
+        ttl_seconds: 60,
+    };
+    accepted(&handle_command(&store, &config(), &req("rrs1", claim), NOW).unwrap());
+    let release = req(
+        "rrs2",
+        CommandBody::ReleaseResources {
+            resources: vec![branch_res()],
+        },
+    );
+    let d = assert_replay_locked(&store, &release, NOW, NOW);
+    match &d {
+        CommandDecision::Accepted {
+            effect: CommandEffect::ResourcesReleased,
+            ..
+        } => {}
+        other => panic!("expected ResourcesReleased, got {other:?}"),
+    }
+    assert!(
+        store.transact(|tx| tx.reservations()).unwrap().is_empty(),
+        "replay must not resurrect the reservation"
+    );
+}
+
+#[test]
+fn acknowledge_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ak1"), NOW).unwrap());
+    let ack = req(
+        "ak2",
+        CommandBody::Acknowledge {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            attention_id: "att-1".into(),
+        },
+    );
+    let d = assert_replay_locked(&store, &ack, NOW, NOW);
+    accepted(&d);
+    // The sequence stability asserted inside the helper proves the ack row
+    // was not re-applied; the Work carries no new version either.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 1, "acknowledge never bumps the Work version");
+}
+
+#[test]
+fn judge_findings_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("jf1"), NOW).unwrap());
+    let decisions = vec![FindingDecision {
+        finding_id: "f1".into(),
+        choice: FindingChoice::Fix,
+    }];
+    let judge = req(
+        "jf2",
+        CommandBody::JudgeFindings {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            expected_pr_head: "h1".into(),
+            decisions: decisions.clone(),
+        },
+    );
+    let d = assert_replay_locked(&store, &judge, NOW, NOW);
+    accepted(&d);
+    // A re-decision would be StaleWorkVersion (now version 2) or collide on
+    // the judgment's (work_id, expected_pr_head) primary key.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "replay must not bump to version 3");
+    let (head, recorded) = store
+        .transact(|tx| tx.latest_judgment(&work_id))
+        .unwrap()
+        .expect("judgment recorded");
+    assert_eq!(head, "h1");
+    assert_eq!(
+        serde_json::to_string(&recorded).unwrap(),
+        serde_json::to_string(&decisions).unwrap(),
+        "one judgment with the original decisions"
+    );
+}
+
+#[test]
+fn release_judgment_replays_the_same_decision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rj1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Paused);
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "rj2",
+                CommandBody::JudgeFindings {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    expected_pr_head: "h1".into(),
+                    decisions: vec![FindingDecision {
+                        finding_id: "f1".into(),
+                        choice: FindingChoice::Accept,
+                    }],
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    let release = req(
+        "rj3",
+        CommandBody::ReleaseJudgment {
+            work_id: work_id.clone(),
+            expected_work_version: 2,
+            expected_pr_head: "h1".into(),
+        },
+    );
+    let d = assert_replay_locked(&store, &release, NOW, NOW);
+    accepted(&d);
+    let committed_at = match &d {
+        CommandDecision::Accepted { committed_at, .. } => *committed_at,
+        other => panic!("expected accepted, got {other:?}"),
+    };
+    // Re-deciding now would be StaleWorkVersion (the Work is version 3) or
+    // Ineligible (the Execution is no longer paused).
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 3, "replay must not bump to version 4");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Queued);
+    assert_eq!(
+        e.enqueued_seq, committed_at,
+        "replay must not requeue with a fresh sequence"
     );
 }

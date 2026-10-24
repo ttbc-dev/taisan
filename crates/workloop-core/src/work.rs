@@ -32,32 +32,31 @@ pub fn handle_command(
     let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);
 
     store.transact(|tx| {
-        match tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)? {
-            Some((stored_digest, decision)) => {
-                if stored_digest == digest {
-                    return Ok(decision);
-                }
-                // The original decision keeps the bare key for replay; the
-                // conflict is durable under a payload-derived key. A replay
-                // of the same conflicting payload returns that stored
-                // conflict decision.
-                let conflict_key = format!("{}#{digest}", req.idempotency_key);
-                if let Some((conflict_digest, conflict_decision)) =
-                    tx.stored_decision(&req.origin, &req.actor, &conflict_key)?
-                    && conflict_digest == digest
-                {
-                    return Ok(conflict_decision);
-                }
-                let decision = rejected(
-                    tx,
-                    RejectionCode::IdempotencyConflict,
-                    req.body.work_id().cloned(),
-                    vec!["same idempotency key with a different payload".into()],
-                )?;
-                tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
+        if let Some((stored_digest, decision)) =
+            tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)?
+        {
+            if stored_digest == digest {
                 return Ok(decision);
             }
-            None => {}
+            // The original decision keeps the bare key for replay; the
+            // conflict is durable under a payload-derived key. A replay
+            // of the same conflicting payload returns that stored
+            // conflict decision.
+            let conflict_key = format!("{}#{digest}", req.idempotency_key);
+            if let Some((conflict_digest, conflict_decision)) =
+                tx.stored_decision(&req.origin, &req.actor, &conflict_key)?
+                && conflict_digest == digest
+            {
+                return Ok(conflict_decision);
+            }
+            let decision = rejected(
+                tx,
+                RejectionCode::IdempotencyConflict,
+                req.body.work_id().cloned(),
+                vec!["same idempotency key with a different payload".into()],
+            )?;
+            tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
+            return Ok(decision);
         }
 
         // Re-decide passes let a constraint conflict resolve against fresh
@@ -472,18 +471,18 @@ fn decide_release(
         actor_id: req.actor.external_id.clone(),
     };
     for res in resources {
-        if let Some(existing) = tx.reservation(&res.key())? {
-            if existing.holder != holder {
-                return Ok((
-                    rejected_now(
-                        tx,
-                        RejectionCode::Unauthorized,
-                        None,
-                        vec![serde_json::to_string(&existing).unwrap_or_default()],
-                    ),
-                    vec![],
-                ));
-            }
+        if let Some(existing) = tx.reservation(&res.key())?
+            && existing.holder != holder
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::Unauthorized,
+                    None,
+                    vec![serde_json::to_string(&existing).unwrap_or_default()],
+                ),
+                vec![],
+            ));
         }
     }
     let command_id = CommandId(tx.alloc_id("cmd")?);
@@ -549,18 +548,18 @@ fn decide_retry(
     // Acceptance-time reservation pre-check; dispatch rechecks atomically.
     let resources = work_resources(&work, config);
     for res in &resources {
-        if let Some(existing) = tx.reservation(&res.key())? {
-            if !is_expired(&existing, now_unix_seconds) {
-                return Ok((
-                    rejected_now(
-                        tx,
-                        RejectionCode::ResourceConflict,
-                        Some(work_id.clone()),
-                        vec![serde_json::to_string(&existing).unwrap_or_default()],
-                    ),
-                    vec![],
-                ));
-            }
+        if let Some(existing) = tx.reservation(&res.key())?
+            && !is_expired(&existing, now_unix_seconds)
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::ResourceConflict,
+                    Some(work_id.clone()),
+                    vec![serde_json::to_string(&existing).unwrap_or_default()],
+                ),
+                vec![],
+            ));
         }
     }
     let seq = tx.alloc_seq()?;
@@ -707,18 +706,18 @@ fn decide_cancel(
             vec![],
         ));
     };
-    if let Some(named) = execution_id {
-        if named != &execution.id {
-            return Ok((
-                rejected_now(
-                    tx,
-                    RejectionCode::Ineligible,
-                    Some(work_id.clone()),
-                    vec!["execution_id is not the active Execution".into()],
-                ),
-                vec![],
-            ));
-        }
+    if let Some(named) = execution_id
+        && named != &execution.id
+    {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["execution_id is not the active Execution".into()],
+            ),
+            vec![],
+        ));
     }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);
