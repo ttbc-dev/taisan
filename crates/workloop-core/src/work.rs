@@ -1362,6 +1362,25 @@ fn assess(
                     execution_id: execution.id.clone(),
                 })?;
             }
+            // A terminal settle that deferred on this outstanding effect
+            // may complete now — but only when every writer is already
+            // resolved, so the stop proof is on record (the same rule
+            // drive_stops applies before reporting the exit).
+            let stop_pending = matches!(execution.state, ExecutionState::Stopping)
+                || (execution.state == ExecutionState::Uncertain
+                    && matches!(
+                        execution.desired_action,
+                        Some(DesiredAction::Cancel) | Some(DesiredAction::Fail)
+                    ));
+            if stop_pending {
+                let writers_unresolved = tx
+                    .invocations_for_execution(&execution.id)?
+                    .iter()
+                    .any(|i| i.state.is_unresolved_writer());
+                if !writers_unresolved {
+                    settle_after_writer_gone(tx, config, &execution, now_unix_seconds)?;
+                }
+            }
             Ok(())
         }
         ObservationFact::PrChecks { .. } | ObservationFact::PrReview { .. } => {
@@ -1491,6 +1510,16 @@ fn settle_after_writer_gone(
         .desired_action
         .clone()
         .unwrap_or(DesiredAction::Fail);
+    // Terminal settlement waits for outstanding outbox effects to
+    // reconcile (lifecycle.md): a pending or unknown GitHub write must
+    // not be drained after a recorded cancellation/failure. The
+    // `pr_action_result` observation re-drives this settle once the
+    // intent is resolved.
+    if matches!(desired, DesiredAction::Cancel | DesiredAction::Fail)
+        && !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty()
+    {
+        return Ok(());
+    }
     let mut next = execution.clone();
     let seq = tx.alloc_seq()?;
     let release_reservations = match desired {
@@ -1847,6 +1876,12 @@ fn fail_terminal(
     code: &str,
     detail: &str,
 ) -> Result<(), StoreError> {
+    // Terminal failure also waits for outstanding outbox effects to
+    // reconcile (lifecycle.md); the next sweep or admission pass
+    // re-checks once the intent is resolved.
+    if !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty() {
+        return Ok(());
+    }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Failed;

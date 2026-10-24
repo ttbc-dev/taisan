@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{ArtifactFact, Observation, ObservationFact, ProcessStateFact};
+use workloop_core::observation::{
+    ActionResult, ArtifactFact, Observation, ObservationFact, ProcessStateFact,
+};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -778,14 +780,60 @@ fn cancel_while_waiting_settles_once_no_writer_remains() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(execution(&store, &eid).state, ExecutionState::Waiting);
+    let action_id = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("publish intent recorded")
+        .action_id;
     cancel(&store, &w, "k-w2");
     assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
-    // With no unresolved writer, stop is proven immediately — the
-    // Execution settles instead of waiting for an exit that already
-    // happened.
+    // Stop proof is immediate (no unresolved writer), but the pending
+    // publish intent is an outstanding external effect: the terminal
+    // cancellation waits for its reconciliation instead of releasing
+    // the work under an outbox row the drain would still execute.
     sup.run_once(&store, NOW).unwrap();
     let e = execution(&store, &eid);
-    assert_eq!(e.state, ExecutionState::Cancelled, "stopping settles");
+    assert_eq!(
+        e.state,
+        ExecutionState::Stopping,
+        "terminal settle defers on the outstanding publish intent"
+    );
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!(
+        (slots, reservations),
+        (1, 2),
+        "slot and writer-resource claims stay held while the effect is outstanding"
+    );
+    // The outbox reconciles the intent (the fixture adapter opened the
+    // PR before cancellation was recorded). Only then may the deferred
+    // terminal decision land — cancellation does not undo the PR.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            source_event_id: Some("gh:pr-action-1".into()),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::PrActionResult {
+                action_id,
+                action_kind: "publish_pr".into(),
+                result: ActionResult::Applied,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.state,
+        ExecutionState::Cancelled,
+        "reconciled effect re-drives the deferred settle"
+    );
     let (slots, reservations) = store
         .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
         .unwrap();

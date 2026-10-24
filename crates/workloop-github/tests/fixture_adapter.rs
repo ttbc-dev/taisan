@@ -555,3 +555,195 @@ fn superseded_head_evidence_does_not_complete_the_work() {
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Succeeded);
 }
+
+#[test]
+fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-g9");
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        PrAction::PublishPr {
+            branch: "work/w-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    store
+        .transact(|tx| {
+            let request_id = tx
+                .pending_requests()?
+                .into_iter()
+                .next()
+                .expect("one durable request")
+                .request_id;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-g9".into()),
+                    request_id,
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::GithubWrite);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    // Cancel while the publish intent is still an outstanding effect.
+    let version = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .unwrap()
+        .version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "k-g9-cancel".into(),
+            body: CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "cancel: {d:?}"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Stopping
+    );
+    // Writer stop is proven (the Invocation is Done): the exit fact
+    // reaches settle, which must defer — the pending publish would be
+    // drained by the outbox after a recorded cancellation otherwise.
+    let gh = FixtureGithub::new();
+    gh.emit(
+        &store,
+        &config(),
+        Observation {
+            source_event_id: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId("inv-g9".into()),
+                process_identity: String::new(),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Stopping,
+        "terminal settlement defers while the publish intent is outstanding"
+    );
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    // The outbox drains the intent: the PR opens, its result
+    // reconciles the row, and the deferred cancellation lands only
+    // after that reconciliation.
+    let mut gh = gh;
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Cancelled,
+        "reconciled outbox result re-drives the deferred terminal settle"
+    );
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!((slots, reservations), (0, 0), "terminal release");
+}
+
+#[test]
+fn budget_failure_waits_for_the_outstanding_outbox_effect() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-g10");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        PrAction::PublishPr {
+            branch: "work/w-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.invocations_used = e.budget.max_invocations;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    // The budget is exhausted, but the work still has an outstanding
+    // outbox effect: the terminal failure defers to reconciliation
+    // (lifecycle.md) instead of recording failure under a pending PR
+    // write the drain would still execute.
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Queued,
+        "terminal failure defers while the publish intent is outstanding"
+    );
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    // Once the outbox reconciles the intent, the next admission pass
+    // records the exhausted budget.
+    let mut gh = FixtureGithub::new();
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Failed,
+        "reconciled effect lets the deferred budget failure land"
+    );
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+}
