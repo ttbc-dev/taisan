@@ -481,6 +481,28 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn latest_pr_head(&self, work_id: &WorkId) -> Result<Option<PrHeadSha>, StoreError> {
+        // Order by observed time (tie-break insertion id), not insertion
+        // order: a delayed webhook for an older head must never become the
+        // current head. Subject may be the Work or one of its Executions.
+        let facts = self.query_all(
+            "SELECT fact FROM observations \
+             WHERE subject_work_id = ?1 \
+                OR subject_execution_id IN (SELECT id FROM executions WHERE work_id = ?1) \
+             ORDER BY observed_unix_seconds DESC, id DESC",
+            params![work_id.0],
+            |row| row.get::<_, String>(0),
+        )?;
+        for fact in facts {
+            let parsed: workloop_core::observation::ObservationFact =
+                serde_json::from_str(&fact).map_err(internal)?;
+            if let workloop_core::observation::ObservationFact::PrHead { head_sha, .. } = parsed {
+                return Ok(Some(head_sha));
+            }
+        }
+        Ok(None)
+    }
+
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
         let s: Option<i64> = self
             .tx

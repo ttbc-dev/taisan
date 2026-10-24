@@ -647,6 +647,56 @@ fn decide_resume(
             vec![],
         ));
     }
+    // A spent budget is terminal, not requeueable: `queued` or `paused` with
+    // the bound exhausted goes to `failed` with the limit recorded. The
+    // shared predicate keeps this entry point on the same rule as
+    // dispatch-time admission.
+    if let Some(limit) = execution.budget_exhaustion(&InvocationRole::Coding) {
+        let seq = tx.alloc_seq()?;
+        let command_id = CommandId(tx.alloc_id("cmd")?);
+        let mut next = execution.clone();
+        next.state = ExecutionState::Failed;
+        next.terminal_code = Some(limit.terminal_code().to_string());
+        next.outcome = Some(Outcome {
+            state: ExecutionState::Failed,
+            code: Some(limit.terminal_code().to_string()),
+            detail: Some(limit.detail()),
+            evidence_refs: vec![],
+            recorded_seq: seq,
+        });
+        return Ok((
+            CommandDecision::Accepted {
+                command_id,
+                work_id: Some(work_id.clone()),
+                work_version: Some(work.version + 1),
+                effect: CommandEffect::StateChanged,
+                committed_at: seq,
+            },
+            vec![
+                Effect::BumpWorkVersion {
+                    work_id: work_id.clone(),
+                    expected: work.version,
+                    next: work.version + 1,
+                },
+                Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: ExecutionState::Paused,
+                },
+                Effect::ReleaseSlot {
+                    execution_id: execution.id.clone(),
+                },
+                Effect::DeleteReservations {
+                    resource_keys: resources_keys_of(tx, &work, &execution)?,
+                    holder: ReservationHolder::Execution {
+                        execution_id: execution.id.clone(),
+                    },
+                },
+                Effect::ClearDeferral {
+                    execution_id: execution.id.clone(),
+                },
+            ],
+        ));
+    }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Queued;
@@ -933,6 +983,31 @@ fn decide_judge(
             ));
         }
     }
+    // The judgment's head must equal the latest head observed in persisted
+    // evidence: a caller-supplied head with no observation is unverifiable,
+    // and a stale one is not the head this judgment is about.
+    let Some(observed) = tx.latest_pr_head(work_id)? else {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::SourceUnavailable,
+                Some(work_id.clone()),
+                vec![format!("no observed PR head for {}", work_id.0)],
+            ),
+            vec![],
+        ));
+    };
+    if observed != expected_pr_head {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec![observed],
+            ),
+            vec![],
+        ));
+    }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
@@ -1018,6 +1093,31 @@ fn decide_release_judgment(
             vec![],
         ));
     }
+    // A recorded judgment alone is not sufficient: the head must also be
+    // the one still observed, or the world moved after the judgment and the
+    // pause must not release against a head the operator never saw.
+    let Some(observed) = tx.latest_pr_head(work_id)? else {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::SourceUnavailable,
+                Some(work_id.clone()),
+                vec![format!("no observed PR head for {}", work_id.0)],
+            ),
+            vec![],
+        ));
+    };
+    if observed != expected_pr_head {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec![observed],
+            ),
+            vec![],
+        ));
+    }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Queued;
@@ -1066,6 +1166,26 @@ pub fn admit_queued(
     execution_id: &ExecutionId,
     now_unix_seconds: i64,
 ) -> Result<Option<Execution>, StoreError> {
+    admit_queued_role(
+        tx,
+        config,
+        execution_id,
+        InvocationRole::Coding,
+        now_unix_seconds,
+    )
+}
+
+/// Admission for one Invocation role: the single seam every request creation
+/// passes, so the budget bounds are enforced no matter which caller emits
+/// the request. A Review admission consumes both counters; a Coding one
+/// consumes only `invocations_used`.
+pub fn admit_queued_role(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution_id: &ExecutionId,
+    role: InvocationRole,
+    now_unix_seconds: i64,
+) -> Result<Option<Execution>, StoreError> {
     let Some(execution) = tx.execution(execution_id)? else {
         return Ok(None);
     };
@@ -1077,6 +1197,42 @@ pub fn admit_queued(
         .ok_or_else(|| StoreError::Internal {
             detail: format!("execution {} has no work", execution.id.0),
         })?;
+
+    // Budget gate first, before any reservation, deferral, or slot effect:
+    // a spent bound is terminal for this Execution and must not be preceded
+    // by partial mutation. No counter increments and no request is emitted.
+    if !execution.accepts_invocation(&role) {
+        if let Some(limit) = execution.budget_exhaustion(&role) {
+            let seq = tx.alloc_seq()?;
+            let mut next = execution.clone();
+            next.state = ExecutionState::Failed;
+            next.terminal_code = Some(limit.terminal_code().to_string());
+            next.outcome = Some(Outcome {
+                state: ExecutionState::Failed,
+                code: Some(limit.terminal_code().to_string()),
+                detail: Some(limit.detail()),
+                evidence_refs: vec![],
+                recorded_seq: seq,
+            });
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: ExecutionState::Queued,
+            })?;
+            tx.apply(&Effect::ReleaseSlot {
+                execution_id: execution.id.clone(),
+            })?;
+            tx.apply(&Effect::DeleteReservations {
+                resource_keys: resources_keys_of(tx, &work, &execution)?,
+                holder: ReservationHolder::Execution {
+                    execution_id: execution.id.clone(),
+                },
+            })?;
+            tx.apply(&Effect::ClearDeferral {
+                execution_id: execution.id.clone(),
+            })?;
+        }
+        return Ok(None);
+    }
 
     // Atomic recheck: another writer may have claimed since acceptance. A
     // resumed Execution retains its own reservations; only a foreign holder
@@ -1122,12 +1278,15 @@ pub fn admit_queued(
         request_id: format!("{}:inv:{}", execution.id.0, execution.invocations_used),
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
-        role: InvocationRole::Coding,
+        role: role.clone(),
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
     next.invocations_used += 1;
+    if role == InvocationRole::Review {
+        next.review_rounds_used += 1;
+    }
     // The first dispatch anchors the runtime budget; re-admission retains it.
     if next.started_seq.is_none() {
         next.started_seq = Some(seq);

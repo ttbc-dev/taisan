@@ -216,6 +216,12 @@ pub trait ReadView {
         work_id: &WorkId,
     ) -> Result<Option<(PrHeadSha, Vec<crate::command::FindingDecision>)>, StoreError>;
 
+    /// Latest PR head observed for a Work, ordered by observed time so a
+    /// delayed delivery for an older head cannot move the head backward.
+    /// Judge/release decisions read provenance from this persisted
+    /// evidence, never from the caller's supplied head alone.
+    fn latest_pr_head(&self, work_id: &WorkId) -> Result<Option<PrHeadSha>, StoreError>;
+
     fn last_seq(&self) -> Result<EventSequence, StoreError>;
 }
 

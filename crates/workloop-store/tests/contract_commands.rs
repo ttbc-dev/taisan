@@ -2,7 +2,7 @@
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::Outcome;
+use workloop_core::observation::{Observation, ObservationFact, Outcome};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_store::sqlite::SqliteStore;
@@ -19,6 +19,10 @@ fn config() -> WorkloopConfig {
         },
         budget: ExecutionBudget::default(),
     }
+}
+
+fn config_with_budget(budget: ExecutionBudget) -> WorkloopConfig {
+    WorkloopConfig { budget, ..config() }
 }
 
 fn actor() -> Actor {
@@ -122,6 +126,48 @@ fn force_state(store: &SqliteStore, id: &ExecutionId, to: ExecutionState) {
         &[Effect::UpdateExecution {
             execution: e,
             expected_state: from,
+        }],
+    );
+}
+
+/// Record the persisted PR-head evidence `judge_findings` and
+/// `release_judgment` must compare against — the adapter's Observation.
+fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i64) {
+    apply_effects(
+        store,
+        &[Effect::InsertObservation {
+            observation: Observation {
+                source_event_id: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::PrHead {
+                    repository: "local/repo".into(),
+                    number: 1,
+                    head_sha: sha.into(),
+                },
+                observed_unix_seconds: observed_at,
+            },
+        }],
+    );
+}
+
+/// Same evidence recorded against one of the Work's Executions instead of
+/// the Work itself; `latest_pr_head` must resolve it either way.
+fn seed_pr_head_for_execution(store: &SqliteStore, execution_id: &ExecutionId, sha: &str) {
+    apply_effects(
+        store,
+        &[Effect::InsertObservation {
+            observation: Observation {
+                source_event_id: None,
+                subject_work_id: None,
+                subject_execution_id: Some(execution_id.clone()),
+                fact: ObservationFact::PrHead {
+                    repository: "local/repo".into(),
+                    number: 1,
+                    head_sha: sha.into(),
+                },
+                observed_unix_seconds: NOW,
+            },
         }],
     );
 }
@@ -585,6 +631,8 @@ fn release_judgment_requires_a_matching_recorded_judgment() {
     let d = handle_command(&store, &config(), &req("j2", release("h1", 1)), NOW).unwrap();
     assert_eq!(reject_reason(&d), RejectionCode::Ineligible);
 
+    // The adapter must record the head before a judgment may bind to it.
+    seed_pr_head(&store, &work_id, "h1", NOW);
     accepted(
         &handle_command(
             &store,
@@ -968,6 +1016,7 @@ fn judge_findings_replays_the_same_decision() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("jf1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
     let decisions = vec![FindingDecision {
         finding_id: "f1".into(),
         choice: FindingChoice::Fix,
@@ -1008,6 +1057,7 @@ fn release_judgment_replays_the_same_decision() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("rj1"), NOW).unwrap());
     force_state(&store, &e1, ExecutionState::Paused);
+    seed_pr_head(&store, &work_id, "h1", NOW);
     accepted(
         &handle_command(
             &store,
@@ -1055,4 +1105,416 @@ fn release_judgment_replays_the_same_decision() {
         e.enqueued_seq, committed_at,
         "replay must not requeue with a fresh sequence"
     );
+}
+
+// ---- Converge round 3: invocation-budget bounds + PR-head provenance ----
+
+fn budget_config(max_invocations: u32, max_review_rounds: u32) -> WorkloopConfig {
+    config_with_budget(ExecutionBudget {
+        max_invocations,
+        max_review_rounds,
+        ..ExecutionBudget::default()
+    })
+}
+
+fn judge_req(key: &str, work_id: &WorkId, version: u64, head: &str) -> CommandRequest {
+    req(
+        key,
+        CommandBody::JudgeFindings {
+            work_id: work_id.clone(),
+            expected_work_version: version,
+            expected_pr_head: head.into(),
+            decisions: vec![FindingDecision {
+                finding_id: "f1".into(),
+                choice: FindingChoice::Fix,
+            }],
+        },
+    )
+}
+
+fn rejection_evidence(d: &CommandDecision) -> Vec<String> {
+    match d {
+        CommandDecision::Rejected { evidence, .. } => evidence.clone(),
+        other => panic!("expected rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn admission_never_exceeds_max_invocations() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(1, 5);
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("b1"), NOW).unwrap());
+
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW)?.is_some(),
+                "first admission is within budget"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(read_execution(&store, &e1).invocations_used, 1);
+
+    // Back to the queue as a resume/retry sweep would leave it; the budget
+    // is now spent and the next admission must fail terminally.
+    force_state(&store, &e1, ExecutionState::Queued);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_none(),
+                "budget-spent admission must not emit a second request"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+    assert_eq!(e.invocations_used, 1, "no counter increment past the bound");
+    let outcome = e.outcome.expect("budget failure records an Outcome");
+    assert_eq!(outcome.state, ExecutionState::Failed);
+    assert_eq!(outcome.code.as_deref(), Some("invocation_budget_exhausted"));
+
+    let (slots, reservations, requests) = store
+        .transact(|tx| {
+            Ok((
+                tx.slot_holders()?.len(),
+                tx.reservations()?.len(),
+                tx.pending_requests()?.len(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(slots, 0, "the slot is released");
+    assert_eq!(reservations, 0, "self-held reservations are released");
+    assert_eq!(requests, 1, "exactly one request was ever inserted");
+}
+
+#[test]
+fn resume_fails_when_invocation_budget_exhausted() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(1, 5);
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("rb1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config, &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+
+    let resume = req(
+        "rb2",
+        CommandBody::Resume {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: e1.clone(),
+        },
+    );
+    let d = assert_replay_locked(&store, &resume, NOW, NOW);
+    match &d {
+        CommandDecision::Accepted { work_version, .. } => {
+            assert_eq!(*work_version, Some(2), "the Command commits one bump");
+        }
+        other => panic!("expected accepted, got {other:?}"),
+    }
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Failed,
+        "a spent budget must fail, not requeue"
+    );
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+    assert!(e.outcome.is_some(), "terminal code plus recorded Outcome");
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "replay must not bump the version again");
+    let reservations = store.transact(|tx| tx.reservations()).unwrap();
+    assert!(
+        reservations.is_empty(),
+        "the failed resume releases the Execution's reservations"
+    );
+}
+
+#[test]
+fn review_admission_never_exceeds_max_review_rounds() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(3, 1);
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("rv1"), NOW).unwrap());
+
+    store
+        .transact(|tx| {
+            let admitted = workloop_core::work::admit_queued_role(
+                tx,
+                &config,
+                &e1,
+                InvocationRole::Review,
+                NOW,
+            )?;
+            assert!(admitted.is_some(), "first review round is within budget");
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Ready);
+    assert_eq!(
+        e.invocations_used, 1,
+        "a review admission consumes an invocation"
+    );
+    assert_eq!(e.review_rounds_used, 1, "and one review round");
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].role, InvocationRole::Review);
+    assert_eq!(requests[0].request_id, format!("{}:inv:0", e1.0));
+
+    force_state(&store, &e1, ExecutionState::Queued);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued_role(
+                    tx,
+                    &config,
+                    &e1,
+                    InvocationRole::Review,
+                    NOW + 10,
+                )?
+                .is_none(),
+                "the spent review bound must fail admission"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(e.terminal_code.as_deref(), Some("review_budget_exhausted"));
+    assert_eq!(e.invocations_used, 1, "invocation budget still has room");
+    assert_eq!(e.review_rounds_used, 1, "no round counted past the bound");
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(requests.len(), 1, "no second review request");
+}
+
+#[test]
+fn judge_rejects_head_with_no_observation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("jn1"), NOW).unwrap());
+
+    let d = handle_command(&store, &config(), &judge_req("jn2", &work_id, 1, "h1"), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::SourceUnavailable);
+    assert!(
+        rejection_evidence(&d)
+            .iter()
+            .any(|e| e.contains(&work_id.0)),
+        "evidence names the Work with no observed head"
+    );
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 1, "an unverifiable head bumps nothing");
+    assert!(
+        store
+            .transact(|tx| tx.latest_judgment(&work_id))
+            .unwrap()
+            .is_none(),
+        "no judgment row is written"
+    );
+}
+
+#[test]
+fn judge_rejects_arbitrary_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ja1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+
+    let d = handle_command(&store, &config(), &judge_req("ja2", &work_id, 1, "h2"), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
+    assert_eq!(
+        rejection_evidence(&d),
+        vec!["h1".to_string()],
+        "evidence names the observed head"
+    );
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 1, "a stale-head judgment bumps nothing");
+    assert!(
+        store
+            .transact(|tx| tx.latest_judgment(&work_id))
+            .unwrap()
+            .is_none(),
+        "no judgment row is written"
+    );
+}
+
+#[test]
+fn judge_accepts_the_observed_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("jc1"), NOW).unwrap());
+    // The adapter recorded the head against the Execution; the provenance
+    // read must resolve it through the Work either way.
+    seed_pr_head_for_execution(&store, &e1, "h1");
+
+    let d = handle_command(&store, &config(), &judge_req("jc2", &work_id, 1, "h1"), NOW).unwrap();
+    accepted(&d);
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2);
+    let (head, _) = store
+        .transact(|tx| tx.latest_judgment(&work_id))
+        .unwrap()
+        .expect("judgment recorded");
+    assert_eq!(head, "h1", "the judgment carries the observed head");
+}
+
+#[test]
+fn release_rejects_head_changed_after_judgment() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("hc1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+    accepted(
+        &handle_command(&store, &config(), &judge_req("hc2", &work_id, 1, "h1"), NOW).unwrap(),
+    );
+    // The PR moves after the judgment was accepted.
+    seed_pr_head(&store, &work_id, "h2", NOW + 10);
+    force_state(&store, &e1, ExecutionState::Paused);
+
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "hc3",
+            CommandBody::ReleaseJudgment {
+                work_id: work_id.clone(),
+                expected_work_version: 2,
+                expected_pr_head: "h1".into(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
+    assert_eq!(
+        rejection_evidence(&d),
+        vec!["h2".to_string()],
+        "evidence names the head that moved"
+    );
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Paused,
+        "a stale-head release never requeues"
+    );
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("work exists");
+    assert_eq!(work.version, 2, "no version bump for the rejection");
+}
+
+#[test]
+fn stale_head_observation_cannot_move_head_backward() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sb1"), NOW).unwrap());
+    // A delayed delivery for the older head arrives after the newer one.
+    seed_pr_head(&store, &work_id, "h2", NOW + 10);
+    seed_pr_head(&store, &work_id, "h1", NOW + 5);
+
+    let d = handle_command(
+        &store,
+        &config(),
+        &judge_req("sb2", &work_id, 1, "h2"),
+        NOW + 10,
+    )
+    .unwrap();
+    accepted(&d); // the newest observed head judges fine
+
+    let d = handle_command(
+        &store,
+        &config(),
+        &judge_req("sb3", &work_id, 2, "h1"),
+        NOW + 15,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
+    assert_eq!(
+        rejection_evidence(&d),
+        vec!["h2".to_string()],
+        "the delayed h1 observation never becomes the current head"
+    );
+}
+
+#[test]
+fn admission_rolls_back_on_request_persistence_failure() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pf1"), NOW).unwrap());
+    // Occupy the request ID admission will derive from invocations_used = 0.
+    apply_effects(
+        &store,
+        &[Effect::InsertRequest {
+            request: InvocationRequest {
+                request_id: format!("{}:inv:0", e1.0),
+                work_id: work_id.clone(),
+                execution_id: e1.clone(),
+                role: InvocationRole::Coding,
+                payload: serde_json::json!({}),
+            },
+        }],
+    );
+
+    let result = store.transact(|tx| {
+        workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?;
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "a conflicting request ID aborts the admission transaction"
+    );
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Queued, "nothing committed");
+    assert_eq!(
+        e.invocations_used, 0,
+        "no counter committed without the request"
+    );
+    let (slots, reservations, requests) = store
+        .transact(|tx| {
+            Ok((
+                tx.slot_holders()?.len(),
+                tx.reservations()?.len(),
+                tx.pending_requests()?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(slots, 0, "no slot claim committed");
+    assert_eq!(reservations, 0, "no reservation committed");
+    assert_eq!(requests.len(), 1, "only the pre-inserted row remains");
+    assert_eq!(requests[0].request_id, format!("{}:inv:0", e1.0));
 }
