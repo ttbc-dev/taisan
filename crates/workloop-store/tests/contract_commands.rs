@@ -484,7 +484,10 @@ fn judgments_bind_to_the_recorded_head() {
     };
     // Nothing recorded to judge against: an unverified head cannot be
     // accepted.
-    assert_eq!(reject_reason(&judge("j2", "sha-x", 1)), RejectionCode::StalePrHead);
+    assert_eq!(
+        reject_reason(&judge("j2", "sha-x", 1)),
+        RejectionCode::StalePrHead
+    );
     emit_head("sha-x");
     // A judgment for a different head than the recorded one is stale.
     assert_eq!(

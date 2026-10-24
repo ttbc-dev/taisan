@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{
-    ArtifactFact, Observation, ObservationFact, ProcessStateFact,
-};
+use workloop_core::observation::{ArtifactFact, Observation, ObservationFact, ProcessStateFact};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
