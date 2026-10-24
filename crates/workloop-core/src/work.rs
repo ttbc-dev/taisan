@@ -748,6 +748,9 @@ fn decide_cancel(
                         execution: next,
                         expected_state: ExecutionState::Queued,
                     },
+                    Effect::ReleaseSlot {
+                        execution_id: execution.id.clone(),
+                    },
                     Effect::ClearDeferral {
                         execution_id: execution.id.clone(),
                     },

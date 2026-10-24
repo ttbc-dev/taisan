@@ -420,6 +420,11 @@ fn cancel_queued_releases_the_resumed_executions_reservations() {
         reservations.is_empty(),
         "cancelled execution released its reservations"
     );
+    let slots = store.transact(|tx| tx.slot_holders()).unwrap();
+    assert!(
+        slots.is_empty(),
+        "cancelled execution released its capacity slot"
+    );
 }
 
 #[test]
