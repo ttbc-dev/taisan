@@ -12,7 +12,9 @@ use crate::observation::{
     ActionResult, ArtifactFact, CheckConclusion, Observation, ObservationFact, Outcome,
     ProcessStateFact, ReviewVerdict,
 };
-use crate::store::{Effect, PrActionIntent, PrActionStatus, ReadView, Store, StoreError, TxView};
+use crate::store::{
+    Effect, PrAction, PrActionIntent, PrActionStatus, ReadView, Store, StoreError, TxView,
+};
 
 /// Installation-level configuration supplied by the composition root.
 #[derive(Debug, Clone)]
@@ -710,12 +712,14 @@ fn decide_cancel(
         expected: work.version,
         next: work.version + 1,
     };
-    let accept = |effects: Vec<Effect>| {
+    // A no-op arm reports the stored version — returning a version the
+    // commit did not produce would strand the caller's next precondition.
+    let accept = |effects: Vec<Effect>, next_version: u64| {
         (
             CommandDecision::Accepted {
                 command_id: command_id.clone(),
                 work_id: Some(work_id.clone()),
-                work_version: Some(work.version + 1),
+                work_version: Some(next_version),
                 effect: CommandEffect::StateChanged,
                 committed_at: seq,
             },
@@ -734,16 +738,28 @@ fn decide_cancel(
                 evidence_refs: vec![],
                 recorded_seq: seq,
             });
-            Ok(accept(vec![
-                bump,
-                Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: ExecutionState::Queued,
-                },
-                Effect::ClearDeferral {
-                    execution_id: execution.id.clone(),
-                },
-            ]))
+            // A resumed Execution is requeued while retaining its
+            // reservations; cancelling it must release them here —
+            // execution-held claims have no TTL to reclaim them later.
+            Ok(accept(
+                vec![
+                    bump,
+                    Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: ExecutionState::Queued,
+                    },
+                    Effect::ClearDeferral {
+                        execution_id: execution.id.clone(),
+                    },
+                    Effect::DeleteReservations {
+                        resource_keys: resources_keys_of(tx, &work, &execution)?,
+                        holder: ReservationHolder::Execution {
+                            execution_id: execution.id.clone(),
+                        },
+                    },
+                ],
+                work.version + 1,
+            ))
         }
         ExecutionState::Paused => {
             // No writer can act: direct cancellation, reservation released.
@@ -757,53 +773,75 @@ fn decide_cancel(
                 evidence_refs: vec![],
                 recorded_seq: seq,
             });
-            Ok(accept(vec![
-                bump,
-                Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: ExecutionState::Paused,
-                },
-                Effect::DeleteReservations {
-                    resource_keys: resources_keys_of(tx, &work, &execution)?,
-                    holder: ReservationHolder::Execution {
-                        execution_id: execution.id.clone(),
+            Ok(accept(
+                vec![
+                    bump,
+                    Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: ExecutionState::Paused,
                     },
-                },
-            ]))
+                    Effect::DeleteReservations {
+                        resource_keys: resources_keys_of(tx, &work, &execution)?,
+                        holder: ReservationHolder::Execution {
+                            execution_id: execution.id.clone(),
+                        },
+                    },
+                ],
+                work.version + 1,
+            ))
         }
         ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
             let mut next = execution.clone();
             next.state = ExecutionState::Stopping;
             next.desired_action = Some(DesiredAction::Cancel);
-            Ok(accept(vec![
-                bump,
-                Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: execution.state.clone(),
-                },
-            ]))
+            Ok(accept(
+                vec![
+                    bump,
+                    Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: execution.state.clone(),
+                    },
+                ],
+                work.version + 1,
+            ))
         }
         ExecutionState::Uncertain => {
             if execution.desired_action == Some(DesiredAction::Continue) {
                 let mut next = execution.clone();
                 next.desired_action = Some(DesiredAction::Cancel);
-                Ok(accept(vec![
-                    bump,
-                    Effect::UpdateExecution {
-                        execution: next,
-                        expected_state: ExecutionState::Uncertain,
-                    },
-                ]))
+                Ok(accept(
+                    vec![
+                        bump,
+                        Effect::UpdateExecution {
+                            execution: next,
+                            expected_state: ExecutionState::Uncertain,
+                        },
+                    ],
+                    work.version + 1,
+                ))
             } else {
                 // Desired fail/cancel already in progress: accepted no-op.
-                Ok(accept(vec![]))
+                Ok(accept(vec![], work.version))
             }
         }
-        ExecutionState::Stopping => Ok(accept(vec![])),
+        ExecutionState::Stopping => Ok(accept(vec![], work.version)),
         ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Cancelled => {
-            Ok(accept(vec![]))
+            Ok(accept(vec![], work.version))
         }
     }
+}
+
+/// The newest recorded `pr_head` for a Work — the head Commands and
+/// completion evidence are measured against.
+fn latest_pr_head(tx: &dyn ReadView, work_id: &WorkId) -> Result<Option<String>, StoreError> {
+    Ok(tx
+        .observations_for_work(work_id)?
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
+            ObservationFact::PrHead { head_sha, .. } => Some(head_sha.clone()),
+            _ => None,
+        }))
 }
 
 fn resources_keys_of(
@@ -870,6 +908,19 @@ fn decide_judge(
             return Ok((d, vec![]));
         }
     };
+    // The judgment is bound to the recorded current head; a stale or
+    // unverified head cannot authorize decisions on the new one.
+    if latest_pr_head(tx, work_id)?.as_deref() != Some(expected_pr_head) {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec!["expected_pr_head does not match the recorded head".into()],
+            ),
+            vec![],
+        ));
+    }
     if decisions.is_empty() {
         return Ok((
             rejected_now(
@@ -941,7 +992,7 @@ fn decide_release_judgment(
     tx: &mut dyn TxView,
     work_id: &WorkId,
     expected_version: WorkVersion,
-    _expected_pr_head: &str,
+    expected_pr_head: &str,
 ) -> Verdict {
     // Releases the human gate: valid on a paused Execution, requeues it.
     let work = match check_work(tx, work_id, expected_version)? {
@@ -969,6 +1020,34 @@ fn decide_release_judgment(
                 RejectionCode::Ineligible,
                 Some(work_id.clone()),
                 vec!["release_judgment requires a paused Execution".into()],
+            ),
+            vec![],
+        ));
+    }
+    // The gate opens only for a recorded judgment on the head the caller
+    // names, and only while that head is still the recorded current one.
+    if latest_pr_head(tx, work_id)?.as_deref() != Some(expected_pr_head) {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec!["expected_pr_head does not match the recorded head".into()],
+            ),
+            vec![],
+        ));
+    }
+    if !tx
+        .judgments(work_id)?
+        .iter()
+        .any(|(head, _)| head == expected_pr_head)
+    {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no recorded judgment for expected_pr_head".into()],
             ),
             vec![],
         ));
@@ -1539,6 +1618,17 @@ fn maybe_publish(
     if !outstanding.is_empty() {
         return Ok(());
     }
+    // An already-recorded publish intent covers this Work — applied,
+    // pending, or unresolved — so a repeated artifact observation must
+    // not queue a second PR. Only a failed intent lets a fresh pass
+    // re-issue after repair.
+    if tx.action_intents()?.iter().any(|i| {
+        i.work_id == execution.work_id
+            && matches!(i.action, PrAction::PublishPr { .. })
+            && i.status != PrActionStatus::Failed
+    }) {
+        return Ok(());
+    }
     let work = tx
         .work(&execution.work_id)?
         .ok_or_else(|| StoreError::Internal {
@@ -1555,7 +1645,7 @@ fn maybe_publish(
             action_id,
             work_id: work.id.clone(),
             repository,
-            action: crate::store::PrAction::PublishPr {
+            action: PrAction::PublishPr {
                 branch: format!("work/{}", work.id.0),
                 title: work.intent.chars().take(70).collect(),
                 body: String::new(),
@@ -1571,10 +1661,30 @@ fn maybe_publish(
     })
 }
 
-/// `succeeded` requires check + review evidence covering the same current
-/// head and no unresolved writer, gate, or outgoing action.
+/// `succeeded` requires an applied `publish_pr` intent, the latest check +
+/// review evidence covering the current head, and no unresolved writer,
+/// gate, or outgoing action.
 fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), StoreError> {
     if execution.state != ExecutionState::Waiting {
+        return Ok(());
+    }
+    // An unresolved writer may still act — its later evidence, not this
+    // stale pass, owns the completion decision.
+    if tx
+        .invocations_for_execution(&execution.id)?
+        .iter()
+        .any(|i| i.state.is_unresolved_writer())
+    {
+        return Ok(());
+    }
+    // Completion means the change was published as one PR; success
+    // evidence before (or without) an applied publish intent is early.
+    let published = tx.action_intents()?.iter().any(|i| {
+        i.work_id == execution.work_id
+            && matches!(i.action, PrAction::PublishPr { .. })
+            && i.status == PrActionStatus::Applied
+    });
+    if !published {
         return Ok(());
     }
     let observations = tx.observations_for_work(&execution.work_id)?;
@@ -1583,26 +1693,30 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         _ => None,
     });
     let Some(head) = head else { return Ok(()) };
-    let checks_ok = observations.iter().any(|o| {
-        matches!(
-            &o.fact,
+    // Only the latest check and review recorded for the current head
+    // count — a superseded approval must not complete the work.
+    let checks_ok = observations
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
             ObservationFact::PrChecks {
                 head_sha,
-                conclusion: CheckConclusion::Success,
+                conclusion,
                 ..
-            } if head_sha == &head
-        )
-    });
-    let review_ok = observations.iter().any(|o| {
-        matches!(
-            &o.fact,
+            } if head_sha == &head => Some(conclusion == &CheckConclusion::Success),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let review_ok = observations
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
             ObservationFact::PrReview {
-                head_sha,
-                verdict: ReviewVerdict::Approve,
-                ..
-            } if head_sha == &head
-        )
-    });
+                head_sha, verdict, ..
+            } if head_sha == &head => Some(verdict == &ReviewVerdict::Approve),
+            _ => None,
+        })
+        .unwrap_or(false);
     if !(checks_ok && review_ok) {
         return Ok(());
     }

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact};
+use workloop_core::observation::{
+    ArtifactFact, Observation, ObservationFact, ProcessStateFact,
+};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -522,6 +524,69 @@ fn missing_artifact_runs_bounded_recovery_then_fails() {
         .unwrap()
         .unwrap();
     assert_eq!(e2.state, ExecutionState::Queued);
+}
+
+#[test]
+fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("recvroot");
+    let (work_id, eid) = submit_and_admit(&store, "k-rr1");
+    let sup = supervisor("exit-no-artifact", root);
+    // A finished writer whose artifact recovery is in flight.
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-rr1".into()),
+                    request_id,
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::ArtifactRecovery);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    // The artifact reappears at the workspace root itself: promoting it
+    // must not copy the file onto itself and report a truncated file.
+    let workspace = sup.workspace_of(&work_id);
+    workloop_exec::supervisor::write_artifact(&workspace.join("artifact.json"), "payload").unwrap();
+    sup.run_recovery(&store, NOW).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("artifact.json")).unwrap(),
+        "payload",
+        "root artifact preserved, not self-truncated"
+    );
+    let present = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    state: ArtifactFact::Present,
+                    ..
+                }
+            )
+        });
+    assert!(present, "verified artifact reported present");
 }
 
 // ---- Clean exit drives the publish intent ----

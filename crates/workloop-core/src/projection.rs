@@ -317,6 +317,7 @@ pub fn work_detail(
     if let Some(e) = &current {
         attention = derive_attention(tx, work_id, e, now_unix_seconds)?;
     }
+    let outcome = current.as_ref().and_then(|e| e.outcome.clone());
 
     // Current PR head is the newest pr_head Observation for this Work; the
     // actionable findings are review facts bound to that head.
@@ -392,7 +393,7 @@ pub fn work_detail(
             executions,
             current_pr,
             findings,
-            outcome: None,
+            outcome,
             attention,
             evidence,
         },

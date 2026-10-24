@@ -2,7 +2,7 @@
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::Outcome;
+use workloop_core::observation::{Observation, ObservationFact, Outcome};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_store::sqlite::SqliteStore;
@@ -310,6 +310,205 @@ fn cancel_queued_is_terminal_and_second_cancel_is_noop() {
     )
     .unwrap();
     accepted(&d);
+}
+
+#[test]
+fn cancel_noop_reports_the_stored_version() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("n1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    // ready → stopping bumps the version once.
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "n2",
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Stopping);
+    // A repeated cancel while already stopping is an accepted no-op: it
+    // reports the stored version, never one the commit did not produce.
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "n3",
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: 2,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    match &d {
+        CommandDecision::Accepted { work_version, .. } => {
+            assert_eq!(*work_version, Some(2));
+        }
+        other => panic!("expected accepted no-op, got {other:?}"),
+    }
+    let stored = store.transact(|tx| tx.work(&work_id)).unwrap().unwrap();
+    assert_eq!(stored.version, 2, "a no-op produced no version bump");
+}
+
+#[test]
+fn cancel_queued_releases_the_resumed_executions_reservations() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("n4"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    // Pause retains the workspace/branch claims; resume requeues the
+    // Execution still holding them.
+    force_state(&store, &e1, ExecutionState::Paused);
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "n5",
+                CommandBody::Resume {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    execution_id: e1.clone(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+    // Cancelling the requeued Execution must release its retained claims —
+    // execution-held reservations have no TTL.
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "n6",
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: 2,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Cancelled);
+    let reservations = store.transact(|tx| tx.reservations()).unwrap();
+    assert!(
+        reservations.is_empty(),
+        "cancelled execution released its reservations"
+    );
+}
+
+#[test]
+fn judgments_bind_to_the_recorded_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("j1"), NOW).unwrap());
+    let emit_head = |head: &str| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                source_event_id: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact: ObservationFact::PrHead {
+                    repository: "local/repo".into(),
+                    number: 1,
+                    head_sha: head.into(),
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    let judge = |key: &str, head: &str, version: u64| {
+        handle_command(
+            &store,
+            &config(),
+            &req(
+                key,
+                CommandBody::JudgeFindings {
+                    work_id: work_id.clone(),
+                    expected_work_version: version,
+                    expected_pr_head: head.into(),
+                    decisions: vec![FindingDecision {
+                        finding_id: "f1".into(),
+                        choice: FindingChoice::Accept,
+                    }],
+                },
+            ),
+            NOW,
+        )
+        .unwrap()
+    };
+    let release = |key: &str, head: &str, version: u64| {
+        handle_command(
+            &store,
+            &config(),
+            &req(
+                key,
+                CommandBody::ReleaseJudgment {
+                    work_id: work_id.clone(),
+                    expected_work_version: version,
+                    expected_pr_head: head.into(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap()
+    };
+    // Nothing recorded to judge against: an unverified head cannot be
+    // accepted.
+    assert_eq!(reject_reason(&judge("j2", "sha-x", 1)), RejectionCode::StalePrHead);
+    emit_head("sha-x");
+    // A judgment for a different head than the recorded one is stale.
+    assert_eq!(
+        reject_reason(&judge("j3", "sha-old", 1)),
+        RejectionCode::StalePrHead
+    );
+    // The current-head judgment is recorded.
+    accepted(&judge("j4", "sha-x", 1));
+    force_state(&store, &e1, ExecutionState::Paused);
+    // The head moved under the recorded judgment: releasing it is stale.
+    emit_head("sha-y");
+    assert_eq!(
+        reject_reason(&release("j5", "sha-x", 2)),
+        RejectionCode::StalePrHead
+    );
+    // The new head has no recorded judgment yet — the gate stays shut.
+    assert_eq!(
+        reject_reason(&release("j6", "sha-y", 2)),
+        RejectionCode::Ineligible
+    );
+    // A judgment on the current head lets release requeue the Execution.
+    accepted(&judge("j7", "sha-y", 2));
+    accepted(&release("j8", "sha-y", 3));
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
 }
 
 // ---- Reservations ----

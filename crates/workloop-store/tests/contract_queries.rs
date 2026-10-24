@@ -157,6 +157,33 @@ fn work_detail_binds_findings_to_the_current_head() {
 }
 
 #[test]
+fn work_detail_reports_the_terminal_outcome() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "q20", "local/repo", 61);
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "q20-cancel".into(),
+            body: CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    let view = found(store.transact(|tx| work_detail(tx, &work_id, NOW)).unwrap());
+    let outcome = view.outcome.expect("terminal outcome surfaced in detail");
+    assert_eq!(outcome.state, ExecutionState::Cancelled);
+    assert_eq!(outcome.code.as_deref(), Some("cancelled"));
+}
+
+#[test]
 fn attention_versions_and_acknowledgement() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "q4", "local/repo", 9);

@@ -266,6 +266,21 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
+            })?;
+            // Completion requires the published PR: the applied
+            // publish intent the outbox would have produced.
+            tx.apply(&Effect::InsertPrActionIntent {
+                intent: PrActionIntent {
+                    action_id: "act-pub-1".into(),
+                    work_id: work_id.clone(),
+                    repository: "local/repo".into(),
+                    action: PrAction::PublishPr {
+                        branch: "work/w-1".into(),
+                        title: "t".into(),
+                        body: "b".into(),
+                    },
+                    status: PrActionStatus::Applied,
+                },
             })
         })
         .unwrap();
@@ -340,6 +355,166 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
         NOW,
     )
     .unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Succeeded);
+}
+
+#[test]
+fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-g6");
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    // A finished writer whose required artifact is now reported, and the
+    // execution waiting on reconciliation.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-1".into()),
+                    request_id,
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::Reconciliation);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    let mut gh = FixtureGithub::new();
+    let obs = |id: &str| Observation {
+        source_event_id: Some(id.into()),
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact: ObservationFact::Artifact {
+            invocation_id: InvocationId("inv-1".into()),
+            required_artifact: "artifact.json".into(),
+            state: ArtifactFact::Present,
+        },
+        observed_unix_seconds: NOW,
+    };
+    // First report queues the publish intent; the outbox applies it.
+    gh.emit(&store, &config(), obs("art-1"), NOW).unwrap();
+    assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(gh.applied().len(), 1, "one PR published");
+    // A repeat of the same fact under a new delivery id must not queue
+    // a second publish — the applied intent already covers this work.
+    gh.emit(&store, &config(), obs("art-2"), NOW).unwrap();
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        store.transact(|tx| tx.action_intents()).unwrap().len(),
+        1,
+        "no second publish intent"
+    );
+    assert_eq!(gh.applied().len(), 1, "still one PR published");
+}
+
+#[test]
+fn superseded_head_evidence_does_not_complete_the_work() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-g7");
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::Ci);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })?;
+            tx.apply(&Effect::InsertPrActionIntent {
+                intent: PrActionIntent {
+                    action_id: "act-pub-2".into(),
+                    work_id: work_id.clone(),
+                    repository: "local/repo".into(),
+                    action: PrAction::PublishPr {
+                        branch: "work/w-1".into(),
+                        title: "t".into(),
+                        body: "b".into(),
+                    },
+                    status: PrActionStatus::Applied,
+                },
+            })
+        })
+        .unwrap();
+    let gh = FixtureGithub::new();
+    let obs = |fact| Observation {
+        source_event_id: None,
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact,
+        observed_unix_seconds: NOW,
+    };
+    let emit = |fact| gh.emit(&store, &config(), obs(fact), NOW).unwrap();
+    emit(ObservationFact::PrHead {
+        repository: "local/repo".into(),
+        number: 3,
+        head_sha: "sha-1".into(),
+    });
+    // A superseded success/approve must not complete the work: only the
+    // latest fact recorded for the current head decides.
+    emit(ObservationFact::PrChecks {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        conclusion: CheckConclusion::Success,
+    });
+    emit(ObservationFact::PrChecks {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        conclusion: CheckConclusion::Failure,
+    });
+    emit(ObservationFact::PrReview {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        reviewer: "rev".into(),
+        verdict: ReviewVerdict::Approve,
+    });
+    emit(ObservationFact::PrReview {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        reviewer: "rev".into(),
+        verdict: ReviewVerdict::ChangesRequested,
+    });
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "superseded approval cannot complete"
+    );
+    // A fresh pass over the same head still completes once the latest
+    // check and review are green.
+    emit(ObservationFact::PrChecks {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        conclusion: CheckConclusion::Success,
+    });
+    emit(ObservationFact::PrReview {
+        repository: "local/repo".into(),
+        head_sha: "sha-1".into(),
+        reviewer: "rev".into(),
+        verdict: ReviewVerdict::Approve,
+    });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Succeeded);
 }

@@ -893,9 +893,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 for (required, dir) in &recovered {
                     if invocation.required_artifacts.contains(required) {
                         // Promote into the workspace root so downstream
-                        // evidence paths are uniform.
-                        let _ =
-                            std::fs::copy(Path::new(dir).join(required), workspace.join(required));
+                        // evidence paths are uniform. A hit already in
+                        // the root needs no copy (copying a file onto
+                        // itself truncates it), and only a verified
+                        // artifact may be reported present.
+                        if Path::new(dir) != workspace.as_path()
+                            && std::fs::copy(
+                                Path::new(dir).join(required),
+                                workspace.join(required),
+                            )
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if !artifact_present(&workspace, required) {
+                            continue;
+                        }
                         self.report(
                             store,
                             &request,
