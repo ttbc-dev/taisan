@@ -127,16 +127,23 @@ pub enum PrAction {
 pub enum StoreError {
     /// A uniqueness or check constraint fired (reservation, request ID,
     /// nonterminal Execution, unresolved writer, slot, dedupe).
-    ConstraintConflict { detail: String },
+    ConstraintConflict {
+        detail: String,
+    },
     /// `UPDATE ... WHERE version = expected` matched no row.
-    VersionConflict { work_id: WorkId, current_version: u64 },
+    VersionConflict {
+        work_id: WorkId,
+        current_version: u64,
+    },
     /// `UPDATE ... WHERE state = expected` matched no row.
     StateConflict {
         execution_id: ExecutionId,
         current_state: ExecutionState,
     },
     NoFreeSlot,
-    Internal { detail: String },
+    Internal {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -146,7 +153,11 @@ impl std::fmt::Display for StoreError {
             Self::VersionConflict {
                 work_id,
                 current_version,
-            } => write!(f, "version conflict on {}: now {current_version}", work_id.0),
+            } => write!(
+                f,
+                "version conflict on {}: now {current_version}",
+                work_id.0
+            ),
             Self::StateConflict {
                 execution_id,
                 current_state,
@@ -173,8 +184,10 @@ pub trait ReadView {
         idempotency_key: &str,
     ) -> Result<Option<(String, CommandDecision)>, StoreError>;
 
-    fn command_decision(&self, command_id: &CommandId)
-        -> Result<Option<CommandDecision>, StoreError>;
+    fn command_decision(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<CommandDecision>, StoreError>;
 
     fn work(&self, work_id: &WorkId) -> Result<Option<Work>, StoreError>;
     fn execution(&self, execution_id: &ExecutionId) -> Result<Option<Execution>, StoreError>;

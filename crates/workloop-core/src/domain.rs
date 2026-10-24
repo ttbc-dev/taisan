@@ -206,8 +206,10 @@ impl Execution {
     /// `uncertain` is excluded: a new writer is never granted while the
     /// previous one is unproven.
     pub fn accepts_invocation(&self) -> bool {
-        matches!(self.state, ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting)
-            && self.invocations_used < self.budget.max_invocations
+        matches!(
+            self.state,
+            ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting
+        ) && self.invocations_used < self.budget.max_invocations
     }
 }
 

@@ -46,13 +46,7 @@ pub fn handle_command(
                 // The original decision keeps the bare key for replay; the
                 // conflict is durable under a payload-derived key.
                 let conflict_key = format!("{}#{digest}", req.idempotency_key);
-                tx.save_decision(
-                    &req.origin,
-                    &req.actor,
-                    &conflict_key,
-                    &digest,
-                    &decision,
-                )?;
+                tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
                 return Ok(decision);
             }
             None => {}
@@ -82,7 +76,7 @@ pub fn handle_command(
                                     RejectionCode::Ineligible,
                                     req.body.work_id().cloned(),
                                     vec![e.to_string()],
-                                )
+                                );
                             }
                         }
                     }
@@ -94,7 +88,13 @@ pub fn handle_command(
             }
         };
 
-        tx.save_decision(&req.origin, &req.actor, &req.idempotency_key, &digest, &decision)?;
+        tx.save_decision(
+            &req.origin,
+            &req.actor,
+            &req.idempotency_key,
+            &digest,
+            &decision,
+        )?;
         Ok(decision)
     })
 }
@@ -148,9 +148,7 @@ fn rejected_now(
     work_id: Option<WorkId>,
     evidence: Vec<String>,
 ) -> CommandDecision {
-    let current = work_id
-        .as_ref()
-        .and_then(|w| tx.work(w).ok().flatten());
+    let current = work_id.as_ref().and_then(|w| tx.work(w).ok().flatten());
     CommandDecision::Rejected {
         command_id: CommandId(
             tx.alloc_id("cmd")
@@ -225,7 +223,14 @@ fn decide(
             issue_refs,
             constraints,
             verification_argv,
-        } => decide_submit(tx, config, intent, issue_refs, constraints, verification_argv),
+        } => decide_submit(
+            tx,
+            config,
+            intent,
+            issue_refs,
+            constraints,
+            verification_argv,
+        ),
         CommandBody::ClaimResources {
             resources,
             ttl_seconds,
@@ -235,7 +240,14 @@ fn decide(
             work_id,
             expected_work_version,
             expected_execution_id,
-        } => decide_retry(tx, config, work_id, *expected_work_version, expected_execution_id, now_unix_seconds),
+        } => decide_retry(
+            tx,
+            config,
+            work_id,
+            *expected_work_version,
+            expected_execution_id,
+            now_unix_seconds,
+        ),
         CommandBody::Resume {
             work_id,
             expected_work_version,
@@ -256,7 +268,13 @@ fn decide(
             expected_work_version,
             expected_pr_head,
             decisions,
-        } => decide_judge(tx, work_id, *expected_work_version, expected_pr_head, decisions),
+        } => decide_judge(
+            tx,
+            work_id,
+            *expected_work_version,
+            expected_pr_head,
+            decisions,
+        ),
         CommandBody::ReleaseJudgment {
             work_id,
             expected_work_version,
@@ -418,7 +436,8 @@ fn decide_claim(
 }
 
 fn is_expired(res: &ResourceReservation, now_unix_seconds: i64) -> bool {
-    res.expires_at_unix_seconds.is_some_and(|e| e <= now_unix_seconds)
+    res.expires_at_unix_seconds
+        .is_some_and(|e| e <= now_unix_seconds)
 }
 
 fn decide_release(
@@ -586,17 +605,23 @@ fn decide_resume(
     };
     let Some(execution) = tx.active_execution(work_id)? else {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "no active Execution to resume".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no active Execution to resume".into()],
+            ),
             vec![],
         ));
     };
     if &execution.id != execution_id || execution.state != ExecutionState::Paused {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "resume requires the named Execution to be paused".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["resume requires the named Execution to be paused".into()],
+            ),
             vec![],
         ));
     }
@@ -662,9 +687,12 @@ fn decide_cancel(
     if let Some(named) = execution_id {
         if named != &execution.id {
             return Ok((
-                rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                    "execution_id is not the active Execution".into(),
-                ]),
+                rejected_now(
+                    tx,
+                    RejectionCode::Ineligible,
+                    Some(work_id.clone()),
+                    vec!["execution_id is not the active Execution".into()],
+                ),
                 vec![],
             ));
         }
@@ -838,9 +866,12 @@ fn decide_judge(
     };
     if decisions.is_empty() {
         return Ok((
-            rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![
-                "judge_findings requires at least one decision".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::InvalidRequest,
+                Some(work_id.clone()),
+                vec!["judge_findings requires at least one decision".into()],
+            ),
             vec![],
         ));
     }
@@ -848,18 +879,29 @@ fn decide_judge(
     for d in decisions {
         if !seen.insert(&d.finding_id) {
             return Ok((
-                rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![
-                    format!("duplicate finding_id {}", d.finding_id),
-                ]),
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!("duplicate finding_id {}", d.finding_id)],
+                ),
                 vec![],
             ));
         }
         if !matches!(
             d.choice,
-            FindingChoice::Fix | FindingChoice::Dismiss | FindingChoice::Accept | FindingChoice::Wait
+            FindingChoice::Fix
+                | FindingChoice::Dismiss
+                | FindingChoice::Accept
+                | FindingChoice::Wait
         ) {
             return Ok((
-                rejected_now(tx, RejectionCode::InvalidRequest, Some(work_id.clone()), vec![]),
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![],
+                ),
                 vec![],
             ));
         }
@@ -905,17 +947,23 @@ fn decide_release_judgment(
     };
     let Some(execution) = tx.active_execution(work_id)? else {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "no active Execution".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["no active Execution".into()],
+            ),
             vec![],
         ));
     };
     if execution.state != ExecutionState::Paused {
         return Ok((
-            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), vec![
-                "release_judgment requires a paused Execution".into(),
-            ]),
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec!["release_judgment requires a paused Execution".into()],
+            ),
             vec![],
         ));
     }

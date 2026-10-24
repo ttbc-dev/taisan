@@ -166,7 +166,8 @@ fn submit_creates_work_and_queued_execution() {
 #[test]
 fn retry_requires_confirmed_failure() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("r1"), NOW).unwrap());
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("r1"), NOW).unwrap());
     // E1 is queued, not failed.
     let d = handle_command(
         &store,
@@ -209,7 +210,8 @@ fn retry_requires_confirmed_failure() {
 #[test]
 fn stale_work_version_is_rejected() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("v1"), NOW).unwrap());
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("v1"), NOW).unwrap());
     let d = handle_command(
         &store,
         &config(),
@@ -230,7 +232,8 @@ fn stale_work_version_is_rejected() {
 #[test]
 fn resume_requeues_paused_and_rejects_others() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("p1"), NOW).unwrap());
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("p1"), NOW).unwrap());
     // queued → ineligible
     let d = handle_command(
         &store,
@@ -273,7 +276,8 @@ fn resume_requeues_paused_and_rejects_others() {
 #[test]
 fn cancel_queued_is_terminal_and_second_cancel_is_noop() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("c1"), NOW).unwrap());
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("c1"), NOW).unwrap());
     let d = handle_command(
         &store,
         &config(),
@@ -368,7 +372,8 @@ fn release_only_frees_the_claimers_rows() {
 #[test]
 fn dispatch_admits_oldest_eligible_and_reserves_atomically() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (_, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("a1"), NOW).unwrap());
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("a1"), NOW).unwrap());
 
     store
         .transact(|tx| {
@@ -398,7 +403,8 @@ fn dispatch_admits_oldest_eligible_and_reserves_atomically() {
 #[test]
 fn queued_execution_defers_when_capacity_is_full() {
     let store = SqliteStore::in_memory(0).unwrap(); // no slots at all
-    let (_, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("q1"), NOW).unwrap());
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("q1"), NOW).unwrap());
     store
         .transact(|tx| {
             let admitted = workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?;
@@ -407,20 +413,15 @@ fn queued_execution_defers_when_capacity_is_full() {
         })
         .unwrap();
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
-    let deferrals = store
-        .transact(|tx| {
-            Ok(tx
-                .slot_holders()?
-                .len())
-        })
-        .unwrap();
+    let deferrals = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
     assert_eq!(deferrals, 0);
 }
 
 #[test]
 fn earlier_external_claim_defers_queued_execution() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) = accepted_with_execution(&handle_command(&store, &config(), &submit("x1"), NOW).unwrap());
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("x1"), NOW).unwrap());
     // An external writer claims the work branch before dispatch.
     let claim = CommandBody::ClaimResources {
         resources: vec![

@@ -235,7 +235,11 @@ fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn update_execution(tx: &Tx<'_>, e: &Execution, expected: &ExecutionState) -> Result<(), StoreError> {
+fn update_execution(
+    tx: &Tx<'_>,
+    e: &Execution,
+    expected: &ExecutionState,
+) -> Result<(), StoreError> {
     let n = tx.exec(
         "UPDATE executions SET state=?4, waiting_reason=?5, desired_action=?6, \
          terminal_code=?7, pause_reason=?8, outcome=?9, enqueued_seq=?10, \
@@ -301,12 +305,7 @@ impl ReadView for Tx<'_> {
             "SELECT payload_digest, decision FROM commands \
              WHERE origin=?1 AND actor_kind=?2 AND actor_id=?3 AND idempotency_key=?4",
             params![origin.0, actor_kind, actor.external_id, idempotency_key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    de_row(&row.get::<_, String>(1)?)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, de_row(&row.get::<_, String>(1)?)?)),
         )
     }
 
@@ -362,9 +361,7 @@ impl ReadView for Tx<'_> {
 
     fn executions_for_work(&self, work_id: &WorkId) -> Result<Vec<Execution>, StoreError> {
         self.query_all(
-            &format!(
-                "SELECT {EXECUTION_COLS} FROM executions WHERE work_id=?1 ORDER BY ordinal"
-            ),
+            &format!("SELECT {EXECUTION_COLS} FROM executions WHERE work_id=?1 ORDER BY ordinal"),
             params![work_id.0],
             execution_from_row,
         )
@@ -688,10 +685,7 @@ impl TxView for Tx<'_> {
                 )?;
                 if n == 0 {
                     return Err(StoreError::ConstraintConflict {
-                        detail: format!(
-                            "invocation {} not in expected state",
-                            invocation.id.0
-                        ),
+                        detail: format!("invocation {} not in expected state", invocation.id.0),
                     });
                 }
             }
@@ -704,7 +698,10 @@ impl TxView for Tx<'_> {
                     params![
                         observation.source_event_id,
                         observation.subject_work_id.as_ref().map(|w| w.0.clone()),
-                        observation.subject_execution_id.as_ref().map(|e| e.0.clone()),
+                        observation
+                            .subject_execution_id
+                            .as_ref()
+                            .map(|e| e.0.clone()),
                         json(&observation.fact)?,
                         observation.observed_unix_seconds,
                     ],
