@@ -1,11 +1,14 @@
 //! The SQLite store: current-state tables plus an append-only `event_log`.
 //! Structural invariants live in constraints and partial unique indexes;
-//! transition legality stays in `work`. One connection behind a mutex means
-//! transactions fully serialize — the constraint layer is the belt, not a
-//! race window.
+//! transition legality stays in `work`. One connection behind a mutex
+//! serializes transactions within a process; across processes (every CLI
+//! invocation is one) SQLite's file locking serializes writers, and the busy
+//! timeout makes the loser wait for the lock instead of failing immediately —
+//! the constraint layer is the belt, not a race window.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
@@ -13,6 +16,11 @@ use workloop_core::observation::Observation;
 use workloop_core::store::{Deferral, Effect, PrActionIntent, ReadView, Store, StoreError, TxView};
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
+/// Connection-local (applies inside `transact` and during `init` itself) and
+/// set explicitly so the guarantee does not depend on the binding's default.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -31,6 +39,11 @@ impl SqliteStore {
     }
 
     fn init(conn: Connection, capacity: u32) -> Result<Self, StoreError> {
+        // Install the busy handler first so even the WAL/schema batch below
+        // waits on a concurrent initializer instead of failing with
+        // SQLITE_BUSY; a residual timeout still maps to `StoreError::Internal`,
+        // which callers propagate without persisting a rejection.
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(internal)?;
         conn.execute_batch(SCHEMA).map_err(internal)?;
@@ -1005,5 +1018,20 @@ impl TxView for Tx<'_> {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_sets_a_busy_timeout() {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let guard = store.conn.lock().unwrap();
+        let ms: i64 = guard
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, i64::try_from(BUSY_TIMEOUT.as_millis()).unwrap());
     }
 }
