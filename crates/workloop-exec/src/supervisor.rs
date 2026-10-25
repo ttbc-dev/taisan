@@ -37,14 +37,35 @@ fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn lstart_of(pid: i32) -> Option<String> {
-    let out = ps_output(&["-o", "lstart=", "-p", &pid.to_string()]).ok()?;
-    let s = out.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(normalize_lstart(s))
+/// One `ps`-based lstart lookup, keeping "the process is gone" separate
+/// from "the lookup could not be completed". Only `Absent` (and a
+/// verified start-time mismatch) may prove a stop; `Failed` proves
+/// nothing and must surface as `Unknown`/`Failed` to callers.
+#[derive(Debug, PartialEq, Eq)]
+enum LstartLookup {
+    Present(String),
+    Absent,
+    Failed(String),
+}
+
+fn classify_lstart_lookup(out: std::io::Result<String>) -> LstartLookup {
+    match out {
+        Err(e) => LstartLookup::Failed(e.to_string()),
+        Ok(out) => {
+            let s = out.trim();
+            if s.is_empty() {
+                // `ps` ran and listed nothing: the pid is not in the
+                // process table.
+                LstartLookup::Absent
+            } else {
+                LstartLookup::Present(normalize_lstart(s))
+            }
+        }
     }
+}
+
+fn lstart_of(pid: i32) -> LstartLookup {
+    classify_lstart_lookup(ps_output(&["-o", "lstart=", "-p", &pid.to_string()]))
 }
 
 fn stat_of(pid: i32) -> Option<String> {
@@ -75,9 +96,15 @@ impl ProcessControlPort for PosixProcessControl {
         // Dropping the handle never kills; reap() later calls waitpid on
         // the recorded pid, which is still our child.
         drop(child);
-        let started_at = lstart_of(pid).ok_or_else(|| SpawnError::Unknown {
-            reason: format!("spawned pid {pid} vanished before identity capture"),
-        })?;
+        let started_at = match lstart_of(pid) {
+            LstartLookup::Present(s) => s,
+            LstartLookup::Absent => {
+                return Err(SpawnError::Unknown {
+                    reason: format!("spawned pid {pid} vanished before identity capture"),
+                });
+            }
+            LstartLookup::Failed(reason) => return Err(SpawnError::Unknown { reason }),
+        };
         let pgid = unsafe { libc::getpgid(pid) };
         Ok(ProcessIdentity {
             pid,
@@ -137,12 +164,18 @@ impl ProcessControlPort for PosixProcessControl {
     }
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
-        let Some(lstart) = lstart_of(identity.pid) else {
+        let lstart = match lstart_of(identity.pid) {
             // The pid is gone; this identity no longer exists.
-            return ProcessEvidence::Stopped {
-                identity: identity.clone(),
-                exit_code: None,
-            };
+            LstartLookup::Absent => {
+                return ProcessEvidence::Stopped {
+                    identity: identity.clone(),
+                    exit_code: None,
+                };
+            }
+            // The lookup itself failed: an incomplete process-table read
+            // is never stop proof — the port contract requires Unknown.
+            LstartLookup::Failed(reason) => return ProcessEvidence::Unknown { reason },
+            LstartLookup::Present(lstart) => lstart,
         };
         if normalize_lstart(&lstart) != normalize_lstart(&identity.started_at) {
             // Reused pid: the recorded process is gone.
@@ -167,21 +200,26 @@ impl ProcessControlPort for PosixProcessControl {
 
     fn signal_verified(&self, identity: &ProcessIdentity, signal: i32) -> SignalOutcome {
         match lstart_of(identity.pid) {
-            None => SignalOutcome::AlreadyGone,
-            Some(now) if normalize_lstart(&now) != normalize_lstart(&identity.started_at) => {
-                SignalOutcome::SkippedStale
-            }
-            Some(_) => {
-                let rc = unsafe { libc::kill(identity.pid, signal) };
-                if rc == 0 {
-                    SignalOutcome::Sent
+            // The identity cannot be re-verified: delivery cannot be
+            // confirmed, and absence must never be assumed from a failed
+            // lookup.
+            LstartLookup::Failed(reason) => SignalOutcome::Failed { reason },
+            LstartLookup::Absent => SignalOutcome::AlreadyGone,
+            LstartLookup::Present(now) => {
+                if normalize_lstart(&now) != normalize_lstart(&identity.started_at) {
+                    SignalOutcome::SkippedStale
                 } else {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::ESRCH) {
-                        SignalOutcome::AlreadyGone
+                    let rc = unsafe { libc::kill(identity.pid, signal) };
+                    if rc == 0 {
+                        SignalOutcome::Sent
                     } else {
-                        SignalOutcome::Failed {
-                            reason: format!("kill({}, {signal}): {e}", identity.pid),
+                        let e = std::io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::ESRCH) {
+                            SignalOutcome::AlreadyGone
+                        } else {
+                            SignalOutcome::Failed {
+                                reason: format!("kill({}, {signal}): {e}", identity.pid),
+                            }
                         }
                     }
                 }
@@ -889,7 +927,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             // Recover from workspace + checkpoints + worker-runtime store.
             let workspace = self.workspace_of(&execution.work_id);
-            let mut recovered: Vec<(String, String)> = Vec::new();
+            let mut recovered: Vec<(String, PathBuf)> = Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 for required in &invocation.required_artifacts {
                     if let Some(dir) = find_artifact(&workspace, required) {
@@ -919,12 +957,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         // the root needs no copy (copying a file onto
                         // itself truncates it), and only a verified
                         // artifact may be reported present.
-                        if Path::new(dir) != workspace.as_path()
-                            && std::fs::copy(
-                                Path::new(dir).join(required),
-                                workspace.join(required),
-                            )
-                            .is_err()
+                        if dir != &workspace
+                            && std::fs::copy(dir.join(required), workspace.join(required)).is_err()
                         {
                             continue;
                         }
@@ -1064,7 +1098,7 @@ fn required_artifacts(request: &InvocationRequest) -> Vec<String> {
 
 /// Whether `name` exists in the workspace root, checkpoints, or the
 /// worker-runtime artifact store. Returns the directory holding it.
-fn find_artifact(workspace: &Path, name: &str) -> Option<String> {
+fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
     for dir in [
         workspace.to_path_buf(),
         workspace.join(".checkpoints"),
@@ -1076,7 +1110,7 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<String> {
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
-            return Some(dir.to_string_lossy().into_owned());
+            return Some(dir);
         }
     }
     None
@@ -1098,4 +1132,36 @@ pub fn write_artifact(path: &Path, content: &str) -> std::io::Result<()> {
     }
     let mut f = std::fs::File::create(path)?;
     f.write_all(content.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lstart_lookup_keeps_failure_distinct_from_absence() {
+        // A `ps` spawn/io failure is an incomplete lookup, never absence.
+        let failed = classify_lstart_lookup(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "ps unavailable",
+        )));
+        assert!(
+            matches!(&failed, LstartLookup::Failed(r) if r.contains("ps unavailable")),
+            "spawn failure classifies as Failed: {failed:?}"
+        );
+        // `ps` running and listing nothing is definitive absence.
+        assert_eq!(
+            classify_lstart_lookup(Ok(String::new())),
+            LstartLookup::Absent
+        );
+        assert_eq!(
+            classify_lstart_lookup(Ok("\n".into())),
+            LstartLookup::Absent
+        );
+        // A listed pid yields the whitespace-normalized verifier.
+        match classify_lstart_lookup(Ok("Sat Oct  4 06:14:00 2026\n".into())) {
+            LstartLookup::Present(s) => assert_eq!(s, "Sat Oct 4 06:14:00 2026"),
+            other => panic!("expected Present, got {other:?}"),
+        }
+    }
 }

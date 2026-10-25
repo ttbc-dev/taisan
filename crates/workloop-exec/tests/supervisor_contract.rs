@@ -233,6 +233,43 @@ fn zombie_counts_as_stopped() {
 }
 
 #[test]
+fn reaped_identity_inspects_stopped_and_signals_already_gone() {
+    let root = tmp_root("reaped");
+    let port = PosixProcessControl;
+    let identity = port
+        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .expect("spawn");
+    port.signal_verified(&identity, libc::SIGKILL);
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "stopped after signal",
+    );
+    // Reap until the pid leaves the process table: a definitively absent
+    // pid is stop proof, and a further verified signal is a no-op.
+    wait_for(
+        || {
+            let mut status = 0;
+            let reaped =
+                unsafe { libc::waitpid(identity.pid, &mut status, libc::WNOHANG) } == identity.pid;
+            reaped
+                || matches!(
+                    port.signal_verified(&identity, libc::SIGKILL),
+                    SignalOutcome::AlreadyGone
+                )
+        },
+        "reaped child",
+    );
+    assert!(matches!(
+        port.inspect(&identity),
+        ProcessEvidence::Stopped { .. }
+    ));
+    assert_eq!(
+        port.signal_verified(&identity, libc::SIGKILL),
+        SignalOutcome::AlreadyGone
+    );
+}
+
+#[test]
 fn setsid_escapee_is_in_the_snapshot_and_signaled() {
     let root = tmp_root("setsid");
     let port = PosixProcessControl;
@@ -729,6 +766,83 @@ fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
             )
         });
     assert!(present, "verified artifact reported present");
+}
+
+#[test]
+fn failed_artifact_promotion_is_not_reported_present() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        // Root ignores file modes; the copy-failure path needs EACCES.
+        return;
+    }
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("recvcopy");
+    let (work_id, eid) = submit_and_admit(&store, "k-recopy1");
+    let sup = supervisor("exit-no-artifact", root);
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-recopy".into()),
+                    request_id,
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec!["artifact.json".into()],
+                    evidence_refs: vec![],
+                },
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::ArtifactRecovery);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    // The artifact exists only under .checkpoints and cannot be read:
+    // the promotion copy fails, and a failed copy must never be reported
+    // as Present evidence.
+    let workspace = sup.workspace_of(&work_id);
+    let src = workspace.join(".checkpoints");
+    std::fs::create_dir_all(&src).unwrap();
+    let src_file = src.join("artifact.json");
+    workloop_exec::supervisor::write_artifact(&src_file, "payload").unwrap();
+    let mut perm = std::fs::metadata(&src_file).unwrap().permissions();
+    perm.set_mode(0o000);
+    std::fs::set_permissions(&src_file, perm).unwrap();
+    sup.run_recovery(&store, NOW).unwrap();
+    let present = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    state: ArtifactFact::Present,
+                    ..
+                }
+            )
+        });
+    assert!(!present, "a failed promotion copy must not report Present");
+    assert!(
+        !workspace.join("artifact.json").exists(),
+        "no partial artifact appears in the workspace root"
+    );
+    // Restore permissions so temp cleanup can remove the tree.
+    let mut perm = std::fs::metadata(&src_file).unwrap().permissions();
+    perm.set_mode(0o644);
+    let _ = std::fs::set_permissions(&src_file, perm);
 }
 
 // ---- Clean exit drives the publish intent ----
