@@ -215,11 +215,8 @@ fn assert_replay_locked(
 #[test]
 fn submit_replays_the_same_decision() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let first = handle_command(&store, &config(), &submit("k1"), NOW).unwrap();
-    let second = handle_command(&store, &config(), &submit("k1"), NOW).unwrap();
-    let first_json = serde_json::to_string(&first).unwrap();
-    let second_json = serde_json::to_string(&second).unwrap();
-    assert_eq!(first_json, second_json, "replay returns the saved decision");
+    let d = assert_replay_locked(&store, &submit("k1"), NOW, NOW);
+    accepted(&d);
 }
 
 #[test]
@@ -1877,4 +1874,246 @@ fn recording_an_invocation_without_a_request_row_leaves_pending_alone() {
         vec![format!("{}:inv:0", e1.0)],
         "the unmatched Invocation leaves the real request pending"
     );
+}
+
+// ---- docs/v0.1.md Commands row: payload-change conflict for every kind ----
+
+/// The Commands matrix says "Idempotent replay of every accepted Command; a
+/// payload change under the same key yields `idempotency_conflict`". Replay
+/// of the accepted decision is covered per kind above; this proves the
+/// payload-change half for every `CommandBody` kind — the digest is compared
+/// before any Command-specific validation, so a mutated body under a stored
+/// key must reject as `idempotency_conflict` without reaching `decide`, and
+/// the conflicting payload itself replays its stored conflict decision.
+#[test]
+fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
+    /// A distinguishing payload edit per Command kind.
+    fn mutate(body: &mut CommandBody) {
+        match body {
+            CommandBody::Submit { intent, .. } => *intent = "different intent".into(),
+            CommandBody::ClaimResources { ttl_seconds, .. } => *ttl_seconds += 1,
+            CommandBody::ReleaseResources { resources } => {
+                resources.push(WriteResource::Branch {
+                    repository: "local/repo".into(),
+                    branch: "wip/other".into(),
+                });
+            }
+            CommandBody::Retry {
+                expected_work_version,
+                ..
+            }
+            | CommandBody::Resume {
+                expected_work_version,
+                ..
+            }
+            | CommandBody::Cancel {
+                expected_work_version,
+                ..
+            } => *expected_work_version = 99,
+            CommandBody::Acknowledge { attention_id, .. } => *attention_id = "att-other".into(),
+            CommandBody::JudgeFindings { decisions, .. } => decisions.push(FindingDecision {
+                finding_id: "f-other".into(),
+                choice: FindingChoice::Wait,
+            }),
+            CommandBody::ReleaseJudgment {
+                expected_pr_head, ..
+            } => *expected_pr_head = "h2".into(),
+        }
+    }
+
+    let pair = |original: CommandRequest| {
+        let mut mutant = original.clone();
+        mutate(&mut mutant.body);
+        (original, mutant)
+    };
+
+    // One case per CommandBody kind: a store where the original is Accepted.
+    let mut cases: Vec<(&str, SqliteStore, CommandRequest, CommandRequest)> = Vec::new();
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (original, mutant) = pair(submit("mx-submit"));
+        cases.push(("submit", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (original, mutant) = pair(req(
+            "mx-claim",
+            CommandBody::ClaimResources {
+                resources: vec![branch_res()],
+                ttl_seconds: 60,
+            },
+        ));
+        cases.push(("claim_resources", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        accepted(
+            &handle_command(
+                &store,
+                &config(),
+                &req(
+                    "mx-release-seed",
+                    CommandBody::ClaimResources {
+                        resources: vec![branch_res()],
+                        ttl_seconds: 60,
+                    },
+                ),
+                NOW,
+            )
+            .unwrap(),
+        );
+        let (original, mutant) = pair(req(
+            "mx-release",
+            CommandBody::ReleaseResources {
+                resources: vec![branch_res()],
+            },
+        ));
+        cases.push(("release_resources", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, e1) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-retry-seed"), NOW).unwrap(),
+        );
+        force_state(&store, &e1, ExecutionState::Failed);
+        let (original, mutant) = pair(req(
+            "mx-retry",
+            CommandBody::Retry {
+                work_id,
+                expected_work_version: 1,
+                expected_execution_id: e1,
+            },
+        ));
+        cases.push(("retry", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, e1) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-resume-seed"), NOW).unwrap(),
+        );
+        force_state(&store, &e1, ExecutionState::Paused);
+        let (original, mutant) = pair(req(
+            "mx-resume",
+            CommandBody::Resume {
+                work_id,
+                expected_work_version: 1,
+                execution_id: e1,
+            },
+        ));
+        cases.push(("resume", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, _) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-cancel-seed"), NOW).unwrap(),
+        );
+        let (original, mutant) = pair(req(
+            "mx-cancel",
+            CommandBody::Cancel {
+                work_id,
+                expected_work_version: 1,
+                execution_id: None,
+            },
+        ));
+        cases.push(("cancel", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, _) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-ack-seed"), NOW).unwrap(),
+        );
+        let (original, mutant) = pair(req(
+            "mx-ack",
+            CommandBody::Acknowledge {
+                work_id,
+                expected_work_version: 1,
+                attention_id: "att-1".into(),
+            },
+        ));
+        cases.push(("acknowledge", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, _) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-judge-seed"), NOW).unwrap(),
+        );
+        seed_pr_head(&store, &work_id, "h1", NOW);
+        let (original, mutant) = pair(req(
+            "mx-judge",
+            CommandBody::JudgeFindings {
+                work_id,
+                expected_work_version: 1,
+                expected_pr_head: "h1".into(),
+                decisions: vec![FindingDecision {
+                    finding_id: "f1".into(),
+                    choice: FindingChoice::Fix,
+                }],
+            },
+        ));
+        cases.push(("judge_findings", store, original, mutant));
+    }
+    {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, e1) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit("mx-rj-seed"), NOW).unwrap(),
+        );
+        force_state(&store, &e1, ExecutionState::Paused);
+        seed_pr_head(&store, &work_id, "h1", NOW);
+        accepted(
+            &handle_command(
+                &store,
+                &config(),
+                &req(
+                    "mx-rj-judge",
+                    CommandBody::JudgeFindings {
+                        work_id: work_id.clone(),
+                        expected_work_version: 1,
+                        expected_pr_head: "h1".into(),
+                        decisions: vec![FindingDecision {
+                            finding_id: "f1".into(),
+                            choice: FindingChoice::Accept,
+                        }],
+                    },
+                ),
+                NOW,
+            )
+            .unwrap(),
+        );
+        let (original, mutant) = pair(req(
+            "mx-release-judgment",
+            CommandBody::ReleaseJudgment {
+                work_id,
+                expected_work_version: 2,
+                expected_pr_head: "h1".into(),
+            },
+        ));
+        cases.push(("release_judgment", store, original, mutant));
+    }
+    assert_eq!(cases.len(), 9, "one case per CommandBody kind");
+
+    for (label, store, original, mutant) in cases {
+        let first = handle_command(&store, &config(), &original, NOW).unwrap();
+        assert!(
+            matches!(first, CommandDecision::Accepted { .. }),
+            "{label}: the original must be accepted, got {first:?}"
+        );
+        let seq_before = store.transact(|tx| tx.last_seq()).expect("read last_seq");
+        let conflict = handle_command(&store, &config(), &mutant, NOW).unwrap();
+        assert_eq!(
+            reject_reason(&conflict),
+            RejectionCode::IdempotencyConflict,
+            "{label}"
+        );
+        let seq_after = store.transact(|tx| tx.last_seq()).expect("read last_seq");
+        assert_eq!(
+            seq_before, seq_after,
+            "{label}: a conflict rejection allocates no new sequence"
+        );
+        let replay = handle_command(&store, &config(), &mutant, NOW).unwrap();
+        assert_eq!(
+            serde_json::to_string(&conflict).unwrap(),
+            serde_json::to_string(&replay).unwrap(),
+            "{label}: the conflicting payload replays its stored conflict decision"
+        );
+    }
 }
