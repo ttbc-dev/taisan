@@ -1188,7 +1188,9 @@ pub fn admit_queued(
 /// Admission for one Invocation role: the single seam every request creation
 /// passes, so the budget bounds are enforced no matter which caller emits
 /// the request. A Review admission consumes both counters; a Coding one
-/// consumes only `invocations_used`.
+/// consumes only `invocations_used`. The head-bound judgment gate is
+/// rechecked here too, so a judgment recorded for an older PR head can
+/// never authorize a request after the head moves.
 pub fn admit_queued_role(
     tx: &mut dyn TxView,
     config: &WorkloopConfig,
@@ -1241,6 +1243,33 @@ pub fn admit_queued_role(
                 execution_id: execution.id.clone(),
             })?;
         }
+        return Ok(None);
+    }
+
+    // The human-judgment gate is bound to the PR head it was decided on: a
+    // judgment recorded while this Execution waited in the queue must not
+    // authorize a worker once the head moves (`PR head changes while
+    // queued`). This rechecks the same persisted evidence `release_judgment`
+    // compared; a head that moved past the recorded judgment needs a fresh
+    // decision, so the Execution pauses without reserving capacity and
+    // without emitting a request.
+    if let Some((judgment_head, _)) = tx.latest_judgment(&work.id)?
+        && let Some(observed) = tx.latest_pr_head(&work.id)?
+        && judgment_head != observed
+    {
+        let mut next = execution.clone();
+        next.state = ExecutionState::Paused;
+        next.pause_reason = Some(format!(
+            "pr head moved after judgment: decided {judgment_head}, observed {observed}; \
+             a new human judgment is required"
+        ));
+        tx.apply(&Effect::UpdateExecution {
+            execution: next,
+            expected_state: ExecutionState::Queued,
+        })?;
+        tx.apply(&Effect::ClearDeferral {
+            execution_id: execution.id.clone(),
+        })?;
         return Ok(None);
     }
 

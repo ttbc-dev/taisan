@@ -1647,3 +1647,115 @@ fn cancel_from_queued_leaves_foreign_claims_alone() {
         "the surviving row is still the external claim"
     );
 }
+
+// ---- Converge round 1: admission rechecks the judgment's PR head ----
+
+/// `release_judgment` requeues E1 under the head it verified, but the head
+/// can move while E1 waits in the queue. Dispatch admission must recheck the
+/// recorded judgment against the currently observed head before saving the
+/// Invocation request: a judgment for the old head cannot authorize a worker
+/// on the new head, and the moved-head state pauses for a fresh judgment
+/// without reserving capacity or emitting a request.
+#[test]
+fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ah1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+
+    // Human-gate cycle: pause, judge on h1, release — E1 requeues under the
+    // judgment bound to h1.
+    force_state(&store, &e1, ExecutionState::Paused);
+    accepted(
+        &handle_command(&store, &config(), &judge_req("ah2", &work_id, 1, "h1"), NOW).unwrap(),
+    );
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "ah3",
+                CommandBody::ReleaseJudgment {
+                    work_id: work_id.clone(),
+                    expected_work_version: 2,
+                    expected_pr_head: "h1".into(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+
+    // The PR head moves while E1 waits in the queue.
+    seed_pr_head(&store, &work_id, "h2", NOW + 10);
+
+    // Dispatch must not authorize a worker on the stale h1 judgment.
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 20)?.is_none(),
+                "a judgment for the old head cannot authorize admission"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "a moved head re-pauses for a fresh judgment"
+    );
+    let reason = e.pause_reason.expect("pause reason recorded");
+    assert!(
+        reason.contains("h1") && reason.contains("h2"),
+        "the pause names both the decided and observed heads, got: {reason}"
+    );
+    let (slots, requests) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.pending_requests()?.len())))
+        .unwrap();
+    assert_eq!(slots, 0, "the stale-head pause reserves no capacity");
+    assert_eq!(requests, 0, "no Invocation request is saved");
+
+    // A fresh judgment on h2 releases the gate; admission then proceeds.
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &judge_req("ah4", &work_id, 3, "h2"),
+            NOW + 30,
+        )
+        .unwrap(),
+    );
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "ah5",
+                CommandBody::ReleaseJudgment {
+                    work_id: work_id.clone(),
+                    expected_work_version: 4,
+                    expected_pr_head: "h2".into(),
+                },
+            ),
+            NOW + 30,
+        )
+        .unwrap(),
+    );
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 40)?.is_some(),
+                "the current-head judgment admits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Ready);
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        1,
+        "exactly one request is saved after the fresh judgment"
+    );
+}
