@@ -375,6 +375,8 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
     assert_eq!(view.deferred[0].reason, "capacity_exhausted");
 
     // An external claim with an expiry is visible in the same view.
+    // Workspace keys are reserved for `execution`, so the external claim
+    // names a branch pair.
     let d = handle_command(
         &store,
         &config(),
@@ -383,8 +385,9 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
             origin: Origin("cli".into()),
             idempotency_key: "q8-claim".into(),
             body: CommandBody::ClaimResources {
-                resources: vec![WriteResource::Workspace {
-                    workspace_id: "shared-ws".into(),
+                resources: vec![WriteResource::Branch {
+                    repository: "local/repo".into(),
+                    branch: "squatter".into(),
                 }],
                 ttl_seconds: 300,
             },
@@ -397,7 +400,7 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
     let external = view
         .reservations
         .iter()
-        .find(|r| r.resource_key == "workspace:shared-ws")
+        .find(|r| r.resource_key == "branch:local/repo:squatter")
         .expect("external reservation listed");
     assert!(matches!(
         external.holder,
@@ -503,15 +506,10 @@ fn deferred_head_does_not_block_later_items() {
             origin: Origin("cli".into()),
             idempotency_key: "q14-claim".into(),
             body: CommandBody::ClaimResources {
-                resources: vec![
-                    WriteResource::Workspace {
-                        workspace_id: "ws-w-1".into(),
-                    },
-                    WriteResource::Branch {
-                        repository: "local/repo".into(),
-                        branch: "work/w-1".into(),
-                    },
-                ],
+                resources: vec![WriteResource::Branch {
+                    repository: "local/repo".into(),
+                    branch: "work/w-1".into(),
+                }],
                 ttl_seconds: 600,
             },
         },

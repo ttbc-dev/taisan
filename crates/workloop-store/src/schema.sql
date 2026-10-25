@@ -71,6 +71,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_writer
     ON invocations (execution_id)
     WHERE state IN ('prepared', 'running', 'unknown');
 
+-- `consumed` flips to 1 when the store records the Invocation for this
+-- request (Effect::InsertInvocation); `pending_requests` reads it.
 CREATE TABLE IF NOT EXISTS invocation_requests (
     request_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,

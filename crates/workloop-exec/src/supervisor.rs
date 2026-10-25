@@ -399,6 +399,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
         // First consumption: persist the Invocation inside the same commit
         // that consumes the request — crash order is identity before launch.
+        // Recording the Invocation flips `consumed` itself; the explicit
+        // mark records the supervisor's handoff and is idempotent.
         let invocation = Invocation {
             id: InvocationId(store.transact(|tx| tx.alloc_id("inv"))?),
             request_id: request.request_id.clone(),

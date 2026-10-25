@@ -371,6 +371,12 @@ fn decide_submit(
     ))
 }
 
+/// An external claim names only `(repository, branch)` pairs; the managed
+/// workspace root is reserved for `execution`.
+fn external_claimable(res: &WriteResource) -> bool {
+    matches!(res, WriteResource::Branch { .. })
+}
+
 fn decide_claim(
     tx: &mut dyn TxView,
     req: &CommandRequest,
@@ -378,7 +384,8 @@ fn decide_claim(
     ttl_seconds: u64,
     now_unix_seconds: i64,
 ) -> Verdict {
-    if resources.is_empty() || ttl_seconds == 0 {
+    if resources.is_empty() || ttl_seconds == 0 || resources.iter().any(|r| !external_claimable(r))
+    {
         return Ok((
             rejected_now(tx, RejectionCode::InvalidRequest, None, vec![]),
             vec![],
@@ -465,6 +472,12 @@ fn decide_release(
     req: &CommandRequest,
     resources: &[WriteResource],
 ) -> Verdict {
+    if resources.iter().any(|r| !external_claimable(r)) {
+        return Ok((
+            rejected_now(tx, RejectionCode::InvalidRequest, None, vec![]),
+            vec![],
+        ));
+    }
     let holder = ReservationHolder::External {
         actor_id: req.actor.external_id.clone(),
     };
@@ -643,6 +656,56 @@ fn decide_resume(
                 vec!["resume requires the named Execution to be paused".into()],
             ),
             vec![],
+        ));
+    }
+    // A spent budget is terminal, not requeueable: `queued` or `paused` with
+    // the bound exhausted goes to `failed` with the limit recorded. The
+    // shared predicate keeps this entry point on the same rule as
+    // dispatch-time admission.
+    if let Some(limit) = execution.budget_exhaustion(&InvocationRole::Coding) {
+        let seq = tx.alloc_seq()?;
+        let command_id = CommandId(tx.alloc_id("cmd")?);
+        let mut next = execution.clone();
+        next.state = ExecutionState::Failed;
+        next.terminal_code = Some(limit.terminal_code().to_string());
+        next.outcome = Some(Outcome {
+            state: ExecutionState::Failed,
+            code: Some(limit.terminal_code().to_string()),
+            detail: Some(limit.detail()),
+            evidence_refs: vec![],
+            recorded_seq: seq,
+        });
+        return Ok((
+            CommandDecision::Accepted {
+                command_id,
+                work_id: Some(work_id.clone()),
+                work_version: Some(work.version + 1),
+                effect: CommandEffect::StateChanged,
+                committed_at: seq,
+            },
+            vec![
+                Effect::BumpWorkVersion {
+                    work_id: work_id.clone(),
+                    expected: work.version,
+                    next: work.version + 1,
+                },
+                Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: ExecutionState::Paused,
+                },
+                Effect::ReleaseSlot {
+                    execution_id: execution.id.clone(),
+                },
+                Effect::DeleteReservations {
+                    resource_keys: resources_keys_of(tx, &work, &execution)?,
+                    holder: ReservationHolder::Execution {
+                        execution_id: execution.id.clone(),
+                    },
+                },
+                Effect::ClearDeferral {
+                    execution_id: execution.id.clone(),
+                },
+            ],
         ));
     }
     let seq = tx.alloc_seq()?;
@@ -846,19 +909,6 @@ fn decide_cancel(
     }
 }
 
-/// The newest recorded `pr_head` for a Work — the head Commands and
-/// completion evidence are measured against.
-fn latest_pr_head(tx: &dyn ReadView, work_id: &WorkId) -> Result<Option<String>, StoreError> {
-    Ok(tx
-        .observations_for_work(work_id)?
-        .iter()
-        .rev()
-        .find_map(|o| match &o.fact {
-            ObservationFact::PrHead { head_sha, .. } => Some(head_sha.clone()),
-            _ => None,
-        }))
-}
-
 fn resources_keys_of(
     tx: &dyn ReadView,
     _work: &Work,
@@ -942,15 +992,27 @@ fn decide_judge(
             return Ok((d, vec![]));
         }
     };
-    // The judgment is bound to the recorded current head; a stale or
-    // unverified head cannot authorize decisions on the new one.
-    if latest_pr_head(tx, work_id)?.as_deref() != Some(expected_pr_head) {
+    // The judgment's head must equal the latest head observed in persisted
+    // evidence: a caller-supplied head with no observation is unverifiable,
+    // and a stale one is not the head this judgment is about.
+    let Some(observed) = tx.latest_pr_head(work_id)? else {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::SourceUnavailable,
+                Some(work_id.clone()),
+                vec![format!("no observed PR head for {}", work_id.0)],
+            ),
+            vec![],
+        ));
+    };
+    if observed != expected_pr_head {
         return Ok((
             rejected_now(
                 tx,
                 RejectionCode::StalePrHead,
                 Some(work_id.clone()),
-                vec!["expected_pr_head does not match the recorded head".into()],
+                vec![observed],
             ),
             vec![],
         ));
@@ -1058,30 +1120,51 @@ fn decide_release_judgment(
             vec![],
         ));
     }
-    // The gate opens only for a recorded judgment on the head the caller
-    // names, and only while that head is still the recorded current one.
-    if latest_pr_head(tx, work_id)?.as_deref() != Some(expected_pr_head) {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::StalePrHead,
-                Some(work_id.clone()),
-                vec!["expected_pr_head does not match the recorded head".into()],
-            ),
-            vec![],
-        ));
-    }
-    if !tx
-        .judgments(work_id)?
-        .iter()
-        .any(|(head, _)| head == expected_pr_head)
-    {
+    // The gate releases only against a recorded judgment for the head the
+    // caller expects; a stale-head release must not requeue the work.
+    let Some((recorded_head, _decisions)) = tx.latest_judgment(work_id)? else {
         return Ok((
             rejected_now(
                 tx,
                 RejectionCode::Ineligible,
                 Some(work_id.clone()),
-                vec!["no recorded judgment for expected_pr_head".into()],
+                vec!["no recorded judgment to release".into()],
+            ),
+            vec![],
+        ));
+    };
+    if recorded_head != expected_pr_head {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec![recorded_head],
+            ),
+            vec![],
+        ));
+    }
+    // A recorded judgment alone is not sufficient: the head must also be
+    // the one still observed, or the world moved after the judgment and the
+    // pause must not release against a head the operator never saw.
+    let Some(observed) = tx.latest_pr_head(work_id)? else {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::SourceUnavailable,
+                Some(work_id.clone()),
+                vec![format!("no observed PR head for {}", work_id.0)],
+            ),
+            vec![],
+        ));
+    };
+    if observed != expected_pr_head {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::StalePrHead,
+                Some(work_id.clone()),
+                vec![observed],
             ),
             vec![],
         ));
@@ -1134,6 +1217,28 @@ pub fn admit_queued(
     execution_id: &ExecutionId,
     now_unix_seconds: i64,
 ) -> Result<Option<Execution>, StoreError> {
+    admit_queued_role(
+        tx,
+        config,
+        execution_id,
+        InvocationRole::Coding,
+        now_unix_seconds,
+    )
+}
+
+/// Admission for one Invocation role: the single seam every request creation
+/// passes, so the budget bounds are enforced no matter which caller emits
+/// the request. A Review admission consumes both counters; a Coding one
+/// consumes only `invocations_used`. The head-bound judgment gate is
+/// rechecked here too, so a judgment recorded for an older PR head can
+/// never authorize a request after the head moves.
+pub fn admit_queued_role(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution_id: &ExecutionId,
+    role: InvocationRole,
+    now_unix_seconds: i64,
+) -> Result<Option<Execution>, StoreError> {
     let Some(execution) = tx.execution(execution_id)? else {
         return Ok(None);
     };
@@ -1146,16 +1251,43 @@ pub fn admit_queued(
             detail: format!("execution {} has no work", execution.id.0),
         })?;
 
-    // Invocation budget is a committed decision checked at request
-    // creation — resume keeps the counters, so an exhausted budget must
-    // fail the Execution rather than spin a deferred queue head.
-    if execution.invocations_used >= execution.budget.max_invocations {
-        fail_terminal(
-            tx,
-            &execution,
-            "invocation_budget_exhausted",
-            "recorded Invocation attempts reached the stored budget",
-        )?;
+    // Budget gate first, before any reservation, deferral, or slot effect:
+    // a spent bound is terminal for this Execution and must not be preceded
+    // by partial mutation. No counter increments and no request is emitted.
+    if !execution.accepts_invocation(&role) {
+        if let Some(limit) = execution.budget_exhaustion(&role) {
+            fail_terminal(tx, &execution, limit.terminal_code(), &limit.detail())?;
+            tx.apply(&Effect::ClearDeferral {
+                execution_id: execution.id.clone(),
+            })?;
+        }
+        return Ok(None);
+    }
+
+    // The human-judgment gate is bound to the PR head it was decided on: a
+    // judgment recorded while this Execution waited in the queue must not
+    // authorize a worker once the head moves (`PR head changes while
+    // queued`). This rechecks the same persisted evidence `release_judgment`
+    // compared; a head that moved past the recorded judgment needs a fresh
+    // decision, so the Execution pauses without reserving capacity and
+    // without emitting a request.
+    if let Some((judgment_head, _)) = tx.latest_judgment(&work.id)?
+        && let Some(observed) = tx.latest_pr_head(&work.id)?
+        && judgment_head != observed
+    {
+        let mut next = execution.clone();
+        next.state = ExecutionState::Paused;
+        next.pause_reason = Some(format!(
+            "pr head moved after judgment: decided {judgment_head}, observed {observed}; \
+             a new human judgment is required"
+        ));
+        tx.apply(&Effect::UpdateExecution {
+            execution: next,
+            expected_state: ExecutionState::Queued,
+        })?;
+        tx.apply(&Effect::ClearDeferral {
+            execution_id: execution.id.clone(),
+        })?;
         return Ok(None);
     }
 
@@ -1204,12 +1336,11 @@ pub fn admit_queued(
     let seq = tx.alloc_seq()?;
     let request = InvocationRequest {
         // One durable request per recorded attempt; the attempt counter
-        // makes re-admission ids unique. Coding-only: review requests are
-        // allocated by the review/fix path, not admission.
+        // makes re-admission ids unique.
         request_id: format!("{}:inv:{}", execution.id.0, execution.invocations_used),
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
-        role: InvocationRole::Coding,
+        role: role.clone(),
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
     };
     let mut next = execution.clone();
@@ -1221,6 +1352,9 @@ pub fn admit_queued(
         next.started_unix_seconds = Some(now_unix_seconds);
     }
     next.invocations_used += 1;
+    if role == InvocationRole::Review {
+        next.review_rounds_used += 1;
+    }
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
         expected_state: ExecutionState::Queued,
@@ -1774,11 +1908,11 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         return Ok(());
     }
     let observations = tx.observations_for_work(&execution.work_id)?;
-    let head = observations.iter().rev().find_map(|o| match &o.fact {
-        ObservationFact::PrHead { head_sha, .. } => Some(head_sha.clone()),
-        _ => None,
-    });
-    let Some(head) = head else { return Ok(()) };
+    // Same observed-time-ordered provenance the judgment gate compares, so
+    // completion and judge/release always measure against one head.
+    let Some(head) = tx.latest_pr_head(&execution.work_id)? else {
+        return Ok(());
+    };
     // Only the latest check and review recorded for the current head
     // count — a superseded approval must not complete the work.
     let checks_ok = observations

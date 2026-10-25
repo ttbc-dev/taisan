@@ -201,15 +201,61 @@ pub struct Execution {
     pub uncertain_since_unix_seconds: Option<i64>,
 }
 
+/// Which budget bound a next Invocation would exceed. Exhaustion is a
+/// terminal decision for the current Execution, recorded as its
+/// `terminal_code`, never a caller-visible rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetLimit {
+    Invocations,
+    ReviewRounds,
+}
+
+impl BudgetLimit {
+    pub fn terminal_code(&self) -> &'static str {
+        match self {
+            Self::Invocations => "invocation_budget_exhausted",
+            Self::ReviewRounds => "review_budget_exhausted",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Invocations => "invocation budget exhausted".into(),
+            Self::ReviewRounds => "review round budget exhausted".into(),
+        }
+    }
+}
+
 impl Execution {
-    /// Whether this Execution may receive a new Invocation request.
-    /// `uncertain` is excluded: a new writer is never granted while the
-    /// previous one is unproven.
-    pub fn accepts_invocation(&self) -> bool {
+    /// The budget bound the next Invocation for `role` would exceed, if any.
+    /// Checked before any counter increment or request emission, so
+    /// `invocations_used`/`review_rounds_used` can never grow past their
+    /// documented bounds.
+    pub fn budget_exhaustion(&self, role: &InvocationRole) -> Option<BudgetLimit> {
+        if self.invocations_used >= self.budget.max_invocations {
+            return Some(BudgetLimit::Invocations);
+        }
+        if matches!(role, InvocationRole::Review)
+            && self.review_rounds_used >= self.budget.max_review_rounds
+        {
+            return Some(BudgetLimit::ReviewRounds);
+        }
+        None
+    }
+
+    /// Whether this Execution may receive a new Invocation request for
+    /// `role`. `queued` is deliberate: admission is the `queued → ready`
+    /// request-creation point this predicate gates. `paused`/`stopping`
+    /// require a Command to requeue first, and `uncertain` is excluded: a
+    /// new writer is never granted while the previous one is unproven.
+    pub fn accepts_invocation(&self, role: &InvocationRole) -> bool {
         matches!(
             self.state,
-            ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting
-        ) && self.invocations_used < self.budget.max_invocations
+            ExecutionState::Queued
+                | ExecutionState::Ready
+                | ExecutionState::Running
+                | ExecutionState::Waiting
+        ) && self.budget_exhaustion(role).is_none()
     }
 }
 

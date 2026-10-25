@@ -151,6 +151,15 @@ impl ReadView for FailingTx<'_> {
     ) -> Result<Vec<(String, Vec<FindingDecision>)>, StoreError> {
         unimplemented!()
     }
+    fn latest_judgment(
+        &self,
+        _work_id: &WorkId,
+    ) -> Result<Option<(String, Vec<FindingDecision>)>, StoreError> {
+        unimplemented!()
+    }
+    fn latest_pr_head(&self, _work_id: &WorkId) -> Result<Option<String>, StoreError> {
+        unimplemented!()
+    }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
         Ok(0)
     }
