@@ -1,0 +1,9 @@
+[package]
+name = "workloop-store"
+edition.workspace = true
+
+[dependencies]
+workloop-core = { path = "../workloop-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = "1"
+serde_json = "1"
