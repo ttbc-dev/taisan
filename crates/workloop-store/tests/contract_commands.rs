@@ -1759,3 +1759,122 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
         "exactly one request is saved after the fresh judgment"
     );
 }
+
+// ---- Converge round 2: recording the Invocation consumes its request ----
+
+fn pending_request_ids(store: &SqliteStore) -> Vec<String> {
+    store
+        .transact(|tx| {
+            Ok(tx
+                .pending_requests()?
+                .into_iter()
+                .map(|r| r.request_id)
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
+}
+
+/// `pending_requests` is the durable handoff `execution` scans on wake and
+/// after restart. Recording the Invocation for a request is its consumption,
+/// so that request must leave the pending list — and only it — keeping a
+/// fresh request distinguishable from one already started.
+#[test]
+fn recording_an_invocation_consumes_only_its_request() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pc1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    let consumed_id = format!("{}:inv:0", e1.0);
+    assert_eq!(pending_request_ids(&store), vec![consumed_id.clone()]);
+
+    // `execution` records the Invocation before launch — the consumption.
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: Invocation {
+                id: InvocationId("inv-1".into()),
+                request_id: consumed_id.clone(),
+                execution_id: e1.clone(),
+                role: InvocationRole::Coding,
+                state: InvocationState::Prepared,
+                process_identity: None,
+                required_artifacts: vec![],
+                evidence_refs: vec![],
+            },
+        }],
+    );
+    assert!(
+        pending_request_ids(&store).is_empty(),
+        "a request whose Invocation was recorded must not stay pending"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&e1))
+            .unwrap()
+            .len(),
+        1,
+        "the recorded Invocation survives for reconciliation by request ID"
+    );
+
+    // The next admission saves a fresh request; the handoff must offer it
+    // while still withholding the consumed one.
+    force_state(&store, &e1, ExecutionState::Queued);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 10)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        pending_request_ids(&store),
+        vec![format!("{}:inv:1", e1.0)],
+        "only the fresh request is pending; the consumed one stays consumed"
+    );
+}
+
+/// The consumption mark matches by request ID; an Invocation whose request
+/// row is absent must still record (no aborted write) and must not disturb
+/// the request that is genuinely pending.
+#[test]
+fn recording_an_invocation_without_a_request_row_leaves_pending_alone() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pc2"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: Invocation {
+                id: InvocationId("inv-orphan".into()),
+                request_id: format!("{}:inv:ghost", e1.0),
+                execution_id: e1.clone(),
+                role: InvocationRole::Coding,
+                state: InvocationState::Done,
+                process_identity: None,
+                required_artifacts: vec![],
+                evidence_refs: vec![],
+            },
+        }],
+    );
+    assert_eq!(
+        pending_request_ids(&store),
+        vec![format!("{}:inv:0", e1.0)],
+        "the unmatched Invocation leaves the real request pending"
+    );
+}

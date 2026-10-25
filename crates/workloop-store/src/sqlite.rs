@@ -699,6 +699,14 @@ impl TxView for Tx<'_> {
                         json(&invocation.evidence_refs)?,
                     ],
                 )?;
+                // Recording the Invocation is the durable consumption of its
+                // request (`execution` records an Invocation before launch);
+                // `pending_requests` must never re-offer it. A request row
+                // that is absent matches nothing and is not an error.
+                self.exec(
+                    "UPDATE invocation_requests SET consumed=1 WHERE request_id=?1",
+                    params![invocation.request_id],
+                )?;
             }
             Effect::UpdateInvocation {
                 invocation,
