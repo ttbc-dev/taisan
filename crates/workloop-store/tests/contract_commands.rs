@@ -1518,3 +1518,132 @@ fn admission_rolls_back_on_request_persistence_failure() {
     assert_eq!(requests.len(), 1, "only the pre-inserted row remains");
     assert_eq!(requests[0].request_id, format!("{}:inv:0", e1.0));
 }
+
+// ---- Converge round 1: terminal cancel releases retained reservations ----
+
+/// A resumed Execution re-enters `queued` still holding its workspace and
+/// branch rows (lifecycle: reservations are held while nonterminal and
+/// released in the terminal commit). Cancelling it from `queued` must
+/// release them in the same commit, or the keys strand under a cancelled
+/// owner for the lifetime of the store.
+#[test]
+fn cancel_resumed_queued_execution_releases_retained_reservations() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("cr1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config(), &e1, NOW)?.is_some(),
+                "admission reserves workspace + branch"
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Pause per the lifecycle contract: release the slot, keep reservations.
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "cr2",
+                CommandBody::Resume {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    execution_id: e1.clone(),
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+    assert_eq!(
+        store.transact(|tx| tx.reservations()).unwrap().len(),
+        2,
+        "the resumed Execution still holds workspace + branch"
+    );
+
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "cr3",
+                CommandBody::Cancel {
+                    work_id,
+                    expected_work_version: 2,
+                    execution_id: None,
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Cancelled);
+    assert!(
+        store.transact(|tx| tx.reservations()).unwrap().is_empty(),
+        "the terminal cancel releases the retained write-resource reservations"
+    );
+}
+
+/// Cancelling a never-admitted `queued` Execution emits a holder-scoped
+/// release for reservations it does not hold; an external claim on the same
+/// branch key must survive untouched.
+#[test]
+fn cancel_from_queued_leaves_foreign_claims_alone() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("cr4"), NOW).unwrap());
+    let work_branch = WriteResource::Branch {
+        repository: "local/repo".into(),
+        branch: format!("work/{}", work_id.0),
+    };
+    let mut claim = req(
+        "cr5",
+        CommandBody::ClaimResources {
+            resources: vec![work_branch],
+            ttl_seconds: 600,
+        },
+    );
+    claim.actor.external_id = "outsider".into();
+    accepted(&handle_command(&store, &config(), &claim, NOW).unwrap());
+    assert_eq!(
+        store.transact(|tx| tx.reservations()).unwrap().len(),
+        1,
+        "the external claim holds the work branch while the Execution is queued"
+    );
+
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "cr6",
+                CommandBody::Cancel {
+                    work_id,
+                    expected_work_version: 1,
+                    execution_id: None,
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Cancelled);
+    let reservations = store.transact(|tx| tx.reservations()).unwrap();
+    assert_eq!(reservations.len(), 1, "the foreign claim is not deleted");
+    assert!(
+        reservations[0].holder.eq(&ReservationHolder::External {
+            actor_id: "outsider".into()
+        }),
+        "the surviving row is still the external claim"
+    );
+}

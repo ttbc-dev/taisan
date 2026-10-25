@@ -805,11 +805,21 @@ fn decide_cancel(
                 evidence_refs: vec![],
                 recorded_seq: seq,
             });
+            // A freshly submitted Execution holds nothing, but a resumed one
+            // re-entered `queued` still holding its workspace/branch rows;
+            // the terminal commit must release them under this holder
+            // (holder-scoped, so no foreign claim is touched).
             Ok(accept(vec![
                 bump,
                 Effect::UpdateExecution {
                     execution: next,
                     expected_state: ExecutionState::Queued,
+                },
+                Effect::DeleteReservations {
+                    resource_keys: resources_keys_of(tx, &work, &execution)?,
+                    holder: ReservationHolder::Execution {
+                        execution_id: execution.id.clone(),
+                    },
                 },
                 Effect::ClearDeferral {
                     execution_id: execution.id.clone(),
