@@ -164,11 +164,32 @@ pub fn phase_of(execution: &Execution, invocations: &[Invocation]) -> WorkPhase 
 
 /// The Work's attention-carrying Execution: the nonterminal one, else the
 /// most recent (its terminal failure may still need a retry decision).
-fn current_execution(tx: &dyn ReadView, work_id: &WorkId) -> Result<Option<Execution>, StoreError> {
+pub(crate) fn current_execution(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<Option<Execution>, StoreError> {
     if let Some(active) = tx.active_execution(work_id)? {
         return Ok(Some(active));
     }
     Ok(tx.executions_for_work(work_id)?.into_iter().last())
+}
+
+/// Attention versions the saved state derives right now, before the
+/// acknowledgement filter — the only ids an `acknowledge` may name.
+/// Acknowledging an id the state does not currently derive could hide a
+/// condition that has not surfaced yet.
+pub(crate) fn derivable_attention_ids(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+    now_unix_seconds: i64,
+) -> Result<Vec<String>, StoreError> {
+    let Some(execution) = current_execution(tx, work_id)? else {
+        return Ok(vec![]);
+    };
+    Ok(attention_views(work_id, &execution, now_unix_seconds)
+        .into_iter()
+        .map(|a| a.attention_id)
+        .collect())
 }
 
 /// Attention derived from a decidable condition: paused human judgment,
@@ -180,6 +201,19 @@ fn derive_attention(
     execution: &Execution,
     now_unix_seconds: i64,
 ) -> Result<Vec<AttentionView>, StoreError> {
+    let mut out = attention_views(work_id, execution, now_unix_seconds);
+    let acked = tx.attention_acks(work_id)?;
+    out.retain(|a| !acked.contains(&a.attention_id));
+    Ok(out)
+}
+
+/// The Attention versions the current Execution state derives, with no
+/// acknowledgement filtering.
+fn attention_views(
+    work_id: &WorkId,
+    execution: &Execution,
+    now_unix_seconds: i64,
+) -> Vec<AttentionView> {
     let mut out = Vec::new();
     let mut push = |reason: &str, anchor: String, threshold: Option<u64>, action: &str| {
         out.push(AttentionView {
@@ -238,9 +272,7 @@ fn derive_attention(
         }
         _ => {}
     }
-    let acked = tx.attention_acks(work_id)?;
-    out.retain(|a| !acked.contains(&a.attention_id));
-    Ok(out)
+    out
 }
 
 pub fn work_list(

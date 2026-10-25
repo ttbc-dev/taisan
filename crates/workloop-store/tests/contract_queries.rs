@@ -244,6 +244,77 @@ fn attention_versions_and_acknowledgement() {
 }
 
 #[test]
+fn acknowledge_requires_a_currently_derivable_attention_version() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "q14", "local/repo", 9);
+    // Nothing is paused yet, but the id names the pause_reason a later
+    // repair pause would produce: acknowledging it now would persist a
+    // row that hides that condition the moment it surfaces.
+    let phantom = format!(
+        "att:{}:paused_judgment:repair: launch refused before spawn",
+        work_id.0
+    );
+    let ack = |key: &str, attention_id: &str| {
+        handle_command(
+            &store,
+            &config(),
+            &CommandRequest {
+                actor: actor(),
+                origin: Origin("cli".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Acknowledge {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    attention_id: attention_id.to_string(),
+                },
+            },
+            NOW,
+        )
+        .unwrap()
+    };
+    let d = ack("q14-ack-early", &phantom);
+    assert!(
+        matches!(&d, CommandDecision::Rejected { reason, .. } if *reason == RejectionCode::Ineligible),
+        "{d:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.attention_acks(&work_id))
+            .unwrap()
+            .is_empty(),
+        "no ack row is recorded for a version the state never derived"
+    );
+
+    // The condition arrives with exactly that pause_reason: the same id
+    // is derivable now, so the acknowledgement is accepted and hides the
+    // displayed version.
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Paused;
+            e.pause_reason = Some("repair: launch refused before spawn".into());
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    let items = found(store.transact(|tx| attention(tx, None, NOW)).unwrap());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].attention_id, phantom, "the same id is now shown");
+    let d = ack("q14-ack-now", &phantom);
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    assert!(
+        found(store.transact(|tx| attention(tx, None, NOW)).unwrap()).is_empty(),
+        "the derivable version is hidden by its acknowledgement"
+    );
+    // The condition still holds, so the version is still derivable: a
+    // repeat acknowledgement is a no-op upsert, not a rejection.
+    let d = ack("q14-ack-again", &phantom);
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+}
+
+#[test]
 fn uncertain_beyond_threshold_surfaces_attention() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (_w, eid) = submit(&store, "q5", "local/repo", 11);

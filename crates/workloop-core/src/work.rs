@@ -275,7 +275,14 @@ fn decide(
             work_id,
             expected_work_version,
             attention_id,
-        } => decide_acknowledge(tx, req, work_id, *expected_work_version, attention_id),
+        } => decide_acknowledge(
+            tx,
+            req,
+            work_id,
+            *expected_work_version,
+            attention_id,
+            now_unix_seconds,
+        ),
         CommandBody::JudgeFindings {
             work_id,
             expected_work_version,
@@ -876,6 +883,7 @@ fn decide_acknowledge(
     work_id: &WorkId,
     expected_version: WorkVersion,
     attention_id: &str,
+    now_unix_seconds: i64,
 ) -> Verdict {
     let work = match check_work(tx, work_id, expected_version)? {
         Ok(w) => w,
@@ -884,6 +892,24 @@ fn decide_acknowledge(
             return Ok((d, vec![]));
         }
     };
+    // Acknowledgement marks a displayed Attention version as seen
+    // (docs/decisions.md); accepting an id the saved state does not
+    // currently derive would persist a row that hides the condition once
+    // it later surfaces with the same id.
+    let derivable = crate::projection::derivable_attention_ids(tx, work_id, now_unix_seconds)?;
+    if !derivable.iter().any(|id| id == attention_id) {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec![format!(
+                    "attention_id {attention_id} does not name a currently derivable Attention version"
+                )],
+            ),
+            vec![],
+        ));
+    }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
@@ -1301,10 +1327,23 @@ fn assess(
             status,
         })?;
     }
-    let Some(execution_id) = &obs.subject_execution_id else {
-        return Ok(());
+    let execution = match (&obs.subject_execution_id, &obs.subject_work_id) {
+        (Some(execution_id), _) => tx.execution(execution_id)?,
+        // Check/review facts are bound to the PR, and the Observation
+        // type makes the execution subject optional: a work-scoped
+        // delivery still has to be assessed for completion against the
+        // Work's current Execution instead of being silently dropped.
+        (None, Some(work_id))
+            if matches!(
+                &obs.fact,
+                ObservationFact::PrChecks { .. } | ObservationFact::PrReview { .. }
+            ) =>
+        {
+            crate::projection::current_execution(tx, work_id)?
+        }
+        (None, _) => None,
     };
-    let Some(execution) = tx.execution(execution_id)? else {
+    let Some(execution) = execution else {
         return Ok(());
     };
     match &obs.fact {
@@ -1322,18 +1361,24 @@ fn assess(
         ),
         ObservationFact::LaunchRefused { invocation_id, .. } => {
             mark_invocation(tx, invocation_id, InvocationState::Abandoned)?;
-            // Definitely no process exists: release the slot, keep the
-            // reservation for a repair, and park the Execution.
-            let mut next = execution.clone();
-            next.state = ExecutionState::Paused;
-            next.pause_reason = Some("repair: launch refused before spawn".into());
-            tx.apply(&Effect::UpdateExecution {
-                execution: next,
-                expected_state: execution.state.clone(),
-            })?;
-            tx.apply(&Effect::ReleaseSlot {
-                execution_id: execution.id.clone(),
-            })?;
+            // Definitely no process exists. lifecycle.md permits this
+            // transition only from `ready`: a late refusal delivered after
+            // cancel/stop (or a terminal settle) must not resurrect the
+            // Execution to `paused`. The refusal still resolves the
+            // Invocation itself — a spawn that never happened is not an
+            // unresolved writer.
+            if execution.state == ExecutionState::Ready {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Paused;
+                next.pause_reason = Some("repair: launch refused before spawn".into());
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: ExecutionState::Ready,
+                })?;
+                tx.apply(&Effect::ReleaseSlot {
+                    execution_id: execution.id.clone(),
+                })?;
+            }
             Ok(())
         }
         ObservationFact::Artifact { state, .. } => {
