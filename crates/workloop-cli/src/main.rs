@@ -440,15 +440,34 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::RunOnce => {
             let supervisor = build_supervisor(&config, &installation);
-            run_tick(&store, &config, &installation, supervisor.as_ref())?;
+            let mut github = FixtureGithub::new();
+            run_tick(
+                &store,
+                &config,
+                &installation,
+                supervisor.as_ref(),
+                &mut github,
+            )?;
         }
         Commands::Run { ticks, interval_ms } => {
             // One Supervisor across ticks: the per-request start/stop locks
-            // live on it, so recreating it would drop serialization.
+            // live on it, so recreating it would drop serialization. The
+            // FixtureGithub lives for the whole loop for the same reason:
+            // its PR numbering and head state must survive between ticks,
+            // or publishes in different ticks restart at PR 1 and an
+            // UpdatePr/PostPrComment head recheck can never match a PR
+            // published in an earlier tick.
             let supervisor = build_supervisor(&config, &installation);
+            let mut github = FixtureGithub::new();
             let mut remaining = ticks;
             loop {
-                run_tick(&store, &config, &installation, supervisor.as_ref())?;
+                run_tick(
+                    &store,
+                    &config,
+                    &installation,
+                    supervisor.as_ref(),
+                    &mut github,
+                )?;
                 if remaining == 1 {
                     break;
                 }
@@ -526,11 +545,14 @@ fn build_supervisor(
 
 /// One pass of the run loop: dispatch scan, execution consumer, GitHub
 /// outbox, timed sweep — every decision committed through the same ports.
+/// The GitHub adapter is owned by the caller so its remote state (PR
+/// numbering, heads, applied writes) persists across ticks of one `run`.
 fn run_tick(
     store: &SqliteStore,
     config: &WorkloopConfig,
     _installation: &Installation,
     supervisor: Option<&Supervisor<PosixProcessControl>>,
+    github: &mut FixtureGithub,
 ) -> Result<(), String> {
     let now = now();
     store
@@ -539,7 +561,6 @@ fn run_tick(
     if let Some(supervisor) = supervisor {
         supervisor.run_once(store, now).map_err(|e| e.to_string())?;
     }
-    let mut github = FixtureGithub::new();
     github
         .apply_outbox(store, config, now)
         .map_err(|e| e.to_string())?;
@@ -551,4 +572,169 @@ fn run_tick(
         .map_err(|e| e.to_string())?;
     print(&list);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workloop_core::store::{Effect, PrAction, PrActionIntent, PrActionStatus};
+    use workloop_core::work::admit_queued;
+
+    fn config() -> WorkloopConfig {
+        WorkloopConfig {
+            default_repository: "local/repo".into(),
+            allowed_effects: AllowedEffects {
+                workspace_write: true,
+                github_write: true,
+                network: false,
+            },
+            budget: ExecutionBudget::default(),
+        }
+    }
+
+    fn installation() -> Installation {
+        Installation {
+            actor_id: "actor-test".into(),
+            actor_kind: "human".into(),
+            repository: "local/repo".into(),
+            capacity: 2,
+            worker_argv: vec![],
+            workspace_root: "workspaces".into(),
+            allowed_effects: None,
+            budget: None,
+        }
+    }
+
+    fn submit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+        let d = handle_command(
+            store,
+            &config(),
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Submit {
+                    intent: format!("intent-{key}"),
+                    issue_refs: vec![],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            now(),
+        )
+        .unwrap();
+        let CommandDecision::Accepted {
+            work_id,
+            effect: CommandEffect::WorkCreated { execution_id },
+            ..
+        } = d
+        else {
+            panic!("submit {key}: {d:?}")
+        };
+        (work_id.unwrap(), execution_id)
+    }
+
+    /// The realistic drain context for an outstanding publish intent:
+    /// admitted, then waiting on the GitHub write.
+    fn force_waiting_on_github_write(store: &SqliteStore, eid: &ExecutionId) {
+        store
+            .transact(|tx| {
+                let mut e = tx.execution(eid)?.unwrap();
+                e.state = ExecutionState::Waiting;
+                e.waiting_reason = Some(WaitingReason::GithubWrite);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: e,
+                    expected_state: ExecutionState::Ready,
+                })
+            })
+            .unwrap();
+    }
+
+    fn queue_publish(store: &SqliteStore, work_id: &WorkId) {
+        store
+            .transact(|tx| {
+                let action_id = tx.alloc_id("act")?;
+                tx.apply(&Effect::InsertPrActionIntent {
+                    intent: PrActionIntent {
+                        action_id,
+                        work_id: work_id.clone(),
+                        repository: "local/repo".into(),
+                        action: PrAction::PublishPr {
+                            branch: format!("work/{}", work_id.0),
+                            title: "t".into(),
+                            body: String::new(),
+                        },
+                        status: PrActionStatus::Pending,
+                    },
+                })?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn github_state_persists_across_ticks_of_one_run() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let config = config();
+        let installation = installation();
+        let (w1, e1) = submit(&store, "tick-1");
+        let (w2, e2) = submit(&store, "tick-2");
+        for eid in [&e1, &e2] {
+            store
+                .transact(|tx| admit_queued(tx, &config, eid, now()).map(|_| ()))
+                .unwrap();
+            force_waiting_on_github_write(&store, eid);
+        }
+
+        // One fixture for the whole run, as `run` keeps it across ticks.
+        let mut github = FixtureGithub::new();
+
+        // Tick 1: work 1 publishes its PR.
+        queue_publish(&store, &w1);
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        assert_eq!(github.applied(), &["publish_pr:local/repo:1"]);
+
+        // Tick 2: work 2 publishes later — its PR number must continue,
+        // not restart at 1 and collide with work 1's.
+        queue_publish(&store, &w2);
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        assert_eq!(
+            github.applied(),
+            &["publish_pr:local/repo:1", "publish_pr:local/repo:2"]
+        );
+
+        // Tick 3: an UpdatePr head recheck matches the head published in
+        // tick 1 — impossible against a fixture that forgot tick 1.
+        store
+            .transact(|tx| {
+                let action_id = tx.alloc_id("act")?;
+                tx.apply(&Effect::InsertPrActionIntent {
+                    intent: PrActionIntent {
+                        action_id,
+                        work_id: w1.clone(),
+                        repository: "local/repo".into(),
+                        action: PrAction::UpdatePr {
+                            number: 1,
+                            expected_head: format!("work/{}-head", w1.0),
+                            body: "edited".into(),
+                        },
+                        status: PrActionStatus::Pending,
+                    },
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        assert_eq!(
+            github.applied(),
+            &[
+                "publish_pr:local/repo:1",
+                "publish_pr:local/repo:2",
+                "update_pr:local/repo:1"
+            ]
+        );
+    }
 }

@@ -1977,7 +1977,12 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
 
 /// The internal dispatch scan: queued Executions in committed enqueue
 /// order. A deferred head never blocks later items; each deferral is
-/// recorded for the `capacity` Query.
+/// recorded for the `capacity` Query. Each admission runs in its own
+/// savepoint, so a dispatch-time `ConstraintConflict` or `NoFreeSlot`
+/// (a request-ID/slot/reservation race with another process) rolls back
+/// only that item, records a retryable diagnostic, and the scan moves on
+/// — the conflict rule in lifecycle.md: the loop rereads and decides
+/// again instead of aborting the whole tick.
 pub fn dispatch_once(
     tx: &mut dyn TxView,
     config: &WorkloopConfig,
@@ -1985,8 +1990,29 @@ pub fn dispatch_once(
 ) -> Result<Vec<ExecutionId>, StoreError> {
     let mut admitted = Vec::new();
     for execution in tx.queued_executions()? {
-        if admit_queued(tx, config, &execution.id, now_unix_seconds)?.is_some() {
-            admitted.push(execution.id);
+        tx.begin_attempt()?;
+        match admit_queued(tx, config, &execution.id, now_unix_seconds) {
+            Ok(admitted_execution) => {
+                tx.commit_attempt()?;
+                if admitted_execution.is_some() {
+                    admitted.push(execution.id.clone());
+                }
+            }
+            Err(e @ (StoreError::ConstraintConflict { .. } | StoreError::NoFreeSlot)) => {
+                // The world changed under the read; partial effects from
+                // this admission are rolled back and the item stays
+                // queued with a diagnostic the next pass re-decides.
+                tx.revert_attempt()?;
+                tx.apply(&Effect::RecordDeferral {
+                    execution_id: execution.id.clone(),
+                    reason: "dispatch_conflict".into(),
+                    diagnostic: e.to_string(),
+                })?;
+            }
+            Err(e) => {
+                tx.revert_attempt()?;
+                return Err(e);
+            }
         }
     }
     Ok(admitted)

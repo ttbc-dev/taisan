@@ -6,7 +6,7 @@ use workloop_core::observation::{
     CheckConclusion, Observation, ObservationFact, Outcome, ReviewVerdict,
 };
 use workloop_core::store::{Effect, PrAction, PrActionIntent, PrActionStatus, Store};
-use workloop_core::work::{WorkloopConfig, handle_command};
+use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -523,6 +523,59 @@ fn earlier_external_claim_defers_queued_execution() {
         })
         .unwrap();
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+}
+
+#[test]
+fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (w1, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("dc1"), NOW).unwrap());
+    let (_, e2) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("dc2"), NOW).unwrap());
+
+    // Seed a request row with the exact ID the first admission will
+    // mint (`{execution}:inv:{invocations_used}`), so the mid-admission
+    // InsertRequest trips the uniqueness constraint — the shape of a
+    // lost request-ID race with another process.
+    let seeded = InvocationRequest {
+        request_id: format!("{}:inv:0", e1.0),
+        work_id: w1,
+        execution_id: e1.clone(),
+        role: InvocationRole::Coding,
+        payload: serde_json::json!({}),
+    };
+    apply_effects(&store, &[Effect::InsertRequest { request: seeded }]);
+
+    let admitted = store
+        .transact(|tx| dispatch_once(tx, &config(), NOW))
+        .expect("a dispatch-time conflict is not a tick error");
+    assert!(
+        !admitted.contains(&e1),
+        "the conflicted item is not admitted: {admitted:?}"
+    );
+    assert!(
+        admitted.contains(&e2),
+        "later independent queued items still admit: {admitted:?}"
+    );
+
+    // The failed admission left no partial effects: e1 stays queued
+    // (its queued→ready update and slot claim rolled back) with a
+    // retryable diagnostic; e2 holds the only slot and request.
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
+    assert_eq!(read_execution(&store, &e2).state, ExecutionState::Ready);
+    let (slots, deferrals) = store
+        .transact(|tx| {
+            Ok((
+                tx.slot_holders()?.len(),
+                tx.deferrals()?
+                    .into_iter()
+                    .find(|d| d.execution_id == e1)
+                    .expect("conflicted item is deferred"),
+            ))
+        })
+        .unwrap();
+    assert_eq!(slots, 1, "only the later item claims a slot");
+    assert_eq!(deferrals.reason, "dispatch_conflict");
 }
 
 // ---- Regression: review findings on slice-0 decision core ----
