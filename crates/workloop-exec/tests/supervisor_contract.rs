@@ -15,7 +15,7 @@ use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
     WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
 };
-use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
+use workloop_exec::supervisor::{PosixProcessControl, StopRecord, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -98,7 +98,15 @@ fn execution(store: &SqliteStore, id: &ExecutionId) -> Execution {
 }
 
 fn submit_and_admit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
-    let d = handle_command(store, &config(), &submit(key), NOW).unwrap();
+    submit_and_admit_with(store, &config(), key)
+}
+
+fn submit_and_admit_with(
+    store: &SqliteStore,
+    cfg: &WorkloopConfig,
+    key: &str,
+) -> (WorkId, ExecutionId) {
+    let d = handle_command(store, cfg, &submit(key), NOW).unwrap();
     let (work_id, eid) = match d {
         CommandDecision::Accepted {
             work_id, effect, ..
@@ -112,7 +120,7 @@ fn submit_and_admit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
         other => panic!("submit rejected: {other:?}"),
     };
     let admitted = store
-        .transact(|tx| admit_queued(tx, &config(), &eid, NOW))
+        .transact(|tx| admit_queued(tx, cfg, &eid, NOW))
         .unwrap();
     assert!(admitted.is_some(), "execution admitted");
     (work_id, eid)
@@ -611,6 +619,12 @@ fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
     let e = execution(&store, &eid);
     cancel(&store, &e.work_id, "k-c2");
     assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    // Stop was requested, not proven: the slot and the write-resource
+    // reservation stay held until the terminal commit.
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!((slots, reservations), (1, 2), "held while stopping");
     // First pass persists the intent and signals; the terminal commit only
     // lands after every recorded identity inspects as stopped.
     for _ in 0..40 {
@@ -632,6 +646,14 @@ fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
         })
         .unwrap();
     assert!(intent.is_some(), "stop intent was durable before signals");
+    let (slots, reservations) = store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap();
+    assert_eq!(
+        (slots, reservations),
+        (0, 0),
+        "slot and reservation release at the terminal commit, not before"
+    );
 }
 
 // ---- Artifact recovery (#10) ----
@@ -1277,8 +1299,14 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
         );
         let first = sup.request_stop(&store, &invocation, &identity).unwrap();
         assert_eq!(first, expected);
-        let resumed = sup.resume_recorded_stop(&store, &invocation).unwrap();
-        assert_eq!(resumed, expected);
+        // The durable intent recorded above is what `drive_stops`
+        // resumes from after a restart.
+        assert!(
+            store
+                .transact(|tx| tx.stop_intent(&invocation.id))
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -1350,4 +1378,631 @@ fn repeated_liveness_transitions_recover_without_poll_observation_growth() {
         unchanged.iter().all(|(before, after)| before == after),
         "{unchanged:?}"
     );
+}
+
+// ---- Stop proof (#16) ----
+
+/// The durable stop intent a crashed supervisor would have left behind,
+/// recorded through the same descendant snapshot and store commit
+/// `request_stop` runs — split at the persistence boundary so the test
+/// can hold the `kill -9` window open before any signal is sent.
+fn persist_stop_intent(
+    store: &SqliteStore,
+    sup: &Supervisor<PosixProcessControl>,
+    invocation: &Invocation,
+    leader: &ProcessIdentity,
+) -> StopIntent {
+    match sup.record_stop_intent(store, invocation, leader).unwrap() {
+        StopRecord::Recorded(intent) => intent,
+        StopRecord::Unknown { reason } => panic!("stop intent not persisted: {reason}"),
+    }
+}
+
+fn held_claims(store: &SqliteStore) -> (usize, usize) {
+    store
+        .transact(|tx| Ok((tx.slot_holders()?.len(), tx.reservations()?.len())))
+        .unwrap()
+}
+
+/// The ordering invariant, positive direction: while the persistence
+/// boundary is still open the recorded leader is untouched — the first
+/// signal can only be delivered after the intent is durable.
+/// `persist_failure_sends_no_signal` covers the negative direction.
+#[test]
+fn stop_intent_is_durable_before_the_first_signal() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("intent-order");
+    let port = PosixProcessControl;
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.clone(),
+        vec![fixture_bin()],
+        config(),
+    );
+    let leader = port
+        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .expect("spawn");
+    let invocation = Invocation {
+        id: InvocationId("inv-order".into()),
+        request_id: "req-order".into(),
+        execution_id: ExecutionId("e-order".into()),
+        role: InvocationRole::Coding,
+        state: InvocationState::Running,
+        process_identity: Some(leader.clone()),
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+    };
+    let receipt = sup
+        .stop_unless_persisted(&invocation, &leader, |mut intent| {
+            assert!(
+                !intent.identities.is_empty(),
+                "the descendant snapshot is recorded with the intent"
+            );
+            match port.inspect(&leader) {
+                // The boundary is open and no signal has been delivered.
+                ProcessEvidence::Alive { .. } => {}
+                other => panic!("a signal preceded the durable intent: {other:?}"),
+            }
+            // The durable write `request_stop` commits, not a stub.
+            store.transact(|tx| {
+                intent.recorded_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertStopIntent { intent })
+            })
+        })
+        .unwrap();
+    assert!(matches!(receipt, StopReceipt::Requested));
+    // The row `drive_stops` resumes from is durable before the first
+    // signal lands.
+    let recorded = store
+        .transact(|tx| tx.stop_intent(&invocation.id))
+        .unwrap()
+        .expect("the stop intent is durable in the store");
+    assert!(
+        recorded.identities.iter().any(|i| i.pid == leader.pid),
+        "the recorded snapshot names the leader"
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "leader stopped after the intent was durable",
+    );
+    port.reap(leader.pid);
+}
+
+/// A `setsid`-escaped child survives the process-group signal; only the
+/// descendant snapshot recorded with the stop intent names it, and the
+/// Execution cannot reach `cancelled` until that identity is inspected.
+#[test]
+fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("setsid-stop");
+    let (w, eid) = submit_and_admit(&store, "k-se1");
+    let argv = vec![
+        fixture_bin(),
+        "setsid-escape".into(),
+        // The leader lives ~20s so the stop intent's snapshot always finds
+        // the escapee still parented under it.
+        "--interval-ms".into(),
+        "1000".into(),
+    ];
+    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    wait_for(
+        || sup.workspace_of(&w).join("heartbeat.log").exists(),
+        "escapee heartbeat",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+    let port = PosixProcessControl;
+
+    cancel(&store, &w, "k-se2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    assert_eq!(held_claims(&store), (1, 2));
+
+    // The intent is durable before any signal — the same snapshot and
+    // store commit `request_stop` runs, held open at the boundary so the
+    // test can deliver the group signal itself. The production snapshot
+    // names the escapee: it escaped the leader's process group, so only
+    // this record covers it.
+    let intent = persist_stop_intent(&store, &sup, &invocation, &leader);
+    assert!(
+        store
+            .transact(|tx| tx.stop_intent(&invocation.id))
+            .unwrap()
+            .is_some(),
+        "the stop intent is durable before the first signal"
+    );
+    let escapee = intent
+        .identities
+        .iter()
+        .find(|i| i.pid != leader.pid)
+        .expect("the snapshot names the setsid escapee")
+        .clone();
+    assert_ne!(
+        escapee.pgid, leader.pgid,
+        "the escapee left the leader's process group"
+    );
+
+    // A process-group signal alone kills the leader but not the escapee.
+    // The group signal is authorized only while the recorded leader
+    // verifies alive — the same gate `stop_unless_persisted` applies.
+    assert!(matches!(
+        port.inspect(&leader),
+        ProcessEvidence::Alive { ref identity } if *identity == leader
+    ));
+    assert_eq!(
+        port.signal_group(leader.pgid.expect("leader pgid"), libc::SIGKILL),
+        SignalOutcome::Sent
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "leader stopped by the group signal",
+    );
+    assert!(
+        matches!(port.inspect(&escapee), ProcessEvidence::Alive { .. }),
+        "a setsid-escaped child survives a process-group signal"
+    );
+
+    // While the escapee is unproven, cancellation cannot settle — the
+    // group-signal evidence covers the leader only. A supervisor restart
+    // (kill -9 between intent and proof) resumes from the durable intent.
+    drop(sup);
+    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
+    restarted.drive_stops(&store, NOW).unwrap();
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Stopping,
+        "the uninspected escapee keeps the Execution from settling"
+    );
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "nothing releases while a recorded identity is unproven"
+    );
+
+    // The resumed pass signalled the escapee under re-verification; once
+    // every recorded identity inspects stopped, the terminal commit lands.
+    wait_for(
+        || matches!(port.inspect(&escapee), ProcessEvidence::Stopped { .. }),
+        "escapee stopped via the recorded identity",
+    );
+    for _ in 0..40 {
+        restarted.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+    for identity in &intent.identities {
+        assert!(
+            matches!(port.inspect(identity), ProcessEvidence::Stopped { .. }),
+            "every recorded identity inspected stopped at the terminal commit: {identity:?}"
+        );
+    }
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// A supervisor `kill -9` mid-stop — after the stop intent is persisted
+/// and the first recorded identity is signaled, but before the rest are
+/// processed: the restarted supervisor resumes signaling and inspection
+/// from the durable intent alone — never re-deriving the tree and never
+/// spawning a second writer.
+#[test]
+fn kill9_after_intent_persisted_resumes_from_the_durable_intent() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("kill9-resume");
+    let (w, eid) = submit_and_admit(&store, "k-k91");
+    let argv = vec![
+        fixture_bin(),
+        "setsid-escape".into(),
+        // The leader lives ~20s so the stop intent's snapshot always
+        // catches the escapee.
+        "--interval-ms".into(),
+        "1000".into(),
+    ];
+    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    wait_for(
+        || sup.workspace_of(&w).join("heartbeat.log").exists(),
+        "escapee heartbeat",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+    let port = PosixProcessControl;
+
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-k92");
+    // Mid-stop crash: the intent — with the full descendant snapshot the
+    // production persist path records — is durable and the leader has
+    // already been signaled when the supervisor dies; the escapee is
+    // still unprocessed.
+    let intent = persist_stop_intent(&store, &sup, &invocation, &leader);
+    let escapee = intent
+        .identities
+        .iter()
+        .find(|i| i.pid != leader.pid)
+        .expect("the snapshot names the setsid escapee")
+        .clone();
+    assert_eq!(
+        port.signal_verified(&leader, libc::SIGKILL),
+        SignalOutcome::Sent,
+        "the crashed supervisor had already signaled the first identity"
+    );
+    drop(sup);
+    assert!(
+        matches!(port.inspect(&escapee), ProcessEvidence::Alive { .. }),
+        "killed mid-stop: the escapee is still unprocessed"
+    );
+
+    // The restarted supervisor holds no memory of the stop; the stop
+    // pass must resume signaling and inspection from the durable intent
+    // alone — never re-deriving the tree and never spawning a writer.
+    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
+    restarted.drive_stops(&store, NOW).unwrap();
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Stopping,
+        "the unproven escapee keeps the Execution from settling"
+    );
+    wait_for(
+        || matches!(port.inspect(&escapee), ProcessEvidence::Stopped { .. }),
+        "escapee stopped via the recorded identity",
+    );
+    for _ in 0..40 {
+        restarted.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&eid))
+            .unwrap()
+            .len(),
+        1,
+        "no second writer while the recorded stop was unproven"
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// An unreaped zombie counts as stopped, and the supervisor reaps the
+/// children it spawned: after the terminal commit the leader's pid has
+/// left the process table entirely rather than lingering as a zombie of
+/// the supervisor.
+#[test]
+fn the_supervisor_reaps_the_children_it_spawned() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("reap-stop");
+    let (_w, eid) = submit_and_admit(&store, "k-reap1");
+    let sup = supervisor("zombie", root);
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+    let port = PosixProcessControl;
+    // The fixture holds an unreaped child; wait until it is recorded.
+    wait_for(
+        || {
+            port.snapshot_descendants(leader.pid)
+                .unwrap()
+                .iter()
+                .any(|i| i.pid != leader.pid)
+        },
+        "zombie child to appear",
+    );
+
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-reap2");
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+
+    // The leader was our child: the supervisor reaped it, so its pid left
+    // the process table instead of lingering as a supervisor-side zombie.
+    // kill(pid, 0) still succeeds on a zombie — only the reap turns it
+    // into ESRCH.
+    wait_for(
+        || {
+            let rc = unsafe { libc::kill(leader.pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        },
+        "reaped leader left the process table",
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// A worker's own `done` claim is evidence to assess, not a release
+/// event: while no stop is in flight it yields neither a terminal state
+/// nor any capacity or reservation release — it resolves the writer
+/// record only, even while the process still runs. A worker never emits
+/// a `ProcessState` fact itself; `Exited` is the supervisor's verified
+/// report, and during a stop that report is the recorded proof the stop
+/// settles on (see `an_exited_report_settles_a_requested_stop`). A
+/// cancel on top of the claim still drives the recorded identity to
+/// stop proof before the claims release — the resolved record alone is
+/// never the proof.
+#[test]
+fn a_workers_done_claim_alone_releases_nothing() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("done-claim");
+    let (w, eid) = submit_and_admit(&store, "k-dc1");
+    let sup = supervisor("hang", root);
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            source_event_id: Some("worker:done-claim".into()),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: invocation.id.clone(),
+                process_identity: format!("{}@{}", leader.pid, leader.started_at),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let e = execution(&store, &eid);
+    assert!(
+        !e.state.is_terminal(),
+        "a done claim alone is never a terminal state: {:?}",
+        e.state
+    );
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "a done claim alone releases no slot and no reservation"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&eid))
+            .unwrap()
+            .remove(0)
+            .state,
+        InvocationState::Done,
+        "the claim resolves the writer record only — not the release"
+    );
+    // The gap the claim must not open: the resolved record is not stop
+    // proof while the process is live, so a cancel still drives the
+    // recorded identity to a real stop before the claims release.
+    let port = PosixProcessControl;
+    assert!(matches!(
+        port.inspect(&leader),
+        ProcessEvidence::Alive { .. }
+    ));
+    cancel(&store, &w, "k-dc2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+    assert!(
+        matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "the live writer was signaled and proven before the release"
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// `work`'s half of the stop-settle: during `stopping`, the reported
+/// `Exited` is the recorded proof that the writer is gone — the
+/// Execution settles to the requested outcome and releases the slot and
+/// the reservation. The other half — the supervisor emits `Exited` only
+/// after inspecting every recorded identity — is the port contract the
+/// setsid/zombie/kill-9 tests pin; here the writer is actually stopped
+/// and reaped first so the report models the verified path.
+#[test]
+fn an_exited_report_settles_a_requested_stop() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("exited-settle");
+    let (w, eid) = submit_and_admit(&store, "k-es1");
+    let sup = supervisor("hang", root);
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+    let port = PosixProcessControl;
+
+    cancel(&store, &w, "k-es2");
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Cancel));
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "the stop request alone releases nothing"
+    );
+
+    // The supervisor's half of the proof — signal, inspect, reap — runs
+    // before `Exited` is ever reported.
+    assert_eq!(
+        port.signal_verified(&leader, libc::SIGKILL),
+        SignalOutcome::Sent
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "writer stopped",
+    );
+    port.reap(leader.pid);
+    drop(sup);
+
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            source_event_id: Some("sup:exited-settle".into()),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: invocation.id.clone(),
+                process_identity: format!("{}@{}", leader.pid, leader.started_at),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.state,
+        ExecutionState::Cancelled,
+        "the verified exit report settles the requested cancel"
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// A missing PID alone releases nothing: an unresolved writer with no
+/// recorded identity cannot be signaled or proven, so the stop drives the
+/// Execution to `uncertain` and the slot and reservation stay held.
+#[test]
+fn a_missing_pid_keeps_the_execution_uncertain_and_releases_nothing() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("missing-pid");
+    let (w, eid) = submit_and_admit(&store, "k-mp1");
+    let sup = supervisor("hang", root);
+    // A consumed request whose invocation was recorded Prepared but never
+    // gained a process identity — the missing-PID case.
+    let request = store
+        .transact(|tx| {
+            let reqs = tx.pending_requests()?;
+            Ok(reqs.into_iter().next().expect("one request"))
+        })
+        .unwrap();
+    store
+        .transact(|tx| {
+            let inv_id = tx.alloc_id("inv")?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(inv_id),
+                    request_id: request.request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Prepared,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    cancel(&store, &w, "k-mp2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    for _ in 0..3 {
+        sup.drive_stops(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        assert_eq!(
+            e.state,
+            ExecutionState::Uncertain,
+            "an unidentifiable writer keeps the stop unproven"
+        );
+        assert_eq!(e.desired_action, Some(DesiredAction::Cancel));
+        assert_eq!(
+            held_claims(&store),
+            (1, 2),
+            "a missing PID releases no slot and no reservation"
+        );
+    }
+}
+
+/// Heartbeat/deadline expiry releases nothing by itself: the runtime
+/// bound expiring only requests a stop (desired `fail`); the slot and the
+/// reservation stay held until the writer is proven stopped.
+#[test]
+fn a_runtime_deadline_expiry_requests_stop_and_releases_nothing() {
+    let mut cfg = config();
+    cfg.budget.runtime_limit_seconds = 60;
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("expiry-stop");
+    let (_w, eid) = submit_and_admit_with(&store, &cfg, "k-exp1");
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root,
+        vec![fixture_bin(), "hang".into()],
+        cfg.clone(),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+
+    sweep(&store, &cfg, NOW + 61).unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.state,
+        ExecutionState::Stopping,
+        "expiry requests a stop; it is not a release"
+    );
+    assert_eq!(e.desired_action, Some(DesiredAction::Fail));
+    assert!(!e.state.is_terminal());
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "expiry alone releases no slot and no reservation"
+    );
+    // Stop proof completes the requested failure and only then releases.
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Failed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Failed);
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
 }
