@@ -428,6 +428,101 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
 }
 
 #[test]
+fn terminal_execution_still_authorizes_outstanding_effect_reconciliation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "terminal-outbox");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        PrAction::PublishPr {
+            branch: "work/terminal".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&eid)?.unwrap();
+            execution.state = ExecutionState::Cancelled;
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    let mut gh = FixtureGithub::new();
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
+    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Cancelled
+    );
+}
+
+#[test]
+fn execution_denial_is_not_overridden_by_installation_permissions() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "execution-denial");
+    let actions = [
+        PrAction::PublishPr {
+            branch: "work/restricted".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        PrAction::UpdatePr {
+            number: 7,
+            expected_head: "head".into(),
+            body: "edited".into(),
+        },
+        PrAction::PostPrComment {
+            number: 7,
+            expected_head: "head".into(),
+            body: "comment".into(),
+        },
+    ];
+    let ids: Vec<_> = actions
+        .into_iter()
+        .map(|action| insert_intent(&store, &work_id, action))
+        .collect();
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&eid)?.unwrap();
+            execution.allowed_effects.github_write = false;
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    let mut gh = FixtureGithub::new();
+    gh.set_head("local/repo", 7, "head");
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert!(gh.applied().is_empty());
+    for id in &ids {
+        assert_eq!(intent_status(&store, id), PrActionStatus::Pending);
+    }
+
+    let (allowed_work, _) = submit(&store, "execution-allowed");
+    let allowed_id = insert_intent(
+        &store,
+        &allowed_work,
+        PrAction::PublishPr {
+            branch: "work/allowed".into(),
+            title: "allowed".into(),
+            body: "b".into(),
+        },
+    );
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(gh.applied(), &["publish_pr:local/repo:8"]);
+    assert_eq!(intent_status(&store, &allowed_id), PrActionStatus::Applied);
+}
+
+#[test]
 fn github_write_denied_leaves_the_outbox_pending() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _eid) = submit(&store, "k-g8");

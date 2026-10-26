@@ -60,10 +60,8 @@ impl FixtureGithub {
     /// recorded as a `pr_action_result` Observation keyed by action ID;
     /// `unknown` stays outstanding until reconciled.
     ///
-    /// The drain is gated by `allowed_effects.github_write`: when the
-    /// installation denies GitHub writes (the CLI default), no intent is
-    /// attempted — rows stay `pending` rather than being mutated or
-    /// reclassified.
+    /// Both the installation and the Execution must grant `github_write`.
+    /// Denied intents stay `pending`. This fixture performs no network I/O.
     pub fn apply_outbox(
         &mut self,
         store: &impl Store,
@@ -98,7 +96,19 @@ impl FixtureGithub {
         now: i64,
     ) -> Result<(), StoreError> {
         let work_id = intent.work_id.clone();
-        let execution_id = store.transact(|tx| Ok(tx.active_execution(&work_id)?.map(|e| e.id)))?;
+        let execution = store.transact(|tx| {
+            Ok(tx
+                .executions_for_work(&work_id)?
+                .into_iter()
+                .max_by_key(|execution| execution.ordinal))
+        })?;
+        let Some(execution) = execution else {
+            return Ok(());
+        };
+        if !execution.allowed_effects.github_write {
+            return Ok(());
+        }
+        let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
             source_event_id: None,
             subject_work_id: Some(work_id.clone()),
