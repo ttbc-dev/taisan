@@ -386,6 +386,7 @@ name = "workloop-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "workloop-core",
  "workloop-exec",

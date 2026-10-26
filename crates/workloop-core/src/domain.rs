@@ -274,12 +274,17 @@ pub struct Invocation {
     pub evidence_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: i32,
     /// Opaque verifier — e.g. the `ps lstart` string — stored verbatim and
     /// re-verified before any signal, never parsed.
     pub started_at: String,
+    /// The process group this identity belongs to. `None` for descendants
+    /// that escaped the group (e.g. `setsid`), which is exactly why the
+    /// snapshot covers them individually.
+    #[serde(default)]
+    pub pgid: Option<i32>,
 }
 
 /// The durable request `execution` consumes; survives a crash between the

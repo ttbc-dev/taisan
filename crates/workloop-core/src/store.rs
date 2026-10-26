@@ -89,6 +89,29 @@ pub enum Effect {
         expected_pr_head: String,
         decisions: Vec<crate::command::FindingDecision>,
     },
+    /// `execution` consumed a durable request; the store is the handoff, so
+    /// consumption is recorded rather than deleted.
+    MarkRequestConsumed {
+        request_id: String,
+    },
+    /// Reconciled result of an outbox action; `unknown` stays outstanding.
+    UpdateActionIntent {
+        action_id: String,
+        status: PrActionStatus,
+    },
+}
+
+/// Reconciliation state of a recorded outbox action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrActionStatus {
+    /// Recorded but not yet attempted.
+    Pending,
+    Applied,
+    Failed,
+    /// The external result is not known; stays outstanding until
+    /// reconciled by action ID.
+    Unknown,
 }
 
 /// A recorded intent to perform a GitHub write; reconciled by action ID.
@@ -98,6 +121,14 @@ pub struct PrActionIntent {
     pub work_id: WorkId,
     pub repository: String,
     pub action: PrAction,
+    #[serde(default = "PrActionStatus::pending")]
+    pub status: PrActionStatus,
+}
+
+impl PrActionStatus {
+    fn pending() -> Self {
+        Self::Pending
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +150,15 @@ pub enum PrAction {
         expected_head: String,
         body: String,
     },
+}
+
+/// A dispatch deferral: why a queued Execution was not admitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Deferral {
+    pub execution_id: ExecutionId,
+    pub reason: String,
+    pub diagnostic: String,
+    pub since_seq: EventSequence,
 }
 
 /// Why the store refused an effect; `work` maps it to a rejection or
@@ -205,10 +245,45 @@ pub trait ReadView {
 
     /// Approved requests not yet consumed by `execution`.
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError>;
+    fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError>;
     fn invocations_for_execution(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Vec<Invocation>, StoreError>;
+    /// The Invocation recorded for a durable request, if any — the
+    /// at-most-once reconciliation key.
+    fn invocation_for_request(&self, request_id: &str) -> Result<Option<Invocation>, StoreError>;
+    /// Invocations that may still write (prepared/running/unknown).
+    fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError>;
+
+    fn works(&self) -> Result<Vec<Work>, StoreError>;
+    fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError>;
+
+    fn stop_intent(&self, invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError>;
+
+    /// Recorded dispatch deferrals, keyed by Execution — the `capacity`
+    /// Query's explanation of queue stalls.
+    fn deferrals(&self) -> Result<Vec<Deferral>, StoreError>;
+
+    /// Attention IDs already acknowledged for a Work.
+    fn attention_acks(&self, work_id: &WorkId) -> Result<Vec<String>, StoreError>;
+
+    /// Observations recorded against an Execution (process, artifact,
+    /// GitHub facts) for evidence views and reconciliation.
+    fn observations_for_execution(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<Observation>, StoreError>;
+    fn observations_for_work(&self, work_id: &WorkId) -> Result<Vec<Observation>, StoreError>;
+
+    /// All outbox rows; `pending`/`unknown` are outstanding effects.
+    fn action_intents(&self) -> Result<Vec<PrActionIntent>, StoreError>;
+
+    /// Recorded finding judgments for a Work.
+    fn judgments(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<(String, Vec<crate::command::FindingDecision>)>, StoreError>;
 
     /// The Work's most recent recorded judgment: its PR head and decisions.
     fn latest_judgment(
