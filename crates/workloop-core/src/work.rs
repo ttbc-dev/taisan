@@ -1463,14 +1463,13 @@ fn assess(
     }
     let execution = match (&obs.subject_execution_id, &obs.subject_work_id) {
         (Some(execution_id), _) => tx.execution(execution_id)?,
-        // Check/review facts are bound to the PR, and the Observation
-        // type makes the execution subject optional: a work-scoped
-        // delivery still has to be assessed for completion against the
-        // Work's current Execution instead of being silently dropped.
         (None, Some(work_id))
             if matches!(
                 &obs.fact,
-                ObservationFact::PrChecks { .. } | ObservationFact::PrReview { .. }
+                ObservationFact::PrChecks { .. }
+                    | ObservationFact::PrReview { .. }
+                    | ObservationFact::PrHead { .. }
+                    | ObservationFact::PrActionResult { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -1562,11 +1561,12 @@ fn assess(
             }
             Ok(())
         }
-        ObservationFact::PrChecks { .. } | ObservationFact::PrReview { .. } => {
-            assess_completion(tx, &execution)
-        }
         _ => Ok(()),
-    }
+    }?;
+    let Some(current) = tx.execution(&execution.id)? else {
+        return Ok(());
+    };
+    assess_completion(tx, &current)
 }
 
 fn mark_invocation(
@@ -1576,7 +1576,7 @@ fn mark_invocation(
 ) -> Result<(), StoreError> {
     for exec in tx.nonterminal_executions()? {
         for inv in tx.invocations_for_execution(&exec.id)? {
-            if inv.id == *invocation_id && inv.state != state {
+            if inv.id == *invocation_id && inv.state.is_unresolved_writer() && inv.state != state {
                 let mut next = inv.clone();
                 next.state = state;
                 tx.apply(&Effect::UpdateInvocation {
@@ -1635,11 +1635,12 @@ fn assess_process(
                     next.state = ExecutionState::Waiting;
                     next.waiting_reason = Some(WaitingReason::Reconciliation);
                     tx.apply(&Effect::UpdateExecution {
-                        execution: next,
+                        execution: next.clone(),
                         expected_state: execution.state.clone(),
                     })?;
-                    maybe_publish(tx, config, execution, now_unix_seconds)
+                    maybe_publish(tx, config, &next, now_unix_seconds)
                 }
+                ExecutionState::Waiting => maybe_publish(tx, config, execution, now_unix_seconds),
                 ExecutionState::Stopping | ExecutionState::Uncertain => {
                     settle_after_writer_gone(tx, config, execution, now_unix_seconds)
                 }
@@ -1806,33 +1807,17 @@ fn maybe_publish(
     if execution.state != ExecutionState::Waiting {
         return Ok(());
     }
-    if matches!(
-        execution.waiting_reason,
-        Some(WaitingReason::ArtifactRecovery)
-    ) {
-        // Recovery only proceeds once every required artifact is present.
-        let invocations = tx.invocations_for_execution(&execution.id)?;
-        let complete = invocations
-            .iter()
-            .rev()
-            .find(|i| i.state == InvocationState::Done || i.state == InvocationState::Abandoned)
-            .map(|i| crate::projection::artifacts_complete(tx, &execution.id, i).unwrap_or(false))
-            .unwrap_or(false);
-        if !complete {
-            return Ok(());
-        }
-    } else {
-        let invocations = tx.invocations_for_execution(&execution.id)?;
-        let latest = invocations.last();
-        let complete = match latest {
-            Some(i) if i.state == InvocationState::Done => {
-                crate::projection::artifacts_complete(tx, &execution.id, i)?
-            }
-            _ => false,
-        };
-        if !complete {
-            return Ok(());
-        }
+    let invocations = tx.invocations_for_execution(&execution.id)?;
+    if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
+        return Ok(());
+    }
+    let Some(latest) = invocations.last() else {
+        return Ok(());
+    };
+    if latest.state != InvocationState::Done
+        || !crate::projection::artifacts_complete(tx, &execution.id, latest)?
+    {
+        return Ok(());
     }
     let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
     if !outstanding.is_empty() {

@@ -364,28 +364,31 @@ pub fn work_detail(
     }
     let outcome = current.as_ref().and_then(|e| e.outcome.clone());
 
-    // Current PR head is the newest pr_head Observation for this Work; the
-    // actionable findings are review facts bound to that head.
     let observations = tx.observations_for_work(work_id)?;
-    let mut current_pr: Option<(PrRef, Option<String>)> = None;
+    let current_pr = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, obs)| match &obs.fact {
+            ObservationFact::PrHead {
+                repository,
+                number,
+                head_sha,
+            } => Some((
+                (obs.observed_unix_seconds, index),
+                (
+                    PrRef {
+                        repository: repository.clone(),
+                        number: *number,
+                    },
+                    Some(head_sha.clone()),
+                ),
+            )),
+            _ => None,
+        })
+        .max_by_key(|(order, _)| *order)
+        .map(|(_, pr)| pr);
     let mut findings = Vec::new();
     let mut sources = vec![store_source()];
-    for obs in &observations {
-        if let ObservationFact::PrHead {
-            repository,
-            number,
-            head_sha,
-        } = &obs.fact
-        {
-            current_pr = Some((
-                PrRef {
-                    repository: repository.clone(),
-                    number: *number,
-                },
-                Some(head_sha.clone()),
-            ));
-        }
-    }
     if let Some((_, Some(head))) = &current_pr {
         let mut has_review_for_head = false;
         for obs in &observations {

@@ -157,6 +157,76 @@ fn work_detail_binds_findings_to_the_current_head() {
 }
 
 #[test]
+fn delayed_head_observation_does_not_change_detail_head_or_findings() {
+    for execution_scoped in [false, true] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (work_id, execution_id) = submit(&store, "delayed-head", "local/repo", 7);
+        for (at, fact) in [
+            (
+                NOW + 10,
+                ObservationFact::PrHead {
+                    repository: "local/repo".into(),
+                    number: 7,
+                    head_sha: "sha-current".into(),
+                },
+            ),
+            (
+                NOW + 10,
+                ObservationFact::PrReview {
+                    repository: "local/repo".into(),
+                    head_sha: "sha-current".into(),
+                    reviewer: "current-reviewer".into(),
+                    verdict: ReviewVerdict::ChangesRequested,
+                },
+            ),
+            (
+                NOW,
+                ObservationFact::PrHead {
+                    repository: "local/repo".into(),
+                    number: 6,
+                    head_sha: "sha-delayed".into(),
+                },
+            ),
+            (
+                NOW,
+                ObservationFact::PrReview {
+                    repository: "local/repo".into(),
+                    head_sha: "sha-delayed".into(),
+                    reviewer: "stale-reviewer".into(),
+                    verdict: ReviewVerdict::Approve,
+                },
+            ),
+        ] {
+            workloop_core::work::handle_observation(
+                &store,
+                &config(),
+                &Observation {
+                    source_event_id: None,
+                    subject_work_id: (!execution_scoped).then(|| work_id.clone()),
+                    subject_execution_id: execution_scoped.then(|| execution_id.clone()),
+                    fact,
+                    observed_unix_seconds: at,
+                },
+                NOW + 20,
+            )
+            .unwrap();
+        }
+        let view = found(
+            store
+                .transact(|tx| work_detail(tx, &work_id, NOW + 20))
+                .unwrap(),
+        );
+        let (pr, head) = view.current_pr.unwrap();
+        assert_eq!(head.as_deref(), Some("sha-current"));
+        assert_eq!(pr.number, 7);
+        assert_eq!(
+            view.findings,
+            vec!["review by current-reviewer at sha-current: ChangesRequested"]
+        );
+    }
+}
+
+#[test]
 fn work_detail_reports_the_terminal_outcome() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _eid) = submit(&store, "q20", "local/repo", 61);

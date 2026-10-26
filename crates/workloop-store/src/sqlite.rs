@@ -624,7 +624,9 @@ impl ReadView for Tx<'_> {
         self.query_all(
             "SELECT source_event_id, subject_work_id, subject_execution_id, \
              fact, observed_unix_seconds FROM observations \
-             WHERE subject_work_id=?1 ORDER BY id",
+             WHERE subject_work_id=?1 \
+                OR subject_execution_id IN (SELECT id FROM executions WHERE work_id=?1) \
+             ORDER BY id",
             params![work_id.0],
             observation_from_row,
         )
