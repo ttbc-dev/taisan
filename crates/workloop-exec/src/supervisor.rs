@@ -297,6 +297,19 @@ impl From<std::io::Error> for ExecError {
     }
 }
 
+/// The outcome of the durable-intent half of the stop path
+/// (`Supervisor::record_stop_intent`).
+#[derive(Debug)]
+pub enum StopRecord {
+    /// The stop intent — descendant snapshot included — is durable; its
+    /// recorded identities are the only ones a later signal pass may
+    /// target.
+    Recorded(StopIntent),
+    /// The snapshot or the durable write could not be completed: nothing
+    /// was persisted, so no signal may be sent.
+    Unknown { reason: String },
+}
+
 /// The execution supervisor: consumes approved requests, spawns workers,
 /// drives stop intents to stop proof, and runs bounded artifact recovery.
 /// Start and stop for one request are serialized through a per-request
@@ -700,17 +713,41 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 continue;
             }
             let invocations = store.transact(|tx| tx.invocations_for_execution(&execution.id))?;
-            let unresolved: Vec<_> = invocations
+            let mut unresolved: Vec<Invocation> = invocations
                 .iter()
                 .filter(|i| i.state.is_unresolved_writer())
                 .cloned()
                 .collect();
+            // A resolved record is not stop proof on its own: an
+            // unverified `Exited` report (e.g. a worker's own done claim)
+            // resolves the Invocation while the process may still run,
+            // and settling on that record alone would release the slot
+            // and the reservation under a live writer. Re-enter it in the
+            // signal/inspect loop unless every recorded process — the
+            // stop intent's snapshot when one exists — verifies stopped.
+            for invocation in &invocations {
+                if invocation.state.is_unresolved_writer() {
+                    continue;
+                }
+                let identities: Vec<ProcessIdentity> =
+                    match store.transact(|tx| tx.stop_intent(&invocation.id))? {
+                        Some(intent) => intent.identities,
+                        None => invocation.process_identity.iter().cloned().collect(),
+                    };
+                let unproven = identities
+                    .iter()
+                    .any(|id| !matches!(self.port.inspect(id), ProcessEvidence::Stopped { .. }));
+                if unproven {
+                    unresolved.push(invocation.clone());
+                }
+            }
             if unresolved.is_empty() {
-                // Every recorded writer is already resolved (or none ever
-                // ran): the writer is gone by definition. Reporting the
-                // exit fact lets `work` settle the stopping/uncertain
-                // Execution — without this it would wait forever for a
-                // process-exit observation that can never arrive.
+                // Every recorded writer is resolved and every recorded
+                // process is verified stopped (or none ever ran):
+                // reporting the exit fact lets `work` settle the
+                // stopping/uncertain Execution — without this it would
+                // wait forever for a process-exit observation that can
+                // never arrive.
                 if let Some(latest) = invocations.last()
                     && let Some(request) = store.transact(|tx| tx.request(&latest.request_id))?
                 {
@@ -831,12 +868,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
         invocation: &Invocation,
         leader: &ProcessIdentity,
     ) -> Result<StopReceipt, ExecError> {
-        self.stop_unless_persisted(invocation, leader, |mut intent| {
-            store.transact(|tx| {
-                intent.recorded_seq = tx.alloc_seq()?;
-                tx.apply(&Effect::InsertStopIntent { intent })?;
-                Ok(())
-            })
+        self.stop_unless_persisted(invocation, leader, |intent| {
+            persist_intent_row(store, intent).map(|_| ())
+        })
+    }
+
+    /// The durable-intent half of `request_stop`: the same descendant
+    /// snapshot, leader checks, and store commit — without the signal
+    /// pass. A crash-window test holds the boundary open here; the
+    /// production stop path always continues into the signals in the
+    /// same call.
+    pub fn record_stop_intent(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        leader: &ProcessIdentity,
+    ) -> Result<StopRecord, ExecError> {
+        let mut recorded = None;
+        let persisted = self.persist_stop_snapshot(invocation, leader, |intent| {
+            recorded = Some(persist_intent_row(store, intent)?);
+            Ok(())
+        })?;
+        Ok(match persisted {
+            Ok(_) => StopRecord::Recorded(
+                recorded.expect("the intent is recorded before the boundary closes"),
+            ),
+            Err(reason) => StopRecord::Unknown { reason },
         })
     }
 
@@ -850,37 +907,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         leader: &ProcessIdentity,
         persist: impl FnOnce(StopIntent) -> Result<(), StoreError>,
     ) -> Result<StopReceipt, ExecError> {
-        // Same key as the start path: start and stop for one request are
-        // serialized through a single per-request lock.
-        let lock = self.lock_for(&invocation.request_id);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut identities = match self.port.snapshot_descendants(leader.pid) {
+        let identities = match self.persist_stop_snapshot(invocation, leader, persist)? {
             Ok(identities) => identities,
             Err(reason) => return Ok(StopReceipt::Unknown { reason }),
         };
-        if identities
-            .iter()
-            .any(|identity| identity.pid == leader.pid && identity.started_at != leader.started_at)
-        {
-            return Ok(StopReceipt::Unknown {
-                reason: "leader pid was reused before the descendant snapshot".into(),
-            });
-        }
-        if !identities.iter().any(|i| i.pid == leader.pid) {
-            identities.insert(0, leader.clone());
-        }
-        let persisted = persist(StopIntent {
-            invocation_id: invocation.id.clone(),
-            identities: identities.clone(),
-            recorded_seq: 0,
-        });
-        if let Err(e) = persisted {
-            // Durably stopping is already recorded on the Execution; with
-            // no durable intent the supervisor must not signal.
-            return Ok(StopReceipt::Unknown {
-                reason: format!("stop intent not persisted, no signal sent: {e}"),
-            });
-        }
         // A stale leader cannot authorize a signal to a reused group.
         if let Some(pgid) = leader.pgid
             && matches!(self.port.inspect(leader), ProcessEvidence::Alive { identity } if identity == *leader)
@@ -902,31 +932,47 @@ impl<P: ProcessControlPort> Supervisor<P> {
         })
     }
 
-    /// After a restart, a durable stop intent resumes signaling and
-    /// inspection from the recorded snapshot — never re-deriving the tree.
-    pub fn resume_recorded_stop(
+    /// Snapshot the writer's descendants and hand the stop intent to
+    /// `persist` under the per-request lock — the half of the stop path
+    /// that must complete before any signal. `Err` carries why nothing
+    /// was persisted; it means no signal may be sent.
+    fn persist_stop_snapshot(
         &self,
-        store: &impl Store,
         invocation: &Invocation,
-    ) -> Result<StopReceipt, ExecError> {
-        let Some(intent) = store.transact(|tx| tx.stop_intent(&invocation.id))? else {
-            return Ok(StopReceipt::Unknown {
-                reason: "no recorded stop intent".into(),
-            });
+        leader: &ProcessIdentity,
+        persist: impl FnOnce(StopIntent) -> Result<(), StoreError>,
+    ) -> Result<Result<Vec<ProcessIdentity>, String>, ExecError> {
+        // Same key as the start path: start and stop for one request are
+        // serialized through a single per-request lock.
+        let lock = self.lock_for(&invocation.request_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut identities = match self.port.snapshot_descendants(leader.pid) {
+            Ok(identities) => identities,
+            Err(reason) => return Ok(Err(reason)),
         };
-        let mut all_gone = true;
-        for id in &intent.identities {
-            match self.port.signal_verified(id, libc::SIGKILL) {
-                SignalOutcome::AlreadyGone => {}
-                SignalOutcome::Sent | SignalOutcome::SkippedStale => all_gone = false,
-                SignalOutcome::Failed { reason } => return Ok(StopReceipt::Unknown { reason }),
-            }
+        if identities
+            .iter()
+            .any(|identity| identity.pid == leader.pid && identity.started_at != leader.started_at)
+        {
+            return Ok(Err(
+                "leader pid was reused before the descendant snapshot".into(),
+            ));
         }
-        Ok(if all_gone {
-            StopReceipt::AlreadyStopped
-        } else {
-            StopReceipt::Requested
-        })
+        if !identities.iter().any(|i| i.pid == leader.pid) {
+            identities.insert(0, leader.clone());
+        }
+        match persist(StopIntent {
+            invocation_id: invocation.id.clone(),
+            identities: identities.clone(),
+            recorded_seq: 0,
+        }) {
+            Ok(()) => Ok(Ok(identities)),
+            // Durably stopping is already recorded on the Execution; with
+            // no durable intent the supervisor must not signal.
+            Err(e) => Ok(Err(format!(
+                "stop intent not persisted, no signal sent: {e}"
+            ))),
+        }
     }
 
     /// One bounded recovery attempt per waiting Execution per pass. Each
@@ -1126,6 +1172,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
     }
+}
+
+/// The durable write `request_stop` and `record_stop_intent` share: the
+/// intent row `drive_stops` resumes from after a restart. Returns the
+/// intent with its recorded sequence filled in.
+fn persist_intent_row(
+    store: &impl Store,
+    mut intent: StopIntent,
+) -> Result<StopIntent, StoreError> {
+    store.transact(|tx| {
+        intent.recorded_seq = tx.alloc_seq()?;
+        tx.apply(&Effect::InsertStopIntent {
+            intent: intent.clone(),
+        })?;
+        Ok(())
+    })?;
+    Ok(intent)
 }
 
 fn required_artifacts(request: &InvocationRequest) -> Vec<String> {
