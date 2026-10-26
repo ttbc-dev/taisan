@@ -215,12 +215,13 @@ fn zombie_counts_as_stopped() {
     wait_for(
         || {
             port.snapshot_descendants(leader.pid)
+                .unwrap()
                 .iter()
                 .any(|i| i.pid != leader.pid)
         },
         "zombie child to appear",
     );
-    let descendants = port.snapshot_descendants(leader.pid);
+    let descendants = port.snapshot_descendants(leader.pid).unwrap();
     let zombie = descendants
         .iter()
         .find(|i| i.pid != leader.pid)
@@ -288,7 +289,7 @@ fn setsid_escapee_is_in_the_snapshot_and_signaled() {
         || root.join("heartbeat.log").exists(),
         "escaped writer heartbeat",
     );
-    let snapshot = port.snapshot_descendants(leader.pid);
+    let snapshot = port.snapshot_descendants(leader.pid).unwrap();
     let escapee = snapshot
         .iter()
         .find(|i| i.pid != leader.pid)

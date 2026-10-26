@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use workloop_core::domain::*;
@@ -26,7 +26,24 @@ pub struct PosixProcessControl;
 
 fn ps_output(args: &[&str]) -> std::io::Result<String> {
     let out = Command::new("ps").args(args).output()?;
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    checked_ps_output(out, args.contains(&"-p"))
+}
+
+fn checked_ps_output(out: Output, allows_absence: bool) -> std::io::Result<String> {
+    if out.status.success()
+        || (allows_absence
+            && out.status.code() == Some(1)
+            && out.stdout.is_empty()
+            && out.stderr.is_empty())
+    {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        Err(std::io::Error::other(format!(
+            "ps failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 /// `ps` lstart prints five fields (`Sat Oct 24 06:14:00 2026`). The ctime
@@ -113,25 +130,27 @@ impl ProcessControlPort for PosixProcessControl {
         })
     }
 
-    fn snapshot_descendants(&self, leader_pid: i32) -> Vec<ProcessIdentity> {
+    fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         // pid, ppid, pgid, lstart(5 fields). Collected while the leader is
         // still alive — after it exits, orphans reparent and leave the tree.
-        let Ok(table) = ps_output(&["-Ao", "pid=,ppid=,pgid=,lstart="]) else {
-            return vec![];
-        };
+        let table = ps_output(&["-Ao", "pid=,ppid=,pgid=,lstart="])
+            .map_err(|e| format!("descendant snapshot failed: {e}"))?;
         let mut by_ppid: HashMap<i32, Vec<(i32, i32, String)>> = HashMap::new();
         let mut all = HashMap::new();
         for line in table.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 8 {
+            if f.is_empty() {
                 continue;
+            }
+            if f.len() != 8 {
+                return Err(format!("incomplete process-table row: {line}"));
             }
             let (Ok(pid), Ok(ppid), Ok(pgid)) = (
                 f[0].parse::<i32>(),
                 f[1].parse::<i32>(),
                 f[2].parse::<i32>(),
             ) else {
-                continue;
+                return Err(format!("invalid process-table row: {line}"));
             };
             let lstart = normalize_lstart(&f[3..].join(" "));
             by_ppid
@@ -140,7 +159,6 @@ impl ProcessControlPort for PosixProcessControl {
                 .push((pid, pgid, lstart.clone()));
             all.insert(pid, (pgid, lstart));
         }
-        let leader_pgid = all.get(&leader_pid).map(|(g, _)| *g).unwrap_or(leader_pid);
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut stack = vec![leader_pid];
@@ -159,8 +177,7 @@ impl ProcessControlPort for PosixProcessControl {
                 stack.extend(children.iter().map(|(c, _, _)| *c));
             }
         }
-        let _ = leader_pgid;
-        out
+        Ok(out)
     }
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
@@ -846,7 +863,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // serialized through a single per-request lock.
         let lock = self.lock_for(&invocation.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut identities = self.port.snapshot_descendants(leader.pid);
+        let mut identities = match self.port.snapshot_descendants(leader.pid) {
+            Ok(identities) => identities,
+            Err(reason) => return Ok(StopReceipt::Unknown { reason }),
+        };
         if !identities.iter().any(|i| i.pid == leader.pid) {
             identities.insert(0, leader.clone());
         }
@@ -1139,6 +1159,85 @@ pub fn write_artifact(path: &Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_ps_status_cannot_prove_absence() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code, stderr: &[u8]| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: vec![],
+            stderr: stderr.to_vec(),
+        };
+        assert_eq!(checked_ps_output(output(1, b""), true).unwrap(), "");
+        assert!(checked_ps_output(output(1, b"process table unavailable"), true).is_err());
+        assert!(checked_ps_output(output(2, b""), true).is_err());
+        assert!(checked_ps_output(output(1, b""), false).is_err());
+    }
+
+    struct SnapshotFailure;
+
+    impl ProcessControlPort for SnapshotFailure {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn expected")
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Err("process table unavailable".into())
+        }
+        fn inspect(&self, _: &ProcessIdentity) -> ProcessEvidence {
+            panic!("no inspect expected")
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            panic!("incomplete snapshot must not authorize signaling")
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            panic!("incomplete snapshot must not authorize signaling")
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    #[test]
+    fn failed_snapshot_neither_persists_partial_stop_intent_nor_signals() {
+        let sup = Supervisor::new(
+            SnapshotFailure,
+            PathBuf::from("/unused"),
+            vec![],
+            workloop_core::work::WorkloopConfig {
+                default_repository: "local/repo".into(),
+                allowed_effects: AllowedEffects {
+                    workspace_write: true,
+                    github_write: false,
+                    network: false,
+                },
+                budget: ExecutionBudget::default(),
+            },
+        );
+        let identity = ProcessIdentity {
+            pid: 42,
+            started_at: "recorded start".into(),
+            pgid: Some(42),
+        };
+        let invocation = Invocation {
+            id: InvocationId("inv-1".into()),
+            request_id: "req-1".into(),
+            execution_id: ExecutionId("exec-1".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Running,
+            process_identity: Some(identity.clone()),
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+        };
+        let receipt = sup
+            .stop_unless_persisted(&invocation, &identity, |_| {
+                panic!("a partial snapshot must not be persisted as complete")
+            })
+            .unwrap();
+        assert_eq!(
+            receipt,
+            StopReceipt::Unknown {
+                reason: "process table unavailable".into()
+            }
+        );
+    }
 
     #[test]
     fn lstart_lookup_keeps_failure_distinct_from_absence() {

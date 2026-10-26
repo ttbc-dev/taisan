@@ -74,7 +74,9 @@ pub trait ProcessControlPort {
     /// The leader plus every write-capable descendant, captured while the
     /// leader still exists. After the leader exits, orphans reparent and
     /// leave the process tree, so this cannot be reconstructed later.
-    fn snapshot_descendants(&self, leader_pid: i32) -> Vec<ProcessIdentity>;
+    /// An incomplete process-table read returns an error and cannot
+    /// authorize signaling from a partial descendant snapshot.
+    fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String>;
 
     /// Read the current state of one recorded identity.
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence;
