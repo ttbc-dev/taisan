@@ -1281,3 +1281,73 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
         assert_eq!(resumed, expected);
     }
 }
+
+#[test]
+fn repeated_liveness_transitions_recover_without_poll_observation_growth() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit_and_admit(&store, "liveness-transitions");
+    let root = tmp_root("liveness-transitions");
+    let sup = supervisor("hang", root.clone());
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let mut recovered = vec![];
+    let mut unchanged = vec![];
+    for offset in 1..=2 {
+        handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                source_event_id: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: Some(eid.clone()),
+                fact: ObservationFact::ProcessState {
+                    invocation_id: invocation.id.clone(),
+                    process_identity: "probe unavailable".into(),
+                    state: ProcessStateFact::Unknown,
+                },
+                observed_unix_seconds: NOW + offset,
+            },
+            NOW + offset,
+        )
+        .unwrap();
+        assert_eq!(execution(&store, &eid).state, ExecutionState::Uncertain);
+        let restarted = supervisor("hang", root.clone());
+        restarted.poll_invocations(&store, NOW + offset).unwrap();
+        recovered.push(execution(&store, &eid).state);
+        let before = store
+            .transact(|tx| tx.observations_for_execution(&eid))
+            .unwrap()
+            .len();
+        restarted
+            .poll_invocations(&store, NOW + offset + 10)
+            .unwrap();
+        let next_restart = supervisor("hang", root.clone());
+        next_restart
+            .poll_invocations(&store, NOW + offset + 20)
+            .unwrap();
+        let after = store
+            .transact(|tx| tx.observations_for_execution(&eid))
+            .unwrap()
+            .len();
+        unchanged.push((before, after));
+    }
+    cancel(&store, &work_id, "liveness-cancel");
+    for _ in 0..40 {
+        sup.run_once(&store, NOW + 100).unwrap();
+        if execution(&store, &eid).state.is_terminal() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        recovered,
+        vec![ExecutionState::Running, ExecutionState::Running]
+    );
+    assert!(
+        unchanged.iter().all(|(before, after)| before == after),
+        "{unchanged:?}"
+    );
+}

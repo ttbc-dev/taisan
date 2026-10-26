@@ -1035,8 +1035,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
         serde_json::to_string(&fact)
             .unwrap_or_default()
             .hash(&mut h);
+        let mut source_event_id = format!("sup:{:x}", h.finish());
+        if let ObservationFact::ProcessState { invocation_id, .. } = &fact {
+            let (generation, repeated) = store.transact(|tx| {
+                let observations = tx.observations_for_execution(&request.execution_id)?;
+                let process_facts: Vec<_> = observations
+                    .iter()
+                    .filter(|observation| {
+                        matches!(&observation.fact,
+                        ObservationFact::ProcessState { invocation_id: recorded, .. }
+                            if recorded == invocation_id)
+                    })
+                    .collect();
+                let repeated = process_facts.last().is_some_and(|last| {
+                    last.source_event_id.as_ref().is_some_and(|id| {
+                        id == &source_event_id || id.starts_with(&format!("{source_event_id}:"))
+                    })
+                });
+                Ok((process_facts.len(), repeated))
+            })?;
+            if repeated {
+                return Ok(());
+            }
+            source_event_id = format!("{source_event_id}:{generation}");
+        }
         let obs = Observation {
-            source_event_id: Some(format!("sup:{:x}", h.finish())),
+            source_event_id: Some(source_event_id),
             subject_work_id: Some(request.work_id.clone()),
             subject_execution_id: Some(request.execution_id.clone()),
             fact,
