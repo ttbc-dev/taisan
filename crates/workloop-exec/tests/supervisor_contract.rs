@@ -1211,3 +1211,73 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
         }
     }
 }
+
+#[test]
+fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
+    use std::path::Path;
+    use workloop_core::ports::SpawnError;
+
+    struct SignalPort(SignalOutcome);
+    impl ProcessControlPort for SignalPort {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            unreachable!()
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
+            ProcessEvidence::Alive {
+                identity: identity.clone(),
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            self.0.clone()
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            self.0.clone()
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    for (signal, expected) in [
+        (SignalOutcome::Sent, StopReceipt::Requested),
+        (SignalOutcome::AlreadyGone, StopReceipt::AlreadyStopped),
+        (SignalOutcome::SkippedStale, StopReceipt::Requested),
+        (
+            SignalOutcome::Failed {
+                reason: "permission denied".into(),
+            },
+            StopReceipt::Unknown {
+                reason: "permission denied".into(),
+            },
+        ),
+    ] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (_, eid) = submit_and_admit(&store, "stop-receipt");
+        let identity = ProcessIdentity {
+            pid: 42,
+            started_at: "original".into(),
+            pgid: Some(42),
+        };
+        let invocation = Invocation {
+            id: InvocationId("inv-receipt".into()),
+            request_id: format!("{}:inv:0", eid.0),
+            execution_id: eid,
+            role: InvocationRole::Coding,
+            state: InvocationState::Running,
+            process_identity: Some(identity.clone()),
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+        };
+        let sup = Supervisor::new(
+            SignalPort(signal),
+            PathBuf::from("/unused"),
+            vec![],
+            config(),
+        );
+        let first = sup.request_stop(&store, &invocation, &identity).unwrap();
+        assert_eq!(first, expected);
+        let resumed = sup.resume_recorded_stop(&store, &invocation).unwrap();
+        assert_eq!(resumed, expected);
+    }
+}

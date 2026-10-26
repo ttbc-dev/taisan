@@ -890,10 +890,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let mut all_gone = true;
         for id in &identities {
             match self.port.signal_verified(id, libc::SIGKILL) {
-                SignalOutcome::Sent | SignalOutcome::AlreadyGone => {}
-                SignalOutcome::SkippedStale | SignalOutcome::Failed { .. } => {
-                    all_gone = false;
-                }
+                SignalOutcome::AlreadyGone => {}
+                SignalOutcome::Sent | SignalOutcome::SkippedStale => all_gone = false,
+                SignalOutcome::Failed { reason } => return Ok(StopReceipt::Unknown { reason }),
             }
         }
         Ok(if all_gone {
@@ -918,8 +917,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let mut all_gone = true;
         for id in &intent.identities {
             match self.port.signal_verified(id, libc::SIGKILL) {
-                SignalOutcome::Sent | SignalOutcome::AlreadyGone => {}
-                _ => all_gone = false,
+                SignalOutcome::AlreadyGone => {}
+                SignalOutcome::Sent | SignalOutcome::SkippedStale => all_gone = false,
+                SignalOutcome::Failed { reason } => return Ok(StopReceipt::Unknown { reason }),
             }
         }
         Ok(if all_gone {
