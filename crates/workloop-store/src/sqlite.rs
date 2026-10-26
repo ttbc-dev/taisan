@@ -2,11 +2,11 @@
 //! Structural invariants live in constraints and partial unique indexes;
 //! transition legality stays in `work`. One connection behind a mutex
 //! serializes transactions within a process; across processes (every CLI
-//! invocation is one) SQLite's file locking serializes writers, and the busy
-//! timeout makes the loser wait for the lock instead of failing immediately —
-//! the constraint layer is the belt, not a race window.
+//! invocation is one) immediate transactions reserve the writer before reading.
+//! Contenders wait on the busy timeout before observing a snapshot, so a later
+//! write never needs to upgrade a stale WAL snapshot.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -133,7 +133,9 @@ impl Store for SqliteStore {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
-        let tx = guard.transaction().map_err(internal)?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         let mut view = Tx { tx };
         let result = f(&mut view);
         match result {
