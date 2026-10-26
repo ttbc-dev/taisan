@@ -251,8 +251,10 @@ fn acknowledge_requires_a_currently_derivable_attention_version() {
     // repair pause would produce: acknowledging it now would persist a
     // row that hides that condition the moment it surfaces.
     let phantom = format!(
-        "att:{}:paused_judgment:repair: launch refused before spawn",
-        work_id.0
+        "att:{}:paused_judgment:repair: launch refused before spawn:{}:{}:0",
+        work_id.0,
+        eid.0,
+        execution(&store, &eid).enqueued_seq
     );
     let ack = |key: &str, attention_id: &str| {
         handle_command(
@@ -301,8 +303,12 @@ fn acknowledge_requires_a_currently_derivable_attention_version() {
         .unwrap();
     let items = found(store.transact(|tx| attention(tx, None, NOW)).unwrap());
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].attention_id, phantom, "the same id is now shown");
-    let d = ack("q14-ack-now", &phantom);
+    let shown = items[0].attention_id.clone();
+    assert_eq!(
+        shown, phantom,
+        "the previously underivable version is now shown"
+    );
+    let d = ack("q14-ack-now", &shown);
     assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
     assert!(
         found(store.transact(|tx| attention(tx, None, NOW)).unwrap()).is_empty(),
@@ -310,8 +316,109 @@ fn acknowledge_requires_a_currently_derivable_attention_version() {
     );
     // The condition still holds, so the version is still derivable: a
     // repeat acknowledgement is a no-op upsert, not a rejection.
-    let d = ack("q14-ack-again", &phantom);
+    let d = ack("q14-ack-again", &shown);
     assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+}
+
+#[test]
+fn repeated_pause_and_new_evidence_get_fresh_attention_versions() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "repeated-pause", "local/repo", 9);
+    let pause = |expected_state| {
+        store
+            .transact(|tx| {
+                let mut execution = tx.execution(&eid)?.unwrap();
+                execution.state = ExecutionState::Paused;
+                execution.pause_reason = Some("repair: launch refused before spawn".into());
+                tx.apply(&Effect::UpdateExecution {
+                    execution,
+                    expected_state,
+                })
+            })
+            .unwrap();
+    };
+    pause(ExecutionState::Queued);
+    let first = found(
+        store
+            .transact(|tx| attention(tx, Some(&work_id), NOW))
+            .unwrap(),
+    )[0]
+    .attention_id
+    .clone();
+    handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "ack-first-pause".into(),
+            body: CommandBody::Acknowledge {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                attention_id: first.clone(),
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(
+        found(
+            store
+                .transact(|tx| attention(tx, Some(&work_id), NOW + 3600))
+                .unwrap()
+        )
+        .is_empty()
+    );
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&eid)?.unwrap();
+            execution.state = ExecutionState::Queued;
+            execution.enqueued_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Paused,
+            })
+        })
+        .unwrap();
+    pause(ExecutionState::Queued);
+    let second = found(
+        store
+            .transact(|tx| attention(tx, Some(&work_id), NOW))
+            .unwrap(),
+    );
+    assert_eq!(
+        second.len(),
+        1,
+        "a repeated pause must resurface after acknowledgement"
+    );
+    assert_ne!(second[0].attention_id, first);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertObservation {
+                observation: Observation {
+                    source_event_id: Some("new-pause-evidence".into()),
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::PrHead {
+                        repository: "local/repo".into(),
+                        number: 9,
+                        head_sha: "new-evidence".into(),
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            })
+        })
+        .unwrap();
+    let third = found(
+        store
+            .transact(|tx| attention(tx, Some(&work_id), NOW))
+            .unwrap(),
+    );
+    assert_eq!(third.len(), 1);
+    assert_ne!(
+        third[0].attention_id, second[0].attention_id,
+        "new evidence changes the version"
+    );
 }
 
 #[test]

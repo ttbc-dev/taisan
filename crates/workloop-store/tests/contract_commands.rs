@@ -1052,7 +1052,16 @@ fn acknowledge_replays_the_same_decision() {
         CommandBody::Acknowledge {
             work_id: work_id.clone(),
             expected_work_version: 1,
-            attention_id: format!("att:{}:paused_judgment:paused", work_id.0),
+            attention_id: store
+                .transact(|tx| {
+                    let workloop_core::projection::QueryResult::Found { value, .. } =
+                        workloop_core::projection::work_detail(tx, &work_id, NOW)?
+                    else {
+                        panic!("work must exist");
+                    };
+                    Ok(value.attention[0].attention_id.clone())
+                })
+                .unwrap(),
         },
     );
     let d = assert_replay_locked(&store, &ack, NOW, NOW);
@@ -2087,7 +2096,16 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
             CommandBody::Acknowledge {
                 work_id: work_id.clone(),
                 expected_work_version: 1,
-                attention_id: format!("att:{}:paused_judgment:paused", work_id.0),
+                attention_id: store
+                    .transact(|tx| {
+                        let workloop_core::projection::QueryResult::Found { value, .. } =
+                            workloop_core::projection::work_detail(tx, &work_id, NOW)?
+                        else {
+                            panic!("work must exist");
+                        };
+                        Ok(value.attention[0].attention_id.clone())
+                    })
+                    .unwrap(),
             },
         ));
         cases.push(("acknowledge", store, original, mutant));

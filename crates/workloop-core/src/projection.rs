@@ -186,7 +186,7 @@ pub(crate) fn derivable_attention_ids(
     let Some(execution) = current_execution(tx, work_id)? else {
         return Ok(vec![]);
     };
-    Ok(attention_views(work_id, &execution, now_unix_seconds)
+    Ok(attention_views(tx, work_id, &execution, now_unix_seconds)?
         .into_iter()
         .map(|a| a.attention_id)
         .collect())
@@ -201,7 +201,7 @@ fn derive_attention(
     execution: &Execution,
     now_unix_seconds: i64,
 ) -> Result<Vec<AttentionView>, StoreError> {
-    let mut out = attention_views(work_id, execution, now_unix_seconds);
+    let mut out = attention_views(tx, work_id, execution, now_unix_seconds)?;
     let acked = tx.attention_acks(work_id)?;
     out.retain(|a| !acked.contains(&a.attention_id));
     Ok(out)
@@ -210,14 +210,27 @@ fn derive_attention(
 /// The Attention versions the current Execution state derives, with no
 /// acknowledgement filtering.
 fn attention_views(
+    tx: &dyn ReadView,
     work_id: &WorkId,
     execution: &Execution,
     now_unix_seconds: i64,
-) -> Vec<AttentionView> {
+) -> Result<Vec<AttentionView>, StoreError> {
+    let execution_evidence = tx.observations_for_execution(&execution.id)?.len();
+    let work_evidence = tx
+        .observations_for_work(work_id)?
+        .into_iter()
+        .filter(|observation| observation.subject_execution_id.is_none())
+        .count();
+    let occurrence = format!(
+        "{}:{}:{}",
+        execution.id.0,
+        execution.enqueued_seq,
+        execution_evidence + work_evidence
+    );
     let mut out = Vec::new();
     let mut push = |reason: &str, anchor: String, threshold: Option<u64>, action: &str| {
         out.push(AttentionView {
-            attention_id: format!("att:{}:{}:{}", work_id.0, reason, anchor),
+            attention_id: format!("att:{}:{}:{}:{}", work_id.0, reason, anchor, occurrence),
             work_id: work_id.clone(),
             reason: reason.to_string(),
             evidence: execution
@@ -272,7 +285,7 @@ fn attention_views(
         }
         _ => {}
     }
-    out
+    Ok(out)
 }
 
 pub fn work_list(
