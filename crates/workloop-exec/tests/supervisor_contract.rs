@@ -1409,6 +1409,54 @@ fn held_claims(store: &SqliteStore) -> (usize, usize) {
         .unwrap()
 }
 
+/// The ordering invariant, positive direction: while the persistence
+/// boundary is still open the recorded leader is untouched — the first
+/// signal can only be delivered after the intent is durable.
+/// `persist_failure_sends_no_signal` covers the negative direction.
+#[test]
+fn stop_intent_is_durable_before_the_first_signal() {
+    let root = tmp_root("intent-order");
+    let port = PosixProcessControl;
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.clone(),
+        vec![fixture_bin()],
+        config(),
+    );
+    let leader = port
+        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .expect("spawn");
+    let invocation = Invocation {
+        id: InvocationId("inv-order".into()),
+        request_id: "req-order".into(),
+        execution_id: ExecutionId("e-order".into()),
+        role: InvocationRole::Coding,
+        state: InvocationState::Running,
+        process_identity: Some(leader.clone()),
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+    };
+    let receipt = sup
+        .stop_unless_persisted(&invocation, &leader, |intent| {
+            assert!(
+                !intent.identities.is_empty(),
+                "the descendant snapshot is recorded with the intent"
+            );
+            match port.inspect(&leader) {
+                // The boundary is open and no signal has been delivered.
+                ProcessEvidence::Alive { .. } => Ok(()),
+                other => panic!("a signal preceded the durable intent: {other:?}"),
+            }
+        })
+        .unwrap();
+    assert!(matches!(receipt, StopReceipt::Requested));
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "leader stopped after the intent was durable",
+    );
+    port.reap(leader.pid);
+}
+
 /// A `setsid`-escaped child survives the process-group signal; only the
 /// descendant snapshot recorded with the stop intent names it, and the
 /// Execution cannot reach `cancelled` until that identity is inspected.
@@ -1425,7 +1473,7 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
         "--interval-ms".into(),
         "1000".into(),
     ];
-    let sup = Supervisor::new(PosixProcessControl, root, argv.clone(), config());
+    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
     sup.consume_requests(&store, NOW).unwrap();
     wait_for(
         || execution(&store, &eid).state == ExecutionState::Running,
@@ -1462,6 +1510,12 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
     );
 
     // A process-group signal alone kills the leader but not the escapee.
+    // The group signal is authorized only while the recorded leader
+    // verifies alive — the same gate `stop_unless_persisted` applies.
+    assert!(matches!(
+        port.inspect(&leader),
+        ProcessEvidence::Alive { ref identity } if *identity == leader
+    ));
     assert_eq!(
         port.signal_group(leader.pgid.expect("leader pgid"), libc::SIGKILL),
         SignalOutcome::Sent
@@ -1479,7 +1533,7 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
     // group-signal evidence covers the leader only. A supervisor restart
     // (kill -9 between intent and proof) resumes from the durable intent.
     drop(sup);
-    let restarted = Supervisor::new(PosixProcessControl, root_unused(), argv, config());
+    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
     restarted.drive_stops(&store, NOW).unwrap();
     assert_eq!(
         execution(&store, &eid).state,
@@ -1515,20 +1569,33 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
     assert_eq!(held_claims(&store), (0, 0), "terminal release");
 }
 
-/// A supervisor `kill -9` after the stop intent is persisted but before
-/// the stop completes: the restarted supervisor resumes signaling and
-/// inspection from the durable intent — never re-deriving the tree and
-/// never spawning a second writer.
+/// A supervisor `kill -9` mid-stop — after the stop intent is persisted
+/// and the first recorded identity is signaled, but before the rest are
+/// processed: the restarted supervisor resumes signaling and inspection
+/// from the durable intent alone — never re-deriving the tree and never
+/// spawning a second writer.
 #[test]
 fn kill9_after_intent_persisted_resumes_from_the_durable_intent() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("kill9-resume");
-    let (_w, eid) = submit_and_admit(&store, "k-k91");
-    let sup = supervisor("hang", root);
+    let (w, eid) = submit_and_admit(&store, "k-k91");
+    let argv = vec![
+        fixture_bin(),
+        "setsid-escape".into(),
+        // The leader lives ~20s so the stop intent's snapshot always
+        // catches the escapee.
+        "--interval-ms".into(),
+        "1000".into(),
+    ];
+    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
     sup.consume_requests(&store, NOW).unwrap();
     wait_for(
         || execution(&store, &eid).state == ExecutionState::Running,
         "running",
+    );
+    wait_for(
+        || sup.workspace_of(&w).join("heartbeat.log").exists(),
+        "escapee heartbeat",
     );
     let invocation = store
         .transact(|tx| tx.invocations_for_execution(&eid))
@@ -1539,26 +1606,38 @@ fn kill9_after_intent_persisted_resumes_from_the_durable_intent() {
 
     let e = execution(&store, &eid);
     cancel(&store, &e.work_id, "k-k92");
-    // Persist the intent, then the supervisor dies before completing the
-    // stop — no signal has been sent yet, so the writer is provably alive.
-    persist_stop_intent(&store, &port, &invocation, &leader);
+    // Mid-stop crash: the intent — with the full descendant snapshot — is
+    // durable and the leader has already been signaled when the
+    // supervisor dies; the escapee is still unprocessed.
+    let intent = persist_stop_intent(&store, &port, &invocation, &leader);
+    let escapee = intent
+        .identities
+        .iter()
+        .find(|i| i.pid != leader.pid)
+        .expect("the snapshot names the setsid escapee")
+        .clone();
+    assert_eq!(
+        port.signal_verified(&leader, libc::SIGKILL),
+        SignalOutcome::Sent,
+        "the crashed supervisor had already signaled the first identity"
+    );
     drop(sup);
     assert!(
-        matches!(port.inspect(&leader), ProcessEvidence::Alive { .. }),
-        "killed before the stop completed: the writer still lives"
+        matches!(port.inspect(&escapee), ProcessEvidence::Alive { .. }),
+        "killed mid-stop: the escapee is still unprocessed"
     );
 
     // The restarted supervisor holds no memory of the stop; it must
     // resume reconciliation from the durable intent alone.
-    let restarted = supervisor("hang", root_unused());
+    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
     assert_eq!(
         restarted.resume_recorded_stop(&store, &invocation).unwrap(),
         StopReceipt::Requested,
-        "the durable intent drives the resumed signaling"
+        "the durable intent drives signaling of the remaining identity"
     );
     wait_for(
-        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
-        "writer stopped by the resumed supervisor",
+        || matches!(port.inspect(&escapee), ProcessEvidence::Stopped { .. }),
+        "escapee stopped via the recorded identity",
     );
     for _ in 0..40 {
         restarted.run_once(&store, NOW).unwrap();
@@ -1624,14 +1703,14 @@ fn the_supervisor_reaps_the_children_it_spawned() {
 
     // The leader was our child: the supervisor reaped it, so its pid left
     // the process table instead of lingering as a supervisor-side zombie.
-    let out = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &leader.pid.to_string()])
-        .output()
-        .expect("ps");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        "reaped leader left the process table: {}",
-        String::from_utf8_lossy(&out.stdout)
+    // kill(pid, 0) still succeeds on a zombie — only the reap turns it
+    // into ESRCH.
+    wait_for(
+        || {
+            let rc = unsafe { libc::kill(leader.pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        },
+        "reaped leader left the process table",
     );
     assert_eq!(held_claims(&store), (0, 0), "terminal release");
 }
@@ -1684,13 +1763,18 @@ fn a_workers_done_claim_alone_releases_nothing() {
         (1, 2),
         "a done claim alone releases no slot and no reservation"
     );
-    // Cleanup: the claim did not stop the real process.
+    // Cleanup: the claim did not stop the real process. Drop the
+    // supervisor first so exactly one path reaps the writer.
     let port = PosixProcessControl;
     assert!(matches!(
         port.inspect(&leader),
         ProcessEvidence::Alive { .. }
     ));
-    port.signal_verified(&leader, libc::SIGKILL);
+    drop(sup);
+    assert_eq!(
+        port.signal_verified(&leader, libc::SIGKILL),
+        SignalOutcome::Sent
+    );
     wait_for(
         || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
         "cleanup stop",
@@ -1801,10 +1885,4 @@ fn a_runtime_deadline_expiry_requests_stop_and_releases_nothing() {
     }
     assert_eq!(execution(&store, &eid).state, ExecutionState::Failed);
     assert_eq!(held_claims(&store), (0, 0), "terminal release");
-}
-
-/// A scratch root for supervisors that exist only to drive store state —
-/// the durable intent, not their workspace root, carries the stop.
-fn root_unused() -> PathBuf {
-    PathBuf::from("/unused")
 }
