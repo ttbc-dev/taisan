@@ -1121,3 +1121,93 @@ fn failed_finish_reports_are_replayed_after_restart() {
         assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
     }
 }
+
+#[test]
+fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
+    use std::cell::Cell;
+    use std::path::Path;
+    use workloop_core::ports::SpawnError;
+
+    struct UnverifiedLeader {
+        identity: ProcessIdentity,
+        condition: &'static str,
+    }
+    impl ProcessControlPort for UnverifiedLeader {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            unreachable!()
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            let mut identity = self.identity.clone();
+            if self.condition == "reused" {
+                identity.started_at = "replacement process".into();
+            }
+            Ok(vec![identity])
+        }
+        fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
+            if self.condition == "unknown" {
+                ProcessEvidence::Unknown {
+                    reason: "lookup failed".into(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: identity.clone(),
+                    exit_code: None,
+                }
+            }
+        }
+        fn signal_verified(&self, identity: &ProcessIdentity, _: i32) -> SignalOutcome {
+            assert_eq!(
+                identity, &self.identity,
+                "a replacement must never be targeted"
+            );
+            SignalOutcome::AlreadyGone
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            panic!("unverified group must not be signaled")
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    for condition in ["reused", "stopped", "unknown"] {
+        let identity = ProcessIdentity {
+            pid: 42,
+            started_at: "original".into(),
+            pgid: Some(42),
+        };
+        let sup = Supervisor::new(
+            UnverifiedLeader {
+                identity: identity.clone(),
+                condition,
+            },
+            PathBuf::from("/unused"),
+            vec![],
+            config(),
+        );
+        let invocation = Invocation {
+            id: InvocationId("inv-stale".into()),
+            request_id: "req-stale".into(),
+            execution_id: ExecutionId("e-stale".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Running,
+            process_identity: Some(identity.clone()),
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+        };
+        let persisted = Cell::new(false);
+        let receipt = sup
+            .stop_unless_persisted(&invocation, &identity, |_| {
+                persisted.set(true);
+                Ok(())
+            })
+            .unwrap();
+        if condition == "reused" {
+            assert!(matches!(receipt, StopReceipt::Unknown { .. }));
+            assert!(
+                !persisted.get(),
+                "replacement descendants are not our stop snapshot"
+            );
+        } else {
+            assert!(persisted.get());
+        }
+    }
+}

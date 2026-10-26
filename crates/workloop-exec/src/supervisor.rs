@@ -858,6 +858,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(identities) => identities,
             Err(reason) => return Ok(StopReceipt::Unknown { reason }),
         };
+        if identities
+            .iter()
+            .any(|identity| identity.pid == leader.pid && identity.started_at != leader.started_at)
+        {
+            return Ok(StopReceipt::Unknown {
+                reason: "leader pid was reused before the descendant snapshot".into(),
+            });
+        }
         if !identities.iter().any(|i| i.pid == leader.pid) {
             identities.insert(0, leader.clone());
         }
@@ -873,9 +881,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 reason: format!("stop intent not persisted, no signal sent: {e}"),
             });
         }
-        // Group first, then every snapshotted identity under re-verified
-        // start time — a setsid escapee is outside the group.
-        if let Some(pgid) = leader.pgid {
+        // A stale leader cannot authorize a signal to a reused group.
+        if let Some(pgid) = leader.pgid
+            && matches!(self.port.inspect(leader), ProcessEvidence::Alive { identity } if identity == *leader)
+        {
             self.port.signal_group(pgid, libc::SIGKILL);
         }
         let mut all_gone = true;
