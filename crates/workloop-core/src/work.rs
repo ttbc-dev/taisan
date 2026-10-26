@@ -1890,12 +1890,22 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     }
     // An unresolved writer may still act — its later evidence, not this
     // stale pass, owns the completion decision.
-    if tx
-        .invocations_for_execution(&execution.id)?
+    let invocations = tx.invocations_for_execution(&execution.id)?;
+    if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
+        return Ok(());
+    }
+    if !invocations
         .iter()
-        .any(|i| i.state.is_unresolved_writer())
+        .any(|i| i.role == InvocationRole::Coding && i.state == InvocationState::Done)
     {
         return Ok(());
+    }
+    for invocation in &invocations {
+        if invocation.state == InvocationState::Done
+            && !crate::projection::artifacts_complete(tx, &execution.id, invocation)?
+        {
+            return Ok(());
+        }
     }
     // Completion means the change was published as one PR; success
     // evidence before (or without) an applied publish intent is early.

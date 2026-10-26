@@ -2668,6 +2668,9 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
     let (w, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("sc1"), NOW).unwrap());
     force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "sc1-coding");
+    invocation.state = InvocationState::Done;
+    apply_effects(&store, &[Effect::InsertInvocation { invocation }]);
     // Completion requires the applied publish intent for the Work.
     apply_effects(
         &store,
@@ -2747,4 +2750,110 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         verdict: ReviewVerdict::Approve,
     });
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+}
+
+#[test]
+fn completion_requires_artifacts_publication_and_resolved_writers() {
+    use workloop_core::observation::{ArtifactFact, ArtifactFact::Present};
+    for scenario in [
+        "no_coding",
+        "missing",
+        "corrupt",
+        "writer",
+        "unpublished",
+        "complete",
+    ] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (w, eid) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit(scenario), NOW).unwrap(),
+        );
+        force_state(&store, &eid, ExecutionState::Waiting);
+        store
+            .transact(|tx| {
+                if scenario != "no_coding" {
+                    let mut invocation = recorded_invocation(&eid, "coding");
+                    invocation.state = if scenario == "writer" {
+                        InvocationState::Running
+                    } else {
+                        InvocationState::Done
+                    };
+                    invocation.required_artifacts = vec!["artifact.json".into()];
+                    tx.apply(&Effect::InsertInvocation { invocation })?;
+                    if scenario != "missing" {
+                        tx.apply(&Effect::InsertObservation {
+                            observation: Observation {
+                                source_event_id: None,
+                                subject_work_id: Some(w.clone()),
+                                subject_execution_id: Some(eid.clone()),
+                                fact: ObservationFact::Artifact {
+                                    invocation_id: InvocationId("coding".into()),
+                                    required_artifact: "artifact.json".into(),
+                                    state: if scenario == "corrupt" {
+                                        ArtifactFact::Corrupt
+                                    } else {
+                                        Present
+                                    },
+                                },
+                                observed_unix_seconds: NOW,
+                            },
+                        })?;
+                    }
+                }
+                tx.apply(&Effect::InsertPrActionIntent {
+                    intent: PrActionIntent {
+                        action_id: "publish".into(),
+                        work_id: w.clone(),
+                        repository: "local/repo".into(),
+                        action: PrAction::PublishPr {
+                            branch: format!("work/{}", w.0),
+                            title: "change".into(),
+                            body: String::new(),
+                        },
+                        status: if scenario == "unpublished" {
+                            PrActionStatus::Failed
+                        } else {
+                            PrActionStatus::Applied
+                        },
+                    },
+                })
+            })
+            .unwrap();
+        seed_pr_head(&store, &w, "head", NOW);
+        for fact in [
+            ObservationFact::PrChecks {
+                repository: "local/repo".into(),
+                head_sha: "head".into(),
+                conclusion: CheckConclusion::Success,
+            },
+            ObservationFact::PrReview {
+                repository: "local/repo".into(),
+                head_sha: "head".into(),
+                reviewer: "reviewer".into(),
+                verdict: ReviewVerdict::Approve,
+            },
+        ] {
+            workloop_core::work::handle_observation(
+                &store,
+                &config(),
+                &Observation {
+                    source_event_id: None,
+                    subject_work_id: Some(w.clone()),
+                    subject_execution_id: None,
+                    fact,
+                    observed_unix_seconds: NOW,
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            read_execution(&store, &eid).state,
+            if scenario == "complete" {
+                ExecutionState::Succeeded
+            } else {
+                ExecutionState::Waiting
+            },
+            "{scenario}"
+        );
+    }
 }

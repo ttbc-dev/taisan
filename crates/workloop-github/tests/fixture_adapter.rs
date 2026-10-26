@@ -87,6 +87,26 @@ fn intent_status(store: &SqliteStore, action_id: &str) -> PrActionStatus {
         .unwrap()
 }
 
+fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), StoreError> {
+    let request = tx
+        .pending_requests()?
+        .into_iter()
+        .find(|request| request.execution_id == *eid)
+        .expect("admitted coding request");
+    tx.apply(&Effect::InsertInvocation {
+        invocation: Invocation {
+            id: InvocationId(format!("{}-coding", eid.0)),
+            request_id: request.request_id,
+            execution_id: eid.clone(),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+        },
+    })
+}
+
 #[test]
 fn publish_writes_only_from_a_recorded_intent_and_reports_applied() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -263,6 +283,7 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
             let mut e = tx.execution(&eid)?.unwrap();
             e.state = ExecutionState::Waiting;
             e.waiting_reason = Some(WaitingReason::Ci);
+            record_finished_coding(tx, &eid)?;
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
@@ -571,6 +592,7 @@ fn superseded_head_evidence_does_not_complete_the_work() {
             let mut e = tx.execution(&eid)?.unwrap();
             e.state = ExecutionState::Waiting;
             e.waiting_reason = Some(WaitingReason::Ci);
+            record_finished_coding(tx, &eid)?;
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
@@ -664,6 +686,7 @@ fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, Exec
             let mut e = tx.execution(&eid)?.unwrap();
             e.state = ExecutionState::Waiting;
             e.waiting_reason = Some(WaitingReason::Ci);
+            record_finished_coding(tx, &eid)?;
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
