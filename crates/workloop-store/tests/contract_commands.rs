@@ -2857,3 +2857,64 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
         );
     }
 }
+
+#[test]
+fn dispatch_state_conflict_defers_only_the_conflicted_execution() {
+    let root = std::env::temp_dir().join(format!(
+        "workloop-dispatch-state-conflict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 2).unwrap();
+    let (_, first) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("state-conflict-first"), NOW).unwrap(),
+    );
+    let (_, second) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("state-conflict-second"), NOW).unwrap(),
+    );
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_first_admission BEFORE UPDATE OF state ON executions
+         WHEN OLD.enqueued_seq = (SELECT MIN(enqueued_seq) FROM executions)
+          AND NEW.state = 'ready'
+         BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    let admitted = store
+        .transact(|tx| dispatch_once(tx, &config(), NOW))
+        .expect("a guarded state conflict must not abort the dispatch scan");
+    assert_eq!(admitted, vec![second.clone()]);
+    assert_eq!(read_execution(&store, &first).state, ExecutionState::Queued);
+    assert_eq!(read_execution(&store, &second).state, ExecutionState::Ready);
+    store
+        .transact(|tx| {
+            assert_eq!(tx.slot_holders()?.len(), 1);
+            assert_eq!(tx.reservations()?.len(), 2);
+            assert_eq!(tx.pending_requests()?.len(), 1);
+            let deferrals = tx.deferrals()?;
+            assert_eq!(deferrals.len(), 1);
+            assert_eq!(deferrals[0].execution_id, first);
+            assert_eq!(deferrals[0].reason, "dispatch_conflict");
+            Ok(())
+        })
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER refuse_first_admission")
+        .unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| dispatch_once(tx, &config(), NOW + 1))
+            .unwrap(),
+        vec![first.clone()]
+    );
+    assert_eq!(read_execution(&store, &first).state, ExecutionState::Ready);
+    drop(connection);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

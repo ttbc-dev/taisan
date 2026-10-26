@@ -1986,7 +1986,7 @@ fn latest_observed_ok(
 /// The internal dispatch scan: queued Executions in committed enqueue
 /// order. A deferred head never blocks later items; each deferral is
 /// recorded for the `capacity` Query. Each admission runs in its own
-/// savepoint, so a dispatch-time `ConstraintConflict` or `NoFreeSlot`
+/// savepoint, so a dispatch-time constraint, state, or capacity conflict
 /// (a request-ID/slot/reservation race with another process) rolls back
 /// only that item, records a retryable diagnostic, and the scan moves on
 /// — the conflict rule in lifecycle.md: the loop rereads and decides
@@ -2006,7 +2006,11 @@ pub fn dispatch_once(
                     admitted.push(execution.id.clone());
                 }
             }
-            Err(e @ (StoreError::ConstraintConflict { .. } | StoreError::NoFreeSlot)) => {
+            Err(
+                e @ (StoreError::ConstraintConflict { .. }
+                | StoreError::StateConflict { .. }
+                | StoreError::NoFreeSlot),
+            ) => {
                 // The world changed under the read; partial effects from
                 // this admission are rolled back and the item stays
                 // queued with a diagnostic the next pass re-decides.
