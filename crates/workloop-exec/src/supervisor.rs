@@ -634,42 +634,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
-    /// The writer is confirmed gone: mark the Invocation done, then check
-    /// every required artifact — reporting `Present` or `Missing` per item.
+    /// Save every artifact fact before the exit fact resolves the writer.
+    /// Interrupted reporting leaves the Invocation in the next scan.
     fn finish_invocation(
         &self,
         store: &impl Store,
         invocation: &Invocation,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
-        store.transact(|tx| {
-            let mut next = invocation.clone();
-            next.state = InvocationState::Done;
-            tx.apply(&Effect::UpdateInvocation {
-                invocation: next,
-                expected_state: invocation.state.clone(),
-            })?;
-            Ok(())
-        })?;
         let request = store
             .transact(|tx| tx.request(&invocation.request_id))?
             .ok_or(ExecError::Store(StoreError::Internal {
                 detail: "invocation without request".into(),
             }))?;
-        self.report(
-            store,
-            &request,
-            ObservationFact::ProcessState {
-                invocation_id: invocation.id.clone(),
-                process_identity: invocation
-                    .process_identity
-                    .as_ref()
-                    .map(|i| format!("{}@{}", i.pid, i.started_at))
-                    .unwrap_or_default(),
-                state: ProcessStateFact::Exited,
-            },
-            now_unix_seconds,
-        )?;
         let workspace = self.workspace_of(&request.work_id);
         for required in &invocation.required_artifacts {
             let present = artifact_present(&workspace, required);
@@ -688,6 +665,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             )?;
         }
+        self.report(
+            store,
+            &request,
+            ObservationFact::ProcessState {
+                invocation_id: invocation.id.clone(),
+                process_identity: invocation
+                    .process_identity
+                    .as_ref()
+                    .map(|i| format!("{}@{}", i.pid, i.started_at))
+                    .unwrap_or_default(),
+                state: ProcessStateFact::Exited,
+            },
+            now_unix_seconds,
+        )?;
         Ok(())
     }
 

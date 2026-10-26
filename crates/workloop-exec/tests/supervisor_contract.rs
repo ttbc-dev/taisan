@@ -1022,3 +1022,102 @@ fn unknown_inspection_maps_to_uncertain() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn failed_finish_reports_are_replayed_after_restart() {
+    use std::cell::Cell;
+    use workloop_core::store::{StoreError, TxView};
+
+    struct FailsOnce<'a> {
+        store: &'a SqliteStore,
+        calls: Cell<usize>,
+        fail_at: usize,
+    }
+    impl Store for FailsOnce<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.fail_at {
+                return Err(StoreError::Internal {
+                    detail: "injected report failure".into(),
+                });
+            }
+            self.store.transact(f)
+        }
+    }
+
+    for fail_at in [4, 5, 6] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let root = tmp_root(&format!("finish-report-{fail_at}"));
+        let (work_id, eid) = submit_and_admit(&store, "finish-report");
+        let sup = supervisor("clean-exit", root.clone());
+        sup.consume_requests(&store, NOW).unwrap();
+        let invocation = store
+            .transact(|tx| {
+                let mut invocation = tx.invocations_for_execution(&eid)?.remove(0);
+                invocation.required_artifacts.push("second.json".into());
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: invocation.clone(),
+                    expected_state: InvocationState::Running,
+                })?;
+                Ok(invocation)
+            })
+            .unwrap();
+        let identity = invocation.process_identity.unwrap();
+        wait_for(
+            || {
+                matches!(
+                    PosixProcessControl.inspect(&identity),
+                    ProcessEvidence::Stopped { .. }
+                )
+            },
+            "worker exit before report failure",
+        );
+        std::fs::write(sup.workspace_of(&work_id).join("second.json"), "{}").unwrap();
+        let failing = FailsOnce {
+            store: &store,
+            calls: Cell::new(0),
+            fail_at,
+        };
+        assert!(sup.poll_invocations(&failing, NOW).is_err());
+        assert_eq!(
+            store
+                .transact(|tx| tx.unresolved_invocations())
+                .unwrap()
+                .len(),
+            1,
+            "failure at transaction {fail_at} must retain the writer for evidence replay"
+        );
+        let restarted = supervisor("clean-exit", root);
+        restarted.poll_invocations(&store, NOW + 1).unwrap();
+        assert!(
+            store
+                .transact(|tx| tx.unresolved_invocations())
+                .unwrap()
+                .is_empty()
+        );
+        let facts = store
+            .transact(|tx| tx.observations_for_execution(&eid))
+            .unwrap();
+        for required in ["artifact.json", "second.json"] {
+            assert!(facts.iter().any(|obs| matches!(&obs.fact,
+                ObservationFact::Artifact { required_artifact, state: ArtifactFact::Present, .. }
+                    if required_artifact == required)));
+        }
+        assert!(facts.iter().any(|obs| matches!(
+            &obs.fact,
+            ObservationFact::ProcessState {
+                state: ProcessStateFact::Exited,
+                ..
+            }
+        )));
+        assert_eq!(
+            execution(&store, &eid).waiting_reason,
+            Some(WaitingReason::GithubWrite)
+        );
+        assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
+    }
+}
