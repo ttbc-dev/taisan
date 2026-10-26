@@ -556,6 +556,215 @@ fn superseded_head_evidence_does_not_complete_the_work() {
     assert_eq!(e.state, ExecutionState::Succeeded);
 }
 
+/// Shared setup for completion-vs-evidence contract tests: an admitted
+/// Execution parked in `Waiting/Ci` with an applied `publish_pr` intent,
+/// so completion turns solely on check/review evidence for the head.
+fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    let (work_id, eid) = submit(store, key);
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::Ci);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })?;
+            tx.apply(&Effect::InsertPrActionIntent {
+                intent: PrActionIntent {
+                    action_id: "act-pub-delayed".into(),
+                    work_id: work_id.clone(),
+                    repository: "local/repo".into(),
+                    action: PrAction::PublishPr {
+                        branch: "work/w-1".into(),
+                        title: "t".into(),
+                        body: "b".into(),
+                    },
+                    status: PrActionStatus::Applied,
+                },
+            })
+        })
+        .unwrap();
+    (work_id, eid)
+}
+
+#[test]
+fn delayed_check_success_cannot_complete_the_work() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = waiting_with_applied_publish(&store, "k-g11");
+    let gh = FixtureGithub::new();
+    let obs = |event: &str, at: i64, fact: ObservationFact| Observation {
+        source_event_id: Some(event.into()),
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact,
+        observed_unix_seconds: at,
+    };
+    let emit = |event: &str, at: i64, fact: ObservationFact| {
+        gh.emit(&store, &config(), obs(event, at, fact), at)
+            .unwrap()
+    };
+    emit(
+        "head-1",
+        NOW,
+        ObservationFact::PrHead {
+            repository: "local/repo".into(),
+            number: 3,
+            head_sha: "sha-1".into(),
+        },
+    );
+    // The current verdict for the head: a failing check observed at t+20.
+    emit(
+        "checks-fail",
+        NOW + 20,
+        ObservationFact::PrChecks {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            conclusion: CheckConclusion::Failure,
+        },
+    );
+    // A delayed delivery of an older green arrives after it and is still
+    // recorded, but its earlier observation time must not outrank the
+    // newer failure (docs/module-contracts.md: delayed webhooks stay
+    // evidence for their own revision).
+    emit(
+        "checks-late-ok",
+        NOW + 10,
+        ObservationFact::PrChecks {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        "review-ok",
+        NOW + 20,
+        ObservationFact::PrReview {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            reviewer: "rev".into(),
+            verdict: ReviewVerdict::Approve,
+        },
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "a delayed green observed earlier cannot complete over the newer failure"
+    );
+    // The delayed delivery is still on record — its rank in the
+    // completion decision changes, never its persistence as evidence.
+    let recorded = store
+        .transact(|tx| tx.observations_for_work(&work_id))
+        .unwrap();
+    assert!(
+        recorded.iter().any(|o| {
+            o.observed_unix_seconds == NOW + 10
+                && matches!(
+                    &o.fact,
+                    ObservationFact::PrChecks {
+                        conclusion: CheckConclusion::Success,
+                        ..
+                    }
+                )
+        }),
+        "the delayed green remains recorded as evidence"
+    );
+    // A genuinely newer green check still completes the work.
+    emit(
+        "checks-ok-new",
+        NOW + 30,
+        ObservationFact::PrChecks {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Succeeded);
+}
+
+#[test]
+fn delayed_review_approval_cannot_complete_the_work() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = waiting_with_applied_publish(&store, "k-g12");
+    let gh = FixtureGithub::new();
+    let obs = |event: &str, at: i64, fact: ObservationFact| Observation {
+        source_event_id: Some(event.into()),
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact,
+        observed_unix_seconds: at,
+    };
+    let emit = |event: &str, at: i64, fact: ObservationFact| {
+        gh.emit(&store, &config(), obs(event, at, fact), at)
+            .unwrap()
+    };
+    emit(
+        "head-1",
+        NOW,
+        ObservationFact::PrHead {
+            repository: "local/repo".into(),
+            number: 3,
+            head_sha: "sha-1".into(),
+        },
+    );
+    // The current verdict for the head: changes requested at t+20.
+    emit(
+        "review-changes",
+        NOW + 20,
+        ObservationFact::PrReview {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            reviewer: "rev".into(),
+            verdict: ReviewVerdict::ChangesRequested,
+        },
+    );
+    emit(
+        "checks-ok",
+        NOW + 20,
+        ObservationFact::PrChecks {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    // A delayed approval observed earlier arrives last: recorded as
+    // evidence, but the newer ChangesRequested still decides.
+    emit(
+        "review-late-ok",
+        NOW + 10,
+        ObservationFact::PrReview {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            reviewer: "rev".into(),
+            verdict: ReviewVerdict::Approve,
+        },
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "a delayed approval observed earlier cannot complete over the newer changes-requested"
+    );
+    // A genuinely newer approval still completes the work.
+    emit(
+        "review-ok-new",
+        NOW + 30,
+        ObservationFact::PrReview {
+            repository: "local/repo".into(),
+            head_sha: "sha-1".into(),
+            reviewer: "rev".into(),
+            verdict: ReviewVerdict::Approve,
+        },
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Succeeded);
+}
+
 #[test]
 fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
     let store = SqliteStore::in_memory(1).unwrap();

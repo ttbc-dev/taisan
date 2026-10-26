@@ -1914,29 +1914,25 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         return Ok(());
     };
     // Only the latest check and review recorded for the current head
-    // count — a superseded approval must not complete the work.
-    let checks_ok = observations
-        .iter()
-        .rev()
-        .find_map(|o| match &o.fact {
-            ObservationFact::PrChecks {
-                head_sha,
-                conclusion,
-                ..
-            } if head_sha == &head => Some(conclusion == &CheckConclusion::Success),
-            _ => None,
-        })
-        .unwrap_or(false);
-    let review_ok = observations
-        .iter()
-        .rev()
-        .find_map(|o| match &o.fact {
-            ObservationFact::PrReview {
-                head_sha, verdict, ..
-            } if head_sha == &head => Some(verdict == &ReviewVerdict::Approve),
-            _ => None,
-        })
-        .unwrap_or(false);
+    // count, ranked by observed time (later insertion breaks ties) — a
+    // superseded approval must not complete the work, and a delayed
+    // delivery observed earlier must not outrank newer evidence.
+    let checks_ok = latest_observed_ok(&observations, |fact| match fact {
+        ObservationFact::PrChecks {
+            head_sha,
+            conclusion,
+            ..
+        } if head_sha == &head => Some(conclusion == &CheckConclusion::Success),
+        _ => None,
+    })
+    .unwrap_or(false);
+    let review_ok = latest_observed_ok(&observations, |fact| match fact {
+        ObservationFact::PrReview {
+            head_sha, verdict, ..
+        } if head_sha == &head => Some(verdict == &ReviewVerdict::Approve),
+        _ => None,
+    })
+    .unwrap_or(false);
     if !(checks_ok && review_ok) {
         return Ok(());
     }
@@ -1973,6 +1969,23 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         },
     })?;
     Ok(())
+}
+
+/// Latest classification by observed time among `classify` matches, with
+/// the store's insertion order (`observations_for_work`'s `ORDER BY id`)
+/// breaking ties — the same `observed_unix_seconds DESC, id DESC` rule
+/// `latest_pr_head` uses, so a delayed delivery inserted later but
+/// observed earlier never outranks newer evidence.
+fn latest_observed_ok(
+    observations: &[Observation],
+    classify: impl Fn(&ObservationFact) -> Option<bool>,
+) -> Option<bool> {
+    observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| classify(&o.fact).map(|ok| ((o.observed_unix_seconds, index), ok)))
+        .max_by_key(|(key, _)| *key)
+        .map(|(_, ok)| ok)
 }
 
 /// The internal dispatch scan: queued Executions in committed enqueue
