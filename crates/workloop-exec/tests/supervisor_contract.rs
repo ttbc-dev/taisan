@@ -1715,9 +1715,13 @@ fn the_supervisor_reaps_the_children_it_spawned() {
     assert_eq!(held_claims(&store), (0, 0), "terminal release");
 }
 
-/// A worker's own `done` claim is evidence to assess, never a release
-/// event: reported on its own it yields neither a terminal state nor any
-/// capacity or reservation release — even while the process still runs.
+/// A worker's own `done` claim is evidence to assess, not a release
+/// event: while no stop is in flight it yields neither a terminal state
+/// nor any capacity or reservation release — it resolves the writer
+/// record only, even while the process still runs. A worker never emits
+/// a `ProcessState` fact itself; `Exited` is the supervisor's verified
+/// report, and during a stop that report is the recorded proof the stop
+/// settles on (see `an_exited_report_settles_a_requested_stop`).
 #[test]
 fn a_workers_done_claim_alone_releases_nothing() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -1763,6 +1767,15 @@ fn a_workers_done_claim_alone_releases_nothing() {
         (1, 2),
         "a done claim alone releases no slot and no reservation"
     );
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&eid))
+            .unwrap()
+            .remove(0)
+            .state,
+        InvocationState::Done,
+        "the claim resolves the writer record only — not the release"
+    );
     // Cleanup: the claim did not stop the real process. Drop the
     // supervisor first so exactly one path reaps the writer.
     let port = PosixProcessControl;
@@ -1780,6 +1793,81 @@ fn a_workers_done_claim_alone_releases_nothing() {
         "cleanup stop",
     );
     port.reap(leader.pid);
+}
+
+/// `work`'s half of the stop-settle: during `stopping`, the reported
+/// `Exited` is the recorded proof that the writer is gone — the
+/// Execution settles to the requested outcome and releases the slot and
+/// the reservation. The other half — the supervisor emits `Exited` only
+/// after inspecting every recorded identity — is the port contract the
+/// setsid/zombie/kill-9 tests pin; here the writer is actually stopped
+/// and reaped first so the report models the verified path.
+#[test]
+fn an_exited_report_settles_a_requested_stop() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("exited-settle");
+    let (w, eid) = submit_and_admit(&store, "k-es1");
+    let sup = supervisor("hang", root);
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+    let port = PosixProcessControl;
+
+    cancel(&store, &w, "k-es2");
+    let e = execution(&store, &eid);
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Cancel));
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "the stop request alone releases nothing"
+    );
+
+    // The supervisor's half of the proof — signal, inspect, reap — runs
+    // before `Exited` is ever reported.
+    assert_eq!(
+        port.signal_verified(&leader, libc::SIGKILL),
+        SignalOutcome::Sent
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "writer stopped",
+    );
+    port.reap(leader.pid);
+    drop(sup);
+
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            source_event_id: Some("sup:exited-settle".into()),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: invocation.id.clone(),
+                process_identity: format!("{}@{}", leader.pid, leader.started_at),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.state,
+        ExecutionState::Cancelled,
+        "the verified exit report settles the requested cancel"
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
 }
 
 /// A missing PID alone releases nothing: an unresolved writer with no
