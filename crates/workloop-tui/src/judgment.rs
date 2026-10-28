@@ -58,6 +58,17 @@ impl JudgmentDraft {
         })
     }
 
+    /// Whether the draft covers exactly the finding ids a `work_detail`
+    /// snapshot displays. A new review recorded for the same head grows
+    /// the displayed set; a draft that no longer covers it must not
+    /// submit — the Command would omit a displayed finding.
+    pub fn covers(&self, finding_ids: &[String]) -> bool {
+        let covered: std::collections::HashSet<&String> =
+            self.findings.iter().map(|s| &s.finding_id).collect();
+        covered.len() == self.findings.len()
+            && covered == finding_ids.iter().collect::<std::collections::HashSet<_>>()
+    }
+
     /// Record exactly one choice per displayed finding id; a later pick
     /// for the same id replaces the earlier one, never duplicates it.
     pub fn choose(&mut self, finding_id: &str, choice: FindingChoice) -> Result<(), String> {

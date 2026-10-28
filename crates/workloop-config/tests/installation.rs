@@ -1,8 +1,8 @@
 //! The shared installation config contract: one schema and one loader
 //! for every adapter. The actor identity persists across relaunches,
 //! concurrent first writers converge on one identity, a reader never
-//! observes a partial write, and malformed content errors instead of
-//! being overwritten.
+//! observes a partial write, and content the loader did not publish
+//! errors instead of being deleted or overwritten.
 
 use std::path::PathBuf;
 
@@ -71,20 +71,24 @@ fn concurrent_first_writers_share_one_actor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A config file observed mid-write can only be foreign (this loader
-/// publishes complete files atomically), so an empty file is reclaimed
-/// and a fresh stable identity created. A malformed nonempty file
-/// still errors — it is never overwritten.
+/// A file the loader did not publish can only be foreign — this loader
+/// never produces empty or partial config, since a first write stages
+/// complete content and publishes it atomically. Such a file errors
+/// rather than being deleted or overwritten: unlinking it could race
+/// a concurrent publisher and remove a live config.
 #[test]
-fn install_recovers_partial_and_errors_malformed() {
-    let dir = root("install-partial");
+fn foreign_empty_or_malformed_config_errors() {
+    let dir = root("install-foreign");
     let path = dir.join("config.json");
 
-    // A crashed foreign write left an empty file — reclaimed, not fatal.
+    // A crashed foreign write left an empty file — reported, not
+    // reclaimed: the operator removes it to reinitialize.
     std::fs::write(&path, "").unwrap();
-    let created = load_or_create(&path).unwrap();
-    let reread = load_or_create(&path).unwrap();
-    assert_eq!(created.actor_id, reread.actor_id);
+    let err = load_or_create(&path).unwrap_err();
+    assert!(
+        err.contains("empty"),
+        "expected the empty-file error: {err}"
+    );
 
     // Malformed nonempty content errors rather than being overwritten.
     std::fs::write(&path, "{ not json").unwrap();

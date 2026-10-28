@@ -194,16 +194,26 @@ impl<'a, S: Store> TuiSession<'a, S> {
             d.work_id == detail.work_id
                 && d.work_version == detail.version
                 && detail.current_pr.as_ref().and_then(|(_, h)| h.as_ref()) == Some(&d.pr_head)
+                && d.covers(&detail.findings)
         });
         if !same {
-            // The displayed version/head moved under the draft: choices
-            // tied to the old snapshot are discarded, never retargeted.
+            // The displayed version/head/finding set moved under the
+            // draft: choices tied to the old snapshot are discarded,
+            // never retargeted.
             self.draft = None;
         }
         let moved = self.detail.as_ref().is_some_and(|prev| {
             prev.version != detail.version
                 || prev.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
                     != detail.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
+                || prev
+                    .findings
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    != detail
+                        .findings
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
         });
         if moved
             || self

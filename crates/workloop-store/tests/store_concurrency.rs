@@ -121,8 +121,8 @@ fn deferred_read_does_not_wait_on_write_lock() {
 
 /// `preview` begins deferred: while a writer holds the lock, the
 /// simulated effect application cannot upgrade the snapshot, so the
-/// preview fails fast with `Err` instead of freezing on the busy
-/// timeout behind the writer.
+/// preview returns `Err` promptly — well inside the 5 s busy timeout
+/// an immediate transaction would spend waiting on the lock.
 #[test]
 fn preview_fails_fast_under_held_write_lock() {
     use workloop_core::command::{CommandBody, CommandRequest};
@@ -178,10 +178,17 @@ fn preview_fails_fast_under_held_write_lock() {
             verification_argv: vec![],
         },
     };
+    let started = std::time::Instant::now();
     let result = preview(&b, &config, &req, 1_700_000_000);
+    let elapsed = started.elapsed();
     assert!(
         result.is_err(),
         "preview under a held write lock must fail, not freeze: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "preview waited on the write lock ({elapsed:?}) — the deferred \
+         upgrade must fail promptly, not exhaust the 5 s busy timeout"
     );
     done_tx.send(()).unwrap();
     writer.join().unwrap().unwrap();

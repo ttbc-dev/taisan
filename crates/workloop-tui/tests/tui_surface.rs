@@ -326,7 +326,26 @@ fn incomplete_draft_cannot_submit() {
     // No choices made — nothing may reach `work`.
     assert!(session.stage_judgment().is_err());
     assert!(session.submit(NOW).is_err());
-    assert!(stored_decision(&store, "tui-1").is_none());
+    // The refusals never armed a request: the first key the session
+    // generates still carries counter 1, and no judgment or version
+    // change reached the store.
+    let probe = session.compose(CommandBody::Cancel {
+        work_id: work_id.clone(),
+        expected_work_version: 1,
+        execution_id: None,
+    });
+    assert!(
+        probe.idempotency_key.starts_with("tui-1-"),
+        "a refused path consumed a request key: {}",
+        probe.idempotency_key
+    );
+    assert_eq!(session.detail().unwrap().version, 1);
+    assert!(
+        store
+            .transact(|tx| tx.latest_judgment(&work_id))
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// AC: a stale-head rejection re-queries the findings and clears the
@@ -567,15 +586,91 @@ fn local_refusals_never_reach_work() {
     session.open(&work_id, NOW).unwrap();
     // No observed head → no draft can begin.
     assert!(session.begin_judgment().is_err());
-    // Nothing the console refused ever persisted a decision.
+    // Nothing the console refused ever armed a request or moved the
+    // store: the first generated key still carries counter 1, and the
+    // Work is untouched since seeding.
     assert!(last_seq(&store) > 0, "seeding wrote the work");
-    let decision_count = store
-        .transact(|tx| {
-            tx.stored_decision(&Origin(ORIGIN.into()), &actor(), "tui-1")
-                .map(|d| d.is_some())
-        })
-        .unwrap();
-    assert!(!decision_count, "a refused path persisted a TUI decision");
+    let probe = session.compose(CommandBody::Cancel {
+        work_id: work_id.clone(),
+        expected_work_version: 1,
+        execution_id: None,
+    });
+    assert!(
+        probe.idempotency_key.starts_with("tui-1-"),
+        "a refused path consumed a request key: {}",
+        probe.idempotency_key
+    );
+    assert_eq!(session.detail().unwrap().version, 1);
+}
+
+/// A second review recorded for the same head grows the displayed
+/// finding set while version and head are unchanged — an observation
+/// bumps neither. A draft or armed request built on the smaller set
+/// would omit a displayed finding id, so `open` discards both rather
+/// than submitting a judgment that covers only part of the board.
+#[test]
+fn new_findings_on_same_head_invalidate_draft() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "nf-seed");
+    observe(&store, &work_id, pr_head("h1"), NOW);
+    observe(&store, &work_id, pr_review("h1"), NOW);
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.begin_judgment().unwrap();
+    let only = session.draft().unwrap().findings[0].finding_id.clone();
+    session.choose(&only, FindingChoice::Fix).unwrap();
+    session.stage_judgment().unwrap();
+
+    // A different reviewer records a second, distinct finding for the
+    // same head — detail.version and detail.current_pr do not move.
+    observe(
+        &store,
+        &work_id,
+        ObservationFact::PrReview {
+            repository: "local/repo".into(),
+            head_sha: "h1".into(),
+            reviewer: "rev2".into(),
+            verdict: ReviewVerdict::Approve,
+        },
+        NOW + 5,
+    );
+    session.open(&work_id, NOW + 6).unwrap();
+    let displayed: std::collections::HashSet<String> =
+        session.detail().unwrap().findings.iter().cloned().collect();
+    {
+        let detail = session.detail().unwrap();
+        assert_eq!(detail.version, 1, "an observation did not bump the version");
+        assert_eq!(
+            detail.current_pr.as_ref().and_then(|(_, h)| h.as_deref()),
+            Some("h1")
+        );
+    }
+
+    assert!(
+        session.draft().is_none(),
+        "a draft covering only part of the displayed findings survived"
+    );
+    assert!(
+        session.staged().is_none(),
+        "an armed request covering the stale finding set survived"
+    );
+
+    // A fresh draft covers exactly the grown set — one slot per
+    // displayed finding id, no more and no less.
+    session.begin_judgment().unwrap();
+    let slots: std::collections::HashSet<&String> = session
+        .draft()
+        .unwrap()
+        .findings
+        .iter()
+        .map(|s| &s.finding_id)
+        .collect();
+    assert_eq!(
+        slots,
+        displayed.iter().collect::<std::collections::HashSet<_>>()
+    );
+    assert_eq!(slots.len(), 2, "two distinct reviews display two findings");
 }
 
 fn bin() -> PathBuf {

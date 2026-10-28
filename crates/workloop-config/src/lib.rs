@@ -53,8 +53,13 @@ fn uuidish() -> String {
 
 /// The unique scratch name the complete content is staged under before
 /// it is published. Uniqueness matters: a crashed writer's leftover
-/// scratch must never block a later first write.
+/// scratch must never block a later first write. The pid distinguishes
+/// concurrent processes, the counter distinguishes threads sharing one
+/// pid (equal nanos collide), and nanos distinguishes a crashed
+/// writer's leftover from a later attempt.
 fn scratch_path(path: &Path) -> PathBuf {
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -63,23 +68,24 @@ fn scratch_path(path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!(".{name}.{}.{nanos:x}.tmp", std::process::id()))
+    path.with_file_name(format!(
+        ".{name}.{}.{seq}.{nanos:x}.tmp",
+        std::process::id()
+    ))
 }
 
-/// Read the config at `path`. `Ok(None)` means no usable config is
-/// there: the name is absent, or it held an empty file — a foreign
-/// artifact this loader never produces, since a first write publishes
-/// only complete content — which is removed so the create path can
-/// claim the name. Nonempty content that does not parse is malformed
-/// and errors rather than being overwritten.
+/// Read the config at `path`. `Ok(None)` means the name is absent.
+/// Any present file this loader did not produce is reported, never
+/// deleted: an empty or malformed file can only be foreign (a first
+/// write publishes only complete content), and reclaiming it by
+/// unlinking could race a concurrent publisher and remove a live
+/// config. The operator removes such a file to reinitialize.
 fn read(path: &Path) -> Result<Option<Installation>, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) if text.trim().is_empty() => match std::fs::remove_file(path) {
-            Ok(()) => Ok(None),
-            // A concurrent reader reclaimed it first.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("config reclaim: {e}")),
-        },
+        Ok(text) if text.trim().is_empty() => Err(format!(
+            "config: {} exists but is empty — remove it to reinitialize",
+            path.display()
+        )),
         Ok(text) => serde_json::from_str(&text)
             .map(Some)
             .map_err(|e| format!("config: {e}")),

@@ -4,7 +4,11 @@
 //! serializes transactions within a process; across processes (every CLI
 //! invocation is one) immediate transactions reserve the writer before reading.
 //! Contenders wait on the busy timeout before observing a snapshot, so a later
-//! write never needs to upgrade a stale WAL snapshot.
+//! `transact` write never needs to upgrade a stale WAL snapshot. Queries and
+//! `preview` instead use `transact_deferred`: they hold no writer lock while
+//! only reading, and a write they perform upgrades the snapshot — failing
+//! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
+//! intervened rather than waiting on the lock.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
