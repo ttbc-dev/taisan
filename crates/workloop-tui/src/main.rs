@@ -8,7 +8,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use workloop_core::command::{CommandDecision, FindingChoice};
+use workloop_core::command::{CommandDecision, CommandId, FindingChoice};
 use workloop_core::domain::WorkId;
 use workloop_store::sqlite::SqliteStore;
 use workloop_tui::install::load_or_create;
@@ -44,7 +44,8 @@ fn usage() -> &'static str {
   preview            advisory preflight of the armed request (work::preview)
   submit             submit the armed request (work::handle_command)
   pending            show the request whose result is unknown
-  recover            settle a pending request via command_result / identical replay
+  recover [cmd_id]   settle a pending request: command_result by id or replay
+                     key, else an identical-key replay — never a mutated request
   detail | board     reprint the open work or the board
   quit               exit — disconnecting changes no execution truth"
 }
@@ -197,16 +198,22 @@ fn dispatch(
             Some(req) => println!("{}", render::pending_frame(&req.idempotency_key, None)),
             None => println!("no pending request"),
         },
-        "recover" => match session.recover(now())? {
-            workloop_tui::session::RecoverOutcome::Found(d) => {
-                println!("recovered recorded decision:");
-                print_decision(&d);
+        "recover" => {
+            let outcome = match rest.first() {
+                Some(id) => session.recover_by_id(&CommandId(id.clone()), now())?,
+                None => session.recover(now())?,
+            };
+            match outcome {
+                workloop_tui::session::RecoverOutcome::Found(d) => {
+                    println!("recovered recorded decision:");
+                    print_decision(&d);
+                }
+                workloop_tui::session::RecoverOutcome::Replayed(d) => {
+                    println!("replayed identical request:");
+                    print_decision(&d);
+                }
             }
-            workloop_tui::session::RecoverOutcome::Replayed(d) => {
-                println!("replayed identical request:");
-                print_decision(&d);
-            }
-        },
+        }
         _ => println!("unknown verb '{verb}' — try help"),
     }
     Ok(true)

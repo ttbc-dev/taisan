@@ -6,7 +6,7 @@
 //! issued-but-unresolved request — and persists nothing of its own.
 
 use workloop_core::command::{
-    CommandBody, CommandDecision, CommandRequest, FindingChoice, RejectionCode,
+    CommandBody, CommandDecision, CommandId, CommandRequest, FindingChoice, RejectionCode,
 };
 use workloop_core::domain::{Actor, ExecutionId, Origin, WorkId};
 use workloop_core::projection::{self, CommandResultLookup, QueryResult, WorkDetailView};
@@ -365,6 +365,41 @@ impl<'a> TuiSession<'a> {
                 Ok(RecoverOutcome::Replayed(decision))
             }
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Recover a pending request by command id — the id the operator
+    /// learned from another surface (the CLI's `command_result`, for
+    /// example). The named durable decision settles the pending request:
+    /// it is a recorded fact either way, and the pending request is
+    /// never mutated by naming it.
+    pub fn recover_by_id(
+        &mut self,
+        command_id: &CommandId,
+        now_unix_seconds: i64,
+    ) -> Result<RecoverOutcome, String> {
+        if self.pending.is_none() {
+            return Err("no pending request".into());
+        }
+        match self
+            .store
+            .transact(|tx| {
+                projection::command_result(
+                    tx,
+                    &CommandResultLookup::Id {
+                        command_id: command_id.clone(),
+                    },
+                )
+            })
+            .map_err(|e| e.to_string())?
+        {
+            QueryResult::Found { value, .. } => {
+                self.pending = None;
+                self.on_decision(&value, now_unix_seconds)?;
+                Ok(RecoverOutcome::Found(value))
+            }
+            QueryResult::NotFound => Err(format!("no recorded decision for {command_id:?}")),
+            other => Err(format!("command_result: {other:?}")),
         }
     }
 

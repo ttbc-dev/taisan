@@ -679,3 +679,52 @@ fn console_eof_and_malformed_input() {
         other => panic!("{other:?}"),
     }
 }
+
+/// AC: a lost result also settles by command id — the id the operator
+/// obtained from another surface (the CLI's command_result, say).
+#[test]
+fn lost_submit_recovers_by_command_id() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "li-seed");
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    let req = session.staged().unwrap().clone();
+
+    // The command landed but the response never arrived; the operator
+    // learns its command id from the other surface.
+    let landed = handle_command(&store, &config(), &req, NOW).unwrap();
+    let command_id = landed.command_id().clone();
+    session.note_lost(req);
+    match session.recover_by_id(&command_id, NOW).unwrap() {
+        RecoverOutcome::Found(d) => {
+            assert_eq!(d.command_id(), &command_id);
+        }
+        other => panic!("expected found, got {other:?}"),
+    }
+    assert!(session.pending().is_none());
+}
+
+/// INV-007: store faults surface as errors — a db path that cannot be
+/// opened fails the process with a message, never a silent rejection.
+#[test]
+fn store_faults_surface_as_errors() {
+    let dir = root("fault");
+    let output = Command::new(bin())
+        .args([
+            "--db",
+            &dir.join("no-such-dir/nested.db").to_string_lossy(),
+            "--config",
+            &dir.join("config.json").to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("workloop-tui spawns");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workloop-tui:"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
