@@ -125,16 +125,17 @@ struct Tx<'t> {
     tx: rusqlite::Transaction<'t>,
 }
 
-impl Store for SqliteStore {
-    fn transact<R>(
+impl SqliteStore {
+    fn run<R>(
         &self,
+        behavior: TransactionBehavior,
         f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
         let tx = guard
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(behavior)
             .map_err(internal)?;
         let mut view = Tx { tx };
         let result = f(&mut view);
@@ -148,6 +149,22 @@ impl Store for SqliteStore {
                 Err(e)
             }
         }
+    }
+}
+
+impl Store for SqliteStore {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.run(TransactionBehavior::Immediate, f)
+    }
+
+    fn transact_deferred<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.run(TransactionBehavior::Deferred, f)
     }
 }
 

@@ -8,10 +8,11 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
+use workloop_config::load_or_create;
 use workloop_core::command::{CommandDecision, CommandId, FindingChoice};
 use workloop_core::domain::WorkId;
+use workloop_core::store::Store;
 use workloop_store::sqlite::SqliteStore;
-use workloop_tui::install::load_or_create;
 use workloop_tui::render;
 use workloop_tui::session::{Action, ORIGIN, SubmitOutcome, TuiSession};
 
@@ -101,8 +102,8 @@ fn run(args: Args) -> Result<(), String> {
 }
 
 /// One console verb. Returns `Ok(false)` to quit; `Err` prints locally.
-fn dispatch(
-    session: &mut TuiSession,
+fn dispatch<S: Store>(
+    session: &mut TuiSession<'_, S>,
     selected: &mut Option<WorkId>,
     verb: &str,
     rest: &[String],
@@ -246,7 +247,7 @@ fn parse_choice(s: &str) -> Result<FindingChoice, String> {
 
 /// `open` accepts a Work id or the card number `board_frame` prints
 /// (`Board::order()` — column-major).
-fn resolve_target(session: &TuiSession, target: &str) -> Result<WorkId, String> {
+fn resolve_target<S: Store>(session: &TuiSession<'_, S>, target: &str) -> Result<WorkId, String> {
     if let Ok(n) = target.parse::<usize>() {
         let order = session.board().ok_or("run refresh first")?.order();
         return order

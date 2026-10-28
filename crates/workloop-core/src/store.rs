@@ -337,4 +337,18 @@ pub trait Store {
         &self,
         f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
     ) -> Result<R, StoreError>;
+
+    /// A transaction that starts deferred: while the closure only reads,
+    /// it holds no writer lock, so a Query or `preview` neither blocks a
+    /// writer nor busy-waits behind one. A write the closure performs
+    /// upgrades the transaction for the remainder of the call — preview
+    /// relies on that to run effect application inside its rolled-back
+    /// savepoint. Defaults to `transact`; stores that can begin a
+    /// transaction deferred override it.
+    fn transact_deferred<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.transact(f)
+    }
 }

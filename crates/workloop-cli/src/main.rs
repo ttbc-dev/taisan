@@ -3,9 +3,10 @@
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::projection::{self, CommandResultLookup};
@@ -134,115 +135,6 @@ enum Commands {
     },
 }
 
-/// Installation config: the actor identity persists here so it is stable
-/// across restarts; worker argv and capacity configure the run loop.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Installation {
-    actor_id: String,
-    actor_kind: String,
-    #[serde(default = "default_repository")]
-    repository: String,
-    #[serde(default = "default_capacity")]
-    capacity: u32,
-    #[serde(default)]
-    worker_argv: Vec<String>,
-    #[serde(default = "default_workspace_root")]
-    workspace_root: String,
-    #[serde(default)]
-    allowed_effects: Option<AllowedEffects>,
-    #[serde(default)]
-    budget: Option<ExecutionBudget>,
-}
-
-fn default_repository() -> String {
-    "local/repo".into()
-}
-fn default_capacity() -> u32 {
-    1
-}
-fn default_workspace_root() -> String {
-    "workspaces".into()
-}
-
-/// Read the file once it is complete, retrying past a first writer's
-/// brief partial view — a file observed between `create_new` and the
-/// completed write is empty or half-written, never authoritative.
-/// `Ok(None)` means the path is absent or was reclaimed from a crashed
-/// first write (an empty file carries nothing, so it is removed for the
-/// create path to claim). A nonempty file that stays unparseable is a
-/// malformed config and errors.
-fn read_installation(path: &Path) -> Result<Option<Installation>, String> {
-    for _ in 0..100 {
-        match std::fs::read_to_string(path) {
-            Ok(text) if text.trim().is_empty() => {
-                std::thread::sleep(std::time::Duration::from_millis(5))
-            }
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(installation) => return Ok(Some(installation)),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("config read: {e}")),
-        }
-    }
-    match std::fs::read_to_string(path) {
-        Ok(text) if text.trim().is_empty() => {
-            let _ = std::fs::remove_file(path);
-            Ok(None)
-        }
-        Ok(text) => match serde_json::from_str::<Installation>(&text) {
-            Err(e) => Err(format!("config: {e}")),
-            Ok(installation) => Ok(Some(installation)),
-        },
-        Err(e) => Err(format!("config read: {e}")),
-    }
-}
-
-fn load_or_create_installation(path: &Path) -> Result<Installation, String> {
-    // Exclusive create: when CLI and TUI (or two CLI processes) start
-    // concurrently before the file exists, exactly one write lands and
-    // every loser adopts the file that did — one actor identity across
-    // adapters.
-    for _ in 0..3 {
-        if let Some(installation) = read_installation(path)? {
-            return Ok(installation);
-        }
-        let installation = Installation {
-            actor_id: format!("actor-{}", uuidish()),
-            actor_kind: "human".into(),
-            repository: default_repository(),
-            capacity: default_capacity(),
-            worker_argv: vec![],
-            workspace_root: default_workspace_root(),
-            allowed_effects: None,
-            budget: None,
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
-        }
-        let text =
-            serde_json::to_string_pretty(&installation).map_err(|e| format!("config: {e}"))?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(text.as_bytes())
-                    .and_then(|()| file.sync_all())
-                    .map_err(|e| format!("config write: {e}"))?;
-                return Ok(installation);
-            }
-            // Lost the create race: adopt the winner's file — the next
-            // pass reads it, retrying past its in-flight write.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("config create: {e}")),
-        }
-    }
-    Err("config: first writer did not finish".into())
-}
-
 fn uuidish() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -331,26 +223,9 @@ fn run(cli: Cli) -> Result<(), String> {
         .config
         .clone()
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
-    let installation = load_or_create_installation(&config_path)?;
-    let actor = Actor {
-        kind: match installation.actor_kind.as_str() {
-            "automation" => ActorKind::Automation,
-            _ => ActorKind::Human,
-        },
-        external_id: installation.actor_id.clone(),
-    };
-    let config = WorkloopConfig {
-        default_repository: installation.repository.clone(),
-        allowed_effects: installation
-            .allowed_effects
-            .clone()
-            .unwrap_or(AllowedEffects {
-                workspace_write: true,
-                github_write: false,
-                network: false,
-            }),
-        budget: installation.budget.clone().unwrap_or_default(),
-    };
+    let installation = load_or_create(&config_path)?;
+    let actor = installation.actor();
+    let config = installation.workloop_config();
     let store =
         SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
     let key = || {
@@ -530,25 +405,25 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::WorkList => {
             let r = store
-                .transact(|tx| projection::work_list(tx, now()))
+                .transact_deferred(|tx| projection::work_list(tx, now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::WorkDetail { work } => {
             let r = store
-                .transact(|tx| projection::work_detail(tx, &WorkId(work), now()))
+                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work), now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::Attention { work } => {
             let r = store
-                .transact(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
+                .transact_deferred(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::Capacity => {
             let r = store
-                .transact(|tx| projection::capacity(tx))
+                .transact_deferred(|tx| projection::capacity(tx))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
@@ -573,7 +448,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
             };
             let r = store
-                .transact(|tx| projection::command_result(tx, &lookup))
+                .transact_deferred(|tx| projection::command_result(tx, &lookup))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
@@ -621,7 +496,7 @@ fn run_tick(
     // Status output goes through the same read-only projection as the
     // query subcommands — never a raw store read.
     let list = store
-        .transact(|tx| projection::work_list(tx, now))
+        .transact_deferred(|tx| projection::work_list(tx, now))
         .map_err(|e| e.to_string())?;
     print(&list);
     Ok(())

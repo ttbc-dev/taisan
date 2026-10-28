@@ -8,7 +8,6 @@
 //! draft, the staged request, and an issued-but-unresolved one.
 
 pub mod board;
-pub mod install;
 pub mod judgment;
 pub mod render;
 pub mod session;

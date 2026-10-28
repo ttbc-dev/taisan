@@ -14,7 +14,6 @@ use workloop_core::projection::{
 };
 use workloop_core::store::Store;
 use workloop_core::work::{ActionPreview, WorkloopConfig, handle_command, preview};
-use workloop_store::sqlite::SqliteStore;
 
 use crate::board::Board;
 use crate::judgment::JudgmentDraft;
@@ -54,9 +53,11 @@ pub enum Action {
     Acknowledge { attention_id: String },
 }
 
-/// The TUI session over one installation's store.
-pub struct TuiSession<'a> {
-    store: &'a SqliteStore,
+/// The TUI session over one installation's store — generic over the
+/// `Store` port: the adapter is coupled to the Command/Query contract,
+/// not to the SQLite implementation behind it.
+pub struct TuiSession<'a, S: Store> {
+    store: &'a S,
     config: WorkloopConfig,
     actor: Actor,
     /// Last `refresh` result — a render snapshot, re-derived each pass.
@@ -77,8 +78,8 @@ pub struct TuiSession<'a> {
     key_counter: u64,
 }
 
-impl<'a> TuiSession<'a> {
-    pub fn new(store: &'a SqliteStore, config: WorkloopConfig, actor: Actor) -> Self {
+impl<'a, S: Store> TuiSession<'a, S> {
+    pub fn new(store: &'a S, config: WorkloopConfig, actor: Actor) -> Self {
         Self {
             store,
             config,
@@ -95,7 +96,7 @@ impl<'a> TuiSession<'a> {
 
     /// Access to the shared store for other surfaces in tests/tools —
     /// the session itself never uses it outside the Command/Query ports.
-    pub fn store(&self) -> &'a SqliteStore {
+    pub fn store(&self) -> &'a S {
         self.store
     }
 
@@ -139,11 +140,13 @@ impl<'a> TuiSession<'a> {
     }
 
     /// Re-derive the board from the `work_list`, `capacity`, and
-    /// `attention` Queries — the only reads the console performs.
+    /// `attention` Queries — the only reads the console performs. The
+    /// transactions begin deferred: pure reads never take the writer
+    /// lock, so a board refresh cannot block or stall on a Command.
     pub fn refresh(&mut self, now_unix_seconds: i64) -> Result<&Board, String> {
         let list = match self
             .store
-            .transact(|tx| projection::work_list(tx, now_unix_seconds))
+            .transact_deferred(|tx| projection::work_list(tx, now_unix_seconds))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, .. } => value,
@@ -151,7 +154,7 @@ impl<'a> TuiSession<'a> {
         };
         let capacity = match self
             .store
-            .transact(|tx| projection::capacity(tx))
+            .transact_deferred(|tx| projection::capacity(tx))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, .. } => Some(value),
@@ -160,7 +163,7 @@ impl<'a> TuiSession<'a> {
         };
         let attention = match self
             .store
-            .transact(|tx| projection::attention(tx, None, now_unix_seconds))
+            .transact_deferred(|tx| projection::attention(tx, None, now_unix_seconds))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, .. } => value,
@@ -173,11 +176,15 @@ impl<'a> TuiSession<'a> {
     /// Open a Work: query `work_detail` and its `attention`, then hold the
     /// snapshot as selection state. Opening a different Work drops the
     /// previous draft; an unchanged re-open keeps choices the operator
-    /// already made only when the version and head still match.
+    /// already made only when the version and head still match. A
+    /// re-query that finds the version or head moved also drops the
+    /// armed request — it was built against the old observation, so it
+    /// must be re-armed from the snapshot the operator now sees rather
+    /// than submitted under it.
     pub fn open(&mut self, work_id: &WorkId, now_unix_seconds: i64) -> Result<(), String> {
         let (detail, sources) = match self
             .store
-            .transact(|tx| projection::work_detail(tx, work_id, now_unix_seconds))
+            .transact_deferred(|tx| projection::work_detail(tx, work_id, now_unix_seconds))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, sources, .. } => (value, sources),
@@ -193,11 +200,17 @@ impl<'a> TuiSession<'a> {
             // tied to the old snapshot are discarded, never retargeted.
             self.draft = None;
         }
-        if self
-            .staged
-            .as_ref()
-            .and_then(|r| r.body.work_id())
-            .is_some_and(|w| w != &detail.work_id)
+        let moved = self.detail.as_ref().is_some_and(|prev| {
+            prev.version != detail.version
+                || prev.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
+                    != detail.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
+        });
+        if moved
+            || self
+                .staged
+                .as_ref()
+                .and_then(|r| r.body.work_id())
+                .is_some_and(|w| w != &detail.work_id)
         {
             self.staged = None;
         }
@@ -376,7 +389,7 @@ impl<'a> TuiSession<'a> {
         };
         match self
             .store
-            .transact(|tx| projection::command_result(tx, &lookup))
+            .transact_deferred(|tx| projection::command_result(tx, &lookup))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, .. } => {
@@ -420,7 +433,7 @@ impl<'a> TuiSession<'a> {
         };
         match self
             .store
-            .transact(|tx| projection::command_result(tx, &lookup))
+            .transact_deferred(|tx| projection::command_result(tx, &lookup))
             .map_err(|e| e.to_string())?
         {
             QueryResult::Found { value, .. } => {
@@ -442,7 +455,7 @@ impl<'a> TuiSession<'a> {
         // pending request stays unknown either way.
         match self
             .store
-            .transact(|tx| {
+            .transact_deferred(|tx| {
                 projection::command_result(
                     tx,
                     &CommandResultLookup::Id {

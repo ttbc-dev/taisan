@@ -107,7 +107,11 @@ pub struct ActionPreview {
 /// violations surface as the same rejection a submit would produce —
 /// and reports the outcome without persisting it. The whole pass sits
 /// inside an outer savepoint that is always rolled back, so no
-/// decision, effect, ID, or sequence allocation survives. An internal
+/// decision, effect, ID, or sequence allocation survives. The
+/// transaction begins deferred: the decision reads hold no writer
+/// lock, so previewing does not busy-wait behind or block a writer —
+/// only the simulated effect application upgrades, and a concurrent
+/// writer surfaces `Err` rather than a frozen preview. An internal
 /// store fault surfaces as `Err`, never as a rejection-looking preview.
 pub fn preview(
     store: &impl Store,
@@ -115,7 +119,7 @@ pub fn preview(
     req: &CommandRequest,
     now_unix_seconds: i64,
 ) -> Result<ActionPreview, StoreError> {
-    store.transact(|tx| {
+    store.transact_deferred(|tx| {
         // A stored decision is what a submit under this key returns: the
         // same payload replays it, a changed payload conflicts.
         let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);

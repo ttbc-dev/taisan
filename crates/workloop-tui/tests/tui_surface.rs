@@ -14,12 +14,11 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact, ReviewVerdict};
 use workloop_core::projection::{self, CommandResultLookup, QueryResult, WorkPhase};
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, Store, StoreError, TxView};
 use workloop_core::work::{
     PreviewAvailability, WorkloopConfig, handle_command, handle_observation,
 };
 use workloop_store::sqlite::SqliteStore;
-use workloop_tui::install::load_or_create;
 use workloop_tui::render::board_frame;
 use workloop_tui::session::{Action, ORIGIN, RecoverOutcome, SubmitOutcome, TuiSession};
 
@@ -47,7 +46,7 @@ fn actor() -> Actor {
 /// Attach a session to `store` — the fixture stands in for the process
 /// boundary: the session reaches the store only through the Command/
 /// Query ports while the test inspects the same records the CLI sees.
-fn session(store: &SqliteStore) -> TuiSession<'_> {
+fn session(store: &SqliteStore) -> TuiSession<'_, SqliteStore> {
     TuiSession::new(store, config(), actor())
 }
 
@@ -579,38 +578,6 @@ fn local_refusals_never_reach_work() {
     assert!(!decision_count, "a refused path persisted a TUI decision");
 }
 
-/// The actor identity persists in the shared installation config: a
-/// first launch creates it, a relaunch reuses it, and the file carries
-/// exactly the schema the CLI writes and reads.
-#[test]
-fn tui_actor_identity_is_stable_and_cli_compatible() {
-    let dir = std::env::temp_dir().join(format!("workloop-tui-cfg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let config_path = dir.join("config.json");
-
-    let first = load_or_create(&config_path).unwrap();
-    let second = load_or_create(&config_path).unwrap();
-    assert_eq!(first.actor_id, second.actor_id, "actor id is stable");
-    assert_eq!(first.actor_kind, second.actor_kind);
-
-    // The file the TUI wrote is the CLI's schema: the required identity
-    // fields plus the loop settings the CLI defaults.
-    let written: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    for key in [
-        "actor_id",
-        "actor_kind",
-        "repository",
-        "capacity",
-        "worker_argv",
-        "workspace_root",
-    ] {
-        assert!(written.get(key).is_some(), "config missing {key}");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_workloop-tui"))
 }
@@ -899,32 +866,6 @@ fn recover_by_id_rejects_unrelated_command_id() {
     assert!(session.pending().is_none());
 }
 
-/// Concurrent first writers converge on one actor identity: exactly
-/// one `create_new` lands and every loser adopts that file.
-#[test]
-fn concurrent_first_writers_share_one_actor() {
-    let dir = root("install-race");
-    let path = std::sync::Arc::new(dir.join("config.json"));
-    let handles: Vec<_> = (0..8)
-        .map(|_| {
-            let p = path.clone();
-            std::thread::spawn(move || load_or_create(&p).map(|i| i.actor_id))
-        })
-        .collect();
-    let ids: std::collections::HashSet<String> = handles
-        .into_iter()
-        .map(|h| h.join().unwrap().unwrap())
-        .collect();
-    assert_eq!(ids.len(), 1, "concurrent writers diverged: {ids:?}");
-    let written: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path.as_ref()).unwrap()).unwrap();
-    assert_eq!(
-        written["actor_id"].as_str().unwrap(),
-        ids.iter().next().unwrap()
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Starting a new judgment drops any armed request — the previously
 /// staged Command belongs to the old draft and must never submit under
 /// the new one's display.
@@ -973,25 +914,85 @@ fn empty_findings_under_unread_source_is_not_clean() {
     assert!(frame.contains("github:review"), "{frame}");
 }
 
-/// A config file observed mid-write (empty) is not authoritative: it
-/// is reclaimed and a fresh stable identity is created. A malformed
-/// nonempty file still errors.
+/// A re-query that finds the version or head moved discards the armed
+/// request: it was built against the old observation and must be
+/// re-armed from the snapshot the operator now sees — never submitted
+/// with a stale expected version under the new display.
 #[test]
-fn install_recovers_partial_and_errors_malformed() {
-    let dir = root("install-partial");
-    let path = dir.join("config.json");
+fn moved_snapshot_clears_staged_request() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "mv-seed");
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    assert!(session.staged().is_some());
 
-    // The crashed first write left an empty file — reclaimed, not fatal.
-    std::fs::write(&path, "").unwrap();
-    let created = load_or_create(&path).unwrap();
-    let reread = load_or_create(&path).unwrap();
-    assert_eq!(created.actor_id, reread.actor_id);
+    // Another surface moves the durable version under the armed request.
+    let _ = handle_command(
+        &store,
+        &config(),
+        &cli_req(
+            "mv-other",
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
 
-    // Malformed nonempty content errors rather than being overwritten.
-    std::fs::write(&path, "{ not json").unwrap();
-    assert!(load_or_create(&path).is_err());
+    session.open(&work_id, NOW).unwrap();
+    assert!(
+        session.staged().is_none(),
+        "an armed request built on the pre-move snapshot survived the re-query"
+    );
+    // Re-arming carries the observed version — not the stale one the
+    // discarded request held.
+    let req = session.stage_action(&Action::Cancel).unwrap().clone();
+    let CommandBody::Cancel {
+        expected_work_version,
+        ..
+    } = &req.body
+    else {
+        panic!("expected cancel")
+    };
+    assert_eq!(*expected_work_version, 2);
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+/// The session is bound to the `Store` port, not the SQLite type: any
+/// implementation backing the Command/Query contract can drive the
+/// adapter.
+#[test]
+fn session_is_generic_over_the_store_port() {
+    /// A `Store` that is not `SqliteStore`: delegates to one, but the
+    /// session sees only the port.
+    struct Delegating<'a>(&'a SqliteStore);
+    impl Store for Delegating<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            self.0.transact(f)
+        }
+        fn transact_deferred<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            self.0.transact_deferred(f)
+        }
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit_work(&store, "gs-seed");
+    let adapter = Delegating(&store);
+    let mut session = TuiSession::new(&adapter, config(), actor());
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    assert_eq!(session.detail().unwrap().work_id, work_id);
+    assert_eq!(session.board().unwrap().order(), vec![work_id]);
 }
 
 /// INV-007: store faults surface as errors — a db path that cannot be
