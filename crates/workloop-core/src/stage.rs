@@ -41,6 +41,13 @@ pub enum ReviewerKind {
 /// it does not derive `Deserialize`: the only construction path is
 /// [`LaneMatrix::validate`], so an unsupported cell is refused at
 /// configuration validation and can never be loaded silently.
+///
+/// ```compile_fail
+/// // A LaneSpec is not `Deserialize` — configuration loading must route
+/// // through `LaneMatrix::validate`, never around it.
+/// use workloop_core::stage::LaneSpec;
+/// let spec: LaneSpec = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LaneSpec {
     executor: ExecutorKind,
@@ -132,6 +139,22 @@ pub struct ConvergeRecord {
     pub threads_addressed: Vec<ThreadRef>,
 }
 
+/// The GitHub-integration port's typed answer to "how does `pushed_sha`
+/// relate to the live PR head" — never a bare bool, so a reversed or
+/// reused ancestry answer cannot masquerade as publication evidence.
+/// `Unknown` is never success: an unverifiable relation counts as
+/// unpublished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadVerification {
+    /// `pushed_sha` is an ancestor of the live PR head.
+    OnLiveHistory,
+    /// `pushed_sha` is not on the live head's history.
+    NotOnLiveHistory,
+    /// The relation could not be established (e.g. the lookup failed).
+    Unknown,
+}
+
 /// How the coordinator classifies a converge record against the live PR.
 /// `ReviewFixed` requires publication evidence; a claimed-but-unpublished
 /// fix is a failure that preserves the record as evidence, never a
@@ -139,7 +162,7 @@ pub struct ConvergeRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConvergeClassification {
-    /// `pushed_sha` equals the live PR head or is an ancestor of it.
+    /// The produced head was pushed and verifies against the live PR head.
     ReviewFixed,
     /// The record's pushed or produced head cannot be verified on the PR.
     PublicationUnverified,
@@ -148,24 +171,34 @@ pub enum ConvergeClassification {
 }
 
 impl ConvergeRecord {
-    /// Classify the record against the *live* PR head. `pushed_is_ancestor`
-    /// is the GitHub-integration port's answer to "is `pushed_sha` an
-    /// ancestor of `live_head`" — the core is I/O-free and never infers
-    /// ancestry from the record's own fields alone.
+    /// Classify the record against the *live* PR head.
+    /// `pushed_verification` is the GitHub-integration port's
+    /// [`HeadVerification`] for `pushed_sha` against `live_head` — the
+    /// core is I/O-free and never infers ancestry from the record's own
+    /// fields alone.
+    ///
+    /// `ReviewFixed` requires all of: a fix was produced
+    /// (`head_after != head_before`), the published head *is* the produced
+    /// head (`pushed_sha == head_after`), and that head verifies on the
+    /// live PR — equal to `live_head` (directly observable, no external
+    /// answer needed) or `OnLiveHistory`.
     pub fn classify(
         &self,
         live_head: &PrHeadSha,
-        pushed_is_ancestor: bool,
+        pushed_verification: HeadVerification,
     ) -> ConvergeClassification {
-        match &self.pushed_sha {
-            Some(sha) if sha == live_head || pushed_is_ancestor => {
-                ConvergeClassification::ReviewFixed
-            }
-            Some(_) => ConvergeClassification::PublicationUnverified,
-            None if self.head_after != self.head_before => {
-                ConvergeClassification::PublicationUnverified
-            }
-            None => ConvergeClassification::NothingToFix,
+        if self.head_after == self.head_before {
+            return ConvergeClassification::NothingToFix;
         }
+        let Some(sha) = &self.pushed_sha else {
+            return ConvergeClassification::PublicationUnverified;
+        };
+        if sha != &self.head_after {
+            return ConvergeClassification::PublicationUnverified;
+        }
+        if sha == live_head || pushed_verification == HeadVerification::OnLiveHistory {
+            return ConvergeClassification::ReviewFixed;
+        }
+        ConvergeClassification::PublicationUnverified
     }
 }

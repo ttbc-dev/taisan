@@ -21,8 +21,9 @@ fn record(head_before: &str, head_after: &str, pushed_sha: Option<&str>) -> Conv
 fn pushed_head_equal_to_live_is_review_fixed() {
     let rec = record("sha-old", "sha-new", Some("sha-new"));
     assert_eq!(
-        rec.classify(&"sha-new".to_string(), false),
-        ConvergeClassification::ReviewFixed
+        rec.classify(&"sha-new".to_string(), HeadVerification::Unknown),
+        ConvergeClassification::ReviewFixed,
+        "equality with the live head is directly observable publication"
     );
 }
 
@@ -32,7 +33,7 @@ fn pushed_head_ancestor_of_live_is_review_fixed() {
     // the pushed head is provably on the live head's history.
     let rec = record("sha-old", "sha-new", Some("sha-new"));
     assert_eq!(
-        rec.classify(&"sha-newer".to_string(), true),
+        rec.classify(&"sha-newer".to_string(), HeadVerification::OnLiveHistory),
         ConvergeClassification::ReviewFixed
     );
 }
@@ -40,11 +41,16 @@ fn pushed_head_ancestor_of_live_is_review_fixed() {
 #[test]
 fn pushed_head_neither_equal_nor_ancestor_is_publication_unverified() {
     let rec = record("sha-old", "sha-new", Some("sha-new"));
-    assert_eq!(
-        rec.classify(&"sha-other".to_string(), false),
-        ConvergeClassification::PublicationUnverified,
-        "a claimed fix whose head never reached the PR is a failure, not a success"
-    );
+    for verification in [
+        HeadVerification::NotOnLiveHistory,
+        HeadVerification::Unknown,
+    ] {
+        assert_eq!(
+            rec.classify(&"sha-other".to_string(), verification),
+            ConvergeClassification::PublicationUnverified,
+            "a claimed fix whose head never reached the PR is a failure, not a success"
+        );
+    }
 }
 
 #[test]
@@ -54,8 +60,30 @@ fn produced_but_unpushed_head_is_publication_unverified() {
     // nothing was pushed.
     let rec = record("sha-old", "sha-new", None);
     assert_eq!(
-        rec.classify(&"sha-old".to_string(), false),
+        rec.classify(&"sha-old".to_string(), HeadVerification::Unknown),
         ConvergeClassification::PublicationUnverified
+    );
+}
+
+#[test]
+fn pushed_head_behind_produced_head_is_not_review_fixed() {
+    // FIND-001(a): commits produced after the push — `pushed_sha` reached
+    // the live head but `head_after` never did.
+    let rec = record("sha-old", "sha-newer", Some("sha-new"));
+    assert_eq!(
+        rec.classify(&"sha-new".to_string(), HeadVerification::OnLiveHistory),
+        ConvergeClassification::PublicationUnverified,
+        "the published head must be the produced head"
+    );
+}
+
+#[test]
+fn no_op_repush_is_not_review_fixed() {
+    // FIND-001(b): repushing an unchanged head claims no fix.
+    let rec = record("sha-old", "sha-old", Some("sha-old"));
+    assert_eq!(
+        rec.classify(&"sha-old".to_string(), HeadVerification::OnLiveHistory),
+        ConvergeClassification::NothingToFix
     );
 }
 
@@ -63,7 +91,7 @@ fn produced_but_unpushed_head_is_publication_unverified() {
 fn unchanged_head_without_push_is_nothing_to_fix() {
     let rec = record("sha-old", "sha-old", None);
     assert_eq!(
-        rec.classify(&"sha-old".to_string(), false),
+        rec.classify(&"sha-old".to_string(), HeadVerification::Unknown),
         ConvergeClassification::NothingToFix
     );
 }
@@ -128,4 +156,19 @@ fn external_bot_event_is_dropped_by_the_filter() {
 #[test]
 fn external_human_event_is_admitted() {
     assert!(admit_bot_filtered_event(EventProvenance::External, false));
+}
+
+#[test]
+fn event_provenance_round_trips_as_snake_case() {
+    // FIND-005: the wire spelling is the contract, not a per-adapter
+    // choice — a mismatched spelling would starve or over-admit events.
+    for (provenance, json) in [
+        (EventProvenance::LaneManaged, "\"lane_managed\""),
+        (EventProvenance::External, "\"external\""),
+    ] {
+        let serialized = serde_json::to_string(&provenance).unwrap();
+        assert_eq!(serialized, json);
+        let parsed: EventProvenance = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, provenance);
+    }
 }

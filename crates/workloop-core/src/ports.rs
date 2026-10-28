@@ -105,7 +105,8 @@ pub trait ProcessControlPort {
 /// and heads are first-class inputs: an adapter derives provenance from
 /// lane-managed identity (the PRs and heads the lane opened), never from
 /// a sender-name heuristic, and must not starve its own loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventProvenance {
     /// Produced by the lane itself: a managed PR or head.
     LaneManaged,
