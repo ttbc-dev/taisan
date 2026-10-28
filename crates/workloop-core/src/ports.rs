@@ -1,6 +1,11 @@
 //! Behavioral ports the core declares and adapters implement. Slice 0:
 //! `ProcessControlPort` (POSIX supervisor in `workloop-exec`) and the
 //! GitHub-integration port (fixture in `workloop-github`).
+//!
+//! The GitHub-integration port also carries the event-filter contract:
+//! a filter that drops bot-authored or bot-sent deliveries must exempt
+//! lane-produced events, or the lane starves its own loop — see
+//! [`admit_bot_filtered_event`].
 
 use std::path::Path;
 
@@ -93,4 +98,31 @@ pub trait ProcessControlPort {
     /// Reap a child this supervisor spawned so inspection is not polluted
     /// by zombies. No-op for pids that are not our children.
     fn reap(&self, pid: i32);
+}
+
+/// Whether an inbound delivery was produced by the lane itself — e.g.
+/// authored or sent by the lane's GitHub App identity. Bot-produced PRs
+/// and heads are first-class inputs: an adapter derives provenance from
+/// lane-managed identity (the PRs and heads the lane opened), never from
+/// a sender-name heuristic, and must not starve its own loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventProvenance {
+    /// Produced by the lane itself: a managed PR or head.
+    LaneManaged,
+    /// Any other delivery, including third-party bot traffic.
+    External,
+}
+
+/// The adapter event-filter contract. A filter that drops bot-authored or
+/// bot-sent deliveries may apply that drop only to `External` events —
+/// lane-produced PRs and heads are always admitted, whatever the sender
+/// kind, or the lane's own review loop silently never fires.
+pub fn admit_bot_filtered_event(
+    provenance: EventProvenance,
+    sender_or_author_is_bot: bool,
+) -> bool {
+    match provenance {
+        EventProvenance::LaneManaged => true,
+        EventProvenance::External => !sender_or_author_is_bot,
+    }
 }

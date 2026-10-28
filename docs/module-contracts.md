@@ -224,6 +224,20 @@ type InvocationFact = { kind: "invocation"; execution_id: ExecutionId;
 	invocation_id: InvocationId; process: ProcessEvidence;
 	worker_report?: WorkerReport };
 
+// Stage contracts are executor-independent: an executor cell selects
+// where a stage runs, never which postconditions it may skip.
+type ExecutorKind = "local" | "remote";
+type ReviewerKind = "devin" | "shadow" | "both";
+type LaneSpec = { executor: ExecutorKind; reviewer: ReviewerKind };
+type ReplyRef = string;   // marked reply posted to the PR
+type ThreadRef = string;  // review thread the pass addressed
+type ConvergeRecord = { head_before: PrHeadSha; head_after: PrHeadSha;
+	pushed_sha?: PrHeadSha; replies_posted: ReplyRef[];
+	threads_addressed: ThreadRef[] };
+type ConvergeClassification = "review_fixed" | "publication_unverified"
+	| "nothing_to_fix";
+type EventProvenance = "lane_managed" | "external";
+
 type PrActionIntent = { action_id: ActionId; work_id: WorkId;
 	repository: string; payload_digest: string } & (
 	| { operation: { kind: "publish_pr"; branch: string; base: string;
@@ -297,6 +311,8 @@ type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertai
 ```
 
 `review` and `check` facts always include the head they examined. A delayed webhook is a signal to fetch the current PR head, not authority to replace it with the event's old head. The old event remains evidence for its own revision. `ProcessEvidence.unknown` is the execution supervisor's observation when a worker cannot be reached; the worker does not claim that status for itself. A worker report is a claim with evidence, not an Outcome. The verification commands accepted by `submit` become part of the bounded coding task; the control adapter cannot replace them when dispatching a worker.
+
+`converge` returns a `ConvergeRecord`, not a free-text verdict: publication is part of the stage's postcondition, exactly as `propose` models it for ship. The coordinator classifies the record against the *live* PR head — `review_fixed` only when `pushed_sha` equals the live head or is an ancestor of it; `publication_unverified` when a produced or claimed head cannot be verified on the PR (a failure that preserves the record as evidence, never a success); `nothing_to_fix` when no fix was produced and nothing was pushed. `LaneSpec` exists only through matrix validation at configuration time: an undeclared `ExecutorKind`×`ReviewerKind` cell is refused rather than silently degrading one axis for the other. `EventProvenance` marks deliveries the lane itself produced; an event filter that drops bot-authored or bot-sent deliveries must admit `lane_managed` events so the lane's own loop is not starved.
 
 `ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. Inspection reads process state, not mere presence: an unreaped zombie still lists in the process table but cannot write, and `execution` reaps the processes it spawned. Stop proof covers the descendant snapshot recorded with the stop intent — a `setsid`-escaped child survives a process-group signal and becomes invisible to the process tree once its leader exits. Before signaling any recorded identity the port re-verifies its recorded start time so a reused PID is never signaled. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
 

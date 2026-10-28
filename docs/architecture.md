@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Core | Work and Execution IDs, state transitions, built-in work queue, capacity, retry/resume policy, evidence, current Attention, execution-ownership decisions | GitHub's issue and PR data |
 | GitHub integration | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
-| Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work or declaring a PR reviewed on a newer head |
+| Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work, redefining stage postconditions, or declaring a PR reviewed on a newer head |
 | Control adapter | Command translation, status projection, external identity mapping | State transitions or independent retry policy |
 | CLI | Reference implementation of the control interface | A separate state model |
 | TUI management console | Interactive queue, Work, Attention, and evidence views; typed Command submission | Its own queue or Work state, Attention classification, or retry policy |
@@ -68,6 +68,12 @@ The core exposes commands such as `submit`, `retry`, `resume`, `cancel`, and `ac
 
 The core returns an accepted/rejected decision, canonical state version, and command ID. `retry` means: create at most one new Execution for eligible, settled Work under the same intent, after checking current evidence and policy. `resume` continues an eligible interrupted Execution from a durable checkpoint; it may start a new Invocation. Adapters cannot implement either by moving a card or spawning a process directly. An unavailable result can be queried by command ID before resubmission. Queries read recorded state; monitors and reconciliation record new Observations before a Projection changes.
 
+### Stage contracts are executor-independent
+
+A stage command defines its outcome by postconditions that hold no matter where the stage runs. An executor cell — local, remote, or a future provider — selects *where* the stage executes and never *what it may skip*. The `converge` stage is the contract's model: its outcome is bounded fix commits *published* to the PR head, marked replies posted, and draft→ready performed exactly once — the same outcome on every executor. The executor returns a structured **converge record** `{head_before, head_after, pushed_sha, replies_posted[], threads_addressed[]}` rather than a free-text verdict; the record shape is part of the contract types (`workloop_core::stage::ConvergeRecord`).
+
+Success classification requires publication evidence: a result counts as `review-fixed` only when the record's `pushed_sha` verifies against the live PR head — equal to it or an ancestor of it. A claimed-but-unpublished fix is a failure with the record preserved as evidence, never a success. The executor and reviewer axes are orthogonal by construction: reviewer selection (`devin`/`shadow`/`both`) must not silently degrade because of the executor (`local`/`remote`), and an unsupported executor×reviewer combination is refused at configuration-validation time.
+
 ## Work and execution
 
 Work has its own identity independent of an issue number or board card. Store GitHub issue references as source links, not primary keys. Each accepted Work starts with one queued Execution; an explicit retry creates the next queued Execution under the same Work. Each Execution has an execution ID, defined input and budget, zero or more Invocations, process/workspace evidence, checkpoints, and recorded Outcomes. A Work item may have multiple sequential Executions but no more than one nonterminal, authoritative Execution, including queued and paused ones. Capacity is reserved atomically when a queued Execution is admitted for its first Invocation, not when `submit` or `retry` is accepted. The [lifecycle contract](lifecycle.md) defines the transitions and release points. Execution ownership combines store-enforced resource reservations, TTL-bounded external claims for manual writers, and stop proof over recorded process identities; [the mechanism is specified without adopting the name Lease](glossary.md#execution-ownership).
@@ -88,6 +94,8 @@ An adapter implements a narrow protocol:
 2. Submit that command with an idempotency key and state precondition.
 3. Render the returned decision and current state.
 4. Reconcile its projection after delayed, duplicated, or lost events.
+
+Bot-produced PRs are first-class inputs. An adapter event filter that drops bot-authored or bot-sent deliveries must exempt work the lane itself produced — managed PRs and heads — or the lane's own loop starves: a lane-opened PR is authored by the lane's app identity, and dropping it would silently disable the reviewer axis it was supposed to receive. Provenance comes from lane-managed identity, not a sender-name heuristic (`workloop_core::ports::EventProvenance`).
 
 The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents the built-in queue and other Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request. The [hermes-setup console PR](https://github.com/shimpeiws/hermes-setup/pull/386) is the current reference for this interaction pattern; its Rust interaction code may inform this TUI, while its Python projections and action paths remain private implementation details, not additional core authorities.
 
