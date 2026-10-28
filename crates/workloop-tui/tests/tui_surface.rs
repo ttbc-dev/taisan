@@ -520,6 +520,75 @@ fn submit_refused_while_result_unknown() {
     ));
 }
 
+/// A local store fault during `submit` is surfaced as an error, not
+/// rendered as a lost response: the transaction rolled back, so no
+/// decision exists to recover. The identical request stays staged and
+/// re-submitting it is safe and settles the Command exactly once.
+#[test]
+fn submit_local_fault_is_not_unknown() {
+    use std::cell::Cell;
+
+    struct Faulting<'a> {
+        inner: &'a SqliteStore,
+        fault: Cell<bool>,
+    }
+    impl Store for Faulting<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            if self.fault.get() {
+                return Err(StoreError::Internal {
+                    detail: "simulated disk full".into(),
+                });
+            }
+            self.inner.transact(f)
+        }
+        fn transact_deferred<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            self.inner.transact_deferred(f)
+        }
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit_work(&store, "lf-seed");
+    let adapter = Faulting {
+        inner: &store,
+        fault: Cell::new(true),
+    };
+    let mut session = TuiSession::new(&adapter, config(), actor());
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    let key = session.staged().unwrap().idempotency_key.clone();
+
+    let err = session.submit(NOW).unwrap_err();
+    assert!(err.contains("simulated disk full"), "{err}");
+    // No unknown-result guard, and the request was not dropped: it is
+    // still staged under the identical key and payload.
+    assert!(session.pending().is_none(), "a local fault armed unknown");
+    assert_eq!(session.staged().unwrap().idempotency_key, key);
+    assert!(
+        stored_decision(&store, &key).is_none(),
+        "the rolled-back attempt persisted a decision"
+    );
+
+    // The fault clears: the same staged request submits and is decided
+    // once, under the key it always carried.
+    adapter.fault.set(false);
+    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
+        panic!("expected decided")
+    };
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    assert!(session.staged().is_none());
+    assert_eq!(
+        stored_decision(&store, &key).unwrap().command_id(),
+        d.command_id()
+    );
+}
+
 /// AC: disconnecting the TUI changes no execution truth — refresh,
 /// open, stage, and preview all leave the store byte-identical, and a
 /// fresh session sees the same truth the CLI does.

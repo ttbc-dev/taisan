@@ -355,8 +355,12 @@ impl<'a, S: Store> TuiSession<'a, S> {
 
     /// Submit the staged request through `work::handle_command`. A stale
     /// rejection re-queries the Work and clears the choices tied to the
-    /// old head. An error leaves the request pending — its result is
-    /// unknown, never assumed.
+    /// old head. A local store fault returns `Err`: `transact` rolled the
+    /// attempt back, so no decision was recorded, and the request stays
+    /// staged with its identical key and payload for a retry — it is not
+    /// armed as an unknown result the operator must `recover`. A genuinely
+    /// lost response is recorded by `note_lost`, never inferred from a
+    /// fault the store reported.
     pub fn submit(&mut self, now_unix_seconds: i64) -> Result<SubmitOutcome, String> {
         if self.pending.is_some() {
             return Err("a submitted request's result is still unknown — run recover first".into());
@@ -369,13 +373,10 @@ impl<'a, S: Store> TuiSession<'a, S> {
                 self.on_decision(&decision, now_unix_seconds);
                 Ok(SubmitOutcome::Decided(decision))
             }
-            Err(_) => {
-                // No decision from the caller's point of view: render it
-                // unknown and keep the identical request for recovery.
-                self.staged = None;
-                self.pending = Some(req);
-                Ok(SubmitOutcome::Unknown)
-            }
+            Err(e) => Err(format!(
+                "submit reached no decision: {e} — the request is still staged; \
+                 submitting again reissues the identical key and payload"
+            )),
         }
     }
 
