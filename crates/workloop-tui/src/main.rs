@@ -45,8 +45,9 @@ fn usage() -> &'static str {
   preview            advisory preflight of the armed request (work::preview)
   submit             submit the armed request (work::handle_command)
   pending            show the request whose result is unknown
-  recover [cmd_id]   settle a pending request: command_result by id or replay
-                     key, else an identical-key replay — never a mutated request
+  recover [cmd_id]   settle a pending request: query command_result by its
+                     replay key (a given cmd_id must match); with no cmd_id,
+                     replay the identical key and payload if nothing landed
   detail | board     reprint the open work or the board
   quit               exit — disconnecting changes no execution truth"
 }

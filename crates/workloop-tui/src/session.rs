@@ -427,7 +427,10 @@ impl<'a, S: Store> TuiSession<'a, S> {
     /// it is proven to be the pending request's own decision: the
     /// replay-key lookup must return the same command id. Naming an
     /// unrelated command never releases the unknown-result guard, and
-    /// the pending request is never mutated.
+    /// the pending request is never mutated. This path never replays: a
+    /// replay would produce a different command id, so a pending request
+    /// with no recorded decision is settled by `recover` (identical key
+    /// and payload) instead.
     pub fn recover_by_id(
         &mut self,
         command_id: &CommandId,
