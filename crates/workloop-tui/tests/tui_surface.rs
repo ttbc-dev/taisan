@@ -925,6 +925,75 @@ fn concurrent_first_writers_share_one_actor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Starting a new judgment drops any armed request — the previously
+/// staged Command belongs to the old draft and must never submit under
+/// the new one's display.
+#[test]
+fn new_judgment_clears_staged_request() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "nj-seed");
+    observe(&store, &work_id, pr_head("h1"), NOW);
+    observe(&store, &work_id, pr_review("h1"), NOW);
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.begin_judgment().unwrap();
+    let finding = session.draft().unwrap().findings[0].finding_id.clone();
+    session.choose(&finding, FindingChoice::Fix).unwrap();
+    session.stage_judgment().unwrap();
+    assert!(session.staged().is_some());
+    // A fresh `judge` discards the armed request tied to the old draft.
+    session.begin_judgment().unwrap();
+    assert!(
+        session.staged().is_none(),
+        "the stale armed request survived a new judgment"
+    );
+    assert!(session.preview(NOW).is_err(), "nothing to preview anymore");
+}
+
+/// An empty finding list under an un-read review source is not "no
+/// findings": the console names the unavailable source instead.
+#[test]
+fn empty_findings_under_unread_source_is_not_clean() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "us-seed");
+    // A head is observed but no review ever arrived — github:review is
+    // Unknown, so empty findings prove nothing.
+    observe(&store, &work_id, pr_head("h1"), NOW);
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    let err = session.begin_judgment().unwrap_err();
+    assert!(
+        err.contains("review source"),
+        "expected the unavailable-source error, got: {err}"
+    );
+    // The detail render surfaces the un-read source too.
+    let frame = workloop_tui::render::sources_frame(session.detail_sources());
+    assert!(frame.contains("github:review"), "{frame}");
+}
+
+/// A config file observed mid-write (empty) is not authoritative: it
+/// is reclaimed and a fresh stable identity is created. A malformed
+/// nonempty file still errors.
+#[test]
+fn install_recovers_partial_and_errors_malformed() {
+    let dir = root("install-partial");
+    let path = dir.join("config.json");
+
+    // The crashed first write left an empty file — reclaimed, not fatal.
+    std::fs::write(&path, "").unwrap();
+    let created = load_or_create(&path).unwrap();
+    let reread = load_or_create(&path).unwrap();
+    assert_eq!(created.actor_id, reread.actor_id);
+
+    // Malformed nonempty content errors rather than being overwritten.
+    std::fs::write(&path, "{ not json").unwrap();
+    assert!(load_or_create(&path).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// INV-007: store faults surface as errors — a db path that cannot be
 /// opened fails the process with a message, never a silent rejection.
 #[test]

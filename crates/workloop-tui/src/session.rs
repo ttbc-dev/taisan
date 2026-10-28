@@ -9,7 +9,9 @@ use workloop_core::command::{
     CommandBody, CommandDecision, CommandId, CommandRequest, FindingChoice, RejectionCode,
 };
 use workloop_core::domain::{Actor, ExecutionId, Origin, WorkId};
-use workloop_core::projection::{self, CommandResultLookup, QueryResult, WorkDetailView};
+use workloop_core::projection::{
+    self, Availability, CommandResultLookup, QueryResult, SourceStatus, WorkDetailView,
+};
 use workloop_core::store::Store;
 use workloop_core::work::{ActionPreview, WorkloopConfig, handle_command, preview};
 use workloop_store::sqlite::SqliteStore;
@@ -61,6 +63,10 @@ pub struct TuiSession<'a> {
     board: Option<Board>,
     /// The open Work's last `work_detail` result.
     detail: Option<WorkDetailView>,
+    /// The `sources` the open detail arrived with — an empty finding
+    /// list under a not-known review source proves nothing, and the
+    /// session must say so rather than reporting "no findings".
+    detail_sources: Vec<SourceStatus>,
     /// The in-progress judgment over the displayed findings.
     draft: Option<JudgmentDraft>,
     /// The request the operator armed for preview/submit.
@@ -79,6 +85,7 @@ impl<'a> TuiSession<'a> {
             actor,
             board: None,
             detail: None,
+            detail_sources: vec![],
             draft: None,
             staged: None,
             pending: None,
@@ -98,6 +105,11 @@ impl<'a> TuiSession<'a> {
 
     pub fn detail(&self) -> Option<&WorkDetailView> {
         self.detail.as_ref()
+    }
+
+    /// Source availability reported with the open detail snapshot.
+    pub fn detail_sources(&self) -> &[SourceStatus] {
+        &self.detail_sources
     }
 
     pub fn draft(&self) -> Option<&JudgmentDraft> {
@@ -163,12 +175,12 @@ impl<'a> TuiSession<'a> {
     /// previous draft; an unchanged re-open keeps choices the operator
     /// already made only when the version and head still match.
     pub fn open(&mut self, work_id: &WorkId, now_unix_seconds: i64) -> Result<(), String> {
-        let detail = match self
+        let (detail, sources) = match self
             .store
             .transact(|tx| projection::work_detail(tx, work_id, now_unix_seconds))
             .map_err(|e| e.to_string())?
         {
-            QueryResult::Found { value, .. } => value,
+            QueryResult::Found { value, sources, .. } => (value, sources),
             other => return Err(format!("work_detail {work_id:?}: {other:?}")),
         };
         let same = self.draft.as_ref().is_some_and(|d| {
@@ -190,15 +202,32 @@ impl<'a> TuiSession<'a> {
             self.staged = None;
         }
         self.detail = Some(detail);
+        self.detail_sources = sources;
         Ok(())
     }
 
     /// Begin the judgment draft over the findings the projection scoped
-    /// to the open Work's current head.
+    /// to the open Work's current head. Starting a new draft drops any
+    /// armed request — a previously staged Command belongs to the old
+    /// draft, never the fresh one. When the detail reports no findings
+    /// but the review source was not actually read, the failure names
+    /// the unavailable source instead of claiming review was clean.
     pub fn begin_judgment(&mut self) -> Result<&JudgmentDraft, String> {
         let detail = self.detail.as_ref().ok_or("open a work first")?;
-        let draft = JudgmentDraft::from_detail(detail)
-            .ok_or("no head-scoped findings to judge on the open work")?;
+        let Some(draft) = JudgmentDraft::from_detail(detail) else {
+            let review_unread = self
+                .detail_sources
+                .iter()
+                .any(|s| s.source == "github:review" && s.availability != Availability::Known);
+            if detail.findings.is_empty()
+                && detail.current_pr.as_ref().is_some_and(|(_, h)| h.is_some())
+                && review_unread
+            {
+                return Err("review source not read — an empty finding list proves nothing".into());
+            }
+            return Err("no head-scoped findings to judge on the open work".into());
+        };
+        self.staged = None;
         self.draft = Some(draft);
         Ok(self.draft.as_ref().expect("just set"))
     }

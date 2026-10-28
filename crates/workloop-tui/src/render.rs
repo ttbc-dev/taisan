@@ -4,7 +4,7 @@
 
 use workloop_core::command::{CommandDecision, PrHeadSha};
 use workloop_core::domain::WorkId;
-use workloop_core::projection::{WorkDetailView, WorkPhase};
+use workloop_core::projection::{Availability, SourceStatus, WorkDetailView, WorkPhase};
 use workloop_core::work::ActionPreview;
 
 use crate::board::Board;
@@ -137,6 +137,23 @@ pub fn detail_frame(detail: &WorkDetailView) -> String {
             o.state,
             o.detail.clone().unwrap_or_default()
         ));
+    }
+    out
+}
+
+/// Source availability carried with a detail snapshot — rendered so an
+/// un-read source is visible rather than mistaken for a clean result.
+pub fn sources_frame(sources: &[SourceStatus]) -> String {
+    let mut out = String::new();
+    for s in sources {
+        let availability = match s.availability {
+            Availability::Known => "known",
+            Availability::Unknown => "unknown",
+            Availability::Unavailable => "unavailable",
+        };
+        if s.availability != Availability::Known {
+            out.push_str(&format!("  source {}: {availability}\n", s.source));
+        }
     }
     out
 }

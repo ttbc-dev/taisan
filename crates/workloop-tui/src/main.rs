@@ -130,10 +130,12 @@ fn dispatch(
                 "{}",
                 render::detail_frame(session.detail().expect("opened"))
             );
+            print!("{}", render::sources_frame(session.detail_sources()));
         }
         "detail" | "d" => {
             let detail = session.detail().ok_or("open a work first")?;
             println!("{}", render::detail_frame(detail));
+            print!("{}", render::sources_frame(session.detail_sources()));
         }
         "judge" => {
             let draft = session.begin_judgment()?;
