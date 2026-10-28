@@ -123,12 +123,29 @@ fn work_detail_binds_findings_to_the_current_head() {
             head_sha: "sha-old".into(),
             reviewer: "stale-rev".into(),
             verdict: ReviewVerdict::ChangesRequested,
+            findings: vec![],
         },
         ObservationFact::PrReview {
             repository: "local/repo".into(),
             head_sha: "sha-new".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::ChangesRequested,
+            findings: vec![
+                FindingRef {
+                    finding_id: "f-1".into(),
+                    reviewed_revision: "sha-new".into(),
+                    summary: "first finding at sha-new".into(),
+                    location: None,
+                    evidence: vec![],
+                },
+                FindingRef {
+                    finding_id: "f-2".into(),
+                    reviewed_revision: "sha-new".into(),
+                    summary: "second finding at sha-new".into(),
+                    location: None,
+                    evidence: vec![],
+                },
+            ],
         },
     ] {
         workloop_core::work::handle_observation(&store, &config(), &obs(fact), NOW).unwrap();
@@ -141,9 +158,11 @@ fn work_detail_binds_findings_to_the_current_head() {
     let (pr_ref, head) = value.current_pr.as_ref().unwrap();
     assert_eq!(pr_ref.number, 7);
     assert_eq!(head.as_deref(), Some("sha-new"));
-    // Only the current-head finding is actionable.
-    assert_eq!(value.findings.len(), 1);
-    assert!(value.findings[0].contains("sha-new"));
+    // Only the current-head findings are actionable.
+    assert_eq!(value.findings.len(), 2);
+    assert_eq!(value.findings[0].finding_id, "f-1");
+    assert_eq!(value.findings[0].reviewed_revision, "sha-new");
+    assert_eq!(value.findings[1].finding_id, "f-2");
     // The review source was read for this head → known.
     assert!(
         sources
@@ -177,6 +196,7 @@ fn delayed_head_observation_does_not_change_detail_head_or_findings() {
                     head_sha: "sha-current".into(),
                     reviewer: "current-reviewer".into(),
                     verdict: ReviewVerdict::ChangesRequested,
+                    findings: vec![],
                 },
             ),
             (
@@ -194,6 +214,7 @@ fn delayed_head_observation_does_not_change_detail_head_or_findings() {
                     head_sha: "sha-delayed".into(),
                     reviewer: "stale-reviewer".into(),
                     verdict: ReviewVerdict::Approve,
+                    findings: vec![],
                 },
             ),
         ] {
@@ -219,9 +240,14 @@ fn delayed_head_observation_does_not_change_detail_head_or_findings() {
         let (pr, head) = view.current_pr.unwrap();
         assert_eq!(head.as_deref(), Some("sha-current"));
         assert_eq!(pr.number, 7);
+        // A verdict-only review yields one synthesized judgeable finding.
+        assert_eq!(view.findings.len(), 1);
+        let finding = &view.findings[0];
+        assert_eq!(finding.finding_id, "verdict:current-reviewer:sha-current");
+        assert_eq!(finding.reviewed_revision, "sha-current");
         assert_eq!(
-            view.findings,
-            vec!["review by current-reviewer at sha-current: ChangesRequested"]
+            finding.summary,
+            "review by current-reviewer at sha-current: ChangesRequested"
         );
     }
 }

@@ -345,6 +345,7 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
             head_sha: "old".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::Approve,
+            findings: vec![],
         }),
         NOW,
     )
@@ -372,6 +373,7 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
             head_sha: "new".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::Approve,
+            findings: vec![],
         }),
         NOW,
     )
@@ -643,12 +645,14 @@ fn superseded_head_evidence_does_not_complete_the_work() {
         head_sha: "sha-1".into(),
         reviewer: "rev".into(),
         verdict: ReviewVerdict::Approve,
+        findings: vec![],
     });
     emit(ObservationFact::PrReview {
         repository: "local/repo".into(),
         head_sha: "sha-1".into(),
         reviewer: "rev".into(),
         verdict: ReviewVerdict::ChangesRequested,
+        findings: vec![],
     });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(
@@ -668,6 +672,7 @@ fn superseded_head_evidence_does_not_complete_the_work() {
         head_sha: "sha-1".into(),
         reviewer: "rev".into(),
         verdict: ReviewVerdict::Approve,
+        findings: vec![],
     });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Succeeded);
@@ -765,6 +770,7 @@ fn delayed_check_success_cannot_complete_the_work() {
             head_sha: "sha-1".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::Approve,
+            findings: vec![],
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
@@ -839,6 +845,7 @@ fn delayed_review_approval_cannot_complete_the_work() {
             head_sha: "sha-1".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::ChangesRequested,
+            findings: vec![],
         },
     );
     emit(
@@ -860,6 +867,7 @@ fn delayed_review_approval_cannot_complete_the_work() {
             head_sha: "sha-1".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::Approve,
+            findings: vec![],
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
@@ -877,6 +885,7 @@ fn delayed_review_approval_cannot_complete_the_work() {
             head_sha: "sha-1".into(),
             reviewer: "rev".into(),
             verdict: ReviewVerdict::Approve,
+            findings: vec![],
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();

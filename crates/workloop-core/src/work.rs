@@ -4,8 +4,8 @@
 //! versions, budgets, and gates.
 
 use crate::command::{
-    CommandBody, CommandDecision, CommandEffect, CommandId, CommandRequest, FindingChoice,
-    RejectionCode, WorkVersion, payload_digest,
+    ActionPreview, CommandBody, CommandDecision, CommandEffect, CommandId, CommandRequest,
+    FindingChoice, PreviewAvailability, RejectionCode, WorkVersion, payload_digest,
 };
 use crate::domain::*;
 use crate::observation::{
@@ -112,6 +112,87 @@ fn apply_all(tx: &mut dyn TxView, effects: &[Effect]) -> Result<(), StoreError> 
         tx.apply(e)?;
     }
     Ok(())
+}
+
+/// Read-only preflight: `preview` evaluates the Command's preconditions
+/// against the saved facts inside a savepoint that is always rolled
+/// back, so it reserves neither capacity nor execution ownership and
+/// never substitutes for the Command-time precondition check. A replayed
+/// key reports the recorded decision, mirroring what `submit` returns.
+pub fn preview(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    req: &CommandRequest,
+    now_unix_seconds: i64,
+) -> Result<ActionPreview, StoreError> {
+    let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);
+    store.transact(|tx| {
+        let observed_work_version = req
+            .body
+            .work_id()
+            .and_then(|w| tx.work(w).ok().flatten())
+            .map(|w| w.version);
+        let observed_pr_head = match &req.body {
+            CommandBody::JudgeFindings { work_id, .. }
+            | CommandBody::ReleaseJudgment { work_id, .. } => tx.latest_pr_head(work_id)?,
+            _ => None,
+        };
+        if let Some((stored_digest, decision)) =
+            tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)?
+        {
+            let (availability, reasons, evidence) = if stored_digest == digest {
+                match &decision {
+                    CommandDecision::Accepted { .. } => {
+                        (PreviewAvailability::Available, vec![], vec![])
+                    }
+                    CommandDecision::Rejected {
+                        reason, evidence, ..
+                    } => (
+                        PreviewAvailability::Blocked,
+                        vec![reason.clone()],
+                        evidence.clone(),
+                    ),
+                }
+            } else {
+                (
+                    PreviewAvailability::Blocked,
+                    vec![RejectionCode::IdempotencyConflict],
+                    vec!["same idempotency key with a different payload".into()],
+                )
+            };
+            return Ok(ActionPreview {
+                availability,
+                observed_work_version,
+                observed_pr_head,
+                reasons,
+                evidence,
+            });
+        }
+        tx.begin_attempt()?;
+        let verdict = decide(tx, config, req, now_unix_seconds);
+        // The savepoint always rolls back: allocated ids, sequence rows,
+        // and any partial effect from the decision pass leave no trace.
+        tx.revert_attempt()?;
+        let (availability, reasons, evidence) = match verdict {
+            Ok((CommandDecision::Accepted { .. }, _)) => {
+                (PreviewAvailability::Available, vec![], vec![])
+            }
+            Ok((
+                CommandDecision::Rejected {
+                    reason, evidence, ..
+                },
+                _,
+            )) => (PreviewAvailability::Blocked, vec![reason], evidence),
+            Err(e) => (PreviewAvailability::Unknown, vec![], vec![e.to_string()]),
+        };
+        Ok(ActionPreview {
+            availability,
+            observed_work_version,
+            observed_pr_head,
+            reasons,
+            evidence,
+        })
+    })
 }
 
 /// Decide whether a store conflict is retryable (re-read and re-decide) or
@@ -1030,7 +1111,7 @@ fn decide_judge(
     }
     let mut seen = std::collections::BTreeSet::new();
     for d in decisions {
-        if !seen.insert(&d.finding_id) {
+        if !seen.insert(d.finding_id.as_str()) {
             return Ok((
                 rejected_now(
                     tx,
@@ -1058,6 +1139,49 @@ fn decide_judge(
                 vec![],
             ));
         }
+    }
+    // The Command must decide on exactly the finding set scoped to the
+    // expected head — the same derivation the projection displays, so a
+    // missing or unknown finding ID is rejected rather than silently
+    // recorded (docs/module-contracts.md "TUI review judgment").
+    let observations = tx.observations_for_work(work_id)?;
+    let judgeable = crate::projection::judgeable_findings(&observations, expected_pr_head);
+    let judgeable_ids: std::collections::BTreeSet<&str> =
+        judgeable.iter().map(|f| f.finding_id.as_str()).collect();
+    for d in decisions {
+        if !judgeable_ids.contains(d.finding_id.as_str()) {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!(
+                        "unknown finding_id {} for head {expected_pr_head}",
+                        d.finding_id
+                    )],
+                ),
+                vec![],
+            ));
+        }
+    }
+    let missing: Vec<&str> = judgeable_ids
+        .iter()
+        .filter(|id| !seen.contains(*id))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::InvalidRequest,
+                Some(work_id.clone()),
+                vec![format!(
+                    "judge_findings is missing decisions for finding IDs: {}",
+                    missing.join(", ")
+                )],
+            ),
+            vec![],
+        ));
     }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);

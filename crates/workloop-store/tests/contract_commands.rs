@@ -3,7 +3,7 @@
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::observation::{
-    CheckConclusion, Observation, ObservationFact, Outcome, ReviewVerdict,
+    CheckConclusion, FindingRef, Observation, ObservationFact, Outcome, ReviewVerdict,
 };
 use workloop_core::store::{Effect, PrAction, PrActionIntent, PrActionStatus, Store};
 use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command};
@@ -148,6 +148,38 @@ fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i
                     head_sha: sha.into(),
                 },
                 observed_unix_seconds: observed_at,
+            },
+        }],
+    );
+}
+
+/// Record a review Observation carrying `finding_ids` against `sha` — the
+/// persisted evidence that makes those IDs judgeable for the head.
+fn seed_pr_review(store: &SqliteStore, work_id: &WorkId, sha: &str, finding_ids: &[&str]) {
+    apply_effects(
+        store,
+        &[Effect::InsertObservation {
+            observation: Observation {
+                source_event_id: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::PrReview {
+                    repository: "local/repo".into(),
+                    head_sha: sha.into(),
+                    reviewer: "rev".into(),
+                    verdict: ReviewVerdict::ChangesRequested,
+                    findings: finding_ids
+                        .iter()
+                        .map(|id| FindingRef {
+                            finding_id: (*id).into(),
+                            reviewed_revision: sha.into(),
+                            summary: format!("finding {id}"),
+                            location: None,
+                            evidence: vec![],
+                        })
+                        .collect(),
+                },
+                observed_unix_seconds: NOW,
             },
         }],
     );
@@ -683,8 +715,10 @@ fn release_judgment_requires_a_matching_recorded_judgment() {
     let d = handle_command(&store, &config(), &req("j2", release("h1", 1)), NOW).unwrap();
     assert_eq!(reject_reason(&d), RejectionCode::Ineligible);
 
-    // The adapter must record the head before a judgment may bind to it.
+    // The adapter must record the head before a judgment may bind to it,
+    // and the finding IDs must come from a review recorded for that head.
     seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
     accepted(
         &handle_command(
             &store,
@@ -1081,6 +1115,7 @@ fn judge_findings_replays_the_same_decision() {
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("jf1"), NOW).unwrap());
     seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
     let decisions = vec![FindingDecision {
         finding_id: "f1".into(),
         choice: FindingChoice::Fix,
@@ -1122,6 +1157,7 @@ fn release_judgment_replays_the_same_decision() {
         accepted_with_execution(&handle_command(&store, &config(), &submit("rj1"), NOW).unwrap());
     force_state(&store, &e1, ExecutionState::Paused);
     seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
     accepted(
         &handle_command(
             &store,
@@ -1441,6 +1477,7 @@ fn judge_accepts_the_observed_head() {
     // The adapter recorded the head against the Execution; the provenance
     // read must resolve it through the Work either way.
     seed_pr_head_for_execution(&store, &e1, "h1");
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
 
     let d = handle_command(&store, &config(), &judge_req("jc2", &work_id, 1, "h1"), NOW).unwrap();
     accepted(&d);
@@ -1462,6 +1499,7 @@ fn release_rejects_head_changed_after_judgment() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("hc1"), NOW).unwrap());
     seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
     accepted(
         &handle_command(&store, &config(), &judge_req("hc2", &work_id, 1, "h1"), NOW).unwrap(),
     );
@@ -1509,6 +1547,7 @@ fn stale_head_observation_cannot_move_head_backward() {
     // A delayed delivery for the older head arrives after the newer one.
     seed_pr_head(&store, &work_id, "h2", NOW + 10);
     seed_pr_head(&store, &work_id, "h1", NOW + 5);
+    seed_pr_review(&store, &work_id, "h2", &["f1"]);
 
     let d = handle_command(
         &store,
@@ -1726,6 +1765,7 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("ah1"), NOW).unwrap());
     seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
 
     // Human-gate cycle: pause, judge on h1, release — E1 requeues under the
     // judgment bound to h1.
@@ -1753,6 +1793,7 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
 
     // The PR head moves while E1 waits in the queue.
     seed_pr_head(&store, &work_id, "h2", NOW + 10);
+    seed_pr_review(&store, &work_id, "h2", &["f1"]);
 
     // Dispatch must not authorize a worker on the stale h1 judgment.
     store
@@ -2116,6 +2157,7 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
             &handle_command(&store, &config(), &submit("mx-judge-seed"), NOW).unwrap(),
         );
         seed_pr_head(&store, &work_id, "h1", NOW);
+        seed_pr_review(&store, &work_id, "h1", &["f1"]);
         let (original, mutant) = pair(req(
             "mx-judge",
             CommandBody::JudgeFindings {
@@ -2137,6 +2179,7 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
         );
         force_state(&store, &e1, ExecutionState::Paused);
         seed_pr_head(&store, &work_id, "h1", NOW);
+        seed_pr_review(&store, &work_id, "h1", &["f1"]);
         accepted(
             &handle_command(
                 &store,
@@ -2379,6 +2422,7 @@ fn judgments_bind_to_the_recorded_head() {
         RejectionCode::SourceUnavailable
     );
     emit_head("sha-x");
+    seed_pr_review(&store, &work_id, "sha-x", &["f1"]);
     // A judgment for a different head than the recorded one is stale.
     assert_eq!(
         reject_reason(&judge("j3", "sha-old", 1)),
@@ -2389,6 +2433,7 @@ fn judgments_bind_to_the_recorded_head() {
     force_state(&store, &e1, ExecutionState::Paused);
     // The head moved under the recorded judgment: releasing it is stale.
     emit_head("sha-y");
+    seed_pr_review(&store, &work_id, "sha-y", &["f1"]);
     assert_eq!(
         reject_reason(&release("j5", "sha-x", 2)),
         RejectionCode::StalePrHead
@@ -2725,6 +2770,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         head_sha: "sha-1".into(),
         reviewer: "rev".into(),
         verdict: ReviewVerdict::Approve,
+        findings: vec![],
     });
     let e = read_execution(&store, &e1);
     assert_eq!(
@@ -2748,6 +2794,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         head_sha: "sha-1".into(),
         reviewer: "rev2".into(),
         verdict: ReviewVerdict::Approve,
+        findings: vec![],
     });
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
 }
@@ -2830,6 +2877,7 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                 head_sha: "head".into(),
                 reviewer: "reviewer".into(),
                 verdict: ReviewVerdict::Approve,
+                findings: vec![],
             },
         ] {
             workloop_core::work::handle_observation(
@@ -2917,4 +2965,133 @@ fn dispatch_state_conflict_defers_only_the_conflicted_execution() {
     drop(connection);
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+// ---- `work.preview` — advisory preflight over the same decide path ----
+
+#[test]
+fn preview_applies_no_durable_effects() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pv1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1"]);
+
+    let seq_before = store.transact(|tx| tx.last_seq()).unwrap();
+    let preview = workloop_core::work::preview(
+        &store,
+        &config(),
+        &judge_req("pv-ok", &work_id, 1, "h1"),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(preview.availability, PreviewAvailability::Available);
+    assert_eq!(preview.observed_work_version, Some(1));
+    assert_eq!(preview.observed_pr_head.as_deref(), Some("h1"));
+    assert_eq!(
+        store.transact(|tx| tx.last_seq()).unwrap(),
+        seq_before,
+        "a preview allocates no sequence"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.stored_decision(&Origin("cli".into()), &actor(), "pv-ok"))
+            .unwrap()
+            .is_none(),
+        "a preview persists no command decision"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.work(&work_id))
+            .unwrap()
+            .unwrap()
+            .version,
+        1,
+        "a preview applies no effects"
+    );
+
+    // A preview reports what submit would reject…
+    let blocked = workloop_core::work::preview(
+        &store,
+        &config(),
+        &judge_req("pv-stale", &work_id, 1, "h9"),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(blocked.availability, PreviewAvailability::Blocked);
+    assert_eq!(blocked.reasons, vec![RejectionCode::StalePrHead]);
+
+    // …and the real submit still rechecks preconditions at Command time.
+    accepted(
+        &handle_command(&store, &config(), &judge_req("pv2", &work_id, 1, "h1"), NOW).unwrap(),
+    );
+}
+
+#[test]
+fn judge_findings_rejects_incomplete_or_unknown_finding_sets() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("jf1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_pr_review(&store, &work_id, "h1", &["f1", "f2"]);
+    let judge = |key: &str, decisions: Vec<FindingDecision>| {
+        handle_command(
+            &store,
+            &config(),
+            &req(
+                key,
+                CommandBody::JudgeFindings {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    expected_pr_head: "h1".into(),
+                    decisions,
+                },
+            ),
+            NOW,
+        )
+        .unwrap()
+    };
+    let decision = |id: &str| FindingDecision {
+        finding_id: id.into(),
+        choice: FindingChoice::Accept,
+    };
+
+    // A missing decision for a displayed finding is rejected.
+    assert_eq!(
+        reject_reason(&judge("jf-missing", vec![decision("f1")])),
+        RejectionCode::InvalidRequest
+    );
+    // An unknown finding ID for this head is rejected.
+    assert_eq!(
+        reject_reason(&judge(
+            "jf-unknown",
+            vec![decision("f1"), decision("f2"), decision("f9")]
+        )),
+        RejectionCode::InvalidRequest
+    );
+    // A duplicated finding ID is rejected.
+    assert_eq!(
+        reject_reason(&judge(
+            "jf-dup",
+            vec![decision("f1"), decision("f1"), decision("f2")]
+        )),
+        RejectionCode::InvalidRequest
+    );
+    // No version bump and no judgment row from any of them.
+    assert_eq!(
+        store
+            .transact(|tx| tx.work(&work_id))
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+    assert!(
+        store
+            .transact(|tx| tx.latest_judgment(&work_id))
+            .unwrap()
+            .is_none()
+    );
+    // Exactly one decision per displayed finding ID is accepted.
+    accepted(&judge("jf-ok", vec![decision("f1"), decision("f2")]));
 }

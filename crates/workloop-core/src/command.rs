@@ -188,6 +188,36 @@ impl CommandDecision {
     }
 }
 
+/// Advisory preflight outcome. `work.preview` reads saved facts only and
+/// reserves neither capacity nor execution ownership; `submit` always
+/// rechecks preconditions at acceptance time, so `Available` is a hint,
+/// never a guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewAvailability {
+    /// The saved facts would admit the Command as decided now.
+    Available,
+    /// The Command would be rejected on the saved facts; `reasons` names
+    /// why.
+    Blocked,
+    /// The preflight itself could not be completed.
+    Unknown,
+}
+
+/// What `work.preview(CommandRequest)` returns — preflight only, no
+/// durable effect and no reserved state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionPreview {
+    pub availability: PreviewAvailability,
+    /// The Work version currently stored, for existing-Work Commands.
+    pub observed_work_version: Option<WorkVersion>,
+    /// The PR head currently observed, for head-bound Commands.
+    pub observed_pr_head: Option<PrHeadSha>,
+    /// The rejection codes a `submit` would produce on the saved facts.
+    pub reasons: Vec<RejectionCode>,
+    pub evidence: Vec<String>,
+}
+
 /// Digest of the canonical command payload, stored with the decision so a
 /// key replay with a changed body is `idempotency_conflict`. FNV-1a over a
 /// deterministic serialization — change detection only, not a secret.

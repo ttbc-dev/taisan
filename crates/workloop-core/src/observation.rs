@@ -50,6 +50,11 @@ pub enum ObservationFact {
         head_sha: String,
         reviewer: String,
         verdict: ReviewVerdict,
+        /// Itemized review findings. Empty for verdict-only reviews, which
+        /// the projection renders as one synthesized finding so the
+        /// judgment surface and its validation share one derivation.
+        #[serde(default)]
+        findings: Vec<FindingRef>,
     },
     PrActionResult {
         action_id: String,
@@ -93,6 +98,26 @@ pub enum ReviewVerdict {
     Approve,
     ChangesRequested,
     Comment,
+}
+
+/// A review finding bound to the revision it was reported against — the
+/// unit a `judge_findings` Command decides on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingRef {
+    pub finding_id: String,
+    /// The revision (PR head) this finding was reported for. Findings for
+    /// earlier revisions stay in evidence history and are not judgeable.
+    pub reviewed_revision: String,
+    pub summary: String,
+    pub location: Option<FindingLocation>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingLocation {
+    pub path: String,
+    pub line: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

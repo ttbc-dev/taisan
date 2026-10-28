@@ -164,6 +164,7 @@ fn completion_is_independent_of_delivery_order_and_subject_scope() {
                             head_sha: "head".into(),
                             reviewer: "reviewer".into(),
                             verdict: ReviewVerdict::Approve,
+                            findings: vec![],
                         },
                         ObservationFact::PrActionResult {
                             action_id: "publish".into(),

@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
-use crate::observation::{ArtifactFact, ObservationFact, Outcome, ProcessStateFact};
+use crate::observation::{
+    ArtifactFact, FindingRef, Observation, ObservationFact, Outcome, ProcessStateFact,
+};
 use crate::store::{Deferral, PrActionStatus, ReadView, StoreError};
 
 /// Whether a source's evidence could actually be read. An unavailable or
@@ -97,7 +99,9 @@ pub struct WorkDetailView {
     pub executions: Vec<ExecutionView>,
     pub current_pr: Option<(PrRef, Option<String>)>,
     /// Findings bound to the current head; older revisions stay in evidence.
-    pub findings: Vec<String>,
+    /// This is the exact set a `judge_findings` Command must decide on —
+    /// the same derivation `work` validates against.
+    pub findings: Vec<FindingRef>,
     pub outcome: Option<Outcome>,
     pub attention: Vec<AttentionView>,
     pub evidence: Vec<String>,
@@ -387,23 +391,19 @@ pub fn work_detail(
         })
         .max_by_key(|(order, _)| *order)
         .map(|(_, pr)| pr);
-    let mut findings = Vec::new();
+    let findings = current_pr
+        .as_ref()
+        .and_then(|(_, head)| head.as_ref())
+        .map(|head| judgeable_findings(&observations, head))
+        .unwrap_or_default();
     let mut sources = vec![store_source()];
     if let Some((_, Some(head))) = &current_pr {
-        let mut has_review_for_head = false;
-        for obs in &observations {
-            if let ObservationFact::PrReview {
-                head_sha,
-                reviewer,
-                verdict,
-                ..
-            } = &obs.fact
-                && head_sha == head
-            {
-                has_review_for_head = true;
-                findings.push(format!("review by {reviewer} at {head_sha}: {verdict:?}"));
-            }
-        }
+        let has_review_for_head = observations.iter().any(|obs| {
+            matches!(
+                &obs.fact,
+                ObservationFact::PrReview { head_sha, .. } if head_sha == head
+            )
+        });
         sources.push(SourceStatus {
             source: "github:review".into(),
             availability: if has_review_for_head {
@@ -448,6 +448,55 @@ pub fn work_detail(
         as_of: tx.last_seq()?,
         sources,
     })
+}
+
+/// The findings a `judge_findings` Command may decide on for `head_sha`:
+/// the union of itemized findings from every review recorded against that
+/// head. A verdict-only review contributes one synthesized finding keyed
+/// by reviewer and head, so the displayed set and the set `work`
+/// validates are always the same derivation. Findings for other
+/// revisions stay in evidence history and never appear here.
+pub fn judgeable_findings(observations: &[Observation], head_sha: &str) -> Vec<FindingRef> {
+    let mut findings = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut push = |finding: FindingRef| {
+        if seen.insert(finding.finding_id.clone()) {
+            findings.push(finding);
+        }
+    };
+    for obs in observations {
+        let ObservationFact::PrReview {
+            head_sha: observed_head,
+            reviewer,
+            verdict,
+            findings: itemized,
+            ..
+        } = &obs.fact
+        else {
+            continue;
+        };
+        if observed_head != head_sha {
+            continue;
+        }
+        if itemized.is_empty() {
+            push(FindingRef {
+                finding_id: format!("verdict:{reviewer}:{observed_head}"),
+                reviewed_revision: observed_head.clone(),
+                summary: format!("review by {reviewer} at {observed_head}: {verdict:?}"),
+                location: None,
+                evidence: vec![],
+            });
+        } else {
+            for finding in itemized {
+                let mut finding = finding.clone();
+                // The Observation's head is authoritative for the revision
+                // this finding was reported against.
+                finding.reviewed_revision = observed_head.clone();
+                push(finding);
+            }
+        }
+    }
+    findings
 }
 
 pub fn attention(
