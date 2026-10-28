@@ -156,6 +156,37 @@ fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i
 /// Record a review Observation carrying `finding_ids` against `sha` — the
 /// persisted evidence that makes those IDs judgeable for the head.
 fn seed_pr_review(store: &SqliteStore, work_id: &WorkId, sha: &str, finding_ids: &[&str]) {
+    seed_pr_review_with(
+        store,
+        work_id,
+        sha,
+        "rev",
+        ReviewVerdict::ChangesRequested,
+        finding_ids
+            .iter()
+            .map(|id| FindingRef {
+                finding_id: (*id).into(),
+                reviewed_revision: sha.into(),
+                summary: format!("finding {id}"),
+                location: None,
+                evidence: vec![],
+            })
+            .collect(),
+        NOW,
+    );
+}
+
+/// Record a review Observation with explicit reviewer, verdict,
+/// findings, and observation time.
+fn seed_pr_review_with(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    sha: &str,
+    reviewer: &str,
+    verdict: ReviewVerdict,
+    findings: Vec<FindingRef>,
+    observed_at: i64,
+) {
     apply_effects(
         store,
         &[Effect::InsertObservation {
@@ -166,20 +197,11 @@ fn seed_pr_review(store: &SqliteStore, work_id: &WorkId, sha: &str, finding_ids:
                 fact: ObservationFact::PrReview {
                     repository: "local/repo".into(),
                     head_sha: sha.into(),
-                    reviewer: "rev".into(),
-                    verdict: ReviewVerdict::ChangesRequested,
-                    findings: finding_ids
-                        .iter()
-                        .map(|id| FindingRef {
-                            finding_id: (*id).into(),
-                            reviewed_revision: sha.into(),
-                            summary: format!("finding {id}"),
-                            location: None,
-                            evidence: vec![],
-                        })
-                        .collect(),
+                    reviewer: reviewer.into(),
+                    verdict,
+                    findings,
                 },
-                observed_unix_seconds: NOW,
+                observed_unix_seconds: observed_at,
             },
         }],
     );
@@ -3025,6 +3047,19 @@ fn preview_applies_no_durable_effects() {
     accepted(
         &handle_command(&store, &config(), &judge_req("pv2", &work_id, 1, "h1"), NOW).unwrap(),
     );
+
+    // A replayed key reports the recorded decision…
+    let replayed =
+        workloop_core::work::preview(&store, &config(), &judge_req("pv2", &work_id, 1, "h1"), NOW)
+            .unwrap();
+    assert_eq!(replayed.availability, PreviewAvailability::Available);
+
+    // …while the same key with a different payload reports the conflict.
+    let conflicted =
+        workloop_core::work::preview(&store, &config(), &judge_req("pv2", &work_id, 1, "h9"), NOW)
+            .unwrap();
+    assert_eq!(conflicted.availability, PreviewAvailability::Blocked);
+    assert_eq!(conflicted.reasons, vec![RejectionCode::IdempotencyConflict]);
 }
 
 #[test]
@@ -3094,4 +3129,100 @@ fn judge_findings_rejects_incomplete_or_unknown_finding_sets() {
     );
     // Exactly one decision per displayed finding ID is accepted.
     accepted(&judge("jf-ok", vec![decision("f1"), decision("f2")]));
+}
+
+#[test]
+fn judgeable_findings_prefers_the_latest_review_at_a_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("jw1"), NOW).unwrap());
+    seed_pr_head(&store, &work_id, "h1", NOW);
+    // A second review at the same head supersedes the first report of
+    // the same finding ID; findings reported only once stay judgeable.
+    seed_pr_review_with(
+        &store,
+        &work_id,
+        "h1",
+        "rev",
+        ReviewVerdict::ChangesRequested,
+        vec![
+            FindingRef {
+                finding_id: "f1".into(),
+                reviewed_revision: "h1".into(),
+                summary: "first report".into(),
+                location: None,
+                evidence: vec![],
+            },
+            FindingRef {
+                finding_id: "f2".into(),
+                reviewed_revision: "h1".into(),
+                summary: "still open".into(),
+                location: None,
+                evidence: vec![],
+            },
+        ],
+        NOW,
+    );
+    seed_pr_review_with(
+        &store,
+        &work_id,
+        "h1",
+        "rev",
+        ReviewVerdict::ChangesRequested,
+        vec![FindingRef {
+            finding_id: "f1".into(),
+            reviewed_revision: "h1".into(),
+            summary: "superseded report".into(),
+            location: None,
+            evidence: vec![],
+        }],
+        NOW + 10,
+    );
+
+    let workloop_core::projection::QueryResult::Found { value, .. } = store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &work_id, NOW))
+        .unwrap()
+    else {
+        panic!("work_detail must resolve the Work");
+    };
+    let summaries: Vec<(&str, &str)> = value
+        .findings
+        .iter()
+        .map(|f| (f.finding_id.as_str(), f.summary.as_str()))
+        .collect();
+    assert_eq!(
+        summaries,
+        [("f2", "still open"), ("f1", "superseded report")],
+        "the latest review at the head supersedes earlier reports of the same finding"
+    );
+
+    // The same derivation validates the Command: both findings need a
+    // decision, so the judgeable set is {f1, f2} keyed on the latest
+    // report of f1.
+    accepted(
+        &handle_command(
+            &store,
+            &config(),
+            &req(
+                "jw-judge",
+                CommandBody::JudgeFindings {
+                    work_id: work_id.clone(),
+                    expected_work_version: 1,
+                    expected_pr_head: "h1".into(),
+                    decisions: vec![
+                        FindingDecision {
+                            finding_id: "f1".into(),
+                            choice: FindingChoice::Fix,
+                        },
+                        FindingDecision {
+                            finding_id: "f2".into(),
+                            choice: FindingChoice::Dismiss,
+                        },
+                    ],
+                },
+            ),
+            NOW,
+        )
+        .unwrap(),
+    );
 }

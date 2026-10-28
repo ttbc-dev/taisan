@@ -51,34 +51,35 @@ pub trait Contracts {
 
 /// `Contracts` over the SQLite store — the production adapter the binary
 /// composes. It wires the shared contract entry points and nothing else.
+/// `now` is sampled per call: a session may run for hours and the
+/// projections' thresholds (uncertain attention, reservation expiry)
+/// must see real elapsed time, like the CLI sampling `now()` per command.
 pub struct SqliteContracts<'a> {
     pub store: &'a workloop_store::sqlite::SqliteStore,
     pub config: &'a workloop_core::work::WorkloopConfig,
-    pub now_unix_seconds: i64,
+    pub now: fn() -> i64,
 }
 
 impl Contracts for SqliteContracts<'_> {
     fn preview(&mut self, req: &CommandRequest) -> Result<ActionPreview, String> {
-        workloop_core::work::preview(self.store, self.config, req, self.now_unix_seconds)
+        workloop_core::work::preview(self.store, self.config, req, (self.now)())
             .map_err(|e| e.to_string())
     }
 
     fn submit(&mut self, req: &CommandRequest) -> Result<CommandDecision, String> {
-        workloop_core::work::handle_command(self.store, self.config, req, self.now_unix_seconds)
+        workloop_core::work::handle_command(self.store, self.config, req, (self.now)())
             .map_err(|e| e.to_string())
     }
 
     fn work_list(&mut self) -> Result<QueryResult<WorkListView>, String> {
         self.store
-            .transact(|tx| workloop_core::projection::work_list(tx, self.now_unix_seconds))
+            .transact(|tx| workloop_core::projection::work_list(tx, (self.now)()))
             .map_err(|e| e.to_string())
     }
 
     fn work_detail(&mut self, work_id: &WorkId) -> Result<QueryResult<WorkDetailView>, String> {
         self.store
-            .transact(|tx| {
-                workloop_core::projection::work_detail(tx, work_id, self.now_unix_seconds)
-            })
+            .transact(|tx| workloop_core::projection::work_detail(tx, work_id, (self.now)()))
             .map_err(|e| e.to_string())
     }
 
@@ -87,7 +88,7 @@ impl Contracts for SqliteContracts<'_> {
         work_id: Option<&WorkId>,
     ) -> Result<QueryResult<Vec<AttentionView>>, String> {
         self.store
-            .transact(|tx| workloop_core::projection::attention(tx, work_id, self.now_unix_seconds))
+            .transact(|tx| workloop_core::projection::attention(tx, work_id, (self.now)()))
             .map_err(|e| e.to_string())
     }
 
@@ -480,12 +481,18 @@ impl<C: Contracts> Tui<C> {
             }
             _ => {}
         }
-        // While a submit result is unknown, only recovery keys run — a
-        // mutated request is never issued in place of the pending one.
+        // While a submit result is unknown, only read-only navigation
+        // passes through — a mutated request is never issued in place of
+        // the pending one.
         if self.pending.is_some() {
             match key {
                 Key::Char('l') => self.recover_pending(),
                 Key::Char('r') => self.replay_pending(),
+                Key::Up | Key::Down | Key::Esc | Key::Char('b') => match self.screen {
+                    Screen::Board => self.handle_board(key),
+                    Screen::Detail => self.handle_detail(key),
+                    Screen::Judge => self.handle_judge(key),
+                },
                 _ => {
                     self.status =
                         "submit result unknown — resolve it first: l=lookup, r=replay".into()

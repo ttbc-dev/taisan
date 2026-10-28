@@ -454,8 +454,12 @@ pub fn work_detail(
 /// the union of itemized findings from every review recorded against that
 /// head. A verdict-only review contributes one synthesized finding keyed
 /// by reviewer and head, so the displayed set and the set `work`
-/// validates are always the same derivation. Findings for other
-/// revisions stay in evidence history and never appear here.
+/// validates are always the same derivation. When the same finding id
+/// appears in more than one review at this head — e.g. a second review
+/// after a verdict flip — the most recently recorded report wins;
+/// deduplication walks the observations newest-first, then restores
+/// forward order. Findings for other revisions stay in evidence history
+/// and never appear here.
 pub fn judgeable_findings(observations: &[Observation], head_sha: &str) -> Vec<FindingRef> {
     let mut findings = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -464,7 +468,7 @@ pub fn judgeable_findings(observations: &[Observation], head_sha: &str) -> Vec<F
             findings.push(finding);
         }
     };
-    for obs in observations {
+    for obs in observations.iter().rev() {
         let ObservationFact::PrReview {
             head_sha: observed_head,
             reviewer,
@@ -487,7 +491,9 @@ pub fn judgeable_findings(observations: &[Observation], head_sha: &str) -> Vec<F
                 evidence: vec![],
             });
         } else {
-            for finding in itemized {
+            // Within a review, dedupe newest-first too — the final
+            // reverse restores forward order at both levels.
+            for finding in itemized.iter().rev() {
                 let mut finding = finding.clone();
                 // The Observation's head is authoritative for the revision
                 // this finding was reported against.
@@ -496,6 +502,7 @@ pub fn judgeable_findings(observations: &[Observation], head_sha: &str) -> Vec<F
             }
         }
     }
+    findings.reverse();
     findings
 }
 

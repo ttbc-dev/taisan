@@ -201,7 +201,7 @@ fn run() -> Result<(), String> {
     let contracts = SqliteContracts {
         store: &store,
         config: &config,
-        now_unix_seconds: now(),
+        now,
     };
     let mut tui = Tui::new(contracts, actor, Origin("tui".into()));
     tui.refresh_board();
@@ -212,8 +212,10 @@ fn run() -> Result<(), String> {
     let mut stdout = std::io::stdout();
     write!(stdout, "\x1b[?25l").map_err(|e| e.to_string())?;
     let result = event_loop(&mut tui, fd, &mut stdout);
-    write!(stdout, "\x1b[?25h\x1b[2J\x1b[H").map_err(|e| e.to_string())?;
-    stdout.flush().map_err(|e| e.to_string())?;
+    // Terminal restore is best-effort: a write failure here must not
+    // clobber the loop's own error.
+    let _ = write!(stdout, "\x1b[?25h\x1b[2J\x1b[H");
+    let _ = stdout.flush();
     result
 }
 

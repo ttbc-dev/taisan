@@ -21,6 +21,10 @@ use workloop_tui::{Contracts, Key, Screen, SqliteContracts, Tui};
 
 const NOW: i64 = 1_700_000_000;
 
+fn fixed_now() -> i64 {
+    NOW
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
         default_repository: "local/repo".into(),
@@ -169,7 +173,7 @@ impl<'a> Recording<'a> {
         SqliteContracts {
             store: self.store,
             config: self.config,
-            now_unix_seconds: NOW,
+            now: fixed_now,
         }
     }
 }
@@ -500,6 +504,11 @@ fn lost_response_committed_recovers_via_command_result() {
     // even deliberate keys are refused until the operator resolves it.
     tui.handle(Key::Char('s'));
     assert_eq!(tui.contracts().submitted.len(), 1);
+    // Read-only navigation still passes through: leaving the judge
+    // screen does not settle or mutate the outstanding request.
+    tui.handle(Key::Esc);
+    assert!(tui.pending_unknown());
+    assert_eq!(tui.screen(), Screen::Detail);
     // command_result by replay key finds the durably stored decision.
     tui.handle(Key::Char('l'));
     assert!(!tui.pending_unknown());
