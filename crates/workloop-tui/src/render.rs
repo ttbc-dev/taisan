@@ -1,0 +1,196 @@
+//! Plain-text rendering of the board, the open Work, the judgment
+//! draft, and Command results. Pure functions over the Query snapshots
+//! — rendering is the only layer that knows about screen layout.
+
+use workloop_core::command::{CommandDecision, PrHeadSha};
+use workloop_core::domain::WorkId;
+use workloop_core::projection::{WorkDetailView, WorkPhase};
+use workloop_core::work::ActionPreview;
+
+use crate::board::Board;
+use crate::judgment::JudgmentDraft;
+
+const COL_WIDTH: usize = 24;
+
+fn phase_name(phase: &WorkPhase) -> &'static str {
+    match phase {
+        WorkPhase::Queued => "QUEUED",
+        WorkPhase::Implementing => "IMPLEMENTING",
+        WorkPhase::Reviewing => "REVIEWING",
+        WorkPhase::Converging => "CONVERGING",
+        WorkPhase::Waiting => "WAITING",
+        WorkPhase::Paused => "PAUSED",
+        WorkPhase::Stopping => "STOPPING",
+        WorkPhase::Unknown => "UNKNOWN",
+        WorkPhase::Stopped => "STOPPED",
+        WorkPhase::Completed => "COMPLETED",
+    }
+}
+
+fn cell(text: &str) -> String {
+    let mut s = text.chars().take(COL_WIDTH - 1).collect::<String>();
+    while s.chars().count() < COL_WIDTH {
+        s.push(' ');
+    }
+    s
+}
+
+/// The kanban board: one column per phase in pipeline order, cards
+/// showing Work id, displayed version, and attention count. `selected`
+/// marks the open card.
+pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
+    let mut out = String::new();
+    if let Some(cap) = &board.capacity {
+        out.push_str(&format!(
+            "capacity {}/{}  reservations {}  deferred {}\n",
+            cap.used,
+            cap.limit,
+            cap.reservations.len(),
+            cap.deferred.len()
+        ));
+    }
+    out.push_str(&format!("attention {}\n", board.attention.len()));
+    for col in &board.columns {
+        out.push_str(&cell(phase_name(&col.phase)));
+    }
+    out.push('\n');
+    let height = board
+        .columns
+        .iter()
+        .map(|c| c.cards.len())
+        .max()
+        .unwrap_or(0);
+    for row in 0..height {
+        for col in &board.columns {
+            let text = match col.cards.get(row) {
+                Some(card) => {
+                    let mark = if selected == Some(&card.work_id) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let attn = if card.attention_count > 0 {
+                        format!(" !{}", card.attention_count)
+                    } else {
+                        String::new()
+                    };
+                    format!("{}{} v{}{}", mark, card.work_id.0, card.version, attn)
+                }
+                None => String::new(),
+            };
+            out.push_str(&cell(&text));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The open Work's detail pane: version, executions, current head,
+/// head-scoped findings (numbered for `pick`), attention, evidence.
+pub fn detail_frame(detail: &WorkDetailView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("work {} v{}\n", detail.work_id.0, detail.version));
+    for e in &detail.executions {
+        out.push_str(&format!(
+            "  execution {} {:?} ownership={}\n",
+            e.execution_id.0, e.state, e.ownership
+        ));
+    }
+    if let Some((pr, head)) = &detail.current_pr {
+        out.push_str(&format!(
+            "  pr {}#{} head {}\n",
+            pr.repository,
+            pr.number,
+            head.as_deref().unwrap_or("?")
+        ));
+    }
+    for (i, f) in detail.findings.iter().enumerate() {
+        out.push_str(&format!("  finding {}: {}\n", i + 1, f));
+    }
+    for a in &detail.attention {
+        out.push_str(&format!(
+            "  attention {}: {} -> {}\n",
+            a.attention_id, a.reason, a.next_action
+        ));
+    }
+    if let Some(o) = &detail.outcome {
+        out.push_str(&format!(
+            "  outcome {:?} {}\n",
+            o.state,
+            o.detail.clone().unwrap_or_default()
+        ));
+    }
+    out
+}
+
+/// The judgment draft: findings, choices so far, and whether it is
+/// ready to arm.
+pub fn draft_frame(draft: &JudgmentDraft) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "judgment {} v{} head {}\n",
+        draft.work_id.0, draft.work_version, draft.pr_head
+    ));
+    for (i, slot) in draft.findings.iter().enumerate() {
+        let choice = slot
+            .choice
+            .as_ref()
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| "-".into());
+        out.push_str(&format!("  {} {} [{}]\n", i + 1, slot.finding_id, choice));
+    }
+    out
+}
+
+pub fn preview_frame(preview: &ActionPreview) -> String {
+    let mut out = format!("availability {:?}\n", preview.availability);
+    if let Some(v) = preview.observed_work_version {
+        out.push_str(&format!("  observed_work_version {v}\n"));
+    }
+    if let Some(h) = &preview.observed_pr_head {
+        out.push_str(&format!("  observed_pr_head {h}\n"));
+    }
+    for r in &preview.reasons {
+        out.push_str(&format!("  reason {r:?}\n"));
+    }
+    for e in &preview.evidence {
+        out.push_str(&format!("  evidence {e}\n"));
+    }
+    out
+}
+
+pub fn decision_frame(decision: &CommandDecision) -> String {
+    match decision {
+        CommandDecision::Accepted {
+            command_id,
+            work_id,
+            work_version,
+            effect,
+            ..
+        } => format!(
+            "accepted {} work={:?} version={:?} effect={effect:?}\n",
+            command_id.0, work_id, work_version
+        ),
+        CommandDecision::Rejected {
+            command_id,
+            reason,
+            current_version,
+            evidence,
+            ..
+        } => format!(
+            "rejected {} reason={reason:?} current_version={current_version:?} evidence={evidence:?}\n",
+            command_id.0
+        ),
+    }
+}
+
+/// A pending request rendered as unknown — the display carries the key
+/// the operator can recover by, never a guessed outcome.
+pub fn pending_frame(idempotency_key: &str, head_hint: Option<&PrHeadSha>) -> String {
+    let mut out = format!("submit result: UNKNOWN (idempotency_key {idempotency_key})\n");
+    if let Some(h) = head_hint {
+        out.push_str(&format!("  expected head at issue time {h}\n"));
+    }
+    out.push_str("  recover with: recover\n");
+    out
+}

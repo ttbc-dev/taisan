@@ -3,9 +3,11 @@
 //! enforces structure; everything here is policy — transition legality,
 //! versions, budgets, and gates.
 
+use serde::{Deserialize, Serialize};
+
 use crate::command::{
     CommandBody, CommandDecision, CommandEffect, CommandId, CommandRequest, FindingChoice,
-    RejectionCode, WorkVersion, payload_digest,
+    PrHeadSha, RejectionCode, WorkVersion, payload_digest,
 };
 use crate::domain::*;
 use crate::observation::{
@@ -105,6 +107,113 @@ pub fn handle_command(
         )?;
         Ok(decision)
     })
+}
+
+/// The TUI → `work` `preview` port: whether saved facts would admit the
+/// Command right now. `unknown` means the facts cannot decide — distinct
+/// from `blocked`, where they produce a definite rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewAvailability {
+    Available,
+    Blocked,
+    Unknown,
+}
+
+/// Advisory preflight result. `reasons` names the rejection codes a
+/// `submit` of the same request would produce; the observed version/head
+/// let the caller display what its expected values were compared
+/// against. Carrying a preview grants no authority: it reserves neither
+/// capacity nor execution ownership, and the Command handler rechecks
+/// every precondition at acceptance time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionPreview {
+    pub availability: PreviewAvailability,
+    pub observed_work_version: Option<WorkVersion>,
+    pub observed_pr_head: Option<PrHeadSha>,
+    pub reasons: Vec<RejectionCode>,
+    pub evidence: Vec<String>,
+}
+
+/// `work.preview(CommandRequest) → ActionPreview`. Runs the same
+/// decision pass `handle_command` would and reports the outcome without
+/// applying it — the pass executes inside a savepoint that is always
+/// rolled back, so no decision, effect, ID, or sequence allocation is
+/// persisted. An internal store fault surfaces as `Err`, never as a
+/// rejection-looking preview.
+pub fn preview(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    req: &CommandRequest,
+    now_unix_seconds: i64,
+) -> Result<ActionPreview, StoreError> {
+    store.transact(|tx| {
+        // A stored decision is what a submit under this key returns: the
+        // same payload replays it, a changed payload conflicts.
+        let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);
+        if let Some((stored_digest, decision)) =
+            tx.stored_decision(&req.origin, &req.actor, &req.idempotency_key)?
+        {
+            if stored_digest == digest {
+                return preview_of_decision(tx, req, &decision);
+            }
+            let mut p = observed(tx, req)?;
+            p.availability = PreviewAvailability::Blocked;
+            p.reasons = vec![RejectionCode::IdempotencyConflict];
+            p.evidence = vec!["same idempotency key with a different payload".into()];
+            return Ok(p);
+        }
+        tx.begin_attempt()?;
+        let outcome = decide(tx, config, req, now_unix_seconds);
+        // Roll back every allocation and effect the pass performed; a
+        // preview failure still rolls the transaction back via transact.
+        tx.revert_attempt()?;
+        let (decision, _effects) = outcome?;
+        preview_of_decision(tx, req, &decision)
+    })
+}
+
+fn observed(tx: &dyn ReadView, req: &CommandRequest) -> Result<ActionPreview, StoreError> {
+    let work_id = req.body.work_id();
+    let observed_work_version = work_id
+        .map(|w| tx.work(w))
+        .transpose()?
+        .flatten()
+        .map(|w| w.version);
+    let observed_pr_head = work_id.map(|w| tx.latest_pr_head(w)).transpose()?.flatten();
+    Ok(ActionPreview {
+        availability: PreviewAvailability::Unknown,
+        observed_work_version,
+        observed_pr_head,
+        reasons: vec![],
+        evidence: vec![],
+    })
+}
+
+fn preview_of_decision(
+    tx: &dyn ReadView,
+    req: &CommandRequest,
+    decision: &CommandDecision,
+) -> Result<ActionPreview, StoreError> {
+    let mut p = observed(tx, req)?;
+    match decision {
+        CommandDecision::Accepted { .. } => p.availability = PreviewAvailability::Available,
+        CommandDecision::Rejected {
+            reason, evidence, ..
+        } => {
+            p.availability = match reason {
+                // The facts are insufficient to decide — not a refusal
+                // the operator could repair in the request.
+                RejectionCode::SourceUnavailable | RejectionCode::OwnershipUncertain => {
+                    PreviewAvailability::Unknown
+                }
+                _ => PreviewAvailability::Blocked,
+            };
+            p.reasons = vec![reason.clone()];
+            p.evidence = evidence.clone();
+        }
+    }
+    Ok(p)
 }
 
 fn apply_all(tx: &mut dyn TxView, effects: &[Effect]) -> Result<(), StoreError> {
