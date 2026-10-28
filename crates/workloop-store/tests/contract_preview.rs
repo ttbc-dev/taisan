@@ -345,3 +345,64 @@ fn preview_never_substitutes_for_submit() {
         other => panic!("expected stale rejection, got {other:?}"),
     }
 }
+
+/// INV-011: preview runs the apply pass too — a Command whose effects
+/// violate a store constraint previews blocked with the same code the
+/// submit rejects with, never `available`. Re-judging a head that
+/// already has a judgment passes `decide` but fails the `judgments`
+/// uniqueness constraint at apply time.
+#[test]
+fn preview_mirrors_apply_time_rejection() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = seed_work(&store, "pj-seed");
+    seed_pr_head(&store, &work_id, "h9", NOW);
+    seed_pr_review(&store, &work_id, "h9", NOW);
+
+    let judge = CommandBody::JudgeFindings {
+        work_id: work_id.clone(),
+        expected_work_version: 1,
+        expected_pr_head: "h9".into(),
+        decisions: vec![FindingDecision {
+            finding_id: "f1".into(),
+            choice: FindingChoice::Fix,
+        }],
+    };
+    let d = handle_command(&store, &config(), &req("pj-first", judge), NOW).unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+
+    // Re-judging the same head: decide passes (head and version match),
+    // but the judgments uniqueness constraint rejects it at apply time.
+    let rejudge = req(
+        "pj-again",
+        CommandBody::JudgeFindings {
+            work_id: work_id.clone(),
+            expected_work_version: 2,
+            expected_pr_head: "h9".into(),
+            decisions: vec![FindingDecision {
+                finding_id: "f1".into(),
+                choice: FindingChoice::Dismiss,
+            }],
+        },
+    );
+
+    // Preview first — the fresh decide+apply pass must predict the
+    // apply-time rejection, not `available`.
+    let p = preview(&store, &config(), &rejudge, NOW).unwrap();
+    assert_eq!(
+        p.availability,
+        PreviewAvailability::Blocked,
+        "preview must mirror the apply-time rejection"
+    );
+    assert_eq!(p.reasons, vec![RejectionCode::Ineligible]);
+    // And the preview persisted nothing for it.
+    assert!(stored(&store, &Origin("tui".into()), "pj-again").is_none());
+
+    // The real submit agrees with the prediction.
+    let d = handle_command(&store, &config(), &rejudge, NOW).unwrap();
+    match d {
+        CommandDecision::Rejected { reason, .. } => {
+            assert_eq!(reason, RejectionCode::Ineligible)
+        }
+        other => panic!("expected the re-judgment rejected, got {other:?}"),
+    }
+}

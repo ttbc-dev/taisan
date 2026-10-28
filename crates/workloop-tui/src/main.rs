@@ -242,7 +242,8 @@ fn parse_choice(s: &str) -> Result<FindingChoice, String> {
     }
 }
 
-/// `open` accepts a Work id or the board row number shown left-to-right.
+/// `open` accepts a Work id or the card number `board_frame` prints
+/// (`Board::order()` — column-major).
 fn resolve_target(session: &TuiSession, target: &str) -> Result<WorkId, String> {
     if let Ok(n) = target.parse::<usize>() {
         let order = session.board().ok_or("run refresh first")?.order();

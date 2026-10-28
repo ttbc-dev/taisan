@@ -37,6 +37,11 @@ impl JudgmentDraft {
         if detail.findings.is_empty() {
             return None;
         }
+        // `work_detail` emits one finding string per recorded review;
+        // identical strings are the same finding id, so the draft keeps
+        // one slot per distinct id — one decision per displayed finding
+        // id, never two rows competing under the same key.
+        let mut seen = std::collections::HashSet::new();
         Some(Self {
             work_id: detail.work_id.clone(),
             work_version: detail.version,
@@ -44,6 +49,7 @@ impl JudgmentDraft {
             findings: detail
                 .findings
                 .iter()
+                .filter(|finding_id| seen.insert(finding_id.as_str()))
                 .map(|finding_id| FindingSlot {
                     finding_id: finding_id.clone(),
                     choice: None,

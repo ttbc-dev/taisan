@@ -48,31 +48,59 @@ fn uuidish() -> String {
 
 /// Read the installation config, creating it with a fresh stable actor
 /// id on first use — identical shape and defaults to the CLI's loader so
-/// either adapter can be the first writer.
+/// either adapter can be the first writer. Creation is an exclusive
+/// `create_new`: when CLI and TUI start concurrently before the file
+/// exists, exactly one write lands and every loser adopts the file that
+/// did, so both adapters converge on one actor identity instead of each
+/// keeping its own generated id.
 pub fn load_or_create(path: &Path) -> Result<Installation, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("config: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let installation = Installation {
-                actor_id: format!("actor-{}", uuidish()),
-                actor_kind: "human".into(),
-                repository: default_repository(),
-                capacity: default_capacity(),
-                worker_argv: vec![],
-                workspace_root: default_workspace_root(),
-                allowed_effects: None,
-                budget: None,
-            };
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
-            }
-            let text =
-                serde_json::to_string_pretty(&installation).map_err(|e| format!("config: {e}"))?;
-            std::fs::write(path, text).map_err(|e| format!("config write: {e}"))?;
-            Ok(installation)
-        }
-        Err(e) => Err(format!("config read: {e}")),
+    if let Ok(text) = std::fs::read_to_string(path) {
+        return serde_json::from_str(&text).map_err(|e| format!("config: {e}"));
     }
+    let installation = Installation {
+        actor_id: format!("actor-{}", uuidish()),
+        actor_kind: "human".into(),
+        repository: default_repository(),
+        capacity: default_capacity(),
+        worker_argv: vec![],
+        workspace_root: default_workspace_root(),
+        allowed_effects: None,
+        budget: None,
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(&installation).map_err(|e| format!("config: {e}"))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("config write: {e}"))?;
+            return Ok(installation);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("config create: {e}")),
+    }
+    // Lost the create race: adopt the winner's file. Its write may still
+    // be in flight, so retry past a brief partial view.
+    for _ in 0..100 {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(installation) => return Ok(installation),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(e) => return Err(format!("config read: {e}")),
+        }
+    }
+    Err("config: first writer did not finish".into())
 }
 
 impl Installation {

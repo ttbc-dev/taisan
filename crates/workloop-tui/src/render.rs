@@ -36,9 +36,20 @@ fn cell(text: &str) -> String {
 }
 
 /// The kanban board: one column per phase in pipeline order, cards
-/// showing Work id, displayed version, and attention count. `selected`
-/// marks the open card.
+/// numbered in `Board::order()` sequence (column-major) so `open <n>`
+/// selects the card the operator counted. Each card shows Work id,
+/// displayed version, and attention count. `selected` marks the open
+/// card.
 pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
+    let mut numbers: std::collections::HashMap<&WorkId, usize> = std::collections::HashMap::new();
+    for (i, card) in board
+        .columns
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .enumerate()
+    {
+        numbers.insert(&card.work_id, i + 1);
+    }
     let mut out = String::new();
     if let Some(cap) = &board.capacity {
         out.push_str(&format!(
@@ -74,7 +85,11 @@ pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
                     } else {
                         String::new()
                     };
-                    format!("{}{} v{}{}", mark, card.work_id.0, card.version, attn)
+                    let n = numbers.get(&card.work_id).copied().unwrap_or(0);
+                    format!(
+                        "{}{}. {} v{}{}",
+                        mark, n, card.work_id.0, card.version, attn
+                    )
                 }
                 None => String::new(),
             };
@@ -112,6 +127,9 @@ pub fn detail_frame(detail: &WorkDetailView) -> String {
             "  attention {}: {} -> {}\n",
             a.attention_id, a.reason, a.next_action
         ));
+    }
+    for e in &detail.evidence {
+        out.push_str(&format!("  evidence {e}\n"));
     }
     if let Some(o) = &detail.outcome {
         out.push_str(&format!(

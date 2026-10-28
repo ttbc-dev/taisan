@@ -62,41 +62,7 @@ pub fn handle_command(
             return Ok(decision);
         }
 
-        // Re-decide passes let a constraint conflict resolve against fresh
-        // state; each attempt runs in a savepoint so partial effects are
-        // rolled back before the next read.
-        let mut attempts = 0;
-        let decision = loop {
-            attempts += 1;
-            tx.begin_attempt()?;
-            match decide(tx, config, req, now_unix_seconds) {
-                Ok((decision, effects)) => match apply_all(tx, &effects) {
-                    Ok(()) => {
-                        tx.commit_attempt()?;
-                        break decision;
-                    }
-                    Err(e) => {
-                        tx.revert_attempt()?;
-                        match conflict_rejection(tx, req, &e)? {
-                            Some(rejection) => break rejection,
-                            None if attempts < 3 => continue,
-                            None => {
-                                break rejected_now(
-                                    tx,
-                                    RejectionCode::Ineligible,
-                                    req.body.work_id().cloned(),
-                                    vec![e.to_string()],
-                                );
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    tx.revert_attempt()?;
-                    return Err(e);
-                }
-            }
-        };
+        let decision = decide_attempts(tx, config, req, now_unix_seconds)?;
 
         tx.save_decision(
             &req.origin,
@@ -135,12 +101,14 @@ pub struct ActionPreview {
     pub evidence: Vec<String>,
 }
 
-/// `work.preview(CommandRequest) → ActionPreview`. Runs the same
-/// decision pass `handle_command` would and reports the outcome without
-/// applying it — the pass executes inside a savepoint that is always
-/// rolled back, so no decision, effect, ID, or sequence allocation is
-/// persisted. An internal store fault surfaces as `Err`, never as a
-/// rejection-looking preview.
+/// `work.preview(CommandRequest) → ActionPreview`. Runs the exact
+/// decide+apply pass `handle_command` would — including effect
+/// application inside the attempt savepoint, so store constraint
+/// violations surface as the same rejection a submit would produce —
+/// and reports the outcome without persisting it. The whole pass sits
+/// inside an outer savepoint that is always rolled back, so no
+/// decision, effect, ID, or sequence allocation survives. An internal
+/// store fault surfaces as `Err`, never as a rejection-looking preview.
 pub fn preview(
     store: &impl Store,
     config: &WorkloopConfig,
@@ -164,13 +132,58 @@ pub fn preview(
             return Ok(p);
         }
         tx.begin_attempt()?;
-        let outcome = decide(tx, config, req, now_unix_seconds);
+        let outcome = decide_attempts(tx, config, req, now_unix_seconds);
         // Roll back every allocation and effect the pass performed; a
         // preview failure still rolls the transaction back via transact.
         tx.revert_attempt()?;
-        let (decision, _effects) = outcome?;
+        let decision = outcome?;
         preview_of_decision(tx, req, &decision)
     })
+}
+
+/// The decide+apply attempt loop `handle_command` and `preview` share.
+/// Re-decide passes let a constraint conflict resolve against fresh
+/// state; each attempt runs in a savepoint so partial effects are
+/// rolled back before the next read. Returns the decision the Command
+/// would produce — the caller decides whether to persist it.
+fn decide_attempts(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    req: &CommandRequest,
+    now_unix_seconds: i64,
+) -> Result<CommandDecision, StoreError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        tx.begin_attempt()?;
+        match decide(tx, config, req, now_unix_seconds) {
+            Ok((decision, effects)) => match apply_all(tx, &effects) {
+                Ok(()) => {
+                    tx.commit_attempt()?;
+                    return Ok(decision);
+                }
+                Err(e) => {
+                    tx.revert_attempt()?;
+                    match conflict_rejection(tx, req, &e)? {
+                        Some(rejection) => return Ok(rejection),
+                        None if attempts < 3 => continue,
+                        None => {
+                            return Ok(rejected_now(
+                                tx,
+                                RejectionCode::Ineligible,
+                                req.body.work_id().cloned(),
+                                vec![e.to_string()],
+                            ));
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                tx.revert_attempt()?;
+                return Err(e);
+            }
+        }
+    }
 }
 
 fn observed(tx: &dyn ReadView, req: &CommandRequest) -> Result<ActionPreview, StoreError> {

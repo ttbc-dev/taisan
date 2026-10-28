@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{Observation, ObservationFact, ReviewVerdict};
+use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact, ReviewVerdict};
 use workloop_core::projection::{self, CommandResultLookup, QueryResult, WorkPhase};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -20,6 +20,7 @@ use workloop_core::work::{
 };
 use workloop_store::sqlite::SqliteStore;
 use workloop_tui::install::load_or_create;
+use workloop_tui::render::board_frame;
 use workloop_tui::session::{Action, ORIGIN, RecoverOutcome, SubmitOutcome, TuiSession};
 
 const NOW: i64 = 1_700_000_000;
@@ -118,6 +119,14 @@ fn pr_review(sha: &str) -> ObservationFact {
         head_sha: sha.into(),
         reviewer: "rev".into(),
         verdict: ReviewVerdict::ChangesRequested,
+    }
+}
+
+fn process_state() -> ObservationFact {
+    ObservationFact::ProcessState {
+        invocation_id: InvocationId("inv-1".into()),
+        process_identity: "pid-1".into(),
+        state: ProcessStateFact::Running,
     }
 }
 
@@ -290,9 +299,17 @@ fn judge_findings_flow_end_to_end() {
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].finding_id, finding);
     assert_eq!(decisions[0].choice, FindingChoice::Dismiss);
-    // A second pick for an id outside the displayed set is refused locally.
-    let mut draft = session.draft().unwrap().clone();
-    assert!(draft.choose("no-such-finding", FindingChoice::Fix).is_err());
+    // The accepted Command bumped the version: the submitted draft is
+    // gone — its choices belong to the pre-Command snapshot.
+    assert!(session.draft().is_none());
+    assert_eq!(session.detail().unwrap().version, 2);
+    // A pick for an id outside the displayed set is refused locally.
+    session.begin_judgment().unwrap();
+    assert!(
+        session
+            .choose("no-such-finding", FindingChoice::Fix)
+            .is_err()
+    );
 }
 
 /// A draft that is not complete cannot arm a request — the Command is
@@ -704,6 +721,208 @@ fn lost_submit_recovers_by_command_id() {
         other => panic!("expected found, got {other:?}"),
     }
     assert!(session.pending().is_none());
+}
+
+/// The card number `board_frame` prints is `Board::order()`'s —
+/// column-major. When an earlier column holds more rows, the nth card
+/// on screen is still the nth `open <n>` resolves.
+#[test]
+fn board_numbers_match_open_order() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (w1, _e1) = submit_work(&store, "bn-1");
+    let (w2, _e2) = submit_work(&store, "bn-2");
+    let (w3, e3) = submit_work(&store, "bn-3");
+    // Park w3 paused: QUEUED holds two rows, PAUSED one — row-major
+    // reading order would number w3 as 2, but order() numbers it 3.
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&e3)?.unwrap();
+            e.state = ExecutionState::Paused;
+            e.pause_reason = Some("repair".into());
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+
+    session.refresh(NOW).unwrap();
+    let board = session.board().unwrap();
+    assert_eq!(board.order(), vec![w1.clone(), w2.clone(), w3.clone()]);
+    let frame = board_frame(board, None);
+    for (i, w) in [w1, w2, w3].iter().enumerate() {
+        assert!(
+            frame.contains(&format!("{}. {}", i + 1, w.0)),
+            "card #{} ({}) missing its printed number:\n{frame}",
+            i + 1,
+            w.0
+        );
+    }
+}
+
+/// Identical finding strings are the same finding id: the draft keeps
+/// one slot per distinct id and the Command carries exactly one
+/// decision for it — two displayed rows can never fight over one key.
+#[test]
+fn duplicate_findings_share_one_decision_slot() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "df-seed");
+    observe(&store, &work_id, pr_head("h1"), NOW);
+    // The same review recorded twice — the projection displays one
+    // identical finding string per observation.
+    observe(&store, &work_id, pr_review("h1"), NOW);
+    observe(&store, &work_id, pr_review("h1"), NOW + 1);
+
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.begin_judgment().unwrap();
+    let draft = session.draft().unwrap();
+    let distinct: std::collections::HashSet<_> = draft
+        .findings
+        .iter()
+        .map(|f| f.finding_id.clone())
+        .collect();
+    assert_eq!(draft.findings.len(), distinct.len(), "slots repeat an id");
+    assert_eq!(draft.findings.len(), 1, "duplicate findings not deduped");
+
+    let finding = draft.findings[0].finding_id.clone();
+    session.choose(&finding, FindingChoice::Fix).unwrap();
+    let req = session.stage_judgment().unwrap().clone();
+    let CommandBody::JudgeFindings { decisions, .. } = &req.body else {
+        panic!("expected judge_findings")
+    };
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].finding_id, finding);
+}
+
+/// The detail pane shows what the projection recorded — evidence from
+/// ProcessState/Artifact/PrActionResult observations is not dropped.
+#[test]
+fn detail_frame_shows_recorded_evidence() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "ev-seed");
+    observe(&store, &work_id, process_state(), NOW);
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    let detail = session.detail().unwrap();
+    assert!(
+        !detail.evidence.is_empty(),
+        "projection recorded no evidence for the observation"
+    );
+    let frame = workloop_tui::render::detail_frame(detail);
+    assert!(
+        frame.contains("evidence process:Running"),
+        "evidence missing from detail pane:\n{frame}"
+    );
+}
+
+/// An accepted Command moved the durable version: the session
+/// re-queries so the next armed action carries the post-Command
+/// version instead of a stale one.
+#[test]
+fn accepted_submit_refreshes_open_detail() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "ar-seed");
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
+        panic!("expected decided")
+    };
+    assert!(matches!(d, CommandDecision::Accepted { .. }));
+    assert_eq!(
+        session.detail().unwrap().version,
+        2,
+        "detail snapshot kept the pre-Command version"
+    );
+    // The next armed action carries the fresh version — not v1, which
+    // the handler would reject as stale.
+    let req = session.stage_action(&Action::Cancel).unwrap().clone();
+    let CommandBody::Cancel {
+        expected_work_version,
+        ..
+    } = &req.body
+    else {
+        panic!("expected cancel")
+    };
+    assert_eq!(*expected_work_version, 2);
+}
+
+/// A command id cannot settle the unknown-result guard unless it is
+/// proven to be the pending request's own decision.
+#[test]
+fn recover_by_id_rejects_unrelated_command_id() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let (work_id, _e) = submit_work(&store, "ri-seed");
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+
+    // A composed-but-never-issued request is "lost".
+    let lost = session.compose(CommandBody::Cancel {
+        work_id: work_id.clone(),
+        expected_work_version: 1,
+        execution_id: None,
+    });
+    session.note_lost(lost);
+
+    // An unrelated durable decision exists — submitted through the CLI.
+    let other = handle_command(
+        &store,
+        &config(),
+        &cli_req(
+            "ri-other",
+            CommandBody::Acknowledge {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                attention_id: "att-x".into(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    let other_id = other.command_id().clone();
+    assert!(
+        session.recover_by_id(&other_id, NOW).is_err(),
+        "an unrelated command id released the unknown-result guard"
+    );
+    assert!(session.pending().is_some());
+    // The honest recovery still works: identical replay.
+    assert!(matches!(
+        session.recover(NOW).unwrap(),
+        RecoverOutcome::Replayed(_)
+    ));
+    assert!(session.pending().is_none());
+}
+
+/// Concurrent first writers converge on one actor identity: exactly
+/// one `create_new` lands and every loser adopts that file.
+#[test]
+fn concurrent_first_writers_share_one_actor() {
+    let dir = root("install-race");
+    let path = std::sync::Arc::new(dir.join("config.json"));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || load_or_create(&p).map(|i| i.actor_id))
+        })
+        .collect();
+    let ids: std::collections::HashSet<String> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1, "concurrent writers diverged: {ids:?}");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path.as_ref()).unwrap()).unwrap();
+    assert_eq!(
+        written["actor_id"].as_str().unwrap(),
+        ids.iter().next().unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// INV-007: store faults surface as errors — a db path that cannot be

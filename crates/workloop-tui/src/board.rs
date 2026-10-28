@@ -80,8 +80,8 @@ impl Board {
         }
     }
 
-    /// Work IDs in board order — the stable numbering the console
-    /// displays and `open <n>` resolves.
+    /// Work IDs in column-major order — the numbering `board_frame`
+    /// prints on each card and `open <n>` resolves.
     pub fn order(&self) -> Vec<WorkId> {
         self.columns
             .iter()

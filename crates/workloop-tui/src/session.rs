@@ -314,7 +314,7 @@ impl<'a> TuiSession<'a> {
         match handle_command(self.store, &self.config, &req, now_unix_seconds) {
             Ok(decision) => {
                 self.staged = None;
-                self.on_decision(&decision, now_unix_seconds)?;
+                self.on_decision(&decision, now_unix_seconds);
                 Ok(SubmitOutcome::Decided(decision))
             }
             Err(_) => {
@@ -352,7 +352,7 @@ impl<'a> TuiSession<'a> {
         {
             QueryResult::Found { value, .. } => {
                 self.pending = None;
-                self.on_decision(&value, now_unix_seconds)?;
+                self.on_decision(&value, now_unix_seconds);
                 return Ok(RecoverOutcome::Found(value));
             }
             QueryResult::NotFound => {}
@@ -361,7 +361,7 @@ impl<'a> TuiSession<'a> {
         match handle_command(self.store, &self.config, &req, now_unix_seconds) {
             Ok(decision) => {
                 self.pending = None;
-                self.on_decision(&decision, now_unix_seconds)?;
+                self.on_decision(&decision, now_unix_seconds);
                 Ok(RecoverOutcome::Replayed(decision))
             }
             Err(e) => Err(e.to_string()),
@@ -370,17 +370,47 @@ impl<'a> TuiSession<'a> {
 
     /// Recover a pending request by command id — the id the operator
     /// learned from another surface (the CLI's `command_result`, for
-    /// example). The named durable decision settles the pending request:
-    /// it is a recorded fact either way, and the pending request is
-    /// never mutated by naming it.
+    /// example). A CommandDecision carries no origin or idempotency
+    /// key, so the named decision settles the pending request only when
+    /// it is proven to be the pending request's own decision: the
+    /// replay-key lookup must return the same command id. Naming an
+    /// unrelated command never releases the unknown-result guard, and
+    /// the pending request is never mutated.
     pub fn recover_by_id(
         &mut self,
         command_id: &CommandId,
         now_unix_seconds: i64,
     ) -> Result<RecoverOutcome, String> {
-        if self.pending.is_none() {
+        let Some(req) = self.pending.clone() else {
             return Err("no pending request".into());
+        };
+        let lookup = CommandResultLookup::ReplayKey {
+            origin: req.origin.clone(),
+            actor: req.actor.clone(),
+            idempotency_key: req.idempotency_key.clone(),
+        };
+        match self
+            .store
+            .transact(|tx| projection::command_result(tx, &lookup))
+            .map_err(|e| e.to_string())?
+        {
+            QueryResult::Found { value, .. } => {
+                if value.command_id() != command_id {
+                    return Err(format!(
+                        "the pending request's recorded decision is {:?}, not {command_id:?} — the pending request stays unknown",
+                        value.command_id()
+                    ));
+                }
+                self.pending = None;
+                self.on_decision(&value, now_unix_seconds);
+                return Ok(RecoverOutcome::Found(value));
+            }
+            QueryResult::NotFound => {}
+            other => return Err(format!("command_result: {other:?}")),
         }
+        // The pending request has no recorded decision under its own
+        // key: a decision named by id cannot be proven to be it, so the
+        // pending request stays unknown either way.
         match self
             .store
             .transact(|tx| {
@@ -393,48 +423,56 @@ impl<'a> TuiSession<'a> {
             })
             .map_err(|e| e.to_string())?
         {
-            QueryResult::Found { value, .. } => {
-                self.pending = None;
-                self.on_decision(&value, now_unix_seconds)?;
-                Ok(RecoverOutcome::Found(value))
-            }
+            QueryResult::Found { .. } => Err(format!(
+                "{command_id:?} is a recorded decision but not the pending request's — recover by replay"
+            )),
             QueryResult::NotFound => Err(format!("no recorded decision for {command_id:?}")),
             other => Err(format!("command_result: {other:?}")),
         }
     }
 
-    /// On a stale rejection, re-query the Work and clear every choice
-    /// tied to the old snapshot — the expected head/version is never
-    /// rewritten to resubmit the old request.
-    fn on_decision(
-        &mut self,
-        decision: &CommandDecision,
-        now_unix_seconds: i64,
-    ) -> Result<(), String> {
-        let CommandDecision::Rejected {
-            reason,
-            current_work_id,
-            ..
-        } = decision
-        else {
-            return Ok(());
-        };
-        if !matches!(
-            reason,
-            RejectionCode::StalePrHead | RejectionCode::StaleWorkVersion
-        ) {
-            return Ok(());
-        }
-        self.draft = None;
-        if let Some(work_id) = current_work_id {
-            self.open(work_id, now_unix_seconds)?;
-            // Rebuild a clean draft over the refreshed findings — the
-            // cleared choices are gone, not retargeted.
-            if let Some(draft) = self.detail.as_ref().and_then(JudgmentDraft::from_detail) {
-                self.draft = Some(draft);
+    /// Keep the selection snapshot honest after a decision. An accepted
+    /// Command moved the durable version, so the Work is re-queried and
+    /// the next armed action carries the post-Command version; a stale
+    /// rejection re-queries too and clears every choice tied to the old
+    /// snapshot — the expected head/version is never rewritten to
+    /// resubmit the old request. A failed re-query drops the snapshot
+    /// rather than leaving a stale version armed — the decision itself
+    /// is always returned to the caller.
+    fn on_decision(&mut self, decision: &CommandDecision, now_unix_seconds: i64) {
+        match decision {
+            CommandDecision::Accepted {
+                work_id: Some(work_id),
+                ..
+            } => {
+                if self.open(work_id, now_unix_seconds).is_err() {
+                    self.detail = None;
+                }
             }
+            CommandDecision::Rejected {
+                reason: RejectionCode::StalePrHead | RejectionCode::StaleWorkVersion,
+                current_work_id,
+                ..
+            } => {
+                self.draft = None;
+                if let Some(work_id) = current_work_id {
+                    match self.open(work_id, now_unix_seconds) {
+                        Ok(()) => {
+                            // Rebuild a clean draft over the refreshed
+                            // findings — the cleared choices are gone,
+                            // not retargeted.
+                            if let Some(draft) =
+                                self.detail.as_ref().and_then(JudgmentDraft::from_detail)
+                            {
+                                self.draft = Some(draft);
+                            }
+                        }
+                        Err(_) => self.detail = None,
+                    }
+                }
+            }
+            _ => {}
         }
-        Ok(())
     }
 
     /// Build a request without staging it — used when a caller composes
