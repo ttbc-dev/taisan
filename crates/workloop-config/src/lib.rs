@@ -94,10 +94,22 @@ fn read(path: &Path) -> Result<Option<Installation>, String> {
     }
 }
 
+/// Directory fsync is not portable: not every platform or filesystem
+/// implements it (macOS returns `EINVAL` for `fsync(2)` on a directory).
+/// The file itself is already published, so only the crash durability
+/// of the directory entry is lost, never the config.
+fn dir_sync_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    )
+}
+
 /// Make a freshly published directory entry durable. Renaming or
 /// linking a file only updates the directory; without syncing it, a
 /// power loss can leave the old directory contents even though the
-/// file's own data survived.
+/// file's own data survived. A platform that cannot sync directories
+/// is not a publish failure (see `dir_sync_unsupported`).
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -105,7 +117,10 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::File::open(parent)?.sync_all()
+        match std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+            Err(e) if dir_sync_unsupported(&e) => Ok(()),
+            outcome => outcome,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -114,23 +129,53 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Publish the complete scratch file at `path`. A hard link is the
-/// preferred atomic publish: `AlreadyExists` means a concurrent first
-/// writer won, so this writer adopts that complete file. Filesystems
-/// without hard links (some FAT/exFAT, SMB/CIFS, or FUSE mounts) fall
-/// back to a same-directory rename, which is still atomic and still
-/// publishes only complete content; a winner that appeared before the
-/// rename is adopted rather than overwritten. Either way the parent
-/// directory is synced so the new name survives a crash.
-fn publish(path: &Path, scratch: &Path) -> Result<(), String> {
-    publish_with(path, scratch, |from, to| std::fs::hard_link(from, to))
+/// The advisory lock every publisher of `path` takes. Creation is
+/// harmless-if-present: the file is a rendezvous point, not state, so a
+/// leftover from a crashed writer never blocks a later first write.
+fn lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.lock"))
 }
 
+/// Serialize publishers across threads and processes. `flock`-style
+/// locks are released by the OS when the holder exits, so a crash cannot
+/// leave the lock held; the lock file itself is deliberately kept
+/// because unlinking it while another writer waits would let a third
+/// writer create a different inode and bypass the lock.
+fn lock_publish(path: &Path) -> Result<std::fs::File, String> {
+    let lock_path = lock_path(path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("config lock: {e}"))?;
+    file.lock().map_err(|e| format!("config lock: {e}"))?;
+    Ok(file)
+}
+
+/// Publish the complete scratch file at `path`. Publishers serialize on
+/// a sibling lock file, so only one can attempt the publish at a time
+/// and the no-hard-link fallback can safely check for a winner before
+/// renaming without a concurrent publisher landing in between. A hard
+/// link is the preferred atomic publish: `AlreadyExists` means a
+/// concurrent first writer won, so this writer adopts that complete
+/// file. Filesystems without hard links (some FAT/exFAT, SMB/CIFS, or
+/// FUSE mounts) fall back to a same-directory rename, which is still
+/// atomic and still publishes only complete content; a winner that
+/// appeared before the rename is adopted rather than overwritten.
+/// Either way the parent directory is synced so the new name survives a
+/// crash.
 fn publish_with(
     path: &Path,
     scratch: &Path,
-    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
+    let _publish_lock = lock_publish(path)?;
     match link(scratch, path) {
         Ok(()) => {
             let _ = std::fs::remove_file(scratch);
@@ -170,10 +215,18 @@ fn publish_with(
 /// adopts it — CLI and TUI converge on one actor identity. A reader
 /// only ever observes the absent name or a complete file: a partial or
 /// empty view of a live write is impossible, so no reader may unlink a
-/// live writer's file, and a crashed writer leaves only a scratch
-/// file, never a broken config. On filesystems without hard links the
-/// same atomic publish falls back to a rename (see `publish`).
+/// live writer's file, and a crashed writer leaves only a scratch file
+/// (plus the inert publish lock), never a broken config. On filesystems
+/// without hard links the same atomic publish falls back to a rename
+/// (see `publish_with`), still serialized by the publish lock.
 pub fn load_or_create(path: &Path) -> Result<Installation, String> {
+    load_or_create_with(path, |from, to| std::fs::hard_link(from, to))
+}
+
+fn load_or_create_with(
+    path: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Installation, String> {
     if let Some(installation) = read(path)? {
         return Ok(installation);
     }
@@ -202,7 +255,7 @@ pub fn load_or_create(path: &Path) -> Result<Installation, String> {
             .and_then(|()| file.sync_all())
             .map_err(|e| format!("config scratch write: {e}"))?;
     }
-    publish(path, &scratch)?;
+    publish_with(path, &scratch, link)?;
     // Return the file that actually won the publish, not necessarily the
     // record this process staged: concurrent first writers must all
     // report the one identity the installation now holds.
@@ -307,6 +360,60 @@ mod tests {
             "the loser overwrote the concurrent winner"
         );
         assert!(!scratch.exists(), "the scratch file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Platforms that reject directory fsync (macOS returns `EINVAL`)
+    /// must not fail the publish after the file has landed.
+    #[test]
+    fn directory_fsync_rejection_is_not_a_publish_failure() {
+        let invalid = io::Error::from(io::ErrorKind::InvalidInput);
+        let unsupported = io::Error::from(io::ErrorKind::Unsupported);
+        let real_fault = io::Error::from(io::ErrorKind::PermissionDenied);
+
+        assert!(dir_sync_unsupported(&invalid));
+        assert!(dir_sync_unsupported(&unsupported));
+        assert!(!dir_sync_unsupported(&real_fault));
+    }
+
+    /// Concurrent first writers on a filesystem without hard links
+    /// serialize on the publish lock: exactly one rename lands and every
+    /// loser adopts that complete file rather than clobbering it.
+    #[test]
+    fn concurrent_fallback_writers_share_one_actor() {
+        let dir = temp_root("publish-fallback-race");
+        let path = std::sync::Arc::new(dir.join("config.json"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    load_or_create_with(&p, |_, _| {
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "hard links unsupported",
+                        ))
+                    })
+                    .map(|installation| installation.actor_id)
+                })
+            })
+            .collect();
+        let ids: std::collections::HashSet<String> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+
+        assert_eq!(
+            ids.len(),
+            1,
+            "concurrent fallback writers diverged: {ids:?}"
+        );
+        assert_eq!(
+            read(&path).unwrap().unwrap().actor_id,
+            *ids.iter().next().unwrap(),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
