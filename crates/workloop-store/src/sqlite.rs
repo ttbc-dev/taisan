@@ -4,7 +4,11 @@
 //! serializes transactions within a process; across processes (every CLI
 //! invocation is one) immediate transactions reserve the writer before reading.
 //! Contenders wait on the busy timeout before observing a snapshot, so a later
-//! write never needs to upgrade a stale WAL snapshot.
+//! `transact` write never needs to upgrade a stale WAL snapshot. Queries and
+//! `preview` instead use `transact_deferred`: they hold no writer lock while
+//! only reading, and a write they perform upgrades the snapshot — failing
+//! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
+//! intervened rather than waiting on the lock.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -125,16 +129,17 @@ struct Tx<'t> {
     tx: rusqlite::Transaction<'t>,
 }
 
-impl Store for SqliteStore {
-    fn transact<R>(
+impl SqliteStore {
+    fn run<R>(
         &self,
+        behavior: TransactionBehavior,
         f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
         let tx = guard
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(behavior)
             .map_err(internal)?;
         let mut view = Tx { tx };
         let result = f(&mut view);
@@ -148,6 +153,22 @@ impl Store for SqliteStore {
                 Err(e)
             }
         }
+    }
+}
+
+impl Store for SqliteStore {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.run(TransactionBehavior::Immediate, f)
+    }
+
+    fn transact_deferred<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.run(TransactionBehavior::Deferred, f)
     }
 }
 

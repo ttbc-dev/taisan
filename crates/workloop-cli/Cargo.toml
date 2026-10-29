@@ -3,6 +3,7 @@ name = "workloop-cli"
 edition.workspace = true
 
 [dependencies]
+workloop-config = { path = "../workloop-config" }
 workloop-core = { path = "../workloop-core" }
 workloop-store = { path = "../workloop-store" }
 workloop-exec = { path = "../workloop-exec" }

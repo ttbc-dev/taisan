@@ -3,9 +3,10 @@
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::projection::{self, CommandResultLookup};
@@ -134,62 +135,6 @@ enum Commands {
     },
 }
 
-/// Installation config: the actor identity persists here so it is stable
-/// across restarts; worker argv and capacity configure the run loop.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Installation {
-    actor_id: String,
-    actor_kind: String,
-    #[serde(default = "default_repository")]
-    repository: String,
-    #[serde(default = "default_capacity")]
-    capacity: u32,
-    #[serde(default)]
-    worker_argv: Vec<String>,
-    #[serde(default = "default_workspace_root")]
-    workspace_root: String,
-    #[serde(default)]
-    allowed_effects: Option<AllowedEffects>,
-    #[serde(default)]
-    budget: Option<ExecutionBudget>,
-}
-
-fn default_repository() -> String {
-    "local/repo".into()
-}
-fn default_capacity() -> u32 {
-    1
-}
-fn default_workspace_root() -> String {
-    "workspaces".into()
-}
-
-fn load_or_create_installation(path: &Path) -> Result<Installation, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("config: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let installation = Installation {
-                actor_id: format!("actor-{}", uuidish()),
-                actor_kind: "human".into(),
-                repository: default_repository(),
-                capacity: default_capacity(),
-                worker_argv: vec![],
-                workspace_root: default_workspace_root(),
-                allowed_effects: None,
-                budget: None,
-            };
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
-            }
-            let text =
-                serde_json::to_string_pretty(&installation).map_err(|e| format!("config: {e}"))?;
-            std::fs::write(path, text).map_err(|e| format!("config write: {e}"))?;
-            Ok(installation)
-        }
-        Err(e) => Err(format!("config read: {e}")),
-    }
-}
-
 fn uuidish() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -278,26 +223,9 @@ fn run(cli: Cli) -> Result<(), String> {
         .config
         .clone()
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
-    let installation = load_or_create_installation(&config_path)?;
-    let actor = Actor {
-        kind: match installation.actor_kind.as_str() {
-            "automation" => ActorKind::Automation,
-            _ => ActorKind::Human,
-        },
-        external_id: installation.actor_id.clone(),
-    };
-    let config = WorkloopConfig {
-        default_repository: installation.repository.clone(),
-        allowed_effects: installation
-            .allowed_effects
-            .clone()
-            .unwrap_or(AllowedEffects {
-                workspace_write: true,
-                github_write: false,
-                network: false,
-            }),
-        budget: installation.budget.clone().unwrap_or_default(),
-    };
+    let installation = load_or_create(&config_path)?;
+    let actor = installation.actor();
+    let config = installation.workloop_config();
     let store =
         SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
     let key = || {
@@ -477,25 +405,25 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::WorkList => {
             let r = store
-                .transact(|tx| projection::work_list(tx, now()))
+                .transact_deferred(|tx| projection::work_list(tx, now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::WorkDetail { work } => {
             let r = store
-                .transact(|tx| projection::work_detail(tx, &WorkId(work), now()))
+                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work), now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::Attention { work } => {
             let r = store
-                .transact(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
+                .transact_deferred(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
         Commands::Capacity => {
             let r = store
-                .transact(|tx| projection::capacity(tx))
+                .transact_deferred(|tx| projection::capacity(tx))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
@@ -520,7 +448,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
             };
             let r = store
-                .transact(|tx| projection::command_result(tx, &lookup))
+                .transact_deferred(|tx| projection::command_result(tx, &lookup))
                 .map_err(|e| e.to_string())?;
             print(&r);
         }
@@ -568,7 +496,7 @@ fn run_tick(
     // Status output goes through the same read-only projection as the
     // query subcommands — never a raw store read.
     let list = store
-        .transact(|tx| projection::work_list(tx, now))
+        .transact_deferred(|tx| projection::work_list(tx, now))
         .map_err(|e| e.to_string())?;
     print(&list);
     Ok(())

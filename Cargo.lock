@@ -388,10 +388,20 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "workloop-config",
  "workloop-core",
  "workloop-exec",
  "workloop-github",
  "workloop-store",
+]
+
+[[package]]
+name = "workloop-config"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "workloop-core",
 ]
 
 [[package]]
@@ -436,6 +446,17 @@ dependencies = [
  "serde",
  "serde_json",
  "workloop-core",
+]
+
+[[package]]
+name = "workloop-tui"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "workloop-config",
+ "workloop-core",
+ "workloop-store",
 ]
 
 [[package]]
