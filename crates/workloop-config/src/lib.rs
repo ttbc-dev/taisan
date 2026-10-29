@@ -94,6 +94,74 @@ fn read(path: &Path) -> Result<Option<Installation>, String> {
     }
 }
 
+/// Make a freshly published directory entry durable. Renaming or
+/// linking a file only updates the directory; without syncing it, a
+/// power loss can leave the old directory contents even though the
+/// file's own data survived.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Publish the complete scratch file at `path`. A hard link is the
+/// preferred atomic publish: `AlreadyExists` means a concurrent first
+/// writer won, so this writer adopts that complete file. Filesystems
+/// without hard links (some FAT/exFAT, SMB/CIFS, or FUSE mounts) fall
+/// back to a same-directory rename, which is still atomic and still
+/// publishes only complete content; a winner that appeared before the
+/// rename is adopted rather than overwritten. Either way the parent
+/// directory is synced so the new name survives a crash.
+fn publish(path: &Path, scratch: &Path) -> Result<(), String> {
+    publish_with(path, scratch, |from, to| std::fs::hard_link(from, to))
+}
+
+fn publish_with(
+    path: &Path,
+    scratch: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    match link(scratch, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(scratch);
+            sync_parent(path).map_err(|e| format!("config dir sync: {e}"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the create race: the winner's file is complete by the
+            // same publish rule, so adopt it.
+            let _ = std::fs::remove_file(scratch);
+            Ok(())
+        }
+        Err(link_err) => match read(path) {
+            Ok(Some(_)) => {
+                let _ = std::fs::remove_file(scratch);
+                Ok(())
+            }
+            Ok(None) => {
+                std::fs::rename(scratch, path).map_err(|e| {
+                    let _ = std::fs::remove_file(scratch);
+                    format!("config publish: hard link failed ({link_err}); rename failed: {e}")
+                })?;
+                sync_parent(path).map_err(|e| format!("config dir sync: {e}"))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(scratch);
+                Err(e)
+            }
+        },
+    }
+}
+
 /// Read the installation config, creating it with a fresh stable actor
 /// id on first use. Creation is publish-by-link: the complete content
 /// is written to a scratch file and then atomically hard-linked into
@@ -103,7 +171,8 @@ fn read(path: &Path) -> Result<Option<Installation>, String> {
 /// only ever observes the absent name or a complete file: a partial or
 /// empty view of a live write is impossible, so no reader may unlink a
 /// live writer's file, and a crashed writer leaves only a scratch
-/// file, never a broken config.
+/// file, never a broken config. On filesystems without hard links the
+/// same atomic publish falls back to a rename (see `publish`).
 pub fn load_or_create(path: &Path) -> Result<Installation, String> {
     if let Some(installation) = read(path)? {
         return Ok(installation);
@@ -133,17 +202,11 @@ pub fn load_or_create(path: &Path) -> Result<Installation, String> {
             .and_then(|()| file.sync_all())
             .map_err(|e| format!("config scratch write: {e}"))?;
     }
-    let published = std::fs::hard_link(&scratch, path);
-    let _ = std::fs::remove_file(&scratch);
-    match published {
-        Ok(()) => Ok(installation),
-        // Lost the create race: the winner's file is complete by the
-        // same publish rule, so adopt it.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            read(path)?.ok_or_else(|| "config: first writer's file vanished".into())
-        }
-        Err(e) => Err(format!("config publish: {e}")),
-    }
+    publish(path, &scratch)?;
+    // Return the file that actually won the publish, not necessarily the
+    // record this process staged: concurrent first writers must all
+    // report the one identity the installation now holds.
+    read(path)?.ok_or_else(|| "config: first writer's file vanished".into())
 }
 
 impl Installation {
@@ -169,5 +232,81 @@ impl Installation {
             }),
             budget: self.budget.clone().unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("workloop-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A filesystem without hard links still publishes the complete
+    /// staged config atomically by renaming it into place.
+    #[test]
+    fn publish_falls_back_to_rename_without_hard_links() {
+        let dir = temp_root("publish-fallback");
+        let path = dir.join("config.json");
+        let scratch = dir.join("scratch.tmp");
+        std::fs::write(
+            &scratch,
+            "{\"actor_id\":\"actor-fallback\",\"actor_kind\":\"human\"}",
+        )
+        .unwrap();
+
+        publish_with(&path, &scratch, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hard links unsupported",
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(
+            read(&path).unwrap().unwrap().actor_id,
+            "actor-fallback",
+            "the staged config was not published"
+        );
+        assert!(!scratch.exists(), "the scratch file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// If a concurrent writer publishes before the fallback rename, the
+    /// loser adopts that complete file instead of overwriting it.
+    #[test]
+    fn publish_fallback_adopts_a_concurrent_winner() {
+        let dir = temp_root("publish-winner");
+        let path = dir.join("config.json");
+        let scratch = dir.join("scratch.tmp");
+        std::fs::write(
+            &scratch,
+            "{\"actor_id\":\"actor-loser\",\"actor_kind\":\"human\"}",
+        )
+        .unwrap();
+        let winner = "{\"actor_id\":\"actor-winner\",\"actor_kind\":\"human\"}";
+
+        publish_with(&path, &scratch, move |_, target| {
+            std::fs::write(target, winner).unwrap();
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hard links unsupported",
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(
+            read(&path).unwrap().unwrap().actor_id,
+            "actor-winner",
+            "the loser overwrote the concurrent winner"
+        );
+        assert!(!scratch.exists(), "the scratch file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
