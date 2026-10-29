@@ -589,6 +589,146 @@ fn submit_local_fault_is_not_unknown() {
     );
 }
 
+/// A submit whose durable commit landed but whose response vanished is
+/// rendered `unknown` — the console's lost-response state — and settled
+/// by `command_result` under the caller's replay key, never reissued
+/// blindly or mutated.
+#[test]
+fn lost_submit_from_ambiguous_fault_is_unknown() {
+    use std::cell::Cell;
+
+    struct DroppedResponse<'a> {
+        inner: &'a SqliteStore,
+        drop_response: Cell<bool>,
+    }
+    impl Store for DroppedResponse<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            let result = self.inner.transact(f);
+            if self.drop_response.get() {
+                // The commit landed but the caller never sees its reply.
+                return Err(StoreError::Internal {
+                    detail: "connection reset after commit".into(),
+                });
+            }
+            result
+        }
+        fn transact_deferred<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            self.inner.transact_deferred(f)
+        }
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit_work(&store, "lu-seed");
+    let adapter = DroppedResponse {
+        inner: &store,
+        drop_response: Cell::new(true),
+    };
+    let mut session = TuiSession::new(&adapter, config(), actor());
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    let key = session.staged().unwrap().idempotency_key.clone();
+
+    let outcome = session.submit(NOW).unwrap();
+    assert!(
+        matches!(outcome, SubmitOutcome::Unknown),
+        "a landed-but-unacknowledged submit must be unknown, got {outcome:?}"
+    );
+    assert_eq!(session.pending().unwrap().idempotency_key, key);
+    assert!(session.staged().is_none(), "the lost request stayed armed");
+    let recorded = stored_decision(&store, &key).expect("the commit landed");
+
+    // `recover` finds the decision by the caller's replay key instead of
+    // issuing anything new.
+    match session.recover(NOW).unwrap() {
+        RecoverOutcome::Found(d) => assert_eq!(d.command_id(), recorded.command_id()),
+        other => panic!("expected found, got {other:?}"),
+    }
+    assert!(session.pending().is_none());
+}
+
+/// When `submit` reports an error and the session cannot read the result
+/// either, it must not conclude the Command failed to land: it renders
+/// `unknown`, and `recover` replays the identical key and payload.
+#[test]
+fn lost_submit_when_result_is_unreadable_is_unknown() {
+    use std::cell::Cell;
+
+    struct Blind<'a> {
+        inner: &'a SqliteStore,
+        blind: Cell<bool>,
+    }
+    impl Store for Blind<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            if self.blind.get() {
+                return Err(StoreError::Internal {
+                    detail: "write link down".into(),
+                });
+            }
+            self.inner.transact(f)
+        }
+        fn transact_deferred<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            if self.blind.get() {
+                return Err(StoreError::Internal {
+                    detail: "read link down".into(),
+                });
+            }
+            self.inner.transact_deferred(f)
+        }
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit_work(&store, "lub-seed");
+    let adapter = Blind {
+        inner: &store,
+        blind: Cell::new(false),
+    };
+    let mut session = TuiSession::new(&adapter, config(), actor());
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    session.stage_action(&Action::Cancel).unwrap();
+    let key = session.staged().unwrap().idempotency_key.clone();
+
+    adapter.blind.set(true);
+    let outcome = session.submit(NOW).unwrap();
+    assert!(
+        matches!(outcome, SubmitOutcome::Unknown),
+        "an unverifiable submit must be unknown, got {outcome:?}"
+    );
+    assert_eq!(session.pending().unwrap().idempotency_key, key);
+    assert!(
+        stored_decision(&store, &key).is_none(),
+        "nothing was recorded while the link was down"
+    );
+
+    adapter.blind.set(false);
+    let replayed = match session.recover(NOW).unwrap() {
+        RecoverOutcome::Replayed(d) => d,
+        other => panic!("expected replayed, got {other:?}"),
+    };
+    assert!(
+        matches!(replayed, CommandDecision::Accepted { .. }),
+        "{replayed:?}"
+    );
+    assert!(session.pending().is_none());
+    assert_eq!(
+        stored_decision(&store, &key).unwrap().command_id(),
+        replayed.command_id()
+    );
+}
+
 /// AC: disconnecting the TUI changes no execution truth — refresh,
 /// open, stage, and preview all leave the store byte-identical, and a
 /// fresh session sees the same truth the CLI does.

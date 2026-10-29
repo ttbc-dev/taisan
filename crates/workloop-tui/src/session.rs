@@ -355,12 +355,15 @@ impl<'a, S: Store> TuiSession<'a, S> {
 
     /// Submit the staged request through `work::handle_command`. A stale
     /// rejection re-queries the Work and clears the choices tied to the
-    /// old head. A local store fault returns `Err`: `transact` rolled the
-    /// attempt back, so no decision was recorded, and the request stays
-    /// staged with its identical key and payload for a retry — it is not
-    /// armed as an unknown result the operator must `recover`. A genuinely
-    /// lost response is recorded by `note_lost`, never inferred from a
-    /// fault the store reported.
+    /// old head. When the handler reports an error, the session asks
+    /// `command_result` for the same replay key before drawing a
+    /// conclusion: a definitively absent decision means `transact`
+    /// rolled the attempt back, so the fault is local, the request stays
+    /// staged with its identical key and payload, and `submit` returns
+    /// `Err`. A recorded decision, or an inability to read the result,
+    /// means the response was genuinely lost — the request is armed
+    /// (`note_lost`) and rendered `Unknown` for `recover` to settle,
+    /// never inferred from a fault the store reported.
     pub fn submit(&mut self, now_unix_seconds: i64) -> Result<SubmitOutcome, String> {
         if self.pending.is_some() {
             return Err("a submitted request's result is still unknown — run recover first".into());
@@ -373,10 +376,32 @@ impl<'a, S: Store> TuiSession<'a, S> {
                 self.on_decision(&decision, now_unix_seconds);
                 Ok(SubmitOutcome::Decided(decision))
             }
-            Err(e) => Err(format!(
-                "submit reached no decision: {e} — the request is still staged; \
-                 submitting again reissues the identical key and payload"
-            )),
+            Err(e) => {
+                let lookup = CommandResultLookup::ReplayKey {
+                    origin: req.origin.clone(),
+                    actor: req.actor.clone(),
+                    idempotency_key: req.idempotency_key.clone(),
+                };
+                let recorded = self
+                    .store
+                    .transact_deferred(|tx| projection::command_result(tx, &lookup));
+                match recorded {
+                    // The attempt definitely did not commit: a local
+                    // fault, not a lost response.
+                    Ok(QueryResult::NotFound) => Err(format!(
+                        "submit reached no decision: {e} — the request is still staged; \
+                         submitting again reissues the identical key and payload"
+                    )),
+                    // The decision (or the ability to read it) is not
+                    // absent: the submit's result is unknown until
+                    // `recover` settles it by key or identical replay.
+                    _ => {
+                        self.staged = None;
+                        self.note_lost(req);
+                        Ok(SubmitOutcome::Unknown)
+                    }
+                }
+            }
         }
     }
 
