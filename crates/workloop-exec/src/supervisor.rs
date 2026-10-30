@@ -955,7 +955,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             .any(|identity| identity.pid == leader.pid && identity.started_at != leader.started_at)
         {
             return Ok(Err(
-                "leader pid was reused before the descendant snapshot".into(),
+                "leader pid was reused before the descendant snapshot".into()
             ));
         }
         if !identities.iter().any(|i| i.pid == leader.pid) {
