@@ -82,7 +82,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 - Record known limitations and explicitly distinguish implemented capabilities from design proposals.
 - Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior.
 
-**v0.1 acceptance:** one Work can be selected, accepted, executed, observed, reviewed and either completed or surfaced as actionable Attention without external Kanban system, a selector implementation or a worker implementation being installed. Optional interfaces must not own independent execution truth.
+**v0.1 acceptance:** one Work can be submitted manually or proposed by the reference Selector, accepted, executed by the reference Worker, observed, reviewed and either completed or surfaced as actionable Attention without an external Kanban system. Replacing either adapter must preserve Core command, queue and outcome semantics; neither adapter owns independent execution truth.
 
 ## Scope discipline
 
