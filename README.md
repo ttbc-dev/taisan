@@ -49,6 +49,8 @@ The system can make routine implementation decisions within the supplied intent 
 
 - [Principles](docs/principles.md) — product and operational rules.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
+- [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
+- [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
 - [Module contracts](docs/module-contracts.md) — typed messages for every module connection and representative flows.
 - [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
