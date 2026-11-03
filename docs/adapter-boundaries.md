@@ -1,6 +1,6 @@
 # Selector and worker adapter boundaries
 
-Status: design proposal (2026-11-03). This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). It does not claim that these interfaces are implemented.
+Status: design proposal. This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). It does not claim that these interfaces are implemented.
 
 ## Goal
 
