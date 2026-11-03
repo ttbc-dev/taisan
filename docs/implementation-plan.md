@@ -1,6 +1,6 @@
-# Workloop re-modeling and implementation plan
+# Workloop v0.1 implementation plan
 
-Status: proposed plan, 2026-11-03. Target: credible OSS demonstration for the 2026-12-08 webinar, with slides frozen by 2026-12-01. No milestone or Issue creation is implied.
+Status: proposed plan through v0.1. This document defines capability milestones and acceptance criteria, not calendar commitments. No milestone or Issue creation is implied.
 
 ## Objective and constraints
 
@@ -44,45 +44,45 @@ Do not claim all these failures are currently unresolved; check corresponding me
 
 Record each as a short decision and update `architecture.md`, `module-contracts.md` and `lifecycle.md` once agreed. Do not introduce a graph framework by default; derive complexity from the actual transitions.
 
-## Implementation sequence and acceptance gates
+## Implementation phases through v0.1
 
-### Phase A — 2026-11-03 to 11-09: baseline and contract freeze
+Phases are ordered by dependencies and verified capabilities, not by dates. Each phase has an acceptance gate; implementation can proceed incrementally and parallelize independent work.
 
-- Run `cargo fmt --check`, `cargo build`, `cargo test`, `cargo clippy -- -D warnings`; record actual results and CI gaps.
-- Inventory implemented vs specified Slice 0 behavior, including stop-proof and crash tests.
-- Audit Hermes loop incidents against the table above; resolve adapter and outcome contracts.
-- Deliverable: executable gap matrix, revised contracts and an agreed end-to-end scenario.
+### Phase 1 — Baseline and contract alignment
 
-**Gate:** no ambiguity about which component can create Work, launch a worker, retry, or settle an outcome.
+- Run `cargo fmt --check`, `cargo build`, `cargo test`, `cargo clippy -- -D warnings`; record results and CI gaps.
+- Inventory implemented versus specified Slice 0 behavior, including stop-proof and crash tests.
+- Audit Hermes loop incidents against the table above; resolve selector, worker and outcome contracts.
+- Deliverable: implementation gap matrix, revised contracts and one agreed end-to-end scenario.
 
-### Phase B — 2026-11-10 to 11-16: adapter skeletons and core correctness
+**Gate:** ownership is unambiguous: who proposes Work, who accepts it, who launches Invocations, who retries and who settles Outcomes.
 
-- Introduce a Selector port and trivial GitHub single-issue selector; keep submission behind Core admission.
-- Introduce or adapt a thin Worker port; implement the Claude Code CLI reference runner through the existing supervisor.
-- Close the highest-risk Slice 0 invariants and add CI; test duplicate proposal, lost launch response and stop uncertainty.
-- Deliverable: one selected Issue becomes queued Work, then a real bounded Invocation, with evidence and safe stop.
+### Phase 2 — Core reliability and reference adapters
 
-**Gate:** no duplicate launch or conflicting writer even under injected failure.
+- Introduce a Selector port and a minimal GitHub single-issue selector; keep admission behind Core.
+- Introduce or adapt a thin Worker port and a Claude Code CLI reference adapter using the existing supervisor.
+- Close high-risk Slice 0 invariant gaps and add CI; test duplicate proposals, lost launch responses and uncertain stops.
+- Deliverable: a selected Issue becomes queued Work and a bounded real Invocation with durable evidence.
 
-### Phase C — 2026-11-17 to 11-23: real GitHub and loop E2E
+**Gate:** no duplicate launch or conflicting writer under injected failure; existing Work continues if selector is unavailable.
 
-- Implement/verify GitHub PR publication and observations, head-bound checks/reviews.
+### Phase 3 — GitHub integration and bounded loop
+
+- Implement or verify real GitHub PR publication and Observations, head-bound checks and reviews.
 - Drive coding → PR → review → bounded fix → reassessment → completion or human Attention.
-- Verify restart/reconciliation, stale head, unavailable adapter, failed artifact, budget exhaustion and cancellation.
-- Deliverable: repeatable, recorded end-to-end demo on an isolated test repository.
+- Verify restart/reconciliation, stale head, unavailable adapters, missing artifacts, budget exhaustion and cancellation.
+- Deliverable: repeatable, evidence-backed end-to-end execution on an isolated test repository.
 
-**Go/no-go on Nov 23:** if real E2E is unreliable, demo the proven core + fixture workflow and show real GitHub integration as explicitly incomplete. Do not weaken invariants to hit the talk date.
+**Gate:** Workloop owns all decisions; neither selector nor worker can silently retry, settle or bypass state guards.
 
-### Phase D — 2026-11-24 to 11-30: OSS readiness and talk
+### Phase 4 — v0.1 validation and distribution
 
-- README, quickstart, sample config, architecture/contract diagrams, security and permission model, failure-mode guide, reference adapter documentation.
-- Verify clean installation and demo reproduction; record backup walkthrough.
-- Prepare 30–35 minute presentation anchored in operational failures and the re-modeled loop.
-- Deliverable: demonstrable tagged/reproducible state and finished slides by **Dec 1**.
+- Document installation, quickstart, sample config, architecture, permissions, failure modes and both reference adapters.
+- Verify a clean installation, contract tests, failure injection and reproducible end-to-end walkthrough.
+- Record known limitations and explicitly distinguish implemented capabilities from design proposals.
+- Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior.
 
-### Phase E — 2026-12-01 to 12-08: freeze and rehearsal
-
-Only critical fixes after slide freeze. Rehearse with recorded fallback; validate timing and Q&A.
+**v0.1 acceptance:** one Work can be selected, accepted, executed, observed, reviewed and either completed or surfaced as actionable Attention without Hermes Kanban, devflow or coding-worker being installed. Optional interfaces must not own independent execution truth.
 
 ## Scope discipline
 
@@ -101,8 +101,8 @@ Only critical fixes after slide freeze. Rehearse with recorded fallback; validat
 | Worker | Start/observe/stop contract; lost response, crash, uncertain process tests |
 | GitHub | PR-head binding, delayed/duplicate webhook, outbox and reconciliation tests |
 | Loop | Bounded review/fix, terminal intent retirement, human Attention |
-| Demo | Clean setup, isolated repository, reproducible E2E or documented fixture fallback |
+| v0.1 | Clean setup, isolated repository, reproducible E2E and documented limitations |
 
 ## Open risks
 
-The proposed timeline is a target, not an estimate backed by a complete code audit. The existing Rust code may require significant correctness work. Real GitHub credentials/permissions and Claude Code invocation behavior must be tested in isolation. The adapter boundary must not pretend every worker can resume or publish a PR. Revisit scope at each acceptance gate.
+Phase scope and effort remain provisional until the code audit is complete. The existing Rust code may require significant correctness work. Real GitHub credentials/permissions and Claude Code invocation behavior must be tested in isolation. The adapter boundary must not pretend every worker can resume or publish a PR. Revisit scope at each acceptance gate.
