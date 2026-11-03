@@ -4,7 +4,7 @@ Status: proposed plan through v0.1. This document defines capability milestones 
 
 ## Objective and constraints
 
-Re-model the **loop management** proven in Hermes Setup as an independent Rust control plane. Reuse its operational lessons, not its overgrown Kanban state machine. Work selection/grouping (currently devflow) and execution (Claude Code, coding-worker, others) are **replaceable adapters**, each with a deliberately thin reference implementation. The hard engineering investment belongs in core lifecycle, execution ownership, reconciliation, bounded review/fix and human Attention.
+Build an independent Rust control plane from explicit lifecycle invariants and failure scenarios. Work selection and grouping, and execution by coding or review tools, are **replaceable adapters** with deliberately thin reference implementations. The hard engineering investment belongs in core lifecycle, execution ownership, reconciliation, bounded review/fix and human Attention.
 
 Preserve the already documented Work / Execution / Invocation distinction, durable Command/Query, SQLite authority, queue, and evidence-driven recovery. Prefer completing and correcting the existing implementation over replacing it.
 
@@ -16,9 +16,9 @@ Preserve the already documented Work / Execution / Invocation distinction, durab
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.
 
-## Source-of-truth audit: Hermes Setup → Workloop
+## Source-of-truth audit: external workflow implementations → Workloop
 
-Audit `hermes-setup`'s `devin-milestone.py` loop/lane, dispatch, reconciliation, attention, and `coding-worker` integration as **behavioral evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination Workloop invariant. Classify as **retain**, **re-model**, or **omit**.
+Audit lifecycle, dispatch, reconciliation, Attention, and worker integration behavior as **design evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination Workloop invariant. Classify as **retain**, **re-model**, or **omit**.
 
 | Existing behavior / incident class | Target invariant | Design treatment |
 | --- | --- | --- |
@@ -29,8 +29,8 @@ Audit `hermes-setup`'s `devin-milestone.py` loop/lane, dispatch, reconciliation,
 | Converge pending/review signal wedges | Head-bound evidence, timeouts and bounded decisions | Re-model |
 | Worker exits but PR/artifacts survive | Separate process, publication and outcome facts | Retain semantics, redesign records |
 | Stop/restart while old writer might still exist | Stop proof before ownership transfer | Retain invariant |
-| Hermes-specific Telegram, general Kanban boards, card decoration | Not core lifecycle | Omit |
-| devflow issue grouping and coding-worker internal pipelines | External responsibilities | Adapter boundary; no migration |
+| Platform-specific messaging, general Kanban boards, card decoration | Not core lifecycle | Omit |
+| Selector grouping and worker internal pipelines | External responsibilities | Adapter boundary; no migration |
 
 Do not claim all these failures are currently unresolved; check corresponding merged PRs and current code. Convert verified incident reproductions into contract tests rather than copying their fixes line-for-line.
 
@@ -52,7 +52,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 - Run `cargo fmt --check`, `cargo build`, `cargo test`, `cargo clippy -- -D warnings`; record results and CI gaps.
 - Inventory implemented versus specified Slice 0 behavior, including stop-proof and crash tests.
-- Audit Hermes loop incidents against the table above; resolve selector, worker and outcome contracts.
+- Audit representative loop incidents against the table above; resolve selector, worker and outcome contracts.
 - Deliverable: implementation gap matrix, revised contracts and one agreed end-to-end scenario.
 
 **Gate:** ownership is unambiguous: who proposes Work, who accepts it, who launches Invocations, who retries and who settles Outcomes.
@@ -82,15 +82,15 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 - Record known limitations and explicitly distinguish implemented capabilities from design proposals.
 - Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior.
 
-**v0.1 acceptance:** one Work can be selected, accepted, executed, observed, reviewed and either completed or surfaced as actionable Attention without Hermes Kanban, devflow or coding-worker being installed. Optional interfaces must not own independent execution truth.
+**v0.1 acceptance:** one Work can be selected, accepted, executed, observed, reviewed and either completed or surfaced as actionable Attention without external Kanban system, a selector implementation or a worker implementation being installed. Optional interfaces must not own independent execution truth.
 
 ## Scope discipline
 
 **Must have:** independent core, explicit selector and worker contracts, minimal reference implementations, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
 
-**Can defer:** sophisticated grouping, coding-worker-specific adapter, multiple worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
+**Can defer:** sophisticated grouping, a worker implementation-specific adapter, multiple worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
 
-**Do not do:** port Hermes Kanban wholesale, make devflow or coding-worker mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
+**Do not do:** port external Kanban system wholesale, make a selector implementation or a worker implementation mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
 
 ## Verification matrix
 
