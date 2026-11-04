@@ -70,6 +70,63 @@ fn claimed_head_without_a_push_is_a_failure_that_preserves_evidence() {
 }
 
 #[test]
+fn produced_head_not_published_is_a_failure_even_when_the_old_head_is_live() {
+    // PRR-763b099779 / hermes-setup #445: the executor produced "bbb"
+    // locally but its push only carried the older "aaa". "aaa" is the
+    // live head, yet the actual fix never reached the PR — never Fixed.
+    let record = record("aaa", "bbb", Some("aaa"));
+    assert_eq!(
+        record.classify("aaa", false),
+        ConvergeClassification::UnpublishedFailure {
+            live_head: "aaa".into(),
+            record: record.clone(),
+        }
+    );
+    // The produced head survives as evidence, not something to drop.
+    let ConvergeClassification::UnpublishedFailure {
+        record: preserved, ..
+    } = record.classify("aaa", false)
+    else {
+        panic!("expected an UnpublishedFailure");
+    };
+    assert_eq!(preserved.head_after, "bbb");
+    assert_eq!(preserved.pushed_sha.as_deref(), Some("aaa"));
+    // An ancestry flag about that older push cannot resurrect the claim.
+    assert_eq!(
+        record.classify("ccc", true),
+        ConvergeClassification::UnpublishedFailure {
+            live_head: "ccc".into(),
+            record: record.clone(),
+        }
+    );
+}
+
+#[test]
+fn no_op_push_of_the_unchanged_head_is_nothing_to_fix() {
+    // Symmetric #445 hole: a run that changed nothing but re-reported
+    // the unchanged head is not a published fix.
+    let unchanged = record("aaa", "aaa", Some("aaa"));
+    assert_eq!(
+        unchanged.classify("aaa", false),
+        ConvergeClassification::NothingToFix
+    );
+    assert_eq!(
+        unchanged.classify("bbb", true),
+        ConvergeClassification::NothingToFix
+    );
+    // An inconsistent record (no change produced, yet a different SHA
+    // pushed) is not honestly a no-op; preserve it as a failure.
+    let inconsistent = record("aaa", "aaa", Some("ccc"));
+    assert_eq!(
+        inconsistent.classify("ccc", false),
+        ConvergeClassification::UnpublishedFailure {
+            live_head: "ccc".into(),
+            record: inconsistent.clone(),
+        }
+    );
+}
+
+#[test]
 fn pushed_head_that_does_not_reach_the_live_head_is_a_failure() {
     // Diverged from the live head (or pushed somewhere the PR cannot
     // see): publication does not verify, so the claim fails with the

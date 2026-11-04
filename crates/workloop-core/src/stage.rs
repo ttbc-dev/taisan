@@ -33,9 +33,9 @@ pub struct ConvergeRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConvergeClassification {
-    /// Publication verified: the pushed head is the live PR head or an
-    /// ancestor of it. The only classification that may count as
-    /// `review-fixed`.
+    /// Publication verified: the pushed head is the produced head
+    /// (`head_after`) and is the live PR head or an ancestor of it. The
+    /// only classification that may count as `review-fixed`.
     Fixed { pushed_sha: String },
     /// Nothing was produced or claimed: the head did not move and
     /// nothing was pushed.
@@ -53,31 +53,49 @@ impl ConvergeRecord {
     /// Classify against the live PR head. `pushed_is_ancestor_of_live`
     /// must come from the coordinator's own verification (GitHub compare
     /// or an ancestry read) of `self.pushed_sha`, never from the
-    /// executor's claim. A result counts as fixed only when the pushed
-    /// head verifies against the live PR head — equal to it or an
-    /// ancestor of it; any other fix claim is an `UnpublishedFailure`
-    /// carrying the full record as evidence.
+    /// executor's claim. A result counts as fixed only when the produced
+    /// head was the one published (`pushed_sha == head_after`) and that
+    /// pushed head verifies against the live PR head — equal to it or an
+    /// ancestor of it. Any other fix claim, including a push that
+    /// carried a different head than the fix produced, is an
+    /// `UnpublishedFailure` carrying the full record as evidence.
     pub fn classify(
         &self,
         live_head: &str,
         pushed_is_ancestor_of_live: bool,
     ) -> ConvergeClassification {
-        match &self.pushed_sha {
-            Some(pushed) if pushed == live_head || pushed_is_ancestor_of_live => {
+        // Nothing produced: the head did not move. A no-op push of that
+        // unchanged head is still nothing to fix, not a published fix.
+        if self.head_after == self.head_before {
+            return match self.pushed_sha.as_deref() {
+                None => ConvergeClassification::NothingToFix,
+                Some(pushed) if pushed == self.head_after => ConvergeClassification::NothingToFix,
+                Some(_) => ConvergeClassification::UnpublishedFailure {
+                    live_head: live_head.to_string(),
+                    record: self.clone(),
+                },
+            };
+        }
+        // A produced fix must be the head that was actually published.
+        // Reporting a pushed SHA that is not the produced head means the
+        // produced commits never reached the PR — even when that SHA
+        // verifies against the live head (hermes-setup #445: the push
+        // carried the old head, the fix stayed in the workspace).
+        match self.pushed_sha.as_deref() {
+            Some(pushed)
+                if pushed == self.head_after
+                    && (pushed == live_head || pushed_is_ancestor_of_live) =>
+            {
                 ConvergeClassification::Fixed {
-                    pushed_sha: pushed.clone(),
+                    pushed_sha: pushed.to_string(),
                 }
             }
-            Some(_) => ConvergeClassification::UnpublishedFailure {
-                live_head: live_head.to_string(),
-                record: self.clone(),
-            },
-            None if self.head_after == self.head_before => ConvergeClassification::NothingToFix,
-            // A new head claimed with no pushed SHA: commits that never
-            // reached the PR (hermes-setup #445) — a failure that
-            // preserves the record, never a success. An ancestry flag
-            // about a nonexistent push cannot manufacture one.
-            None => ConvergeClassification::UnpublishedFailure {
+            // A new head claimed with no pushed SHA, a mismatched SHA,
+            // or a push that does not verify against the live head: a
+            // failure that preserves the whole record, never a success.
+            // An ancestry flag about a push that does not carry the
+            // produced head cannot manufacture one.
+            _ => ConvergeClassification::UnpublishedFailure {
                 live_head: live_head.to_string(),
                 record: self.clone(),
             },
