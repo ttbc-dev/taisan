@@ -7,10 +7,11 @@ which existing operational behavior belongs in v0.1 — classified as
 decision. It does not authorize implementation; it ends at scope definition
 and implementation planning.
 
-The four source repositories are private. Per this repository's
-source-reference rule (see `AGENTS.md`), they are referenced by role, not
-by name, and their internal file paths and symbols are described rather
-than reproduced:
+The four source repositories are private. Publication-facing documents
+reference them by role, not by name (see `AGENTS.md`). This audit record
+is the owner-controlled exception: it retains issue numbers, revision
+SHAs, and source-internal module names as owner-verifiable evidence
+locators so each mapping can be re-checked against the sources:
 
 | Role name used here | What it is |
 | --- | --- |
@@ -19,8 +20,7 @@ than reproduced:
 | **the selector repo** | the harness-agnostic issue-selection tool |
 | **the infra repo** | the remote-execution infrastructure running bounded worker jobs in isolated containers |
 
-Issue numbers and recorded revision SHAs are retained as owner-verifiable
-evidence locators; they identify nothing without access to the sources.
+These locators identify nothing without access to the sources.
 `agent-workloop` is itself private today; if it is ever published, this
 document needs a disclosure review first. Publication-facing documents
 carry only a minimal origin statement (see `docs/provenance.md`); the

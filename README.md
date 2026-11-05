@@ -56,7 +56,7 @@ The system can make routine implementation decisions within the supplied intent 
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
-- [Provenance](docs/provenance.md) — source-system origins, reference audit, and implementation status.
+- [Provenance](docs/provenance.md) — source-system origins by role, implementation status, and the audit-record pointer.
 
 ## v0.1 direction
 
