@@ -56,7 +56,13 @@ It provides:
 - `request_stop(request_id)`: request cancellation; **not** proof that writers stopped;
 - optional `resume` capability declared by the adapter; absence means Workloop cannot assume an internal session can be resumed.
 
+Worker-internal mechanics stay inside the adapter: how a process is launched, how requests and results are translated to and from the worker's own formats, authentication to the worker runtime, internal session state, and any resume implementation. None of these may surface in Core types, state transitions, or Outcome decisions — the Core contract above is the whole boundary. Capabilities are either required by this contract or explicitly declared optional; an adapter must never silently emulate a capability it does not support, or compensate by altering Command, queue, budget, or Outcome semantics.
+
 The core supervisor persists launch intent, owns resource reservations, and establishes stop proof before authorizing a conflicting writer. Worker exit code, self-reported success, PR URL or a model's summary are evidence, not Work completion. Results must be tied to the Invocation and, for review, the reviewed PR head. Replays must not silently start a second worker.
+
+**Adapter selection and interchange.** The Worker adapter is chosen through installation config — the `worker_argv` entry point today; the exact selection key is an implementation detail — never by changing Core. Any implementation conforming to this contract is interchangeable for *new* Invocation requests. Interchange does not transfer a running Invocation to a different worker, and it requires no migration of adapter-internal state.
+
+The Worker contract test suite below is shared: it runs unchanged against every adapter implementation, covering failure behavior (lost start response, duplicate request delivery, unobservable liveness, stop proof, missing artifacts, stale-head evidence) as well as the happy path. A second, independently implemented adapter that replays scripted results is sufficient to prove interchangeability — it does not need to be a real coding agent.
 
 **Reference worker:** a thin Claude Code CLI process adapter that launches one bounded request in an isolated workspace, captures exit/process identity and output artifacts, and exposes cancellation and observation. No built-in planning pipeline, review framework or proprietary Claude Code-specific state in Core. Other worker adapters are valid implementations; their internal orchestration must not supersede core retry or settlement authority.
 
@@ -75,7 +81,8 @@ CLI, TUI and GitHub comments are **control interfaces** translating human/automa
 7. Review result refers to an old head: cannot settle a newer head.
 8. Swap two conforming worker implementations: Workloop command, queue, budget and outcome semantics remain unchanged.
 9. An adapter attempts to request retry or change a Work state directly: rejected; only Commands through Core may do so.
+10. The same Invocation request is delivered twice: reconciled by request identity; no duplicate start or duplicate effect.
 
 ## Non-goals
 
-No external Kanban migration or synchronization, no general plugin marketplace or dynamic loader, no automatic semantic grouping in the reference selector, and no model-specific orchestration inside the core.
+No external Kanban migration or synchronization, no general plugin marketplace or dynamic loader, no automatic semantic grouping in the reference selector, and no model-specific orchestration inside the core. Adapter interchange excludes live handoff of a running Invocation to a different Worker, migration of adapter-internal saved state, and any mechanism for switching workers mid-Invocation.
