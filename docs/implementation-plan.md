@@ -1,4 +1,4 @@
-# Workloop v0.1 implementation plan
+# taisan v0.1 implementation plan
 
 Status: proposed plan through v0.1. This document defines capability milestones and acceptance criteria, not calendar commitments. No milestone or Issue creation is implied.
 
@@ -16,9 +16,9 @@ Preserve the already documented Work / Execution / Invocation distinction, durab
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.
 
-## Source-of-truth audit: prior workflow implementations → Workloop
+## Source-of-truth audit: prior workflow implementations → taisan
 
-Audit lifecycle, dispatch, reconciliation, Attention, and worker integration behavior as **design evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination Workloop invariant. Classify as **retain**, **re-model**, or **omit**.
+Audit lifecycle, dispatch, reconciliation, Attention, and worker integration behavior as **design evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination taisan invariant. Classify as **retain**, **re-model**, or **omit**.
 
 | Existing behavior / incident class | Target invariant | Design treatment |
 | --- | --- | --- |
@@ -38,7 +38,7 @@ Do not claim all these failures are currently unresolved; check corresponding me
 
 1. **Selector admission:** proposal identity, dedup across overlapping issue groups, source freshness, allowlist and unattended submission policy. Keep manual submit as fallback.
 2. **Worker boundary:** durable invocation request, evidence schema, start/observe/stop semantics, resume capability and stage roles; separate worker report from authoritative outcome.
-3. **Review/converge ownership:** Workloop controls review/fix rounds and budgets; workers perform individual stages. Define how an adapter with its own internal workflow reports intermediate evidence without taking over Workloop settlement.
+3. **Review/converge ownership:** taisan controls review/fix rounds and budgets; workers perform individual stages. Define how an adapter with its own internal workflow reports intermediate evidence without taking over taisan settlement.
 4. **Recovery:** ownership across crashes, uncertain launch, resource reservations, outbox reconciliation, terminal cleanup and human intervention.
 5. **Completion contract:** verified PR head, checks, review evidence, writer stop and explicit policy for human merge/approval. Avoid interpreting a green worker exit as completion.
 
@@ -73,7 +73,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 - Verify restart/reconciliation, stale head, unavailable adapters, missing artifacts, budget exhaustion and cancellation.
 - Deliverable: repeatable, evidence-backed end-to-end execution on an isolated test repository.
 
-**Gate:** Workloop owns all decisions; neither selector nor worker can silently retry, settle or bypass state guards.
+**Gate:** taisan owns all decisions; neither selector nor worker can silently retry, settle or bypass state guards.
 
 ### Phase 4 — v0.1 validation and distribution
 

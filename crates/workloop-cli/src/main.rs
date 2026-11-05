@@ -1,4 +1,4 @@
-//! `workloop` — the command/query surface and composition-root run loop.
+//! `taisan` — the command/query surface and composition-root run loop.
 //! The CLI validates and shapes input only; every decision goes through
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
@@ -17,7 +17,11 @@ use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
 #[derive(Parser)]
-#[command(name = "workloop", about = "GitHub development workloop (slice 0)")]
+#[command(
+    name = "taisan",
+    bin_name = "taisan",
+    about = "taisan work orchestration loop (slice 0)"
+)]
 struct Cli {
     /// SQLite store path.
     #[arg(long, global = true, default_value = "workloop.db")]
@@ -210,10 +214,10 @@ fn print(value: &impl serde::Serialize) {
     );
 }
 
-fn main() {
+pub(crate) fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("workloop: {e}");
+        eprintln!("taisan: {e}");
         std::process::exit(1);
     }
 }

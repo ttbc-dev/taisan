@@ -1465,7 +1465,7 @@ fn store_faults_surface_as_errors() {
         .expect("workloop-tui spawns");
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("workloop-tui:"),
+        String::from_utf8_lossy(&output.stderr).contains("taisan-tui:"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
