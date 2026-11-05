@@ -25,6 +25,12 @@ the design remains traceable; the repositories themselves, their histories,
 and their contents are not distributed with this project and are not
 consulted at build or runtime.
 
+Non-secret component names from those repositories (for example the Kanban
+console, `cw-dispatch`, or `ship`/`converge`) are retained deliberately as
+provenance pointers — they identify which behavior was used as evidence.
+They are not credentials, personal paths, or secrets, and they imply no
+access to the private repositories.
+
 ## Provenance versus dependency
 
 A **provenance reference** explains why a rule or boundary exists. It is
@@ -75,7 +81,8 @@ readers of this repository).
 | `shimpeiws/hermes-setup` PR 386 — "feat: expose Kanban console overview and work detail projections (#372)" | Same section, now cited by name | **Valid target, private access** — merged 2026-10-23; adds `kanban-dev-console-rust` with `preflight → submit`, snapshot refresh, and lost-response replay, matching the described interaction | `gh api repos/shimpeiws/hermes-setup/pulls/386` (owner-verifiable only; the repository is private) |
 | `shimpeiws/hermes-setup`, `shimpeiws/coding-worker`, `shimpeiws/devflow`, `shimpeiws/coding-worker-infra` | This document | **Valid targets, private access** — all four exist and are private | `gh repo view` on each name |
 | Internal links between `README.md` and `docs/*.md` | All documents | **Valid** — every relative link and heading anchor resolves | Scripted link check over the repository's Markdown files |
-| "Auditor" | `docs/implementation-plan.md` deferred list | **Unresolved** — no repository or component by that name was found under the project account; documented here rather than inventing a target | `gh repo view`/`gh search repos` returned no match |
+| "Auditor" | `docs/implementation-plan.md` deferred list | **Unresolved** — no repository or component by that name was found under the project account or in the source repositories; documented here rather than inventing a target | `gh repo view`/`gh search repos`/`gh search code` and tree inspection returned no match |
+| Tracker references `#17`, `#28`, `#33`–`#36` | This document and `docs/implementation-plan.md` | **Valid** — open issues matching the cited topics (real GitHub adapter, CI pipeline, source-workflow audit, acceptance definition, ownership contract, E2E planning) | `gh issue list` / `gh issue view` at audit time |
 
 Unresolved or inaccessible targets are recorded explicitly; no replacement
 URLs were invented.
@@ -97,7 +104,12 @@ distinguishing implemented foundations, fixtures, and missing integrations.
 - `workloop-cli` — command/query surface and composition-root run loop
   (submit, retry, resume, cancel, review judgment, resource claims, queries,
   dispatch, and budget sweep).
-- `workloop-tui` — management TUI over the same Command/Query contracts.
+- `workloop-tui` — management TUI over the same Command/Query contracts;
+  the review-judgment flow (head-scoped findings, per-finding decisions,
+  advisory preflight, stale-head requery) is covered by
+  `judge_findings_flow_end_to_end`, `incomplete_draft_cannot_submit`, and
+  `stale_head_rejection_requeries_and_clears_choices` in
+  `crates/workloop-tui/tests/tui_surface.rs`.
 - `workloop-config` — installation config: actor identity, worker argv,
   capacity, workspace root, and allowed effects.
 
@@ -124,9 +136,10 @@ distinguishing implemented foundations, fixtures, and missing integrations.
 
 ### Documents checked
 
-`README.md` and every file in `docs/`: `principles.md`, `architecture.md`,
-`adapter-boundaries.md`, `implementation-plan.md`, `module-contracts.md`,
-`lifecycle.md`, `glossary.md`, `v0.1.md`, `decisions.md`.
+`README.md` and every file in `docs/` (including this document):
+`principles.md`, `architecture.md`, `adapter-boundaries.md`,
+`implementation-plan.md`, `module-contracts.md`, `lifecycle.md`,
+`glossary.md`, `v0.1.md`, `decisions.md`, `provenance.md`.
 
 ### Corrections made
 
