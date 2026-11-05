@@ -88,7 +88,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 **Must have:** independent core, explicit selector and worker contracts, minimal reference implementations, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
 
-**Can defer:** sophisticated grouping, a worker implementation-specific adapter, multiple worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
+**Can defer:** sophisticated grouping, a worker implementation-specific adapter, multiple worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex audit automation, cross-host scheduling, broad enterprise integrations.
 
 **Do not do:** port external Kanban system wholesale, make a selector implementation or a worker implementation mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
 

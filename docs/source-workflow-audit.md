@@ -53,9 +53,10 @@ Notes on inspection fidelity:
 - The local checkouts of the selector and infra repos were not on `main`
   (one ahead of `origin/main`, one on a pinned lane branch); claims were
   likewise verified against `origin/main`.
-- Symbol-level locators (file paths, function names, line numbers) were
-  collected during inspection and are described by role below rather
-  than reproduced, per the source-reference rule.
+- Symbol-level locators were collected during inspection. File paths,
+  function names, and line numbers are not reproduced; module, command,
+  and component names are retained as owner-verifiable locators under
+  the audit-record exception in `AGENTS.md`.
 - The ops repo's converge state-transitions design document is itself a
   design audit pinned to earlier revisions (`839094bb` ops / `e6c16686`
   worker); where this document cites it as evidence, the underlying
