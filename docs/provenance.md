@@ -27,9 +27,9 @@ referred to here by role, using the legend in the audit document:
 | the infra repo | Remote execution infrastructure running bounded worker jobs in isolated containers | Execution-environment evidence: bounded runs, idempotent lifecycle operations, and the observation that a lost acknowledgement is not proof of failure |
 
 All four systems are private. Their names, contents, histories, and
-internal identifiers are not distributed with this project and are not
-consulted at build or runtime; the audit document records what was
-inspected and at which revisions.
+internal identifiers are not reproduced in this project's
+publication-facing documents and are not consulted at build or runtime;
+the audit document records what was inspected and at which revisions.
 
 ## Provenance versus dependency
 
