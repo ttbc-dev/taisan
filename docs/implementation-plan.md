@@ -10,8 +10,8 @@ Preserve the already documented Work / Execution / Invocation distinction, durab
 
 ## Current repository baseline (code inspection, not test verification)
 
-- Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-github` fixture, and `workloop-tui` source.
-- The CLI already exposes submit/retry/resume/cancel, review judgment, queries, run loop.
+- Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-config`, `workloop-github` fixture, `workloop-fixture-worker`, and `workloop-tui`.
+- The CLI already exposes submit/retry/resume/cancel, review judgment, queries, run loop; the TUI implements the same Command/Query contracts including the review-judgment flow.
 - `workloop-github/src/lib.rs` exports only `fixture` at inspection time; a real GitHub adapter must be verified/implemented.
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.

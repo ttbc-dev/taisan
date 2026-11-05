@@ -15,7 +15,7 @@ The initial deployment may place these in one process and one local database. Th
 
 ## Module map
 
-This is the intended module boundary. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. External coding agents and review tools can implement these roles through adapters.
+This is the intended module boundary. The outer box marks this repository's scope, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. External coding agents and review tools can implement these roles through adapters.
 
 ```mermaid
 flowchart LR
