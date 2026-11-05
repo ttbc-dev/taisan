@@ -22,7 +22,10 @@ than reproduced:
 Issue numbers and recorded revision SHAs are retained as owner-verifiable
 evidence locators; they identify nothing without access to the sources.
 `agent-workloop` is itself private today; if it is ever published, this
-document needs a disclosure review first.
+document needs a disclosure review first. Publication-facing documents
+carry only a minimal origin statement (see `docs/provenance.md`); the
+name- and identifier-level detail removed there is preserved in this
+repository's git history.
 
 ## Inspected revisions and scope
 

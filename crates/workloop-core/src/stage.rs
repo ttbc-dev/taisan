@@ -1,9 +1,12 @@
 //! Stage contracts: what a stage *means*, independent of the executor
 //! that runs it. An executor cell — local, remote, or a future provider —
-//! selects where a stage runs, never what it may skip. Recorded from
-//! production: hermes-setup #445 (a remote converge with no publication
-//! stage) and #446 (a reviewer axis silently dropped for bot-authored
-//! PRs); fix in hermes-setup PR #447.
+//! selects where a stage runs, never what it may skip. The rules below
+//! were distilled from two production failure modes in the source
+//! workflow (tracked here as issue #21): a converge stage that could
+//! report success while its fix commits never reached the PR, and a
+//! reviewer axis silently dropped for bot-authored PRs. The incident
+//! analysis lives in `docs/source-workflow-audit.md`; the regression
+//! scenarios are pinned by `tests/stage_contract.rs`.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,7 +82,7 @@ impl ConvergeRecord {
         // A produced fix must be the head that was actually published.
         // Reporting a pushed SHA that is not the produced head means the
         // produced commits never reached the PR — even when that SHA
-        // verifies against the live head (hermes-setup #445: the push
+        // verifies against the live head (observed failure: the push
         // carried the old head, the fix stayed in the workspace).
         match self.pushed_sha.as_deref() {
             Some(pushed)
@@ -145,7 +148,8 @@ pub enum MatrixConfigError {
 /// configuration-validation time rather than run with a degraded
 /// reviewer axis. All six executor × reviewer cells are supported
 /// because the adapter event-filter contract exempts lane-produced
-/// bot-authored PRs and heads (hermes-setup #446).
+/// bot-authored PRs and heads — a filter that drops them starves the
+/// lane's own review loop (the observed silent-reviewer failure).
 const SUPPORTED_MATRIX_CELLS: [(Executor, Reviewer); 6] = [
     (Executor::Local, Reviewer::Devin),
     (Executor::Local, Reviewer::Shadow),
@@ -160,7 +164,7 @@ const SUPPORTED_MATRIX_CELLS: [(Executor, Reviewer); 6] = [
 /// in `SUPPORTED_MATRIX_CELLS`. On success it returns the reviewer axis
 /// exactly as configured: no executor cell may rewrite or default it,
 /// and an unknown value is a configuration error rather than a fallback
-/// (hermes-setup #446: remote-lane shadow review must stay shadow).
+/// (a remote executor must never silently downgrade shadow review).
 pub fn validate_review_matrix(
     executor: &str,
     reviewer: &str,

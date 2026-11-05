@@ -43,10 +43,10 @@ fn pushed_head_verified_as_ancestor_of_live_head_classifies_fixed() {
 
 #[test]
 fn claimed_head_without_a_push_is_a_failure_that_preserves_evidence() {
-    // hermes-setup #445: local commits existed (`head_after` moved) but
-    // nothing reached the PR. Never a success — and the whole record
-    // survives as evidence. An ancestry flag about a nonexistent push
-    // cannot manufacture a success either.
+    // Regression for the unpublished-fix failure: local commits existed
+    // (`head_after` moved) but nothing reached the PR. Never a success —
+    // and the whole record survives as evidence. An ancestry flag about a
+    // nonexistent push cannot manufacture a success either.
     let record = record("aaa", "bbb", None);
     for pushed_is_ancestor_of_live in [false, true] {
         assert_eq!(
@@ -71,9 +71,9 @@ fn claimed_head_without_a_push_is_a_failure_that_preserves_evidence() {
 
 #[test]
 fn produced_head_not_published_is_a_failure_even_when_the_old_head_is_live() {
-    // PRR-763b099779 / hermes-setup #445: the executor produced "bbb"
-    // locally but its push only carried the older "aaa". "aaa" is the
-    // live head, yet the actual fix never reached the PR — never Fixed.
+    // The executor produced "bbb" locally but its push only carried the
+    // older "aaa". "aaa" is the live head, yet the actual fix never
+    // reached the PR — never Fixed.
     let record = record("aaa", "bbb", Some("aaa"));
     assert_eq!(
         record.classify("aaa", false),
@@ -103,7 +103,7 @@ fn produced_head_not_published_is_a_failure_even_when_the_old_head_is_live() {
 
 #[test]
 fn no_op_push_of_the_unchanged_head_is_nothing_to_fix() {
-    // Symmetric #445 hole: a run that changed nothing but re-reported
+    // Symmetric hole: a run that changed nothing but re-reported
     // the unchanged head is not a published fix.
     let unchanged = record("aaa", "aaa", Some("aaa"));
     assert_eq!(
@@ -212,9 +212,9 @@ fn every_supported_matrix_cell_preserves_the_reviewer_axis() {
             "the reviewer axis must come back exactly as configured for {executor}"
         );
     }
-    // The hermes-setup #446 regression cell: a remote lane's shadow
-    // review must survive validation unchanged — never silently
-    // downgraded to the Devin path.
+    // Regression cell: a remote lane's shadow review must survive
+    // validation unchanged — never silently downgraded to the Devin
+    // path.
     assert_eq!(
         validate_review_matrix("remote", "shadow").unwrap(),
         (Executor::Remote, Reviewer::Shadow)
