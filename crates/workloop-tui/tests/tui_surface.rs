@@ -121,6 +121,15 @@ fn pr_review(sha: &str) -> ObservationFact {
     }
 }
 
+fn pr_review_of(sha: &str, reviewer: &str) -> ObservationFact {
+    ObservationFact::PrReview {
+        repository: "local/repo".into(),
+        head_sha: sha.into(),
+        reviewer: reviewer.into(),
+        verdict: ReviewVerdict::ChangesRequested,
+    }
+}
+
 fn process_state() -> ObservationFact {
     ObservationFact::ProcessState {
         invocation_id: InvocationId("inv-1".into()),
@@ -1058,6 +1067,17 @@ fn duplicate_findings_share_one_decision_slot() {
     assert_eq!(draft.findings.len(), distinct.len(), "slots repeat an id");
     assert_eq!(draft.findings.len(), 1, "duplicate findings not deduped");
 
+    // The pane numbers that same single slot: a duplicate row never
+    // advertises a second number `pick` has no slot for.
+    let printed = displayed_findings(&workloop_tui::render::detail_frame(
+        session.detail().unwrap(),
+    ));
+    assert_eq!(
+        printed,
+        vec![(1, draft.findings[0].finding_id.clone())],
+        "the pane's numbering and the draft's slots disagree"
+    );
+
     let finding = draft.findings[0].finding_id.clone();
     session.choose(&finding, FindingChoice::Fix).unwrap();
     let req = session.stage_judgment().unwrap().clone();
@@ -1066,6 +1086,135 @@ fn duplicate_findings_share_one_decision_slot() {
     };
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].finding_id, finding);
+}
+
+/// Seed a detail whose findings carry a duplicate: the same review
+/// recorded twice, then a second reviewer — `[A, A, B]`, the layout
+/// where a raw enumerate numbering pushes `pick` off its targets.
+fn duplicate_findings(store: &SqliteStore) -> WorkId {
+    let (work_id, _e) = submit_work(store, "dup-seed");
+    observe(store, &work_id, pr_head("h1"), NOW);
+    observe(store, &work_id, pr_review("h1"), NOW);
+    observe(store, &work_id, pr_review("h1"), NOW + 1);
+    observe(store, &work_id, pr_review_of("h1", "rev2"), NOW + 2);
+    work_id
+}
+
+/// The `(number, finding id)` pairs the detail pane prints, in display
+/// order.
+fn displayed_findings(frame: &str) -> Vec<(usize, String)> {
+    frame
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("finding ")?;
+            let (n, id) = rest.split_once(": ")?;
+            Some((n.parse().ok()?, id.to_string()))
+        })
+        .collect()
+}
+
+/// AC: displayed numbers and pick targets are the same finding set —
+/// the detail pane numbers one row per distinct finding id, in the same
+/// order as the judgment draft's slots, so a duplicate review cannot
+/// inflate the pane past the slot list `pick` resolves against.
+#[test]
+fn detail_frame_numbers_match_pick_slots() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut session = session(&store);
+    let work_id = duplicate_findings(&store);
+
+    session.refresh(NOW).unwrap();
+    session.open(&work_id, NOW).unwrap();
+    let detail = session.detail().unwrap();
+    assert_eq!(
+        detail.findings.len(),
+        3,
+        "fixture must record the same finding twice"
+    );
+
+    let printed = displayed_findings(&workloop_tui::render::detail_frame(detail));
+    session.begin_judgment().unwrap();
+    let slots: Vec<(usize, String)> = session
+        .draft()
+        .unwrap()
+        .findings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i + 1, s.finding_id.clone()))
+        .collect();
+    assert_eq!(
+        printed, slots,
+        "the pane's numbered findings and `pick`'s slot list disagree"
+    );
+    assert_eq!(
+        printed.len(),
+        2,
+        "a duplicate row inflated the displayed numbering"
+    );
+    let distinct: std::collections::HashSet<&String> = printed.iter().map(|(_, id)| id).collect();
+    assert_eq!(distinct.len(), printed.len(), "a number names two ids");
+}
+
+/// AC: the real console's `pick <n>` selects the finding the detail pane
+/// numbered `n` when the projection recorded a duplicate — `pick 2`
+/// lands on the second displayed finding, not on a duplicate's slot and
+/// not on an out-of-range number.
+#[test]
+fn console_pick_uses_displayed_numbers_with_duplicates() {
+    let dir = root("pickdup");
+    let db_path = dir.join("workloop.db");
+    let work_id = {
+        let store = SqliteStore::open(&db_path, 1).unwrap();
+        duplicate_findings(&store)
+    };
+
+    let (ok, stdout, stderr) = run_console(
+        &dir,
+        "refresh\nopen 1\njudge\npick 1 fix\npick 2 dismiss\npreview\nsubmit\nquit\n",
+    );
+    assert!(ok, "console exited nonzero: {stderr}");
+    // The pane the operator read before picking advertises exactly the
+    // slots `pick` resolves — two numbers, the second naming rev2.
+    let printed = displayed_findings(&stdout);
+    assert_eq!(
+        printed.len(),
+        2,
+        "duplicate finding inflated the pane's numbering:\n{stdout}"
+    );
+    assert!(
+        printed[1].1.contains("rev2"),
+        "displayed finding 2 is not the second distinct finding:\n{stdout}"
+    );
+    assert!(stdout.contains("accepted"), "{stdout}");
+
+    let store = SqliteStore::open(&db_path, 1).unwrap();
+    let (head, decisions) = store
+        .transact(|tx| tx.latest_judgment(&work_id))
+        .unwrap()
+        .expect("judgment recorded");
+    assert_eq!(head, "h1");
+    assert_eq!(decisions.len(), 2, "duplicate produced a third decision");
+    // Each displayed number selected the finding the pane numbered it:
+    // pick 1 -> the first distinct finding (fix), pick 2 -> rev2's
+    // (dismiss) — never a duplicate row or an off-by-one target.
+    let detail = match store
+        .transact(|tx| projection::work_detail(tx, &work_id, NOW + 100))
+        .unwrap()
+    {
+        QueryResult::Found { value, .. } => value,
+        other => panic!("work_detail: {other:?}"),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let distinct: Vec<String> = detail
+        .findings
+        .iter()
+        .filter(|f| seen.insert(f.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(decisions[0].finding_id, distinct[0], "pick 1 mis-targeted");
+    assert_eq!(decisions[0].choice, FindingChoice::Fix);
+    assert_eq!(decisions[1].finding_id, distinct[1], "pick 2 mis-targeted");
+    assert_eq!(decisions[1].choice, FindingChoice::Dismiss);
 }
 
 /// The detail pane shows what the projection recorded — evidence from
