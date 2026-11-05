@@ -52,7 +52,7 @@ The system can make routine implementation decisions within the supplied intent 
 Install Rust with support for edition 2024, then build from source. Real integrations are not yet available.
 
 ```sh
-git clone https://github.com/shimpeiws/agent-workloop.git taisan
+git clone https://github.com/shimpeiws/taisan.git
 cd taisan
 cargo build --workspace
 cargo run -p workloop-cli --bin taisan -- --help
@@ -66,7 +66,7 @@ cargo install --path crates/workloop-cli --bin taisan
 cargo install --path crates/workloop-tui --bin taisan-tui
 ```
 
-The package names and repository URL retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
+The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
 ## Design documents
 
