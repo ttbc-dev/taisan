@@ -8,7 +8,7 @@ use workloop_core::projection::{Availability, SourceStatus, WorkDetailView, Work
 use workloop_core::work::ActionPreview;
 
 use crate::board::Board;
-use crate::judgment::JudgmentDraft;
+use crate::judgment::{JudgmentDraft, distinct_findings};
 
 const COL_WIDTH: usize = 24;
 
@@ -102,6 +102,10 @@ pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
 
 /// The open Work's detail pane: version, executions, current head,
 /// head-scoped findings (numbered for `pick`), attention, evidence.
+/// Findings are numbered per distinct finding id — the same set, in the
+/// same order, as the judgment draft's slots — so the number printed
+/// beside a finding always names the slot `pick <n>` selects. A finding
+/// string recorded twice is one id and gets one number.
 pub fn detail_frame(detail: &WorkDetailView) -> String {
     let mut out = String::new();
     out.push_str(&format!("work {} v{}\n", detail.work_id.0, detail.version));
@@ -119,7 +123,7 @@ pub fn detail_frame(detail: &WorkDetailView) -> String {
             head.as_deref().unwrap_or("?")
         ));
     }
-    for (i, f) in detail.findings.iter().enumerate() {
+    for (i, f) in distinct_findings(detail).enumerate() {
         out.push_str(&format!("  finding {}: {}\n", i + 1, f));
     }
     for a in &detail.attention {

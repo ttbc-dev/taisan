@@ -8,6 +8,22 @@ use workloop_core::command::{CommandBody, FindingChoice, FindingDecision, PrHead
 use workloop_core::domain::WorkId;
 use workloop_core::projection::WorkDetailView;
 
+/// The distinct finding ids a `work_detail` snapshot displays, in
+/// first-seen order. `work_detail` emits one finding string per recorded
+/// review, and identical strings are the same finding id — so this is
+/// the single numbering the detail pane prints and the draft's slot list
+/// is built from: a number on screen always names the finding `pick`
+/// selects, never a duplicate row that pushed the printed numbers off
+/// the slots.
+pub fn distinct_findings(detail: &WorkDetailView) -> impl Iterator<Item = &str> + '_ {
+    let mut seen = std::collections::HashSet::new();
+    detail
+        .findings
+        .iter()
+        .map(|finding_id| finding_id.as_str())
+        .filter(move |finding_id| seen.insert(*finding_id))
+}
+
 /// One displayed finding and the operator's pending choice. The
 /// `finding_id` is the finding exactly as `work_detail` scoped it to the
 /// current head — the draft never invents or rewrites ids.
@@ -37,21 +53,17 @@ impl JudgmentDraft {
         if detail.findings.is_empty() {
             return None;
         }
-        // `work_detail` emits one finding string per recorded review;
-        // identical strings are the same finding id, so the draft keeps
-        // one slot per distinct id — one decision per displayed finding
-        // id, never two rows competing under the same key.
-        let mut seen = std::collections::HashSet::new();
+        // One slot per distinct displayed finding id — `distinct_findings`
+        // is the same set the detail pane numbers, so two rows can never
+        // compete under the same key and no displayed number ever falls
+        // outside the slot list.
         Some(Self {
             work_id: detail.work_id.clone(),
             work_version: detail.version,
             pr_head: head.clone(),
-            findings: detail
-                .findings
-                .iter()
-                .filter(|finding_id| seen.insert(finding_id.as_str()))
+            findings: distinct_findings(detail)
                 .map(|finding_id| FindingSlot {
-                    finding_id: finding_id.clone(),
+                    finding_id: finding_id.to_string(),
                     choice: None,
                 })
                 .collect(),

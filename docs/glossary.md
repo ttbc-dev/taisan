@@ -64,4 +64,4 @@ v0.1 adds two more mechanisms to this list: a **resource reservation** keyed on 
 
 ## External identities
 
-GitHub issues and PRs remain external records. Their numbers and head revisions are references and Observations, not substitutes for `work_id` or `execution_id`. The CLI and TUI submit Commands and display Projections of the built-in queue. GitHub comments may provide another control surface; none defines a separate Work state. Existing Hermes Kanban card IDs are not used for new Work identity.
+GitHub issues and PRs remain external records. Their numbers and head revisions are references and Observations, not substitutes for `work_id` or `execution_id`. The CLI and TUI submit Commands and display Projections of the built-in queue. GitHub comments may provide another control surface; none defines a separate Work state. Existing external Kanban system card IDs are not used for new Work identity.

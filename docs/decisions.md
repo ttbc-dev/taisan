@@ -10,7 +10,7 @@
 - Make commands idempotent, version-aware, and auditable.
 - Keep planning and prioritization human-led in v0.1.
 - Implement the development queue in this repository. Its Kanban-style view is derived from the Work/Execution store; there is no separately synchronized card state.
-- Do not require Hermes Kanban or migrate its historical cards for the initial personal-use deployment.
+- Do not require external Kanban system or migrate its historical cards for the initial personal-use deployment.
 - Create E1 with accepted `submit`, create a queued E2 with an accepted `retry`, and requeue the same Execution with `resume`. Dispatch reserves capacity only when starting an Invocation request.
 - Keep the v0.1 queue in committed enqueue order, dispatching the oldest eligible item so one unavailable source does not block independent work. An automatic wait retains its Execution capacity slot; uncertain ownership retains the slot until the old writer is stopped or prevented from writing.
 - Enforce write-resource exclusion across Work records and supported entry points. Work-level single-Execution rules alone do not protect shared workspaces or branches; unmanaged writers must not write to managed resources.
