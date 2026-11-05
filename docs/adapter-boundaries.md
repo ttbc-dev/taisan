@@ -1,6 +1,6 @@
 # Selector and worker adapter boundaries
 
-Status: design proposal. This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). It does not claim that these interfaces are implemented.
+Status: design proposal for the adapter contracts. This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). The Worker role is exercised through the execution supervisor and a configurable `worker_argv` (the fixture worker in slice 0); the Work Selector port and the real GitHub adapter are not yet implemented. See [provenance](provenance.md) for the implementation audit.
 
 ## Goal
 

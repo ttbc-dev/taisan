@@ -335,7 +335,7 @@ These are behavioral ports, not separate processes. Delivery between `work`, `ex
 
 The internal dispatch loop reads `PendingExecutionPage` from the same store; it does not consume external board records. It may propose a start, but `work` decides eligibility and the store atomically reserves capacity while moving that Execution to `ready` and saving an Invocation request. `work` derives the request ID from the Execution ID and its next Invocation sequence; the commit checks Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `policy_limit` records a budget or deadline decision without inventing a worker/GitHub Observation; the commit compares its observed time or count with the stored limit. A later coding, review, or fix request in the same reserved Execution does not reserve a second slot. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: a TUI action uses a typed Command, and moving a row on screen has no lifecycle effect.
 
-The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; adapting a private worker that currently performs such writes will require separating that behavior.
+The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; adapting an existing worker that currently performs such writes will require separating that behavior.
 
 ## Built-in queue admission
 
@@ -348,7 +348,7 @@ No external board record is created in this flow. The TUI's queue row and the CL
 
 ## TUI review judgment
 
-The [external workflow implementation console](https://github.com/shimpeiws/external workflow implementation/pull/386) shows the intended operator interaction: read a Work detail, choose a decision for each finding, preflight, then submit a typed action. This repository will implement its own TUI against the workloop contracts.
+The intended operator interaction — read a Work detail, choose a decision for each finding, preflight, then submit a typed action — was distilled from the source workflow's operator console (see [provenance](provenance.md)). This repository's TUI implements the same interaction against the workloop contracts; the contract tests `judge_findings_flow_end_to_end`, `incomplete_draft_cannot_submit`, and `stale_head_rejection_requeries_and_clears_choices` in `crates/workloop-tui/tests/tui_surface.rs` pin the flow.
 
 1. The TUI queries the Work detail and current Attention. The Projection includes `work_id`, Work version, PR head SHA, finding IDs, evidence references, and any unavailable source. The TUI keeps selection state, but it does not classify Attention.
 2. The operator chooses exactly one supported decision for every finding ID in the displayed head-scoped set. `work` rejects missing, duplicate, unknown, or empty finding IDs and unsupported decisions. The TUI builds a proposed `judge_findings` Command with the displayed Work version and PR head. A read-only preflight shows whether the saved facts allow that Command. Preflight does not reserve the state or guarantee later acceptance.
@@ -396,9 +396,9 @@ The store enforces, atomically inside the caller's transaction:
 
 The store does not evaluate transition legality, budgets, or gates — that stays in `work`. Every commit records its cause and appends to `event_log` in the same transaction, so a crash cannot leave a decision recorded without its effect or vice versa.
 
-## Remaining decisions before implementation
+## Implementation-facing decisions
 
-The contract-level choices are settled above: store shape and constraint placement, in-process delivery with the store as durable handoff, the expected-head write contract, and command retention and actor identity. What remains is implementation-facing, not contract-facing:
+The contract-level choices are settled above: store shape and constraint placement, in-process delivery with the store as durable handoff, the expected-head write contract, and command retention and actor identity. What remains is implementation-facing, not contract-facing. Slice 0 has since produced first versions of all three items below — the SQLite DDL in `workloop-store`, the `ProcessControlPort` supervisor in `workloop-exec`, and the Cargo workspace layout — so the open items are refinements toward full v0.1 rather than greenfield decisions:
 
 - The concrete DDL that realizes the store constraints, including the transaction boundaries for the `queued → ready` commit racing with `cancel`.
 - The concrete process supervisor implementing `ProcessControlPort`: descendant snapshotting, state-checked inspection including zombies, PID-reuse-safe signaling, and child reaping. The [ownership mechanism is specified without the name Lease](glossary.md#execution-ownership); whether it is one or a fence is resolved by "no replacement while unproven".

@@ -10,13 +10,13 @@ Preserve the already documented Work / Execution / Invocation distinction, durab
 
 ## Current repository baseline (code inspection, not test verification)
 
-- Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-github` fixture, and `workloop-tui` source.
-- The CLI already exposes submit/retry/resume/cancel, review judgment, queries, run loop.
+- Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-config`, `workloop-github` fixture, `workloop-fixture-worker`, and `workloop-tui`.
+- The CLI already exposes submit/retry/resume/cancel, review judgment, queries, run loop; the TUI implements the same Command/Query contracts including the review-judgment flow.
 - `workloop-github/src/lib.rs` exports only `fixture` at inspection time; a real GitHub adapter must be verified/implemented.
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.
 
-## Source-of-truth audit: external workflow implementations → Workloop
+## Source-of-truth audit: prior workflow implementations → Workloop
 
 Audit lifecycle, dispatch, reconciliation, Attention, and worker integration behavior as **design evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination Workloop invariant. Classify as **retain**, **re-model**, or **omit**.
 
@@ -89,7 +89,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 **Must have:** independent core, explicit selector and worker contracts, minimal reference implementations plus one contract-verification Worker adapter with swap verification, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
 
-**Can defer:** sophisticated grouping, additional worker implementation-specific adapters beyond the contract pair, multiple production-grade worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
+**Can defer:** sophisticated grouping, additional worker implementation-specific adapters beyond the contract pair, multiple production-grade worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex audit automation, cross-host scheduling, broad enterprise integrations.
 
 **Do not do:** port external Kanban system wholesale, make a selector implementation or a worker implementation mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
 
