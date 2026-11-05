@@ -166,4 +166,4 @@ Attention is derived from a human decision that can be made now: a paused judgme
 
 ## Deliberately deferred
 
-Host-level enforcement of workspace and branch claims must still be proven by the vertical slice. Also deferred are multiple hosts, multiple concurrent Executors for one Work, arbitrary Kanban cards, automatic priority changes, history import from Hermes, and completion across multiple PRs. None is required to define the v0.1 lifecycle above.
+Host-level enforcement of workspace and branch claims must still be proven by the vertical slice. Also deferred are multiple hosts, multiple concurrent Executors for one Work, arbitrary Kanban cards, automatic priority changes, history import from external systems, and completion across multiple PRs. None is required to define the v0.1 lifecycle above.

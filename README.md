@@ -1,6 +1,6 @@
 # Autonomous Development Workloop
 
-An early design for a self-hosted development workloop for individuals and small teams using GitHub. A human chooses the work and supplies intent and constraints; the workloop coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
+An open source control plane for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; the workloop coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
 **Status:** design proposal. There is no installable implementation yet.
 
@@ -8,7 +8,7 @@ An early design for a self-hosted development workloop for individuals and small
 
 Starting a coding agent is easy. Operating several jobs over time is harder: a worker can disappear while its task still appears active, the same job can start twice, a review can become stale when the PR head changes, and a fix loop can continue without converging. The workloop makes these transitions explicit and inspectable.
 
-The initial target is one operator or a small team running a single self-hosted instance across GitHub repositories. It is intended to be portable between independent engagements, with separate credentials, configuration, and state for each installation.
+The initial deployment targets a single operator or small team running one self-hosted instance. Each installation keeps its own credentials, configuration, and state.
 
 ## Core model
 
@@ -30,7 +30,7 @@ GitHub issues / human intent -> Work -> Execution(s) -> PR and review -> Outcome
 
 The core owns Work identity, state transitions, capacity, retry and resume decisions, evidence, and outcomes. Execution ownership combines store-enforced resource reservations, TTL-bounded external claims for manual writers, and stop proof over recorded process identities. Interfaces submit commands and project state; they do not become the authority for execution. GitHub remains the source for issues, pull requests, and their revisions. See the [glossary](docs/glossary.md) for the terms and their lifetimes.
 
-The repository will implement its own development queue. Pending Work, execution requests, and capacity reservations live in the same state store as Work and Execution; the Kanban-style list is a Projection, not a second card database. A Hermes installation is not required. The existing Hermes console is a reference for operator interaction, not the queue's backend.
+The repository implements its own development queue. Pending Work, execution requests, and capacity reservations live in the same state store as Work and Execution; the Kanban-style list is a Projection, not a second card database.
 
 ## Scope and boundaries
 
@@ -49,16 +49,18 @@ The system can make routine implementation decisions within the supplied intent 
 
 - [Principles](docs/principles.md) — product and operational rules.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
+- [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
+- [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
 - [Module contracts](docs/module-contracts.md) — typed messages for every module connection and representative flows.
 - [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 
-## Proposed first milestone
+## v0.1 direction
 
-Run one Work item from the built-in queue through PR, review, a bounded fix cycle, and completion using only the core and CLI. Add one external control adapter and verify that duplicate commands, stale views, process loss, and adapter outages cannot create duplicate executions or false success. The design is proven only after the same Work can be observed and controlled through two independent interfaces. The TUI management console will show this same queue and is an implementation target in this repository after that initial validation slice.
+The first release aims to run one Work item from the built-in queue through a pull request, review, a bounded fix cycle, and a verified outcome. A second control interface should preserve the same command semantics. Duplicate commands, stale views, process loss, and adapter outages must not create duplicate executions or false success.
 
 ## License
 
-No license has been selected. The repository is private during design; select a license before public distribution.
+No license has been selected. Choose and add an open source license before distribution.

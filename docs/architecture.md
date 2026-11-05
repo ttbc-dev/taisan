@@ -15,7 +15,7 @@ The initial deployment may place these in one process and one local database. Th
 
 ## Module map
 
-This is the intended module boundary, not the current layout of the private implementations. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. Devin, Claude Code, and the existing `coding-worker` CLI are possible implementations of these roles.
+This is the intended module boundary. The outer box marks what this repository will implement, including the TUI management console. The inner box marks the Workloop core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. External coding agents and review tools can implement these roles through adapters.
 
 ```mermaid
 flowchart LR
@@ -78,7 +78,7 @@ The state store is the authority for commands, queue eligibility, reservations, 
 
 This repository implements the development queue needed to accept Work, select eligible queued Executions within capacity, and hold uncertain ownership. The management views also show active and completed Work and human Attention. A queue row is a Projection of the same Work, Execution, and Invocation records that Commands change; moving a row in the TUI does not itself change state. A scheduler may propose Candidates, but only an accepted `submit` creates Work and E1. The internal dispatch loop proposes a queued Execution; `work` rechecks eligibility and reserves capacity while saving its first durable Invocation request in one transaction. `execution` consumes only that approved request. A crash or lost response must be reconciled against its request ID and process evidence before another start is permitted. Resume requeues the same Execution; retry creates a new queued Execution. All three commands can be accepted while capacity is full.
 
-The first implementation is a single-instance, single-host development queue. It does not reproduce Hermes Kanban's general-purpose boards, card dependencies, comments, attachments, arbitrary assignees, or generic worker dispatcher. It can use a local database; it does not require a Hermes installation. Existing Hermes cards and their history are outside the new store, and no ongoing card synchronization or migration layer is planned for the initial personal-use deployment.
+The first implementation is a single-instance, single-host development queue. It does not implement general-purpose boards, card dependencies, comments, attachments, arbitrary assignees, or a generic worker dispatcher. It can use a local database and does not require an external queue service.
 
 ## Adapters
 
@@ -89,9 +89,9 @@ An adapter implements a narrow protocol:
 3. Render the returned decision and current state.
 4. Reconcile its projection after delayed, duplicated, or lost events.
 
-The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents the built-in queue and other Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request. The [hermes-setup console PR](https://github.com/shimpeiws/hermes-setup/pull/386) is the current reference for this interaction pattern; its Rust interaction code may inform this TUI, while its Python projections and action paths remain private implementation details, not additional core authorities.
+The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents the built-in queue and other Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request.
 
-Candidate external adapters are a GitHub issue-comment interface and a GitHub Projects projection. GitHub Projects fields are presentation and control input, not execution authority. Hermes Kanban is not a required adapter or runtime for new Work.
+Candidate external adapters are a GitHub issue-comment interface and a GitHub Projects projection. GitHub Projects fields are presentation and control input, not execution authority. No external Kanban runtime is required for new Work.
 
 ## Recovery rules
 
