@@ -7,10 +7,11 @@ which existing operational behavior belongs in v0.1 — classified as
 decision. It does not authorize implementation; it ends at scope definition
 and implementation planning.
 
-The four source repositories are private. Per this repository's
-source-reference rule (see `AGENTS.md`), they are referenced by role, not
-by name, and their internal file paths and symbols are described rather
-than reproduced:
+The four source repositories are private. Publication-facing documents
+reference them by role, not by name (see `AGENTS.md`). This audit record
+is the owner-controlled exception: it retains issue numbers, revision
+SHAs, and source-internal module names as owner-verifiable evidence
+locators so each mapping can be re-checked against the sources:
 
 | Role name used here | What it is |
 | --- | --- |
@@ -19,10 +20,17 @@ than reproduced:
 | **the selector repo** | the harness-agnostic issue-selection tool |
 | **the infra repo** | the remote-execution infrastructure running bounded worker jobs in isolated containers |
 
-Issue numbers and recorded revision SHAs are retained as owner-verifiable
-evidence locators; they identify nothing without access to the sources.
+These locators identify nothing without access to the sources.
 `agent-workloop` is itself private today; if it is ever published, this
-document needs a disclosure review first.
+document needs a disclosure review first — and so does the git history,
+which retains the identifiers removed from current files; publication
+must either rewrite/export history or explicitly accept that exposure.
+Publication-facing documents
+carry only a minimal origin statement (see `docs/provenance.md`); the
+name- and identifier-level detail removed there — source-system names,
+private issue/PR metadata, the reference-verification table, and the
+document-audit corrections list — is preserved in this repository's git
+history.
 
 ## Inspected revisions and scope
 
@@ -45,9 +53,10 @@ Notes on inspection fidelity:
 - The local checkouts of the selector and infra repos were not on `main`
   (one ahead of `origin/main`, one on a pinned lane branch); claims were
   likewise verified against `origin/main`.
-- Symbol-level locators (file paths, function names, line numbers) were
-  collected during inspection and are described by role below rather
-  than reproduced, per the source-reference rule.
+- Symbol-level locators were collected during inspection. File paths,
+  function names, and line numbers are not reproduced; module, command,
+  and component names are retained as owner-verifiable locators under
+  the audit-record exception in `AGENTS.md`.
 - The ops repo's converge state-transitions design document is itself a
   design audit pinned to earlier revisions (`839094bb` ops / `e6c16686`
   worker); where this document cites it as evidence, the underlying

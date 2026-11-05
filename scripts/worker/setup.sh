@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Repository setup check (coding-worker remote runs).
+# Repository setup check (remote worker runs).
 #
 # The remote verify profile requires `cargo build/test/fmt/clippy`, but the
 # worker image carries no Rust toolchain. This hook installs a minimal rustup
-# toolchain into $HOME (propose.sh resolves $HOME/.cargo/bin since #112). It
-# runs in the job's check phase inside this checkout and must stay
+# toolchain into $HOME (the remote job resolves $HOME/.cargo/bin for cargo).
+# It runs in the job's check phase inside this checkout and must stay
 # non-interactive, idempotent and bounded.
 set -euo pipefail
 
