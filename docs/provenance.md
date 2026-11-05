@@ -82,7 +82,7 @@ readers of this repository).
 | `shimpeiws/hermes-setup`, `shimpeiws/coding-worker`, `shimpeiws/devflow`, `shimpeiws/coding-worker-infra` | This document | **Valid targets, private access** — all four exist and are private | `gh repo view` on each name |
 | Internal links between `README.md` and `docs/*.md` | All documents | **Valid** — every relative link and heading anchor resolves | Scripted link check over the repository's Markdown files |
 | "Auditor" | `docs/implementation-plan.md` deferred list | **Unresolved** — no repository or component by that name was found under the project account or in the source repositories; documented here rather than inventing a target | `gh repo view`/`gh search repos`/`gh search code` and tree inspection returned no match |
-| Tracker references `#17`, `#28`, `#33`–`#36` | This document and `docs/implementation-plan.md` | **Valid** — open issues matching the cited topics (real GitHub adapter, CI pipeline, source-workflow audit, acceptance definition, ownership contract, E2E planning) | `gh issue list` / `gh issue view` at audit time |
+| Tracker references `#17`, `#28`, `#33`–`#36` | This document | **Valid** — open issues matching the cited topics (real GitHub adapter, CI pipeline, source-workflow audit, acceptance definition, ownership contract, E2E planning) | `gh issue list` / `gh issue view` at audit time |
 
 Unresolved or inaccessible targets are recorded explicitly; no replacement
 URLs were invented.
@@ -158,6 +158,10 @@ distinguishing implemented foundations, fixtures, and missing integrations.
   `workloop-fixture-worker`, confirmed `workloop-tui` exists).
 - `docs/architecture.md` — module-map preamble reworded from future tense
   ("will implement") to scope language now that the TUI exists.
+- `docs/module-contracts.md` — the "Remaining decisions before
+  implementation" section renamed to "Implementation-facing decisions"
+  with a note that slice 0 has already produced first versions of the DDL,
+  supervisor, and crate layout.
 
 The remaining documents describe target contracts and milestone criteria.
 Their "design proposal / not an implemented API" phrasing remains accurate
