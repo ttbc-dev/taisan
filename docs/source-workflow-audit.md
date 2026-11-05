@@ -141,7 +141,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 | --- | --- | --- | --- | --- | --- |
 | Dispatch = atomic (transition + reservation + saved request) | **retain** | the atomicity is what the ops repo approximates across card/claim/launch | dispatcher transition `queued→ready/running` reserves slot and saves request in one commit | lifecycle.md dispatch section; store tests | — |
 | Lost acknowledgement is not failure | **retain** | remote `uncertain` handling: identity persisted, next tick reconciles | `uncertain` Invocation state; reconcile, never re-key | lifecycle.md; `workloop-exec` stop proof | — |
-| Two-layer duplicate guard (local lock + remote label) | **re-model** | the *requirement* is single-writer ownership of a workspace/branch; the mechanism (label+lock) is GitHub-and-host specific | `SafeOwnership`/writer fencing before start | module-contracts ownership; `workloop-exec` | ownership scope for foreign writers unresolved (see incident audit) |
+| Two-layer duplicate guard (local lock + remote label) | **re-model** | the *requirement* is single-writer ownership of a workspace/branch; the mechanism (label+lock) is GitHub-and-host specific | `SafeOwnership`/writer fencing before start | module-contracts ownership; `workloop-exec` | covered for supported entry points and TTL external claims (lifecycle.md:108-112); only contract-bypassing processes remain out of scope (see incident audit) |
 | Remote slot admission, lane executor matrix | **omit** | single-host v0.1; the executor dimension is config, not lifecycle | n/a | n/a | revived only if remote execution enters scope |
 
 ### 5. Execution — the worker attempt
@@ -243,7 +243,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 | Idempotent lifecycle ops keyed on stable identities | **retain** | the coordinator CLI's repeated-call reconciliation is the right shape | all Commands idempotent by key+digest | store command tests | — |
 | Bounded, recorded recovery with permanent-refusal class | **retain** | #377: recovery retry needs durable attempts, budgets, escalation — `max_invocations` alone doesn't bound collect | bounded durable recovery (waiting reason / paused(repair) / failed(evidence_unavailable)); Attention escalation | lifecycle.md; contract tests | artifact-disposition state still unmodeled in current contract (open) |
 | Deterministic blocker re-evaluation from structured evidence | **re-model** | the *requirement* (resume only when provable conditions changed; never auto-expand permissions, #215) transfers; the periodic-job mechanism doesn't | `paused` continuation conditions + resume validation | lifecycle.md resume contract | recording "what must change to resume" is a required field — currently implicit |
-| Attribution heuristic for foreign writers (checkpoint markers) | **re-model** | the mechanism is ship-dir-specific and omitted; the requirement — a writer whose provenance can't be proven is treated as live — transfers into ownership evidence | `SafeOwnership` evidence | module-contracts | ownership scope decision open (incident audit) |
+| Attribution heuristic for foreign writers (checkpoint markers) | **re-model** | the mechanism is ship-dir-specific and omitted; the requirement — a writer whose provenance can't be proven is treated as live — transfers into ownership evidence | `SafeOwnership` evidence | module-contracts | covered by the reservation store + TTL external claims for supported entry points (incident audit) |
 | Prune/reclaim scripts | **omit** | they destroyed evidence the workloop requires; retention policy is a deliberate non-port | append-only `event_log` preserves history | store | retention/export safety is decisions.md Q4 — open |
 
 ### 10. Attention — surfacing what needs a human
@@ -324,10 +324,13 @@ deployed; each class states what the fix was and what remains.
 - **Residual defect**: the manual-writer boundary — a foreign process
   (unmanaged CLI, manual salvage) writing to a managed workspace is only
   defended by heuristic attribution, and only on the paths that check it.
-  Workloop must decide `SafeOwnership` scope: per-Work writer uniqueness
-  is specified; cross-Work / external-writer exclusion is not.
-  **Disposition: re-model (ownership scope is an open question, not a
-  ported mechanism).**
+  Workloop's contract now covers this: cross-Work exclusion is enforced
+  by resource reservations keyed on workspace + `(repository, branch)`
+  (lifecycle.md:108-112, decisions.md), and supported external writers
+  register TTL-bounded claims via `claim_resources`; what remains out of
+  scope is arbitrary external processes that bypass the contract
+  entirely. **Disposition: re-model — the requirement transfers as
+  reservations + external claims; the heuristic mechanism is omitted.**
 
 ### Uncertain stops
 
@@ -455,10 +458,11 @@ applicability, rationale, and open questions.
   point, judgment-wait ledgers); workloop instead makes most
   disagreement unrepresentable — which is exactly why the port is a
   re-model.
-- **Open questions.** Whether queued-admission ownership checks treat a
-  foreign writer as `queued+blocked-diagnostic` or `uncertain`; whether
-  artifact-collection pending becomes a `waiting` reason or a
-  `paused(repair)` substate.
+- **Open questions.** Whether artifact-collection pending becomes a
+  `waiting` reason or a `paused(repair)` substate. (Foreign-writer
+  handling at queued admission is now settled: a conflicting external
+  claim leaves the Execution `queued` with a retryable diagnostic —
+  lifecycle.md:110-112.)
 
 ### Failure semantics
 
@@ -467,12 +471,14 @@ applicability, rationale, and open questions.
   refusal (a distinct exit code), structured stop action over exit code.
 - **Rationale.** These distinctions each exist because conflating them
   caused a specific incident (#266, #307, #337, #377).
-- **Open questions.** The swallowed stop-intent `OSError` shows "persist
-  intent before signal" is asserted but not enforced in the source;
-  workloop must decide the commit ordering (intent inside the `stopping`
-  transition) rather than port the callback. Whether every launch attempt
-  counts against `max_invocations` — v0.1 may deliberately simplify, but
-  it must say so.
+- **Already settled in the contract.** The swallowed stop-intent
+  `OSError` shows "persist intent before signal" was asserted but not
+  enforced in the source; workloop's contract now requires it —
+  lifecycle.md:162 and decisions.md require durable stop intent before
+  signaling with no signal when persistence fails, and `workloop-exec`
+  implements that ordering. Invocation budgeting is likewise decided:
+  lifecycle.md:149 counts every durably recorded Invocation attempt,
+  including a definite `not_started` result.
 
 ### Trust boundaries
 
