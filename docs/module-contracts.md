@@ -348,7 +348,7 @@ No external board record is created in this flow. The TUI's queue row and the CL
 
 ## TUI review judgment
 
-The [external workflow implementation console](https://github.com/shimpeiws/external workflow implementation/pull/386) shows the intended operator interaction: read a Work detail, choose a decision for each finding, preflight, then submit a typed action. This repository will implement its own TUI against the workloop contracts.
+The hermes-setup Kanban console — a private source repository; see [provenance](provenance.md) — shows the intended operator interaction ([PR #386](https://github.com/shimpeiws/hermes-setup/pull/386), private): read a Work detail, choose a decision for each finding, preflight, then submit a typed action. This repository's TUI implements the same interaction against the workloop contracts.
 
 1. The TUI queries the Work detail and current Attention. The Projection includes `work_id`, Work version, PR head SHA, finding IDs, evidence references, and any unavailable source. The TUI keeps selection state, but it does not classify Attention.
 2. The operator chooses exactly one supported decision for every finding ID in the displayed head-scoped set. `work` rejects missing, duplicate, unknown, or empty finding IDs and unsupported decisions. The TUI builds a proposed `judge_findings` Command with the displayed Work version and PR head. A read-only preflight shows whether the saved facts allow that Command. Preflight does not reserve the state or guarantee later acceptance.

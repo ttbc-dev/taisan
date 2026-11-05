@@ -2,7 +2,7 @@
 
 An open source control plane for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; the workloop coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
-**Status:** design proposal. There is no installable implementation yet.
+**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations are not yet implemented. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
@@ -56,6 +56,7 @@ The system can make routine implementation decisions within the supplied intent 
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
+- [Provenance](docs/provenance.md) — source-system origins, reference audit, and implementation status.
 
 ## v0.1 direction
 
