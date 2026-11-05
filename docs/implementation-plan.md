@@ -61,10 +61,11 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 - Introduce a Selector port and a minimal GitHub single-issue selector; keep admission behind Core.
 - Introduce or adapt a thin Worker port and a Claude Code CLI reference adapter using the existing supervisor.
+- Add a second, independently implemented contract-verification Worker adapter (scripted/deterministic) and run the shared Worker contract suite — including the swap-invariance check — against both adapters, selected via config with no Core change.
 - Close high-risk Slice 0 invariant gaps and add CI; test duplicate proposals, lost launch responses and uncertain stops.
 - Deliverable: a selected Issue becomes queued Work and a bounded real Invocation with durable evidence.
 
-**Gate:** no duplicate launch or conflicting writer under injected failure; existing Work continues if selector is unavailable.
+**Gate:** no duplicate launch or conflicting writer under injected failure; existing Work continues if selector is unavailable; Command, queue, budget and Outcome semantics are identical under either conforming Worker adapter.
 
 ### Phase 3 — GitHub integration and bounded loop
 
@@ -82,13 +83,13 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 - Record known limitations and explicitly distinguish implemented capabilities from design proposals.
 - Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior.
 
-**v0.1 acceptance:** one Work can be submitted manually or proposed by the reference Selector, accepted, executed by the reference Worker, observed, reviewed and either completed or surfaced as actionable Attention without an external Kanban system. Replacing either adapter must preserve Core command, queue and outcome semantics; neither adapter owns independent execution truth.
+**v0.1 acceptance:** one Work can be submitted manually or proposed by the reference Selector, accepted, executed by the reference Worker, observed, reviewed and either completed or surfaced as actionable Attention without an external Kanban system. Replacing either adapter must preserve Core command, queue and outcome semantics; neither adapter owns independent execution truth. For the Worker port this is proven by two conforming implementations — the reference real Worker and a second contract-verification adapter — passing the shared contract suite under config-only selection; it does not require multiple production-grade worker providers, and it does not transfer a running Invocation between workers.
 
 ## Scope discipline
 
-**Must have:** independent core, explicit selector and worker contracts, minimal reference implementations, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
+**Must have:** independent core, explicit selector and worker contracts, minimal reference implementations plus one contract-verification Worker adapter with swap verification, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
 
-**Can defer:** sophisticated grouping, a worker implementation-specific adapter, multiple worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
+**Can defer:** sophisticated grouping, additional worker implementation-specific adapters beyond the contract pair, multiple production-grade worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex Auditor automation, cross-host scheduling, broad enterprise integrations.
 
 **Do not do:** port external Kanban system wholesale, make a selector implementation or a worker implementation mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
 
@@ -98,7 +99,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 | --- | --- |
 | Core | State-transition and idempotency tests, queue/capacity/resource invariants |
 | Selector | Stable proposal identity, allowlist, duplicate and stale-source tests |
-| Worker | Start/observe/stop contract; lost response, crash, uncertain process tests |
+| Worker | Start/observe/stop contract; lost response, duplicate request, crash, uncertain process tests; shared suite passes on both adapters; swap preserves semantics |
 | GitHub | PR-head binding, delayed/duplicate webhook, outbox and reconciliation tests |
 | Loop | Bounded review/fix, terminal intent retirement, human Attention |
 | v0.1 | Clean setup, isolated repository, reproducible E2E and documented limitations |
