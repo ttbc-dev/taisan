@@ -3,7 +3,9 @@
 This document records where the workloop design comes from: which
 external systems are design evidence rather than runtime dependencies,
 and how much of the design is actually implemented. It is deliberately
-minimal — it names no private repository, path, symbol, or issue. The
+minimal — it names no private repository, path, symbol, or issue number
+from the source systems; references to this repository's own issues are
+retained as maintainer locators. The
 detailed audit — inspected revisions, per-behavior
 retain/re-model/omit decisions, incident analysis, and evidence
 classification — lives in
@@ -124,8 +126,8 @@ audit document.
   repo's incident history are the primary failure-semantics evidence.
 - **Rationale.** Rules like "an expired claim is not stop evidence" and
   "unknown is a first-class state" come from observed failures, not
-  speculation; each is covered by a contract test or scenario in this
-  repository.
+  speculation; the audit maps each rule to its contract coverage or open
+  gap.
 - **Open questions.** Which incident classes still lack contract-test
   coverage is tracked in `docs/implementation-plan.md` and the audit's
   verification gaps.

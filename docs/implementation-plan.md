@@ -16,7 +16,7 @@ Preserve the already documented Work / Execution / Invocation distinction, durab
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.
 
-## Source-of-truth audit: external workflow implementations → Workloop
+## Source-of-truth audit: prior workflow implementations → Workloop
 
 Audit lifecycle, dispatch, reconciliation, Attention, and worker integration behavior as **design evidence**. For each behavior record: trigger, authority, persisted state, external facts, failure/recovery path, current known incident, and destination Workloop invariant. Classify as **retain**, **re-model**, or **omit**.
 
