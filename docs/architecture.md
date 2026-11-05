@@ -68,6 +68,22 @@ The core exposes commands such as `submit`, `retry`, `resume`, `cancel`, and `ac
 
 The core returns an accepted/rejected decision, canonical state version, and command ID. `retry` means: create at most one new Execution for eligible, settled Work under the same intent, after checking current evidence and policy. `resume` continues an eligible interrupted Execution from a durable checkpoint; it may start a new Invocation. Adapters cannot implement either by moving a card or spawning a process directly. An unavailable result can be queried by command ID before resubmission. Queries read recorded state; monitors and reconciliation record new Observations before a Projection changes.
 
+### Stage contracts are executor-independent
+
+A stage command defines its outcome by postconditions that are independent of the executor. An executor cell — local, remote, or a future provider — selects *where* a stage runs, never *what it may skip*: the same postconditions, evidence, and success classification apply in every cell of the matrix. Two production defects shared the root cause of the executor matrix changing what a stage *means* rather than where it runs (hermes-setup #445 and #446), so the contract layer encodes the rule instead of rediscovering it.
+
+`converge` means: bounded fix commits *published* to the PR head, marked replies posted, and draft→ready advanced exactly once — the same outcome whether the executor is local, remote, or a future provider. Its Command therefore requires the executor to return a structured converge record, not a free-text verdict:
+
+```ts
+type ConvergeRecord = { head_before: PrHeadSha; head_after: PrHeadSha;
+  pushed_sha?: PrHeadSha; replies_posted: string[];
+  threads_addressed: string[] };
+```
+
+The record shape is a contract type (`workloop_core::stage::ConvergeRecord`). The coordinator verifies `pushed_sha` against the live PR head before adopting the result: a converge result counts as fixed (`review-fixed`) only when the published head is the produced head (`pushed_sha == head_after`) and it verifies against the live PR head — equal to it or an ancestor of it. A claimed fix that cannot show a produced head published to the PR is classified as a failure with the record preserved as evidence, never a success; a push that carried an older head than the fix produced does not publish the fix, even if that older head is the live head. A no-op that changed nothing is `nothing-to-fix`, not a published fix. Publication is part of the stage's postcondition, exactly as `propose` already models it for ship; an executor that produced commits the PR never received has failed the stage, not passed it.
+
+The executor and reviewer axes are orthogonal by construction: the reviewer axis (`devin`/`shadow`/`both`) must never be silently narrowed by the executor axis (`local`/`remote`). If a combination is unsupported, it is refused at configuration validation time (`workloop_core::stage::validate_review_matrix`) — never silently degraded at run time.
+
 ## Work and execution
 
 Work has its own identity independent of an issue number or board card. Store GitHub issue references as source links, not primary keys. Each accepted Work starts with one queued Execution; an explicit retry creates the next queued Execution under the same Work. Each Execution has an execution ID, defined input and budget, zero or more Invocations, process/workspace evidence, checkpoints, and recorded Outcomes. A Work item may have multiple sequential Executions but no more than one nonterminal, authoritative Execution, including queued and paused ones. Capacity is reserved atomically when a queued Execution is admitted for its first Invocation, not when `submit` or `retry` is accepted. The [lifecycle contract](lifecycle.md) defines the transitions and release points. Execution ownership combines store-enforced resource reservations, TTL-bounded external claims for manual writers, and stop proof over recorded process identities; [the mechanism is specified without adopting the name Lease](glossary.md#execution-ownership).
@@ -88,6 +104,8 @@ An adapter implements a narrow protocol:
 2. Submit that command with an idempotency key and state precondition.
 3. Render the returned decision and current state.
 4. Reconcile its projection after delayed, duplicated, or lost events.
+
+The adapter's event filter is part of this contract: any filter that drops bot-authored or bot-sent events must exempt work the lane itself produced. PRs and heads authored by the installation's own lane identity (managed PRs and managed heads) are first-class inputs, not noise — without that exemption the lane's own loop starves, since every lane-opened PR is bot-authored (hermes-setup #446: a `pull_request` bot filter made the remote lane's shadow review a silent no-op, letting one matrix dimension — the executor — override another). The exemption is keyed to the installation's managed identities and its managed PR/head set, not a blanket "allow all bots" rule.
 
 The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents the built-in queue and other Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request.
 
