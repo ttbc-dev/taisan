@@ -143,6 +143,8 @@ distinguishing implemented foundations, fixtures, and missing integrations.
 - `docs/implementation-plan.md` — repository baseline updated to the
   current crate inventory (added `workloop-config` and
   `workloop-fixture-worker`, confirmed `workloop-tui` exists).
+- `docs/architecture.md` — module-map preamble reworded from future tense
+  ("will implement") to scope language now that the TUI exists.
 
 The remaining documents describe target contracts and milestone criteria.
 Their "design proposal / not an implemented API" phrasing remains accurate
