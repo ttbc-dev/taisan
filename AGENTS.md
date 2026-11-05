@@ -12,8 +12,9 @@
 - `docs/source-workflow-audit.md` is the owner-controlled audit record
   and the single exception to the naming rule: it retains source-internal
   names, issue/PR numbers, and revision SHAs so each design mapping can
-  be re-verified against the sources. It is not publication-facing and
-  requires a disclosure review before the repository is published.
+  be re-verified against the sources. It is not publication-facing;
+  publication of the repository requires a disclosure review covering
+  this document and the git history that retains the removed identifiers.
 
 ## Pull requests
 

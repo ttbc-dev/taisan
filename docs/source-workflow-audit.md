@@ -22,7 +22,10 @@ locators so each mapping can be re-checked against the sources:
 
 These locators identify nothing without access to the sources.
 `agent-workloop` is itself private today; if it is ever published, this
-document needs a disclosure review first. Publication-facing documents
+document needs a disclosure review first — and so does the git history,
+which retains the identifiers removed from current files; publication
+must either rewrite/export history or explicitly accept that exposure.
+Publication-facing documents
 carry only a minimal origin statement (see `docs/provenance.md`); the
 name- and identifier-level detail removed there — source-system names,
 private issue/PR metadata, the reference-verification table, and the
