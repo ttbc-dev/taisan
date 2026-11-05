@@ -11,7 +11,12 @@ The four source repositories are private. Their names, revisions, file and
 symbol references, and issue/PR numbers are recorded so the design stays
 traceable; the repositories themselves are not distributed with this
 project and are not consulted at build or runtime. Links into them are
-verifiable only by the repository owner.
+verifiable only by the repository owner. This document inherits that
+privacy boundary: it deliberately reproduces private-repo detail
+(revisions, symbols, issue states, and one residual defect) because the
+issue's acceptance criteria require it. `agent-workloop` is itself
+private today; if it is ever published, this document needs a disclosure
+review first.
 
 ## Inspected revisions and scope
 
@@ -79,7 +84,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 | Behavior | Class | Rationale | Destination | Impl / test mapping | Verification gaps |
 | --- | --- | --- | --- | --- | --- |
 | Pure snapshot+policy selection with stable fingerprint | **retain** (semantics) | the selection-is-a-pure-function boundary is what made Hermes/CLI agreement a code property; workloop keeps the identical boundary | Work Selector port in `adapter-boundaries.md` — Candidates carry stable proposal identity | no implementation yet; contract tests needed for determinism and stable identity | port specified but unimplemented; snapshot schema for workloop undefined |
-| Grouping by milestone+label-set, group as atomic batch | **re-model** | grouping is selection detail, not a core invariant; keep "group is atomic — never split mid-group" but leave key derivation to the selector impl | Work Selector output shape (group `execution_order`) | fixture selector for contract tests | real selector deferred; group identity vs `work_id` mapping is issue #34 |
+| Grouping by milestone+label-set, group as atomic batch | **re-model** | grouping is selection detail, not a core invariant; the boundary is: oversized *candidate buckets* are split deterministically at selection time (`max_size`), and each emitted group is then atomic for execution — never split mid-run. Keep the latter; key derivation and `max_size` stay selector-internal | Work Selector output shape (group `execution_order`) | fixture selector for contract tests | real selector deferred; group identity vs `work_id` mapping is issue #34 |
 | Per-repo YAML policy / allowlist | **re-model** | the need (scope which repos/issues are eligible) is generic; the file format and label namespaces are personal config | installation/adapter config | `workloop-config` fields | none beyond config schema |
 | Scheduler auto-intake of selected groups | **omit** | automated issue discovery is a personal operations feature, not lifecycle semantics; submission into workloop is via `submit` | none — out of scope per `architecture.md` | n/a | if a selector adapter is later added, it must go through `submit`, never around admission |
 
@@ -179,7 +184,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 
 | Behavior | Trigger | Decision authority | Persisted state | External facts | Failure / recovery | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
-| `devflow propose` | verified run | the pipeline's only GitHub write path: branch, commit, push, PR | `propose-record.json` with bounded refusal codes | git remote, GitHub API | refusal codes are the only persisted detail (sanitized export can't leak); `publish_failed` covers partial publish | `src/devflow/propose.ts` (issue #41/#317): never merges, never force-pushes, marker + provenance on every body |
+| `devflow propose` | verified run | the pipeline's PR-creation write path: branch, commit, push, PR creation | `propose-record.json` with bounded refusal codes | git remote, GitHub API | refusal codes are the only persisted detail (sanitized export can't leak); `publish_failed` covers partial publish | `src/devflow/propose.ts` (issue #41/#317): never merges, never force-pushes, marker + provenance on every body. Note: propose creates the PR; converge (below) performs its own push/reply mutations — they are distinct write paths inside one tool, not one shared mutation funnel |
 | `devflow converge` fix publication | converge round with fixes | converge pushes fix commits to head branch, posts marked replies with fix SHA | `findings.json` ledger, `converge.json` rounds | PR head, review threads | head-signal marks bound to head SHA | `src/devflow/converge.ts`; `src/review/head-signal.ts` |
 | Remote-lane publication | remote ship/converge settle | coordinator `cwctl publish` + job-contract bounded publish stage (#447) | run record `publication_status`, `pushed_head` | remote container, GitHub | publish-before-collect ordering (#389); fail-closed adoption check | `coding_worker_remote_lib.py:905` (`publish`); `devin-milestone.py:8986` (`_cw_remote_converge_pushed_head`); issues #389 CLOSED, #445/#447 |
 | Unknown write reconciliation | after any GitHub mutation | action-id/PR-URL reconciliation | proposal/publication records | GitHub reads | adopt matching existing effect; refuse ambiguous | `src/devflow/propose.ts` reconciliation; `scripts/host/publication-validation.sh`; `cwctl` publish exit 9 (second-different-PR conflict) |
@@ -188,7 +193,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 
 | Behavior | Class | Rationale | Destination | Impl / test mapping | Verification gaps |
 | --- | --- | --- | --- | --- | --- |
-| Single publication owner with persisted intent | **retain** | #389: double publication owner → duplicate-PR risk; #445: verdict without push evidence | core-owned `PrActionIntent` outbox is the only mutation entry; unknown responses reconciled by action ID | module-contracts PrActionIntent; `workloop-github` fixture | real adapter is issue #17 |
+| Single publication owner with persisted intent | **retain** | #389: double publication owner → duplicate-PR risk; #445: verdict without push evidence. In the source, propose and converge are *two* mutation paths inside one tool; workloop's invariant is stricter — every GitHub mutation from any stage funnels through persisted `PrActionIntent` | core-owned `PrActionIntent` outbox is the only mutation entry; unknown responses reconciled by action ID | module-contracts PrActionIntent; `workloop-github` fixture | real adapter is issue #17 |
 | Verdict requires publication evidence (fail-closed adoption) | **retain** | #445: `fixed` while head == pre-run head must block, never settle | stage contract: `converge` outcome = fix commits *published* to PR head | lifecycle.md head-bound completion; contract test | — |
 | Marked replies, no merge/force-push, provenance markers | **retain** | machine marker + bounded effects are the trust contract | adapter mutation surface | fixture adapter records intents | — |
 | Bounded refusal codes as the only persisted failure detail | **re-model** | sanitize-by-code is a good idea; exact code set is implementation detail | failure codes on Command results | lifecycle.md failure classes | — |
@@ -236,7 +241,7 @@ in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 | Idempotent lifecycle ops keyed on stable identities | **retain** | cwctl's repeated-call reconciliation is the right shape | all Commands idempotent by key+digest | store command tests | — |
 | Bounded, recorded recovery with permanent-refusal class | **retain** | #377: recovery retry needs durable attempts, budgets, escalation — `max_invocations` alone doesn't bound collect | bounded durable recovery (waiting reason / paused(repair) / failed(evidence_unavailable)); Attention escalation | lifecycle.md; contract tests | artifact-disposition state still unmodeled in current contract (open) |
 | Deterministic blocker re-evaluation from structured evidence | **re-model** | the *requirement* (resume only when provable conditions changed; never auto-expand permissions, #215) transfers; the periodic-job mechanism doesn't | `paused` continuation conditions + resume validation | lifecycle.md resume contract | recording "what must change to resume" is a required field — currently implicit |
-| Attribution heuristic for foreign writers (checkpoint markers) | **omit as mechanism / retain as requirement** | the heuristic is ship_dir-specific; the requirement — a writer whose provenance can't be proven is treated as live — transfers | `SafeOwnership` evidence | module-contracts | ownership scope decision open (incident audit) |
+| Attribution heuristic for foreign writers (checkpoint markers) | **re-model** | the mechanism is ship_dir-specific and omitted; the requirement — a writer whose provenance can't be proven is treated as live — transfers into ownership evidence | `SafeOwnership` evidence | module-contracts | ownership scope decision open (incident audit) |
 | Prune/reclaim scripts | **omit** | they destroyed evidence the workloop requires; retention policy is a deliberate non-port | append-only `event_log` preserves history | store | retention/export safety is decisions.md Q4 — open |
 
 ### 10. Attention — surfacing what needs a human
@@ -423,11 +428,13 @@ deployment does it*:
   argv/logs.
 - **Personal-environment (omit)**: Hermes Kanban board/card/request/
   run-record triangulation; claim TTLs and heartbeats; parked-selector
-  registry; lane executor matrix and per-repo YAML policies as formats;
-  Telegram delivery and cron cadence; webhook filters and debounce;
-  `install-*.sh` repo→`~/.hermes` deploy model; pinned OpenCode runtime;
-  incus containers and restricted-SSH transport; prune/reclaim scripts;
-  ConvergeLock; checkpoint-attribution heuristics.
+  registry; lane executor matrix; Telegram delivery and cron cadence;
+  webhook filters and debounce; `install-*.sh` repo→`~/.hermes` deploy
+  model; pinned OpenCode runtime; incus containers and restricted-SSH
+  transport; prune/reclaim scripts; ConvergeLock. Two list-adjacent items
+  are mechanisms only, not requirements: per-repo YAML policy *format*
+  (the scoping requirement is re-modeled, §1) and checkpoint-attribution
+  *heuristics* (the foreign-writer requirement is re-modeled, §9).
 
 ## Design aspects
 
