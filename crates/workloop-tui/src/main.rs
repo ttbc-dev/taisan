@@ -1,4 +1,4 @@
-//! `workloop-tui` — the management console: a kanban board over the
+//! `taisan-tui` — the management console: a kanban board over the
 //! built-in queue plus typed Command actions. It is a line-driven
 //! console: every verb either re-queries the projection or arms,
 //! previews, and submits one typed Command — the identical contract
@@ -17,7 +17,11 @@ use workloop_tui::render;
 use workloop_tui::session::{Action, ORIGIN, SubmitOutcome, TuiSession};
 
 #[derive(Parser)]
-#[command(name = "workloop-tui", about = "Workloop management console (TUI)")]
+#[command(
+    name = "taisan-tui",
+    bin_name = "taisan-tui",
+    about = "taisan management console (TUI)"
+)]
 struct Args {
     /// SQLite store path — the same store the CLI drives.
     #[arg(long, global = true, default_value = "workloop.db")]
@@ -52,10 +56,10 @@ fn usage() -> &'static str {
   quit               exit — disconnecting changes no execution truth"
 }
 
-fn main() {
+pub(crate) fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
-        eprintln!("workloop-tui: {e}");
+        eprintln!("taisan-tui: {e}");
         std::process::exit(1);
     }
 }
@@ -79,7 +83,7 @@ fn run(args: Args) -> Result<(), String> {
     );
     println!("{usage}", usage = usage());
     loop {
-        print!("workloop-tui> ");
+        print!("taisan-tui> ");
         let _ = std::io::stdout().flush();
         let Some(line) = lines.next() else {
             // EOF: disconnecting is a no-op on execution truth.

@@ -1,6 +1,8 @@
 [package]
 name = "workloop-cli"
 edition.workspace = true
+default-run = "taisan"
+description = "taisan command-line interface"
 
 [dependencies]
 workloop-config = { path = "../workloop-config" }

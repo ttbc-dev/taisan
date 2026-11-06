@@ -1,12 +1,14 @@
-# Autonomous Development Workloop
+# taisan
 
-An open source control plane for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; the workloop coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
+![taisan hero illustration](assets/taisan-hero.jpg)
+
+taisan is an adapter-based work orchestration loop for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; taisan coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
 **Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations are not yet implemented. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
-Starting a coding agent is easy. Operating several jobs over time is harder: a worker can disappear while its task still appears active, the same job can start twice, a review can become stale when the PR head changes, and a fix loop can continue without converging. The workloop makes these transitions explicit and inspectable.
+Starting a coding agent is easy. Operating several jobs over time is harder: a worker can disappear while its task still appears active, the same job can start twice, a review can become stale when the PR head changes, and a fix loop can continue without converging. taisan makes these transitions explicit and inspectable.
 
 The initial deployment targets a single operator or small team running one self-hosted instance. Each installation keeps its own credentials, configuration, and state.
 
@@ -44,6 +46,27 @@ The repository implements its own development queue. Pending Work, execution req
 | Optional adapters, including a GitHub interface | Broad workflow-platform integrations |
 
 The system can make routine implementation decisions within the supplied intent and constraints. It must expose consequential uncertainty and a clear intervention path. It does not merge or deploy by default.
+
+## Build and run
+
+Install Rust with support for edition 2024, then build from source. Real integrations are not yet available.
+
+```sh
+git clone https://github.com/shimpeiws/taisan.git
+cd taisan
+cargo build --workspace
+cargo run -p workloop-cli --bin taisan -- --help
+cargo run -p workloop-tui --bin taisan-tui -- --help
+```
+
+To install the commands from this checkout:
+
+```sh
+cargo install --path crates/workloop-cli --bin taisan
+cargo install --path crates/workloop-tui --bin taisan-tui
+```
+
+The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
 ## Design documents
 

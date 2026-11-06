@@ -4,18 +4,18 @@ Status: design proposal for the adapter contracts. This document refines [archit
 
 ## Goal
 
-Agent Workloop is a **control plane**, not a work planner and not a coding agent. The lifecycle is derived from explicit invariants and failure scenarios. The core defines its own state model and dispatch rules.
+taisan is a **control plane**, not a work planner and not a coding agent. The lifecycle is derived from explicit invariants and failure scenarios. The core defines its own state model and dispatch rules.
 
 Two independently replaceable ports surround the core:
 
 - **Work Selector** decides *what to propose*: which issues belong together and why. Issue selection and grouping are adapter responsibilities, not core dependencies.
-- **Worker** decides *how to perform one authorized invocation*: coding, review, or fix. Claude Code, a worker implementation, or another runner may implement the port. Their internal orchestration is not the Workloop authority.
+- **Worker** decides *how to perform one authorized invocation*: coding, review, or fix. Claude Code, a worker implementation, or another runner may implement the port. Their internal orchestration is not the taisan authority.
 
 Neither adapter writes core state, reserves capacity, creates Executions, retries Work, or declares a Work completed. Core decisions remain deterministic given persisted facts and policy.
 
 ## Ownership matrix
 
-| Responsibility | Selector | Workloop Core | Worker | GitHub integration |
+| Responsibility | Selector | taisan Core | Worker | GitHub integration |
 | --- | --- | --- | --- | --- |
 | Discover candidate issues / grouping | Owns | Validates submitted proposal | No | Supplies issue facts |
 | Accept Work, identity, dedup, queue | Proposes | Owns | No | No |
@@ -54,7 +54,7 @@ It provides:
 - `start(request)`: acknowledge a stable request identity; distinguish known not-started, started, and **unknown** outcomes;
 - `observe(request_id)`: report process identity/liveness, checkpoint, artifacts, completion/failure and evidence provenance;
 - `request_stop(request_id)`: request cancellation; **not** proof that writers stopped;
-- optional `resume` capability declared by the adapter; absence means Workloop cannot assume an internal session can be resumed.
+- optional `resume` capability declared by the adapter; absence means taisan cannot assume an internal session can be resumed.
 
 Worker-internal mechanics stay inside the adapter: how a process is launched, how requests and results are translated to and from the worker's own formats, authentication to the worker runtime, internal session state, and any resume implementation. None of these may surface in Core types, state transitions, or Outcome decisions — the Core contract above is the whole boundary. Capabilities are either required by this contract or explicitly declared optional; an adapter must never silently emulate a capability it does not support, or compensate by altering Command, queue, budget, or Outcome semantics.
 
@@ -79,7 +79,7 @@ CLI, TUI and GitHub comments are **control interfaces** translating human/automa
 5. Worker reports success without required artifacts/checks: no successful Work outcome.
 6. Worker crashes, escapes process group, or fails stop proof: ownership stays uncertain and replacement is blocked.
 7. Review result refers to an old head: cannot settle a newer head.
-8. Swap two conforming worker implementations: Workloop command, queue, budget and outcome semantics remain unchanged.
+8. Swap two conforming worker implementations: taisan command, queue, budget and outcome semantics remain unchanged.
 9. An adapter attempts to request retry or change a Work state directly: rejected; only Commands through Core may do so.
 10. The same Invocation request is delivered twice: reconciled by request identity; no duplicate start or duplicate effect.
 

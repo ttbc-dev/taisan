@@ -77,7 +77,7 @@ that holds decision authority, what state it persists, which external
 facts it depends on, its failure/recovery path, and source evidence.
 The classification that follows each table assigns retain / re-model /
 omit with rationale, the destination workloop responsibility or invariant,
-and verification gaps. "Workloop responsibility" references the contracts
+and verification gaps. "taisan responsibility" references the contracts
 in `docs/lifecycle.md`, `docs/module-contracts.md`, and
 `docs/adapter-boundaries.md`.
 
@@ -333,7 +333,7 @@ deployed; each class states what the fix was and what remains.
 - **Residual defect**: the manual-writer boundary — a foreign process
   (unmanaged CLI, manual salvage) writing to a managed workspace is only
   defended by heuristic attribution, and only on the paths that check it.
-  Workloop's contract now covers this: cross-Work exclusion is enforced
+  taisan's contract now covers this: cross-Work exclusion is enforced
   by resource reservations keyed on workspace + `(repository, branch)`
   (lifecycle.md:108-112, decisions.md), and supported external writers
   register TTL-bounded claims via `claim_resources`; what remains out of
@@ -410,7 +410,7 @@ deployed; each class states what the fix was and what remains.
 - **Residual defects**: **stall detection, repeated-identical-failure
   detection, and bounded requeue after timeout are all still OPEN
   proposals in the ops repo** — this is the largest class that is *not*
-  fixed at the recorded revision. Workloop's re-model must include:
+  fixed at the recorded revision. taisan's re-model must include:
   distinguish "no progress" (stall — notify only) from "deadline
   exceeded" (stop intent → proven group stop → bounded requeue);
   repeated identical failure kinds surface to Attention; recovery loops
@@ -508,7 +508,7 @@ applicability, rationale, and open questions.
   fingerprint excluding bookkeeping; claim pinned to the tracker's
   `labeled` event id; plan keys binding head+findings+decisions; run id
   vs coordinator vs worker ids deliberately distinct.
-- **Rationale.** Workloop's `work_id`/`execution_id`/`invocation_id`
+- **Rationale.** taisan's `work_id`/`execution_id`/`invocation_id`
   exist precisely because issue numbers, card IDs, and PIDs were not
   stable identities.
 - **Open questions.** How Work identity relates to multi-issue groups
