@@ -1,6 +1,6 @@
 # Worker protocol, artifact handoff, and isolation
 
-Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory is now merged in `docs/extraction-coverage.json`. The Worker-specific requirement mapping below remains provisional: it uses the earlier R01–R38 audit IDs and must be reconciled with the complete inventory under #52 before claiming that mapping complete. #51's [failure classification](evidence-gates.md#failure-classification-and-recovery-decisions) and [Work-wide accounting](evidence-gates.md#work-wide-recovery-accounting) govern normalized recovery decisions; Worker reason codes alone do not authorize retries.
+Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory is merged in `docs/extraction-coverage.json`; all 33 Worker-owned inventory targets are mapped to clauses and shared-suite cases — or to an approved deferral — in [worker requirements](worker-requirements.md). #51's [failure classification](evidence-gates.md#failure-classification-and-recovery-decisions) and [Work-wide accounting](evidence-gates.md#work-wide-recovery-accounting) govern normalized recovery decisions; Worker reason codes alone do not authorize retries.
 
 ## Owner decisions
 
@@ -15,7 +15,15 @@ The owner chose these in the #52 working session on 2026-11-07:
 | Durable git-object handoff | After confirmed exit and stop proof, import the produced commit closure into an installation-owned bare **handoff repository** under `refs/taisan/artifacts/<artifact_id>`. Verify the closure, record a canonical manifest digest, and treat the committed store record plus the existing ref as the durable acknowledgement | A `git bundle` file as the durable body; bundle and ref together |
 | Isolation | bubblewrap (mount, PID, network and IPC namespaces) plus environment/credential hygiene, plus a **mandatory** model-API allowlist egress proxy (N1) in v0.1 | Hygiene only; a separate UID; Landlock only; cgroup only; containers; a shared network (N0) |
 
-These choices shape implementation units U2 and U4 in the [implementation plan](implementation-plan.md). They do not authorize implementation, and no runtime or live behavior is claimed here. Numeric defaults in [Proposed defaults](#proposed-defaults-pending-owner-approval) are pending owner approval.
+The owner approved these refinements in the #52 session on 2026-11-08:
+
+| Decision | Choice | Rejected alternatives |
+| --- | --- | --- |
+| Export transport | A sandboxed `git bundle` of `base..produced` as the transient transport: the export git invocation runs inside the sandbox with hooks and fsmonitor disabled, and trusted code reads the bundle only as data. The durable body remains the imported object closure under `refs/taisan/artifacts/<artifact_id>` plus the `acknowledged` store row | Trusted git commands against the live workspace; a direct fetch that lets the source repository's config drive pack generation; raw `.git/objects` copying; the bundle file itself as the durable body |
+| Verification egress | The verification profile denies network by default. A Work may declare required verification hosts in its immutable capability requirements at admission; the effective egress set is the installation-level verification allowlist plus the Work's declared hosts, enforced by the same CONNECT-proxy mechanism. The set never contains model-API hosts and the profile never carries runtime credentials | An always-denied verification network; unrestricted egress; sharing the Worker model-API allowlist |
+| Numeric defaults | Approved as proposed: `--max-turns` 200, 10 s stop grace, 1 MiB report cap, 32 MiB log cap, 30 min per-command verification timeout, 8 MiB per-command output cap, zero shim-level retries | — |
+
+These choices shape implementation units U2 and U4 in the [implementation plan](implementation-plan.md). They do not authorize implementation, and no runtime or live behavior is claimed here.
 
 ## Roles and authority
 
@@ -72,6 +80,7 @@ struct WorkerRequest {
     workspace: WorkspaceId,
     budget: InvocationBudget,                     // deadline, max_turns, output caps
     required_capabilities: WorkerCapabilityRequirement,
+                                                // includes declared verification egress hosts (default empty)
     continuation: Vec<ContinuationRef>,           // prior artifact/report refs, never runtime sessions
 }
 enum WorkerTaskBody {
@@ -124,7 +133,7 @@ A pre-publication correction binds the exact predecessor artifact, Work/specific
 | --- | --- | --- |
 | Coding / Fix | Prompt built from goal, source snapshots or finding occurrences, constraints, and verification argv. Edits and local commits allowed in `/workspace`. Publication tools and outer loops are disabled by the shim's tool allowlist and by the absence of credentials | `claimed_head`, optional `claimed_checks`; the commit itself is handed off by the supervisor |
 | InvariantCheck | The supervisor prepares a read-only checkout of the exact artifact commit. Prompt lists every invariant ID of the approved set. Edits are not allowed (workspace bind is read-only for this role) | One `ReportedInvariantItem` per invariant; #51 decides coverage and validity |
-| CodeReview | Read-only checkout of the exact `DiffTarget`. Prompt covers the immutable diff | `findings` for this single requested source; #51 seals the snapshot |
+| CodeReview | Read-only checkout of the exact `DiffTarget`. Prompt covers the immutable diff. `review_source` is a retained snapshot materialized by the supervisor before dispatch — the Worker never fetches remote review input itself; an absent, stale, or undeliverable source makes the request invalid and stops dispatch | `findings` for this single requested source; #51 seals the snapshot |
 
 The shim runs `claude -p` with `--output-format stream-json`, a bounded `--max-turns`, an explicit tool allowlist and permission mode, and `--strict-mcp-config` with an empty MCP config. Flags are hygiene and translation, not enforcement. Exact flags and the stream schema are pinned to the runtime version recorded in `WorkerCapabilities`. A runtime version that differs from the declaration is a configuration repair, not a silent upgrade.
 
@@ -206,10 +215,11 @@ The reference adapter declares `checkpoints: WorkspaceCommits`: WIP that the run
 ## Verification runner
 
 1. For each declared argv, create an independent clean worktree from `refs/taisan/artifacts/<artifact_id>`. Verify the exact commit and tracked input bytes before running it; no command inherits source changes from another command.
-2. Run that argv in the recorded verification sandbox profile. Tracked source inputs are read-only. Build outputs and temporary files use separate per-command writable directories that cannot shadow tracked inputs. The out directory is per-command, network is denied (no proxy), there are no runtime credentials, and the same PID namespace stop rules apply. A command requiring source mutation is incompatible with this profile and needs an explicit validated profile decision; its result cannot silently certify the original commit.
-3. Record `VerificationResult{requirement, artifact, commit, argv, environment: profile digest, result, output}` with bounded output. A timeout or a killed runner is `Incomplete`, never `Failed` with an invented exit code and never `Passed`.
+2. Run that argv in the recorded verification sandbox profile. Tracked source inputs are read-only. Build outputs and temporary files use separate per-command writable directories that cannot shadow tracked inputs. The out directory is per-command, there are no runtime credentials, and the same PID namespace stop rules apply. A command requiring source mutation is incompatible with this profile and needs an explicit validated profile decision; its result cannot silently certify the original commit.
+3. Egress: denied by default. The effective allowlist for a command is the installation-level verification allowlist plus the egress hosts the Work declared in `required_capabilities` at admission — enforced through the same CONNECT-proxy mechanism, CONNECT-only on port 443 with DNS resolved by the proxy, TLS uninspected. The allowlist never contains model-API hosts, and its digest is part of the recorded environment identity. A command needing an undeclared host fails; a Work that needs hosts it did not declare is an admission gap, never a reason to open the network silently.
+4. Record `VerificationResult{requirement, artifact, commit, argv, environment: profile digest, result, output}` with bounded output. A timeout or a killed runner is `Incomplete`, never `Failed` with an invented exit code and never `Passed`.
 
-The runner is a supervised effect of the CLI loop, not a Worker Invocation; it is bounded by its own per-command timeout and the Execution deadline. Tests that need network access are not supported by the v0.1 profile; such a Work needs an owner-approved profile change, not a silent network grant.
+The runner is a supervised effect of the CLI loop, not a Worker Invocation; it is bounded by its own per-command timeout and the Execution deadline.
 
 ## Isolation
 
@@ -248,6 +258,7 @@ Before the first dispatch with a profile, and whenever the profile, runtime vers
 - writing outside `/workspace` and `/taisan/out` fails;
 - reading the owner's host credential files fails, `SSH_AUTH_SOCK` is unset, and `git credential fill` returns nothing;
 - TCP connect to the repository host and an arbitrary address fails, CONNECT to a non-allowlisted host is denied by the proxy, and the model-API host is reachable for each of Coding, Fix, InvariantCheck, and CodeReview;
+- the verification profile denies an undeclared destination and reaches a declared one, and holds no runtime credential;
 - a `setsid` child is killed when the namespace init exits.
 
 Any failing or skipped probe refuses dispatch with a repair prerequisite. There is no fallback to hygiene-only execution, and a flag or `AllowedEffects` value never substitutes for these probes.
@@ -279,6 +290,8 @@ Classes follow #51's taxonomy (transient/retryable, permanent, environment repai
 | Isolation preflight failure | Probe results | Environment repair; dispatch refused |
 | Proxy unavailable during run | Runtime network errors and proxy health | Environment repair after stop proof |
 
+A permanent refusal class (`provider_refused`) blocks the task immediately and consumes no artifact-recovery or report-recovery attempt; the refusal record and any retained evidence survive exhaustion with their honest flags intact.
+
 ## Shared Worker contract suite
 
 Both implementations run the same suite through the supervisor and the public Command/Query path. **Real**: the reference shim, run against a deterministic fake `claude` executable that replays scripted stream-json, plus a separate live smoke with the real runtime in U8. **Contract adapter**: an independently implemented deterministic Worker that shares no code with the shim and replays scripted results. The current fixture worker's process modes may be reused by the contract adapter's process cases.
@@ -300,36 +313,23 @@ Both implementations run the same suite through the supervisor and the public Co
 | WS-13 | Corrupt bundle / digest mismatch | Invalid, never published |
 | WS-14 | Write outside allowed paths | Denied by sandbox; preflight and in-run probe |
 | WS-15 | Read host credential, use SSH agent or credential helper | Unavailable |
-| WS-16 | All four Worker roles connect to the model API, repository host, and non-allowlisted host; verification runner attempts the same | Only the allowed model API is reachable for each Worker role. Verification runner has no network access |
+| WS-16 | All four Worker roles connect to the model API, repository host, and non-allowlisted host; verification runner attempts the same | Only the allowed model API is reachable for each Worker role. The verification runner reaches only installation-default and Work-declared hosts and holds no runtime credentials |
 | WS-17 | Provider refusal, rate limit, max turns | Bounded reason codes; no outer retry by adapter |
 | WS-18 | Stale-head review report | Cannot settle the newer head (#51) |
 | WS-19 | Adapter attempts to change Work state or request retry | No path exists; any such output ignored and recorded |
 | WS-20 | Config-only swap between adapters for new Invocations | Identical Command, queue, budget and Outcome results; running Invocation unaffected |
 | WS-21 | Runtime version differs from declaration | Configuration repair; no start |
 | WS-22 | Verification runner timeout or source-mutation attempt | Timeout is `Incomplete`, not `Failed` or `Passed`. Source mutation is denied; every subsequent command starts from the exact original artifact with independent outputs |
+| WS-23 | Verification egress with Work-declared hosts | Declared and installation-default hosts reachable; undeclared destination denied; no runtime credential present; recorded environment digest reflects the effective allowlist |
+| WS-24 | Missing, stale, or undeliverable worker input snapshot (`review_source`, `invariant_set`, `goal`) | Dispatch refused as an invalid request; the Worker never fetches the input itself |
 
-## Provisional requirement mapping
+## Requirement mapping
 
-To be redone against #50's inventory IDs. "Clause" names the section of this document.
+Every Worker-owned requirement #50's inventory assigns to this issue — 33 targets — is mapped to a normative clause of this document plus shared-suite coverage, or to an explicit approved deferral, in [worker requirements](worker-requirements.md). Requirements whose retained safety obligation is met by a different mechanism than the source's (for example, sandbox enforcement in place of a server-side audit) record the substitution there; no target remains unmapped.
 
-| ID | Worker-owned aspect | Clause | Suite |
-| --- | --- | --- | --- |
-| R11 | Lost acknowledgement is not failure | start, observe, stop | WS-03, WS-05 |
-| R12 | Duplicate guard | start idempotency; isolation (unmanaged writes impossible from sandbox) | WS-02, WS-14 |
-| R13 | Bounded run contract | Schemas (`budget`, `base`); Adapter-local retries | WS-17, WS-22 |
-| R14 | Report is evidence, not outcome | Schemas; Evidence validity | WS-08–WS-10 |
-| R15 | Stop semantics | Process descendants and stop proof | WS-06, WS-07 |
-| R16 | Read-only planner | Deferred (Worker-internal); InvariantCheck/CodeReview read-only binds cover read-only roles | — owner-approved deferral in #36 |
-| R17 | Verification bound to exact bytes | Verification runner; handoff | WS-01, WS-13, WS-22 |
-| R18 | Structured terminal classification | `BoundedReasonCode`; Failure mapping | WS-17 |
-| R30 | Reconciliation reads facts | Crash recovery | WS-03, WS-11 |
-| R32 | Bounded recovery with permanent-refusal class | Crash recovery; Failure mapping | WS-08, WS-11, WS-17 |
-| R34 | Unproven writer is live | Stop proof; `uncertain` | WS-05, WS-06 |
-| R38 | Secrets never in argv/logs/evidence | Isolation: credentials | WS-15, preflight |
+## Approved defaults
 
-## Proposed defaults pending owner approval
-
-| Setting | Proposed default |
+| Setting | Default |
 | --- | --- |
 | Reference adapter `--max-turns` | 200 per Invocation |
 | Stop grace between SIGTERM and SIGKILL | 10 s |
@@ -346,9 +346,9 @@ To be redone against #50's inventory IDs. "Clause" names the section of this doc
 | State transitions | Launch, exit, export, and verification produce facts that drive `ready`/`running`/`waiting`/`uncertain` | `NotStarted` vs `Unknown`; export only after stop proof; handoff states `imported`→`acknowledged` | Whether export/verification progress needs its own `waiting` reason name (#55) |
 | Failure semantics | Runtime, sandbox, and handoff failures look alike from exit codes | Closed reason codes, class mapping, recovery table | Final taxonomy names from #51 |
 | Trust boundaries | Prompt-injected runtime; host credentials on the same account | bwrap + hygiene + mandatory proxy; no workspace code runs in trusted processes | Model-API exfiltration remains |
-| Identity invariants | Requests, Invocations, artifacts, and commits recur across attempts | Per-Invocation out directory; `ArtifactId` ref; request digest; capability digest bound per request | Re-mapping to #50 IDs |
+| Identity invariants | Requests, Invocations, artifacts, and commits recur across attempts | Per-Invocation out directory; `ArtifactId` ref; request digest; capability digest bound per request | — mapped to #50 inventory |
 | Information preservation | Claims, invalid reports, and WIP must survive | Invalid evidence retained; workspace and bundle kept until acknowledgement | Exact pins and reclamation (#54) |
-| Resource bounds | Runtime turns, verification time, logs, recovery | Separate bounds; no shim retries | Owner approval of proposed defaults |
+| Resource bounds | Runtime turns, verification time, logs, recovery | Separate bounds; no shim retries | — defaults approved |
 
 ## Implementation-plan mapping and non-claims
 
