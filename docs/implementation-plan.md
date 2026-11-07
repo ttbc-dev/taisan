@@ -24,6 +24,10 @@ These decisions settle the boundaries above, not the exact retention defaults, s
 
 [Evidence and review gates](evidence-gates.md) refines U1/U5 under #51. The owner selected mechanical Work verification plus independently optional invariant conformance (default on) and code review, with additional GitHub CI only when explicitly configured. Conformance runs before publication; code review runs after it. Both enabled assessment loops are bounded and surface unresolved work as Attention. No native Approve setting, repository-rule import or draft/Request-changes merge barrier is added. Immutable review rounds/exact-set judgments, typed receipts and proof closure replace aggregate-check/review assumptions in the target design; current runtime and #24 remain unchanged.
 
+## Detailed Worker protocol design
+
+[Worker protocol, artifact handoff and isolation](worker-protocol.md) refines U2/U4 under #52. The owner selected Claude Code CLI headless behind a taisan-owned shim as the reference Worker, `resume: unsupported` in v0.1, supervisor-run mechanical verification on the handed-off commit, a handoff repository ref as the durable git-object acknowledgement, and bubblewrap isolation with a mandatory model-API egress proxy. Its R-ID mapping is provisional until #50's inventory exists. No runtime, sandbox or live evidence is claimed.
+
 ## Revisions and evidence baseline
 
 Runtime inspection and checks use main `dc63df1edbceba5d2c863fcd840ca34d3b962e10`. The plan was prepared atop PR #46 at `28d09d4f914373d18a6805141c2fbf4f8ddf5186`, which includes that runtime revision and changes documentation only. During planning, #46 merged as `94061eeb5b5812c8597e71ac0950afdb3877dd88`; this branch now targets that main revision. `git diff dc63df1 28d09d4 -- crates Cargo.toml Cargo.lock scripts` is empty. The checks therefore cover the same runtime tree, not any future adapter implementation. Recheck runtime evidence after subsequent code changes.

@@ -50,6 +50,10 @@ The [concrete design](identity-storage.md) records maintenance-only cutover with
 
 [Evidence and review gates](evidence-gates.md) records separate Work mechanical checks, optional invariant conformance with default on, independent code-review on/off, and explicitly configured additional GitHub CI. Conformance runs before publication and uses bounded fix/recheck or Attention; code review runs after publication with bounded fix/re-review or Attention. Native Approve, repository-rule import, and automatic code-review merge/draft barriers are excluded. Keep invalid evidence distinct from a valid negative result. Exact immutable finding-set/round guards apply at judgment, release and dependent authorization, including same-head growth. A disabled lane is not a passed assessment.
 
+## Worker protocol decisions from #52
+
+The [Worker protocol](worker-protocol.md) records the owner's choices: Claude Code CLI headless behind a taisan-owned shim as the reference Worker, with `resume` declared unsupported in v0.1; mechanical verification run by the supervisor against the handed-off commit, with Worker check results kept as claims; durable handoff as an acknowledged `refs/taisan/artifacts/<artifact_id>` ref in an installation-owned handoff repository with a manifest digest; and isolation by bubblewrap namespaces, environment/credential hygiene, and a mandatory model-API allowlist egress proxy. Requirement mapping to #50's inventory is provisional and must be redone when that inventory exists. Proposed numeric defaults await owner approval.
+
 ## Questions to resolve through a spike
 
 1. ~~What execution-ownership mechanism prevents conflicting work in a single-instance deployment, including process crashes and delayed writes? Does it meet the requirements for a Lease?~~ Resolved: resource reservations, TTL external claims, and stop proof (verified on a single host); no Lease name, no separate fence. Remaining: prove host-level enforcement in the vertical slice.

@@ -14,6 +14,8 @@ The required CLI and planned CLI-backed agent skills use the same Command and Qu
 
 The canonical target port is [RepositoryHostPort](repository-host-contract.md). Core uses scoped repository/change identities and immutable revisions without inspecting provider names or payloads. GitHub PR terminology in the example flows is a reference deployment, not a required host model. These target types replace the current GitHub-specific names when implemented, with callers, store keys, and tests migrated together. There are no parallel generic/GitHub Core paths or compatibility aliases.
 
+The [Worker protocol](worker-protocol.md) refines `WorkerTask`, `WorkerReport`, `PreparedChange` and `AllowedEffects` below: concrete request/report/capability schemas, supervisor-owned export into a handoff repository ref, supervisor-run mechanical verification, and enforced sandbox isolation instead of flags. Target design only.
+
 The [concrete identity/storage design](identity-storage.md) defines Rust/SQLite scope, command payload identity, source-change reapproval and the owner-approved archive/new-store cutover for legacy slice-0 data. This is target design only.
 
 IDs are distinct opaque types even if an implementation stores each as a string. `WorkVersion` is a version of one Work item. `EventSequence` identifies a committed position in one installation's history. `CommitRevision` identifies the revision used for a review or check.
