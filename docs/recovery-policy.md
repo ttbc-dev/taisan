@@ -22,7 +22,7 @@ The following names are target configuration keys, not implemented options. All 
 
 The Work-wide four-hour limit supplements the existing per-Execution Invocation, review, runtime, and artifact-recovery bounds. It does not replace them. Human waiting cannot replenish either budget. A time limit prohibits new attempts and initiates safe stopping; it does not establish termination.
 
-#53 must document each key's type, unit, default, accepted range, zero and disable semantics, precedence, cross-field constraints, and examples. Define the jitter policy and how a changed retry count extends or truncates the configured schedule. Reject unknown keys and invalid combinations at configuration load. Do not silently interpret zero as unlimited. Explicit disabling of an operational threshold must not disable ownership, approval, evidence, or deduplication guards. Provide a complete reference usable by coding agents.
+The [installation configuration](installation-config.md#configuration-schema) documents each key's type, unit, default, accepted range, zero and disable semantics, precedence, cross-field constraints, and examples under one TOML schema. Define the jitter policy and how a changed retry count extends or truncates the configured schedule. Reject unknown keys and invalid combinations at configuration load. Do not silently interpret zero as unlimited. Explicit disabling of an operational threshold must not disable ownership, approval, evidence, or deduplication guards. Provide a complete reference usable by coding agents.
 
 ## Failure and progress classification
 
@@ -66,7 +66,7 @@ After a human decision, the same paused Execution re-enters the queue and reacqu
 
 Resolve and save a versioned effective policy with each accepted Work. Configuration edits apply to new Work by default. Existing Work retains its accepted policy, including after restart or same-Work specification reapproval.
 
-An explicit authorized policy-change operation may update existing Work. Record the actor, old and new policy, rationale, Work-version precondition, and decision. Preserve consumed counters and elapsed time. Require explicit approval for a budget expansion. Tightening a limit below consumed usage triggers the limit path; it does not discard evidence or prove stop. An already-issued Invocation retains its immutable input; enforce changed Work-level limits through supervision and safe stopping rather than rewriting the request. #53 and #55 define the exact schema and Command before exposing this operation.
+An explicit authorized policy-change operation may update existing Work. Record the actor, old and new policy, rationale, Work-version precondition, and decision. Preserve consumed counters and elapsed time. Require explicit approval for a budget expansion. Tightening a limit below consumed usage triggers the limit path; it does not discard evidence or prove stop. An already-issued Invocation retains its immutable input; enforce changed Work-level limits through supervision and safe stopping rather than rewriting the request. The [installation configuration](installation-config.md) defines the schema; #55 defines the Command before exposing this operation.
 
 ## Planned verification
 

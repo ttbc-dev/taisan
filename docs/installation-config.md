@@ -1,0 +1,256 @@
+# Installation configuration, credential references, and permission boundaries
+
+Status: concrete design for #53. This document specifies future Rust/configuration behavior; it changes no runtime, installs no credentials, and performs no live checks. It consumes #50's identity/binding model, #51's evidence and repair prerequisites, #52's worker isolation profile, and #54's retention keys. The owner approved the credential-reference provider set, the TOML schema, the role profile defaults, the preflight probe boundary, the XDG layout, the rotation boundary, and the setup command contract recorded below.
+
+## Owner decisions
+
+| Choice | Result |
+| --- | --- |
+| Credential references | `credential_ref` is an opaque Core value with three resolution providers: `env:NAME`, `file:/absolute/path` (mode `0600` and owner-checked), and `command:argv` (e.g. a secret-manager CLI). Values resolve only at the adapter boundary and never enter Core, evidence, argv, logs, intents, or exports |
+| Configuration format | One TOML file, `config.toml`, with a required `schema_version`. Unknown keys, unknown/newer versions, and structurally invalid files are refused without mutation — the same refusal model as the store's `user_version` |
+| Role profile | Three roles — `publication`, `review`, `discussion` — each binding `(actor, credential_ref)`. v0.1 permits one user token bound to all three roles; a distinct reviewer identity is the documented recommended configuration |
+| Preflight boundary | `taisan check` validates offline by default; `--probe` performs read-only adapter capability calls. Dispatch-time revalidation is always mandatory — a setup probe is never a standing grant |
+| Installation layout | XDG split: `~/.config/taisan/config.toml` for configuration, `~/.local/share/taisan/` for state (store, CAS bodies, workspaces, out directories, handoff repository) |
+| Rotation boundary | Same-actor credential renewal (updated `credential_ref` resolving to the same verified actor) is permitted and never retargets existing Work or unresolved effects. Actor replacement is a binding change: existing Work keeps its original binding; the new actor applies to new Work only. Unresolved effects always reconcile under the original actor/binding |
+| Source machinery | Source-repo automation mechanisms — webhook/cron/launchd routes, tunnels, installer convergence, remote operator control — are omitted. Their retained obligations are re-modelled onto configuration validation, preflight, fail-closed defaults, and secret hygiene |
+| Setup contract | `init` scaffolds a validated profile only from observed evidence and never fabricates identity; `check` runs an ordered read-only fail-closed preflight |
+
+## Installation layout
+
+| Path | Contents | Notes |
+| --- | --- | --- |
+| `~/.config/taisan/config.toml` | The single installation configuration | Published atomically; `TAISAN_CONFIG` overrides the path |
+| `~/.local/share/taisan/store.db` | SQLite store | `TAISAN_STATE_DIR` overrides the root |
+| `~/.local/share/taisan/bodies/` | CAS objects ([retention policy](retention-policy.md)) | |
+| `~/.local/share/taisan/workspaces/` | Managed workspaces | Managed root; no unmanaged writer may enter |
+| `~/.local/share/taisan/handoff.git` | Installation-owned bare handoff repository | Durable artifact objects ([worker protocol](worker-protocol.md#artifact-handoff)) |
+| `~/.local/share/taisan/archive/` | Read-only legacy archives | `unlimited` retention default |
+
+Every path resolves through one fixed precedence: explicit flag, environment override, then the XDG default — never the ambient working directory. Configuration and state roots must be distinct from any managed workspace, and setup refuses a state root nested inside a workspace or vice versa.
+
+## Configuration schema
+
+Target schema sketch, sanitized — a literal, loadable example without real identities or secrets:
+
+```toml
+schema_version = 1
+
+[installation]
+capacity_slots = 1
+
+[hosts.h1]
+adapter = "github"                    # adapter id from the adapter registry
+endpoint = "https://api.github.com"   # stable endpoint identity, not a display alias
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "0123456789"                     # adapter-resolved stable repository id
+display = "team/tool"                 # display metadata only, never an equality key
+use = "publication"                   # publication target
+
+[[hosts.h1.repositories]]
+id = "5566778899"
+display = "org/reference-docs"
+use = "source"                        # allowlisted read-only source
+
+[roles.publication]
+host = "h1"
+actor = "taisan-publisher"            # verified adapter-side actor identity
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[roles.review]                        # recommended: a distinct reviewer identity
+host = "h1"
+actor = "taisan-reviewer"
+credential_ref = "file:/home/user/.secrets/taisan-review.token"
+
+[roles.discussion]
+host = "h1"
+actor = "taisan-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[worker]
+argv = ["taisan-worker-shim", "--runtime", "claude-code-cli"]
+runtime_version = ">=2.0.0"           # pinned to declared range, verified at preflight
+model = "claude-sonnet-4-6"           # pinned at load; re-checked after dispatch
+max_turns = 200
+
+[verification.egress]
+allowlist = ["crates.io", "static.crates.io"]
+
+[capabilities.required]
+# Work requirements compose with this floor at admission; callers cannot weaken it
+publication = ["repository_read", "branch_read", "push_ref",
+               "change_request_read", "change_request_create",
+               "change_request_update", "comment_write", "mark_ready"]
+review      = ["repository_read", "branch_read", "review_feedback",
+               "inline_comment", "thread_reply", "thread_resolve"]
+discussion  = ["comment_read", "comment_write"]
+
+[recovery]  # keys defined by recovery-policy.md; defaults apply when omitted
+[policy.retention]  # keys defined by retention-policy.md
+```
+
+Validation rules:
+
+- `schema_version` is required and must equal a version this runtime understands; unknown/newer/corrupt content is refused without mutation, never auto-migrated.
+- Unknown keys at any level fail loading with the offending key named. `0` is never silently "unlimited" — each limit key's zero/disable semantics follow its defining document ([recovery policy](recovery-policy.md#configurable-policy-and-defaults), [retention policy](retention-policy.md#configuration)).
+- Every `credential_ref` must parse as a known provider (`env:`, `file:`, `command:`); file providers require an absolute path. Validation checks the reference's shape, never its value.
+- Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
+- `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
+- Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op.
+- Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects.
+
+## Credential references and secret hygiene
+
+A `credential_ref` names a slot, not a secret. Resolution happens once per use at the adapter boundary; the resolved value stays inside the adapter process and is never persisted, logged, placed on argv, embedded in intents or receipts, or exported in evidence.
+
+| Provider | Form | Validation | Resolution semantics |
+| --- | --- | --- | --- |
+| `env:` | `env:NAME` | Name is a valid environment identifier; the variable's existence is checked at preflight/dispatch without echoing the value | Reads the process environment of the adapter process |
+| `file:` | `file:/absolute/path` | Absolute path; regular file; owner-only permissions (`0600`, or `0400`) verified before reading; symlinks resolved and rechecked | Reads the file's exact bytes; a permission failure is `credential.unresolvable`, never a weaker read |
+| `command:` | `command:["argv",...]` | Non-empty argv; deterministic executable resolution (absolute path or pinned lookup); no shell | Executes the command in the adapter's trusted context and captures stdout; stderr and exit code bound the failure reason |
+
+Failure classes at resolution: `credential.missing` (slot undefined), `credential.unresolvable` (provider failed — unset variable, unreadable file, nonzero command), `credential.expired` (provider or adapter reports expiry), `credential.actor_mismatch` (resolved identity differs from the bound actor). Every failure is typed and bounded for display; the secret value can never appear in a failure message.
+
+## Roles and permission matrix
+
+Checks at four boundaries — configuration load, admission, dispatch, and effect application. Capability support and authorization are evaluated separately (`supported`/`unsupported`/`unknown` × `allowed`/`denied`/`unknown`) per the [host contract](repository-host-contract.md#common-semantics-and-optional-capabilities).
+
+| Boundary | Publication role | Review role | Discussion role | Reconciliation |
+| --- | --- | --- | --- | --- |
+| Config load | actor+credential_ref parse; required capability names valid; host/repo declared | same; reviewer identity recommended distinct | same | n/a |
+| Admission | Work's required ops ⊆ supported∩allowed evidence for this actor | same for review ops | same for comment ops | read ops verified for every bound actor — reconciliation must survive lost write permission |
+| Dispatch | fresh capability report re-checked; unavailable → defer with diagnostic | same | same | read capability re-checked; unknown read → `unknown`, never "no effect" |
+| Effect apply | intent's operation re-checked at the apply boundary; expected prior-state guard enforced | same | same | `reconcile` uses the original binding's read permission only; never a new write |
+
+Outcomes are typed: a required operation that is `unsupported` refuses admission; `denied` holds with an authorization failure and repair prerequisite; `unknown` leaves admission unaccepted or defers dispatch. No boundary treats "permission check skipped" as pass.
+
+## Rotation, renewal, and binding preservation
+
+- **Same-actor renewal**: a credential_ref updated to resolve to the *same verified actor* (token refresh, new secret file, provider change) is permitted. Existing Work, intents, and unresolved effects are unaffected; the next resolution picks up the new secret under the same actor identity.
+- **Actor replacement**: binding a role to a different actor identity is a binding change. Existing Work and unresolved effects keep the original actor; the new actor applies to Work accepted after the change. An intent always records the actor it was authorized under.
+- **Lost read permission**: reconciliation of prior unknown effects stays possible while read access survives; when reads fail, effects remain `unknown` and ownership is retained — never converted to failure, release, or a new action.
+- **Removed adapter or host**: new Work cannot select it; existing Work retains its recorded binding and needs the old adapter for reconciliation — removing it surfaces `unavailable` evidence and blocks release.
+- **Changed defaults**: apply to new Work only; they cannot silently retarget or silently downgrade an existing binding.
+- **Unresolved effects**: always reconcile against the intent's original actor/credential binding. Credential rotation cannot reattribute, replay, or erase an unresolved action.
+
+## Setup contract
+
+Two boundaries, both auditable and non-destructive.
+
+**`init`** scaffolds `config.toml` only from observed evidence: it may discover adapter-reported identities (host instance, repository stable id, actor slug) through explicit user-supplied pointers, but never fabricates identities, permissions, or capabilities. It writes only installation-owned files via the existing atomic publish, and never mutates shared user configuration (`~/.gitconfig`, shell rc files, external tools' state). A partial init leaves either no config or a complete one.
+
+**`check`** runs an ordered read-only fail-closed preflight. Each stage names its failure and stops the sequence:
+
+1. Parse `config.toml` (schema_version, unknown keys, structural validity)
+2. Identity tuples: host/repository/actor scoping, allowlist coherence, role completeness
+3. Credential references: provider shape valid, slots resolvable in *existence* (env present, file readable with `0600`, command exits zero) — values are never echoed
+4. Paths: state/workspace/bodies/handoff roots exist or are creatable, writable, correctly nested
+5. Worker runtime: `worker.argv` resolves deterministically and `runtime_version` constraint matches the observed binary
+6. Isolation primitives: the declared sandbox mechanism is present (bubblewrap, egress proxy endpoint)
+7. Store: schema version recognized, no unknown/corrupt state
+8. `--probe` only: read-only `capabilities()` calls for each bound actor and the pinned repository context; reported per operation and actor
+
+`check` is read-only: it creates no Work, mutates no config, and touches no remote state beyond the opt-in probe. Its output is a structured per-stage report — absent config, malformed TOML, missing/expired/unresolvable credentials, and unwritable paths are each distinct results with the exact key/path named.
+
+## Failure and repair semantics
+
+Configuration, authentication, and environment failures follow the shared repair contract: a repair prerequisite names the failed prerequisite, the actor/action required, and the evidence that must change before resume. An unchanged broken configuration cannot create an automatic retry loop — resume requires fresh validated evidence, never a retry of the same failing read.
+
+| Failure | Code | Repair actor / action | Evidence required before resume |
+| --- | --- | --- | --- |
+| Absent config file | `config.absent` | Operator runs `init` or supplies `--config` | Valid config loads end-to-end |
+| Malformed/unknown keys | `config.invalid_key` | Operator edits config; key named in error | `check` stage 1–2 pass |
+| Credential slot missing | `credential.missing` | Operator defines the ref | Ref parses; provider exists |
+| Expired/denied credential | `credential.expired` / `credential.unresolvable` | Operator renews credential; `check` stage 3 passes | Fresh resolution succeeds; bound actor still matches |
+| Lost permission on a required op | `capability.denied` | Operator re-grants or binds an authorized actor | Fresh capability evidence `allowed` |
+| Unsupported required capability | `capability.unsupported` | Change required profile or adapter (new binding) | Cannot repair existing Work — new Work only |
+| Source unavailable | `source.unavailable` | Transient: hold/retry within recovery bounds | Fresh authoritative read |
+| Absent worker runtime | `runtime.missing` | Operator installs the pinned runtime | `check` stage 5 passes |
+| Runtime version mismatch | `runtime.version_mismatch` | Upgrade runtime or update the pin deliberately | Observed version satisfies the pin |
+| Changed actor binding mid-Work | `binding.actor_mismatch` | n/a — original binding retained | Original actor reconciles existing effects; new actor serves new Work only |
+| Broken config left unchanged | (no code — no retry) | n/a | Resume requires the failed prerequisite's evidence to have changed |
+
+Repair evidence is always fresh and validated: the exact failed prerequisite acquires new evidence, and resume rechecks WorkVersion, binding, remaining budgets, and unresolved ownership (per #51's changed-evidence rules).
+
+## Evidence validity for configuration items
+
+The shared four-state contract applies to configuration, credential, and capability evidence:
+
+| State | Examples in this scope | Effect |
+| --- | --- | --- |
+| `absent` | No config file; a required role never declared; a capability report never produced | Dependent operation cannot proceed; absence is never an empty pass |
+| `present` + valid | Config parses with exact schema_version; capability evidence matches the bound host/repository/actor/operation | Satisfies the boundary it was produced for |
+| `present` + invalid | Malformed TOML, stale capability evidence for a different revision, mismatched actor, credential resolving to a different identity | Retained with its reason; cannot satisfy; demands repair, never substitution |
+| `unavailable` | Credential provider unreachable, capability probe timed out, adapter removed | Typed reason retained; `unknown` — never treated as denied or as supported |
+
+## Literal examples
+
+Values are illustrative, not executed evidence.
+
+| Scenario | Result |
+| --- | --- |
+| `credential_ref = "file:~/token.txt"` | Load error: `file:` requires an absolute path and `~` is not expanded |
+| `file:` target is `0644` | `credential.unresolvable` at check stage 3; secret never read under weak permissions |
+| Token rotated in place, same actor slug verified by probe | Existing Work and unresolved intents unaffected; next apply resolves the new secret |
+| Reviewer `credential_ref` now resolves to a different actor | `credential.actor_mismatch`; existing Work keeps its original reviewer binding — new binding serves new Work only |
+| `check` on a host with no `bwrap` | Stage 6 fails `runtime.missing` with the isolation primitive named; earlier stages' passes are still reported |
+| `check --probe` reports `push_ref: denied` for the publication actor | Admission of Work requiring `push_ref` will refuse at the admission boundary; nothing was dispatched |
+| Config adds `comment_write` to review requirements mid-Work | Existing Work's saved binding/policy unchanged; the new floor applies to Work accepted afterward |
+| `--probe` unreachable | `capability.unknown`, not `denied`; admission/dispatch hold rather than fail-closed to a wrong negative |
+| Unresolved push intent, then token revoked and replaced by a different actor's token | Reconciliation uses the intent's original actor; the replacement actor does not reattribute or replay it |
+
+## Planned verification
+
+Named checks for the configuration contract suite (CF). Planned contract scenarios, not executed results.
+
+| Check | Scenario | Required result |
+| --- | --- | --- |
+| CF-01 | Config with unknown key / missing `schema_version` / newer version | Load refused, key named, file untouched |
+| CF-02 | `0`, negative, unknown-unit limit values | Load errors naming the key; `unlimited` honored only where its document permits |
+| CF-03 | `env:`/`file:`/`command:` refs — present, absent, wrong-permission file, nonzero command | Each distinct typed failure; no value in any output |
+| CF-04 | Secret in argv/evidence/report/logs | Static scan plus seeded-secret test: zero occurrences |
+| CF-05 | Role missing `actor`/`credential_ref`; actor on undeclared host | Load error naming the role |
+| CF-06 | Required capability `unsupported`/`denied`/`unknown` at admission | Refuse / hold-with-repair / unaccepted — never silent pass |
+| CF-07 | Capability report changes between admission and dispatch | Dispatch defers with diagnostic; saved binding intact |
+| CF-08 | Same-actor renewal mid-Work | Unresolved effects reconcile under original actor; new secret resolves |
+| CF-09 | Actor replacement in config | Existing Work retains original binding; new Work uses new actor; unresolved intent never reattributes |
+| CF-10 | Lost read permission during reconciliation | Effect stays `unknown`, ownership retained |
+| CF-11 | Adapter/host removed from config | Existing Work's binding retained; reconciliation reports `unavailable`; new Work cannot bind it |
+| CF-12 | `init` on a host missing the runtime | Scaffold incomplete-failure report; no partial config published |
+| CF-13 | `check` stage ordering | A stage failure stops later stages; report names the failed stage and key/path |
+| CF-14 | `check` is read-only | Store, config, remote state byte-identical afterward; probe is opt-in only |
+| CF-15 | Unchanged broken config retried | Same failure, no automatic retry loop; resume requires changed evidence |
+| CF-16 | `TAISAN_CONFIG`/`TAISAN_STATE_DIR` precedence | Flag > env > XDG default; ambient cwd never used |
+| CF-17 | Workspace/state path nesting violation | Refused at check stage 4 |
+| CF-18 | `use = "source"` repo targeted by a publication intent | Refused structurally before any adapter call |
+| CF-19 | Model/runtime version pin vs. observed binary | Mismatch is `runtime.version_mismatch`; loaded config records the pin actually verified |
+| CF-20 | Credential resolving to wrong actor | `credential.actor_mismatch` — never silently rebinds |
+| CF-21 | Recovery/retention key invalid in the same file | Same load-error path as other keys; one schema, one validator |
+| CF-22 | Deterministic runtime resolution | `worker.argv` resolution ignores ambient PATH surprises; explicit overrides only |
+| CF-23 | Sanitized example parses | The documented example loads under the same validator |
+| CF-24 | Interrupted `init` publish | Either no config or a complete config exists; scratch residue never loads |
+
+## Requirement mapping
+
+All 51 inventory targets owned by #53 are mapped in [installation requirements](installation-requirements.md). Source automation mechanisms are omitted and their retained obligations re-modelled here, recorded per requirement.
+
+## Six design aspects
+
+| Aspect | Risk without control | Control in this design | Open / deferred |
+| --- | --- | --- | --- |
+| State transitions | A config change could silently retarget live Work or an unresolved effect | Saved binding is immutable per Work; capability checks repeat at every boundary; rotation rules separate credential renewal from actor replacement | — |
+| Failure semantics | A broken config could flap in a retry loop, or an expired secret could masquerade as a decision | Typed failure codes + repair prerequisites; resume requires changed evidence; unknown stays unknown | Exact CLI output envelopes are #55 scope |
+| Trust boundaries | Secrets could leak into argv/logs/evidence; a worker could inherit host credentials | Refs-only in config; provider resolution at the adapter boundary; worker environment carries no host credential (with #52's isolation) | `command:` provider executes trusted config — its argv is config, not Core input |
+| Identity invariants | Actor/credential could be silently re-bound; capability evidence could bind the wrong host/repository | Actor identity verified against binding at resolution/probe; capability evidence carries exact context; replaced actors serve new Work only | — |
+| Information preservation | Config edits could erase provenance of who authorized what under which policy | Effective policy + binding saved per Work; receipts record the observed actor; schema versioning refuses silent reinterpretation | — |
+| Resource bounds | Preflight could hang on a live probe; file reads could be unbounded | Probe is opt-in and bounded; `check` is ordered fail-closed; bounded report output | Probe timeouts inherit recovery transport bounds |
+
+## Implementation-plan mapping and non-claims
+
+- **U2**: `config.toml` schema and validator, credential-reference resolver, role/capability checks, `init`/`check` preflight, installation layout, secret-hygiene tests.
+- **U1**: store-side persistence of saved bindings/effective policy (already designed under #50/#51).
+- **U3**: the GitHub adapter implements `capabilities()` and per-operation authorization evaluation for the GitHub permission model.
+- **U5**: dispatch-time revalidation wiring into the CLI run loop.
+
+This document claims no installed configuration, no resolved credential, no live probe result, and no runtime implementation. Deferred items: GitHub App authentication setup (token-first is the v0.1 path; App support is a later adapter unit), a `command:` provider hardening guide beyond the contract above, and any config hot-reload protocol for the running loop (#55 scope).
