@@ -479,7 +479,7 @@ Existing `judge_findings_flow_end_to_end`, `incomplete_draft_cannot_submit`, and
 
 ## Explicit retry after a failed Execution
 
-Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry is a new attempt under the same Work intent; it is not another Invocation inside `E1`.
+Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry is a new attempt under the current approved immutable specification revision; it is not another Invocation inside `E1`. Retry does not edit that revision. A separately approved same-Work specification revision may update intent, constraints, and checks while preserving binding, prior snapshots, approvals as history, and consumed budgets.
 
 1. The CLI, directly or through an agent skill, queries `W1`. The Projection shows `E1`'s Outcome, evidence, current Attention, and whether process ownership is still uncertain.
 2. The operator submits `retry` with `work_id=W1`, `expected_execution_id=E1`, the displayed Work version, and an idempotency key.
@@ -508,7 +508,7 @@ The store enforces, atomically inside the caller's transaction:
 - `(origin, actor, idempotency_key)` unique, with the payload digest recorded — a replay returns the saved decision, a changed payload yields `idempotency_conflict`.
 - `request_id` and `action_id` unique; target source-event uniqueness is `(host instance, adapter source, source_event_id)` for host Observations. Current slice-0 storage uses a single-source event key and must migrate with its callers. Preserve at-most-once requests, outbox identities, and deduplicated Observations.
 - `UNIQUE(work_id)` over nonterminal Executions and `UNIQUE(execution_id)` over unresolved writers — partial unique indexes; a competing admission returns `constraint_conflict`.
-- `resource_reservations.resource_key` unique over a normalized key space (`workspace:<id>`, `branch:<host>:<repository-id>:<name>` in the target contract) covering execution reservations and external claims alike.
+- `resource_reservations.resource_key` unique over a normalized key space (versioned structured arrays `["workspace", store_id, workspace_id]` and `["branch", host_id, repository_id, branch_name]` in the target contract) covering execution reservations and external claims alike.
 - `capacity_slots` holds N fixed rows; claiming a free row in the same transaction reserves the slot, and no free row yields `constraint_conflict("capacity")`.
 - Work version by optimistic check in the commit (`WHERE version = expected`); a mismatch returns `version_conflict`.
 
@@ -523,3 +523,7 @@ The target contract-level choices are settled above: store shape and constraint 
 - The Rust module and crate layout itself, which follows the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, GitHub, and worker adapters.
 
 Directories follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, GitHub, and worker adapters, plus the retained deferred TUI. Agent skills invoke the CLI. The layout does not decide the contracts.
+
+## Approved recovery and configuration policy
+
+Use the owner-approved [recovery and configuration policy](recovery-policy.md) for configurable defaults, Work-wide accounting, policy changes, and safe human-wait capacity release. The [post-v0.1 milestones](post-v0.1-milestones.md) retain the seven approved machinery deferrals without deferring v0.1 safety requirements. Both documents specify target behavior, not implemented runtime support.

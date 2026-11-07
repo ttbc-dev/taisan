@@ -45,3 +45,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 A passing check establishes internal mapping completeness against the recorded catalog. It cannot prove that a reviewer understood every source body, that a cited test was executed, that an acceptance snapshot is still current on GitHub, or that the target works at runtime. Independent source review, acceptance comparison, and behavior verification remain separate obligations.
 
 The source tree pins describe the audited baseline. Changes to the design after that baseline do not silently change the source inventory. Updating a pin requires rebuilding its file catalog and reviewing changed entries and affected behavior mappings.
+
+## Approved deferrals
+
+The seven deferred behaviors have explicit owner approval and retained scope in [post-v0.1 milestones](post-v0.1-milestones.md). Their `owner_disposition` fields record that decision. Planned target specifications remain gaps; approval of a deferral does not turn mapping completeness into runtime verification or close #50 automatically.

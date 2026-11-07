@@ -331,3 +331,7 @@ Two independently produced shapes were compared: relational identity/role/capabi
 The owner chose archive/new-store, so both candidates' executable legacy conversion/replay paths are removed. Copy-versus-in-place transformation of old rows is no longer a decision to implement. Preserve archive/read access and safe cutover rather than adding a compatibility wrapper or reconstructing absent provenance. Transactional bootstrap/version checks apply to the new store; full online migration and generic migration engines are excluded.
 
 The remaining detailed evidence/invariant approval schema is #51; credential/config/access enforcement is #53; retention defaults/history compaction are #54; Command syntax, source-hold interaction and future automatic regeneration protocol are #55. Reviewers must preserve the settled manual v0.1 source-change hold and future auto-mode extension rather than selecting arbitrary thresholds or enabling it silently. The final concrete sketch and its tradeoffs require owner review before #50 is complete.
+
+## Approved recovery and configuration policy
+
+Use the owner-approved [recovery and configuration policy](recovery-policy.md) for configurable defaults, Work-wide accounting, policy changes, and safe human-wait capacity release. The [post-v0.1 milestones](post-v0.1-milestones.md) retain the seven approved machinery deferrals without deferring v0.1 safety requirements. Both documents specify target behavior, not implemented runtime support.

@@ -17834,7 +17834,8 @@
    "requirement_ids": [
     "R26",
     "R32"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#planning-and-bounded-replanning"
   },
   {
    "id": "worker-B005",
@@ -17874,7 +17875,8 @@
    "rationale": "optional planner is not mandatory target capability",
    "requirement_ids": [
     "R16"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#planning-and-bounded-replanning"
   },
   {
    "id": "worker-B009",
@@ -18339,7 +18341,8 @@
    "rationale": "#52 optional worker internal hardening",
    "requirement_ids": [
     "R16"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#planning-and-bounded-replanning"
   },
   {
    "id": "TGT-B08",
@@ -20630,7 +20633,8 @@
    "rationale": "human evaluation machinery; the transferable requirement — labelled truth stays provenance-bound and separate from unreviewed inputs, and LLM labels never masquerade as human adjudication — may or may not apply to the target lifecycle, which is an owner decision",
    "requirement_ids": [
     "R268"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#evaluation-and-independent-adjudication"
   },
   {
    "id": "worker-B062",
@@ -20664,7 +20668,8 @@
    "rationale": "evaluation machinery for the Devin-cutover decision; the transferable requirement (run inventories that distinguish absent vs invalid vs missing-identifier evidence and never count incomplete remote reads as complete) may matter to target reporting but is not a core lifecycle need",
    "requirement_ids": [
     "R272"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#evaluation-and-independent-adjudication"
   },
   {
    "id": "worker-B066",
@@ -20680,7 +20685,8 @@
    "rationale": "trial machinery serves the Devin-cutover evaluation program; the transferable requirement (decision-grade comparisons never pass by default and pairing heuristics never claim correctness) is retained in intent while machinery deferral is an owner call",
    "requirement_ids": [
     "R274"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#evaluation-and-independent-adjudication"
   },
   {
    "id": "worker-B068",
@@ -21331,7 +21337,8 @@
    "rationale": "evaluation machinery for the annotator program; the transferable requirement — material shown to an independent reviewer/adjudicator must not leak the answer-key vocabulary and must bind each presented case to exactly one dataset identity and a real evidence anchor — is real but is an owner decision for the target lifecycle",
    "requirement_ids": [
     "R331"
-   ]
+   ],
+   "owner_disposition": "Owner approved: defer machinery from v0.1 and retain as committed later milestone scope; preserve v0.1 safety and bounded recovery requirements. See docs/post-v0.1-milestones.md#evaluation-and-independent-adjudication"
   },
   {
    "id": "worker-B130",
