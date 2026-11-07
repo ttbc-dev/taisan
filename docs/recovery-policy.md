@@ -6,6 +6,8 @@ Status: owner-approved target design from the #50 review. This document changes 
 
 Every operational limit, interval, retry schedule, classifier, progress rule, and escalation threshold has a documented default and a configuration override. Keep safety invariants separate: configuration cannot authorize duplicate writers, infer success from unavailable evidence, or erase an unresolved effect.
 
+This is a project-wide policy, not a recovery-only exception. Apply it to admission, execution, verification, publication, retention, and operator intervention. Documented configuration may be extensive; coding agents must be able to discover and validate it without relying on hidden constants. The [project principles](principles.md) require this policy for subsequent designs.
+
 The following names are target configuration keys, not implemented options. All counters and elapsed time are durable across process restart and successor Executions of the same Work. Limits compose: reaching any applicable limit prohibits another automatic attempt.
 
 | Target key | Default | Meaning |
@@ -46,6 +48,10 @@ Repository-host effects use a separate path. `work` saves a `HostActionIntent`; 
 
 A lane means an execution capacity slot, not a branch or workspace reservation. Moving responsibility to a human does not itself prove safe release.
 
+Across the lifecycle, minimize lane blocking during human-decision and configuration-repair waits. Prevent new dependent dispatches and publication, request a safe stop of an active worker, and release the slot promptly when stop or write-prevention evidence is established. Persist the continuation before release. If no worker has started, hold the Work without acquiring a slot, or release a prepared slot only after proving its saved request cannot still launch. Keep conflicting-resource reservations independently; do not retain compute capacity solely because a human has not answered.
+
+For example, detecting that a source Issue was closed holds new dispatch and publication for an explicit human decision; it does not automatically cancel Work. Before execution, do not occupy a lane while waiting. During execution, preserve the issued task and WIP, safely stop the worker, and release the lane once writer safety is proven. Do not silently replace the live task with edited Issue content. A later human decision resumes through the queue and fresh guards.
+
 | State at handoff | Capacity and reservations |
 | --- | --- |
 | Writer stopped or proven unable to write, no unknown host effect | Pause with durable continuation; release the slot, retain reservations needed for WIP and resume |
@@ -67,3 +73,5 @@ An explicit authorized policy-change operation may update existing Work. Record 
 Test defaults and every override through configuration loading and effective Work policy. Cover invalid keys, ranges, schedules, disabled thresholds, and policy updates. Fault-inject lost start receipts, lost host-write responses, restart during backoff, and successor Executions; no case may reset budgets or create a duplicate writer/effect. Verify that two equivalent post-correction failures request human action and material progress only rearms its diagnostic timer.
 
 With capacity one, pause W1 after proven worker stop and show independent W2 can run while W1 retains its reservations. Repeat with an unknown writer: W2 cannot take that slot. Repeat with a stopped writer and unknown host effect: independent W2 can run, conflicting Work cannot, and W1 cannot settle or perform a dependent write. Human release requeues W1 and reacquires capacity without resetting policy usage. These are future contract tests, not runtime completion claims.
+
+Repeat the capacity-one scenario for source-Issue closure and configuration-repair waits, both before and after worker launch. Prove that a prepared request cannot launch after its slot is released, and that independent Work proceeds after confirmed stop while conflicting Work remains excluded.
