@@ -21451,11 +21451,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r03",
      "owner_issue": 53,
      "acceptance_id": "I53-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21485,11 +21485,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r04",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`workloop-core/src/command.rs::[source-symbol]`; `workloop-store/tests/contract_commands.rs::submit_replays_the_same_decision` and `same_key_different_payload_is_idempotency_conflict` pass. Selector overlap dedup is separate."
@@ -21583,11 +21583,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r08",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21967,11 +21967,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r18",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22144,11 +22144,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r24",
      "owner_issue": 53,
      "acceptance_id": "I53-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22266,11 +22266,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r27",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/retention-requirements.md",
@@ -22340,11 +22340,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r29",
      "owner_issue": 53,
      "acceptance_id": "I53-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22391,11 +22391,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r30",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/retention-requirements.md",
@@ -22529,11 +22529,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r33",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22566,11 +22566,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r34",
      "owner_issue": 53,
      "acceptance_id": "I53-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/retention-requirements.md",
@@ -22616,11 +22616,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r35",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22667,11 +22667,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r36",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22716,11 +22716,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r37",
      "owner_issue": 53,
      "acceptance_id": "I53-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22766,11 +22766,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r38",
      "owner_issue": 53,
      "acceptance_id": "I53-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/retention-requirements.md",
@@ -23052,11 +23052,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r49",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Public tunnel ingress routes only declared hostnames and rejects all unmatched traffic",
@@ -23075,11 +23075,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r50",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Dependabot PR merge/close effects require explicit named human command plus fresh state/check re-fetch",
@@ -23215,11 +23215,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r56",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ordered model-provider fallback chain with explicit per-provider endpoint config",
@@ -23238,11 +23238,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r57",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Refinement mutations are rate-capped and label removal is denied by default",
@@ -23261,11 +23261,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r58",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Local agent run events are emitted to a loopback webhook under machine-scoped identity and file-held secret",
@@ -23307,11 +23307,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r60",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Maintenance automation rollout gates keep issue creation and [source-symbol] handoff disabled until dry-run precision is proven",
@@ -23330,11 +23330,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r61",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "External-agent delegation requires a durable run identity and a human approval gate for dangerous operations",
@@ -23353,11 +23353,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r62",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] admission boundary is loopback-only Bearer auth treated as shell-equivalent",
@@ -23516,11 +23516,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r69",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Coordinator config is the sole source of remote verify profiles; malformed mapping fails every remote phase closed",
@@ -23585,11 +23585,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r72",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-run allowed-path / required-output grants widen scope for exactly one run and always lose to forbidden paths",
@@ -23608,11 +23608,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r73",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] consumes a staged merge only after re-proving every precondition under the task lock",
@@ -23772,11 +23772,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r80",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Scheduled scoped credential mint atomically rewrites lane .env without leaking the secret",
@@ -24025,11 +24025,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r90",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Persisted triage verdicts (skip cache, refusal, park) are bound to issue content and config fingerprints and replayed with live-identical semantics",
@@ -24118,11 +24118,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r94",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remote operator control of stopped [source-symbol] agents re-verifies fresh state and pane identity before sending",
@@ -24187,11 +24187,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r97",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Backend script/interpreter resolution is deterministic with explicit env overrides and never falls back to the working directory or a repository checkout",
@@ -24630,11 +24630,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r116",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Two-phase bounded worktree reclamation binds human approval to an exact evidence-hash plan, revalidates each candidate fresh, and stops the batch on first anomaly",
@@ -24971,11 +24971,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r130",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Webhook route filter admits only dependabot-authored PR events; everything else is a silent drop, malformed input fails the route",
@@ -25576,11 +25576,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r156",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Installer mutation of a shared user config is ownership-scoped: repair requires canonical-identity proof, removal preserves foreign hooks, verification executes the deployed wiring",
@@ -26513,11 +26513,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r194",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Tiered stale-worktree reclamation is fail-closed: only allowlisted checkouts are scanned, active-cwd coverage must be proven before any removal, every candidate is re-classified against freshly-fetche",
@@ -26536,11 +26536,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r195",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Tier-C manual removal preserves unpublished work as a verified owner-private git bundle before deletion, with post-bundle revalidation; retention pruning deletes only verified owned bundles and keeps ",
@@ -26559,11 +26559,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r196",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "CI-failure webhook route filter admits only [source-symbol] failure payloads and dedups the one repo/workflow pair already covered by a dedicated route; malformed input fails the route",
@@ -26582,11 +26582,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r197",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A job other lanes already depend on is registered ACTIVE only after the deployed copy proves its inputs",
@@ -26605,11 +26605,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r198",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deny-guard wiring is proven to fire, not merely present: the deployed guard is executed on a deny-listed payload, dead generated shapes are upgraded only on exact canonical identity, and foreign hook ",
@@ -26628,11 +26628,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r199",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Cron reconcile repairs an owned job's schedule in place while preserving the operator's enable/disable decision; duplicate or unreadable job state refuses",
@@ -26651,11 +26651,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r200",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Console [source-symbol] is a staged, same-filesystem atomic promote holding a single .previous release with trap-driven crash restore",
@@ -26674,11 +26674,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r201",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Sync-safe convergence: a durable disabled marker blocks re-staging, up-to-date is proven read-only before any toolchain is invoked, and every exit path runs an honestly-classified backend observation",
@@ -26720,11 +26720,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r203",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Webhook route secret provisioning keeps the secret off argv, captures it from subscribe output, and persists it to a mode-600 hand-off file; failed or unparseable registration aborts the [source-symbol]",
@@ -26812,11 +26812,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r207",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Untrusted spec-evidence quotes are sanitized, bounded, and re-proven against the issue body before they may echo into a notification or tracker comment; public close text carries only machine-verified",
@@ -27157,11 +27157,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r222",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A packaged console [source-symbol] is proven by a deterministic manifest plus published-contract agreement: the timestamp-free manifest records binary/python-interface SHA-256s, source contracts, the binary's",
@@ -27318,11 +27318,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r229",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deployed webhook intake is health-gated end to end: route listing, tunnel ingress validity, launchd service, loopback route method-rejection and [source-symbol]-side per-repo event-subscription equality must a",
@@ -27341,11 +27341,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r230",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Nightly-E2E route script admits only completed [source-symbol] payloads of the exact (repo, workflow-name) pair, enriches through a bounded read-only [source-file] fetch with payload fallback, and renders the fixed",
@@ -27387,11 +27387,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r232",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Scheduled [source-symbol] sweep reclaims only proven-terminal, retention-expired run outputs — whole-tree invocations/ and bundle/repo plus per-artifact-gated nested target/[source-symbol] — under the shared rec",
@@ -27410,11 +27410,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r233",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "CI-failure investigation is read-only and bounded to the delivered run: untrusted log content, a closed classification vocabulary, honest blockers, and human-gated follow-up",
@@ -27602,11 +27602,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r241",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The backend directory the installer's publisher path verifies is resolved through the identical fixed precedence chain the runtime collector paths use — an explicit --backend or env knob can never pas",
@@ -27702,11 +27702,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r245",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] doctor runs an ordered read-only fail-closed preflight that gates ship before any dispatch",
@@ -27923,11 +27923,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r254",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] profile init scaffolds a validated repository profile only from observed evidence and never fabricates",
@@ -27976,11 +27976,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r256",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/retention-requirements.md",
@@ -28037,11 +28037,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r258",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Dual [source-symbol] App identities split author and reviewer write surfaces with live slug verification, permission-minimal tokens, and strict credential hygiene",
@@ -28465,11 +28465,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r276",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Trusted reviewer posting identity resolves to a per-repo [source-symbol] App installation token that is minted fresh, never persisted, and falls back to operator [source-file] auth when unconfigured",
@@ -28773,11 +28773,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r289",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Live-dispatch readiness gate: declared checks verified at the exact pinned base on the target host, unenforceable limits converted to named operator duties, and explicit owner confirmations recorded b",
@@ -29747,11 +29747,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/installation-requirements.md",
+     "anchor": "r330",
      "owner_issue": 53,
      "acceptance_id": "I53-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Local server resource attribution is positively proven: a non-local server URL never inherits local listeners or descendants, and unmeasurable inspection reports unknown, never absence",
