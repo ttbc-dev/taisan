@@ -1,6 +1,6 @@
 # Work lifecycle and built-in queue
 
-This document fixes the v0.1 lifecycle semantics behind the [module contracts](module-contracts.md). It is a design contract, not an implemented API. The initial installation has one host and one state store. Work, Execution, and Invocation have different lifetimes; the queue and TUI columns are views of those records, not extra card states.
+This document fixes the v0.1 lifecycle semantics behind the [module contracts](module-contracts.md). It is a design contract, not an implemented API. The initial installation has one host and one state store. Work, Execution, and Invocation have different lifetimes; the queue and interface views are projections of those records, not extra card states.
 
 ## Caller behavior
 
@@ -16,7 +16,7 @@ observe(I2, confirmed failure)      → E1 failed; capacity released
 retry(W1, expected=E1, key=C)       → Execution E2 queued under W1
 ```
 
-An accepted `submit`, `retry`, or `resume` records the requested work once. It does not promise immediate worker start. Capacity shortage leaves the Execution queued; the operator does not have to resubmit it. The CLI and TUI read the same Work list and use the same Commands.
+An accepted `submit`, `retry`, or `resume` records the requested work once. It does not promise immediate worker start. Capacity shortage leaves the Execution queued; the operator does not have to resubmit it. The required CLI and planned CLI-backed skills read the same Work list and use the same Commands. The existing TUI is deferred from v0.1; MCP is optional future work. Interface deferral does not change lifecycle semantics.
 
 ## Authoritative records
 
@@ -101,7 +101,7 @@ The pending queue consists of current Executions in `queued`, ordered by their c
 
 The internal dispatch loop reads a queued Execution and its observed Work version. Selection grants no permission. `work` rechecks the current state, input revision, human gates, ownership, and capacity. One state-store transaction moves `queued → ready`, reserves one slot, and saves the first `InvocationRequest`. The request ID is derived from the Execution ID and its next durable Invocation sequence; the store enforces uniqueness. If the Work version, capacity, or request ID conflicts, the loop rereads and decides again. `execution` consumes only an approved request and records an Invocation before asking a worker to start.
 
-After coding, `work` may request review or fix within the same Execution. When that Execution already holds a slot, `ready` for the next Invocation saves a new request without reserving a second slot. An Invocation is never started merely because a TUI row says `running`.
+After coding, `work` may request review or fix within the same Execution. When that Execution already holds a slot, `ready` for the next Invocation saves a new request without reserving a second slot. An Invocation is never started merely because an interface displays `running`.
 
 The input revision and PR head used for an Invocation are checked when its request is saved. A judgment accepted while E waited in the queue is not applied to a newer head. A changed head that needs a new human judgment moves E to `paused` without reserving capacity. An unavailable source leaves E `queued` with a retryable diagnostic; it never silently substitutes a different review target.
 

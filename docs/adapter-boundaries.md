@@ -68,7 +68,7 @@ The Worker contract test suite below is shared: it runs unchanged against every 
 
 ## Separation of control surfaces and adapters
 
-CLI, TUI and GitHub comments are **control interfaces** translating human/automation commands. They are not selectors or workers. GitHub issue/PR observation and publication is an **integration adapter**. Keep these ports separate even if a single binary hosts them in v0.1.
+The CLI is the required **control interface**, with CLI-backed agent skills planned for v0.1. The existing TUI is deferred; GitHub comments and a future MCP adapter are optional control interfaces. Skills invoke the CLI and interpret its results. None owns execution state or replaces a Selector or Worker. GitHub issue/PR observation and publication is an **integration adapter**. Keep these ports separate even if a single binary hosts them in v0.1.
 
 ## Required contract tests
 
