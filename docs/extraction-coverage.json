@@ -21841,11 +21841,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r15",
      "owner_issue": 54,
      "acceptance_id": "I54-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21925,11 +21925,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r17",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22273,11 +22273,11 @@
      "state": "planned"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r27",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22314,11 +22314,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r28",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22398,11 +22398,11 @@
      "state": "planned"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r30",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22486,11 +22486,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r32",
      "owner_issue": 54,
      "acceptance_id": "I54-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22573,11 +22573,11 @@
      "state": "planned"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r34",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22773,11 +22773,11 @@
      "state": "planned"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r38",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22865,11 +22865,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r41",
      "owner_issue": 54,
      "acceptance_id": "I54-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Configurable retention with safety-preserving reclamation",
@@ -23376,11 +23376,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r63",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Automation-path retirement classification is evidence-bound and never destructive on audit alone",
@@ -23865,11 +23865,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r84",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Usage accounting is a read-only derived report over immutable versioned observations — one charge, idempotent ingestion, honest units",
@@ -23888,11 +23888,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r85",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded telemetry ingestion and export: checkpointed importer, loss-counted queue drops, no hot-path backpressure",
@@ -24511,11 +24511,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r111",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Orphan session-card claim release re-verifies the record generation under lock before commit, and terminal unlinked provisional cards are archived with bounded retry and never-reused keys",
@@ -25905,11 +25905,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r169",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Group admission is all-or-nothing on agent-ok verdicts; triage automation faults get at most one bounded in-attempt retry while denials and timeouts are never retried in place",
@@ -27671,11 +27671,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r244",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] gc reclaims disposable checkouts only after terminal remote state and never deletes audit evidence",
@@ -27983,11 +27983,11 @@
      "state": "planned"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r256",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] pins every model source at load time and re-checks the actually-reported model after dispatch and over persisted evidence",
@@ -28014,11 +28014,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r257",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] propose publishes a PR only after ordered binding gates pass, recording refusals with a bounded [source-symbol] and preserving posted evidence",
@@ -28939,11 +28939,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/retention-requirements.md",
+     "anchor": "r296",
      "owner_issue": 54,
      "acceptance_id": "I54-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Cost and allowance estimates are produced only from a validated, byte-digested pricing snapshot; any unresolvable rate or timestamp yields an `unavailable` estimate with a named reason, never a guesse",

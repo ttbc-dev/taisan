@@ -173,7 +173,7 @@ The workspace's own git config, hooks, and attributes are never executed by trus
 3. In the export sandbox, resolve `work/<work_id>`, verify it descends from the request's `base`, and write `out/export.bundle` for `base..produced`. A dirty tree is recorded as WIP evidence; it is not part of the artifact.
 4. Outside the sandbox: `git bundle verify`, then fetch the bundle into a quarantine namespace of the handoff repository. Run `git fsck --connectivity-only` from the produced commit; compute the canonical manifest `{format_version, repository, base, produced, tree, sorted object IDs of base..produced}` and its SHA-256 as `content_digest`.
 5. In one store transaction: insert `artifact_handoffs{artifact_id, invocation, base, produced, manifest_digest, state: imported}`. Then update `refs/taisan/artifacts/<artifact_id>` to `produced` with an expected-absent guard, and commit `state: acknowledged` in a second transaction after reading the ref back.
-6. The out-directory bundle and the workspace may be reclaimed only after `acknowledged` and when retention (#54) permits.
+6. The out-directory bundle and the workspace may be reclaimed only after `acknowledged` and when the [retention policy](retention-policy.md) permits.
 
 Durable acknowledgement means the store row is `acknowledged` **and** the ref resolves to `produced` with a passing connectivity check. SHA-only report claims, files in `/tmp`, workspace paths, or a bundle file alone never establish handoff.
 
@@ -210,7 +210,7 @@ The Worker's `claimed_head` must equal the handed-off `produced` commit; a misma
 
 ### Checkpoints
 
-The reference adapter declares `checkpoints: WorkspaceCommits`: WIP that the runtime committed on the managed branch remains in the workspace and is the continuation input for a later Fix Invocation via `ContinuationRef`. There is no runtime artifact store (`runtime_artifact_store: None`), so artifact recovery reads only the workspace and the out directory. A checkpoint is evidence of WIP, never a produced artifact until handed off. Recovery dependency pins (#54) protect: the workspace while the Execution is nonterminal or a reservation is held; the out directory until acknowledgement; and every handoff ref referenced by an unresolved effect, a current gate, or an Outcome.
+The reference adapter declares `checkpoints: WorkspaceCommits`: WIP that the runtime committed on the managed branch remains in the workspace and is the continuation input for a later Fix Invocation via `ContinuationRef`. There is no runtime artifact store (`runtime_artifact_store: None`), so artifact recovery reads only the workspace and the out directory. A checkpoint is evidence of WIP, never a produced artifact until handed off. Recovery dependency pins ([retention policy](retention-policy.md#dependency-pins)) protect: the workspace while the Execution is nonterminal or a reservation is held; the out directory until acknowledgement; and every handoff ref referenced by an unresolved effect, a current gate, or an Outcome.
 
 ## Verification runner
 
@@ -347,7 +347,7 @@ Every Worker-owned requirement #50's inventory assigns to this issue — 33 targ
 | Failure semantics | Runtime, sandbox, and handoff failures look alike from exit codes | Closed reason codes, class mapping, recovery table | Final taxonomy names from #51 |
 | Trust boundaries | Prompt-injected runtime; host credentials on the same account | bwrap + hygiene + mandatory proxy; no workspace code runs in trusted processes | Model-API exfiltration remains |
 | Identity invariants | Requests, Invocations, artifacts, and commits recur across attempts | Per-Invocation out directory; `ArtifactId` ref; request digest; capability digest bound per request | — mapped to #50 inventory |
-| Information preservation | Claims, invalid reports, and WIP must survive | Invalid evidence retained; workspace and bundle kept until acknowledgement | Exact pins and reclamation (#54) |
+| Information preservation | Claims, invalid reports, and WIP must survive | Invalid evidence retained; workspace and bundle kept until acknowledgement | Exact pins and reclamation in the [retention policy](retention-policy.md) |
 | Resource bounds | Runtime turns, verification time, logs, recovery | Separate bounds; no shim retries | — defaults approved |
 
 ## Implementation-plan mapping and non-claims
