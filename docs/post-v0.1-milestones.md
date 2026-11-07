@@ -14,6 +14,8 @@ Track delivery in [milestone 3](https://github.com/shimpeiws/taisan/milestone/3)
 
 Converge repair planning is distinct from worker-internal planning: it classifies findings and binds a correction plan to the current head, findings, and human decisions. Track its detailed behavior through `worker-B042` as well as `worker-B004`; deferring planner machinery does not remove the v0.1 bounded review/fix loop, finding coverage, approval, or recovery requirements. Do not copy worker-owned outer loops or host publication into the managed Worker entry point.
 
+The owner also approved two follow-up capabilities under this milestone. Automatic PR-conflict repair must bind its plan and evidence to both source and target revisions and preserve publication, approval, and recovery guards. Dedicated external completed-fix adoption must bind a retained task, exact artifact and manual actor, retain an immutable evidence snapshot, and run fresh independent verification and review. v0.1 detects conflicts for human handling and supports claimed manual workspace repair through ordinary resume; neither capability is a v0.1 delivery gate.
+
 ## Evaluation and independent adjudication
 
 Track delivery in [milestone 4](https://github.com/shimpeiws/taisan/milestone/4).

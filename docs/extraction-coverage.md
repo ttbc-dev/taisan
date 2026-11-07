@@ -48,4 +48,8 @@ The source tree pins describe the audited baseline. Changes to the design after 
 
 ## Approved deferrals
 
-The seven deferred behaviors have explicit owner approval and retained scope in [post-v0.1 milestones](post-v0.1-milestones.md). Their `owner_disposition` fields record that decision. Planned target specifications remain gaps; approval of a deferral does not turn mapping completeness into runtime verification or close #50 automatically.
+The seven original deferred behaviors and the subsequently approved dedicated external-result adoption deferral have explicit owner approval and retained scope in [post-v0.1 milestones](post-v0.1-milestones.md). Their `owner_disposition` fields record that decision. Planned target specifications remain gaps; approval of a deferral does not turn mapping completeness into runtime verification or close #50 automatically.
+
+## Identity/admission mapping review
+
+All 40 initially planned #50 targets now link to [normative identity/admission obligations](identity-storage.md#extracted-identity-and-admission-obligations), with target-specific proof scenarios. This does not upgrade implementation status or complete the other design issues. The mapping has 364 remaining planned target links owned by #51-#56 and no unresolved owner dispositions.

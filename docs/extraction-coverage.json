@@ -21285,14 +21285,15 @@
   },
   {
    "id": "worker-B124",
-   "disposition": "retain",
-   "rationale": "Manual provenance plus evidence-snapshot isolation is a distinct admission contract that prevents forged or post-hoc-mutated runs from satisfying a retained fix; it should be carried into the target spec.",
+   "disposition": "defer",
+   "rationale": "Dedicated external completed-result adoption is deferred to the planning/replanning milestone; v0.1 retains claimed manual workspace repair and fresh managed verification, not imported success claims.",
    "requirement_ids": [
     "R14",
     "R30",
     "R32",
     "R327"
-   ]
+   ],
+   "owner_disposition": "Owner approved after the four-point scope review: defer dedicated adoption from v0.1 and retain it in milestone 3. See docs/post-v0.1-milestones.md#planning-and-bounded-replanning."
   },
   {
    "id": "worker-B125",
@@ -23279,15 +23280,15 @@
     "U1"
    ],
    "planned_proof": [
-    "construct a ready set of 5 issues -> verify groups of <=3 emitted; make the policy file unreadable -> verify ready-issues fails closed; toggling the cap -> verify grouping respects it"
+    "An oversized proposal is refused or held with its bound; missing policy cannot silently increase workload."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Group-size admission bound is derived from the ship deadline and documented incident evidence",
@@ -23441,15 +23442,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a card whose record mismatches any check errors without mutation; a crash between marker and promote converges on re-run; a record with a missing, zero or non-integer attempt refuses even when the key is well-formed"
+    "Interrupt archive creation and activation; neither case imports legacy requests or launches a writer."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC3",
+     "state": "specified"
     }
    ],
    "title": "Archived-card recovery passes the full remote-run identity gate with a write-ahead restore marker and the supported unarchive verb",
@@ -23488,15 +23489,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a new base tip on the same head produces a new card while the old episode stays deduped; a manual converge on the same PR does not suppress the conflict episode; the sweep stops at five enqueues and reports the remainder"
+    "Keep the source head fixed and advance the target revision: record a new episode, not a duplicate or an automatic repair."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Conflict-converge episodes are identified by (repo, PR, head, base tip) with episode-scoped dedup and a bounded per-sweep enqueue",
@@ -23557,15 +23558,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a same-owner rename resolves the existing checkout to the canonical name; an owner transfer with a stale remote and foreign dir is not auto-resolved; a write call failing on 307 surfaces the rename hint"
+    "Rename preserves identity; transfer blocks new effects until approval; a different stable repository cannot adopt existing Work."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Repo rename/transfer: reads follow redirects but writes fail; code canonicalizes same-owner renames and a runbook migrates in-flight state",
@@ -23626,15 +23627,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a synchronize on a lane-pushed head emits no resume; a foreign bot review is dropped; a trusted-bot review on a stale head is rejected; an unbindable event yields a dropped/quarantined ledger entry, not silence"
+    "An old-head or unbound event cannot authorize dispatch; record its disposition and reason."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Resume and shadow event admission binds events to lane-authored evidence and current head (fail-closed)",
@@ -23697,15 +23698,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a release after an allowlist executor flip still targets the [source-symbol] lane; a wait whose provenance cannot be resolved refuses until the operator pins a lane; a card created before its wait's release never launches; failing to terminate a stale card fails the release"
+    "Change defaults while a judgment waits; release preserves original binding and refuses a stale head."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Judgment release re-verifies PR/head/lane evidence and resolves executor only from provenance",
@@ -23837,15 +23838,15 @@
     "U1"
    ],
    "planned_proof": [
-    "the same member set re-adopted after completion yields a new [source-symbol] while a card-replacement continuation inherits the original; a crash before session bind leaves consumption unknown rather than zero; observations with only PID/basename/branch-name similarity remain unbound"
+    "A resumed Execution retains its Work; a new explicit submission receives a new Work; ambiguous predecessor identity remains unbound."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Durable workflow correlation identity bound to the adopted [source-symbol] group lineage",
@@ -23937,15 +23938,15 @@
     "U1"
    ],
    "planned_proof": [
-    "reenqueue on a card failing any single proof creates nothing and reports refusal; a qualifying [source-symbol] stamp with restored free space creates exactly one retry-<[source-symbol]> card leaving the original blocked; a [source-symbol] stamp is refused as [source-symbol] and no retry- card appears"
+    "Retry one safely failed Work once despite repeated delivery; unknown ownership creates no successor and independent queued Work remains eligible."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -23967,15 +23968,15 @@
     "U1"
    ],
    "planned_proof": [
-    "approve re-hash mismatch -> [source-symbol]; partial [source-file] failure -> re-run resumes at the failed child and never duplicates created children (token match); reject then approve same version -> [source-symbol]; same fingerprint after maintainer close -> deduplicated, no new card"
+    "A split recommendation creates no child Issue or host action in v0.1; duplicate approval cannot become implicit publication authority."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Split-proposal lane turns a split-recommended issue into a human-decided, idempotent child-issue creation flow",
@@ -24013,15 +24014,15 @@
     "U1"
    ],
    "planned_proof": [
-    "replay of a stored refusal returns the same kind/reasons and does not advance; editing the issue body, updating a declared dependency, advancing origin/<base>, or changing model/config invalidates the entry; stamp-fetch failure performs live triage instead of trusting the entry; a starved timeout produces [source-symbol] and no park record"
+    "Changed assessment input invalidates its use for new admission; missing isolation proof prevents launch. Exact Command replay still returns its saved decision."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -24043,15 +24044,15 @@
     "U1"
    ],
    "planned_proof": [
-    "two runs sharing an issue -> label survives first run's termination and is removed only when the last covering run ends; an issue labeled with no covering run is swept; a run that crashed before its terminal record still leaves the label for the sweep (never blocks selection forever); label-missing issue is still protected from double-start by the internal launch lock"
+    "Concurrent submissions yield one owner; stale or missing labels cannot admit a second owner; an old terminal event cannot release a newer claim."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Machine-owned running-label admits and releases issues with last-owner semantics and stale sweep",
@@ -24764,15 +24765,15 @@
     "U1"
    ],
    "planned_proof": [
-    "bot [source-symbol] -> drop; trusted app submitted commented review with [source-symbol]==head -> recorded; same with stale commit -> drop; human synchronize on lane-pushed head -> drop; comment on unmanaged PR with live unbound ship -> origin='unbound' record; duplicate [source-symbol] -> [source-symbol] False, no effect"
+    "An unbound comment or self-produced event cannot release a human gate; an old-head review stays evidence only for that head."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Resume-intake gate admits only provable human signals on managed PRs: trusted-app reviews bound to current head, self-push loops and ambiguous identity dropped, unbound ship-window comments parked not",
@@ -25334,15 +25335,15 @@
     "U1"
    ],
    "planned_proof": [
-    "table-driven outcomes: [source-symbol] error parks the selector and records [source-symbol]; ambiguous error with a newly-counted pending request returns 'ambiguous'; parked selector skips before enqueue; scan-incomplete returns 'ambiguous' hold; every path sets a [source-symbol] in [source-symbol]"
+    "Exercise denial, unavailable source, duplicate request and unknown launch; each has one explicit decision and no duplicate dispatch."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Per-repo intake attempt is a single bounded, fully-categorized outcome: every enabled repo yields exactly one normalized [source-symbol] driving incidents, report and capacity",
@@ -25495,15 +25496,15 @@
     "U1"
    ],
    "planned_proof": [
-    "capable+0.6, payload clean -> derived with [source-symbol]+fingerprint; payload contains held issue in [source-symbol] -> exclusion-violated; help shows flag but schema 0.5 -> capability-missing; fetch raises -> fetch-error, hold kept"
+    "A proposal leaking an excluded Issue is rejected; an invalid or foreign link cannot appear as an authoritative action target."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -25617,15 +25618,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a member whose status query throws, returns a non-dict payload, or carries only transient exclusion reasons classifies 'unknown'/'open' and the group stays retryable; a member confirmed closed or excluded with reason in the permanent set makes the group dead and the refusal carries the terminal re-enqueue notice"
+    "Close an Issue before launch and during execution: no new dependent effect, no inferred cancellation, and an independent Work runs after stop proof. An unreadable source or unverified head cannot establish a terminal fact."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/evidence-gates.md",
@@ -25740,15 +25741,15 @@
     "U1"
    ],
    "planned_proof": [
-    "resend a stamped request -> deduplicated onto the same task; resend the same key with mutated judgments/head/post/paths -> loud refusal naming the key; force [source-symbol] to land terminal on base key then -r2 -> third attempt on -r3 then [source-symbol] error with the original card untouched; fail [source-symbol] after a successful create -> [source-symbol] and no second card"
+    "Replay equal bytes once; changed bytes conflict; fresh keys cannot duplicate unfinished source-Issue ownership."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -25770,15 +25771,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a [source-symbol] ship with a resumable saved point mints exactly one cont- card across two ticks (key dedup) and the original is transient-blocked only after the card exists; a PR-bound or foreign-driven [source-symbol] yields no continuation; depth beyond [source-symbol] returns [source-symbol]; an ambiguous resume inventory holds and retries with attempts counted once per tick"
+    "Unknown checkpoint identity or old writer blocks continuation; a valid checkpoint resumes under unchanged Work usage; exhausted budgets cannot be bypassed by a successor."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -26015,15 +26016,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a skip entry bound to sha X is ignored after origin/<base> moves to Y and the candidate is re-triaged live; a hand-edited refusal entry containing only advanceable verdicts falls through to live triage; a stamp-fetch failure makes all three stores miss and the walk launches live triage; a mid-walk snapshot/tip mismatch restarts the walk with counters reset"
+    "Advance the base while source text stays equal: cached evidence cannot authorize admission. A fresh result records its actual revision."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Persisted triage verdict caches are bound to issue [source-symbol] stamps, the origin/<base> sha they were judged on, and the triage session fingerprint — a base-tip move mid-walk restarts evaluation so no",
@@ -26038,15 +26039,15 @@
     "U1"
    ],
    "planned_proof": [
-    "two concurrent starts of the same selector: exactly one launches and the other gets [source-symbol]; a manual issue:N enqueue for an issue already inside an active group's [source-symbol] is refused by the overlap check; a base tip moved between triage and launch aborts dispatch; a guard-hook materialization failure leaves no worktree and no spawned process"
+    "Race manual and Selector submission, and change the observed base before dispatch; at most one valid owner/request commits."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Dispatch dedup is one serialized per-repo critical section that checks both selector identity and issue-set overlap before claiming the worktree and persisting the run — no path can double-launch an i",
@@ -26061,15 +26062,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a resume issued while a reconcile pass holds the record lock returns the busy error and the record is unchanged; after the tick the resume flips the run to reviewing and re-asserts labels; a [source-symbol] run resumes under the task lock and leaves a comment on the card"
+    "Race resume with a reconciler commit; the stale version is refused and both original and new evidence survive."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Operator resume of a blocked run mutates the record only under the owning lock with a fresh in-lock re-read, so a resume can neither be lost to nor overwrite a concurrent reconcile write",
@@ -26084,15 +26085,15 @@
     "U1"
    ],
    "planned_proof": [
-    "bare migrate-ledger lists candidates and writes nothing; --apply with ledger.enabled off fails before any write; --apply creates cards/mappings while a byte-diff of the [source-symbol] files shows no change; a second --apply does not duplicate mappings"
+    "Repeat preflight without modifying the archive; interrupted cutover cannot adopt legacy pending requests into the fresh StoreId."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC3",
+     "state": "specified"
     }
    ],
    "title": "Legacy-run ledger migration is non-destructive: dry-run enumeration by default, --apply writes only new monitoring-card and mapping state, and source [source-symbol] are never mutated",
@@ -26176,15 +26177,15 @@
     "U1"
    ],
    "planned_proof": [
-    "two enqueues of identical content mint one key/card while a differing selection.[source-symbol] still dedups; re-saving a request after [source-symbol] stamping validates under the original fingerprint; a byte-flipped artifact fails validation; keys 'a/b' and 'a-b' resolve to distinct files"
+    "Equal semantic inputs with reordered declared sets compare equally; changed task bytes conflict; raw evidence provenance remains retained separately."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ops work-request identity is a canonical content hash that deliberately excludes volatile provenance and post-mint bookkeeping, so the same work dedups onto one card while re-saves and resumed enqu",
@@ -26199,15 +26200,15 @@
     "U1"
    ],
    "planned_proof": [
-    "two processes mutating the same task's state never interleave; a non-blocking acquisition under a held lock raises [source-symbol] and the reconciler skips the tick; killing the holder mid-section frees the lock without manual cleanup"
+    "Race state commits from two callers: no lost update, one version advances, and the loser cannot launch using stale state."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "All run-state mutation for one [source-symbol] task serializes under a per-task flock; a contending tick skips instead of interleaving, and lock-wait exhaustion is a distinct typed outcome",
@@ -26246,15 +26247,15 @@
     "U1"
    ],
    "planned_proof": [
-    "mutated fingerprint/repository/[source-symbol] each reject; an [source-symbol] leak into any group, [source-symbol], or [source-symbol] rejects the whole payload; a recorded pr-triage revalidated against a diverged work list (reordered [source-symbol] or changed status/action/reasons) blocks the sweep while [source-symbol]/[source-symbol] churn passes"
+    "Alter a repository, digest or member list in retained input; reject it without dispatch or mutation, while unchanged valid input still passes freshness checks."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Handed-off [source-symbol] artifacts are adopted only through fail-closed contract validation, and a recorded sweep work list only after verbatim revalidation",
@@ -26393,15 +26394,15 @@
     "U1"
    ],
    "planned_proof": [
-    "an unlisted repo resolves '' for executor/reviewer/identity; executor:'bogus' resolves ''; executor:'[source-symbol]' + no explicit mode resolves smart while [source-symbol] resolves dangerous; a malformed [source-symbol] string survives into the config so the snapshot guard rejects it; a blank [source-symbol] config yields the default marker"
+    "An unknown adapter or permission value fails explicitly; changing defaults cannot retarget accepted Work or its unresolved action."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-repo lane policy resolves fail-closed — allowlist membership gates admission; executor, reviewer, review identity and permission mode resolve to closed vocabularies or refuse",
@@ -26447,15 +26448,15 @@
     "U1"
    ],
    "planned_proof": [
-    "concurrent [source-symbol] from two pids leaves one intact record (no torn JSON); a record with an extra future field loads with the field dropped; a truncated JSON warns on stderr, returns None from [source-symbol], and [source-symbol] skips it while [source-symbol] still refuses the slug"
+    "Interrupt a transaction or corrupt a request payload; report its reason and do not infer that no prior writer/effect exists."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -27567,15 +27568,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a row outside [source-symbol]/END is ignored; a blank or unrecognized verdict cell raises [source-symbol]; 'agent-ok（分割を推奨）' yields split-recommended while 'needs-human（分割を推奨しない）' stays needs-human; deps appear in the prompt only as context; escaped-pipe titles round-trip"
+    "An unknown verdict or extra-scope task is refused; a timed-out diagnostic read reports unavailable without substituting another proposal."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/evidence-gates.md",
@@ -27643,15 +27644,15 @@
     "U1"
    ],
    "planned_proof": [
-    "implementation-eligible candidate whose [source-symbol] hit .github/workflows or config/.env -> eligible=false with 'forbidden scope' in [source-symbol]; empty [source-symbol] -> eligible=false and [source-symbol]='implementation-eligible'; an 'issue-only' verdict leaves assessed=0"
+    "A proposed effect outside accepted scope or with unverifiable scope is refused with a structured reason; an agent recommendation cannot override it."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Maintenance eligibility assessment is a fail-closed scope gate between critic approval and automated [source-symbol] handoff",
@@ -27911,15 +27912,15 @@
     "U1"
    ],
    "planned_proof": [
-    "init against (a) a checkout with recognized manifests, (b) an unreadable dir, (c) an unrecognized layout, and (d) an existing --out without --force; assert a valid observed profile in (a), pre-write refusal in (b) and (d), and omitted-plus-TODO (not fabricated) fields in (c)"
+    "Unreadable config fails before dispatch; a policy update preserves old policy/evidence and counters; a changed actor cannot edit the accepted binding."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -27941,15 +27942,15 @@
     "U1"
    ],
    "planned_proof": [
-    "prepare against fixtures covering each refusal (closed issue, agent:running, claiming PR, repo mismatch, unresolved HEAD, invalid task) plus an Acceptance-less issue and an override set; assert refusals write nothing, undecidable inputs land in [source-file], overrides land in task.provenance.overrides, and a mismatched-overrides resume refuses"
+    "A mismatched source/base/policy cannot reuse a prepared request; a no-effect query does not spend a new attempt; invalid evidence cannot release claims."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -28791,15 +28792,15 @@
     "U1"
    ],
    "planned_proof": [
-    "resolve env:X with X unset, empty, and set (failure naming X in the first two, exact-value map in the third); [source-symbol]:any returns ok with empty secrets and never exposes a key; foo:bar fails naming 'foo' and the supported set; undefined returns empty secrets; assert no error string contains a resolved value"
+    "Missing and unknown credential references refuse dependent operations with sanitized errors; successful resolution proves the saved actor before use."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Opaque [source-symbol] resolution is fail-closed: env: injects a named variable, [source-symbol]: yields no adapter secret, and any other scheme is an explicit error — never a silent skip",
@@ -28957,15 +28958,15 @@
     "U1"
    ],
    "planned_proof": [
-    "a profile with an unknown top-level field, a non-mapping execution/runtime combination, or split location/canonical is refused at load; a shadow+[source-symbol] pair is refused; a converge.planner model carrying variant is refused; a profile naming an outside-allowlist model source fails naming the field path; a bare --profile name resolves to the profiles-dir file but '..', a dotfile, and an unreadable file never resolve; a repo lookup with zero and with two matching profiles both refuse while invalid sibling files are reported without masking the unique match; the loaded record's sha256 differs after a one-byte profile edit"
+    "Two matching profiles require explicit selection; an invalid model or mismatched repository fails loading; changed bytes cannot silently reuse the old effective policy."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Selector job profile admission: a profile is usable only after probe-task validation through the real task/job validators, repository identity agreement, fail-closed file/name/repo resolution, and a pa",
@@ -29028,15 +29029,15 @@
     "U1"
    ],
    "planned_proof": [
-    "two bound runs for the same normalized task -> the next invocation halts [source-symbol] action human without dispatching; a spec-decision revision does not reset the count; a completed non-[source-symbol] run whose only failing required checks are [source-symbol]/unavailable is adopted for verify rather than burned as a redispatch; a [source-symbol] failure at cap reports [source-symbol] naming pattern classes and no secret text"
+    "Reapprove a specification and restart after failed dispatch: consumed Work usage remains, and a deterministic refusal is not automatically repurchased."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/evidence-gates.md",
@@ -29058,15 +29059,15 @@
     "U1"
    ],
    "planned_proof": [
-    "seed bound run dirs for the same job hash: (a) terminal dead-end under the cap -> exactly one fresh dispatch with a counted detail line; (b) at cap -> halt exit 6 before any label write, repeated invocations do not flap the label; (c) retained evidence-refusal result -> halt exit 3 with pattern classes and no dispatch; (d) --resume on a dead-end leaf bypasses the gate"
+    "Crash after attempt charge but before worker acknowledgment; restart counts it once and reconciles the same request; a capped Work cannot launch via resume."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Bounded fresh-dispatch budget at the submit stage: a terminal dead-end run or a deterministic evidence refusal earns at most a counted fresh dispatch, never an identical re-purchase, and at the cap th",
@@ -29105,15 +29106,15 @@
     "U1"
    ],
    "planned_proof": [
-    "simulate (a) code-class failure -> attempt-1 materializes failed patch, re-verify green promotes it as effective run; (b) attempt fails again -> chained attempt-2 seeds from attempt-1's tree, then cap halts human with named dirs; (c) crash after [source-file]on but before run lands -> resume counts the attempt; (d) [source-symbol] remediation run with a lost verdict -> re-verified, not re-dispatched; (e) profile supplemental-check drift -> retained passing verdict ignored and verify re-runs; (f) harness-class-only check failure -> environment retryable stop"
+    "Two correction attempts use their actual predecessor artifacts and preserve cumulative usage; changed checks require fresh verification; missing report triggers reconciliation rather than duplicate correction."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Verify-stage bounded chained remediation: a code-class verify failure seeds counted remediation attempts chained on materialized bases; environment-class failures stay retryable and refused/human-clas",
@@ -29152,15 +29153,15 @@
     "U1"
    ],
    "planned_proof": [
-    "run a dry-run spec check then a live ship -> the live gate re-runs the checker rather than adopting the dry-run record; copy the dry-run record into the live path -> load rejects it; dry-run converge leaves converge/ untouched; a live resume ignores a dry-run checkpoint trail"
+    "Copy simulated evidence into a live location; mode/identity validation still refuses it and the real check must run."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Plan-only (dry-run) evidence is quarantined into parallel -dry-run namespaces and stamped in the record: it never satisfies a live gate, never clobbers bound terminal records, and a live resume ignore",
@@ -29626,15 +29627,15 @@
     "U1"
    ],
    "planned_proof": [
-    "resolve with (a) --out, (b) --state-root with a github canonical, (c) --state-root with a ghe canonical, and (d) neither; enumerate a state root containing github and host-prefixed trees plus stray files; assert precedence order, host-level layout, skipped non-dirs, and that [source-file]on + next commands carry the absolute dir"
+    "Colliding display names on different hosts remain disjoint; a conflict on one source member leaves no partial new claims and never deletes an existing holder."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ship dir resolution binds one canonical durable-state location per (forge, repo, issue): --out wins, then the state-root host/owner/repo/issue-N layout, then a cwd-relative default; enumeration covers",
@@ -29649,15 +29650,15 @@
     "U1"
    ],
    "planned_proof": [
-    "halt a review at [source-symbol]=1 with a surviving critical; extend by 1 and assert the round-1 findings file is reused (no re-review), the fix dispatches once, [source-symbol] records [1->2], and [source-symbol] becomes 2; repeat with a differing --review-rounds to prove the halted cap is the base; assert extension against a cleared manifest errors without mutating it"
+    "Extend a recorded bound from one to two after one consumed attempt: usage stays one; a stale update conflicts; no evidence or approval history is replaced."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Operator --review-extend-rounds resumes a halted pre-PR review in place: retained rounds and bound findings carry over, the cap grows from the halted manifest's recorded cap (not the invocation's --re",
@@ -29667,20 +29668,20 @@
   },
   {
    "id": "R327",
-   "status": "missing",
+   "status": "deferred",
    "implementation_units": [
     "U1"
    ],
    "planned_proof": [
-    "fail a fix dispatch, complete the retained fix-task out-of-band, adopt it, and assert: no second dispatch, adopted.via=manual with [source-symbol] and [source-symbol] recorded, the bound [source-symbol] is a round-scoped snapshot that stays valid after the source dir is tampered, and a re-verified fix promotes the snapshot to [source-symbol]; additionally assert refusals for a non-answering run, an empty dir, and an adopt with no bound fix task"
+    "An external success report cannot clear a gate; claimed manual workspace repair followed by fresh managed verification can proceed without a second concurrent writer."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
-     "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "acceptance_id": "I50-AC2",
+     "state": "specified"
     }
    ],
    "title": "Operator-completed fix adoption (--adopt): an out-of-band run bound to the retained fix task by job hash is copied into a round-scoped evidence snapshot with manual provenance — re-verified and re-rev",
@@ -29813,15 +29814,15 @@
     "U1"
    ],
    "planned_proof": [
-    "allocate many run paths and assert pairwise-distinct [source-symbol] plus disjoint [source-symbol] and [source-symbol] trees; pre-create a colliding runs/<id> and assert a different identity is chosen; force 100 collisions (fixed RNG/existing dirs) and assert a fail-closed throw; resumed allocation returns a new [source-symbol] with the parent's [source-symbol]"
+    "Force an ID collision and concurrent allocation: only one identity is accepted; resume uses a fresh Invocation and cannot overwrite prior evidence."
    ],
    "targets": [
     {
      "document": "docs/identity-storage.md",
-     "anchor": "",
+     "anchor": "extracted-identity-and-admission-obligations",
      "owner_issue": 50,
      "acceptance_id": "I50-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Run allocation mints collision-safe run identities and binds evidence outside the disposable workspace, resuming with a fresh run ID on the retained checkout",
