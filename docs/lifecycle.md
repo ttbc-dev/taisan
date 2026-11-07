@@ -2,6 +2,8 @@
 
 This document fixes the v0.1 lifecycle semantics behind the [module contracts](module-contracts.md). It is a design contract, not an implemented API. The initial installation has one host and one state store. Work, Execution, and Invocation have different lifetimes; the queue and interface views are projections of those records, not extra card states.
 
+The host-neutral target messages and capability requirements are defined in [ADR-002](repository-host-contract.md). GitHub PR examples below describe the v0.1 reference deployment. `CommitRevision` and `HostBinding` refer to the common module-contract types; the current Rust/schema names remain unmodified by this design.
+
 ## Caller behavior
 
 ```text
@@ -24,9 +26,9 @@ The notation is illustrative and does not select a programming language or datab
 
 ```ts
 type RequestId = string & { readonly tag: "invocation_request" };
-type ImmutableIntent = { goal: string; issues: GitHubIssueRef[];
+type ImmutableIntent = { goal: string; issues: IssueRef[];
   constraints: string[]; verification_argv: string[][] };
-type ExecutionInput = { intent_digest: string; selected_base_revision?: string };
+type ExecutionInput = { intent_digest: string; selected_base_revision?: CommitRevision };
 type ExecutionBudget = { deadline?: string; max_invocations?: number;
   max_review_rounds?: number; runtime_limit_seconds?: number;
   first_admitted_at?: string };
@@ -36,7 +38,7 @@ type ContinuationRef = { evidence: EvidenceRef[]; checkpoint?: EvidenceRef };
 type ExternalWait = { kind: "checks" | "review" | "github_action" | "artifact_recovery"; ref: string };
 type PauseReason = { kind: "human_judgment" | "recoverable_stop" | "repair";
   evidence: EvidenceRef[] };
-type VerifiedCompletion = { pr: GitHubPrRef; head: PrHeadSha;
+type VerifiedCompletion = { pr: GitHubPrRef; head: CommitRevision;
   checks: EvidenceRef[]; review: EvidenceRef[]; writer_stop: EvidenceRef[] };
 type ConfirmedFailure = { code: string; evidence: EvidenceRef[] };
 
@@ -55,6 +57,7 @@ type Work = {
   version: WorkVersion;
   intent: ImmutableIntent;
   current_execution: ExecutionId;
+  host_binding: HostBinding;
 };
 
 type Execution = {
@@ -70,7 +73,7 @@ type ExecutionState =
   | { kind: "queued"; enqueued_at: EventSequence }
   | { kind: "ready"; request_id: RequestId }
   | { kind: "running"; invocation_id: InvocationId; stage: "coding" | "review" | "fix" }
-  | { kind: "waiting"; reason: ExternalWait; head?: PrHeadSha }
+  | { kind: "waiting"; reason: ExternalWait; head?: CommitRevision }
   | { kind: "paused"; reason: PauseReason; continuation: ContinuationRef }
   | { kind: "uncertain"; request_id: RequestId; reason: string; desired: "continue" | "cancel" | "fail" }
   | { kind: "stopping"; request_id: RequestId; desired: "cancel" | "fail" }
@@ -98,6 +101,8 @@ type Invocation = {
 ## Queue admission
 
 The pending queue consists of current Executions in `queued`, ordered by their committed `enqueued_at` sequence and then Execution ID. A duplicate Command replay keeps the original sequence. Dispatch scans in that order for the oldest currently eligible Execution; a blocked or unavailable source does not prevent later independent work from being considered. It records a retryable diagnostic for the blocked item and does not silently change its input or target. v0.1 has no manual ordering, priority lanes, or separate queue table.
+
+Admission requires a usable baseline and every optional capability required by the Work policy. Work retains the accepted host/repository/actor binding and requirements across retry/resume. Unsupported requirements reject admission; temporarily unavailable capability evidence defers dispatch without starting a Worker. Permission/capability drift blocks new dependent effects, but old unknown effects are still reconciled under their original binding and prohibit terminal release. See ADR-002 for the explicit rejection and recovery distinctions.
 
 The internal dispatch loop reads a queued Execution and its observed Work version. Selection grants no permission. `work` rechecks the current state, input revision, human gates, ownership, and capacity. One state-store transaction moves `queued → ready`, reserves one slot, and saves the first `InvocationRequest`. The request ID is derived from the Execution ID and its next durable Invocation sequence; the store enforces uniqueness. If the Work version, capacity, or request ID conflicts, the loop rereads and decides again. `execution` consumes only an approved request and records an Invocation before asking a worker to start.
 

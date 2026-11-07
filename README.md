@@ -38,7 +38,7 @@ The repository implements its own development queue. Pending Work, execution req
 
 | In the first release | Deferred |
 | --- | --- |
-| GitHub-based intake, PRs, and review signals | Other source-control hosts |
+| GitHub-based intake, PRs, and review signals; a common repository-host adapter contract | Production adapters for other source-control hosts |
 | Single-instance self-hosted operation | Hosted multi-tenant service |
 | Bounded implementation and review-fix cycles | Fully autonomous product planning |
 | CLI and CLI-backed agent skills for submission, inspection, and operator actions | TUI management console, MCP server, and web dashboard |
@@ -74,6 +74,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [Agent interface requirements](docs/agent-interface.md) — CLI-backed skills, installation deliverables, and verification gaps.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
 - [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
+- [Repository host contract](docs/repository-host-contract.md) — common semantics, required capabilities, host identity, and GitHub/GitLab validation scope.
 - [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
 - [Module contracts](docs/module-contracts.md) — typed messages for every module connection and representative flows.
 - [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.

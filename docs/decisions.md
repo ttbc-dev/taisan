@@ -2,7 +2,7 @@
 
 ## Working decisions
 
-- Target individuals and small teams with GitHub repositories.
+- Target individuals and small teams, with GitHub as the first production repository host.
 - Deliver a self-hosted, single-instance deployment first.
 - Keep Work identity and execution authority in the core; interfaces translate commands and project state.
 - Require a CLI and CLI-backed agent skills for v0.1 so users can operate through their existing coding agent. Keep direct CLI operation for diagnosis. Skills are planned, not implemented.
@@ -39,6 +39,8 @@
 - The publication classifier does not verify replies, thread actions, ready state, stop proof, or the full Outcome gate. Core must assemble those independent receipts before full stage success; an ancestor publication match never makes old-head review valid for a newer head.
 - The executor × reviewer matrix is orthogonal by construction: reviewer (`devin`/`shadow`/`both`) is never narrowed or defaulted by executor (`local`/`remote`). Unsupported combinations are refused at configuration-validation time (`workloop_core::stage::validate_review_matrix`, table `SUPPORTED_MATRIX_CELLS`); no cell silently degrades the reviewer axis (the source workflow once had a remote lane's shadow review silently no-op because an executor concern — the bot-author event filter — overrode the reviewer dimension; covered by `every_supported_matrix_cell_preserves_the_reviewer_axis` in the same test file).
 - Bot-produced work is first-class: adapter event filters that drop bot-authored/bot-sent events exempt lane-produced PRs and heads — the installation's own GitHub App identity and the managed refs it opened — so the lane's own review loop is never starved by its own bot authorship (the silent-reviewer incident above). The exemption is keyed to managed identities, not a blanket "allow all bots".
+
+- Repository-host portability: [ADR-002](repository-host-contract.md) selects one `RepositoryHostPort` with a mandatory semantic baseline and explicit optional capabilities. A conforming adapter meeting the Work's immutable requirements is selectable for new Work through configuration without Core changes. Missing/unknown/denied requirements cannot silently downgrade behavior. Host/repository/event/actor identities are scoped; old Work and unknown effects retain their binding. GitHub remains the v0.1 production target. The current Rust API is not yet this neutral contract; #36 plans caller/store/test migration, the GitLab mapping, and narrow live proof before claiming interchangeability.
 
 ## Questions to resolve through a spike
 

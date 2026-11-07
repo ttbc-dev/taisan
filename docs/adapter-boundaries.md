@@ -13,6 +13,8 @@ Two independently replaceable ports surround the core:
 
 Neither adapter writes core state, reserves capacity, creates Executions, retries Work, or declares a Work completed. Core decisions remain deterministic given persisted facts and policy.
 
+The repository-host integration is also replaceable under [ADR-002](repository-host-contract.md): a conforming adapter satisfying a Work's required capabilities is selected through configuration without Core changes. The GitHub-specific names and authentication examples in ADR-001 describe the first adapter; the neutral target messages and capability rules are normative for other hosts. No production GitLab adapter is implemented by these documents.
+
 ## Ownership matrix
 
 | Responsibility | Selector | taisan Core | Worker | GitHub integration |
@@ -70,6 +72,8 @@ The Worker contract test suite below is shared: it runs unchanged against every 
 
 The CLI is the required **control interface**, with CLI-backed agent skills planned for v0.1. The existing TUI is deferred; GitHub comments and a future MCP adapter are optional control interfaces. Skills invoke the CLI and interpret its results. None owns execution state or replaces a Selector or Worker. GitHub issue/PR observation and publication is an **integration adapter**. Keep these ports separate even if a single binary hosts them in v0.1.
 
+The repository host adapter implements a single `RepositoryHostPort`; [its contract](repository-host-contract.md) defines mandatory semantics, optional capabilities, binding, and host validation. This replaces the integration boundary rather than wrapping a GitHub-only Core. Worker/Selector exchangeability and host exchangeability are separate acceptance items.
+
 ## Required contract tests
 
 1. Selector returns duplicate or reordered proposals: stable identities, no duplicate accepted Work.
@@ -88,6 +92,8 @@ The CLI is the required **control interface**, with CLI-backed agent skills plan
 No external Kanban migration or synchronization, no general plugin marketplace or dynamic loader, no automatic semantic grouping in the reference selector, and no model-specific orchestration inside the core. Adapter interchange excludes live handoff of a running Invocation to a different Worker, migration of adapter-internal saved state, and any mechanism for switching workers mid-Invocation.
 
 ## ADR-001: Core authorizes publication; GitHub integration performs it
+
+ADR-002 generalizes the integration owner to a repository host adapter without changing these authority, evidence, or recovery rules. The GitHub operation names below are reference-adapter terminology. Target `HostActionIntent` replaces `PrActionIntent`; `open_change_request` replaces PR-only `publish_pr`, and `update_change_request` replaces metadata-only `update_pr`. Review feedback, approval, and requesting changes have separate target effects. The neutral `HostActionIntent` names are defined in [module contracts](module-contracts.md#type-sketch). GitHub App/user token handling is not imposed on other hosts.
 
 Decision for issue #35: retain executor-independent stage postconditions, and route every GitHub mutation through Core-approved, durable `PrActionIntent`s. A stage is a unit of assessed behavior, not permission for its worker to publish. The coordinator is the existing `work` decision logic and `execution` supervisor, not a new workflow engine.
 

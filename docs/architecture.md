@@ -4,8 +4,8 @@
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| Core | Work and Execution IDs, state transitions, built-in work queue, capacity, retry/resume policy, evidence, current Attention, execution-ownership decisions | GitHub's issue and PR data |
-| GitHub integration | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
+| Core | Work and Execution IDs, state transitions, built-in work queue, capacity, retry/resume policy, evidence, current Attention, execution-ownership decisions | Repository-host issue and change-request data |
+| Repository host adapter, GitHub first | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
 | Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work or declaring a PR reviewed on a newer head |
 | Control adapter | Command translation, status projection, external identity mapping | State transitions or independent retry policy |
 | CLI | Required control interface for people and agent skills; structured Command and Query results | A separate state model |
@@ -25,7 +25,7 @@ flowchart LR
         CLI[CLI]
         TUI[TUI: existing, deferred]
         COMMENTS[GitHub comment adapter: optional]
-        GITHUB[GitHub integration]
+        HOST[RepositoryHostPort: GitHub first]
 
         subgraph CORE[taisan core]
             W[work: decisions and Outcomes]
@@ -48,8 +48,8 @@ flowchart LR
         TUI -->|Query| P
         COMMENTS -->|Command| W
         COMMENTS -->|Query| P
-        GITHUB -->|Observation| W
-        W -->|PR action| GITHUB
+        HOST -->|Observation| W
+        W -->|HostActionIntent| HOST
     end
 
     E -->|coding task| CODING[CodingWorker role]
@@ -59,6 +59,12 @@ flowchart LR
 ```
 
 GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The CLI reads the queue, Work, Attention, and evidence through Queries, then submits typed Commands for operator decisions. Planned agent skills invoke that CLI; the deferred TUI uses the same boundary. These callers do not classify state or write the store themselves. The execution-ownership mechanism is specified in the [glossary](glossary.md#execution-ownership): reservations, external claims, and stop proof rather than a single Lease entity.
+
+### Repository host exchangeability
+
+[ADR-002](repository-host-contract.md) requires a host adapter satisfying the common contract and the accepted Work's capability profile to be selectable through configuration without Core changes. Core uses scoped opaque repository/change IDs and immutable revisions. Authentication, API/webhook formats, pagination, native review semantics, and diff positions remain adapter responsibilities. There is one host integration edge; no provider-specific lifecycle branch or generic JSON escape hatch exists in the target Core.
+
+Required capabilities and authorization are checked before acceptance and dispatch, and before each relevant action. Unsupported or unknown capabilities cannot silently weaken review, approval, or readiness. Capability drift stops new dependent work but preserves read-only reconciliation and reservations for unknown effects. Existing Work keeps its original host/adapter/actor binding after configuration changes. GitHub remains v0.1's production target; the GitLab mapping and narrow validation requirement are in ADR-002.
 
 ## Command contract
 

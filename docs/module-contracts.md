@@ -1,6 +1,6 @@
 # Module contracts
 
-This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against four interactions. It is a design proposal, not an implemented API or a choice of programming language. The type notation is illustrative; the lifecycle states and guards follow [Work lifecycle](lifecycle.md). The terms and lifetimes come from the [glossary](glossary.md).
+This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against four interactions. It is a design proposal, not an implemented API or a choice of programming language. ADR-002 adds a host-neutral target boundary; the existing Rust APIs remain GitHub-specific and unmodified by this document. The type notation is illustrative; the lifecycle states and guards follow [Work lifecycle](lifecycle.md). The terms and lifetimes come from the [glossary](glossary.md).
 
 ## Caller view
 
@@ -8,7 +8,9 @@ The required CLI and planned CLI-backed agent skills use the same Command and Qu
 
 ## Type sketch
 
-IDs are distinct opaque types even if an implementation stores each as a string. `WorkVersion` is a version of one Work item. `EventSequence` identifies a committed position in one installation's history. `PrHeadSha` identifies the revision used for a review or check.
+The canonical target port is [RepositoryHostPort](repository-host-contract.md). Core uses scoped repository/change identities and immutable revisions without inspecting provider names or payloads. GitHub PR terminology in the example flows is a reference deployment, not a required host model. These target types replace the current GitHub-specific names when implemented, with callers, store keys, and tests migrated together. There are no parallel generic/GitHub Core paths or compatibility aliases.
+
+IDs are distinct opaque types even if an implementation stores each as a string. `WorkVersion` is a version of one Work item. `EventSequence` identifies a committed position in one installation's history. `CommitRevision` identifies the revision used for a review or check.
 
 ```ts
 type OpaqueId<T extends string> = string & { readonly tag: T };
@@ -21,22 +23,40 @@ type ObservationId = OpaqueId<"observation">;
 type ActionId = OpaqueId<"external_action">;
 type WorkVersion = OpaqueNumber<"work_version">;
 type EventSequence = OpaqueNumber<"event_sequence">;
-type PrHeadSha = OpaqueId<"pr_head_sha">;
-type EvidenceRef = { id: string; digest: string; subject_revision?: string };
-type GitHubIssueRef = { repository: string; number: number };
-type GitHubPrRef = { repository: string; number: number };
+type HostInstanceId = OpaqueId<"host_instance">;
+type RepositoryRef = { host: HostInstanceId; id: string };
+type CommitRevision = { repository: RepositoryRef; object_id: string };
+type EvidenceRef = { id: string; digest: string; subject_revision?: CommitRevision };
+type IssueRef = { repository: RepositoryRef; id: string };
+type ChangeRequestRef = { repository: RepositoryRef; id: string };
+type HostCapability = "repository_read" | "branch_read" | "push_ref"
+	| "change_request_read" | "change_request_create" | "change_request_update"
+	| "comment_read" | "comment_write" | "issue_read" | "checks_read"
+	| "review_findings_read" | "inline_comment" | "review_feedback"
+	| "approve" | "request_changes" | "thread_reply" | "thread_resolve" | "ready";
+type HostActorRef = { host: HostInstanceId; id: string };
+type HostBinding = { adapter_id: string; instance: HostInstanceId;
+	repository: RepositoryRef; contract_version: 1;
+	required_capabilities: HostCapability[];
+	actors: { role: "publication" | "review" | "discussion";
+	    actor: HostActorRef; credential_ref: string }[] };
 type SubjectRef =
 	| { kind: "work"; work_id: WorkId; execution_id?: ExecutionId;
-	    invocation_id?: InvocationId; pr?: GitHubPrRef }
-	| { kind: "candidate"; issue: GitHubIssueRef };
-type FindingRef = { finding_id: string; reviewed_revision: string;
-	summary: string; location?: { path: string; line?: number };
+	    invocation_id?: InvocationId; change_request?: ChangeRequestRef }
+	| { kind: "candidate"; issue: IssueRef };
+type DiffSnapshotRef = { change_request: ChangeRequestRef;
+	head: CommitRevision; comparison_base: CommitRevision;
+	target_revision: CommitRevision; evidence: EvidenceRef };
+type DiffLocation = { snapshot: DiffSnapshotRef; path: string;
+	line: number; side: "before" | "after" };
+type FindingRef = { finding_id: string; reviewed_revision: CommitRevision;
+	summary: string; location?: { path: string; line?: number; snapshot?: DiffSnapshotRef };
 	evidence: EvidenceRef[] };
 type CheckResult = "pending" | "passed" | "failed" | "unknown";
 type RejectionCode = "invalid_request" | "unauthorized" | "stale_work_version"
-	| "stale_pr_head" | "ineligible" | "ownership_uncertain"
+	| "stale_head" | "ineligible" | "ownership_uncertain"
 	| "capacity_exhausted" | "source_unavailable" | "idempotency_conflict"
-	| "resource_conflict";
+	| "resource_conflict" | "unsupported_capability";
 
 type Actor = { kind: "human" | "automation"; external_id: string };
 type CommandMeta = { actor: Actor; origin: string; idempotency_key: string };
@@ -44,7 +64,7 @@ type ExistingWork = { work_id: WorkId; expected_work_version: WorkVersion };
 type FindingDecision = { finding_id: string; choice: "fix" | "dismiss" | "accept" | "wait" };
 type WriteResource =
 	| { kind: "workspace"; workspace_id: string }
-	| { kind: "branch"; repository: string; branch: string };
+	| { kind: "branch"; repository: RepositoryRef; branch: string };
 type ResourceReservation = { resources: WriteResource[]; holder:
 	| { kind: "execution"; execution_id: ExecutionId }
 	| { kind: "external"; actor_id: string };
@@ -57,7 +77,7 @@ type CommandEffect =
 	| { kind: "state_changed" };
 
 type CommandRequest = CommandMeta & (
-	| { kind: "submit"; intent: string; issue_refs: GitHubIssueRef[];
+	| { kind: "submit"; intent: string; issue_refs: IssueRef[];
 	    constraints: string[]; verification_argv: string[][] }
 	| { kind: "claim_resources"; resources: WriteResource[]; ttl_seconds: number }
 	| { kind: "release_resources"; resources: WriteResource[] }
@@ -66,8 +86,8 @@ type CommandRequest = CommandMeta & (
 		| { kind: "resume"; execution_id: ExecutionId }
 		| { kind: "cancel"; execution_id?: ExecutionId }
 		| { kind: "acknowledge"; attention_id: string }
-		| { kind: "judge_findings"; expected_pr_head: PrHeadSha; decisions: FindingDecision[] }
-		| { kind: "release_judgment"; expected_pr_head: PrHeadSha }
+		| { kind: "judge_findings"; expected_head: CommitRevision; decisions: FindingDecision[] }
+		| { kind: "release_judgment"; expected_head: CommitRevision }
 	))
 );
 
@@ -80,7 +100,7 @@ type CommandDecision =
 	    evidence: EvidenceRef[]; committed_at: EventSequence };
 
 type Query =
-	| { kind: "work_list"; repository?: string;
+	| { kind: "work_list"; repository?: RepositoryRef;
 	    phase?: WorkPhase; cursor?: string }
 	| { kind: "work_detail"; work_id: WorkId }
 	| { kind: "attention"; work_id?: WorkId }
@@ -96,7 +116,7 @@ type QueryResult<T> =
 	| { kind: "not_found" | "forbidden" | "store_unavailable" };
 
 type ActionPreview = { availability: "available" | "blocked" | "unknown";
-	observed_work_version?: WorkVersion; observed_pr_head?: PrHeadSha;
+	observed_work_version?: WorkVersion; observed_head?: CommitRevision;
 	reasons: RejectionCode[]; evidence: EvidenceRef[] };
 type AttentionView = { attention_id: string; work_id: WorkId;
 	reason: string; evidence: EvidenceRef[];
@@ -123,7 +143,7 @@ type ExecutionState =
 	| { kind: "ready"; request_id: string }
 	| { kind: "running"; invocation_id: InvocationId;
 	    stage: "coding" | "review" | "fix" }
-	| { kind: "waiting"; reason: string; head?: PrHeadSha }
+	| { kind: "waiting"; reason: string; head?: CommitRevision }
 	| { kind: "paused"; reason: string; continuation: EvidenceRef }
 	| { kind: "uncertain"; request_id: string; reason: string;
 	    desired: "continue" | "cancel" | "fail" }
@@ -132,9 +152,9 @@ type ExecutionState =
 	| { kind: "failed"; outcome: OutcomeView }
 	| { kind: "cancelled"; stop_evidence: EvidenceRef[] };
 type ExecutionStateKind = ExecutionState["kind"];
-type WorkDetail = { work_id: WorkId; version: WorkVersion;
+type WorkDetail = { work_id: WorkId; version: WorkVersion; host_binding: HostBinding;
 	current_execution_id: ExecutionId; executions: ExecutionView[];
-	current_pr?: { ref: GitHubPrRef; head?: PrHeadSha };
+	current_change_request?: { ref: ChangeRequestRef; head?: CommitRevision };
 	findings: FindingRef[]; outcome?: OutcomeView;
 	attention: AttentionView[]; evidence: EvidenceRef[] };
 type CapacityView = {
@@ -150,7 +170,7 @@ type CapacityView = {
 
 `claim_resources` and `release_resources` let a manual or unmanaged writer register on the same reservation store that Execution admission uses; they carry no Work ID. An Execution's reservation is declared as `{workspace: <id derived from the Work ID>}` plus `{repository, branch}` with the branch fixed as `work/<work_id>`, is acquired in its `queued → ready` commit, and is held until the Execution reaches a terminal state. An external claim names only `(repository, branch)` pairs, carries a TTL renewed by repeating `claim_resources` from the same actor, and conflicts with any held row are rejected as `resource_conflict` with the current holder returned in evidence. Claim expiry forfeits the exclusion guarantee; it is not evidence that the writer stopped. `release_resources` frees the claimer's own rows; an operator force-release is recorded as an override decision.
 
-`work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes GitHub or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
+`work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes the repository host or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
 
 The `capacity` Query returns a `CapacityView`: which Executions hold slots and why, all held resource reservations including external claims, and queued Executions deferred by a diagnostic such as a conflicting claim or an unavailable source. It is the explanation surface for queue stalls — no separate reservation bookkeeping exists for it to disagree with. `AttentionView` carries the investigation threshold that produced it and the next responsible actor/action; acknowledgement marks the displayed version as seen, and a new version is the only thing that resurfaces it.
 
@@ -162,20 +182,80 @@ type ObservationBase = { id: ObservationId;
 	evidence: EvidenceRef[] };
 type UnknownFact = { kind: "unknown"; reason: string };
 type Observation = ObservationBase & (
-	| { source: "github"; fact: GitHubFact | UnknownFact }
+	| { source: "repository_host"; instance: HostInstanceId; adapter_source: string;
+	    fact: HostFact | UnknownFact }
 	| { source: "execution"; fact: InvocationFact | UnknownFact }
 );
 
-type GitHubFact =
-	| { kind: "issue"; issue: GitHubIssueRef; source_revision: string }
-	| { kind: "pr_head"; pr: GitHubPrRef; head: PrHeadSha }
-	| { kind: "check"; pr: GitHubPrRef; head: PrHeadSha; conclusion: CheckResult }
-	| { kind: "review"; pr: GitHubPrRef; head: PrHeadSha; findings: FindingRef[] }
-	| { kind: "pr_action_result"; action_id: ActionId; status: "applied" | "failed" | "unknown";
-	    receipts: EvidenceRef[] };
+type HostContext = { adapter_id: string; instance: HostInstanceId;
+	repository: RepositoryRef; actor: HostActorRef; contract_version: 1 };
+type CapabilityReport = { context: HostContext; observed_at: string;
+	capabilities: { capability: HostCapability;
+	    support: "supported" | "unsupported" | "unknown";
+	    authorization: "allowed" | "denied" | "unknown";
+	    reason?: string; evidence: EvidenceRef[] }[] };
+type HostReadTarget = { subject: SubjectRef; context: HostContext } & (
+	| { kind: "repository"; repository: RepositoryRef }
+	| { kind: "issue"; issue: IssueRef }
+	| { kind: "branch"; repository: RepositoryRef; branch: string }
+	| { kind: "change_request"; change_request: ChangeRequestRef;
+	    revision?: CommitRevision;
+	    include: ("head" | "checks" | "review_findings" | "approvals" | "readiness" | "comments")[] }
+	| { kind: "thread"; change_request: ChangeRequestRef; thread_id: string }
+);
+type HostEffectFact =
+	| { kind: "ref_published"; repository: RepositoryRef; branch: string;
+	    produced: CommitRevision; observed: CommitRevision;
+	    relation: "equal" | "ancestor"; evidence: EvidenceRef[] }
+	| { kind: "change_opened"; change_request: ChangeRequestRef;
+	    source_branch: string; target_branch: string; head: CommitRevision }
+	| { kind: "metadata_updated"; change_request: ChangeRequestRef; head: CommitRevision;
+	    title?: string; body_digest?: string }
+	| { kind: "comment_posted"; change_request: ChangeRequestRef;
+	    comment_id: string; actor: HostActorRef; marker: string; body_digest: string;
+	    target_revision: CommitRevision; thread_id?: string; location?: DiffLocation }
+	| { kind: "feedback_published"; change_request: ChangeRequestRef; head: CommitRevision;
+	    review_id: string; actor: HostActorRef; body_digest: string }
+	| { kind: "review_decision"; change_request: ChangeRequestRef; head: CommitRevision;
+	    actor: HostActorRef; decision: "approved" | "changes_requested";
+	    eligible: boolean }
+	| { kind: "thread_resolved"; change_request: ChangeRequestRef;
+	    thread_id: string; head: CommitRevision; resolved: true }
+	| { kind: "ready_observed"; change_request: ChangeRequestRef; head: CommitRevision; ready: true };
+type HostActionReceipt = { action_id: ActionId; payload_digest: string;
+	binding: HostBinding; intended_actor: HostActorRef;
+	change_request?: ChangeRequestRef; revision?: CommitRevision;
+	evidence: EvidenceRef[] } & (
+	| { status: "applied"; authenticated_actor: HostActorRef;
+	    effects: [HostEffectFact, ...HostEffectFact[]] }
+	| { status: "failed" | "unknown"; authenticated_actor?: HostActorRef;
+	    effects: HostEffectFact[] }
+);
+type HostCommentFact = { kind: "comment"; change_request: ChangeRequestRef; comment_id: string;
+	actor: HostActorRef; content: EvidenceRef; body_digest: string;
+	marker?: string; thread_id?: string; revision?: CommitRevision };
+type HostFact =
+	| { kind: "repository"; repository: RepositoryRef; default_branch: string }
+	| { kind: "issue"; issue: IssueRef; source_revision: string;
+	    title: string; content: EvidenceRef }
+	| { kind: "branch"; repository: RepositoryRef; branch: string;
+	    state: { kind: "absent" } | { kind: "at"; revision: CommitRevision } }
+	| { kind: "change_head"; change_request: ChangeRequestRef; head: CommitRevision }
+	| { kind: "check"; change_request: ChangeRequestRef; head: CommitRevision;
+	    check_id: string; producer: HostActorRef; conclusion: CheckResult }
+	| { kind: "review"; change_request: ChangeRequestRef; head: CommitRevision;
+	    reviewer: HostActorRef; findings: FindingRef[] }
+	| { kind: "approval"; change_request: ChangeRequestRef; head: CommitRevision;
+	    actor: HostActorRef; decision: "approved" | "changes_requested" | "withdrawn";
+	    eligible: boolean }
+	| { kind: "readiness"; change_request: ChangeRequestRef; head: CommitRevision; ready: boolean }
+	| HostCommentFact
+	| { kind: "thread"; change_request: ChangeRequestRef; thread_id: string;
+	    resolved: boolean; comments: HostCommentFact[] }
+	| { kind: "host_action_result"; result: HostActionReceipt };
 
 type InvocationRequest = { request_id: string; work_id: WorkId;
-	execution_id: ExecutionId; input_revision: string; budget: Budget } & (
+	execution_id: ExecutionId; input_revision: CommitRevision; budget: Budget } & (
 	| { role: "coding"; task: CodingTask }
 	| { role: "review"; task: ReviewTask }
 );
@@ -195,30 +275,30 @@ interface ProcessControlPort {
 }
 type TaskBase = { goal: string; input_artifacts: EvidenceRef[];
 	acceptance_criteria: string[]; verification_argv: string[][] };
-type CodingTask = TaskBase & { kind: "coding"; issue_refs: GitHubIssueRef[] };
-type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: string };
+type CodingTask = TaskBase & { kind: "coding"; issue_refs: IssueRef[] };
+type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: CommitRevision };
 type Budget = { deadline?: string; max_invocations?: number;
 	max_review_rounds?: number; runtime_limit_seconds?: number;
 	first_admitted_at?: string };
-type ExecutionSpec = { execution_id: ExecutionId; work_id: WorkId;
-	input_revision: string; intent_digest: string; budget: Budget;
+type ExecutionSpec = { execution_id: ExecutionId; work_id: WorkId; host_binding: HostBinding;
+	input_revision: CommitRevision; intent_digest: string; budget: Budget;
 	initial_state: "queued" };
 type ExecutionTransition = { execution_id: ExecutionId;
 	expected_state: ExecutionStateKind; next_state: ExecutionState;
 	reason: string; evidence: EvidenceRef[] };
 type WorkspaceRef = { workspace_id: string; path: string };
 type AllowedEffects = { workspace_write: boolean; local_git_write: boolean;
-	github_write: false };
+	repository_host_write: false };
 // Target envelope for immutable changes, not an implemented Rust schema.
 type PreparedChange = { schema_version: number; work_id: WorkId;
 	execution_id: ExecutionId; request_id: string; invocation_id: InvocationId;
-	task_digest: string; repository: string; base_revision: string;
-	produced_revision: string; git_objects: EvidenceRef; checks: EvidenceRef[] };
+	task_digest: string; repository: RepositoryRef; base_revision: CommitRevision;
+	produced_revision: CommitRevision; git_objects: EvidenceRef; checks: EvidenceRef[] };
 type WorkerReport =
 	| { kind: "coding"; invocation_id: InvocationId;
 	    status: "completed" | "failed" | "waiting";
 	    artifacts: EvidenceRef[]; checks: EvidenceRef[] }
-	| { kind: "review"; invocation_id: InvocationId; reviewed_revision: string;
+	| { kind: "review"; invocation_id: InvocationId; reviewed_revision: CommitRevision;
 	    status: "completed" | "failed" | "waiting";
 	    findings: FindingRef[]; evidence: EvidenceRef[] };
 type ProcessEvidence =
@@ -230,32 +310,35 @@ type InvocationFact = { kind: "invocation"; execution_id: ExecutionId;
 	invocation_id: InvocationId; process: ProcessEvidence;
 	worker_report?: WorkerReport };
 
-type PrActionIntent = { action_id: ActionId; work_id: WorkId;
-	repository: string; payload_digest: string;
-	actor: { identity: string; credential_ref: string;
+type HostActionIntent = { action_id: ActionId; work_id: WorkId; binding: HostBinding;
+	repository: RepositoryRef; payload_digest: string;
+	actor: { identity: HostActorRef; credential_ref: string;
 	    role: "publication" | "review" | "discussion" } } & (
 	| { operation: { kind: "push_ref"; branch: string;
-	    expected_previous_ref: { kind: "absent" } | { kind: "at"; sha: PrHeadSha };
-	    produced_head: PrHeadSha; change_artifact: EvidenceRef } }
-	| { operation: { kind: "publish_pr"; branch: string; base: string;
-	    published_head: PrHeadSha; push_action_id: ActionId;
+	    expected_previous_ref: { kind: "absent" } | { kind: "at"; sha: CommitRevision };
+	    produced_head: CommitRevision; change_artifact: EvidenceRef } }
+	| { operation: { kind: "open_change_request"; branch: string; base: string;
+	    published_head: CommitRevision; push_action_id: ActionId;
 	    title: string; body: EvidenceRef } }
-	| { pr: GitHubPrRef; expected_head: PrHeadSha;
-	    operation: { kind: "update_pr"; title?: string; body?: EvidenceRef }
-	      | { kind: "post_pr_comment"; body: EvidenceRef; marker: string; thread_id?: string }
-	      | { kind: "submit_pr_review"; event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
-	          body: EvidenceRef; inline_comments: EvidenceRef[] }
-	      | { kind: "resolve_pr_thread"; thread_id: string }
-	      | { kind: "mark_pr_ready" } }
+	| { change_request: ChangeRequestRef; expected_head: CommitRevision;
+	    operation: { kind: "update_change_request"; title?: string; body?: EvidenceRef }
+	      | { kind: "post_comment"; body: EvidenceRef; marker: string; thread_id?: string }
+	      | { kind: "post_inline_comment"; body: EvidenceRef; marker: string;
+	          location: DiffLocation }
+	      | { kind: "publish_review_feedback"; body: EvidenceRef }
+	      | { kind: "approve_change" }
+	      | { kind: "request_changes"; reason: EvidenceRef }
+	      | { kind: "resolve_thread"; thread_id: string }
+	      | { kind: "mark_ready" } }
 );
 
 type WorkChange =
 	| { kind: "none" }
 	| { kind: "transition"; new_execution?: ExecutionSpec;
 	    execution_transition?: ExecutionTransition;
-	    judgments?: { head: PrHeadSha; decisions: FindingDecision[] };
+	    judgments?: { head: CommitRevision; decisions: FindingDecision[] };
 	    requests: InvocationRequest[];
-	    pr_actions: PrActionIntent[] };
+	    host_actions: HostActionIntent[] };
 type WorkCommit =
 	| { kind: "work"; work_id: WorkId; expected_version?: WorkVersion;
 	    cause:
@@ -295,7 +378,7 @@ type OwnershipAssessment =
 	| { kind: "uncertain"; reason: string; evidence: EvidenceRef[] };
 type InvocationRecord = { invocation_id: InvocationId;
 	request_id: string; execution_id: ExecutionId; role: "coding" | "review";
-	input_revision: string; ownership: SafeOwnership };
+	input_revision: CommitRevision; ownership: SafeOwnership };
 type InvocationWrite =
 	| { kind: "created"; record: InvocationRecord }
 	| { kind: "observed"; fact: InvocationFact;
@@ -316,15 +399,21 @@ type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertai
 
 `ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. Inspection reads process state, not mere presence: an unreaped zombie still lists in the process table but cannot write, and `execution` reaps the processes it spawned. Stop proof covers the descendant snapshot recorded with the stop intent — a `setsid`-escaped child survives a process-group signal and becomes invisible to the process tree once its leader exits. Before signaling any recorded identity the port re-verifies its recorded start time so a reused PID is never signaled. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
 
-`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied.
+`AllowedEffects` states the target boundary: workers may change their isolated workspace, but repository-host mutation goes through the recorded `HostActionIntent`. A `HostActionIntent` is saved before the host adapter writes; an unknown external result must be reconciled before `work` treats the action as applied.
 
-The target `push_ref` performs only a managed branch update and requires the approved previous ref to be absent or exactly the recorded SHA. For an existing branch, the produced commit must also be a descendant of that SHA; reject a changed ref or non-fast-forward update. `publish_pr` creates only the PR after the referenced push action is verified applied to `published_head`; it performs no push, carries no prior PR head, and reconciles by exact repository/head branch/base and PR existence. A branch/head mismatch prevents PR creation and returns a fresh Observation to Core. `update_pr` changes PR metadata only; later fix publication uses a new `push_ref` intent, not a metadata update.
+The individually reported baseline capabilities and required optional effects are validated under [ADR-002](repository-host-contract.md) before acceptance/dispatch; the Work binding is immutable. All revision repositories and action actors must match that binding.
 
-`update_pr`, `post_pr_comment`, `submit_pr_review`, `resolve_pr_thread`, and `mark_pr_ready` carry `expected_head`, and the integration re-reads the head immediately before writing; a mismatch aborts the write, records `pr_action_result: failed` and a fresh `pr_head` Observation, and `work` re-evaluates. v0.1 never re-issues an action automatically — a retry requires evidence that covers the new head.
+A receipt with `status: applied` carries the authenticated adapter actor and nonempty effect facts. Embedded comment/review actor fields identify the external author; reading an already-ready state does not attribute its original transition to the reader. The receipt must include the operation-specific `HostEffectFact` matching the exact authorized target, actor, payload, and postcondition. Missing/mismatched normalized facts cannot establish success, even with opaque provider evidence attached. Partial facts remain retained under failed/unknown results. Core validates them without decoding provider JSON. `ref_published.relation` is an independently verified publication fact, not permission to reuse old review evidence on a newer observed head.
 
-The separate push/PR-create effects, prepared-change envelope, selected actor, review submission, reply marker, thread/ready operations, and result receipts above are target-contract additions from [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it), not implemented Rust API claims. Each effect is separately durable and reconciled; a pre-write head read is not atomic with GitHub. Receipts bind action/payload, producing Invocation/artifact, target PR/head, and observed effect, including published SHA or comment/thread/ready identity. A branch update also checks its prior ref to avoid overwriting a concurrent writer.
+Each inline intent fixes the change request, head, comparison-base and target revisions in `DiffSnapshotRef`, plus path/line/side. The adapter verifies that immutable diff snapshot and its retained evidence before applying, including when the target branch changed without a source-head change. A mismatch rejects the old intent; never recompute its position against a newer diff. Ordinary external comments without a proven revision binding cannot count as a head-bound review or satisfy an applied inline effect.
 
-Integration accepts App installation or user-token authentication through configuration; credentials stay outside the Worker and the action carries only a reference. Review submission targets `expected_head` and preserves the requested review event; missing independent-approval eligibility cannot silently downgrade it. Core builds stage evidence from those facts and never treats the existing publication classifier as the complete converge gate.
+The target `push_ref` performs only a managed branch update and requires the approved previous ref to be absent or exactly the recorded SHA. For an existing branch, the produced commit must also be a descendant of that SHA; reject a changed ref or non-fast-forward update. `open_change_request` creates only the PR after the referenced push action is verified applied to `published_head`; it performs no push, carries no prior PR head, and reconciles by exact repository/head branch/base and PR existence. A branch/head mismatch prevents PR creation and returns a fresh Observation to Core. `update_change_request` changes PR metadata only; later fix publication uses a new `push_ref` intent, not a metadata update.
+
+`update_change_request`, `post_comment`, `publish_review_feedback`, `approve_change`, `request_changes`, `resolve_thread`, and `mark_ready` carry `expected_head`, and the integration re-reads the head immediately before writing; a mismatch aborts the write, records `host_action_result: failed` and a fresh `change_head` Observation, and `work` re-evaluates. v0.1 never re-issues an action automatically — a retry requires evidence that covers the new head.
+
+The separate push/PR-create effects, prepared-change envelope, selected actor, review submission, reply marker, thread/ready operations, and result receipts above are target-contract additions from [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it), not implemented Rust API claims. Each effect is separately durable and reconciled; a pre-write head read is not atomic with the host. Each action is mapped to its baseline or optional capability under ADR-002 before authorization. A thread-targeted `post_comment` additionally requires `thread_reply`. Receipts bind action/payload, producing Invocation/artifact, target PR/head, and observed effect, including published SHA or comment/thread/ready identity. A branch update also checks its prior ref to avoid overwriting a concurrent writer.
+
+Host authentication is adapter-specific. The GitHub adapter accepts App installation or user-token authentication through configuration; credentials stay outside the Worker and the action carries only a reference. Review submission targets `expected_head` and preserves the requested review effect; missing independent-approval eligibility cannot silently downgrade it. Core builds stage evidence from those facts and never treats the existing publication classifier as the complete converge gate.
 
 `SafeOwnership` records the evidence that permits an Invocation to start. It does not name or prescribe a Lease mechanism. An uncertain assessment cannot produce an `InvocationRecord`. If the state store reports a version or constraint conflict, `work` rereads state and evaluates the Command or Observation again; it does not retry the proposed write unchanged.
 
@@ -341,8 +430,8 @@ These are behavioral ports, not separate processes. Delivery between `work`, `ex
 | TUI (deferred) → `projection` | `query(Query) → QueryResult<T>` | Return the queue, Work detail, Attention, Command results, and source availability. |
 | GitHub comment adapter (optional) → `work` | `submit(CommandRequest) → CommandDecision` | Map external actor and delivery ID; reject duplicate effects. |
 | GitHub comment adapter (optional) → `projection` | `query(Query) → QueryResult<T>` | Read the status to render; a comment is not the state store. |
-| GitHub integration → `work` | `ingest(Observation) → IngestReceipt` | Deduplicate source events and assess facts against the current Work revision. |
-| `work` → GitHub integration | `PrActionIntent → action result Observation` | Apply only the recorded intent; reconcile an unknown response. |
+| repository host adapter → `work` | `ingest(Observation) → IngestReceipt` | Deduplicate source events and assess facts against the current Work revision. |
+| `work` → repository host adapter | `HostActionIntent → action result Observation` | Apply only the recorded intent; reconcile an unknown response. |
 | `work` → `execution` | durable `InvocationRequest → DispatchReceipt` | Verify the request and ownership before creating an Invocation. |
 | `execution` → `work` | `ingest(Observation) → IngestReceipt` | Assess worker and process facts; do not copy a worker's claimed Outcome. |
 | `work` → state store | `commitWorkDecision(WorkCommit) → CommitReceipt` | Atomically enforce Work version, one nonterminal Execution, reservation changes derived from state transitions, Command result, and outgoing intents. Observation assessment uses the same port without inventing a Command. |
@@ -356,11 +445,11 @@ These are behavioral ports, not separate processes. Delivery between `work`, `ex
 | CodingWorker → `execution` | coding `WorkerReport` and evidence | Correlate by Invocation ID; report artifacts and checks, not Work completion. |
 | ReviewWorker → `execution` | review `WorkerReport` and evidence | Correlate by Invocation ID and reviewed revision; report findings, not final acceptance. |
 
-`IngestReceipt` reports recorded, duplicate, or rejected input. `DispatchReceipt` reports queued, already queued, or refused because safe ownership cannot be established. Delivery of a durable `InvocationRequest` is at least once; its request ID prevents a second Invocation for the same request. A Command that creates or requeues an Execution saves its decision and queue position together, without reserving capacity. The internal `queued → ready` transition reserves capacity and saves the first request in one transaction. A process crash after admission therefore leaves an approved request for `execution` to resume or reconcile. `execution` records an Invocation before launch, and a lost start response becomes `ProcessEvidence.unknown` until reconciled. GitHub writes cannot share this transaction and require reconciliation.
+`IngestReceipt` reports recorded, duplicate, or rejected input. `DispatchReceipt` reports queued, already queued, or refused because safe ownership cannot be established. Delivery of a durable `InvocationRequest` is at least once; its request ID prevents a second Invocation for the same request. A Command that creates or requeues an Execution saves its decision and queue position together, without reserving capacity. The internal `queued → ready` transition reserves capacity and saves the first request in one transaction. A process crash after admission therefore leaves an approved request for `execution` to resume or reconcile. `execution` records an Invocation before launch, and a lost start response becomes `ProcessEvidence.unknown` until reconciled. Repository-host writes cannot share this transaction and require reconciliation.
 
 The internal dispatch loop reads `PendingExecutionPage` from the same store; it does not consume external board records. It may propose a start, but `work` decides eligibility and the store atomically reserves capacity while moving that Execution to `ready` and saving an Invocation request. `work` derives the request ID from the Execution ID and its next Invocation sequence; the commit checks Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `policy_limit` records a budget or deadline decision without inventing a worker/GitHub Observation; the commit compares its observed time or count with the stored limit. A later coding, review, or fix request in the same reserved Execution does not reserve a second slot. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: an operator action uses a typed Command, and rendering or selecting a row has no lifecycle effect.
 
-The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; a managed Worker entry point disables those writes, its independent claims, outer retry/review loop, and final settlement. The GitHub integration performs the remote effects authorized by Core; the stage runner translates one bounded task and returns evidence. [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it) defines partial effects, credential scope, and evidence validity.
+The worker ports must not give a worker an unreviewed path to mutate the repository host. The target design routes PR publication and other PR actions through `HostActionIntent`; a managed Worker entry point disables those writes, its independent claims, outer retry/review loop, and final settlement. The repository host adapter performs the remote effects authorized by Core; the stage runner translates one bounded task and returns evidence. [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it) defines partial effects, credential scope, and evidence validity.
 
 ## Built-in queue admission
 
@@ -402,9 +491,9 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 
 1. `execution` records an Invocation before starting a CodingWorker or ReviewWorker role. Its request names the Execution, input revision, task, and budget. Devin, Claude Code, or another provider can fill the role.
 2. The worker returns artifacts and evidence to `execution`. `execution` records the Invocation result and reports an Observation to `work`. A worker saying "done" is evidence to assess, not a Work Outcome.
-3. GitHub integration records separate Observations for the PR head, checks, and review events. Each review conclusion is bound to the head SHA it examined. `work` assesses the worker and GitHub Observations together, then records an Outcome or requests another Invocation within the same Execution.
+3. repository host adapter records separate Observations for the PR head, checks, and review effects. Each review conclusion is bound to the head SHA it examined. `work` assesses the worker and GitHub Observations together, then records an Outcome or requests another Invocation within the same Execution.
 4. A later PR-head Observation makes a prior head's review conclusion stale. A delayed webhook for the old head triggers a current GitHub read; it cannot move the recorded current head backward. `work` cannot mark the new head reviewed from the old result. `projection` shows the current head and the missing review evidence in the next Query.
-5. When `work` requests a PR action, it records the outgoing intent before GitHub integration performs the write. Reconciliation records the actual GitHub result as an Observation. An accepted internal decision alone does not prove that the PR changed.
+5. When `work` requests a PR action, it records the outgoing intent before repository host adapter performs the write. Reconciliation records the actual host result as an Observation. An accepted internal decision alone does not prove that the PR changed.
 
 ## State store model
 
@@ -415,9 +504,9 @@ Tables: `works`, `executions`, `invocations`, `invocation_requests`, `commands`,
 The store enforces, atomically inside the caller's transaction:
 
 - `(origin, actor, idempotency_key)` unique, with the payload digest recorded — a replay returns the saved decision, a changed payload yields `idempotency_conflict`.
-- `request_id`, `action_id`, and `source_event_id` unique — at-most-once requests, outbox actions, and deduplicated Observations.
+- `request_id` and `action_id` unique; target source-event uniqueness is `(host instance, adapter source, source_event_id)` for host Observations. Current slice-0 storage uses a single-source event key and must migrate with its callers. Preserve at-most-once requests, outbox identities, and deduplicated Observations.
 - `UNIQUE(work_id)` over nonterminal Executions and `UNIQUE(execution_id)` over unresolved writers — partial unique indexes; a competing admission returns `constraint_conflict`.
-- `resource_reservations.resource_key` unique over a normalized key space (`workspace:<id>`, `branch:<repo>:<name>`) covering execution reservations and external claims alike.
+- `resource_reservations.resource_key` unique over a normalized key space (`workspace:<id>`, `branch:<host>:<repository-id>:<name>` in the target contract) covering execution reservations and external claims alike.
 - `capacity_slots` holds N fixed rows; claiming a free row in the same transaction reserves the slot, and no free row yields `constraint_conflict("capacity")`.
 - Work version by optimistic check in the commit (`WHERE version = expected`); a mismatch returns `version_conflict`.
 
@@ -425,7 +514,7 @@ The store does not evaluate transition legality, budgets, or gates — that stay
 
 ## Implementation-facing decisions
 
-The contract-level choices are settled above: store shape and constraint placement, in-process delivery with the store as durable handoff, the expected-head write contract, and command retention and actor identity. What remains is implementation-facing, not contract-facing. Slice 0 has since produced first versions of all three items below — the SQLite DDL in `workloop-store`, the `ProcessControlPort` supervisor in `workloop-exec`, and the Cargo workspace layout — so the open items are refinements toward full v0.1 rather than greenfield decisions:
+The target contract-level choices are settled above: store shape and constraint placement, in-process delivery with the store as durable handoff, the expected-head write contract, and command retention and actor identity. The host-neutral migration in ADR-002 remains implementation work; the current Rust schema and wire names are not changed here. Slice 0 has since produced first versions of all three items below — the SQLite DDL in `workloop-store`, the `ProcessControlPort` supervisor in `workloop-exec`, and the Cargo workspace layout — so the open items are refinements toward full v0.1 rather than greenfield decisions:
 
 - The concrete DDL that realizes the store constraints, including the transaction boundaries for the `queued → ready` commit racing with `cancel`.
 - The concrete process supervisor implementing `ProcessControlPort`: descendant snapshotting, state-checked inspection including zombies, PID-reuse-safe signaling, and child reaping. The [ownership mechanism is specified without the name Lease](glossary.md#execution-ownership); whether it is one or a fence is resolved by "no replacement while unproven".

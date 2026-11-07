@@ -8,6 +8,8 @@ Build an independent Rust control plane from explicit lifecycle invariants and f
 
 Preserve the already documented Work / Execution / Invocation distinction, durable Command/Query, SQLite authority, queue, and evidence-driven recovery. Prefer completing and correcting the existing implementation over replacing it. The initial release requires direct CLI operation and CLI-backed agent skills. TUI delivery is deferred; MCP is optional future work. Skills never replace durable execution ownership in the core.
 
+The [repository-host contract](repository-host-contract.md) is also required design scope. v0.1 targets GitHub production integration; Core must support configuration-only selection of any conforming host adapter for the required capability profile after the planned migration. This is a target invariant, not a current implementation claim.
+
 ## Current repository baseline (code inspection, not test verification)
 
 - Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-config`, `workloop-github` fixture, `workloop-fixture-worker`, and `workloop-tui`.
@@ -60,6 +62,10 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 ### Phase 2 — Core reliability and reference adapters
 
+- Migrate host-neutral identities, action/observation contracts, capability validation, and persistence keys together with callers and tests; retain historical evidence and idempotency identities. Keep one host port, not parallel generic and GitHub Core paths. Plan this work through #36 before coding.
+- Run an unchanged host contract suite against independent host fixtures, covering mandatory baseline, declared optional capabilities, scoped IDs, permission drift, partial success, lost responses, and original-binding recovery. A scripted GitLab-shaped fixture is contract pressure, not real GitLab support.
+- Maintain the GitHub/GitLab mapping and plan a narrow live GitLab contract spike before claiming host interchangeability. Full production GitLab support remains deferred; this proof is separate from GitHub S1 and does not authorize runtime work in #35.
+
 - Introduce a Selector port and a minimal GitHub single-issue selector; keep admission behind Core.
 - Introduce or adapt a thin Worker port and a Claude Code CLI reference adapter using the existing supervisor.
 - Add a second, independently implemented contract-verification Worker adapter (scripted/deterministic) and run the shared Worker contract suite — including the swap-invariance check — against both adapters, selected via config with no Core change.
@@ -102,7 +108,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 | Core | State-transition and idempotency tests, queue/capacity/resource invariants |
 | Selector | Stable proposal identity, allowlist, duplicate and stale-source tests |
 | Worker | Start/observe/stop contract; lost response, duplicate request, crash, uncertain process tests; shared suite passes on both adapters; swap preserves semantics |
-| GitHub | PR-head binding, delayed/duplicate webhook, outbox and reconciliation tests |
+| Repository host | Versioned common suite, required-capability refusal before start, scoped identity/event keys, immutable binding, partial-effect reconciliation, and GitHub live head/review evidence. GitLab mapping and narrow live proof are required before claiming cross-host interchangeability. |
 | Loop | Bounded review/fix, terminal intent retirement, human Attention |
 | CLI and agent skills | Clean installation and skill invocation; submit, inspect, intervention, structured rejection/failure/unknown results, identical replay, and acceptance-time finding coverage as defined in [agent interface requirements](agent-interface.md) |
 | v0.1 | Clean setup, isolated repository, reproducible E2E and documented limitations |
