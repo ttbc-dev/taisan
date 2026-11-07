@@ -52,4 +52,8 @@ The seven original deferred behaviors and the subsequently approved dedicated ex
 
 ## Identity/admission mapping review
 
-All 40 initially planned #50 targets now link to [normative identity/admission obligations](identity-storage.md#extracted-identity-and-admission-obligations), with target-specific proof scenarios. This does not upgrade implementation status or complete the other design issues. The mapping has 364 remaining planned target links owned by #51-#56 and no unresolved owner dispositions.
+All 40 initially planned #50 targets now link to [normative identity/admission obligations](identity-storage.md#extracted-identity-and-admission-obligations), with target-specific proof scenarios. This does not upgrade implementation status or complete the other design issues. The mapping has no unresolved owner dispositions.
+
+## Evidence and recovery mapping review
+
+All 125 initially planned #51 targets now link to [normative evidence and recovery obligations](evidence-requirements.md), with requirement-specific proof scenarios and the shared absent, valid, and invalid evidence contract. Together with #50, this leaves 239 planned target links under #52-#56. Run the checker to regenerate these counts. `complete` remains false; no runtime implementation status is upgraded.

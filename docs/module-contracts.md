@@ -2,6 +2,10 @@
 
 This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against four interactions. It is a design proposal, not an implemented API or a choice of programming language. ADR-002 adds a host-neutral target boundary; the existing Rust APIs remain GitHub-specific and unmodified by this document. The type notation is illustrative; the lifecycle states and guards follow [Work lifecycle](lifecycle.md). The terms and lifetimes come from the [glossary](glossary.md).
 
+## Evidence and lane-policy refinement
+
+[Evidence and review gates](evidence-gates.md) refines the target messages below. Mechanical Work verification remains separate from optional invariant conformance (default on), optional code review, and additional explicitly configured CI. Code review does not require native Approve or create merge/draft gates. Disabled lanes are explicit, not passing evidence. Judgment/release use exact immutable round/set identity as well as Work version and exact diff target, including same-head finding growth. These target refinements are not implemented by the current Rust fixture.
+
 ## Caller view
 
 The required CLI and planned CLI-backed agent skills use the same Command and Query contracts. The existing TUI is deferred from v0.1; GitHub comments and MCP are optional future control adapters. Skills call the CLI rather than the state store or supervisor. The caller lists the built-in queue with `work_list`, then queries `work_detail(W1)`, may ask `work` for a read-only preflight of a judgment, and submits that Command with the displayed Work version and PR head. If the submit response disappears, it asks for the result by Command ID or replays the same key and payload. An accepted result means the decision is durable; it does not mean a worker or GitHub write has finished.
@@ -9,6 +13,8 @@ The required CLI and planned CLI-backed agent skills use the same Command and Qu
 ## Type sketch
 
 The canonical target port is [RepositoryHostPort](repository-host-contract.md). Core uses scoped repository/change identities and immutable revisions without inspecting provider names or payloads. GitHub PR terminology in the example flows is a reference deployment, not a required host model. These target types replace the current GitHub-specific names when implemented, with callers, store keys, and tests migrated together. There are no parallel generic/GitHub Core paths or compatibility aliases.
+
+The [Worker protocol](worker-protocol.md) refines `WorkerTask`, `WorkerReport`, `PreparedChange` and `AllowedEffects` below: concrete request/report/capability schemas, supervisor-owned export into a handoff repository ref, supervisor-run mechanical verification, and enforced sandbox isolation instead of flags. Target design only.
 
 The [concrete identity/storage design](identity-storage.md) defines Rust/SQLite scope, command payload identity, source-change reapproval and the owner-approved archive/new-store cutover for legacy slice-0 data. This is target design only.
 
@@ -144,7 +150,7 @@ type ExecutionState =
 	| { kind: "queued"; enqueued_at: EventSequence }
 	| { kind: "ready"; request_id: string }
 	| { kind: "running"; invocation_id: InvocationId;
-	    stage: "coding" | "review" | "fix" }
+	    stage: "coding" | "review" | "fix" | "invariant_check" }
 	| { kind: "waiting"; reason: string; head?: CommitRevision }
 	| { kind: "paused"; reason: string; continuation: EvidenceRef }
 	| { kind: "uncertain"; request_id: string; reason: string;
@@ -259,7 +265,9 @@ type HostFact =
 type InvocationRequest = { request_id: string; work_id: WorkId;
 	execution_id: ExecutionId; input_revision: CommitRevision; budget: Budget } & (
 	| { role: "coding"; task: CodingTask }
+	| { role: "fix"; task: FixTask }
 	| { role: "review"; task: ReviewTask }
+	| { role: "invariant_check"; task: InvariantCheckTask }
 );
 type WorkerTask = InvocationRequest & { invocation_id: InvocationId;
 	workspace: WorkspaceRef; allowed_effects: AllowedEffects };
@@ -278,7 +286,14 @@ interface ProcessControlPort {
 type TaskBase = { goal: string; input_artifacts: EvidenceRef[];
 	acceptance_criteria: string[]; verification_argv: string[][] };
 type CodingTask = TaskBase & { kind: "coding"; issue_refs: IssueRef[] };
+type FixTask = TaskBase & { kind: "fix"; predecessor: EvidenceRef;
+	origin: { kind: "prepublication"; failed_evidence: EvidenceRef[] }
+	    | { kind: "review"; target: EvidenceRef; round: EvidenceRef;
+	        judgment: EvidenceRef; findings: FindingRef[] } };
 type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: CommitRevision };
+type InvariantCheckTask = TaskBase & { kind: "invariant_check";
+	artifact: EvidenceRef; invariant_set: EvidenceRef;
+	specification_revision: number; assessed_revision: CommitRevision };
 type Budget = { deadline?: string; max_invocations?: number;
 	max_review_rounds?: number; runtime_limit_seconds?: number;
 	first_admitted_at?: string };
@@ -297,12 +312,18 @@ type PreparedChange = { schema_version: number; work_id: WorkId;
 	task_digest: string; repository: RepositoryRef; base_revision: CommitRevision;
 	produced_revision: CommitRevision; git_objects: EvidenceRef; checks: EvidenceRef[] };
 type WorkerReport =
-	| { kind: "coding"; invocation_id: InvocationId;
+	| { kind: "coding" | "fix"; invocation_id: InvocationId;
 	    status: "completed" | "failed" | "waiting";
 	    artifacts: EvidenceRef[]; checks: EvidenceRef[] }
 	| { kind: "review"; invocation_id: InvocationId; reviewed_revision: CommitRevision;
 	    status: "completed" | "failed" | "waiting";
-	    findings: FindingRef[]; evidence: EvidenceRef[] };
+	    findings: FindingRef[]; evidence: EvidenceRef[] }
+	| { kind: "invariant_check"; invocation_id: InvocationId;
+	    status: "completed" | "failed" | "waiting"; artifact: EvidenceRef;
+	    invariant_set: EvidenceRef; assessment: EvidenceRef; evidence: EvidenceRef[] };
+// Coding and fix retain distinct report kinds with the same artifact fields.
+// Invariant-check reports additionally carry the exact set/coverage and artifact
+// under the typed evidence-gates.md schema; they are not a code-review verdict.
 type ProcessEvidence =
 	| { state: "alive"; process_identity: string; observed_at: string }
 	| { state: "stopped"; process_identity: string; observed_at: string;
@@ -379,7 +400,7 @@ type OwnershipAssessment =
 	| SafeOwnership
 	| { kind: "uncertain"; reason: string; evidence: EvidenceRef[] };
 type InvocationRecord = { invocation_id: InvocationId;
-	request_id: string; execution_id: ExecutionId; role: "coding" | "review";
+	request_id: string; execution_id: ExecutionId; role: "coding" | "fix" | "review" | "invariant_check";
 	input_revision: CommitRevision; ownership: SafeOwnership };
 type InvocationWrite =
 	| { kind: "created"; record: InvocationRecord }
@@ -449,7 +470,7 @@ These are behavioral ports, not separate processes. Delivery between `work`, `ex
 
 `IngestReceipt` reports recorded, duplicate, or rejected input. `DispatchReceipt` reports queued, already queued, or refused because safe ownership cannot be established. Delivery of a durable `InvocationRequest` is at least once; its request ID prevents a second Invocation for the same request. A Command that creates or requeues an Execution saves its decision and queue position together, without reserving capacity. The internal `queued → ready` transition reserves capacity and saves the first request in one transaction. A process crash after admission therefore leaves an approved request for `execution` to resume or reconcile. `execution` records an Invocation before launch, and a lost start response becomes `ProcessEvidence.unknown` until reconciled. Repository-host writes cannot share this transaction and require reconciliation.
 
-The internal dispatch loop reads `PendingExecutionPage` from the same store; it does not consume external board records. It may propose a start, but `work` decides eligibility and the store atomically reserves capacity while moving that Execution to `ready` and saving an Invocation request. `work` derives the request ID from the Execution ID and its next Invocation sequence; the commit checks Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `policy_limit` records a budget or deadline decision without inventing a worker/GitHub Observation; the commit compares its observed time or count with the stored limit. A later coding, review, or fix request in the same reserved Execution does not reserve a second slot. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: an operator action uses a typed Command, and rendering or selecting a row has no lifecycle effect.
+The internal dispatch loop reads `PendingExecutionPage` from the same store; it does not consume external board records. It may propose a start, but `work` decides eligibility, including the [Work-wide recovery ledger](evidence-gates.md#work-wide-recovery-accounting), and the store atomically reserves capacity while moving that Execution to `ready` and saving an Invocation request. `work` derives the request ID from the Execution ID and its next Invocation sequence; the commit checks Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `policy_limit` records a budget or deadline decision without inventing a worker/GitHub Observation; the commit compares its observed time or count with the stored limit. A later coding, fix, invariant-check, or code-review request in the same reserved Execution does not reserve a second slot. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: an operator action uses a typed Command, and rendering or selecting a row has no lifecycle effect.
 
 The worker ports must not give a worker an unreviewed path to mutate the repository host. The target design routes PR publication and other PR actions through `HostActionIntent`; a managed Worker entry point disables those writes, its independent claims, outer retry/review loop, and final settlement. The repository host adapter performs the remote effects authorized by Core; the stage runner translates one bounded task and returns evidence. [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it) defines partial effects, credential scope, and evidence validity.
 
@@ -491,7 +512,7 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 
 ## Worker result and PR review
 
-1. `execution` records an Invocation before starting a CodingWorker or ReviewWorker role. Its request names the Execution, input revision, task, and budget. Devin, Claude Code, or another provider can fill the role.
+1. `execution` records an Invocation before starting a coding, fix, invariant-check, or code-review role. Its request names the Execution, input revision, task, and budget. Devin, Claude Code, or another provider can fill the role.
 2. The worker returns artifacts and evidence to `execution`. `execution` records the Invocation result and reports an Observation to `work`. A worker saying "done" is evidence to assess, not a Work Outcome.
 3. repository host adapter records separate Observations for the PR head, checks, and review effects. Each review conclusion is bound to the head SHA it examined. `work` assesses the worker and GitHub Observations together, then records an Outcome or requests another Invocation within the same Execution.
 4. A later PR-head Observation makes a prior head's review conclusion stale. A delayed webhook for the old head triggers a current GitHub read; it cannot move the recorded current head backward. `work` cannot mark the new head reviewed from the old result. `projection` shows the current head and the missing review evidence in the next Query.
@@ -500,6 +521,8 @@ Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry i
 ## State store model
 
 v0.1 uses a hybrid schema on SQLite: current-state tables that enforce structural invariants, plus an append-only `event_log` for audit and reconstruction. `EventSequence` is the log's committed position — it orders the queue, marks snapshot `as_of`, and anchors resume positions.
+
+Target evidence/recovery extensions use immutable `assessment_subjects`, `source_snapshots`, `review_rounds`, `review_occurrences`, `round_judgments`, `judgment_decisions`, `failure_records`, `recovery_decisions`, `recovery_usage_entries`, and `recovery_time_intervals`, with Work-current pointers. Their membership, exact-set checks, attempt uniqueness, and atomic usage/request updates are specified in [evidence and gates](evidence-gates.md). These are planned tables, not implemented schema.
 
 Tables: `works`, `executions`, `invocations`, `invocation_requests`, `commands`, `resource_reservations`, `capacity_slots`, `observations`, `pr_action_intents`, `stop_intents` (holding descendant snapshots), `attention_acks`, `event_log`.
 

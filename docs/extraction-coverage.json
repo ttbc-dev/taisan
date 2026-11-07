@@ -21444,11 +21444,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r03",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21478,11 +21478,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r04",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21576,11 +21576,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r08",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21616,11 +21616,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r09",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "Single-installation capacity/reservation accounting tested by `contract_queries.rs::capacity_explains_every_slot_reservation_and_deferral`; per-host or per-repository pools are deferred."
@@ -21643,11 +21643,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r10",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21680,11 +21680,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r11",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21723,11 +21723,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r12",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21751,11 +21751,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r13",
      "owner_issue": 51,
      "acceptance_id": "I51-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21792,11 +21792,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r14",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21827,11 +21827,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r15",
      "owner_issue": 51,
      "acceptance_id": "I51-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21875,11 +21875,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r16",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21911,11 +21911,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r17",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21953,11 +21953,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r18",
      "owner_issue": 51,
      "acceptance_id": "I51-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22000,11 +22000,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r19",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22027,11 +22027,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r20",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22048,11 +22048,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r21",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22076,11 +22076,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r22",
      "owner_issue": 51,
      "acceptance_id": "I51-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22103,11 +22103,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r23",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22130,11 +22130,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r24",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22180,11 +22180,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r25",
      "owner_issue": 51,
      "acceptance_id": "I51-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22223,11 +22223,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r26",
      "owner_issue": 51,
      "acceptance_id": "I51-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22259,11 +22259,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r27",
      "owner_issue": 51,
      "acceptance_id": "I51-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22307,11 +22307,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r28",
      "owner_issue": 51,
      "acceptance_id": "I51-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22377,11 +22377,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r30",
      "owner_issue": 51,
      "acceptance_id": "I51-AC3",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22434,11 +22434,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r31",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22472,11 +22472,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r32",
      "owner_issue": 51,
      "acceptance_id": "I51-AC3",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22522,11 +22522,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r33",
      "owner_issue": 51,
      "acceptance_id": "I51-AC3",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22609,11 +22609,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r35",
      "owner_issue": 51,
      "acceptance_id": "I51-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22653,11 +22653,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r36",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22702,11 +22702,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r37",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22752,11 +22752,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r38",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22832,11 +22832,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r40",
      "owner_issue": 51,
      "acceptance_id": "I51-AC6",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22890,11 +22890,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r42",
      "owner_issue": 51,
      "acceptance_id": "I51-AC3",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal closure requires settled writers and external effects",
@@ -22960,11 +22960,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r45",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "NEW-INSTALL-RECOVERY",
@@ -22983,11 +22983,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r46",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "NEW-RETENTION-BOUNDS",
@@ -23168,11 +23168,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r54",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded policy autojudge answers judgment-wait findings and escalates the remainder to humans",
@@ -23192,11 +23192,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r55",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Shadow-review route converts recorded webhook events into dry-run-by-default review cards with bounded retries",
@@ -23400,11 +23400,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r64",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal verdict authority is the worker's structured stop.action record, never the process exit code",
@@ -23470,11 +23470,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r67",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Proven-never-published auto-resolution is one-shot per run identity and grants exactly one publish attempt",
@@ -23655,11 +23655,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r75",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Finding disposition ledger reconciles pushed fixes without eviction, guessing, or silent capacity overflow",
@@ -23679,11 +23679,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r76",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Judgment answers bind to the head they answered; a head change re-presents and never silently reuses stale answers",
@@ -23749,11 +23749,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r79",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Autojudge applies policy answers only to explicitly opted-in repos and bounded classes, escalating everything else whole-episode to humans",
@@ -23796,11 +23796,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r81",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Single PR-scoped mutation-ownership boundary with fencing across output directories and coordinators",
@@ -23912,11 +23912,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r86",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -24072,11 +24072,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r92",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Dangerous-permission launches require repo-local hard-deny guard wiring; launch aborts or escalates rather than run unguarded",
@@ -24326,11 +24326,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r103",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal-card resolution re-checks recorded Issue/PR links through a bounded injected [source-symbol] seam under an explicit never-resolve list",
@@ -24396,11 +24396,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r106",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Judgment-wait answering records per-finding typed decisions and resumes convergence via auto-release with error-kind-gated retry",
@@ -24535,11 +24535,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r112",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Durable wake request persists dispatch intent and a detached waiter fires [source-symbol] once, reusing only a provably-identical live process",
@@ -24559,11 +24559,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r113",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Typed judge failure consumes its single per-(repo,PR,head) retry attempt before scheduling, then revalidates the same head under a constrained budget",
@@ -24583,11 +24583,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r114",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Posted-review settle emits an idempotent converge resume signal keyed to the published comment, gated on recorded run evidence",
@@ -24607,11 +24607,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r115",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Settle-time provenance gate binds a reviewed PR only on lane-owned evidence; unprovable PRs become typed refusals, never converge cards",
@@ -24677,11 +24677,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r118",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Blocker re-evaluation fails closed on unverifiable evidence: malformed or out-of-allowlist dependencies count as unmet, corrupt attempt ledger aborts the tick, missing scans never read as cleared",
@@ -24793,11 +24793,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r123",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -24824,11 +24824,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r124",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -24924,11 +24924,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r128",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Worker-result verdict classification: converge 'refused' is an operator block and 'nothing-to-fix' completes only on attested required-check green plus clean termination",
@@ -24948,11 +24948,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r129",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Review-fix (converge) cycle bound counts every minted remote attempt per (repo, PR), including attempts parked out-of-band and retries across replaced cards",
@@ -25629,11 +25629,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r158",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Permanent-ineligibility revalidation verdicts are proven-only: unknown, absent, or ambiguous member states stay retryable and can never kill a request",
@@ -25722,11 +25722,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r162",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A remote converge 'fixed'/'complete' verdict is adopted only when the produced head provably reached the PR; definitive unpushed preserves container+evidence and blocks, transient reads retry bounded ",
@@ -25898,11 +25898,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r169",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -26228,11 +26228,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r183",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Typed block/deferral evidence sidecars bind to a card by restamped identity under a closed kind vocabulary, and any unreadable/mismatched record reads as 'not proven' — the fail-closed input the recov",
@@ -26298,11 +26298,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r186",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Unattended [source-symbol] sessions run under a generated session-scoped permission config — pinned allow surface, allowlisted inherited keys, user allow replaced and user deny/ask carried over",
@@ -26322,11 +26322,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r187",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-run session-config grants widen only on proof: a review-loop Write for a [source-file]-resolved dir realpath-proven under ~/.agents/review-loop, and a review-fix push only for a charset-whitelisted rec",
@@ -26422,11 +26422,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r191",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -26483,11 +26483,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r193",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -27549,11 +27549,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r239",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Worker child environment is credential-scoped: Ops delivery secrets stripped, only declared worker-needed names forwarded from ~/.[source-symbol]/.env",
@@ -27579,11 +27579,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r240",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol]'s subprocess contract: a scoped prompt confines the agent to the group's declared issue set and only marker-delimited table rows under a closed verdict vocabulary are admitted as judgments",
@@ -27695,11 +27695,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r245",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -27726,11 +27726,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r246",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge repair planning binds a bounded planner-produced plan to head+finding set+decisions+model, spends a capped replan budget on voided plans, and retries execution failures under the retained bin",
@@ -27750,11 +27750,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r247",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge admits review findings only through marker-bound provenance -- own identity or allowlisted lane accounts -- and gates dispatch on an exact-head terminal review signal",
@@ -27774,11 +27774,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r248",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Standalone converge owns its managed runtime before its ledger and accounts repair spend honestly -- a derived 2N dispatch budget, free passes, and charge/free failure boundaries from dispatch-proof m",
@@ -27798,11 +27798,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r249",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A converge invocation that pushed a repair head releases as resumable pending -- never a clean verdict -- naming the pushed head, observed blockers, and owed findings",
@@ -27822,11 +27822,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r250",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Human-authored findings join the bounded fix run under the babysit contract -- proposed answers judgment calls, reasonless dismissals are dishonored, and unresolved human threads end the invocation aw",
@@ -27846,11 +27846,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r251",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge persists a per-PR cumulative budget bound to repo+PR, counts unknown cost as unverifiable rather than zero, refuses dispatch until a human raises caps or resets, and stamps per-invocation evi",
@@ -27870,11 +27870,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r252",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A draft PR leaves draft exactly once when every current-head condition holds -- bound verification, settled draft checks, no critical or halt findings or owed human replies, settled review surface, no",
@@ -28007,11 +28007,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r257",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -28061,11 +28061,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r259",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge holds a fresh head unsettled until expected checks register or a persisted per-(name,head) registration window expires, and carries completions forward only onto converge-pushed heads",
@@ -28085,11 +28085,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r260",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge classifies review findings mechanically into skip/halt/fix, never auto-dispatches halt-class without explicit operator opt-in or read-only triage promotion, and always records the classificat",
@@ -28109,11 +28109,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r261",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Halt episodes mint an answerable identity and admit human decisions through head+episode-bound channels that fail closed, replay idempotently, and persist durable directives and holds",
@@ -28156,11 +28156,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r263",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Shared-bus event attribution and stream-authoritative fail-closed completion with mandatory session cleanup",
@@ -28180,11 +28180,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r264",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remediation dispatch preserves the original acceptance contract and explicit evidence selections",
@@ -28204,11 +28204,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r265",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ingested reviewer feedback is classified before any fix dispatch",
@@ -28228,11 +28228,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r266",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deterministic normalization of untrusted historical review capture into an evidence dataset",
@@ -28252,11 +28252,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r267",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Immutable review snapshot and bound verdict contract",
@@ -28276,11 +28276,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r268",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Human adjudication ledger separated from the unreviewed dataset",
@@ -28323,11 +28323,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r270",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deterministic verdict-versus-adjudication comparison report with honest denominators",
@@ -28347,11 +28347,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r271",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Read-only live-PR capture with declared bounds and recorded degradation",
@@ -28371,11 +28371,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r272",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Existing-run archive inventory and same-head reviewer comparison",
@@ -28395,11 +28395,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r273",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Reviewer-mode selection quarantines shadow findings from actionable dispatch",
@@ -28419,11 +28419,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r274",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deterministic per-head trial evidence and undecided-by-default exit evaluation",
@@ -28489,11 +28489,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r277",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Untrusted finding content is neutralized before embedding in remote bodies and every marker is emitted through exactly one code path",
@@ -28513,11 +28513,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r278",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Review findings publish only as PR reviews with head-bound anchoring, degraded body-only fallback, and a snapshot-bound target",
@@ -28537,11 +28537,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r279",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "HEAD-scoped Check Run projects the persisted verdict deterministically, separates retryable technical failure from honest non-retryable outcomes, and manages attempt lifecycle/republish",
@@ -28561,11 +28561,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r280",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Finding publication dedupes remote surfaces by stable finding identity and performs content-aware in-place updates only on proven own-authored comments",
@@ -28585,11 +28585,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r281",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Judge discovery is structurally isolated from prior review output; reconciliation runs only on the finished verdict and gaps in the two evidence classes are classified separately",
@@ -28609,11 +28609,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r282",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Every judge run records effective-model provenance: requested vs adapter-reported model, adapter id, prompt version, and a config fingerprint - never fabricated",
@@ -28633,11 +28633,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r283",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ledger-mode publication persists the review transaction before any remote write, recovers uncertain remote effects from own-authored markers only, and retries exactly the unposted findings",
@@ -28657,11 +28657,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r284",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Finding lifecycle dispositions require positive evidence or an explicit operator act; absence is recorded only by complete reviews and never auto-resolves an advisory",
@@ -28681,11 +28681,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r285",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Evaluation and validation reports distinguish implementation failure, missing inputs, and incomparable baseline; unknowns are marked, never invented, and mock-backed runs never attest real-model behav",
@@ -28820,11 +28820,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r291",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Attacker-influenced text embedded in a model prompt is size-bounded and framed as untrusted data, never instructions",
@@ -28844,11 +28844,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r292",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A CONFLICTING PR dispatches a bounded conflict-resolution run at most once per (head, base) pair, pushes a real two-parent merge commit, and caps cumulative paid attempts while landed/refused are term",
@@ -28868,11 +28868,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r293",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A non-fast-forward push rejection replays the captured patch onto the moved head instead of paying another worker run",
@@ -28892,11 +28892,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r294",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Failing head checks synthesize deterministic findings and carry sanitized bounded CI evidence; the review-quality Check Run's blockers become critical findings and its execution errors halt",
@@ -28916,11 +28916,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r295",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Restart-boundary fix-strategy judge binds a durable verdict to head+finding set before the next fix dispatch",
@@ -28986,11 +28986,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r298",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Publish-retry crash recovery reverts only mutations it can prove were its own: a leftover proposal commit must have the recorded pin as parent, carry this run's provenance trailers, and hold a committ",
@@ -29010,11 +29010,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r299",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deterministic repo recipe materialization reproduces a pinned commit SHA or fails integrity -- never a silent substitution",
@@ -29040,11 +29040,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r300",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ship bounds worker dispatches per task to [source-symbol] and classifies every terminal non-progress outcome into a distinct stop kind -- a dead end is never silently re-dispatched",
@@ -29087,11 +29087,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r302",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Spec-check decision revisions re-bind the task before run selection: reconciling the annotatable record into [source-file]on changes the job hash so a run dispatched under an older decision revision no long",
@@ -29134,11 +29134,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r304",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Untrusted checker output is admitted only through fail-closed marker-framed parsing: the last BEGIN wins, every END candidate is tried until JSON parses, example-fenced prompt echoes parse to nothing,",
@@ -29181,11 +29181,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r306",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Offline [source-symbol] workflow harness: manifest fixtures dispatch through the real adapter; the ready verdict is computed strictly from worker-side evidence while external review findings and baseline comp",
@@ -29251,11 +29251,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r309",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Provider-unavailability fallback advances a phase through its deduplicated candidate list only on refusal-class failures observed after dispatch, records every advance, and charges refused attempts' s",
@@ -29275,11 +29275,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r310",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Eval resume reuses a persisted fixture record only when it binds identical job bytes and a resume key covering the baseline reference and the resolved baseline-evidence bytes; reused records are re-as",
@@ -29299,11 +29299,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r311",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Run-scoped signal composition on the [source-symbol] transport: every request composes the run lifecycle signal with a bounded timeout, while termination-triggered cleanup and post-outcome recovery reads byp",
@@ -29323,11 +29323,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r312",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Persisted remote-write artifacts are redacted before landing in evidence yet stay cryptographically bound to the verbatim wire payload via dual digests, so idempotency and audit survive scrubbing",
@@ -29347,11 +29347,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r313",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Only the authoritative (newest, non-replayed) review may mutate live ledger state; replayed or chronologically stale verdicts keep their history rows but never rewrite claims, resolve/reopen criteria,",
@@ -29371,11 +29371,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r314",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Durable projection outbox stages every remote-write intent inside the review commit transaction, drains under the shared PR lease with bounded attempts, and supersedes intents a newer authoritative re",
@@ -29464,11 +29464,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r318",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Verdict evidence citations resolve against the pinned checkout under one shared grammar; mechanical anchor repair recovers a position only from evidence the model itself cited and never fabricates an ",
@@ -29488,11 +29488,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r319",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Persisted records are digest-bound over canonical bytes and published atomically",
@@ -29512,11 +29512,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r320",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A bounded subprocess kill terminates the entire spawned process group, and captured output is byte-bounded with recorded truncation",
@@ -29536,11 +29536,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r321",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Event-stream evidence decoding is lossless across arbitrary chunk boundaries, including the terminal event at stream end",
@@ -29560,11 +29560,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r322",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Converge invocation admission is fail-closed on identity binding: foreign ledgers, mismatched profiles, fork heads, and terminal PRs refuse before any dispatch or ledger write",
@@ -29584,11 +29584,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r323",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A worker-declared 'fixed' disposition is honored only when the produced patch provably touches the finding's path; mismatches downgrade to fix-incomplete and unverifiable path shapes keep 'fixed' with",
@@ -29608,11 +29608,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r324",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A run-scoped review publication-mode override binds the converge invocation's finding-trust grammar and beats the persisted profile in both directions",
@@ -29724,11 +29724,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r329",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Credential-shaped secrets are scrubbed from durable projection records - job error text, per-attempt evidence files, and the retained review-evidence artifact - while the canonical ledger verdict keep",
@@ -29771,11 +29771,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r331",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Annotator-facing evidence briefs are blinded and identity-bound: no adjudication vocabulary may leak into reviewer material, and each brief binds to exactly one pilot finding and a real snapshot ancho",
@@ -29795,11 +29795,11 @@
    ],
    "targets": [
     {
-     "document": "docs/evidence-gates.md",
-     "anchor": "",
+     "document": "docs/evidence-requirements.md",
+     "anchor": "r332",
      "owner_issue": 51,
      "acceptance_id": "I51-AC1",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Judge prompt versions are immutable pinned text: a run's selected version is reproduced verbatim across initial dispatch and repair, stamped on every artifact, and unknown versions refuse",
