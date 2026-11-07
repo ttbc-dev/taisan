@@ -1,17 +1,18 @@
 # taisan v0.1 implementation plan
 
-Status: proposed plan through v0.1. This document defines capability milestones and acceptance criteria, not calendar commitments. No milestone or Issue creation is implied.
+Status: proposed plan through v0.1. This document defines capability milestones and acceptance criteria, not calendar commitments. No milestone or Issue creation is implied. Issue #47 aligns the release scope with CLI-backed agent skills; it authorizes documentation only, not runtime or skill implementation.
 
 ## Objective and constraints
 
 Build an independent Rust control plane from explicit lifecycle invariants and failure scenarios. Work selection and grouping, and execution by coding or review tools, are **replaceable adapters** with deliberately thin reference implementations. The hard engineering investment belongs in core lifecycle, execution ownership, reconciliation, bounded review/fix and human Attention.
 
-Preserve the already documented Work / Execution / Invocation distinction, durable Command/Query, SQLite authority, queue, and evidence-driven recovery. Prefer completing and correcting the existing implementation over replacing it.
+Preserve the already documented Work / Execution / Invocation distinction, durable Command/Query, SQLite authority, queue, and evidence-driven recovery. Prefer completing and correcting the existing implementation over replacing it. The initial release requires direct CLI operation and CLI-backed agent skills. TUI delivery is deferred; MCP is optional future work. Skills never replace durable execution ownership in the core.
 
 ## Current repository baseline (code inspection, not test verification)
 
 - Rust Cargo workspace exists, with `workloop-core`, SQLite `workloop-store`, `workloop-exec` POSIX supervisor, `workloop-cli`, `workloop-config`, `workloop-github` fixture, `workloop-fixture-worker`, and `workloop-tui`.
-- The CLI already exposes submit/retry/resume/cancel, review judgment, queries, run loop; the TUI implements the same Command/Query contracts including the review-judgment flow.
+- The CLI already exposes submit/retry/resume/cancel/acknowledge, review judgment, queries, and a run loop, and emits JSON results. The completeness of its agent-facing result/failure contract is unverified. Agent skills and their installation/invocation guidance are missing.
+- The TUI implements the same Command/Query contracts against fixtures. Its crate, binaries, and tests remain, but delivery and TUI-specific interactions are deferred from v0.1 gates. Existing TUI tests do not prove a skill workflow or fix #24.
 - `workloop-github/src/lib.rs` exports only `fixture` at inspection time; a real GitHub adapter must be verified/implemented.
 - The presence of code does **not** establish passing tests, production readiness, or completion of every lifecycle invariant. Run the full verification gate and inspect coverage before assigning implementation work.
 - Existing architecture and lifecycle docs currently describe the queue and execution model; the new selector port and its contracts are not yet fully represented in the implementation.
@@ -50,7 +51,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 ### Phase 1 — Baseline and contract alignment
 
-- Run `cargo fmt --check`, `cargo build`, `cargo test`, `cargo clippy -- -D warnings`; record results and CI gaps.
+- Run `cargo fmt --check`, `cargo build --workspace`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`; build before tests because contract tests spawn `target/debug/workloop-fixture-worker`. Record results and CI gaps.
 - Inventory implemented versus specified Slice 0 behavior, including stop-proof and crash tests.
 - Audit representative loop incidents against the table above; resolve selector, worker and outcome contracts.
 - Deliverable: implementation gap matrix, revised contracts and one agreed end-to-end scenario.
@@ -62,7 +63,7 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 - Introduce a Selector port and a minimal GitHub single-issue selector; keep admission behind Core.
 - Introduce or adapt a thin Worker port and a Claude Code CLI reference adapter using the existing supervisor.
 - Add a second, independently implemented contract-verification Worker adapter (scripted/deterministic) and run the shared Worker contract suite — including the swap-invariance check — against both adapters, selected via config with no Core change.
-- Close high-risk Slice 0 invariant gaps and add CI; test duplicate proposals, lost launch responses and uncertain stops.
+- Close high-risk Slice 0 invariant gaps and add CI; test duplicate proposals, lost launch responses and uncertain stops. Assess #24 as a core acceptance-time finding-coverage gap, including same-head finding growth, rather than dropping it with the TUI.
 - Deliverable: a selected Issue becomes queued Work and a bounded real Invocation with durable evidence.
 
 **Gate:** no duplicate launch or conflicting writer under injected failure; existing Work continues if selector is unavailable; Command, queue, budget and Outcome semantics are identical under either conforming Worker adapter.
@@ -78,18 +79,19 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 
 ### Phase 4 — v0.1 validation and distribution
 
+- Deliver CLI-backed agent skills and document their installation, discovery/invocation, sample intent, installation identity, permissions, and failure/recovery behavior. Verify the CLI result contract before using it in skills. These are future implementation units, not changes authorized by #47.
 - Document installation, quickstart, sample config, architecture, permissions, failure modes and both reference adapters.
 - Verify a clean installation, contract tests, failure injection and reproducible end-to-end walkthrough.
 - Record known limitations and explicitly distinguish implemented capabilities from design proposals.
-- Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior.
+- Deliverable: a usable, self-hosted v0.1 with a built-in queue, CLI and agent skills, replaceable selector and worker, real GitHub integration and bounded recovery/review behavior. TUI and MCP are not release dependencies.
 
-**v0.1 acceptance:** one Work can be submitted manually or proposed by the reference Selector, accepted, executed by the reference Worker, observed, reviewed and either completed or surfaced as actionable Attention without an external Kanban system. Replacing either adapter must preserve Core command, queue and outcome semantics; neither adapter owns independent execution truth. For the Worker port this is proven by two conforming implementations — the reference real Worker and a second contract-verification adapter — passing the shared contract suite under config-only selection; it does not require multiple production-grade worker providers, and it does not transfer a running Invocation between workers.
+**v0.1 acceptance:** one Work can be submitted manually or proposed by the reference Selector, accepted, executed by the reference Worker, observed, reviewed and either completed or surfaced as actionable Attention without an external Kanban system. Direct CLI and installed-skill paths satisfy the [agent interface acceptance matrix](agent-interface.md#acceptance-and-evidence); no second independent control interface is required. Replacing either adapter must preserve Core command, queue and outcome semantics; neither adapter owns independent execution truth. For the Worker port this is proven by two conforming implementations — the reference real Worker and a second contract-verification adapter — passing the shared contract suite under config-only selection; it does not require multiple production-grade worker providers, and it does not transfer a running Invocation between workers.
 
 ## Scope discipline
 
-**Must have:** independent core, explicit selector and worker contracts, minimal reference implementations plus one contract-verification Worker adapter with swap verification, queue/ownership/recovery correctness, observable outcomes, repeatable demo.
+**Must have:** independent core, explicit selector and worker contracts, minimal reference implementations plus one contract-verification Worker adapter with swap verification, queue/ownership/recovery correctness, observable outcomes, direct CLI and CLI-backed skills with setup guidance and verified result/failure semantics, repeatable demo.
 
-**Can defer:** sophisticated grouping, additional worker implementation-specific adapters beyond the contract pair, multiple production-grade worker providers, hosted service, automatic issue prioritization, advanced TUI polish, complex audit automation, cross-host scheduling, broad enterprise integrations.
+**Can defer:** sophisticated grouping, additional worker implementation-specific adapters beyond the contract pair, multiple production-grade worker providers, hosted service, automatic issue prioritization, TUI delivery, MCP server, GitHub comment control adapter, Projects projection, complex audit automation, cross-host scheduling, broad enterprise integrations.
 
 **Do not do:** port external Kanban system wholesale, make a selector implementation or a worker implementation mandatory, allow selectors/workers to mutate core state directly, hide unknown state as success, or change existing GitHub Issues/milestones during this planning phase.
 
@@ -102,7 +104,23 @@ Phases are ordered by dependencies and verified capabilities, not by dates. Each
 | Worker | Start/observe/stop contract; lost response, duplicate request, crash, uncertain process tests; shared suite passes on both adapters; swap preserves semantics |
 | GitHub | PR-head binding, delayed/duplicate webhook, outbox and reconciliation tests |
 | Loop | Bounded review/fix, terminal intent retirement, human Attention |
+| CLI and agent skills | Clean installation and skill invocation; submit, inspect, intervention, structured rejection/failure/unknown results, identical replay, and acceptance-time finding coverage as defined in [agent interface requirements](agent-interface.md) |
 | v0.1 | Clean setup, isolated repository, reproducible E2E and documented limitations |
+
+## Interface scope input for #36
+
+Issue #36 owns the full requirement-to-implementation mapping, dependency breakdown, and follow-up planning. The rows below supply the agreed interface scope from #47 without duplicating that breakdown or claiming #36 is complete. They are inspection-based classifications, not passing verification evidence.
+
+| Requirement | Current evidence or gap | #36 planning action |
+| --- | --- | --- |
+| Direct CLI Commands and Queries | Implemented, agent-facing completeness unverified; CLI prints JSON but a complete failure/output contract has not been validated | Reuse the CLI; assess structured result, diagnostic, exit-status, identity, and lost-response behavior before skill delivery |
+| CLI-backed agent skills | Missing; no shipped skill or installation/invocation walkthrough | Plan skill authoring and installation guidance after the CLI contract is verified; verify through a supported agent with no TUI or MCP dependency |
+| Operator workflow | Required; submit, status/evidence/Attention, eligible retry/resume/cancel/acknowledge, and review judgment | Map each row of the agent-interface acceptance matrix to implementation and evidence; preserve core guards and budgets |
+| Current finding-set coverage at judgment acceptance (#24, open at scope review) | Core validation gap remains: initial TUI coverage checks and stale-head tests do not prove safety when findings arrive on the same head between inspection and submission | Retain core/CLI regression work in the release plan; assess #24 for reuse or proposed revision without closing or changing it here |
+| TUI management console | Implemented against fixtures, deferred from v0.1 commitments | Keep existing code and tests; remove TUI-specific delivery gates, retain shared core requirements and test evidence |
+| MCP and other control adapters | Optional future work | No MCP implementation or second independent control-interface release gate |
+
+The owner approved CLI and skill delivery with TUI deferred. This approval settles interface scope only. Runtime/skill implementation and live E2E remain separate follow-up work; #36 must still classify the broader audit requirements and obtain the review required by its own acceptance criteria.
 
 ## Open risks
 
