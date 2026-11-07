@@ -21687,11 +21687,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r11",
      "owner_issue": 52,
      "acceptance_id": "I52-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21758,11 +21758,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r13",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21799,11 +21799,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r14",
      "owner_issue": 52,
      "acceptance_id": "I52-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21834,11 +21834,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r15",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21882,11 +21882,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r16",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21918,11 +21918,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r17",
      "owner_issue": 52,
      "acceptance_id": "I52-AC2",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -21960,11 +21960,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r18",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22055,11 +22055,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r21",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22137,11 +22137,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r24",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22187,11 +22187,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r25",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22384,11 +22384,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r30",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22479,11 +22479,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r32",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22660,11 +22660,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r36",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22709,11 +22709,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r37",
      "owner_issue": 52,
      "acceptance_id": "I52-AC3",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22759,11 +22759,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r38",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -22937,11 +22937,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r44",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Credential renewal preserves bound actor and scope",
@@ -23423,11 +23423,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r65",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded evidence collection with a permanent-refusal fast path; exhaustion preserves container, evidence and honest flags",
@@ -23725,11 +23725,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r78",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remote converge review input is a bounded sanitized fetch with an explicit delivery verdict",
@@ -26368,11 +26368,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r189",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     },
     {
      "document": "docs/[source-file]",
@@ -26697,11 +26697,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r202",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Atomic staged [source-symbol] transaction promotes a revision-matched artifact set only as a whole and restores the prior set on any abort",
@@ -26743,11 +26743,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r204",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A re-converging installer separates infrastructure convergence from user-owned state: artifacts and cron refresh on every (hourly-sync) run while subscription seeding requires an explicit opt-in flag ",
@@ -26766,11 +26766,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r205",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Dependent-CLI [source-symbol] is gated on a deployed-provider API-surface proof: required callables must exist in the already-installed libraries and candidates must [source-symbol], then post-deploy import and --",
@@ -27893,11 +27893,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r253",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Pre-PR independent review verifies a retained patch under a server-enforced read-only reviewer with bounded probe/fallback, deadline-vs-outage distinction, self-review refusal, and fail-closed finding",
@@ -28132,11 +28132,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r262",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Managed [source-symbol] server lifecycle: audited-version gate and bounded probe, generated-password enforcement, private config home with permission lockdown, and credential-scrubbed teardown",
@@ -28299,11 +28299,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r269",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Enforced read-only judge run with audited scope and honest verdict outcomes",
@@ -28704,11 +28704,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r286",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Plan-phase read-only audit folds every observed tool event into [source-symbol] / [source-symbol] / violation; only violations fail the phase before execution starts",
@@ -28727,11 +28727,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r287",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Every run session is released on every terminal path; cleanup is best-effort and every leak path is recorded rather than silent",
@@ -28750,11 +28750,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r288",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Plan-phase output is private: [source-file] is excluded from sanitized export and the plan session's streamed assistant text never reaches durable events - only per-token counts persist",
@@ -29204,11 +29204,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r307",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Two-phase plan-execute dispatch binds a verified read-only plan phase and embeds the marker-delimited plan verbatim as the execute phase's implementation contract; no usable plan means no execution",
@@ -29227,11 +29227,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r308",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Finalize-time manifest self-repair runs one bounded read-only session that rewrites a schema-invalid impact manifest under installed-agent proof plus workspace-scope audit, and can never modify the al",
@@ -29394,11 +29394,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r315",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Adapter-side resource-scope audit: read-tool inputs resolving outside the granted workspace are recorded violations, never trusted to server enforcement alone",
@@ -29440,11 +29440,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r317",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Materializing an untrusted revision is a plain, bounded file write: repository-controlled hooks/filters/config can never execute, credentials resolve only through an operator-pinned helper, and the la",
@@ -29700,11 +29700,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/worker-requirements.md",
+     "anchor": "r328",
      "owner_issue": 52,
      "acceptance_id": "I52-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Worker-supplied file edits are confined to the granted workspace; traversal escapes are refused with a named failure before any write lands",

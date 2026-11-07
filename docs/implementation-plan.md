@@ -26,7 +26,7 @@ These decisions settle the boundaries above, not the exact retention defaults, s
 
 ## Detailed Worker protocol design
 
-[Worker protocol, artifact handoff and isolation](worker-protocol.md) refines U2/U4 under #52. The owner selected Claude Code CLI headless behind a taisan-owned shim as the reference Worker, `resume: unsupported` in v0.1, supervisor-run mechanical verification on the handed-off commit, a handoff repository ref as the durable git-object acknowledgement, and bubblewrap isolation with a mandatory model-API egress proxy. Its R-ID mapping is provisional until #50's inventory exists. No runtime, sandbox or live evidence is claimed.
+[Worker protocol, artifact handoff and isolation](worker-protocol.md) refines U2/U4 under #52. The owner selected Claude Code CLI headless behind a taisan-owned shim as the reference Worker, `resume: unsupported` in v0.1, supervisor-run mechanical verification on the handed-off commit, a handoff repository ref as the durable git-object acknowledgement, and bubblewrap isolation with a mandatory model-API egress proxy. All Worker-owned inventory targets are mapped in [worker requirements](worker-requirements.md). No runtime, sandbox or live evidence is claimed.
 
 ## Revisions and evidence baseline
 

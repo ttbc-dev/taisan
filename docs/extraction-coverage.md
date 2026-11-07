@@ -57,3 +57,7 @@ All 40 initially planned #50 targets now link to [normative identity/admission o
 ## Evidence and recovery mapping review
 
 All 125 initially planned #51 targets now link to [normative evidence and recovery obligations](evidence-requirements.md), with requirement-specific proof scenarios and the shared absent, valid, and invalid evidence contract. Together with #50, this leaves 239 planned target links under #52-#56. Run the checker to regenerate these counts. `complete` remains false; no runtime implementation status is upgraded.
+
+## Worker protocol and handoff mapping review
+
+All 33 initially planned #52 targets now link to [normative Worker contract obligations](worker-requirements.md), each naming its governing clause and shared-suite coverage or an explicit approved deferral. Four targets (R16, R286, R288, R307) are deferred under the approved planner-machinery milestone scope; the re-modelled targets (including R189, R204, R253, R262, R287, R308, R315, R317) record mechanism substitutions — sandbox enforcement in place of server-side audit or self-repair sessions — reviewed in the 2026-11-08 #52 session. This leaves 206 planned target links under #53-#56. Run the checker to regenerate these counts. `complete` remains false; no runtime implementation status is upgraded.
