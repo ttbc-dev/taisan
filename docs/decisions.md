@@ -46,11 +46,15 @@
 
 The [concrete design](identity-storage.md) records maintenance-only cutover with a read-only legacy archive and fresh new-format Work, no legacy runtime/key-replay import, unfinished-Issue overlap rejection for both manual and Selector admission, and renewed approval of a same-Work specification revision when the final pre-dispatch read detects changed Issue content. Core requires and evaluates this read; the host adapter performs it and the CLI loop drives it. That read is the agreed version boundary, not an atomic lock against later remote edits. Reapproval cannot change host/actor/permission binding or reset budgets. Future configured invariant regeneration/auto execution is an extension, not a v0.1 requirement or permission to bypass approval policy. New-format command replay remains authoritative.
 
+## Assessment policy decisions from #51
+
+[Evidence and review gates](evidence-gates.md) records separate Work mechanical checks, optional invariant conformance with default on, independent code-review on/off, and explicitly configured additional GitHub CI. Conformance runs before publication and uses bounded fix/recheck or Attention; code review runs after publication with bounded fix/re-review or Attention. Native Approve, repository-rule import, and automatic code-review merge/draft barriers are excluded. Keep invalid evidence distinct from a valid negative result. Exact immutable finding-set/round guards apply at judgment, release and dependent authorization, including same-head growth. A disabled lane is not a passed assessment.
+
 ## Questions to resolve through a spike
 
 1. ~~What execution-ownership mechanism prevents conflicting work in a single-instance deployment, including process crashes and delayed writes? Does it meet the requirements for a Lease?~~ Resolved: resource reservations, TTL external claims, and stop proof (verified on a single host); no Lease name, no separate fence. Remaining: prove host-level enforcement in the vertical slice.
 2. Should the first GitHub command surface use issue comments, PR comments, or both? How is a multi-issue Work linked without implying one issue equals one job?
-3. What review signals are sufficient to declare a specific PR head ready, and what remains a human decision?
+3. Assessment policy is specified in #51; exact runtime/CLI behavior and setup defaults remain #53/#55 work. GitHub merge readiness is not a native Approve gate in automatic Work success.
 4. What evidence must be retained to diagnose failures while keeping engagement data isolated and exports safe?
 5. Which executor contract is minimal enough for a second executor without diluting checkpoint and recovery semantics?
 

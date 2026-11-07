@@ -2,6 +2,10 @@
 
 This document specifies the messages crossing every edge of the [module map](architecture.md#module-map), then checks them against four interactions. It is a design proposal, not an implemented API or a choice of programming language. ADR-002 adds a host-neutral target boundary; the existing Rust APIs remain GitHub-specific and unmodified by this document. The type notation is illustrative; the lifecycle states and guards follow [Work lifecycle](lifecycle.md). The terms and lifetimes come from the [glossary](glossary.md).
 
+## Evidence and lane-policy refinement
+
+[Evidence and review gates](evidence-gates.md) refines the target messages below. Mechanical Work verification remains separate from optional invariant conformance (default on), optional code review, and additional explicitly configured CI. Code review does not require native Approve or create merge/draft gates. Disabled lanes are explicit, not passing evidence. Judgment/release use exact immutable round/set identity as well as Work version and exact diff target, including same-head finding growth. These target refinements are not implemented by the current Rust fixture.
+
 ## Caller view
 
 The required CLI and planned CLI-backed agent skills use the same Command and Query contracts. The existing TUI is deferred from v0.1; GitHub comments and MCP are optional future control adapters. Skills call the CLI rather than the state store or supervisor. The caller lists the built-in queue with `work_list`, then queries `work_detail(W1)`, may ask `work` for a read-only preflight of a judgment, and submits that Command with the displayed Work version and PR head. If the submit response disappears, it asks for the result by Command ID or replays the same key and payload. An accepted result means the decision is durable; it does not mean a worker or GitHub write has finished.
@@ -260,6 +264,7 @@ type InvocationRequest = { request_id: string; work_id: WorkId;
 	execution_id: ExecutionId; input_revision: CommitRevision; budget: Budget } & (
 	| { role: "coding"; task: CodingTask }
 	| { role: "review"; task: ReviewTask }
+	| { role: "invariant_check"; task: InvariantCheckTask }
 );
 type WorkerTask = InvocationRequest & { invocation_id: InvocationId;
 	workspace: WorkspaceRef; allowed_effects: AllowedEffects };
@@ -279,6 +284,9 @@ type TaskBase = { goal: string; input_artifacts: EvidenceRef[];
 	acceptance_criteria: string[]; verification_argv: string[][] };
 type CodingTask = TaskBase & { kind: "coding"; issue_refs: IssueRef[] };
 type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: CommitRevision };
+type InvariantCheckTask = TaskBase & { kind: "invariant_check";
+	artifact: EvidenceRef; invariant_set: EvidenceRef;
+	specification_revision: number; assessed_revision: CommitRevision };
 type Budget = { deadline?: string; max_invocations?: number;
 	max_review_rounds?: number; runtime_limit_seconds?: number;
 	first_admitted_at?: string };
@@ -302,7 +310,12 @@ type WorkerReport =
 	    artifacts: EvidenceRef[]; checks: EvidenceRef[] }
 	| { kind: "review"; invocation_id: InvocationId; reviewed_revision: CommitRevision;
 	    status: "completed" | "failed" | "waiting";
-	    findings: FindingRef[]; evidence: EvidenceRef[] };
+	    findings: FindingRef[]; evidence: EvidenceRef[] }
+	| { kind: "invariant_check"; invocation_id: InvocationId;
+	    status: "completed" | "failed" | "waiting"; artifact: EvidenceRef;
+	    invariant_set: EvidenceRef; assessment: EvidenceRef; evidence: EvidenceRef[] };
+// Invariant-check reports additionally carry the exact set/coverage and artifact
+// under the typed evidence-gates.md schema; they are not a code-review verdict.
 type ProcessEvidence =
 	| { state: "alive"; process_identity: string; observed_at: string }
 	| { state: "stopped"; process_identity: string; observed_at: string;
