@@ -4,8 +4,8 @@
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| Core | Work and Execution IDs, state transitions, built-in work queue, capacity, retry/resume policy, evidence, current Attention, execution-ownership decisions | GitHub's issue and PR data |
-| GitHub integration | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
+| Core | Work and Execution IDs, state transitions, built-in work queue, capacity, retry/resume policy, evidence, current Attention, execution-ownership decisions | Repository-host issue and change-request data |
+| Repository host adapter, GitHub first | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
 | Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work or declaring a PR reviewed on a newer head |
 | Control adapter | Command translation, status projection, external identity mapping | State transitions or independent retry policy |
 | CLI | Required control interface for people and agent skills; structured Command and Query results | A separate state model |
@@ -25,7 +25,7 @@ flowchart LR
         CLI[CLI]
         TUI[TUI: existing, deferred]
         COMMENTS[GitHub comment adapter: optional]
-        GITHUB[GitHub integration]
+        HOST[RepositoryHostPort: GitHub first]
 
         subgraph CORE[taisan core]
             W[work: decisions and Outcomes]
@@ -48,8 +48,8 @@ flowchart LR
         TUI -->|Query| P
         COMMENTS -->|Command| W
         COMMENTS -->|Query| P
-        GITHUB -->|Observation| W
-        W -->|PR action| GITHUB
+        HOST -->|Observation| W
+        W -->|HostActionIntent| HOST
     end
 
     E -->|coding task| CODING[CodingWorker role]
@@ -59,6 +59,12 @@ flowchart LR
 ```
 
 GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The CLI reads the queue, Work, Attention, and evidence through Queries, then submits typed Commands for operator decisions. Planned agent skills invoke that CLI; the deferred TUI uses the same boundary. These callers do not classify state or write the store themselves. The execution-ownership mechanism is specified in the [glossary](glossary.md#execution-ownership): reservations, external claims, and stop proof rather than a single Lease entity.
+
+### Repository host exchangeability
+
+[ADR-002](repository-host-contract.md) requires a host adapter satisfying the common contract and the accepted Work's capability profile to be selectable through configuration without Core changes. Core uses scoped opaque repository/change IDs and immutable revisions. Authentication, API/webhook formats, pagination, native review semantics, and diff positions remain adapter responsibilities. There is one host integration edge; no provider-specific lifecycle branch or generic JSON escape hatch exists in the target Core.
+
+Required capabilities and authorization are checked before acceptance and dispatch, and before each relevant action. Unsupported or unknown capabilities cannot silently weaken review, approval, or readiness. Capability drift stops new dependent work but preserves read-only reconciliation and reservations for unknown effects. Existing Work keeps its original host/adapter/actor binding after configuration changes. GitHub remains v0.1's production target; the GitLab mapping and narrow validation requirement are in ADR-002.
 
 ## Command contract
 
@@ -75,7 +81,9 @@ The core returns an accepted/rejected decision, canonical state version, and com
 
 A stage command defines its outcome by postconditions that are independent of the executor. An executor cell — local, remote, or a future provider — selects *where* a stage runs, never *what it may skip*: the same postconditions, evidence, and success classification apply in every cell of the matrix. Two production defects in the source workflow shared the root cause of the executor matrix changing what a stage *means* rather than where it runs — a remote converge run reported its fix as done while the commits never reached the PR, and a remote lane's reviewer axis was silently dropped for bot-authored PRs (issue #21; covered by the `stage_contract` tests in `workloop-core`) — so the contract layer encodes the rule instead of rediscovering it.
 
-`converge` means: bounded fix commits *published* to the PR head, marked replies posted, and draft→ready advanced exactly once — the same outcome whether the executor is local, remote, or a future provider. Its Command therefore requires the executor to return a structured converge record, not a free-text verdict:
+Publication ownership is decided in [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it): Core approves durable actions and GitHub integration performs all remote writes. GitHub integration owns App or user-token authentication and binds each action to a configured actor, with distinct publication/review roles where required. Workers receive no GitHub mutation credentials. A stage spans preparation, publication, and assessment; the Worker performs preparation only.
+
+`converge` means: bounded fix commits *published* to the PR head, marked replies posted, and the required draft-to-ready state verified through a reconciled action — the same outcome whether the executor is local, remote, or a future provider. Core therefore assembles structured converge evidence from the Worker artifact and GitHub action receipts, not a free-text verdict. The existing narrow publication record is:
 
 ```ts
 type ConvergeRecord = { head_before: PrHeadSha; head_after: PrHeadSha;
@@ -83,7 +91,7 @@ type ConvergeRecord = { head_before: PrHeadSha; head_after: PrHeadSha;
   threads_addressed: string[] };
 ```
 
-The record shape is a contract type (`workloop_core::stage::ConvergeRecord`). The coordinator verifies `pushed_sha` against the live PR head before adopting the result: a converge result counts as fixed (`review-fixed`) only when the published head is the produced head (`pushed_sha == head_after`) and it verifies against the live PR head — equal to it or an ancestor of it. A claimed fix that cannot show a produced head published to the PR is classified as a failure with the record preserved as evidence, never a success; a push that carried an older head than the fix produced does not publish the fix, even if that older head is the live head. A no-op that changed nothing is `nothing-to-fix`, not a published fix. Publication is part of the stage's postcondition, exactly as `propose` already models it for ship; an executor that produced commits the PR never received has failed the stage, not passed it.
+The record shape is a contract type (`workloop_core::stage::ConvergeRecord`). Its classifier proves only the publication condition given independently verified inputs; reply/thread effects and ready state require separate receipts and gates. This ADR changes the target integration contract, not that implemented Rust type. The coordinator verifies `pushed_sha` against the live PR head before adopting the result: a converge result counts as fixed (`review-fixed`) only when the published head is the produced head (`pushed_sha == head_after`) and it verifies against the live PR head — equal to it or an ancestor of it. A claimed fix that cannot show a produced head published to the PR is classified as a failure with the record preserved as evidence, never a success; a push that carried an older head than the fix produced does not publish the fix, even if that older head is the live head. A no-op that changed nothing is `nothing-to-fix`, not a published fix. Publication is part of the stage's postcondition, exactly as `propose` already models it for ship; a stage whose produced commits the PR never received has failed, even if its preparation Invocation completed. An ancestor match proves publication but does not extend old-head checks or review to the newer head.
 
 The executor and reviewer axes are orthogonal by construction: the reviewer axis (`devin`/`shadow`/`both`) must never be silently narrowed by the executor axis (`local`/`remote`). If a combination is unsupported, it is refused at configuration validation time (`workloop_core::stage::validate_review_matrix`) — never silently degraded at run time.
 

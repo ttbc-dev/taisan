@@ -2,6 +2,8 @@
 
 This document fixes the v0.1 lifecycle semantics behind the [module contracts](module-contracts.md). It is a design contract, not an implemented API. The initial installation has one host and one state store. Work, Execution, and Invocation have different lifetimes; the queue and interface views are projections of those records, not extra card states.
 
+The host-neutral target messages and capability requirements are defined in [ADR-002](repository-host-contract.md). GitHub PR examples below describe the v0.1 reference deployment. `CommitRevision` and `HostBinding` refer to the common module-contract types; the current Rust/schema names remain unmodified by this design.
+
 ## Caller behavior
 
 ```text
@@ -24,9 +26,9 @@ The notation is illustrative and does not select a programming language or datab
 
 ```ts
 type RequestId = string & { readonly tag: "invocation_request" };
-type ImmutableIntent = { goal: string; issues: GitHubIssueRef[];
+type ImmutableIntent = { goal: string; issues: IssueRef[];
   constraints: string[]; verification_argv: string[][] };
-type ExecutionInput = { intent_digest: string; selected_base_revision?: string };
+type ExecutionInput = { intent_digest: string; selected_base_revision?: CommitRevision };
 type ExecutionBudget = { deadline?: string; max_invocations?: number;
   max_review_rounds?: number; runtime_limit_seconds?: number;
   first_admitted_at?: string };
@@ -36,7 +38,7 @@ type ContinuationRef = { evidence: EvidenceRef[]; checkpoint?: EvidenceRef };
 type ExternalWait = { kind: "checks" | "review" | "github_action" | "artifact_recovery"; ref: string };
 type PauseReason = { kind: "human_judgment" | "recoverable_stop" | "repair";
   evidence: EvidenceRef[] };
-type VerifiedCompletion = { pr: GitHubPrRef; head: PrHeadSha;
+type VerifiedCompletion = { pr: GitHubPrRef; head: CommitRevision;
   checks: EvidenceRef[]; review: EvidenceRef[]; writer_stop: EvidenceRef[] };
 type ConfirmedFailure = { code: string; evidence: EvidenceRef[] };
 
@@ -55,6 +57,7 @@ type Work = {
   version: WorkVersion;
   intent: ImmutableIntent;
   current_execution: ExecutionId;
+  host_binding: HostBinding;
 };
 
 type Execution = {
@@ -70,7 +73,7 @@ type ExecutionState =
   | { kind: "queued"; enqueued_at: EventSequence }
   | { kind: "ready"; request_id: RequestId }
   | { kind: "running"; invocation_id: InvocationId; stage: "coding" | "review" | "fix" }
-  | { kind: "waiting"; reason: ExternalWait; head?: PrHeadSha }
+  | { kind: "waiting"; reason: ExternalWait; head?: CommitRevision }
   | { kind: "paused"; reason: PauseReason; continuation: ContinuationRef }
   | { kind: "uncertain"; request_id: RequestId; reason: string; desired: "continue" | "cancel" | "fail" }
   | { kind: "stopping"; request_id: RequestId; desired: "cancel" | "fail" }
@@ -98,6 +101,8 @@ type Invocation = {
 ## Queue admission
 
 The pending queue consists of current Executions in `queued`, ordered by their committed `enqueued_at` sequence and then Execution ID. A duplicate Command replay keeps the original sequence. Dispatch scans in that order for the oldest currently eligible Execution; a blocked or unavailable source does not prevent later independent work from being considered. It records a retryable diagnostic for the blocked item and does not silently change its input or target. v0.1 has no manual ordering, priority lanes, or separate queue table.
+
+Admission requires a usable baseline and every optional capability required by the Work policy. Work retains the accepted host/repository/actor binding and requirements across retry/resume. Unsupported requirements reject admission; temporarily unavailable capability evidence defers dispatch without starting a Worker. Permission/capability drift blocks new dependent effects, but old unknown effects are still reconciled under their original binding and prohibit terminal release. See ADR-002 for the explicit rejection and recovery distinctions.
 
 The internal dispatch loop reads a queued Execution and its observed Work version. Selection grants no permission. `work` rechecks the current state, input revision, human gates, ownership, and capacity. One state-store transaction moves `queued → ready`, reserves one slot, and saves the first `InvocationRequest`. The request ID is derived from the Execution ID and its next durable Invocation sequence; the store enforces uniqueness. If the Work version, capacity, or request ID conflicts, the loop rereads and decides again. `execution` consumes only an approved request and records an Invocation before asking a worker to start.
 
@@ -130,7 +135,7 @@ Every supported writer entry point for a managed resource uses this ownership pa
 | `running` | Worker exits; external check/action is pending | `waiting`; keep the Execution slot. |
 | `running` | Worker exits; required artifact/evidence is missing but a durable source may recover it | `waiting` for `artifact_recovery`; retain ownership until recovery is complete or bounded recovery is exhausted. |
 | `waiting` | Fresh evidence permits the next coding/review/fix step | `ready` with a new request under the same Execution and reservation. |
-| `waiting` for `artifact_recovery` | Bounded recovery attempts or deadline exhausted | `failed` with an `artifact_recovery_exhausted` code; record the bound, attempts, and preserved evidence; release slot and the write-resource reservation. |
+| `waiting` for `artifact_recovery` | Bounded recovery attempts or deadline exhausted; writers stopped and external effects reconciled | `failed` with an `artifact_recovery_exhausted` code; record the bound, attempts, and preserved evidence; release slot and the write-resource reservation. |
 | `running` or `waiting` | Human decision or recoverable interruption; writers safe | `paused`; record continuation, release slot, and retain the write-resource reservation. |
 | `paused` | Valid `resume` or `release_judgment` | Same Execution `queued` with a new enqueue sequence and unchanged budget. |
 | `running` or `waiting` | Failure confirmed and writers safe | `failed`; record reason, release slot, and release the write-resource reservation. |
@@ -147,6 +152,14 @@ Every supported writer entry point for a managed resource uses this ownership pa
 The table names allowed transitions, not all policy checks. A Command also checks actor, Work version, idempotency key, target Execution, and budget. `retry` requires a confirmed `failed` current Execution; `resume` requires `paused`. Neither is accepted from `uncertain`, `stopping`, `succeeded`, or `cancelled`. Budget exhaustion is an internal timed decision that checks the stored limit against the observed clock in the commit; it is not a reason to reject `cancel`. `cancel` acceptance may mean that stopping is requested; it is not a claim that the process or external action has stopped. A second cancellation with a different key against an already cancelled Work is an accepted no-op with no new version.
 
 Execution budget counts every durably recorded Invocation attempt, including a definite `not_started` result, and review/fix rounds. v0.1 defaults per Execution: `max_invocations` = 10 across both roles, `max_review_rounds` = 5 where each review Invocation consumes one round — including a re-review driven by a head change — and `runtime_limit_seconds` = 6 hours. The first dispatch starts its runtime budget; queue time does not consume that budget. Resume retains the original counters and deadline. Retry creates a new Execution with the policy's next budget; it cannot change the accepted Work intent. An absolute Work deadline, if configured, is separate and continues while queued. Artifact recovery has its own bounded attempt/deadline policy — 3 attempts within 30 minutes by default — and does not count as a new Invocation. `execution` performs each attempt, collecting from the workspace, recorded checkpoints, and the worker runtime's artifact store, and durably records the attempt count, deadline, and result before reporting an Observation. Recovery runs only after a confirmed worker exit; it does not start while the writer may still be alive. If the bound is exhausted the Execution transitions to `failed` with an `artifact_recovery_exhausted` code: required evidence could not be verified, so success cannot be claimed. Available workspace/WIP evidence is preserved, and the failure is eligible for a recorded repair or retry decision — a retried Execution can claim the same workspace and branch. Missing artifacts alone do not prove that a writer is still alive or that it stopped.
+
+## Artifact and publication assessment
+
+[ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it) fixes the target evidence contract. Core validates schema, digest, Invocation, base/produced revision, reviewed head, and required checks before accepting an artifact. Missing evidence after confirmed exit enters bounded artifact recovery. A corrupt or mismatched artifact is retained as invalid evidence, never published or silently substituted. A stale review remains evidence for its own head and causes reassessment within budget. Confirmed invalid claims drive failure; if a writer, request, or effect may still act, `stopping` or `uncertain` with desired `fail` precedes terminal `failed`.
+
+Publication, each required reply/thread action, and ready transition are separate Core-approved intents. A successful push remains recorded when a later effect fails. Unknown effects are reconciled by stable action identity and external facts without blind resend, including after cancellation. An exhausted artifact-recovery budget cannot bypass unresolved effects. Full converge success requires verified publication and every required side effect; `ConvergeRecord::classify` alone is insufficient. A produced SHA that is an ancestor of the live head proves publication, while checks and review must cover the live head before final success.
+
+These are design requirements for follow-up implementation, not claims that the fixture harness already validates every evidence field or external effect.
 
 ## Completion, review, and Attention
 

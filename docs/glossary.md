@@ -65,3 +65,7 @@ v0.1 adds two more mechanisms to this list: a **resource reservation** keyed on 
 ## External identities
 
 GitHub issues and PRs remain external records. Their numbers and head revisions are references and Observations, not substitutes for `work_id` or `execution_id`. The CLI submits Commands and displays Projections of the built-in queue; planned v0.1 agent skills call that CLI. The existing TUI is deferred from release requirements, and MCP is optional future work. GitHub comments may provide another control surface; none defines a separate Work state. Existing external Kanban system card IDs are not used for new Work identity.
+
+## Repository host terminology
+
+A **repository host adapter** implements the common repository-host contract. A **change request** is the neutral reference for a GitHub PR or GitLab MR; its opaque ID is scoped to the stable repository and host-instance identity. A **capability** promises a specific operation and evidence semantics, not merely an available API. Optional capabilities become mandatory when required by an accepted Work. A **host binding** records that Work's host, repository, adapter, contract version, actor roles, and requirements; configuration changes do not retarget it. See [ADR-002](repository-host-contract.md). Existing GitHub-specific Rust names are implementation state, not evidence of cross-host portability.
