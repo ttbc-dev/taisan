@@ -38,7 +38,7 @@ Do not claim all these failures are currently unresolved; check corresponding me
 
 1. **Selector admission:** proposal identity, dedup across overlapping issue groups, source freshness, allowlist and unattended submission policy. Keep manual submit as fallback.
 2. **Worker boundary:** durable invocation request, evidence schema, start/observe/stop semantics, resume capability and stage roles; separate worker report from authoritative outcome.
-3. **Review/converge ownership:** taisan controls review/fix rounds and budgets; workers perform individual stages. Define how an adapter with its own internal workflow reports intermediate evidence without taking over taisan settlement.
+3. **Review/converge ownership:** publication responsibility is decided in [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it); implement and verify its per-effect receipts, App/user-token credential roles, permission isolation, and validity guards through the #36 gap matrix. taisan controls review/fix rounds and budgets; workers perform individual stages. Define how an adapter with its own internal workflow reports intermediate evidence without taking over taisan settlement.
 4. **Recovery:** ownership across crashes, uncertain launch, resource reservations, outbox reconciliation, terminal cleanup and human intervention.
 5. **Completion contract:** verified PR head, checks, review evidence, writer stop and explicit policy for human merge/approval. Avoid interpreting a green worker exit as completion.
 

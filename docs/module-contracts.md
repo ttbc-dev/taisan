@@ -171,7 +171,8 @@ type GitHubFact =
 	| { kind: "pr_head"; pr: GitHubPrRef; head: PrHeadSha }
 	| { kind: "check"; pr: GitHubPrRef; head: PrHeadSha; conclusion: CheckResult }
 	| { kind: "review"; pr: GitHubPrRef; head: PrHeadSha; findings: FindingRef[] }
-	| { kind: "pr_action_result"; action_id: ActionId; status: "applied" | "failed" | "unknown" };
+	| { kind: "pr_action_result"; action_id: ActionId; status: "applied" | "failed" | "unknown";
+	    receipts: EvidenceRef[] };
 
 type InvocationRequest = { request_id: string; work_id: WorkId;
 	execution_id: ExecutionId; input_revision: string; budget: Budget } & (
@@ -208,6 +209,11 @@ type ExecutionTransition = { execution_id: ExecutionId;
 type WorkspaceRef = { workspace_id: string; path: string };
 type AllowedEffects = { workspace_write: boolean; local_git_write: boolean;
 	github_write: false };
+// Target envelope for immutable changes, not an implemented Rust schema.
+type PreparedChange = { schema_version: number; work_id: WorkId;
+	execution_id: ExecutionId; request_id: string; invocation_id: InvocationId;
+	task_digest: string; repository: string; base_revision: string;
+	produced_revision: string; git_objects: EvidenceRef; checks: EvidenceRef[] };
 type WorkerReport =
 	| { kind: "coding"; invocation_id: InvocationId;
 	    status: "completed" | "failed" | "waiting";
@@ -225,12 +231,22 @@ type InvocationFact = { kind: "invocation"; execution_id: ExecutionId;
 	worker_report?: WorkerReport };
 
 type PrActionIntent = { action_id: ActionId; work_id: WorkId;
-	repository: string; payload_digest: string } & (
+	repository: string; payload_digest: string;
+	actor: { identity: string; credential_ref: string;
+	    role: "publication" | "review" | "discussion" } } & (
+	| { operation: { kind: "push_ref"; branch: string;
+	    expected_previous_ref: { kind: "absent" } | { kind: "at"; sha: PrHeadSha };
+	    produced_head: PrHeadSha; change_artifact: EvidenceRef } }
 	| { operation: { kind: "publish_pr"; branch: string; base: string;
-	    change_artifact: EvidenceRef } }
+	    published_head: PrHeadSha; push_action_id: ActionId;
+	    title: string; body: EvidenceRef } }
 	| { pr: GitHubPrRef; expected_head: PrHeadSha;
-	    operation: { kind: "update_pr"; change_artifact: EvidenceRef }
-	      | { kind: "post_pr_comment"; body: EvidenceRef } }
+	    operation: { kind: "update_pr"; title?: string; body?: EvidenceRef }
+	      | { kind: "post_pr_comment"; body: EvidenceRef; marker: string; thread_id?: string }
+	      | { kind: "submit_pr_review"; event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+	          body: EvidenceRef; inline_comments: EvidenceRef[] }
+	      | { kind: "resolve_pr_thread"; thread_id: string }
+	      | { kind: "mark_pr_ready" } }
 );
 
 type WorkChange =
@@ -300,7 +316,15 @@ type DispatchReceipt = { kind: "queued" | "already_queued" | "ownership_uncertai
 
 `ProcessControlPort` is internal to `execution`: its host or worker-runtime adapter inspects and requests a stop for the recorded Invocation, then `execution` persists the resulting process Observation. A `requested` stop is not proof of termination. Inspection reads process state, not mere presence: an unreaped zombie still lists in the process table but cannot write, and `execution` reaps the processes it spawned. Stop proof covers the descendant snapshot recorded with the stop intent — a `setsid`-escaped child survives a process-group signal and becomes invisible to the process tree once its leader exits. Before signaling any recorded identity the port re-verifies its recorded start time so a reused PID is never signaled. If the runtime cannot identify and inspect the old writer, `work` keeps the Execution `uncertain` and does not grant another writer. This port is not a second lifecycle decision maker.
 
-`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied. `publish_pr` carries no expected head and reconciles by branch or PR existence. `update_pr` and `post_pr_comment` carry `expected_head`, and the integration re-reads the head immediately before writing; a mismatch aborts the write, records `pr_action_result: failed` and a fresh `pr_head` Observation, and `work` re-evaluates. v0.1 never re-issues an action automatically — a retry requires evidence that covers the new head. Exact Work states, retry limits, and GitHub operation payloads can be refined without changing these ownership rules.
+`AllowedEffects` states the target boundary: workers may change their isolated workspace, but GitHub mutation goes through the recorded `PrActionIntent`. A `PrActionIntent` is saved before GitHub integration writes; an unknown external result must be reconciled before `work` treats the action as applied.
+
+The target `push_ref` performs only a managed branch update and requires the approved previous ref to be absent or exactly the recorded SHA. For an existing branch, the produced commit must also be a descendant of that SHA; reject a changed ref or non-fast-forward update. `publish_pr` creates only the PR after the referenced push action is verified applied to `published_head`; it performs no push, carries no prior PR head, and reconciles by exact repository/head branch/base and PR existence. A branch/head mismatch prevents PR creation and returns a fresh Observation to Core. `update_pr` changes PR metadata only; later fix publication uses a new `push_ref` intent, not a metadata update.
+
+`update_pr`, `post_pr_comment`, `submit_pr_review`, `resolve_pr_thread`, and `mark_pr_ready` carry `expected_head`, and the integration re-reads the head immediately before writing; a mismatch aborts the write, records `pr_action_result: failed` and a fresh `pr_head` Observation, and `work` re-evaluates. v0.1 never re-issues an action automatically — a retry requires evidence that covers the new head.
+
+The separate push/PR-create effects, prepared-change envelope, selected actor, review submission, reply marker, thread/ready operations, and result receipts above are target-contract additions from [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it), not implemented Rust API claims. Each effect is separately durable and reconciled; a pre-write head read is not atomic with GitHub. Receipts bind action/payload, producing Invocation/artifact, target PR/head, and observed effect, including published SHA or comment/thread/ready identity. A branch update also checks its prior ref to avoid overwriting a concurrent writer.
+
+Integration accepts App installation or user-token authentication through configuration; credentials stay outside the Worker and the action carries only a reference. Review submission targets `expected_head` and preserves the requested review event; missing independent-approval eligibility cannot silently downgrade it. Core builds stage evidence from those facts and never treats the existing publication classifier as the complete converge gate.
 
 `SafeOwnership` records the evidence that permits an Invocation to start. It does not name or prescribe a Lease mechanism. An uncertain assessment cannot produce an `InvocationRecord`. If the state store reports a version or constraint conflict, `work` rereads state and evaluates the Command or Observation again; it does not retry the proposed write unchanged.
 
@@ -335,7 +359,7 @@ These are behavioral ports, not separate processes. Delivery between `work`, `ex
 
 The internal dispatch loop reads `PendingExecutionPage` from the same store; it does not consume external board records. It may propose a start, but `work` decides eligibility and the store atomically reserves capacity while moving that Execution to `ready` and saving an Invocation request. `work` derives the request ID from the Execution ID and its next Invocation sequence; the commit checks Work version and enforces request ID uniqueness. A conflict makes `work` reread before deciding again. `WorkCommit.cause.dispatch` records this internal decision without impersonating an operator Command. `policy_limit` records a budget or deadline decision without inventing a worker/GitHub Observation; the commit compares its observed time or count with the stored limit. A later coding, review, or fix request in the same reserved Execution does not reserve a second slot. `execution` reads approved Invocation requests from the store. Re-reading after a crash must find the prior request ID before any new start. The queue view itself has no write path: a TUI action uses a typed Command, and moving a row on screen has no lifecycle effect.
 
-The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; adapting an existing worker that currently performs such writes will require separating that behavior.
+The worker ports must not give a worker an unreviewed path to mutate GitHub. The target design routes PR publication and other PR actions through `PrActionIntent`; a managed Worker entry point disables those writes, its independent claims, outer retry/review loop, and final settlement. The GitHub integration performs the remote effects authorized by Core; the stage runner translates one bounded task and returns evidence. [ADR-001](adapter-boundaries.md#adr-001-core-authorizes-publication-github-integration-performs-it) defines partial effects, credential scope, and evidence validity.
 
 ## Built-in queue admission
 
