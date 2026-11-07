@@ -75,7 +75,9 @@ integrations.
   advisory preflight, stale-head requery) is covered by
   `judge_findings_flow_end_to_end`, `incomplete_draft_cannot_submit`, and
   `stale_head_rejection_requeries_and_clears_choices` in
-  `crates/workloop-tui/tests/tui_surface.rs`.
+  `crates/workloop-tui/tests/tui_surface.rs`. TUI delivery is deferred from
+  v0.1; these tests do not prove CLI-backed skill delivery or resolve the
+  same-head finding-growth gap tracked in issue #24.
 - `workloop-config` — installation config: actor identity, worker argv,
   capacity, workspace root, and allowed effects.
 
@@ -85,6 +87,15 @@ integrations.
   outbox rows and emits synthetic Observations. No network I/O.
 - `workloop-fixture-worker` — a real local process with argv-driven failure
   modes, used by contract tests and runnable installations.
+
+**Required agent interface work:**
+
+- CLI-backed agent skills, installation and invocation guidance, and
+  end-to-end skill verification are not implemented. The CLI already emits
+  JSON; its complete agent-facing result and failure contract remains to
+  be verified. See [agent interface requirements](agent-interface.md).
+- The existing TUI is retained but is not an initial-release requirement.
+  An MCP server is optional future work.
 
 **Missing integrations:**
 

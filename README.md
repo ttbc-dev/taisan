@@ -4,7 +4,7 @@
 
 taisan is an adapter-based work orchestration loop for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; taisan coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
-**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations are not yet implemented. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
+**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations and agent skills are not yet implemented. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
@@ -21,7 +21,7 @@ GitHub issues / human intent -> Work -> Execution(s) -> PR and review -> Outcome
                                           |
                               queue / Attention views
                                           |
-                              CLI / TUI / GitHub adapters
+                              CLI <- agent skills (planned)
 ```
 
 - **Work** is a durable, meaningful development unit. It may include multiple related issues; an issue is not automatically a job.
@@ -41,7 +41,7 @@ The repository implements its own development queue. Pending Work, execution req
 | GitHub-based intake, PRs, and review signals | Other source-control hosts |
 | Single-instance self-hosted operation | Hosted multi-tenant service |
 | Bounded implementation and review-fix cycles | Fully autonomous product planning |
-| CLI as the baseline control surface; TUI management console for state inspection and operator actions | A required web dashboard |
+| CLI and CLI-backed agent skills for submission, inspection, and operator actions | TUI management console, MCP server, and web dashboard |
 | Built-in, single-instance development queue and Kanban-style Work view | General-purpose boards, card dependencies, comments, and attachments |
 | Optional adapters, including a GitHub interface | Broad workflow-platform integrations |
 
@@ -56,21 +56,22 @@ git clone https://github.com/shimpeiws/taisan.git
 cd taisan
 cargo build --workspace
 cargo run -p workloop-cli --bin taisan -- --help
-cargo run -p workloop-tui --bin taisan-tui -- --help
 ```
 
-To install the commands from this checkout:
+To install the CLI from this checkout:
 
 ```sh
 cargo install --path crates/workloop-cli --bin taisan
-cargo install --path crates/workloop-tui --bin taisan-tui
 ```
+
+Agent skill installation and invocation guidance is a planned v0.1 deliverable, not available in this checkout. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
 
 The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
 ## Design documents
 
 - [Principles](docs/principles.md) — product and operational rules.
+- [Agent interface requirements](docs/agent-interface.md) — CLI-backed skills, installation deliverables, and verification gaps.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
 - [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
 - [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
@@ -83,7 +84,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 
 ## v0.1 direction
 
-The first release aims to run one Work item from the built-in queue through a pull request, review, a bounded fix cycle, and a verified outcome. A second control interface should preserve the same command semantics. Duplicate commands, stale views, process loss, and adapter outages must not create duplicate executions or false success.
+The first release aims to run one Work item from the built-in queue through a pull request, review, a bounded fix cycle, and a verified outcome. Users must be able to operate it directly through the CLI and through skills in their existing coding agent. Skills call the same CLI contracts; a second independent control interface is not a release gate. TUI delivery and MCP support are deferred. Duplicate commands, stale views, process loss, and adapter outages must not create duplicate executions or false success.
 
 ## License
 

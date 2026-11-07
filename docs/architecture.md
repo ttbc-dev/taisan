@@ -8,21 +8,23 @@
 | GitHub integration | Issue/PR reads, head revisions, checks, review events and publication | Work ownership or execution authority |
 | Executor | Isolated workspace, worker Invocations, process and artifact reporting | Choosing work or declaring a PR reviewed on a newer head |
 | Control adapter | Command translation, status projection, external identity mapping | State transitions or independent retry policy |
-| CLI | Reference implementation of the control interface | A separate state model |
-| TUI management console | Interactive queue, Work, Attention, and evidence views; typed Command submission | Its own queue or Work state, Attention classification, or retry policy |
+| CLI | Required control interface for people and agent skills; structured Command and Query results | A separate state model |
+| Agent skills (planned, required for v0.1) | Intent collection, CLI invocation, and explanation of recorded results in the user's existing coding agent | Execution ownership, independent state, retry policy, or recovery |
+| TUI management console (existing, deferred from v0.1) | Interactive queue, Work, Attention, and evidence views; typed Command submission | Its own queue or Work state, Attention classification, or retry policy |
 
 The initial deployment may place these in one process and one local database. The boundaries are behavioral; v0.1 does not require a distributed service or dynamic plugin loader.
 
 ## Module map
 
-This is the intended module boundary. The outer box marks this repository's scope, including the TUI management console. The inner box marks the taisan core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. External coding agents and review tools can implement these roles through adapters.
+This is the intended module boundary. The outer box marks this repository's scope, with required CLI-backed agent skills and the existing TUI marked as deferred. MCP is optional future work, not a v0.1 component. The inner box marks the taisan core; being outside that box does not put a module outside this repository. The `work` module owns decisions about a Work item. Its queued Executions and approved Invocation requests form the built-in queue; `projection` presents them as a Kanban-style view without a second card record. `execution` supervises the Invocations that carry out those decisions. CodingWorker and ReviewWorker are roles invoked by `execution`, not kinds of Work or Execution. A single Execution may invoke either role more than once. External coding agents and review tools can implement these roles through adapters.
 
 ```mermaid
 flowchart LR
     subgraph REPO[taisan repository]
+        SKILLS[Agent skills: planned v0.1 requirement]
         CLI[CLI]
-        TUI[TUI management console]
-        COMMENTS[GitHub comment adapter]
+        TUI[TUI: existing, deferred]
+        COMMENTS[GitHub comment adapter: optional]
         GITHUB[GitHub integration]
 
         subgraph CORE[taisan core]
@@ -39,6 +41,7 @@ flowchart LR
             STORE -->|saved state| P
         end
 
+        SKILLS -->|invoke CLI and read structured results| CLI
         CLI -->|Command| W
         CLI -->|Query| P
         TUI -->|Command and preflight| W
@@ -55,7 +58,7 @@ flowchart LR
     REVIEW -->|findings and evidence| E
 ```
 
-GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The TUI reads the queue, Work, Attention, and evidence through Queries, then submits typed Commands for operator decisions. It does not classify state or write the store itself. The execution-ownership mechanism is specified in the [glossary](glossary.md#execution-ownership): reservations, external claims, and stop proof rather than a single Lease entity.
+GitHub review events and worker results arrive as Observations. The `work` module decides whether to request a change, accept an Outcome, or wait for more evidence; the workers only perform the requested task and return evidence. `projection` reads saved state for Queries and does not change it. The CLI reads the queue, Work, Attention, and evidence through Queries, then submits typed Commands for operator decisions. Planned agent skills invoke that CLI; the deferred TUI uses the same boundary. These callers do not classify state or write the store themselves. The execution-ownership mechanism is specified in the [glossary](glossary.md#execution-ownership): reservations, external claims, and stop proof rather than a single Lease entity.
 
 ## Command contract
 
@@ -107,7 +110,9 @@ An adapter implements a narrow protocol:
 
 The adapter's event filter is part of this contract: any filter that drops bot-authored or bot-sent events must exempt work the lane itself produced. PRs and heads authored by the installation's own lane identity (managed PRs and managed heads) are first-class inputs, not noise — without that exemption the lane's own loop starves, since every lane-opened PR is bot-authored (the source workflow learned this the hard way: a `pull_request` bot filter once made a lane's shadow review a silent no-op, letting one matrix dimension — the executor — override another; see issue #21). The exemption is keyed to the installation's managed identities and its managed PR/head set, not a blanket "allow all bots" rule.
 
-The CLI and TUI management console are control interfaces implemented in this repository. The CLI is the baseline and must work with every optional adapter disconnected. The TUI is part of the intended system: it presents the built-in queue and other Projections, supports an operator's decisions, and submits Commands through the same control boundary as the CLI. It requests a read-only preflight before submission; the core still enforces Command preconditions. After a lost response, it queries the result or replays the same idempotent request.
+The CLI is implemented and remains usable directly with every optional control adapter disconnected. CLI-backed agent skills are a required v0.1 deliverable, not yet implemented. Skills collect intent, invoke the CLI, and explain structured results; they do not own a queue, spawn managed workers directly, or decide recovery. The core and supervisor retain durable execution ownership after the agent conversation ends. See [agent interface requirements](agent-interface.md) for the workflow and verification plan.
+
+The existing TUI is deferred from v0.1 release requirements. Its code and tests remain, including read-only preflight and lost-response recovery. Preflight never guarantees acceptance; every caller must use core Command preconditions and query the original result or replay the identical request after a lost response. A future MCP adapter can translate these contracts, but no MCP server or second independent control interface is required for v0.1.
 
 Candidate external adapters are a GitHub issue-comment interface and a GitHub Projects projection. GitHub Projects fields are presentation and control input, not execution authority. No external Kanban runtime is required for new Work.
 
