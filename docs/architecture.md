@@ -75,7 +75,7 @@ The core exposes commands such as `submit`, `retry`, `resume`, `cancel`, and `ac
 - expected state/version, where relevant;
 - optional reason and target Execution.
 
-The core returns an accepted/rejected decision, canonical state version, and command ID. `retry` means: create at most one new Execution for eligible, settled Work under the same intent, after checking current evidence and policy. `resume` continues an eligible interrupted Execution from a durable checkpoint; it may start a new Invocation. Adapters cannot implement either by moving a card or spawning a process directly. An unavailable result can be queried by command ID before resubmission. Queries read recorded state; monitors and reconciliation record new Observations before a Projection changes.
+The core returns an accepted/rejected decision, canonical state version, and command ID. `retry` means: create at most one new Execution for eligible, settled Work under the current approved immutable specification revision, after checking current evidence and policy. Retry itself cannot edit that revision. A separately approved new specification revision retains prior snapshots and approvals as history, the immutable binding, and consumed budgets. `resume` continues an eligible interrupted Execution from a durable checkpoint; it may start a new Invocation. Adapters cannot implement either by moving a card or spawning a process directly. An unavailable result can be queried by command ID before resubmission. Queries read recorded state; monitors and reconciliation record new Observations before a Projection changes.
 
 ### Stage contracts are executor-independent
 

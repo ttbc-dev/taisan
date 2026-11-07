@@ -40,7 +40,7 @@ Core validates proposal shape, repository scope, source freshness, idempotency a
 
 **Reference selector:** list eligible GitHub issues from a configured allowlist, propose **one issue per Work**, no semantic grouping, deterministic order and stable proposal keys. This is intentionally simple. More sophisticated grouping belongs in any third-party adapter satisfying the contract.
 
-Open contract question: the exact candidate dedup/overlap policy across independently selected Works; specify before enabling unattended selection. The current manual `submit` remains supported and must not depend on a selector.
+The [identity/storage contract](identity-storage.md) settles same-scoped-Issue overlap: reject a new Work while unfinished Work owns that source Issue, for both manual and Selector admission. Stable proposal keys replay their original decision; safe terminal release permits a new explicit submission. Manual `submit` remains supported without a selector. Richer grouping and unattended selection remain deferred.
 
 ### Worker contract
 

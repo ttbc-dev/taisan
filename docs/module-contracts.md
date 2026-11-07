@@ -10,6 +10,8 @@ The required CLI and planned CLI-backed agent skills use the same Command and Qu
 
 The canonical target port is [RepositoryHostPort](repository-host-contract.md). Core uses scoped repository/change identities and immutable revisions without inspecting provider names or payloads. GitHub PR terminology in the example flows is a reference deployment, not a required host model. These target types replace the current GitHub-specific names when implemented, with callers, store keys, and tests migrated together. There are no parallel generic/GitHub Core paths or compatibility aliases.
 
+The [concrete identity/storage design](identity-storage.md) defines Rust/SQLite scope, command payload identity, source-change reapproval and the owner-approved archive/new-store cutover for legacy slice-0 data. This is target design only.
+
 IDs are distinct opaque types even if an implementation stores each as a string. `WorkVersion` is a version of one Work item. `EventSequence` identifies a committed position in one installation's history. `CommitRevision` identifies the revision used for a review or check.
 
 ```ts
@@ -166,7 +168,7 @@ type CapacityView = {
 	            diagnostic: string; since: EventSequence }[] };
 ```
 
-`submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection. v0.1 retains command keys and decisions indefinitely — a lost response must always be recoverable — and each adapter's actor identity comes from the installation config and stays stable across restarts.
+`submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection. v0.1 retains command keys and decisions indefinitely — a lost response must always be recoverable — and each adapter's actor identity comes from the installation config and stays stable across restarts. This replay guarantee is scoped to the active store authority. Under #50, the unversioned legacy store is preserved for read-only reference and not imported into the fresh store; archive inspection does not resume old Work or replay old keys into new execution. An explicit StoreId distinguishes those histories.
 
 `claim_resources` and `release_resources` let a manual or unmanaged writer register on the same reservation store that Execution admission uses; they carry no Work ID. An Execution's reservation is declared as `{workspace: <id derived from the Work ID>}` plus `{repository, branch}` with the branch fixed as `work/<work_id>`, is acquired in its `queued → ready` commit, and is held until the Execution reaches a terminal state. An external claim names only `(repository, branch)` pairs, carries a TTL renewed by repeating `claim_resources` from the same actor, and conflicts with any held row are rejected as `resource_conflict` with the current holder returned in evidence. Claim expiry forfeits the exclusion guarantee; it is not evidence that the writer stopped. `release_resources` frees the claimer's own rows; an operator force-release is recorded as an override decision.
 
@@ -477,7 +479,7 @@ Existing `judge_findings_flow_end_to_end`, `incomplete_draft_cannot_submit`, and
 
 ## Explicit retry after a failed Execution
 
-Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry is a new attempt under the same Work intent; it is not another Invocation inside `E1`.
+Assume Work `W1` has Execution `E1` with a confirmed terminal failure. A retry is a new attempt under the current approved immutable specification revision; it is not another Invocation inside `E1`. Retry does not edit that revision. A separately approved same-Work specification revision may update intent, constraints, and checks while preserving binding, prior snapshots, approvals as history, and consumed budgets.
 
 1. The CLI, directly or through an agent skill, queries `W1`. The Projection shows `E1`'s Outcome, evidence, current Attention, and whether process ownership is still uncertain.
 2. The operator submits `retry` with `work_id=W1`, `expected_execution_id=E1`, the displayed Work version, and an idempotency key.
@@ -506,7 +508,7 @@ The store enforces, atomically inside the caller's transaction:
 - `(origin, actor, idempotency_key)` unique, with the payload digest recorded — a replay returns the saved decision, a changed payload yields `idempotency_conflict`.
 - `request_id` and `action_id` unique; target source-event uniqueness is `(host instance, adapter source, source_event_id)` for host Observations. Current slice-0 storage uses a single-source event key and must migrate with its callers. Preserve at-most-once requests, outbox identities, and deduplicated Observations.
 - `UNIQUE(work_id)` over nonterminal Executions and `UNIQUE(execution_id)` over unresolved writers — partial unique indexes; a competing admission returns `constraint_conflict`.
-- `resource_reservations.resource_key` unique over a normalized key space (`workspace:<id>`, `branch:<host>:<repository-id>:<name>` in the target contract) covering execution reservations and external claims alike.
+- `resource_reservations.resource_key` unique over a normalized key space (versioned structured arrays `["workspace", store_id, workspace_id]` and `["branch", host_id, repository_id, branch_name]` in the target contract) covering execution reservations and external claims alike.
 - `capacity_slots` holds N fixed rows; claiming a free row in the same transaction reserves the slot, and no free row yields `constraint_conflict("capacity")`.
 - Work version by optimistic check in the commit (`WHERE version = expected`); a mismatch returns `version_conflict`.
 
@@ -521,3 +523,7 @@ The target contract-level choices are settled above: store shape and constraint 
 - The Rust module and crate layout itself, which follows the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, GitHub, and worker adapters.
 
 Directories follow the ownership boundaries: `work`, `execution`, `projection`, shared persistence, and the CLI, GitHub, and worker adapters, plus the retained deferred TUI. Agent skills invoke the CLI. The layout does not decide the contracts.
+
+## Approved recovery and configuration policy
+
+Use the owner-approved [recovery and configuration policy](recovery-policy.md) for configurable defaults, Work-wide accounting, policy changes, and safe human-wait capacity release. The [post-v0.1 milestones](post-v0.1-milestones.md) retain the seven approved machinery deferrals without deferring v0.1 safety requirements. Both documents specify target behavior, not implemented runtime support.
