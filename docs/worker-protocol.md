@@ -1,6 +1,6 @@
 # Worker protocol, artifact handoff, and isolation
 
-Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory does not exist yet. The requirement mapping below is therefore **provisional**: it uses the existing R01–R38 audit IDs and the failure classes named in #51. It must be re-mapped once #50 publishes stable requirement IDs, before #52 can be called complete.
+Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory is now merged in `docs/extraction-coverage.json`. The Worker-specific requirement mapping below remains provisional: it uses the earlier R01–R38 audit IDs and must be reconciled with the complete inventory under #52 before claiming that mapping complete. #51's [failure classification](evidence-gates.md#failure-classification-and-recovery-decisions) and [Work-wide accounting](evidence-gates.md#work-wide-recovery-accounting) govern normalized recovery decisions; Worker reason codes alone do not authorize retries.
 
 ## Owner decisions
 
@@ -66,7 +66,7 @@ struct WorkerRequest {
     request: RequestId,
     invocation: InvocationId,
     role: WorkerRole,                             // Coding | Fix | InvariantCheck | CodeReview
-    task: WorkerTaskBody,                         // role-specific, below
+    task: WorkerTaskBody,
     repository: RepositoryRef,
     base: CommitRevision,                         // exact revision checked out before start
     workspace: WorkspaceId,
@@ -77,10 +77,15 @@ struct WorkerRequest {
 enum WorkerTaskBody {
     Coding { goal: RetainedContentRef, issues: Vec<SourceSnapshotRef>, constraints: Vec<String>,
              verification_argv: Vec<Vec<String>> },
-    Fix { goal: RetainedContentRef, findings: Vec<OccurrenceRef>, target: DiffTarget,
+    Fix { goal: RetainedContentRef, predecessor: ArtifactId, origin: FixOrigin,
           verification_argv: Vec<Vec<String>> },
     InvariantCheck { artifact: ArtifactId, invariant_set: InvariantSetRef, spec: SpecRevision },
     CodeReview { target: DiffTarget, review_source: ReviewTaskSourceRef },
+}
+enum FixOrigin {
+    Prepublication { failed_evidence: NonEmptyVec<EvidenceId> },
+    Review { target: DiffTarget, round: ReviewRoundId, judgment: JudgmentId,
+             findings: NonEmptyVec<OccurrenceRef> },
 }
 struct WorkerCapabilities {
     adapter: AdapterId,
@@ -91,7 +96,7 @@ struct WorkerCapabilities {
     resume: Unsupported,                          // v0.1 reference value
     checkpoints: CheckpointSupport,               // WorkspaceCommits for the reference adapter
     runtime_artifact_store: Option<StoreKind>,    // None for the reference adapter
-    local_retries: DeclaredRetries,               // see "Adapter-local retries"
+    local_retries: DeclaredRetries,
 }
 struct WorkerReport {
     format_version: WorkerFormatVersion,          // "taisan.worker.report/1"
@@ -110,6 +115,8 @@ struct WorkerReport {
 ```
 
 `BoundedReasonCode` is a closed set (`provider_refused`, `rate_limited`, `quota_exhausted`, `auth_unavailable`, `max_turns_reached`, `deadline_reached`, `runtime_crashed`, `invalid_request`, `unsupported_role`, `internal_error`). Provider text is kept only in the bounded `runtime.log` body, never in reason fields, Command results, or Attention text.
+
+A pre-publication correction binds the exact predecessor artifact, Work/specification, failed mechanical/invariant evidence, and approved repair goal without requiring a PR identity. Review correction additionally binds the current diff target, immutable round, exact-set judgment, and selected findings. Core validates these references and freezes the fix goal before dispatch. Adapter role/task/body mismatches are invalid; a Fix report retains the `fix` discriminator and uses the same artifact fields as coding in the mirrored module contract. The serialized role names are `coding`, `fix`, `invariant_check`, and `review` for the respective Coding, Fix, InvariantCheck, and CodeReview variants. Both correction origins consume the same Work-wide fix account. A PR-less fix must not fabricate a ChangeRequestRef or inherit an unrelated review judgment.
 
 ### Role translation for the reference adapter
 
@@ -198,8 +205,8 @@ The reference adapter declares `checkpoints: WorkspaceCommits`: WIP that the run
 
 ## Verification runner
 
-1. Create a clean worktree from `refs/taisan/artifacts/<artifact_id>` in a per-run directory.
-2. Run each declared argv in order in the verification sandbox profile: the worktree is read-write, the out directory is per-run, network is denied (no proxy), there are no runtime credentials, and the same PID namespace stop rules apply.
+1. For each declared argv, create an independent clean worktree from `refs/taisan/artifacts/<artifact_id>`. Verify the exact commit and tracked input bytes before running it; no command inherits source changes from another command.
+2. Run that argv in the recorded verification sandbox profile. Tracked source inputs are read-only. Build outputs and temporary files use separate per-command writable directories that cannot shadow tracked inputs. The out directory is per-command, network is denied (no proxy), there are no runtime credentials, and the same PID namespace stop rules apply. A command requiring source mutation is incompatible with this profile and needs an explicit validated profile decision; its result cannot silently certify the original commit.
 3. Record `VerificationResult{requirement, artifact, commit, argv, environment: profile digest, result, output}` with bounded output. A timeout or a killed runner is `Incomplete`, never `Failed` with an invented exit code and never `Passed`.
 
 The runner is a supervised effect of the CLI loop, not a Worker Invocation; it is bounded by its own per-command timeout and the Execution deadline. Tests that need network access are not supported by the v0.1 profile; such a Work needs an owner-approved profile change, not a silent network grant.
@@ -227,7 +234,7 @@ The runner is a supervised effect of the CLI loop, not a Worker Invocation; it i
 
 - **Filesystem.** Read-only binds of the system directories the runtime and toolchain need; tmpfs for `HOME`, `/tmp`, and `/run`; read-write binds only for `/workspace` (read-only for InvariantCheck and CodeReview) and `/taisan/out`; read-only bind of `/taisan/request.json` and, if needed, the single runtime credential file. The owner's home directory, other workspaces, the state store, the handoff repository, and installation config are not mounted.
 - **Credentials.** The environment is constructed from an allowlist, not inherited. Runtime credentials come from a credential reference resolved by the supervisor and passed as an environment variable or a read-only file; their values never appear in argv, request files, logs, or evidence. No repository-host credential, git credential helper, SSH agent socket, or keyring socket enters the sandbox. Git inside the sandbox uses `GIT_CONFIG_GLOBAL` pointing at a generated config with `credential.helper=` and `protocol.allow=never` except `file`.
-- **Network (N1, mandatory).** `--unshare-net` leaves only loopback. A taisan-owned CONNECT proxy outside the sandbox listens on a Unix socket bound into the sandbox and exposed to the runtime as `HTTPS_PROXY` through an in-sandbox relay. The proxy allows CONNECT only to the configured model-API host names and port 443, resolves DNS itself, logs allowed and denied destinations as bounded evidence, and denies everything else. TLS is not inspected. Coding and Fix Invocations get the proxy; the verification runner gets no proxy.
+- **Network (N1, mandatory).** `--unshare-net` leaves only loopback. A taisan-owned CONNECT proxy outside the sandbox listens on a Unix socket bound into the sandbox and exposed to the runtime as `HTTPS_PROXY` through an in-sandbox relay. The proxy allows CONNECT only to the configured model-API host names and port 443, resolves DNS itself, logs allowed and denied destinations as bounded evidence, and denies everything else. TLS is not inspected. Coding, Fix, InvariantCheck, and CodeReview Invocations all get the same model-API-only proxy. Read-only assessment roles need model access too. The supervisor verification runner gets no proxy or runtime credentials.
 - **Process.** `--unshare-pid` makes bwrap's child the PID-namespace init; `--die-with-parent` and `--new-session` prevent survival after the supervisor-spawned leader and terminal injection.
 
 ### Process descendants and stop proof
@@ -240,7 +247,7 @@ Before the first dispatch with a profile, and whenever the profile, runtime vers
 
 - writing outside `/workspace` and `/taisan/out` fails;
 - reading the owner's host credential files fails, `SSH_AUTH_SOCK` is unset, and `git credential fill` returns nothing;
-- TCP connect to the repository host and an arbitrary address fails, CONNECT to a non-allowlisted host is denied by the proxy, and the model-API host is reachable;
+- TCP connect to the repository host and an arbitrary address fails, CONNECT to a non-allowlisted host is denied by the proxy, and the model-API host is reachable for each of Coding, Fix, InvariantCheck, and CodeReview;
 - a `setsid` child is killed when the namespace init exits.
 
 Any failing or skipped probe refuses dispatch with a repair prerequisite. There is no fallback to hygiene-only execution, and a flag or `AllowedEffects` value never substitutes for these probes.
@@ -293,13 +300,13 @@ Both implementations run the same suite through the supervisor and the public Co
 | WS-13 | Corrupt bundle / digest mismatch | Invalid, never published |
 | WS-14 | Write outside allowed paths | Denied by sandbox; preflight and in-run probe |
 | WS-15 | Read host credential, use SSH agent or credential helper | Unavailable |
-| WS-16 | Connect to repository host or non-allowlisted host | Denied by proxy/namespace |
+| WS-16 | All four Worker roles connect to the model API, repository host, and non-allowlisted host; verification runner attempts the same | Only the allowed model API is reachable for each Worker role. Verification runner has no network access |
 | WS-17 | Provider refusal, rate limit, max turns | Bounded reason codes; no outer retry by adapter |
 | WS-18 | Stale-head review report | Cannot settle the newer head (#51) |
 | WS-19 | Adapter attempts to change Work state or request retry | No path exists; any such output ignored and recorded |
 | WS-20 | Config-only swap between adapters for new Invocations | Identical Command, queue, budget and Outcome results; running Invocation unaffected |
 | WS-21 | Runtime version differs from declaration | Configuration repair; no start |
-| WS-22 | Verification runner timeout | `Incomplete`, not `Failed` or `Passed` |
+| WS-22 | Verification runner timeout or source-mutation attempt | Timeout is `Incomplete`, not `Failed` or `Passed`. Source mutation is denied; every subsequent command starts from the exact original artifact with independent outputs |
 
 ## Provisional requirement mapping
 

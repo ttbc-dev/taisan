@@ -26,9 +26,9 @@ The notation is illustrative and does not select a programming language or datab
 
 ```ts
 type RequestId = string & { readonly tag: "invocation_request" };
-type ImmutableIntent = { goal: string; issues: IssueRef[];
+type SpecificationIntent = { goal: string; issues: IssueRef[];
   constraints: string[]; verification_argv: string[][] };
-type ExecutionInput = { intent_digest: string; selected_base_revision?: CommitRevision };
+type ExecutionInput = { spec_revision: number; intent_digest: string; selected_base_revision?: CommitRevision };
 type ExecutionBudget = { deadline?: string; max_invocations?: number;
   max_review_rounds?: number; runtime_limit_seconds?: number;
   first_admitted_at?: string };
@@ -55,7 +55,9 @@ type ResourceReservation = {
 type Work = {
   id: WorkId;
   version: WorkVersion;
-  intent: ImmutableIntent;
+  current_spec: number;
+  approved_spec?: number;
+  // Immutable snapshots retain SpecificationIntent and prior approval evidence.
   current_execution: ExecutionId;
   host_binding: HostBinding;
 };
@@ -85,7 +87,7 @@ type Invocation = {
   id: InvocationId;
   request_id: RequestId;
   execution_id: ExecutionId;
-  role: "coding" | "invariant_check" | "review";
+  role: "coding" | "fix" | "invariant_check" | "review";
   state: "prepared" | "running" | "unknown" | "exited" | "not_started";
   process_identity?: ProcessIdentity;
   evidence: EvidenceRef[];
@@ -94,7 +96,7 @@ type Invocation = {
 
 `Work` has no separately updated phase. Its current phase, Outcome, and Attention are derived from its current Execution and saved Observations. E1 is created with W1 in the accepted `submit` transaction, before capacity is reserved. A retry creates E2 in the accepted `retry` transaction. Resume requeues the same Execution; it never creates another Execution or resets that Execution's budget.
 
-`queued` means accepted but without a capacity reservation or approved Invocation request. `ready`, `running`, `waiting`, `uncertain`, and `stopping` hold one Execution capacity slot. `paused` and the three terminal states hold none. v0.1 keeps the slot during automatic CI or review waiting, even if the last process has exited. This avoids a second capacity acquisition path between stages. A later version can change that policy without adding a card state.
+`queued` means accepted but without a capacity reservation or approved Invocation request. `ready`, `running`, `waiting`, `uncertain`, and `stopping` hold one Execution capacity slot. `paused` and the three terminal states hold none. v0.1 keeps the slot during automatic CI or review waiting, even if the last process has exited. This avoids a second capacity acquisition path between stages. Human-decision and configuration-repair handoffs instead release the slot after writer safety is established, while reservations remain held; see [recovery policy](recovery-policy.md#human-waiting-and-capacity).
 
 `paused` requires durable continuation input and proof that earlier writers have stopped or cannot write. A pause for `repair` records the failed precondition, the required repair, and evidence that the condition was revalidated before `resume`; repeatedly resuming unchanged configuration is not an eligible transition. `uncertain` is evidence of an unresolved start or process identity, not a synonym for failure. It retains capacity until reconciliation establishes a safe transition. A worker report claiming completion is evidence; only `work` can record `succeeded` or `failed` after checking it.
 
@@ -132,9 +134,10 @@ Every supported writer entry point for a managed resource uses this ownership pa
 | `ready` or `running` | Launch or liveness cannot be established | `uncertain`; retain slot and prohibit replacement start. |
 | `uncertain` | Correlated old process confirmed alive | `running`, or `stopping` if stop was requested; keep the same request and slot. |
 | `uncertain` | Old process confirmed stopped and no effect remains unknown | `paused`, `failed`, or `cancelled` according to the saved cause and desired action; release slot, and release the write-resource reservation unless pausing. |
+| `uncertain`, `waiting`, or `stopping` | Writer confirmed stopped; only a host effect remains unknown and human action is required | `paused` with the unresolved action and saved desired outcome; release compute slot, retain affected-resource reservations, and block dependent writes and terminal settlement. |
 | `running` | Worker exits; external check/action is pending | `waiting`; keep the Execution slot. |
 | `running` | Worker exits; required artifact/evidence is missing but a durable source may recover it | `waiting` for `artifact_recovery`; retain ownership until recovery is complete or bounded recovery is exhausted. |
-| `waiting` | Fresh evidence permits the next coding/review/fix step | `ready` with a new request under the same Execution and reservation. |
+| `waiting` | Fresh evidence permits the next coding/fix/invariant-check/code-review step | `ready` with a new request under the same Execution and reservation. |
 | `waiting` for `artifact_recovery` | Bounded recovery attempts or deadline exhausted; writers stopped and external effects reconciled | `failed` with an `artifact_recovery_exhausted` code; record the bound, attempts, and preserved evidence; release slot and the write-resource reservation. |
 | `running` or `waiting` | Human decision or recoverable interruption; writers safe | `paused`; record continuation, release slot, and retain the write-resource reservation. |
 | `paused` | Valid `resume` or `release_judgment` | Same Execution `queued` with a new enqueue sequence and unchanged budget. |
@@ -151,7 +154,7 @@ Every supported writer entry point for a managed resource uses this ownership pa
 
 The table names allowed transitions, not all policy checks. A Command also checks actor, Work version, idempotency key, target Execution, and budget. `retry` requires a confirmed `failed` current Execution; `resume` requires `paused`. Neither is accepted from `uncertain`, `stopping`, `succeeded`, or `cancelled`. Budget exhaustion is an internal timed decision that checks the stored limit against the observed clock in the commit; it is not a reason to reject `cancel`. `cancel` acceptance may mean that stopping is requested; it is not a claim that the process or external action has stopped. A second cancellation with a different key against an already cancelled Work is an accepted no-op with no new version.
 
-Execution budget counts every durably recorded Invocation attempt, including a definite `not_started` result, and review/fix rounds. v0.1 defaults per Execution: `max_invocations` = 10 across coding/fix/invariant-check/code-review Invocations, `max_review_rounds` = 5 where each code-review Invocation consumes one round — including a re-review driven by a head change — and `runtime_limit_seconds` = 6 hours. The first dispatch starts its runtime budget; queue time does not consume that budget. Resume retains the original counters and deadline. Retry creates a new Execution with the policy's next budget; it cannot change the accepted Work intent. An absolute Work deadline, if configured, is separate and continues while queued. Artifact recovery has its own bounded attempt/deadline policy — 3 attempts within 30 minutes by default — and does not count as a new Invocation. `execution` performs each attempt, collecting from the workspace, recorded checkpoints, and the worker runtime's artifact store (the reference adapter declares none; see [Worker protocol](worker-protocol.md#crash-recovery)), and durably records the attempt count, deadline, and result before reporting an Observation. Recovery runs only after a confirmed worker exit; it does not start while the writer may still be alive. If the bound is exhausted the Execution transitions to `failed` with an `artifact_recovery_exhausted` code: required evidence could not be verified, so success cannot be claimed. Available workspace/WIP evidence is preserved, and the failure is eligible for a recorded repair or retry decision — a retried Execution can claim the same workspace and branch. Missing artifacts alone do not prove that a writer is still alive or that it stopped.
+Execution budget counts every durably recorded Invocation attempt, including a definite `not_started` result, and review/fix rounds. v0.1 defaults per Execution: `max_invocations` = 10 across coding/fix/invariant-check/code-review Invocations, `max_review_rounds` = 5 where each code-review Invocation consumes one round — including a re-review driven by a head change — and `runtime_limit_seconds` = 6 hours. The first dispatch starts its runtime budget; queue time does not consume that budget. Resume retains the original counters and deadline. Retry creates a new Execution under the current approved specification; it cannot edit that revision or reset Work-wide recovery usage. A separately approved specification revision can update intent, constraints, and checks while retaining immutable snapshots, previous approvals as history, and binding. An absolute Work deadline, if configured, is separate and continues while queued. Artifact recovery has its own bounded attempt/deadline policy — 3 attempts within 30 minutes by default — and does not count as a new Invocation. `execution` performs each attempt, collecting from the workspace, recorded checkpoints, and the worker runtime's artifact store (the reference adapter declares none; see [Worker protocol](worker-protocol.md#crash-recovery)), and durably records the attempt count, deadline, and result before reporting an Observation. Recovery runs only after a confirmed worker exit; it does not start while the writer may still be alive. If the bound is exhausted the Execution transitions to `failed` with an `artifact_recovery_exhausted` code: required evidence could not be verified, so success cannot be claimed. Available workspace/WIP evidence is preserved, and the failure is eligible for a recorded repair or retry decision — a retried Execution can claim the same workspace and branch. Missing artifacts alone do not prove that a writer is still alive or that it stopped.
 
 ## Artifact and publication assessment
 
@@ -180,3 +183,7 @@ Attention is derived from a human decision that can be made now: a paused judgme
 ## Deliberately deferred
 
 Host-level enforcement of workspace and branch claims must still be proven by the vertical slice. Also deferred are multiple hosts, multiple concurrent Executors for one Work, arbitrary Kanban cards, automatic priority changes, history import from external systems, and completion across multiple PRs. None is required to define the v0.1 lifecycle above.
+
+## Approved recovery and configuration policy
+
+Use the owner-approved [recovery and configuration policy](recovery-policy.md) for configurable defaults, Work-wide accounting, policy changes, and safe human-wait capacity release. The [post-v0.1 milestones](post-v0.1-milestones.md) retain the seven approved machinery deferrals without deferring v0.1 safety requirements. Both documents specify target behavior, not implemented runtime support.

@@ -1,6 +1,6 @@
 # Evidence, invariant checks, and review gates
 
-Status: concrete design for #51, based on the [identity/storage design](identity-storage.md) in PR #57. Documentation only: no runtime schema/API, configuration, credentials, checks, publication or E2E behavior is implemented here. This document records the owner's success-policy choices and supersedes earlier unconditional review/aggregate-check assumptions for the general v0.1 profile. The representative S1 demonstration still enables both assessment lanes to exercise them.
+Status: concrete design for #51, based on the merged [identity/storage design](identity-storage.md) and owner-approved [recovery policy](recovery-policy.md) in PR #57. Documentation only: no runtime schema/API, configuration, credentials, checks, publication or E2E behavior is implemented here. This document records the owner's success-policy choices and supersedes earlier unconditional review/aggregate-check assumptions for the general v0.1 profile. The representative S1 demonstration still enables both assessment lanes to exercise them.
 
 ## Owner-approved lanes and caller flow
 
@@ -14,7 +14,7 @@ Status: concrete design for #51, based on the [identity/storage design](identity
 
 Core owns the predicates and the requirement to obtain fresh observations. Host/Worker adapters perform reads and bounded tasks; the CLI loop drives those requests. A status Query never refreshes a remote source. A generic worker exit or model summary is not an Outcome.
 
-1. Accept and approve Work/specification/invariant-set identity and a lane-policy snapshot. Config is resolved by the setup/adapter boundary, not parsed ad hoc in Core. New requirements cannot silently weaken accepted Work or reset Execution budgets; #53/#55 specify explicit config/reapproval behavior.
+1. Accept and approve Work/specification/invariant-set identity and a lane-policy snapshot. Config is resolved by the setup/adapter boundary, not parsed ad hoc in Core. New requirements cannot silently weaken accepted Work or reset Execution or Work-wide usage. The approved [recovery policy](recovery-policy.md) governs defaults and authorized policy updates; #53/#55 specify validation and Commands.
 2. Core requires the authoritative pre-dispatch source read from #50. After matching approved input, dispatch one bounded coding Invocation. Keep request, artifact, verification and process identities distinct.
 3. Finalize an immutable change after writer-stop proof. Verify retained git objects, exact produced commit and declared mechanical command results. When invariant conformance is on, dispatch the configured invariant-check task for that exact change/specification. A valid negative assessment drives bounded repair; it does not become success or an invalid record.
 4. Only after the enabled pre-publication gates pass does Core authorize separate guarded push and change-request create/update intents. The host adapter alone publishes. Keep each successful effect even if a later one fails or becomes unknown.
@@ -266,6 +266,8 @@ Repository merge-rule changes are not automatically imported into Work policy. N
 
 Add immutable typed evidence metadata/content references, review snapshots/rounds/occurrences/assessments, invariant assessments and required-stage-effect records to #50's model. Foreign keys bind exact Store/Work/Execution/specification/policy and diff targets; content references may be compacted/moved under #54 without changing metadata identity or fabricating availability. Do not keep raw unbounded remote text as keys.
 
+Run `python3 scripts/check-evidence-schema.py` to check the fragment's membership/uniqueness constraints and same-revision recollection with stub subjects. It does not prove exact-set transaction predicates, sealed-row immutability, recovery semantics, implemented store behavior, or live acceptance.
+
 The following SQL fragment illustrates exact-set membership constraints; parent subject/source tables and the full target-scoped FKs remain part of the complete schema implementation, not omitted checks at runtime.
 
 ```sql
@@ -353,15 +355,143 @@ struct CompletionProof {
 
 Core validates nonempty evidence where the declared requirement set is nonempty, exact target/specification/profile identity, complete enabled lanes, explicit disabled markers, no current unresolved finding judgment, and closure of every required effect and writer. A normal `succeeded` Outcome points to the frozen proof with exact PR/head/base and all relevant evidence IDs. Partial progress/Attention is not succeeded. Later remote changes update current readiness, never rewrite the historical Outcome.
 
-All real coding/fix/invariant-check/code-review Invocations count toward the existing per-Execution max_invocations. Code-review Invocations also consume the per-Execution max_review_rounds; a snapshot refresh alone does not. The invariant-check purpose is distinct from code review even if one Worker implementation serves both; #52 specifies its task translation. Save counts with the durable request as in the existing budget contract; a definitely not-started attempt still counts. No refund or cumulative Work lifetime budget is introduced. Resume/reapproval/restart do not reset the same Execution; an explicit retry after confirmed failure creates a new Execution with its own configured limits under the existing contract. Artifact recovery keeps its separate attempts/deadline. Host reads/actions are not fictional Worker Invocations and have their own bounded transport/reconciliation behavior designed in #55.
+All real coding, fix, invariant-check, and code-review Invocations count toward per-Execution `max_invocations`. Code-review Invocations also consume `max_review_rounds`; a snapshot refresh and supervisor mechanical verification do not. A durable request consumes the attempt once, including a definitely not-started result. Replaying the request cannot charge or launch it twice. Resume, reapproval, and restart preserve usage. A successor Execution receives its own per-Execution limits while the [Work-wide recovery ledger](#work-wide-recovery-accounting) preserves cumulative correction, transport, equivalent-failure, and time bounds. No new Execution or specification revision replenishes those bounds. Artifact recovery and host transport/reconciliation remain distinct from Worker Invocations.
 
-When enabled conformance or mechanical verification fails, no new publication is authorized. Bounded fixes produce new immutable artifacts and fresh results. If attempts/limits cannot resolve it, record the failed/inconclusive requirement and current Attention. Optional code-review findings similarly run bounded fix/re-review; remaining findings need an explicit operator decision. Neither budget exhaustion nor review-off selection retroactively creates passed evidence. An ordinary code-review Accept/Dismiss does not waive a required invariant violation; changing an invariant or enabled requirement needs explicit specification/policy reapproval, not a finding-status shortcut.
+When enabled conformance or mechanical verification fails, no new publication is authorized. Bounded fixes produce new immutable artifacts and fresh results. Pre-publication Fix requests bind the predecessor artifact and exact failed mechanical/invariant evidence without requiring a change-request identity. Review Fix requests additionally bind the current DiffTarget, round, exact-set judgment, and selected occurrences. The approved repair goal and constraints are immutable in either case; a stale target invalidates dependent dispatch. If attempts/limits cannot resolve it, record the failed/inconclusive requirement and current Attention. Optional code-review findings similarly run bounded fix/re-review; remaining findings need an explicit operator decision. Neither budget exhaustion nor review-off selection retroactively creates passed evidence. An ordinary code-review Accept/Dismiss does not waive a required invariant violation; changing an invariant or enabled requirement needs explicit specification/policy reapproval, not a finding-status shortcut.
 
 A repair wait/Attention carries typed prerequisites: exact failed/missing source or requirement, evidence to be refreshed, required actor/action, spec/binding to preserve, remaining limits, and any unresolved writer/effect. A resume decision rechecks the prerequisites rather than relying on a generic message `fixed`. Inconclusive/unavailable evidence can be recollected within bounds; corrupt/wrong-subject claims remain invalid history and cannot be upgraded by relabeling. A valid negative result needs a new result/remediation or explicit policy decision, not repeated parsing.
 
-Before safe pause, stop/prove writers and retain WIP/resource/Issue ownership. Before terminal failure/cancellation, reconcile outstanding effects and prove all writers safe; only that terminal commit releases slot/reservations/Issue claims. Unknown ownership/effects keep safety holds even after deadline. Stop request, heartbeat silence, parent exit or worker `done` alone is never proof over all recorded descendants. The supervisor remains responsible for those process facts; Core authorizes the transition, CLI drives it.
+Before safe pause, prove writers stopped or unable to write and persist WIP, continuation, and resource/Issue ownership. Release compute capacity promptly once writer safety is proven, including when only a host effect remains unknown. Keep that action and its affected-resource reservations, and prohibit dependent writes and terminal settlement. Unknown process ownership retains the slot. Only safe terminal settlement releases the remaining reservations and Issue claims. Deadlines establish no stop or no-effect proof. These independent capacity and resource rules follow [human waiting and capacity](recovery-policy.md#human-waiting-and-capacity). Stop request, heartbeat silence, parent exit or worker `done` alone is never proof over all recorded descendants. The supervisor remains responsible for those process facts; Core authorizes the transition, CLI drives it.
 
 If a human merges/closes the PR while review/fix is in progress, do not treat merge as proof of Work success or continue writing blindly. A fresh closed/merged host fact prevents dependent new mutations, retains current safety reconciliation and surfaces the appropriate operator handoff. Do not rewrite fixed Invocation inputs or infer stop proof from PR state. #55 specifies the precise operator command/lifecycle presentation using these guards.
+
+## Failure classification and recovery decisions
+
+Classification consumes normalized boundary facts and exact retained evidence, not a Worker summary or a raw exit code. The configured classifier version and normalization profile are part of the accepted policy. Preserve raw bodies, classification inputs, and reasons. An exit code does not establish writer stop, artifact validity, or host-write outcome.
+
+Apply safety precedence before choosing remediation. A request that may still launch or a writer whose state is unknown requires process reconciliation. A host write without an exact applied/no-effect result requires effect reconciliation. Neither uncertainty can become an ordinary failed attempt. After these safety checks, distinguish the following classes.
+
+| Class | Required evidence and permitted action | Refusal and handoff |
+| --- | --- | --- |
+| `transient` | A versioned classifier identifies a recoverable read/service failure, or a write has exact no-effect proof. Retry the same logical operation within saved backoff, transport count, and deadlines, rechecking fresh write guards when exact no-effect proof permits another write attempt; allocate a new counted attempt only after the decision commits | Missing no-effect proof becomes `unknown_effect`. Exhaustion holds for human action; never invent an applied receipt |
+| `permanent` | Exact request plus deterministic refusal, unsupported operation, or invalid task. Retain the refusal; stop safely and fail the Execution when no writer/effect can act | Do not automatically buy the same refusal again. Resume/re-execution requires changed validated input or an explicitly approved policy/specification decision |
+| `environment_repair` | Auth, permission, configuration, sandbox, or durable-store prerequisite failed. Hold for repair, save exact prerequisites, safely stop, and release compute capacity when proven safe | A generic acknowledgment or unchanged config cannot resume. Require a fresh successful boundary check tied to the repaired credential/config/environment revision |
+| `human_decision` | A finding needs disposition, repeated correction failed, a source changed/closed, or a configured bound is reached. Persist current Attention and continuation | No automatic acceptance or retry. An authorized decision must name the current Work version, evidence, and remaining limits |
+| `unknown_effect` | The original ActionId/request, authorized actor/target/payload, partial facts, and lost/ambiguous result exist. Inspect only the original action and its exact postcondition within the reconciliation window | No blind resend, successor write, success, or terminal release. Expiry requests human action and preserves uncertainty; stopped-writer capacity can still be released |
+| `correction_required` | A valid exact mechanical/invariant negative result or actionable current review decision identifies a code defect. Request a new immutable fix Invocation and fresh verification within all applicable bounds | Do not use transport retries to repeat failing checks or accept stale success. Missing evidence is not a code defect |
+| `unknown_evidence` | Classification, report, or artifact evidence is absent, incomplete, invalid, or unclassifiable. Preserve its validity and reason; bounded recollection may obtain a new exact record after writer stop | Never interpret unknown as changed cause or success. Invalid evidence remains immutable. Exhaustion holds for repair/human action or safely fails with the unresolved requirement recorded |
+
+A valid negative result and its normalized class are separate fields. For example, a valid failed check may require environment repair rather than code correction. A missing report with a valid handed-off artifact does not fabricate review/invariant results. Unavailable source bodies block dependent gates even if a previous digest is known. A stale or wrong-subject record cannot be repaired in place; record a fresh collection for the intended subject.
+
+```rust
+struct FailureRecord {
+    id: FailureId,
+    subject: AssessmentSubject,
+    operation: RecoveryOperationRef,
+    attempt: AttemptRef,
+    class: FailureClass,
+    reason: ReasonCode,
+    evidence: NonEmptyVec<EvidenceId>,
+    evidence_state: EvidenceValidity,
+    classifier: ClassifierVersion,
+    normalization: NormalizationProfileRef,
+    equivalence: FailureEquivalence,
+    condition: ConditionSnapshotRef,
+}
+enum FailureEquivalence {
+    Known { stage: StagePurpose, criterion: StableCriterionRef,
+        category: ErrorCategory, diagnostics_digest: Digest },
+    Unclassified { reason: ReasonCode },
+}
+struct RecoveryDecision {
+    id: RecoveryDecisionId,
+    work: WorkRef,
+    expected_version: WorkVersion,
+    failure: FailureId,
+    policy: PolicySnapshotRef,
+    action: RecoveryAction,
+    prerequisites: Vec<RepairPrerequisite>,
+    usage_before: RecoveryUsageRef,
+    usage_after: RecoveryUsageRef,
+    authority: DecisionAuthority,
+    reason: ReasonCode,
+    decided_at: Timestamp,
+}
+enum RecoveryAction {
+    Recollect { source: EvidenceSourceRef },
+    Reconcile { original: RecoveryOperationRef },
+    RetryTransport { original: RecoveryOperationRef, not_before: Timestamp },
+    Correct { predecessor: ArtifactId, request: RequestId },
+    Requeue { predecessor: ExecutionId, successor: ExecutionId },
+    Hold { continuation: ContinuationRef, attention: AttentionRef },
+    Stop { intent: StopIntentRef },
+    Fail { outcome: OutcomeRef },
+}
+struct RepairPrerequisite {
+    criterion: RepairCriterionRef,
+    prior_condition: ConditionSnapshotRef,
+    required_actor: ActorRequirement,
+    required_evidence: EvidenceRequirementRef,
+}
+```
+
+These types extend the target design, not the implemented Rust API. `RecoveryOperationRef` resolves to a scoped source collection, artifact recovery, Invocation request, or host action. `AttemptRef` distinguishes a new attempt from delivery replay. `ConditionSnapshotRef` identifies immutable input/config/capability/check/source revisions and their retained validation evidence. Evidence validity records absent, valid, or invalid with an explicit reason; unavailable and incomplete collections retain their source state. A known equivalence key uses canonical bytes under the saved normalization profile. Scope the key to Work, stage, stable criterion, error category, and normalized diagnostics. Strip only the profile's declared volatile fields such as timestamps and temporary paths. Never merge by free-text similarity or delete the raw evidence.
+
+Record every authoritative classification once per operation/attempt/evidence revision. Re-reading a failed check is not a second failed validation. A fix artifact or new Execution alone does not change equivalent-failure identity. Unclassifiable diagnostics cannot reset a known streak or justify another automatic correction; hold for classification or human action. A changed classifier version is an explicit policy update, not a reset signal. Preserve comparable prior usage; if the versions cannot be compared, require human decision rather than assuming a new failure.
+
+The Core transaction stores the FailureRecord, decision, prerequisite evidence, usage delta, next not-before/deadline, continuation or request, and WorkVersion update together. Decision identity and attempt uniqueness make delivery replay idempotent. A version conflict rolls back the entire decision and requires rereading current facts. No adapter may allocate a successor Execution or repeat an external write on its own. Store immutable records plus Work-current pointers; retain actor and old/new policy for any authorized change. SQL uniqueness must cover `(work, operation, attempt, classification_revision)` and `(work, decision_id)`, with Work-scoped foreign keys for failure, usage, and successor lineage. Duplicate identity with different canonical bytes is a conflict.
+
+A repair prerequisite is satisfied only by valid fresh evidence for its exact criterion and subject. A changed token identifier without a successful permission check is insufficient. A changed spec needs explicit approval; a new policy keeps old usage. Reject absent, stale, wrong-actor, malformed, or mismatched evidence with a retained reason. An explicit operator retry after safe failure creates a successor only if its saved prerequisites and all applicable bounds pass; approval cannot serve as writer-stop or no-effect evidence. Budget expansion uses the approved policy-change path, never a caller-supplied fresh counter baseline.
+
+## Work-wide recovery accounting
+
+Use the numeric defaults already approved in [recovery policy](recovery-policy.md#configurable-policy-and-defaults). This design adds no numeric default or exception. Each effective policy is immutable and versioned; configuration edits affect new Work unless an authorized version-checked policy change updates existing Work. Store counters as Work-owned ledger entries and cached totals, not only fields on the current Execution.
+
+| Account | Durable identity and charge | Exhaustion behavior |
+| --- | --- | --- |
+| Invocation | `(Execution, RequestId)` counts coding, fix, invariant-check, and code-review requests once, including definitely not-started attempts; preserve historical per-Execution totals | No new Invocation after that Execution's limit; safely fail/hold under the selected recovery decision |
+| Review | `(Execution, code-review RequestId)` also consumes one review round. Polls, snapshot recollection, supervisor checks, and invariant checks consume no review round | Human decision without automatic finding acceptance |
+| Automatic correction | Work-wide fix-request identity. Charge once when Core durably authorizes an automatic fix, whether caused by code, checks, invariants, or review | Default three automatic fix Invocations across all Executions; a successor or reapproval cannot add a fourth |
+| Transport | `(Work, logical operation, retry sequence)` counts retries after the initial attempt. The logical operation retains its identity across restarts and successor Executions; an ActionId cannot be replaced to replenish retries | Default three retries with saved `[10,30,90]` second backoff. Recheck remaining deadlines before dispatch; host-write uncertainty switches to reconciliation |
+| Artifact recovery | `(Work, ArtifactId or producing Invocation, recovery sequence)` and original recovery deadline; a successor cannot restart recovery for the same artifact | Existing default three attempts within thirty minutes. A newly produced artifact has its own recovery account and still consumes Work automatic time |
+| Equivalent validation failures | `(Work, equivalence key)` plus current correction/validation lineage. Charge each new authoritative failed post-correction validation once; retain all historical counts and the consecutive streak | At the approved default of two consecutive equivalent post-correction failures, request human action. A matching check becoming valid and successful ends its streak; an explicit different classified cause starts its own streak. Neither resets other usage |
+| Execution runtime | First-dispatch timestamp and saved per-Execution runtime deadline, including pauses after first dispatch; queue time before first dispatch does not start it | Existing default six hours; resume never moves its deadline |
+| Automatic time | Work-wide non-overlapping intervals, opening at first dispatch and while automatically running or waiting, including backoff/reconciliation and automatic queue waits after first dispatch | Default four cumulative hours. Human-decision waits are excluded only after their durable handoff. Earlier automatic time remains charged |
+| Absolute Work deadline | Optional immutable Work deadline, compared with observed time in every relevant decision; continues through all queues and human waits | No attempt after deadline. Stop/reconcile safely, never infer termination from clock expiry |
+
+Maintain `(work, usage_sequence)` immutable deltas with a unique causal decision/request/attempt reference; cached totals and successor creation commit in the same transaction. Every automatic successor inherits the Work's policy, cumulative usage, failure history, pending operations, and original applicable deadlines. Per-Execution counters may start at zero for the new Execution, but do not replace these Work accounts. A successor request correcting an earlier produced change remains a correction and consumes the Work fix account even if its adapter task uses the coding shape. Creating E2 or relabeling the role cannot turn correction into a new initial implementation. Human resume uses the same paused Execution and reacquires capacity through the queue. An operator retry creates a new Execution only after safe failure and fresh guards; none of these commands refund usage.
+
+Time accounting records each phase boundary and one current open interval. Concurrent CI and reconciliation consume one wall-clock interval, not the sum of lane times. A restart closes/reopens no artificial free interval: charge elapsed time since the durable boundary before authorizing work. Use nondecreasing persisted observed time; an invalid or backward clock prevents deadline-dependent new dispatch until reconciled rather than replenishing time. Human waiting excludes only the interval durably classified as requiring human action, not unrecorded downtime. Per-Execution runtime and the absolute deadline remain independently applicable during that wait. Policy changes preserve elapsed intervals and counters; tightening below consumed usage takes the limit path, while expansion needs explicit approval.
+
+Optional provider token/cost usage retains its source, unit, precision, and availability separately from deterministic request counts. Missing or interrupted usage is unknown, never zero. If an accepted policy uses a spend bound, unknown usage cannot establish sufficient remaining allowance; reconcile it or request a policy-authorized human decision. No new spend default is introduced here.
+
+Material progress is a separately persisted versioned observation. Accepted new artifact evidence, a formerly failing required check becoming valid and successful, or a reconciled action acquiring a verified result may rearm the no-progress warning. A log message, new commit hash, partial report, repeated poll, or new Execution cannot do so by itself. The default thirty-minute warning does not force a stop, waive an unresolved effect, or refund any attempt/time. Each occurrence retains the evidence and the configured progress rule.
+
+| Literal case | Accepted or rejected result |
+| --- | --- |
+| W1/E1 used two automatic fixes; E2 requests another | Accept the third only if other guards/bounds pass. Persist W1 usage three and E2's own Invocation charge |
+| E2 requests a fourth automatic fix after W1 usage three | Reject exhausted Work bound even with unused E2 Invocation slots |
+| Correction C1 fails exact check T with key K; C2 fails T with only timestamp/path changes | Two distinct post-correction validations under K; Attention. Duplicate delivery of C2 does not add a third |
+| New head/report has unclassifiable diagnostics | Preserve unknown; cannot assert a different cause, clear K, or automatically re-execute |
+| T becomes valid and passes after explicit repair | Reset T's consecutive streak with retained evidence; retain previous failures, correction usage, and automatic elapsed time |
+| Restart after transport retry two during backoff | Preserve operation identity, consumed retries, and not-before time. The next retry is three, not one |
+| One hour automatic work, two hours human wait, then resume | Automatic time remains one hour; Execution runtime has elapsed three hours and absolute deadline continues |
+| Operator retries with unchanged failed environment | Reject missing changed-and-validated prerequisite; a new Execution is not repair evidence |
+| Approved extension raises fix limit from three to four after usage three | Preserve usage three and both policy versions. One more automatic fix may become eligible; no refund or other invariant waiver |
+| Unknown create action exceeds ten-minute reconciliation window | Attention with original ActionId and partial push receipt; no new create, failed receipt, or terminal settlement |
+
+## Incident contracts and regression scenarios
+
+The source inventory and [requirement obligations](evidence-requirements.md) provide traceable design inputs. Source fixes establish a failure class, never target-runtime acceptance. Keep private source locators only in the owner-controlled audit record. In particular, the existing #21/PR #31 classifier evidence supports only its recorded classification assertion, not the complete side-effect gate or a live publication claim.
+
+| Incident | Exact contract and retained state | Planned regression through Command/Query and adapter ports |
+| --- | --- | --- |
+| Publication claimed without push | Worker report has no host-effect authority. Require independent exact push receipt before open/update or any reply claiming publication; keep missing versus invalid receipt reasons | Supply a valid local artifact and a report saying published, but no ref receipt. Assert no create/reply authorization and no succeeded Outcome. Repeat with a valid receipt for another commit; reject mismatch |
+| Push succeeds, report or create response is interrupted | Preserve exact push result and original action. Missing Worker report drives bounded evidence recovery; unknown create drives reconciliation, not another push/create | Persist applied push, lose create response, restart. Assert one push and one create attempt; reconciled exact create completes its action. An unavailable/mismatched read leaves it unknown. Proven writer stop releases capacity for independent Work, retaining conflicting reservations |
+| Stale source head or changed diff base | Old evidence remains historical; replace current target/generation, invalidate dependent judgment/release/publication authority. Fresh pre-dispatch source read remains mandatory | Inspect H1/B1 then observe H2/B1 or H1/B2 before judgment and release. Assert rejection of old coverage and no stale-dependent effect. A late H1 notification cannot restore it |
+| Same-head finding growth | An exact complete round `{A}` cannot authorize decisions over `{A,B}`. Install new immutable round and invalidate dependent generation in the same local transaction | Race collection of B with judgment acceptance and terminal release on H1. Assert either valid old transaction before new evidence or explicit stale/set-mismatch rejection after it; never accept incomplete decisions. Duplicate delivery leaves generation unchanged |
+
+These planned regressions exercise local transactional guarantees and the recorded final-read boundary. They do not promise an atomic remote snapshot or eliminate a remote change after the last authoritative read. Each required evidence, FailureRecord, RecoveryDecision, usage delta, prerequisite, and completion proof must be tested as absent, exact-and-valid, or malformed/stale/mismatched, with its original reason retained.
 
 ## Literal acceptance and rejection cases
 
@@ -392,8 +522,8 @@ If a human merges/closes the PR while review/fix is in progress, do not treat me
 | Trust boundaries | Worker/checker/source claims never directly settle Work | Wrong producer/actor/Work/spec/repo/head/base, malformed envelope and forged complete-empty source tests; no raw provider JSON logic in Core |
 | Identity invariants | Same source IDs, heads and findings recur across attempts | Scope collisions, duplicate conflicting payloads, immutable round/assessment, cross-attempt links without inherited decisions |
 | Information preservation | Original judgments/results/partial successes must survive new rounds | Compare retained exact snapshots, references, rationale and invalidity reasons; reclaimed required body never replaced by hash-only success |
-| Resource bounds | Two optional LLM lanes and repeated fixes consume real budget | All Invocations counted once; no refund or reset on resume/reapproval/restart; retries/new Executions follow existing limits; retention/transport bounds remain #54/#55 |
+| Resource bounds | Two optional LLM lanes and repeated fixes consume real budget | All Invocations counted once; Work-wide recovery usage survives successor Executions, resume, reapproval, and restart; independent invocation/review/artifact/transport/time bounds compose; #53/#55 expose policy and Commands |
 
 Implementation tests must call the public Command/Query/adapter path and assert literal decisions/evidence, with direct structural FK/immutability tests where appropriate. Cover all four on/off lane combinations; same-head growth before judgment and between judgment/release; exact invariant-set coverage; valid negative versus invalid records; named CI producer/head/rerun selection; wrong diff base; no native merge gate; original-action reconciliation; no repeated effects; process escape/uncertain stop; proof closure with missing bodies; budget accounting and paused repair. These are future contract tests, not implemented fixes to #24 or live evidence.
 
-The candidates compared a mutable per-finding disposition ledger and immutable round/source/assessment snapshots. The latter is the base: it records exactly which complete set was judged and makes same-head growth explicit. Take the former's concise partial-effect/repair tracking, but not text-based finding closure, Work-lifetime cumulative budgets or generic write retry. Small immutable assessment vectors and typed current pointers avoid a generic workflow/finding graph. #52 owns Worker protocols, #53 config/credentials/defaults, #54 body/history retention, #55 CLI/loop/repair syntax, and #56 integrated acceptance. The owner-approved choices above are not reopened by those implementation details; code-review's default value remains a setup decision unless separately agreed. No runtime work is authorized by this document.
+The candidates compared a mutable per-finding disposition ledger and immutable round/source/assessment snapshots. The latter is the base: it records exactly which complete set was judged and makes same-head growth explicit. Take the former's concise partial-effect/repair tracking, but not text-based finding closure or generic write retry. Work-wide recovery budgets follow the later owner-approved #50 policy and supplement per-Execution limits. Small immutable assessment vectors and typed current pointers avoid a generic workflow/finding graph. #52 owns Worker protocols, #53 config/credentials/defaults, #54 body/history retention, #55 CLI/loop/repair syntax, and #56 integrated acceptance. The owner-approved choices above are not reopened by those implementation details; code-review's default value remains a setup decision unless separately agreed. No runtime work is authorized by this document.

@@ -9,7 +9,7 @@ taisan is a **control plane**, not a work planner and not a coding agent. The li
 Two independently replaceable ports surround the core:
 
 - **Work Selector** decides *what to propose*: which issues belong together and why. Issue selection and grouping are adapter responsibilities, not core dependencies.
-- **Worker** decides *how to perform one authorized invocation*: coding, review, or fix. Claude Code, a worker implementation, or another runner may implement the port. Their internal orchestration is not the taisan authority.
+- **Worker** decides *how to perform one authorized invocation*: coding, fix, invariant checking, or code review. Claude Code, a worker implementation, or another runner may implement the port. Their internal orchestration is not the taisan authority.
 
 Neither adapter writes core state, reserves capacity, creates Executions, retries Work, or declares a Work completed. Core decisions remain deterministic given persisted facts and policy.
 
@@ -40,13 +40,13 @@ Core validates proposal shape, repository scope, source freshness, idempotency a
 
 **Reference selector:** list eligible GitHub issues from a configured allowlist, propose **one issue per Work**, no semantic grouping, deterministic order and stable proposal keys. This is intentionally simple. More sophisticated grouping belongs in any third-party adapter satisfying the contract.
 
-Open contract question: the exact candidate dedup/overlap policy across independently selected Works; specify before enabling unattended selection. The current manual `submit` remains supported and must not depend on a selector.
+The [identity/storage contract](identity-storage.md) settles same-scoped-Issue overlap: reject a new Work while unfinished Work owns that source Issue, for both manual and Selector admission. Stable proposal keys replay their original decision; safe terminal release permits a new explicit submission. Manual `submit` remains supported without a selector. Richer grouping and unattended selection remain deferred.
 
 ### Worker contract
 
 A Worker Adapter receives a durable, uniquely identified **Invocation request** with:
 
-- execution/invocation/request IDs, role (coding/review/fix), immutable goal and constraints;
+- execution/invocation/request IDs, role (coding/fix/invariant_check/review), immutable goal and constraints;
 - workspace and permitted resources, base/head revision when relevant;
 - verification instructions, budget/deadline, evidence and continuation references;
 - explicit permissions and credential scope.
