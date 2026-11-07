@@ -42,6 +42,10 @@
 
 - Repository-host portability: [ADR-002](repository-host-contract.md) selects one `RepositoryHostPort` with a mandatory semantic baseline and explicit optional capabilities. A conforming adapter meeting the Work's immutable requirements is selectable for new Work through configuration without Core changes. Missing/unknown/denied requirements cannot silently downgrade behavior. Host/repository/event/actor identities are scoped; old Work and unknown effects retain their binding. GitHub remains the v0.1 production target. The current Rust API is not yet this neutral contract; #36 plans caller/store/test migration, the GitLab mapping, and narrow live proof before claiming interchangeability.
 
+## Identity/storage decisions from #50
+
+The [concrete design](identity-storage.md) records maintenance-only cutover with a read-only legacy archive and fresh new-format Work, no legacy runtime/key-replay import, unfinished-Issue overlap rejection for both manual and Selector admission, and renewed approval of a same-Work specification revision when the final pre-dispatch read detects changed Issue content. Core requires and evaluates this read; the host adapter performs it and the CLI loop drives it. That read is the agreed version boundary, not an atomic lock against later remote edits. Reapproval cannot change host/actor/permission binding or reset budgets. Future configured invariant regeneration/auto execution is an extension, not a v0.1 requirement or permission to bypass approval policy. New-format command replay remains authoritative.
+
 ## Questions to resolve through a spike
 
 1. ~~What execution-ownership mechanism prevents conflicting work in a single-instance deployment, including process crashes and delayed writes? Does it meet the requirements for a Lease?~~ Resolved: resource reservations, TTL external claims, and stop proof (verified on a single host); no Lease name, no separate fence. Remaining: prove host-level enforcement in the vertical slice.
