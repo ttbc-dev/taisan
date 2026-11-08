@@ -343,7 +343,7 @@ Every Worker-owned requirement #50's inventory assigns to this issue — 33 targ
 
 | Aspect | Applicability and rationale | Settled here | Open question |
 | --- | --- | --- | --- |
-| State transitions | Launch, exit, export, and verification produce facts that drive `ready`/`running`/`waiting`/`uncertain` | `NotStarted` vs `Unknown`; export only after stop proof; handoff states `imported`→`acknowledged` | Whether export/verification progress needs its own `waiting` reason name (#55) |
+| State transitions | Launch, exit, export, and verification produce facts that drive `ready`/`running`/`waiting`/`uncertain` | `NotStarted` vs `Unknown`; export only after stop proof; handoff states `imported`→`acknowledged` | Whether export/verification progress needs its own `waiting` reason name ([execution loop](execution-loop.md)) |
 | Failure semantics | Runtime, sandbox, and handoff failures look alike from exit codes | Closed reason codes, class mapping, recovery table | Final taxonomy names from #51 |
 | Trust boundaries | Prompt-injected runtime; host credentials on the same account | bwrap + hygiene + mandatory proxy; no workspace code runs in trusted processes | Model-API exfiltration remains |
 | Identity invariants | Requests, Invocations, artifacts, and commits recur across attempts | Per-Invocation out directory; `ArtifactId` ref; request digest; capability digest bound per request | — mapped to #50 inventory |

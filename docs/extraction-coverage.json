@@ -21590,11 +21590,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r08",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21650,11 +21650,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r10",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`contract_commands.rs::dispatch_admits_oldest_eligible_and_reserves_atomically` and `admission_rolls_back_on_request_persistence_failure` pass."
@@ -21694,11 +21694,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r11",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`supervisor_contract.rs::crash_near_spawn_leaves_uncertain_with_no_second_writer` and `contract_queries.rs::command_result_recovers_a_lost_response_by_id_and_replay_key` pass. Live host-effect unknowns remain U3."
@@ -21765,11 +21765,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r13",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -21848,11 +21848,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r15",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`supervisor_contract.rs`: PID reuse, snapshot escape, zombie/reap, persistence refusal, and kill-9 restart tests pass. This verifies the local POSIX contract only."
@@ -21974,11 +21974,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r18",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22151,11 +22151,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r24",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22194,11 +22194,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r25",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22230,11 +22230,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r26",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22280,11 +22280,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r27",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22347,11 +22347,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r29",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22405,11 +22405,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r30",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22441,11 +22441,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r31",
      "owner_issue": 55,
      "acceptance_id": "I55-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`contract_commands.rs` replay tests cover all Command kinds and changed-payload conflicts; Queries recover saved decisions."
@@ -22493,11 +22493,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r32",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22536,11 +22536,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r33",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22580,11 +22580,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r34",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22623,11 +22623,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r35",
      "owner_issue": 55,
      "acceptance_id": "I55-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "current_evidence": "`contract_queries.rs::attention_versions_and_acknowledgement`, `uncertain_beyond_threshold_surfaces_attention`, and `acknowledge_requires_a_currently_derivable_attention_version` pass."
@@ -22674,11 +22674,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r36",
      "owner_issue": 55,
      "acceptance_id": "I55-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22723,11 +22723,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r37",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ]
   },
@@ -22799,11 +22799,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r39",
      "owner_issue": 55,
      "acceptance_id": "I55-AC6",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-Work material-progress observation",
@@ -22839,11 +22839,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r40",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Durable bounded automatic recovery across Executions",
@@ -22913,11 +22913,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r43",
      "owner_issue": 55,
      "acceptance_id": "I55-AC7",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Versioned retirement of pending recovery intents",
@@ -23006,11 +23006,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r47",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Lane-doctor recovery skill admits implicit invocation via agent registration",
@@ -23098,11 +23098,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r51",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Scheduler tick work is interval-deadline bounded and defers remaining repos to the next tick",
@@ -23121,11 +23121,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r52",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ops intake-mode rollback is non-destructive to in-flight work",
@@ -23144,11 +23144,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r53",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Session ledger reflects external agent lifecycle events onto [source-symbol] cards idempotently with assignee-separated claims",
@@ -23819,11 +23819,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r82",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Crash-cut re-entry protocol: ordered reconciliation that adopts proven effects and never redispatches repair",
@@ -23919,11 +23919,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r86",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Triage permission-denial parks the selector keyed by repo + selection fingerprint + head group; un-park only on selector/config change or explicit requeue",
@@ -23949,11 +23949,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r87",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal-block reenqueue requires recorded-identifier proof and a fresh retry- idempotency key while the original blocked card stays untouched",
@@ -23995,11 +23995,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r89",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Observation-exhaustion auto-unblock returns only proven-live transient-blocked cards, never operator blocks (#398)",
@@ -24095,11 +24095,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r93",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Subscription digest monitor advances baseline cursor only after successful output (at-least-once notification)",
@@ -24141,11 +24141,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r95",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded projection subprocess terminates the complete child process group on deadline, cancellation, or output overflow",
@@ -24164,11 +24164,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r96",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Versioned projection envelope validation fails closed while retaining unknown members",
@@ -24210,11 +24210,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r98",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Serial projection worker with bounded pending-call queue and bounded stdin reader rejects overflow deterministically",
@@ -24233,11 +24233,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r99",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "MCP lifecycle gates tool methods on initialize and every exit path cancels and reaps the projection child group",
@@ -24256,11 +24256,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r100",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Stuck-work attention signals fire only on recorded timestamp-plus-budget proof, never on absent or ambiguous evidence",
@@ -24279,11 +24279,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r101",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Attention notification ledger records per-item source and evidence signature, resends failed deliveries, audits resolutions, and holds only converge-derived notices when the [source-symbol] ledger is u",
@@ -24349,11 +24349,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r104",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "detail reuses a caller-supplied status snapshot only inside a freshness TTL and falls back to a full rebuild on any validation failure",
@@ -24372,11 +24372,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r105",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Console mutations go through a typed action allowlist carrying stable target identity, preflight evidence, freshness marker, and idempotency key",
@@ -24419,11 +24419,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r107",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Blocked work re-dispatch requires a passing preflight against current evidence and a fresh deterministic idempotency key",
@@ -24442,11 +24442,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r108",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Local-agent event intake verifies signed v1 envelopes, scrubs untrusted fields, and applies events idempotently without ever launching a run",
@@ -24465,11 +24465,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r109",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Producer hooks and plugin fail open and queue unsent events durably; bounded flush resends without blocking the host tool",
@@ -24488,11 +24488,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r110",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ops [source-symbol] links a session to a work card only on explicit [source-symbol] evidence and never completes a card from session events",
@@ -24653,11 +24653,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r117",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] event producer forwards only lifecycle metadata fail-open: bounded inflight/pending, killed-on-timeout spawns, subagent sessions never recorded",
@@ -24700,11 +24700,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r119",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Recovery attempts are bounded, persisted before dispatch, and 'skipped' (pre-dispatch) outcomes refund the budget — a crash mid-dispatch can never mint a second card",
@@ -24723,11 +24723,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r120",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Re-eval notices are owed across ticks: delivery is recorded per item signature only after a successful emit, skipped ticks neither flush nor erase pending, and a missing notify API degrades to pending",
@@ -24746,11 +24746,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r121",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Attention digest is at-least-once with withhold-by-key: only rendered entries are marked delivered, an unreadable judgment-wait ledger withholds converge items without erasing their owed pending",
@@ -24800,11 +24800,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r123",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Publish-capable runs verify the reviewer [source-symbol] App identity before launch; --post without a valid identity blocks the card deterministically",
@@ -24831,11 +24831,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r124",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ship-run halt questions are sourced only from the named run's own on-disk converge findings under trusted-root containment",
@@ -24854,11 +24854,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r125",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A halted episode persists an idempotent, superseding, always-answerable judgment-wait for (repo, PR); provably-reconciled or meta-only halts open none",
@@ -24877,11 +24877,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r126",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Judgment carry-over re-records prior human answers only under proven same-context conditions: same-generation stale answers by explicit apply (#390), cross-generation released `fix` answers auto-carri",
@@ -24900,11 +24900,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r127",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Pre-launch admission serializes capacity-check -> claim -> spawn under a lane lock, defers on live-count/concurrency/swap/memory/heavy-process evidence while the card stays ready, and records the reas",
@@ -24994,11 +24994,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r131",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Cron wrapper keeps scheduler tick failure surfacing on a single channel via deliberate exit-code selection",
@@ -25017,11 +25017,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r132",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Mutating operator CLI commands serialize under the scheduler run lock and fail closed rather than race a tick",
@@ -25040,11 +25040,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r133",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Best-effort exclusion-comment reconciliation: baseline without mass-posting, marker+authorship adopt-or-post, in-place update/resolve, and durable scan cursors that survive budget exhaustion",
@@ -25063,11 +25063,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r134",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Notice ledger records delivered-vs-observed evidence separately; resolution audit names only what the operator was actually told",
@@ -25086,11 +25086,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r135",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Generated-cache exclusion playbook preserves files and only ever excludes the exact observed untracked generated paths",
@@ -25109,11 +25109,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r136",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Equivalent-active-task scan dispatches only on proven identity overlap; every unreadable source is a structured refusal",
@@ -25132,11 +25132,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r137",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Retry-card enqueue replays only provenance-marked request fields and never re-pins a legacy implicit 'smart' permission mode",
@@ -25155,11 +25155,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r138",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Deterministic retry-<[source-symbol]> successor dispatch re-runs full intake, pins the selection to the incident's exact group, and settles ambiguous outcomes by reserving the slot",
@@ -25178,11 +25178,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r139",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Resumable system park is distinguished from operator stop by stamped evidence only; disk recovery is re-measured against the configured floor with unknown failing closed",
@@ -25201,11 +25201,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r140",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Pre-launch reenqueue admits only a proven terminal PRE-PUSH environment failure from a bound [source-symbol] record as the exception to the no-execution-record rule",
@@ -25224,11 +25224,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r141",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal-card quiescence proof reconciles every recorded binding — request fields, all run files matching [source-symbol]/[source-symbol], and strict [source-symbol] records — before any re-key",
@@ -25247,11 +25247,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r142",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remediation audit entries are episode-keyed (re-alert starts a fresh attempt budget) and carry normalized data only; legacy pending notices migrate into the durable queue",
@@ -25270,11 +25270,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r143",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remediation pass defers whole dispatches to the tick deadline, surfaces crashed playbooks as needs-human, and never loses an undelivered escalation notice",
@@ -25293,11 +25293,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r144",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Scheduler config is fail-closed: restricted-YAML parse errors collect rather than guess, unknown keys are recorded, 'enabled' absent means disabled, and any validation problem aborts the tick",
@@ -25316,11 +25316,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r145",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Enqueue handoff persists a durable selection artifact then spawns a bounded subprocess whose failures are classified, never raised",
@@ -25362,11 +25362,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r147",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The scheduler tick is deadline-bounded, single-flight, and leaves a durable outcome record for every enabled repo",
@@ -25385,11 +25385,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r148",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Overlapping scheduler ticks resolve to a skip via non-blocking flock; non-contention lock failures are fatal, never a queue",
@@ -25408,11 +25408,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r149",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal-card park clears only on proven all-issues-CLOSED via one bounded batch fetch per repo; clearing is an in-place evidence mark, never a delete",
@@ -25431,11 +25431,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r150",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Persisted triage diagnostic references are self-certifying: path rebuilt from a generated basename under the known state dir, and the artifact's own [source-symbol] must equal the recorded ref",
@@ -25454,11 +25454,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r151",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Parked selectors stay parked across a fingerprint-scheme upgrade via a one-shot legacy-match rebind, so a rule change still unparks them later",
@@ -25477,11 +25477,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r152",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Held terminal parks narrow but never reorder [source-symbol]'s candidate list; only proven all-internal-dependency groups advance under an explicit scheduler-owned [source-symbol]",
@@ -25507,11 +25507,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r153",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded [source-symbol] reselect: capability requires flag support AND a 0.6-emitting schema; a returned payload leaking any held issue is rejected wholesale; exclusion scope joins artifact identity",
@@ -25530,11 +25530,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r154",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-park board reconciliation is read-only and bounded: probe results classify evidence (terminal-confirmed/status-changed/card-unreadable/unverified) and attach a fixed operator action — never write ",
@@ -25553,11 +25553,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r155",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Per-candidate conflict exclusion probes every group: proven live work is excluded with typed [source-symbol], an incomplete scan holds dispatch as a distinct outcome, and kept candidates are refingerprinte",
@@ -25599,11 +25599,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r157",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Reconcile pass is globally serialized, settles each item under its owning lock, then runs dependent sweeps only after all settlements — with best-effort isolation and an exit-code failure signal",
@@ -25652,11 +25652,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r159",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Lane-demotion recovery re-homes a decomposer-demoted card only on attributable decomposition evidence and records each confirmed mutation before the next",
@@ -25675,11 +25675,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r160",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded replan mints at most one deterministic replan-<[source-symbol]> successor carrying only the still-valid strict-subset remainder, behind a fail-closed equivalent-work scan and an honestly-scoped select",
@@ -25698,11 +25698,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r161",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Remote launch deferral parks a minted-but-unadmitted run identity out-of-band and defers through a bounded pending budget with typed reason codes",
@@ -25752,11 +25752,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r163",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A reused lane idempotency key bound to different work fails loudly at intake; terminal-card dedup collisions retry a bounded -r2/-r3 key ladder",
@@ -25782,11 +25782,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r164",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A worker-reported ship deadline tries one lineage-bounded saved-point continuation (cont- card -> ship --resume) before the generic verdict can strand the retained workspace",
@@ -25805,11 +25805,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r165",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Stale READY lane cards are superseded by the newest card covering the same (kind, repo, PR) before launch",
@@ -25828,11 +25828,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r166",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] sweep drives the [source-symbol] lane as one ordered, deadline-bounded pass with per-card task lock and live-status re-read",
@@ -25851,11 +25851,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r167",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ops enqueue is an idempotent request lifecycle: same-work key proof, bounded terminal-dedup re-key, crash recovery, verified [source-symbol] binding and [source-file]on attachment",
@@ -25874,11 +25874,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r168",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Ops worker claim liveness: claimant-only heartbeat plus a [source-symbol] thread across long blocking stages; [source-symbol] aborts the turn as [source-symbol] stop",
@@ -25928,11 +25928,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r170",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] serializes launch/reattach per card: live-pid reattach, dead-record advance, never-started fresh dispatch, revalidate-then-triage-then-launch under claim pulse",
@@ -25951,11 +25951,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r171",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] watch loop: non-blocking observation under claim pulse, transition comments, terminal exit and a fail-closed timeout notice",
@@ -25974,11 +25974,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r172",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "PR sweep: fail-closed pr-triage artifact validation and revalidation before any effect, then one guarded detached Devin run per actionable PR under the repo concurrency bound",
@@ -25997,11 +25997,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r173",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Selector resume promises are honest: a launch-cap refusal may claim resume-from-here only when every spent launch left a durable verdict record, otherwise it reports a head restart and names the disab",
@@ -26112,11 +26112,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r178",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Terminal-card remote cleanup retries a failed destroy only through a phase-scoped export-proof fence, dominated by the durable coordinator quarantine read-back",
@@ -26135,11 +26135,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r179",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "An orphaned open run record under a terminal card settles from its own recorded evidence: a breaker-caused [source-symbol] block may complete; an operator block never reverses",
@@ -26158,11 +26158,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r180",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The [source-symbol] board adapter is a bounded subprocess boundary that fails closed on timeout/nonzero/malformed output, and its negative answers bias toward no-action or the conservative class rather than a ",
@@ -26274,11 +26274,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r185",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Post-completion auto-continue launches [source-symbol]'s next ready group under per-repo serialization, a daily group budget, an issue-overlap refusal and the hard-guard precondition; spawned continuations ar",
@@ -26345,11 +26345,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r188",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Denied-operation evidence is a fixed-vocabulary diagnosis — bounded shell grammar, [source-symbol]-correlated ATIF extraction, and categorized write targets that never persist argument values or raw co",
@@ -26375,11 +26375,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r189",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Triage failure artifacts are owner-only, size-bounded and self-certifying — a minted [source-symbol] inside the payload, allowlisted counts/categories/limitations only, and write failure that can never",
@@ -26429,11 +26429,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r191",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A [source-symbol] run's launch fixes the machine contract in its prompt — untrusted-data boundary, single-PR scope, STATUS vocabulary, exec discipline — and completion is judged only by the last line-anchored S",
@@ -26459,11 +26459,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r192",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The [source-symbol] run ledger is durable and honest: writes are atomic (pid-unique tmp file + rename under the state dir) and reads are tolerant but never silent — unknown fields drop for forward-compat while ",
@@ -26490,11 +26490,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r193",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The post-PR review loop converges on actionable-thread evidence only: bounded fix passes judged by a disposition contract bound to launched thread ids, separate budgets for converging rounds vs crashe",
@@ -26789,11 +26789,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r206",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Read-only [source-symbol] judge output is admitted only via a unique marker-delimited JSON section; failures dump raw output owner-only and name the dump whenever no history record can point at it",
@@ -26835,11 +26835,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r208",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Console snapshot-cache lifecycle: refresh validates the whole observation against versioned contracts before any persisted byte, writes back atomically status-last over a complete batch only, and a st",
@@ -26858,11 +26858,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r209",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Quitting the console while an action request is queued-but-unsubmitted requires an explicit second operator confirmation; an already-dispatched submit never blocks exit",
@@ -26881,11 +26881,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r210",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A detail observation is classified Found/Absent/Unusable — only found:false naming the requested [source-symbol] is a known absence; foreign identity or a malformed/absent `found` renders failure wording, nev",
@@ -26904,11 +26904,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r211",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The console binary publishes its compiled projection-contract constants with exactly the Python probe's key set so [source-symbol] --check proves Rust/Python pairing instead of trusting the source checkout",
@@ -26927,11 +26927,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r212",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The console TUI stays interactive for its whole session: projection backend calls run on a spawned worker thread, the startup freshness-triggered refresh is queued and never awaited, and buffered navi",
@@ -26950,11 +26950,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r213",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Every terminal-bound string is stripped of ANSI/control/bidi/zero-width content and clipped on display-cell width with a single-cell ellipsis — raw external bytes never reach the terminal",
@@ -26996,11 +26996,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r215",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Refresh write-back of the projection cache publishes fetched artifacts atomically per file, advances the [source-file]on freshness marker only after the whole batch landed, never rewrites [source-file]on, and",
@@ -27019,11 +27019,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r216",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The startup/auto-refresh freshness gate counts an observation proven-fresh only inside the -SKEW..=TTL [source-symbol] band AND with explicit partial:false — stale, unparsable, missing or degraded observ",
@@ -27042,11 +27042,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r217",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Console backend dispatch is a single serialized worker: coalesced read jobs, an exclusive preflight-to-submit action flow, a quit guard for unsubmitted writes, and fail-closed worker-death resolution",
@@ -27065,11 +27065,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r218",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] CLI preserves the frozen Python exit-code contract: usage and pre-spawn refusals exit 1, adapter failures exit 3 with a single bounded sanitized diagnostic, and projection exit codes",
@@ -27088,11 +27088,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r219",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Adapter failures surface only through a frozen closed error-code vocabulary, and untrusted stderr/protocol text is flattened to a single bounded (<=400-byte) line before it reaches any diagnostic",
@@ -27111,11 +27111,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r220",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "MCP tools/call admission is a closed read-only catalog with strict input schemas — every name/key/value violation is rejected -32602 with bounded echoes before any subprocess exists",
@@ -27134,11 +27134,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r221",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Read-only projection CLI contract: fixed subcommand allowlist, fail-closed usage errors, exit 2 only on total source failure, external reads confined to bounded injected seams",
@@ -27180,11 +27180,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r223",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Console launch is diagnose → bounded validated snapshot refresh with atomic three-state staged→retired→snapshot promotion → execve: a failed refresh aborts before anything is replaced, the retired tre",
@@ -27203,11 +27203,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r224",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] is a deterministic, read-only current-state projection of [source-symbol] dev work: every source fails independently into labelled per-source diagnostics, joins use authoritative ids only (",
@@ -27226,11 +27226,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r225",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] is a closed-vocabulary, evidence-only diagnostic layer: units that are not fully known carry bounded [source-symbol]/source/[source-symbol]/[source-symbol] entries drawn only from fixed maps — no",
@@ -27249,11 +27249,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r226",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Maintenance cron output is an escalation-only whitelist: only actionable event kinds break the silent-success contract",
@@ -27272,11 +27272,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r227",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Untrusted session/run identifiers are control-stripped and bounded before reaching the agent-readable [source-symbol] card surface",
@@ -27295,11 +27295,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r228",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Reflect lock-busy drops are journaled per session and drained cross-session by the next lock-holder so a missed session.end never permanently strands a claim",
@@ -27364,11 +27364,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r231",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "triage-diagnose is a one-shot, deadline-bounded, read-only triage probe on a single issue whose verdict never feeds start/enqueue — the sole sanctioned exception to the no-sync-long-running rule, fail",
@@ -27433,11 +27433,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r234",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Subscription update queries are scoped exactly to the registered set — broader [source-symbol] activity never substitutes — and watched items are never mutated",
@@ -27456,11 +27456,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r235",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Operator action on a [source-symbol] attention item is a thin orchestration: a mandatory fresh re-fetch and per-kind read-only evidence re-verification gate every write, one item per invocation, existing write",
@@ -27479,11 +27479,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r236",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Operator status answers derive solely from the deterministic projection CLI — sessions/process lists/logs are never progress evidence — and the honest-unknown vocabulary is relayed verbatim",
@@ -27502,11 +27502,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r237",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol].* lane config is a closed multi-registry key schema — parser allowlist, lane defaults, type validation, remote consumer and the operator example must all name a key, and [source-symbol] fail",
@@ -27525,11 +27525,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r238",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Sweep-detected ship deadline: identity-checked stop, persisted [source-symbol] outcome, transient block, then idempotent terminal sync and bounded replan handoff",
@@ -27625,11 +27625,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r242",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Local-agent session staleness is a derived, non-destructive display overlay — aged non-terminal sessions render 'stale' (never 'completed'), the stored record is never rewritten, and unreadable siblin",
@@ -27953,11 +27953,11 @@
      "state": "specified"
     },
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r255",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "[source-symbol] prepare binds a live issue snapshot and remote HEAD to a repository profile under fail-closed refusal rules",
@@ -28442,11 +28442,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r275",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Bounded single-shot review chain with typed terminal-outcome contract",
@@ -29417,11 +29417,11 @@
    ],
    "targets": [
     {
-     "document": "docs/[source-file]",
-     "anchor": "",
+     "document": "docs/loop-requirements.md",
+     "anchor": "r316",
      "owner_issue": 55,
      "acceptance_id": "I55-AC5",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "A remote terminal-state probe is three-valued: only positive merged evidence is 'merged', and unknown is never coerced into a safe-to-act answer",
