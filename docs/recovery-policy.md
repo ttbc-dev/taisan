@@ -1,6 +1,6 @@
 # Recovery and configuration policy
 
-Status: owner-approved target design from the #50 review. This document changes no runtime behavior or installed configuration. #51 specifies evidence and counters, #53 specifies configuration validation, and #55 specifies the CLI protocol and execution loop.
+Status: owner-approved target design from the #50 review. This document changes no runtime behavior or installed configuration. #51 specifies evidence and counters, #53 specifies configuration validation, and the [execution loop](execution-loop.md) specifies the CLI protocol and execution loop.
 
 ## Configurable policy and defaults
 
@@ -66,7 +66,7 @@ After a human decision, the same paused Execution re-enters the queue and reacqu
 
 Resolve and save a versioned effective policy with each accepted Work. Configuration edits apply to new Work by default. Existing Work retains its accepted policy, including after restart or same-Work specification reapproval.
 
-An explicit authorized policy-change operation may update existing Work. Record the actor, old and new policy, rationale, Work-version precondition, and decision. Preserve consumed counters and elapsed time. Require explicit approval for a budget expansion. Tightening a limit below consumed usage triggers the limit path; it does not discard evidence or prove stop. An already-issued Invocation retains its immutable input; enforce changed Work-level limits through supervision and safe stopping rather than rewriting the request. The [installation configuration](installation-config.md) defines the schema; #55 defines the Command before exposing this operation.
+An explicit authorized policy-change operation may update existing Work. Record the actor, old and new policy, rationale, Work-version precondition, and decision. Preserve consumed counters and elapsed time. Require explicit approval for a budget expansion. Tightening a limit below consumed usage triggers the limit path; it does not discard evidence or prove stop. An already-issued Invocation retains its immutable input; enforce changed Work-level limits through supervision and safe stopping rather than rewriting the request. The [installation configuration](installation-config.md) defines the schema; the [execution loop](execution-loop.md#command-surface) defines the Command before exposing this operation.
 
 ## Planned verification
 

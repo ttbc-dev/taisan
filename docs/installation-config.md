@@ -240,7 +240,7 @@ All 51 inventory targets owned by #53 are mapped in [installation requirements](
 | Aspect | Risk without control | Control in this design | Open / deferred |
 | --- | --- | --- | --- |
 | State transitions | A config change could silently retarget live Work or an unresolved effect | Saved binding is immutable per Work; capability checks repeat at every boundary; rotation rules separate credential renewal from actor replacement | — |
-| Failure semantics | A broken config could flap in a retry loop, or an expired secret could masquerade as a decision | Typed failure codes + repair prerequisites; resume requires changed evidence; unknown stays unknown | Exact CLI output envelopes are #55 scope |
+| Failure semantics | A broken config could flap in a retry loop, or an expired secret could masquerade as a decision | Typed failure codes + repair prerequisites; resume requires changed evidence; unknown stays unknown | Exact CLI output envelopes are in the [execution loop](execution-loop.md#cli-contract) |
 | Trust boundaries | Secrets could leak into argv/logs/evidence; a worker could inherit host credentials | Refs-only in config; provider resolution at the adapter boundary; worker environment carries no host credential (with #52's isolation) | `command:` provider executes trusted config — its argv is config, not Core input |
 | Identity invariants | Actor/credential could be silently re-bound; capability evidence could bind the wrong host/repository | Actor identity verified against binding at resolution/probe; capability evidence carries exact context; replaced actors serve new Work only | — |
 | Information preservation | Config edits could erase provenance of who authorized what under which policy | Effective policy + binding saved per Work; receipts record the observed actor; schema versioning refuses silent reinterpretation | — |
@@ -253,4 +253,4 @@ All 51 inventory targets owned by #53 are mapped in [installation requirements](
 - **U3**: the GitHub adapter implements `capabilities()` and per-operation authorization evaluation for the GitHub permission model.
 - **U5**: dispatch-time revalidation wiring into the CLI run loop.
 
-This document claims no installed configuration, no resolved credential, no live probe result, and no runtime implementation. Deferred items: GitHub App authentication setup (token-first is the v0.1 path; App support is a later adapter unit), a `command:` provider hardening guide beyond the contract above, and any config hot-reload protocol for the running loop (#55 scope).
+This document claims no installed configuration, no resolved credential, no live probe result, and no runtime implementation. Deferred items: GitHub App authentication setup (token-first is the v0.1 path; App support is a later adapter unit), a `command:` provider hardening guide beyond the contract above, and any config hot-reload protocol for the running loop ([execution loop](execution-loop.md) scope).
