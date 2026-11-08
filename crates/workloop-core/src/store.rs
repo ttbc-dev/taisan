@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::command::{CommandDecision, CommandId, PrHeadSha};
+use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
-use crate::observation::Observation;
+use crate::identity::{
+    ActorRole, ChangeRequestRef, CommitRevision, HostActorRef, HostInstanceId, IssueRef,
+    RepositoryRef, StoreId,
+};
+use crate::observation::{HostActionStatus, NormalizedEffectFact, Observation};
 
 /// A write `work` asks the store to apply inside the caller's transaction.
 /// The store maps each variant to constrained SQL; it never interprets
@@ -10,14 +14,25 @@ use crate::observation::Observation;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Effect {
+    /// Atomically records the Work, its binding and immutable
+    /// membership/spec children, the active issue claims, and the usage
+    /// row. Issue-claim conflicts surface as `ConstraintConflict`.
     InsertWork {
         work: Work,
+        spec: SpecSnapshot,
+        issue_refs: Vec<WorkIssueRef>,
+        claims: Vec<IssueRef>,
+        usage: WorkUsage,
     },
-    /// Optimistic version check inside the commit.
-    BumpWorkVersion {
-        work_id: WorkId,
+    /// Full-row write guarded by the caller-observed version. Carries
+    /// spec/source-gate updates atomically with the version bump.
+    UpdateWork {
+        work: Work,
         expected: u64,
-        next: u64,
+    },
+    /// Appends a new immutable spec revision.
+    InsertSpec {
+        spec: SpecSnapshot,
     },
     InsertExecution {
         execution: Execution,
@@ -66,8 +81,44 @@ pub enum Effect {
     InsertStopIntent {
         intent: StopIntent,
     },
-    InsertPrActionIntent {
-        intent: PrActionIntent,
+    InsertHostActionIntent {
+        intent: HostActionIntent,
+    },
+    /// Reconciled result of an outbox action; `unknown` stays outstanding.
+    /// `effects` records the normalized receipt facts and the actor the
+    /// host authenticated.
+    UpdateHostActionIntent {
+        action_id: String,
+        status: HostActionStatus,
+        authenticated_actor: Option<HostActorRef>,
+        effects: Vec<NormalizedEffectFact>,
+    },
+    /// Seals an immutable review round and its occurrence set atomically.
+    InsertReviewRound {
+        round: ReviewRound,
+        occurrences: Vec<FindingOccurrence>,
+    },
+    /// Records an immutable exact-set judgment over a sealed round.
+    InsertRoundJudgment {
+        judgment: RoundJudgment,
+    },
+    /// Takes active issue claims for a Work (submit/retry). Conflicts
+    /// surface as `ConstraintConflict`.
+    InsertIssueClaims {
+        work_id: WorkId,
+        issues: Vec<IssueRef>,
+    },
+    /// Releases the Work's active claims on terminal settlement.
+    ReleaseIssueClaims {
+        work_id: WorkId,
+    },
+    /// Overwrites the Work's usage row with the caller's updated value.
+    UpdateWorkUsage {
+        usage: WorkUsage,
+    },
+    /// Appends an immutable failure/recovery decision record.
+    InsertRecoveryDecision {
+        decision: RecoveryDecision,
     },
     /// Why a queued Execution was deferred at dispatch; surfaced by the
     /// `capacity` Query.
@@ -84,70 +135,78 @@ pub enum Effect {
         attention_id: String,
         actor_id: String,
     },
-    InsertJudgment {
-        work_id: WorkId,
-        expected_pr_head: String,
-        decisions: Vec<crate::command::FindingDecision>,
-    },
     /// `execution` consumed a durable request; the store is the handoff, so
     /// consumption is recorded rather than deleted.
     MarkRequestConsumed {
         request_id: String,
     },
-    /// Reconciled result of an outbox action; `unknown` stays outstanding.
-    UpdateActionIntent {
-        action_id: String,
-        status: PrActionStatus,
-    },
 }
 
 /// Reconciliation state of a recorded outbox action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrActionStatus {
-    /// Recorded but not yet attempted.
-    Pending,
-    Applied,
-    Failed,
-    /// The external result is not known; stays outstanding until
-    /// reconciled by action ID.
-    Unknown,
-}
+pub type HostIntentStatus = HostActionStatus;
 
-/// A recorded intent to perform a GitHub write; reconciled by action ID.
+/// A recorded intent to perform a host-side write, bound to the exact
+/// host, repository, role, and actor the binding authorized. Reconciled
+/// by `action_id`; the payload digest pins the immutable intent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrActionIntent {
+pub struct HostActionIntent {
     pub action_id: String,
     pub work_id: WorkId,
-    pub repository: String,
-    pub action: PrAction,
-    #[serde(default = "PrActionStatus::pending")]
-    pub status: PrActionStatus,
+    pub host: HostInstanceId,
+    pub repository: RepositoryRef,
+    pub role: ActorRole,
+    pub actor: HostActorRef,
+    pub action: HostAction,
+    /// SHA-256 over the canonical action payload.
+    pub payload_digest: String,
+    #[serde(default = "pending_status")]
+    pub status: HostActionStatus,
+    /// The actor the host authenticated on the receipt, when reported.
+    #[serde(default)]
+    pub authenticated_actor: Option<HostActorRef>,
+    /// The normalized effect facts recorded with the receipt.
+    #[serde(default)]
+    pub effects: Vec<NormalizedEffectFact>,
+    pub created_seq: EventSequence,
 }
 
-impl PrActionStatus {
-    fn pending() -> Self {
-        Self::Pending
-    }
+fn pending_status() -> HostActionStatus {
+    HostActionStatus::Pending
 }
 
+/// The typed host actions a binding can authorize. Each variant carries
+/// its exact immutable payload; receipts must carry a matching
+/// normalized effect fact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum PrAction {
-    PublishPr {
+pub enum HostAction {
+    /// Publish `produced` on `branch`.
+    PushRef {
         branch: String,
+        produced: CommitRevision,
+    },
+    /// Open a change request from `source_branch` into `target_branch`.
+    OpenChangeRequest {
+        source_branch: String,
+        target_branch: String,
         title: String,
         body: String,
     },
-    UpdatePr {
-        number: u64,
-        /// Re-read immediately before writing; a mismatch aborts.
-        expected_head: String,
-        body: String,
+    /// Update metadata; a head read immediately before writing must
+    /// still equal `expected_head` or the write aborts.
+    UpdateChangeRequest {
+        change: ChangeRequestRef,
+        expected_head: CommitRevision,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
     },
-    PostPrComment {
-        number: u64,
-        expected_head: String,
+    /// Post a comment bound to an exact head and marker.
+    PostComment {
+        change: ChangeRequestRef,
+        expected_head: CommitRevision,
+        marker: String,
         body: String,
     },
 }
@@ -166,7 +225,7 @@ pub struct Deferral {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     /// A uniqueness or check constraint fired (reservation, request ID,
-    /// nonterminal Execution, unresolved writer, slot, dedupe).
+    /// nonterminal Execution, unresolved writer, slot, dedupe, claim).
     ConstraintConflict {
         detail: String,
     },
@@ -181,6 +240,12 @@ pub enum StoreError {
         current_state: ExecutionState,
     },
     NoFreeSlot,
+    /// The store file is not a recognized v1 database: an unversioned
+    /// slice-0 database is archive-only, and an unknown future version
+    /// is refused.
+    UnsupportedFormat {
+        detail: String,
+    },
     Internal {
         detail: String,
     },
@@ -207,6 +272,7 @@ impl std::fmt::Display for StoreError {
                 execution_id.0
             ),
             Self::NoFreeSlot => write!(f, "no free capacity slot"),
+            Self::UnsupportedFormat { detail } => write!(f, "unsupported store format: {detail}"),
             Self::Internal { detail } => write!(f, "store error: {detail}"),
         }
     }
@@ -217,6 +283,9 @@ impl std::error::Error for StoreError {}
 /// Read side of a transaction. `work` decides from this snapshot; the store
 /// guarantees it is consistent with the writes the same tx applies.
 pub trait ReadView {
+    /// The installation authority of this store file.
+    fn store_id(&self) -> Result<StoreId, StoreError>;
+
     fn stored_decision(
         &self,
         origin: &Origin,
@@ -230,12 +299,27 @@ pub trait ReadView {
     ) -> Result<Option<CommandDecision>, StoreError>;
 
     fn work(&self, work_id: &WorkId) -> Result<Option<Work>, StoreError>;
+    /// The spec snapshot for `revision`, or the Work's current revision
+    /// when `None`.
+    fn spec(
+        &self,
+        work_id: &WorkId,
+        revision: Option<SpecRevision>,
+    ) -> Result<Option<SpecSnapshot>, StoreError>;
     fn execution(&self, execution_id: &ExecutionId) -> Result<Option<Execution>, StoreError>;
     /// The Work's nonterminal Execution, if one exists (unique by constraint).
     fn active_execution(&self, work_id: &WorkId) -> Result<Option<Execution>, StoreError>;
     fn executions_for_work(&self, work_id: &WorkId) -> Result<Vec<Execution>, StoreError>;
     /// Queued Executions in committed enqueue order — dispatch scans this.
     fn queued_executions(&self) -> Result<Vec<Execution>, StoreError>;
+
+    /// Immutable source membership recorded at acceptance.
+    fn issue_refs(&self, work_id: &WorkId) -> Result<Vec<IssueRef>, StoreError>;
+    /// The Work holding an active claim on this issue, if any.
+    fn issue_claim(&self, issue: &IssueRef) -> Result<Option<WorkId>, StoreError>;
+
+    /// The Work's durable usage accounting row.
+    fn work_usage(&self, work_id: &WorkId) -> Result<Option<WorkUsage>, StoreError>;
 
     fn reservation(&self, resource_key: &str) -> Result<Option<ResourceReservation>, StoreError>;
     fn reservations(&self) -> Result<Vec<ResourceReservation>, StoreError>;
@@ -269,33 +353,29 @@ pub trait ReadView {
     fn attention_acks(&self, work_id: &WorkId) -> Result<Vec<String>, StoreError>;
 
     /// Observations recorded against an Execution (process, artifact,
-    /// GitHub facts) for evidence views and reconciliation.
+    /// host facts) for evidence views and reconciliation.
     fn observations_for_execution(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Vec<Observation>, StoreError>;
     fn observations_for_work(&self, work_id: &WorkId) -> Result<Vec<Observation>, StoreError>;
+    /// System-scope facts not bound to one Work (capability reports).
+    fn all_observations(&self) -> Result<Vec<Observation>, StoreError>;
 
     /// All outbox rows; `pending`/`unknown` are outstanding effects.
-    fn action_intents(&self) -> Result<Vec<PrActionIntent>, StoreError>;
+    fn action_intents(&self) -> Result<Vec<HostActionIntent>, StoreError>;
 
-    /// Recorded finding judgments for a Work.
-    fn judgments(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Vec<(String, Vec<crate::command::FindingDecision>)>, StoreError>;
+    /// The most recently sealed review round for a Work, if any.
+    fn latest_round(&self, work_id: &WorkId) -> Result<Option<ReviewRound>, StoreError>;
+    /// The occurrence set of one sealed round.
+    fn occurrences(&self, round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError>;
+    /// The judgment recorded for one sealed round, if any.
+    fn judgment_for_round(&self, round_id: &str) -> Result<Option<RoundJudgment>, StoreError>;
+    /// The Work's most recent recorded round judgment.
+    fn latest_judgment(&self, work_id: &WorkId) -> Result<Option<RoundJudgment>, StoreError>;
 
-    /// The Work's most recent recorded judgment: its PR head and decisions.
-    fn latest_judgment(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Option<(PrHeadSha, Vec<crate::command::FindingDecision>)>, StoreError>;
-
-    /// Latest PR head observed for a Work, ordered by observed time so a
-    /// delayed delivery for an older head cannot move the head backward.
-    /// Judge/release decisions read provenance from this persisted
-    /// evidence, never from the caller's supplied head alone.
-    fn latest_pr_head(&self, work_id: &WorkId) -> Result<Option<PrHeadSha>, StoreError>;
+    /// Failure/recovery decision records for a Work.
+    fn recovery_decisions(&self, work_id: &WorkId) -> Result<Vec<RecoveryDecision>, StoreError>;
 
     fn last_seq(&self) -> Result<EventSequence, StoreError>;
 }
@@ -304,7 +384,7 @@ pub trait ReadView {
 pub trait TxView: ReadView {
     /// Monotonic durable position; also the queue order key.
     fn alloc_seq(&mut self) -> Result<EventSequence, StoreError>;
-    /// Installation-scoped unique IDs (`w-`, `e-`, `inv-`, `req-`, `cmd-`…).
+    /// Installation-scoped unique IDs (fresh UUID-based).
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError>;
 
     fn apply(&mut self, effect: &Effect) -> Result<(), StoreError>;
@@ -319,12 +399,14 @@ pub trait TxView: ReadView {
 
     /// Persist the decision for idempotent replay; the unique
     /// `(origin, actor, idempotency_key)` constraint enforces one decision.
+    /// `canonical_payload` is stored verbatim so replay compares bytes.
     fn save_decision(
         &mut self,
         origin: &Origin,
         actor: &Actor,
         idempotency_key: &str,
         payload_digest: &str,
+        canonical_payload: &[u8],
         decision: &CommandDecision,
     ) -> Result<(), StoreError>;
 }

@@ -7,20 +7,56 @@ use std::cell::Cell;
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::store::{Effect, ReadView, Store, StoreError, TxView};
-use workloop_core::work::{WorkloopConfig, handle_command};
+use workloop_core::identity::{
+    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, IssueRef,
+    RepositoryId, RepositoryRef, RoleBinding, StoreId,
+};
+use workloop_core::observation::Observation;
+use workloop_core::store::{
+    Deferral, Effect, HostActionIntent, ReadView, Store, StoreError, TxView,
+};
+use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 
 const NOW: i64 = 1_700_000_000;
 
+fn host_instance() -> HostInstanceId {
+    HostInstanceId::trusted("host-local")
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo")),
+            contract_version: 0,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host: host_instance(),
+                    actor: HostActorId::trusted("bot-pub"),
+                },
+                credential_ref: "default".into(),
+            }],
+        },
+        declared_capabilities: [
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]
+        .into_iter()
+        .collect(),
+        lanes: Default::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: false,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     }
 }
 
@@ -34,7 +70,7 @@ fn submit(key: &str) -> CommandRequest {
         idempotency_key: key.into(),
         body: CommandBody::Submit {
             intent: "ship it".into(),
-            issue_refs: vec![],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },
@@ -56,6 +92,9 @@ struct FailingTx<'a> {
 }
 
 impl ReadView for FailingTx<'_> {
+    fn store_id(&self) -> Result<StoreId, StoreError> {
+        Ok(StoreId::trusted("store-test"))
+    }
     fn stored_decision(
         &self,
         _origin: &Origin,
@@ -73,6 +112,13 @@ impl ReadView for FailingTx<'_> {
     fn work(&self, _work_id: &WorkId) -> Result<Option<Work>, StoreError> {
         Ok(None)
     }
+    fn spec(
+        &self,
+        _work_id: &WorkId,
+        _revision: Option<SpecRevision>,
+    ) -> Result<Option<SpecSnapshot>, StoreError> {
+        unimplemented!()
+    }
     fn execution(&self, _execution_id: &ExecutionId) -> Result<Option<Execution>, StoreError> {
         unimplemented!()
     }
@@ -83,6 +129,15 @@ impl ReadView for FailingTx<'_> {
         unimplemented!()
     }
     fn queued_executions(&self) -> Result<Vec<Execution>, StoreError> {
+        unimplemented!()
+    }
+    fn issue_refs(&self, _work_id: &WorkId) -> Result<Vec<IssueRef>, StoreError> {
+        unimplemented!()
+    }
+    fn issue_claim(&self, _issue: &IssueRef) -> Result<Option<WorkId>, StoreError> {
+        Ok(None)
+    }
+    fn work_usage(&self, _work_id: &WorkId) -> Result<Option<WorkUsage>, StoreError> {
         unimplemented!()
     }
     fn reservation(&self, _resource_key: &str) -> Result<Option<ResourceReservation>, StoreError> {
@@ -124,7 +179,7 @@ impl ReadView for FailingTx<'_> {
     fn stop_intent(&self, _invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError> {
         unimplemented!()
     }
-    fn deferrals(&self) -> Result<Vec<workloop_core::store::Deferral>, StoreError> {
+    fn deferrals(&self) -> Result<Vec<Deferral>, StoreError> {
         unimplemented!()
     }
     fn attention_acks(&self, _work_id: &WorkId) -> Result<Vec<String>, StoreError> {
@@ -133,31 +188,31 @@ impl ReadView for FailingTx<'_> {
     fn observations_for_execution(
         &self,
         _execution_id: &ExecutionId,
-    ) -> Result<Vec<workloop_core::observation::Observation>, StoreError> {
+    ) -> Result<Vec<Observation>, StoreError> {
         unimplemented!()
     }
-    fn observations_for_work(
-        &self,
-        _work_id: &WorkId,
-    ) -> Result<Vec<workloop_core::observation::Observation>, StoreError> {
+    fn observations_for_work(&self, _work_id: &WorkId) -> Result<Vec<Observation>, StoreError> {
         unimplemented!()
     }
-    fn action_intents(&self) -> Result<Vec<workloop_core::store::PrActionIntent>, StoreError> {
+    fn all_observations(&self) -> Result<Vec<Observation>, StoreError> {
         unimplemented!()
     }
-    fn judgments(
-        &self,
-        _work_id: &WorkId,
-    ) -> Result<Vec<(String, Vec<FindingDecision>)>, StoreError> {
+    fn action_intents(&self) -> Result<Vec<HostActionIntent>, StoreError> {
         unimplemented!()
     }
-    fn latest_judgment(
-        &self,
-        _work_id: &WorkId,
-    ) -> Result<Option<(String, Vec<FindingDecision>)>, StoreError> {
+    fn latest_round(&self, _work_id: &WorkId) -> Result<Option<ReviewRound>, StoreError> {
         unimplemented!()
     }
-    fn latest_pr_head(&self, _work_id: &WorkId) -> Result<Option<String>, StoreError> {
+    fn occurrences(&self, _round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError> {
+        unimplemented!()
+    }
+    fn judgment_for_round(&self, _round_id: &str) -> Result<Option<RoundJudgment>, StoreError> {
+        unimplemented!()
+    }
+    fn latest_judgment(&self, _work_id: &WorkId) -> Result<Option<RoundJudgment>, StoreError> {
+        unimplemented!()
+    }
+    fn recovery_decisions(&self, _work_id: &WorkId) -> Result<Vec<RecoveryDecision>, StoreError> {
         unimplemented!()
     }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
@@ -190,6 +245,7 @@ impl TxView for FailingTx<'_> {
         _actor: &Actor,
         _idempotency_key: &str,
         _payload_digest: &str,
+        _canonical_payload: &[u8],
         _decision: &CommandDecision,
     ) -> Result<(), StoreError> {
         self.saved.set(self.saved.get() + 1);

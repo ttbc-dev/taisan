@@ -1,26 +1,88 @@
 //! Projection Query contract tests (`docs/v0.1.md`: `work_list`,
 //! `work_detail`, `attention`, `capacity`, `command_result`). Queries are
-//! read-only derived state — they never refresh GitHub or start a worker.
+//! read-only derived state — they never refresh the host or start a worker.
+
+use std::collections::BTreeSet;
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
+use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::projection::*;
 use workloop_core::store::*;
-use workloop_core::work::{WorkloopConfig, admit_queued, dispatch_once, handle_command, sweep};
+use workloop_core::work::{
+    HostTemplate, WorkloopConfig, admit_queued, dispatch_once, handle_command, sweep,
+};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
 
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+fn target(object: &str) -> DiffTarget {
+    DiffTarget {
+        change: change(),
+        head: rev(object),
+        base: None,
+        target_revision: None,
+    }
+}
+
+fn publisher() -> HostActorRef {
+    HostActorRef {
+        host: host(),
+        actor: HostActorId::trusted("pub-agent"),
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: publisher(),
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+            HostCapability::IssueRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: false,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     }
 }
 
@@ -31,7 +93,7 @@ fn actor() -> Actor {
     }
 }
 
-fn submit(store: &SqliteStore, key: &str, repo: &str, number: u64) -> (WorkId, ExecutionId) {
+fn submit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
     let d = handle_command(
         store,
         &config(),
@@ -41,10 +103,7 @@ fn submit(store: &SqliteStore, key: &str, repo: &str, number: u64) -> (WorkId, E
             idempotency_key: key.into(),
             body: CommandBody::Submit {
                 intent: format!("intent-{key}"),
-                issue_refs: vec![GitHubIssueRef {
-                    repository: repo.into(),
-                    number,
-                }],
+                sources: vec![],
                 constraints: vec![],
                 verification_argv: vec![],
             },
@@ -63,6 +122,82 @@ fn submit(store: &SqliteStore, key: &str, repo: &str, number: u64) -> (WorkId, E
     (work_id.unwrap(), execution_id)
 }
 
+/// The change the Work opened plus its observed head — the two facts
+/// `current_target` derives the diff target from.
+fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
+    for fact in [
+        ObservationFact::HostActionResult {
+            action_id: "act-open".into(),
+            authenticated_actor: None,
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change(),
+                head: rev(object),
+                source_branch: "work/w-1".into(),
+                target_branch: "main".into(),
+            }],
+        },
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev(object),
+        },
+    ] {
+        workloop_core::work::handle_observation(
+            store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact,
+                observed_unix_seconds: at,
+            },
+            at,
+        )
+        .unwrap();
+    }
+}
+
+/// A complete review over `source_keys` on `object`'s target, through the
+/// same ingest path a real delivery uses — seals an immutable round.
+fn seal_review(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    object: &str,
+    source_keys: &[&str],
+    execution_id: Option<&ExecutionId>,
+    at: i64,
+) {
+    workloop_core::work::handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: execution_id.cloned(),
+            fact: ObservationFact::Review {
+                target: target(object),
+                source: "reviewer".into(),
+                source_revision: None,
+                completeness: Completeness::Complete,
+                occurrences: source_keys
+                    .iter()
+                    .map(|key| OccurrenceInput {
+                        source_key: (*key).into(),
+                        content_digest: None,
+                        severity: None,
+                        position: None,
+                        thread_id: None,
+                    })
+                    .collect(),
+            },
+            observed_unix_seconds: at,
+        },
+        at,
+    )
+    .unwrap();
+}
+
 fn found<T>(r: QueryResult<T>) -> T {
     match r {
         QueryResult::Found { value, .. } => value,
@@ -79,8 +214,8 @@ fn execution(store: &SqliteStore, id: &ExecutionId) -> Execution {
 #[test]
 fn work_list_phases_derive_from_records() {
     let store = SqliteStore::in_memory(2).unwrap();
-    let (_w1, _e1) = submit(&store, "q1", "local/repo", 1);
-    let (_w2, e2) = submit(&store, "q2", "local/repo", 2);
+    let (_w1, _e1) = submit(&store, "q1");
+    let (_w2, e2) = submit(&store, "q2");
     let view = found(store.transact(|tx| work_list(tx, NOW)).unwrap());
     assert_eq!(view.items.len(), 2);
     assert!(view.items.iter().all(|i| i.phase == WorkPhase::Queued));
@@ -99,56 +234,43 @@ fn work_list_phases_derive_from_records() {
 #[test]
 fn work_detail_binds_findings_to_the_current_head() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "q3", "local/repo", 7);
-    let obs = |fact| Observation {
-        source_event_id: None,
-        subject_work_id: Some(work_id.clone()),
-        subject_execution_id: Some(eid.clone()),
-        fact,
-        observed_unix_seconds: NOW,
-    };
-    for fact in [
-        ObservationFact::PrHead {
-            repository: "local/repo".into(),
-            number: 7,
-            head_sha: "sha-old".into(),
-        },
-        ObservationFact::PrHead {
-            repository: "local/repo".into(),
-            number: 7,
-            head_sha: "sha-new".into(),
-        },
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-old".into(),
-            reviewer: "stale-rev".into(),
-            verdict: ReviewVerdict::ChangesRequested,
-        },
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-new".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::ChangesRequested,
-        },
-    ] {
-        workloop_core::work::handle_observation(&store, &config(), &obs(fact), NOW).unwrap();
-    }
+    let (work_id, eid) = submit(&store, "q3");
+    // Head moves old → new; each head gets its own sealed review round.
+    open_change(&store, &work_id, "sha-old", NOW);
+    seal_review(
+        &store,
+        &work_id,
+        "sha-old",
+        &["old-finding"],
+        Some(&eid),
+        NOW,
+    );
+    open_change(&store, &work_id, "sha-new", NOW);
+    seal_review(
+        &store,
+        &work_id,
+        "sha-new",
+        &["new-finding"],
+        Some(&eid),
+        NOW,
+    );
     let QueryResult::Found { value, sources, .. } =
         store.transact(|tx| work_detail(tx, &work_id, NOW)).unwrap()
     else {
         panic!("expected found")
     };
-    let (pr_ref, head) = value.current_pr.as_ref().unwrap();
-    assert_eq!(pr_ref.number, 7);
-    assert_eq!(head.as_deref(), Some("sha-new"));
-    // Only the current-head finding is actionable.
+    let (change_ref, head) = value.current_change.as_ref().unwrap();
+    assert_eq!(change_ref.change_request.as_str(), "cr-1");
+    assert_eq!(head.as_ref(), Some(&rev("sha-new")));
+    // Only the current-head round's findings are actionable.
     assert_eq!(value.findings.len(), 1);
-    assert!(value.findings[0].contains("sha-new"));
+    assert_eq!(value.findings[0].source_key, "new-finding");
+    assert!(value.findings[0].occurrence_id.starts_with("occ-"));
     // The review source was read for this head → known.
     assert!(
         sources
             .iter()
-            .any(|s| s.source == "github:review" && s.availability == Availability::Known)
+            .any(|s| s.source == "review:reviewer" && s.availability == Availability::Known)
     );
     let missing = store
         .transact(|tx| work_detail(tx, &WorkId("w-nope".into()), NOW))
@@ -157,71 +279,68 @@ fn work_detail_binds_findings_to_the_current_head() {
 }
 
 #[test]
-fn delayed_head_observation_does_not_change_detail_head_or_findings() {
+fn delayed_review_evidence_does_not_misrepresent_the_current_target() {
     for execution_scoped in [false, true] {
         let store = SqliteStore::in_memory(1).unwrap();
-        let (work_id, execution_id) = submit(&store, "delayed-head", "local/repo", 7);
-        for (at, fact) in [
-            (
-                NOW + 10,
-                ObservationFact::PrHead {
-                    repository: "local/repo".into(),
-                    number: 7,
-                    head_sha: "sha-current".into(),
-                },
-            ),
-            (
-                NOW + 10,
-                ObservationFact::PrReview {
-                    repository: "local/repo".into(),
-                    head_sha: "sha-current".into(),
-                    reviewer: "current-reviewer".into(),
-                    verdict: ReviewVerdict::ChangesRequested,
-                },
-            ),
-            (
-                NOW,
-                ObservationFact::PrHead {
-                    repository: "local/repo".into(),
-                    number: 6,
-                    head_sha: "sha-delayed".into(),
-                },
-            ),
-            (
-                NOW,
-                ObservationFact::PrReview {
-                    repository: "local/repo".into(),
-                    head_sha: "sha-delayed".into(),
-                    reviewer: "stale-reviewer".into(),
-                    verdict: ReviewVerdict::Approve,
-                },
-            ),
-        ] {
-            workloop_core::work::handle_observation(
-                &store,
-                &config(),
-                &Observation {
-                    source_event_id: None,
-                    subject_work_id: (!execution_scoped).then(|| work_id.clone()),
-                    subject_execution_id: execution_scoped.then(|| execution_id.clone()),
-                    fact,
-                    observed_unix_seconds: at,
-                },
-                NOW + 20,
-            )
-            .unwrap();
-        }
+        let (work_id, execution_id) = submit(&store, "delayed-head");
+        open_change(&store, &work_id, "sha-current", NOW + 10);
+        seal_review(
+            &store,
+            &work_id,
+            "sha-current",
+            &["current-finding"],
+            Some(&execution_id),
+            NOW + 10,
+        );
+        // A stale-head review delivered late: recorded, never displaces
+        // the current target's evidence.
+        let stale_obs = Observation {
+            delivery: None,
+            subject_work_id: (!execution_scoped).then(|| work_id.clone()),
+            subject_execution_id: execution_scoped.then(|| execution_id.clone()),
+            fact: ObservationFact::Review {
+                target: target("sha-delayed"),
+                source: "stale-reviewer".into(),
+                source_revision: None,
+                completeness: Completeness::Complete,
+                occurrences: vec![OccurrenceInput {
+                    source_key: "stale-finding".into(),
+                    content_digest: None,
+                    severity: None,
+                    position: None,
+                    thread_id: None,
+                }],
+            },
+            observed_unix_seconds: NOW,
+        };
+        workloop_core::work::handle_observation(&store, &config(), &stale_obs, NOW + 20).unwrap();
         let view = found(
             store
                 .transact(|tx| work_detail(tx, &work_id, NOW + 20))
                 .unwrap(),
         );
-        let (pr, head) = view.current_pr.unwrap();
-        assert_eq!(head.as_deref(), Some("sha-current"));
-        assert_eq!(pr.number, 7);
-        assert_eq!(
-            view.findings,
-            vec!["review by current-reviewer at sha-current: ChangesRequested"]
+        let (pr, head) = view.current_change.unwrap();
+        assert_eq!(head, Some(rev("sha-current")));
+        assert_eq!(pr.change_request.as_str(), "cr-1");
+        if execution_scoped {
+            // An execution-scoped review is recorded but never seals a
+            // round — the current round's findings stand.
+            assert_eq!(view.findings.len(), 1);
+            assert_eq!(view.findings[0].source_key, "current-finding");
+        } else {
+            // The stale work-scoped review seals a round that does not
+            // match the current target: the current target's review
+            // evidence is unavailable, never substituted by stale
+            // findings.
+            assert!(
+                view.findings.is_empty(),
+                "a stale round must not surface as current findings"
+            );
+        }
+        assert!(
+            view.findings
+                .iter()
+                .all(|f| f.source_key != "stale-finding")
         );
     }
 }
@@ -229,7 +348,7 @@ fn delayed_head_observation_does_not_change_detail_head_or_findings() {
 #[test]
 fn work_detail_reports_the_terminal_outcome() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _eid) = submit(&store, "q20", "local/repo", 61);
+    let (work_id, _eid) = submit(&store, "q20");
     let d = handle_command(
         &store,
         &config(),
@@ -256,7 +375,7 @@ fn work_detail_reports_the_terminal_outcome() {
 #[test]
 fn attention_versions_and_acknowledgement() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "q4", "local/repo", 9);
+    let (work_id, eid) = submit(&store, "q4");
     // Park the execution paused → paused_judgment attention.
     store
         .transact(|tx| {
@@ -316,7 +435,7 @@ fn attention_versions_and_acknowledgement() {
 #[test]
 fn acknowledge_requires_a_currently_derivable_attention_version() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "q14", "local/repo", 9);
+    let (work_id, eid) = submit(&store, "q14");
     // Nothing is paused yet, but the id names the pause_reason a later
     // repair pause would produce: acknowledging it now would persist a
     // row that hides that condition the moment it surfaces.
@@ -393,7 +512,7 @@ fn acknowledge_requires_a_currently_derivable_attention_version() {
 #[test]
 fn repeated_pause_and_new_evidence_get_fresh_attention_versions() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "repeated-pause", "local/repo", 9);
+    let (work_id, eid) = submit(&store, "repeated-pause");
     let pause = |expected_state| {
         store
             .transact(|tx| {
@@ -466,13 +585,16 @@ fn repeated_pause_and_new_evidence_get_fresh_attention_versions() {
         .transact(|tx| {
             tx.apply(&Effect::InsertObservation {
                 observation: Observation {
-                    source_event_id: Some("new-pause-evidence".into()),
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Local,
+                        source: "test".into(),
+                        event_id: "new-pause-evidence".into(),
+                    }),
                     subject_work_id: Some(work_id.clone()),
                     subject_execution_id: None,
-                    fact: ObservationFact::PrHead {
-                        repository: "local/repo".into(),
-                        number: 9,
-                        head_sha: "new-evidence".into(),
+                    fact: ObservationFact::ChangeHead {
+                        change: change(),
+                        head: rev("new-evidence"),
                     },
                     observed_unix_seconds: NOW,
                 },
@@ -494,13 +616,13 @@ fn repeated_pause_and_new_evidence_get_fresh_attention_versions() {
 #[test]
 fn uncertain_beyond_threshold_surfaces_attention() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (_w, eid) = submit(&store, "q5", "local/repo", 11);
+    let (_w, eid) = submit(&store, "q5");
     store
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();
     // Drop into uncertain just now — below the 15-minute threshold.
     let obs = Observation {
-        source_event_id: None,
+        delivery: None,
         subject_work_id: None,
         subject_execution_id: Some(eid.clone()),
         fact: ObservationFact::ProcessState {
@@ -530,8 +652,8 @@ fn uncertain_beyond_threshold_surfaces_attention() {
 #[test]
 fn capacity_explains_every_slot_reservation_and_deferral() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (_w1, e1) = submit(&store, "q6", "local/repo", 21);
-    let (_w2, e2) = submit(&store, "q7", "local/repo", 22);
+    let (_w1, e1) = submit(&store, "q6");
+    let (_w2, e2) = submit(&store, "q7");
     // One free slot: e1 admitted, e2 deferred — the deferral must not
     // block the queue's explanation.
     store
@@ -554,6 +676,10 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
     // An external claim with an expiry is visible in the same view.
     // Workspace keys are reserved for `execution`, so the external claim
     // names a branch pair.
+    let squatter = WriteResource::Branch {
+        repository: repo(),
+        branch: "squatter".into(),
+    };
     let d = handle_command(
         &store,
         &config(),
@@ -562,10 +688,7 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
             origin: Origin("cli".into()),
             idempotency_key: "q8-claim".into(),
             body: CommandBody::ClaimResources {
-                resources: vec![WriteResource::Branch {
-                    repository: "local/repo".into(),
-                    branch: "squatter".into(),
-                }],
+                resources: vec![squatter.clone()],
                 ttl_seconds: 300,
             },
         },
@@ -577,7 +700,7 @@ fn capacity_explains_every_slot_reservation_and_deferral() {
     let external = view
         .reservations
         .iter()
-        .find(|r| r.resource_key == "branch:local/repo:squatter")
+        .find(|r| r.resource_key == squatter.key())
         .expect("external reservation listed");
     assert!(matches!(
         external.holder,
@@ -595,7 +718,7 @@ fn command_result_recovers_a_lost_response_by_id_and_replay_key() {
         idempotency_key: "q9-submit".into(),
         body: CommandBody::Submit {
             intent: "x".into(),
-            issue_refs: vec![],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },
@@ -648,7 +771,7 @@ fn command_result_recovers_a_lost_response_by_id_and_replay_key() {
 #[test]
 fn runtime_limit_is_a_committed_stopping_decision() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (_w, eid) = submit(&store, "q10", "local/repo", 31);
+    let (_w, eid) = submit(&store, "q10");
     store
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();
@@ -661,7 +784,7 @@ fn runtime_limit_is_a_committed_stopping_decision() {
     assert_eq!(e.desired_action, Some(DesiredAction::Fail));
     // Queue time does not consume the runtime budget: a queued execution
     // at the same clock is untouched.
-    let (_w2, e2) = submit(&store, "q11", "local/repo", 32);
+    let (_w2, e2) = submit(&store, "q11");
     sweep(&store, &config(), over).unwrap();
     assert_eq!(execution(&store, &e2).state, ExecutionState::Queued);
 }
@@ -670,8 +793,8 @@ fn runtime_limit_is_a_committed_stopping_decision() {
 fn deferred_head_does_not_block_later_items() {
     let store = SqliteStore::in_memory(2).unwrap();
     // w1 wants the same branch the external actor holds; w2 is free.
-    let (_w1, e1) = submit(&store, "q12", "local/repo", 41);
-    let (_w2, e2) = submit(&store, "q13", "other/repo", 42);
+    let (_w1, e1) = submit(&store, "q12");
+    let (_w2, e2) = submit(&store, "q13");
     handle_command(
         &store,
         &config(),
@@ -684,8 +807,8 @@ fn deferred_head_does_not_block_later_items() {
             idempotency_key: "q14-claim".into(),
             body: CommandBody::ClaimResources {
                 resources: vec![WriteResource::Branch {
-                    repository: "local/repo".into(),
-                    branch: "work/w-1".into(),
+                    repository: repo(),
+                    branch: format!("work/{}", _w1.0),
                 }],
                 ttl_seconds: 600,
             },
@@ -711,6 +834,7 @@ fn deferred_head_does_not_block_later_items() {
 #[test]
 fn expired_external_claim_forfeits_exclusion() {
     let store = SqliteStore::in_memory(2).unwrap();
+    let (_w, eid) = submit(&store, "q16");
     handle_command(
         &store,
         &config(),
@@ -723,8 +847,8 @@ fn expired_external_claim_forfeits_exclusion() {
             idempotency_key: "q15-claim".into(),
             body: CommandBody::ClaimResources {
                 resources: vec![WriteResource::Branch {
-                    repository: "local/repo".into(),
-                    branch: "work/w-1".into(),
+                    repository: repo(),
+                    branch: format!("work/{}", _w.0),
                 }],
                 ttl_seconds: 60,
             },
@@ -732,7 +856,6 @@ fn expired_external_claim_forfeits_exclusion() {
         NOW,
     )
     .unwrap();
-    let (_w, eid) = submit(&store, "q16", "local/repo", 51);
     // The claim's TTL lapsed: dispatch reclaims the resource and admits.
     store
         .transact(|tx| dispatch_once(tx, &config(), NOW + 61).map(|_| ()))

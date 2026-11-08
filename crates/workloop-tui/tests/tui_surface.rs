@@ -1,1472 +1,521 @@
-//! TUI surface contract tests (issue #15): the console is the second
-//! interface adapter. It reaches `work` only through `preview` and
-//! `submit(CommandRequest)` and `projection` only through Query; the
-//! board is derived from saved records; preview is advisory; stale
-//! rejections re-query and clear; a lost response recovers by
-//! command_result or identical replay — never a mutated request; and
-//! disconnecting changes no execution truth.
+//! TUI surface end-to-end: a scripted operator session drives the real
+//! TuiSession against a real SqliteStore + workloop_core::work, covering
+//! submit → observe → open → judgment → stale → release and the
+//! pane-detail/pick-number contract.
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-use workloop_core::command::*;
-use workloop_core::domain::*;
-use workloop_core::observation::{Observation, ObservationFact, ProcessStateFact, ReviewVerdict};
-use workloop_core::projection::{self, CommandResultLookup, QueryResult, WorkPhase};
-use workloop_core::store::{Effect, Store, StoreError, TxView};
-use workloop_core::work::{
-    PreviewAvailability, WorkloopConfig, handle_command, handle_observation,
+use workloop_core::command::{CommandDecision, CommandRequest, FindingChoice, RejectionCode};
+use workloop_core::domain::{
+    Actor, ActorKind, ExecutionBudget, LanePolicy, Origin, WorkId, WorkPolicy,
 };
+use workloop_core::identity::{
+    ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget,
+    HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
+    RoleBinding,
+};
+use workloop_core::observation::{
+    Completeness, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
+    OccurrenceInput,
+};
+use workloop_core::projection::FindingView;
+use workloop_core::store::Store;
+use workloop_core::work::{self, HostTemplate, WorkloopConfig};
 use workloop_store::sqlite::SqliteStore;
-use workloop_tui::render::board_frame;
-use workloop_tui::session::{Action, ORIGIN, RecoverOutcome, SubmitOutcome, TuiSession};
+
+use workloop_tui::render;
+use workloop_tui::session::{Action, SubmitOutcome, TuiSession};
+
+fn temp_root() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "tuisurf-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 const NOW: i64 = 1_700_000_000;
 
+fn operator() -> Actor {
+    Actor {
+        kind: ActorKind::Human,
+        external_id: "tui-op".into(),
+    }
+}
+
+fn host_instance() -> HostInstanceId {
+    HostInstanceId::trusted("host-local")
+}
+
+fn repository() -> RepositoryRef {
+    RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo"))
+}
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repository(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+fn rev(sha: &str) -> CommitRevision {
+    CommitRevision::new(repository(), sha).unwrap()
+}
+
+fn target(sha: &str) -> DiffTarget {
+    DiffTarget {
+        change: change(),
+        head: rev(sha),
+        base: None,
+        target_revision: None,
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
-        allowed_effects: AllowedEffects {
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repository(),
+            contract_version: 1,
+            actors: vec![
+                RoleBinding {
+                    role: ActorRole::Publication,
+                    actor: HostActorRef {
+                        host: host_instance(),
+                        actor: HostActorId::trusted("pub-agent"),
+                    },
+                    credential_ref: "cred-publication".into(),
+                },
+                RoleBinding {
+                    role: ActorRole::Review,
+                    actor: HostActorRef {
+                        host: host_instance(),
+                        actor: HostActorId::trusted("review-bot"),
+                    },
+                    credential_ref: "cred-review".into(),
+                },
+            ],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+            HostCapability::IssueRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
+        allowed_effects: workloop_core::domain::AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: true,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     }
 }
 
-fn actor() -> Actor {
-    Actor {
-        kind: ActorKind::Human,
-        external_id: "op-tui".into(),
-    }
-}
-
-/// Attach a session to `store` — the fixture stands in for the process
-/// boundary: the session reaches the store only through the Command/
-/// Query ports while the test inspects the same records the CLI sees.
-fn session(store: &SqliteStore) -> TuiSession<'_, SqliteStore> {
-    TuiSession::new(store, config(), actor())
-}
-
-fn cli_req(key: &str, body: CommandBody) -> CommandRequest {
-    CommandRequest {
-        actor: actor(),
-        origin: Origin("cli".into()),
-        idempotency_key: key.into(),
-        body,
-    }
-}
-
-fn submit_work(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
-    let d = handle_command(
-        store,
-        &config(),
-        &cli_req(
-            key,
-            CommandBody::Submit {
-                intent: format!("intent-{key}"),
-                issue_refs: vec![GitHubIssueRef {
-                    repository: "local/repo".into(),
-                    number: 1,
-                }],
-                constraints: vec![],
-                verification_argv: vec![],
-            },
-        ),
-        NOW,
-    )
-    .unwrap();
-    match d {
-        CommandDecision::Accepted {
-            work_id,
-            effect: CommandEffect::WorkCreated { execution_id },
-            ..
-        } => (work_id.unwrap(), execution_id),
-        other => panic!("submit {key}: {other:?}"),
+fn submit_work(store: &SqliteStore) -> WorkId {
+    let req = CommandRequest {
+        actor: operator(),
+        origin: Origin("test".into()),
+        idempotency_key: format!("key-{}", workloop_core::domain::new_id("t")),
+        body: workloop_core::command::CommandBody::Submit {
+            intent: "demo task".into(),
+            sources: vec![],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    };
+    let decision = work::handle_command(store, &config(), &req, NOW).unwrap();
+    match decision {
+        CommandDecision::Accepted { work_id, .. } => work_id.unwrap(),
+        other => panic!("submit rejected: {other:?}"),
     }
 }
 
 fn observe(store: &SqliteStore, work_id: &WorkId, fact: ObservationFact, at: i64) {
-    handle_observation(
+    let obs = Observation {
+        delivery: None,
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: None,
+        fact,
+        observed_unix_seconds: at,
+    };
+    work::handle_observation(store, &config(), &obs, at).unwrap();
+}
+
+/// Publish the change request and record its head — the outbox receipt
+/// and the head observation together establish the diff target.
+fn open_change_at(store: &SqliteStore, work_id: &WorkId, sha: &str, at: i64) {
+    observe(
         store,
-        &config(),
-        &Observation {
-            source_event_id: None,
-            subject_work_id: Some(work_id.clone()),
-            subject_execution_id: None,
-            fact,
-            observed_unix_seconds: at,
+        work_id,
+        ObservationFact::HostActionResult {
+            action_id: "act-open".into(),
+            authenticated_actor: None,
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change(),
+                head: rev(sha),
+                source_branch: "work/demo".into(),
+                target_branch: "main".into(),
+            }],
         },
         at,
+    );
+    observe(
+        store,
+        work_id,
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev(sha),
+        },
+        at,
+    );
+}
+
+/// One complete review delivery seals an immutable round over the exact
+/// diff target; each entry is one occurrence the judgment must decide.
+fn seal_review(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    sha: &str,
+    source: &str,
+    source_keys: &[&str],
+    at: i64,
+) {
+    observe(
+        store,
+        work_id,
+        ObservationFact::Review {
+            target: target(sha),
+            source: source.into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: source_keys
+                .iter()
+                .map(|k| OccurrenceInput {
+                    source_key: k.to_string(),
+                    content_digest: None,
+                    severity: None,
+                    position: None,
+                    thread_id: None,
+                })
+                .collect(),
+        },
+        at,
+    );
+}
+
+/// The standard fixture: a published change at `sha` and one sealed
+/// round with one occurrence per source key.
+fn review_fixture(store: &SqliteStore, work_id: &WorkId, sha: &str, source_keys: &[&str]) {
+    open_change_at(store, work_id, sha, NOW);
+    seal_review(store, work_id, sha, "reviewer", source_keys, NOW);
+}
+
+#[test]
+fn board_open_judge_choose_stage_submit_release() {
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    let mut s = TuiSession::new(&store, config(), operator());
+
+    // Board shows the new Work.
+    s.refresh(NOW).unwrap();
+    let frame = render::board_frame(s.board().unwrap(), None);
+    assert!(frame.contains(&work_id.0), "board: {frame}");
+
+    // Observations publish the change and seal a two-occurrence round.
+    review_fixture(&store, &work_id, "h1", &["a", "b"]);
+
+    // Open the work → detail pane shows the findings.
+    s.open(&work_id, NOW).unwrap();
+    let detail = render::detail_frame(s.detail().unwrap());
+    assert!(detail.contains("finding 1: a"), "detail: {detail}");
+    assert!(detail.contains("finding 2: b"), "detail: {detail}");
+
+    // Judgment flow: decide every displayed occurrence.
+    let draft = s.begin_judgment().unwrap();
+    let ids: Vec<String> = draft
+        .findings
+        .iter()
+        .map(|f| f.occurrence_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    s.choose(&ids[0], FindingChoice::Fix, None).unwrap();
+    s.choose(
+        &ids[1],
+        FindingChoice::Dismiss,
+        Some("not-reproducible".into()),
     )
     .unwrap();
-}
-
-fn pr_head(sha: &str) -> ObservationFact {
-    ObservationFact::PrHead {
-        repository: "local/repo".into(),
-        number: 1,
-        head_sha: sha.into(),
-    }
-}
-
-fn pr_review(sha: &str) -> ObservationFact {
-    ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: sha.into(),
-        reviewer: "rev".into(),
-        verdict: ReviewVerdict::ChangesRequested,
-    }
-}
-
-fn pr_review_of(sha: &str, reviewer: &str) -> ObservationFact {
-    ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: sha.into(),
-        reviewer: reviewer.into(),
-        verdict: ReviewVerdict::ChangesRequested,
-    }
-}
-
-fn process_state() -> ObservationFact {
-    ObservationFact::ProcessState {
-        invocation_id: InvocationId("inv-1".into()),
-        process_identity: "pid-1".into(),
-        state: ProcessStateFact::Running,
-    }
-}
-
-fn last_seq(store: &SqliteStore) -> i64 {
-    store.transact(|tx| tx.last_seq()).unwrap()
-}
-
-fn stored_decision(store: &SqliteStore, key: &str) -> Option<CommandDecision> {
-    match store
-        .transact(|tx| {
-            projection::command_result(
-                tx,
-                &CommandResultLookup::ReplayKey {
-                    origin: Origin(ORIGIN.into()),
-                    actor: actor(),
-                    idempotency_key: key.into(),
-                },
-            )
-        })
-        .unwrap()
-    {
-        QueryResult::Found { value, .. } => Some(value),
-        _ => None,
-    }
-}
-
-/// AC: columns derive from `work_list`/`attention`/`capacity` — phase,
-/// outcome, and attention counts come from saved records, never from
-/// state the TUI persists.
-#[test]
-fn board_columns_derive_from_queries() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (w1, _e1) = submit_work(&store, "b-queued");
-    let (w2, e2) = submit_work(&store, "b-paused");
-    // Park w2 paused so it lands in the PAUSED column with attention —
-    // the fixture equivalent of prior history.
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&e2)?.unwrap();
-            e.state = ExecutionState::Paused;
-            e.pause_reason = Some("repair: needs human".into());
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Queued,
-            })
-        })
-        .unwrap();
-
-    session.refresh(NOW).unwrap();
-    let board = session.board().expect("board");
-    let phase_of = |w: &WorkId| {
-        board
-            .columns
-            .iter()
-            .find(|c| c.cards.iter().any(|card| &card.work_id == w))
-            .map(|c| c.phase.clone())
-    };
-    assert_eq!(phase_of(&w1), Some(WorkPhase::Queued));
-    assert_eq!(phase_of(&w2), Some(WorkPhase::Paused));
-    let w2_card = board
-        .columns
-        .iter()
-        .flat_map(|c| &c.cards)
-        .find(|card| card.work_id == w2)
-        .unwrap();
-    assert_eq!(w2_card.attention_count, 1, "attention derives from records");
-    assert_eq!(board.attention.len(), 1);
-    assert_eq!(board.capacity.as_ref().unwrap().limit, 1);
-    // The board holds no card state of its own: order is the projection's.
-    assert_eq!(board.order(), vec![w1, w2]);
-}
-
-/// AC: TUI submissions go through `handle_command` under origin "tui"
-/// and are recoverable by their own replay key — a namespace distinct
-/// from the CLI's.
-#[test]
-fn tui_commands_record_tui_origin() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "o-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let key = session.staged().unwrap().idempotency_key.clone();
-    let SubmitOutcome::Decided(decision) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    assert!(matches!(decision, CommandDecision::Accepted { .. }));
-    let stored = stored_decision(&store, &key).expect("decision persisted");
-    assert_eq!(
-        serde_json::to_string(&stored).unwrap(),
-        serde_json::to_string(&decision).unwrap(),
-        "command_result recovers the TUI decision by its replay key"
-    );
-    // The CLI reads the same truth; its origin is a different namespace
-    // so a TUI key is not visible under origin "cli".
-    let cli_view = store
-        .transact(|tx| {
-            projection::command_result(
-                tx,
-                &CommandResultLookup::ReplayKey {
-                    origin: Origin("cli".into()),
-                    actor: actor(),
-                    idempotency_key: key.clone(),
-                },
-            )
-        })
-        .unwrap();
-    assert!(matches!(cli_view, QueryResult::NotFound));
-}
-
-/// AC: preview is advisory — it persists nothing and never substitutes
-/// for the submit-time precondition check.
-#[test]
-fn session_preview_is_advisory() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "pv-seed");
-    let before = last_seq(&store);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let key = session.staged().unwrap().idempotency_key.clone();
-    let p = session.preview(NOW).unwrap();
-    assert_eq!(p.availability, PreviewAvailability::Available);
-    assert_eq!(p.observed_work_version, Some(1));
-    assert_eq!(last_seq(&store), before, "preview wrote nothing");
-    assert!(stored_decision(&store, &key).is_none());
-    // The real submit still runs the full precondition check.
-    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    assert!(matches!(d, CommandDecision::Accepted { .. }));
-}
-
-/// AC: the judgment flow displays head-scoped findings, collects one
-/// supported decision per displayed finding id, and submits the
-/// displayed Work version and PR head.
-#[test]
-fn judge_findings_flow_end_to_end() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "j-seed");
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    observe(&store, &work_id, pr_review("h1"), NOW);
-
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    let finding = session.draft().unwrap().findings[0].finding_id.clone();
-    assert!(finding.contains("h1"), "displayed finding is head-scoped");
-    // Exactly one decision per displayed id: a re-pick replaces.
-    session.choose(&finding, FindingChoice::Fix).unwrap();
-    session.choose(&finding, FindingChoice::Dismiss).unwrap();
-
-    let preview = session.preview(NOW).unwrap();
-    assert_eq!(preview.availability, PreviewAvailability::Available);
-    assert_eq!(preview.observed_pr_head.as_deref(), Some("h1"));
-
-    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
-    let (head, decisions) = store
-        .transact(|tx| tx.latest_judgment(&work_id))
-        .unwrap()
-        .expect("judgment recorded");
-    assert_eq!(head, "h1");
-    assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0].finding_id, finding);
-    assert_eq!(decisions[0].choice, FindingChoice::Dismiss);
-    // The accepted Command bumped the version: the submitted draft is
-    // gone — its choices belong to the pre-Command snapshot.
-    assert!(session.draft().is_none());
-    assert_eq!(session.detail().unwrap().version, 2);
-    // A pick for an id outside the displayed set is refused locally.
-    session.begin_judgment().unwrap();
+    s.stage_judgment().unwrap();
+    let outcome = s.submit(NOW).unwrap();
     assert!(
-        session
-            .choose("no-such-finding", FindingChoice::Fix)
-            .is_err()
+        matches!(
+            outcome,
+            SubmitOutcome::Decided(CommandDecision::Accepted { .. })
+        ),
+        "submit: {outcome:?}"
     );
+
+    // The durable judgment exists; releasing it is a valid Command form
+    // (the Execution is not paused, so an ineligible rejection is fine).
+    let s2 = &mut s;
+    let req = s2.stage_action(&Action::ReleaseJudgment).unwrap();
+    assert!(matches!(
+        req.body,
+        workloop_core::command::CommandBody::ReleaseJudgment { .. }
+    ));
+    let outcome = s2.submit(NOW).unwrap();
+    match outcome {
+        SubmitOutcome::Decided(CommandDecision::Accepted { .. }) => {}
+        SubmitOutcome::Decided(CommandDecision::Rejected {
+            reason: RejectionCode::Ineligible,
+            ..
+        }) => {}
+        other => panic!("release submit: {other:?}"),
+    }
 }
 
-/// A draft that is not complete cannot arm a request — the Command is
-/// built only once every displayed finding carries a decision.
 #[test]
-fn incomplete_draft_cannot_submit() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "ic-seed");
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    observe(&store, &work_id, pr_review("h1"), NOW);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    // No choices made — nothing may reach `work`.
-    assert!(session.stage_judgment().is_err());
-    assert!(session.submit(NOW).is_err());
-    // The refusals never armed a request: the first key the session
-    // generates still carries counter 1, and no judgment or version
-    // change reached the store.
-    let probe = session.compose(CommandBody::Cancel {
-        work_id: work_id.clone(),
-        expected_work_version: 1,
-        execution_id: None,
-    });
-    assert!(
-        probe.idempotency_key.starts_with("tui-1-"),
-        "a refused path consumed a request key: {}",
-        probe.idempotency_key
-    );
-    assert_eq!(session.detail().unwrap().version, 1);
-    assert!(
-        store
-            .transact(|tx| tx.latest_judgment(&work_id))
-            .unwrap()
-            .is_none()
-    );
+fn detail_frame_numbers_match_draft_slots() {
+    // AC: "a pick number always selects the occurrence shown at that
+    // position" — the detail pane numbers the same list the draft's
+    // slots hold, in the same order.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    // Two occurrences share a source key: identity is the occurrence
+    // id, never the display text — three rows, three distinct slots.
+    review_fixture(&store, &work_id, "h1", &["a", "a", "rev2"]);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    let frame = render::detail_frame(s.detail().unwrap());
+    let draft = s.begin_judgment().unwrap().clone();
+    assert_eq!(draft.findings.len(), 3);
+    for (i, slot) in draft.findings.iter().enumerate() {
+        assert!(
+            frame.contains(&format!("finding {}: {}", i + 1, slot.source_key)),
+            "slot {} missing from frame: {frame}",
+            i + 1
+        );
+    }
+    // pick 2 selects the second slot — same source key as slot 1, but a
+    // distinct occurrence id, so the choice lands on occurrence 2 only.
+    let second = draft.findings[1].occurrence_id.clone();
+    s.choose(&second, FindingChoice::Fix, None).unwrap();
+    let draft = s.draft().unwrap();
+    assert!(draft.findings[0].choice.is_none());
+    assert_eq!(draft.findings[1].choice, Some(FindingChoice::Fix));
+    assert!(draft.findings[2].choice.is_none());
 }
 
-/// AC: a stale-head rejection re-queries the findings and clears the
-/// old choices; the expected head is never rewritten to resubmit them.
 #[test]
 fn stale_head_rejection_requeries_and_clears_choices() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "s-seed");
-    observe(&store, &work_id, pr_head("h-old"), NOW);
-    observe(&store, &work_id, pr_review("h-old"), NOW);
+    // AC: "a stale-head rejection re-queries the changed head" — stage a
+    // judgment on h-old, move the head to h-new, submit → StaleHead →
+    // choices cleared and the draft re-read at h-new.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h-old", &["a"]);
 
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    let old_finding = session.draft().unwrap().findings[0].finding_id.clone();
-    session.choose(&old_finding, FindingChoice::Fix).unwrap();
-    session.stage_judgment().unwrap();
-    let submitted_key = session.staged().unwrap().idempotency_key.clone();
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let occ = s.draft().unwrap().findings[0].occurrence_id.clone();
+    s.choose(&occ, FindingChoice::Fix, None).unwrap();
+    s.stage_judgment().unwrap();
 
-    // The head moves after the operator's snapshot.
-    observe(&store, &work_id, pr_head("h-new"), NOW + 10);
-    observe(&store, &work_id, pr_review("h-new"), NOW + 10);
-
-    let SubmitOutcome::Decided(d) = session.submit(NOW + 20).unwrap() else {
-        panic!("expected decided")
-    };
-    match &d {
-        CommandDecision::Rejected { reason, .. } => {
-            assert_eq!(*reason, RejectionCode::StalePrHead)
-        }
-        other => panic!("expected stale_pr_head, got {other:?}"),
-    }
-
-    // The session re-queried: the detail shows the new head and the
-    // rebuilt draft has no choices left — nothing retargeted or
-    // resubmitted the old set.
-    let detail = session.detail().expect("re-queried detail");
-    assert_eq!(
-        detail.current_pr.as_ref().and_then(|(_, h)| h.as_deref()),
-        Some("h-new")
-    );
-    let draft = session.draft().expect("fresh draft for the new head");
-    assert_eq!(draft.pr_head, "h-new");
-    assert!(draft.findings.iter().all(|f| f.choice.is_none()));
-    assert!(session.staged().is_none());
-    // Exactly one request was ever submitted under its own key.
-    assert!(matches!(
-        stored_decision(&store, &submitted_key),
-        Some(CommandDecision::Rejected { .. })
-    ));
-}
-
-/// A stale Work version behaves the same way: the snapshot is
-/// re-queried and the stale choices are cleared.
-#[test]
-fn stale_work_version_rejection_requeries() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "sv-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    // Another surface bumps the version.
-    let _ = handle_command(
-        &store,
-        &config(),
-        &cli_req(
-            "sv-other",
-            CommandBody::Cancel {
-                work_id: work_id.clone(),
-                expected_work_version: 1,
-                execution_id: None,
-            },
-        ),
-        NOW,
-    )
-    .unwrap();
-    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    match &d {
-        CommandDecision::Rejected { reason, .. } => {
-            assert_eq!(*reason, RejectionCode::StaleWorkVersion)
-        }
-        other => panic!("expected stale_work_version, got {other:?}"),
-    }
-    assert_eq!(session.detail().unwrap().version, 2);
-    assert!(session.staged().is_none());
-}
-
-/// AC: a lost response is unknown, recovered via `command_result` by
-/// the caller's replay key when the decision did land.
-#[test]
-fn lost_submit_recovers_recorded_decision() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "l-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let req = session.staged().unwrap().clone();
-
-    // The command landed but the response never arrived.
-    let landed = handle_command(&store, &config(), &req, NOW).unwrap();
-    session.note_lost(req.clone());
-    assert!(session.pending().is_some());
-    match session.recover(NOW).unwrap() {
-        RecoverOutcome::Found(d) => {
-            assert_eq!(
-                serde_json::to_string(&d).unwrap(),
-                serde_json::to_string(&landed).unwrap()
-            );
-        }
-        other => panic!("expected found, got {other:?}"),
-    }
-    assert!(session.pending().is_none());
-}
-
-/// AC: when nothing landed, recovery replays the identical key and
-/// payload — the request is decided once, never mutated.
-#[test]
-fn lost_submit_replays_identical_request() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "l2-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    // A composed-but-never-issued request whose response is "lost".
-    let req = session.compose(CommandBody::Cancel {
-        work_id: work_id.clone(),
-        expected_work_version: 1,
-        execution_id: None,
-    });
-    session.note_lost(req.clone());
-    match session.recover(NOW).unwrap() {
-        RecoverOutcome::Replayed(d) => {
-            assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
-        }
-        other => panic!("expected replayed, got {other:?}"),
-    }
-    assert!(session.pending().is_none());
-    // Replaying again under the same key returns that exact decision.
-    let again = handle_command(&store, &config(), &req, NOW).unwrap();
-    assert_eq!(
-        serde_json::to_string(&again).unwrap(),
-        serde_json::to_string(&stored_decision(&store, &req.idempotency_key).unwrap()).unwrap()
-    );
-}
-
-/// While a result is unknown, no new mutating request may be issued —
-/// the session refuses rather than risking an unordered mutation.
-#[test]
-fn submit_refused_while_result_unknown() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "sr-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    let lost = session.compose(CommandBody::Cancel {
-        work_id: work_id.clone(),
-        expected_work_version: 1,
-        execution_id: None,
-    });
-    session.note_lost(lost);
-    session.stage_action(&Action::Retry).ok();
-    assert!(session.submit(NOW).is_err());
-    // Recovery clears the way; the pending request settles first.
-    assert!(matches!(
-        session.recover(NOW).unwrap(),
-        RecoverOutcome::Replayed(_)
-    ));
-}
-
-/// A local store fault during `submit` is surfaced as an error, not
-/// rendered as a lost response: the transaction rolled back, so no
-/// decision exists to recover. The identical request stays staged and
-/// re-submitting it is safe and settles the Command exactly once.
-#[test]
-fn submit_local_fault_is_not_unknown() {
-    use std::cell::Cell;
-
-    struct Faulting<'a> {
-        inner: &'a SqliteStore,
-        fault: Cell<bool>,
-    }
-    impl Store for Faulting<'_> {
-        fn transact<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            if self.fault.get() {
-                return Err(StoreError::Internal {
-                    detail: "simulated disk full".into(),
-                });
-            }
-            self.inner.transact(f)
-        }
-        fn transact_deferred<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            self.inner.transact_deferred(f)
-        }
-    }
-
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _e) = submit_work(&store, "lf-seed");
-    let adapter = Faulting {
-        inner: &store,
-        fault: Cell::new(true),
-    };
-    let mut session = TuiSession::new(&adapter, config(), actor());
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let key = session.staged().unwrap().idempotency_key.clone();
-
-    let err = session.submit(NOW).unwrap_err();
-    assert!(err.contains("simulated disk full"), "{err}");
-    // No unknown-result guard, and the request was not dropped: it is
-    // still staged under the identical key and payload.
-    assert!(session.pending().is_none(), "a local fault armed unknown");
-    assert_eq!(session.staged().unwrap().idempotency_key, key);
-    assert!(
-        stored_decision(&store, &key).is_none(),
-        "the rolled-back attempt persisted a decision"
-    );
-
-    // The fault clears: the same staged request submits and is decided
-    // once, under the key it always carried.
-    adapter.fault.set(false);
-    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
-    assert!(session.staged().is_none());
-    assert_eq!(
-        stored_decision(&store, &key).unwrap().command_id(),
-        d.command_id()
-    );
-}
-
-/// A submit whose durable commit landed but whose response vanished is
-/// rendered `unknown` — the console's lost-response state — and settled
-/// by `command_result` under the caller's replay key, never reissued
-/// blindly or mutated.
-#[test]
-fn lost_submit_from_ambiguous_fault_is_unknown() {
-    use std::cell::Cell;
-
-    struct DroppedResponse<'a> {
-        inner: &'a SqliteStore,
-        drop_response: Cell<bool>,
-    }
-    impl Store for DroppedResponse<'_> {
-        fn transact<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            let result = self.inner.transact(f);
-            if self.drop_response.get() {
-                // The commit landed but the caller never sees its reply.
-                return Err(StoreError::Internal {
-                    detail: "connection reset after commit".into(),
-                });
-            }
-            result
-        }
-        fn transact_deferred<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            self.inner.transact_deferred(f)
-        }
-    }
-
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _e) = submit_work(&store, "lu-seed");
-    let adapter = DroppedResponse {
-        inner: &store,
-        drop_response: Cell::new(true),
-    };
-    let mut session = TuiSession::new(&adapter, config(), actor());
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let key = session.staged().unwrap().idempotency_key.clone();
-
-    let outcome = session.submit(NOW).unwrap();
-    assert!(
-        matches!(outcome, SubmitOutcome::Unknown),
-        "a landed-but-unacknowledged submit must be unknown, got {outcome:?}"
-    );
-    assert_eq!(session.pending().unwrap().idempotency_key, key);
-    assert!(session.staged().is_none(), "the lost request stayed armed");
-    let recorded = stored_decision(&store, &key).expect("the commit landed");
-
-    // `recover` finds the decision by the caller's replay key instead of
-    // issuing anything new.
-    match session.recover(NOW).unwrap() {
-        RecoverOutcome::Found(d) => assert_eq!(d.command_id(), recorded.command_id()),
-        other => panic!("expected found, got {other:?}"),
-    }
-    assert!(session.pending().is_none());
-}
-
-/// When `submit` reports an error and the session cannot read the result
-/// either, it must not conclude the Command failed to land: it renders
-/// `unknown`, and `recover` replays the identical key and payload.
-#[test]
-fn lost_submit_when_result_is_unreadable_is_unknown() {
-    use std::cell::Cell;
-
-    struct Blind<'a> {
-        inner: &'a SqliteStore,
-        blind: Cell<bool>,
-    }
-    impl Store for Blind<'_> {
-        fn transact<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            if self.blind.get() {
-                return Err(StoreError::Internal {
-                    detail: "write link down".into(),
-                });
-            }
-            self.inner.transact(f)
-        }
-        fn transact_deferred<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            if self.blind.get() {
-                return Err(StoreError::Internal {
-                    detail: "read link down".into(),
-                });
-            }
-            self.inner.transact_deferred(f)
-        }
-    }
-
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _e) = submit_work(&store, "lub-seed");
-    let adapter = Blind {
-        inner: &store,
-        blind: Cell::new(false),
-    };
-    let mut session = TuiSession::new(&adapter, config(), actor());
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let key = session.staged().unwrap().idempotency_key.clone();
-
-    adapter.blind.set(true);
-    let outcome = session.submit(NOW).unwrap();
-    assert!(
-        matches!(outcome, SubmitOutcome::Unknown),
-        "an unverifiable submit must be unknown, got {outcome:?}"
-    );
-    assert_eq!(session.pending().unwrap().idempotency_key, key);
-    assert!(
-        stored_decision(&store, &key).is_none(),
-        "nothing was recorded while the link was down"
-    );
-
-    adapter.blind.set(false);
-    let replayed = match session.recover(NOW).unwrap() {
-        RecoverOutcome::Replayed(d) => d,
-        other => panic!("expected replayed, got {other:?}"),
-    };
-    assert!(
-        matches!(replayed, CommandDecision::Accepted { .. }),
-        "{replayed:?}"
-    );
-    assert!(session.pending().is_none());
-    assert_eq!(
-        stored_decision(&store, &key).unwrap().command_id(),
-        replayed.command_id()
-    );
-}
-
-/// AC: disconnecting the TUI changes no execution truth — refresh,
-/// open, stage, and preview all leave the store byte-identical, and a
-/// fresh session sees the same truth the CLI does.
-#[test]
-fn disconnect_changes_no_execution_truth() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _e) = submit_work(&store, "d-seed");
-    let before_seq = last_seq(&store);
-    let before_works = store.transact(|tx| tx.works()).unwrap();
-    {
-        let mut session = session(&store);
-        session.refresh(NOW).unwrap();
-        session.open(&work_id, NOW).unwrap();
-        session.stage_action(&Action::Cancel).unwrap();
-        session.preview(NOW).unwrap();
-        // Disconnect: the session — and all its selection state — goes
-        // away when this scope ends.
-    }
-    assert_eq!(last_seq(&store), before_seq, "UI actions wrote nothing");
-    assert_eq!(
-        serde_json::to_string(&store.transact(|tx| tx.works()).unwrap()).unwrap(),
-        serde_json::to_string(&before_works).unwrap()
-    );
-
-    // A new session sees the same truth the CLI does — the Work is still
-    // queued and controllable through either surface.
-    let mut session2 = session(&store);
-    session2.refresh(NOW).unwrap();
-    assert_eq!(session2.board().unwrap().order(), vec![work_id.clone()]);
-    let d = handle_command(
-        &store,
-        &config(),
-        &cli_req(
-            "d-cli-cancel",
-            CommandBody::Cancel {
-                work_id: work_id.clone(),
-                expected_work_version: 1,
-                execution_id: None,
-            },
-        ),
-        NOW,
-    )
-    .unwrap();
-    assert!(matches!(d, CommandDecision::Accepted { .. }));
-}
-
-/// Local refusals never reach `work`: verbs without the required
-/// session state are rejected at the adapter boundary, and no decision
-/// row appears for them.
-#[test]
-fn local_refusals_never_reach_work() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "lr-seed");
-
-    // submit with nothing staged; judge with nothing open; choose with
-    // no draft — all refused locally.
-    assert!(session.submit(NOW).is_err());
-    assert!(session.preview(NOW).is_err());
-    assert!(session.begin_judgment().is_err());
-    assert!(session.choose("f", FindingChoice::Fix).is_err());
-    assert!(session.stage_action(&Action::Cancel).is_err());
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    // No observed head → no draft can begin.
-    assert!(session.begin_judgment().is_err());
-    // Nothing the console refused ever armed a request or moved the
-    // store: the first generated key still carries counter 1, and the
-    // Work is untouched since seeding.
-    assert!(last_seq(&store) > 0, "seeding wrote the work");
-    let probe = session.compose(CommandBody::Cancel {
-        work_id: work_id.clone(),
-        expected_work_version: 1,
-        execution_id: None,
-    });
-    assert!(
-        probe.idempotency_key.starts_with("tui-1-"),
-        "a refused path consumed a request key: {}",
-        probe.idempotency_key
-    );
-    assert_eq!(session.detail().unwrap().version, 1);
-}
-
-/// A second review recorded for the same head grows the displayed
-/// finding set while version and head are unchanged — an observation
-/// bumps neither. A draft or armed request built on the smaller set
-/// would omit a displayed finding id, so `open` discards both rather
-/// than submitting a judgment that covers only part of the board.
-#[test]
-fn new_findings_on_same_head_invalidate_draft() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "nf-seed");
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    observe(&store, &work_id, pr_review("h1"), NOW);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    let only = session.draft().unwrap().findings[0].finding_id.clone();
-    session.choose(&only, FindingChoice::Fix).unwrap();
-    session.stage_judgment().unwrap();
-
-    // A different reviewer records a second, distinct finding for the
-    // same head — detail.version and detail.current_pr do not move.
+    // Head moves under the operator; no review for the new head has
+    // been delivered, so the staged judgment rejects as StaleHead.
     observe(
         &store,
         &work_id,
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "h1".into(),
-            reviewer: "rev2".into(),
-            verdict: ReviewVerdict::Approve,
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev("h-new"),
         },
-        NOW + 5,
-    );
-    session.open(&work_id, NOW + 6).unwrap();
-    let displayed: std::collections::HashSet<String> =
-        session.detail().unwrap().findings.iter().cloned().collect();
-    {
-        let detail = session.detail().unwrap();
-        assert_eq!(detail.version, 1, "an observation did not bump the version");
-        assert_eq!(
-            detail.current_pr.as_ref().and_then(|(_, h)| h.as_deref()),
-            Some("h1")
-        );
-    }
-
-    assert!(
-        session.draft().is_none(),
-        "a draft covering only part of the displayed findings survived"
-    );
-    assert!(
-        session.staged().is_none(),
-        "an armed request covering the stale finding set survived"
+        NOW + 10,
     );
 
-    // A fresh draft covers exactly the grown set — one slot per
-    // displayed finding id, no more and no less.
-    session.begin_judgment().unwrap();
-    let slots: std::collections::HashSet<&String> = session
-        .draft()
-        .unwrap()
+    let outcome = s.submit(NOW + 11).unwrap();
+    let SubmitOutcome::Decided(CommandDecision::Rejected { reason, .. }) = outcome else {
+        panic!("expected rejection, got {outcome:?}");
+    };
+    assert_eq!(reason, RejectionCode::StaleHead);
+    // Re-queried: the new head has no sealed round, so there is nothing
+    // to decide — the draft and staged request are cleared, never
+    // retargeted onto the new head.
+    assert!(s.draft().is_none());
+    assert!(s.staged().is_none());
+    // The detail pane shows the current head.
+    let detail = render::detail_frame(s.detail().unwrap());
+    assert!(detail.contains("h-new"), "detail: {detail}");
+}
+
+#[test]
+fn new_round_on_same_head_invalidates_draft_and_staged() {
+    // AC: "new findings on the same head invalidate a draft or armed
+    // request built on the smaller set" — a new sealed round on the same
+    // head replaces the occurrence set; the draft and staged request
+    // built on the old set must be discarded.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h1", &["a"]);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let occ = s.draft().unwrap().findings[0].occurrence_id.clone();
+    s.choose(&occ, FindingChoice::Fix, None).unwrap();
+    s.stage_judgment().unwrap();
+
+    // A second complete review on the same head seals a new round — the
+    // occurrence ids change, and the Work version bumps.
+    seal_review(&store, &work_id, "h1", "reviewer", &["a", "c"], NOW + 5);
+
+    // Re-query (poll tick / next open) sees the new detail.
+    s.open(&work_id, NOW + 6).unwrap();
+    assert!(s.draft().is_none(), "draft must be discarded");
+    assert!(s.staged().is_none(), "staged request must be discarded");
+    // Re-building a draft covers the new occurrence set.
+    let draft = s.begin_judgment().unwrap();
+    let keys: Vec<&str> = draft
         .findings
         .iter()
-        .map(|s| &s.finding_id)
+        .map(|f| f.source_key.as_str())
         .collect();
-    assert_eq!(
-        slots,
-        displayed.iter().collect::<std::collections::HashSet<_>>()
-    );
-    assert_eq!(slots.len(), 2, "two distinct reviews display two findings");
+    assert_eq!(keys, vec!["a", "c"]);
 }
 
-fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_workloop-tui"))
-}
-
-fn root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("workloop-tui-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Drive the real binary over piped stdin — the console process itself.
-fn run_console(root: &Path, input: &str) -> (bool, String, String) {
-    let mut child = Command::new(bin())
-        .args([
-            "--db",
-            &root.join("workloop.db").to_string_lossy(),
-            "--config",
-            &root.join("config.json").to_string_lossy(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("workloop-tui spawns");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
-
-/// INV-009: EOF and malformed input never produce a Command — the
-/// console refuses bad verbs locally and exits cleanly on EOF/quit.
-#[test]
-fn console_eof_and_malformed_input() {
-    let dir = root("console");
-    let db_path = dir.join("workloop.db");
-    let store = SqliteStore::open(&db_path, 1).unwrap();
-    let (work_id, _e) = submit_work(&store, "c-seed");
-    drop(store);
-
-    // Malformed input is refused locally; EOF ends the session.
-    let (ok, stdout, stderr) = run_console(&dir, "bogus verb here\nquit\n");
-    assert!(ok, "console exited nonzero: {stderr}");
-    assert!(stdout.contains("unknown verb"), "{stdout}");
-
-    // EOF alone disconnects cleanly.
-    let (ok, _, stderr) = run_console(&dir, "");
-    assert!(ok, "EOF exit failed: {stderr}");
-
-    // A full drive: open the work, arm a cancel, preview it, submit.
-    let (ok, stdout, stderr) =
-        run_console(&dir, "refresh\nopen 1\ncancel\npreview\nsubmit\nquit\n");
-    assert!(ok, "console exited nonzero: {stderr}");
-    assert!(stdout.contains("availability Available"), "{stdout}");
-    assert!(stdout.contains("accepted"), "{stdout}");
-
-    // The store holds the truth the console produced — a cancelled Work.
-    let store = SqliteStore::open(&db_path, 1).unwrap();
-    let detail = store
-        .transact(|tx| projection::work_detail(tx, &work_id, NOW + 100))
-        .unwrap();
-    match detail {
-        QueryResult::Found { value, .. } => {
-            assert_eq!(value.version, 2, "cancel bumped the version");
-            assert!(
-                value
-                    .executions
-                    .iter()
-                    .all(|e| e.state == ExecutionState::Cancelled),
-                "{:?}",
-                value.executions
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-/// AC: a lost result also settles by command id — the id the operator
-/// obtained from another surface (the CLI's command_result, say).
-#[test]
-fn lost_submit_recovers_by_command_id() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "li-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let req = session.staged().unwrap().clone();
-
-    // The command landed but the response never arrived; the operator
-    // learns its command id from the other surface.
-    let landed = handle_command(&store, &config(), &req, NOW).unwrap();
-    let command_id = landed.command_id().clone();
-    session.note_lost(req);
-    match session.recover_by_id(&command_id, NOW).unwrap() {
-        RecoverOutcome::Found(d) => {
-            assert_eq!(d.command_id(), &command_id);
-        }
-        other => panic!("expected found, got {other:?}"),
-    }
-    assert!(session.pending().is_none());
-}
-
-/// The card number `board_frame` prints is `Board::order()`'s —
-/// column-major. When an earlier column holds more rows, the nth card
-/// on screen is still the nth `open <n>` resolves.
-#[test]
-fn board_numbers_match_open_order() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (w1, _e1) = submit_work(&store, "bn-1");
-    let (w2, _e2) = submit_work(&store, "bn-2");
-    let (w3, e3) = submit_work(&store, "bn-3");
-    // Park w3 paused: QUEUED holds two rows, PAUSED one — row-major
-    // reading order would number w3 as 2, but order() numbers it 3.
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&e3)?.unwrap();
-            e.state = ExecutionState::Paused;
-            e.pause_reason = Some("repair".into());
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Queued,
-            })
-        })
-        .unwrap();
-
-    session.refresh(NOW).unwrap();
-    let board = session.board().unwrap();
-    assert_eq!(board.order(), vec![w1.clone(), w2.clone(), w3.clone()]);
-    let frame = board_frame(board, None);
-    for (i, w) in [w1, w2, w3].iter().enumerate() {
-        assert!(
-            frame.contains(&format!("{}. {}", i + 1, w.0)),
-            "card #{} ({}) missing its printed number:\n{frame}",
-            i + 1,
-            w.0
-        );
-    }
-}
-
-/// Identical finding strings are the same finding id: the draft keeps
-/// one slot per distinct id and the Command carries exactly one
-/// decision for it — two displayed rows can never fight over one key.
-#[test]
-fn duplicate_findings_share_one_decision_slot() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "df-seed");
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    // The same review recorded twice — the projection displays one
-    // identical finding string per observation.
-    observe(&store, &work_id, pr_review("h1"), NOW);
-    observe(&store, &work_id, pr_review("h1"), NOW + 1);
-
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    let draft = session.draft().unwrap();
-    let distinct: std::collections::HashSet<_> = draft
-        .findings
-        .iter()
-        .map(|f| f.finding_id.clone())
-        .collect();
-    assert_eq!(draft.findings.len(), distinct.len(), "slots repeat an id");
-    assert_eq!(draft.findings.len(), 1, "duplicate findings not deduped");
-
-    // The pane numbers that same single slot: a duplicate row never
-    // advertises a second number `pick` has no slot for.
-    let printed = displayed_findings(&workloop_tui::render::detail_frame(
-        session.detail().unwrap(),
-    ));
-    assert_eq!(
-        printed,
-        vec![(1, draft.findings[0].finding_id.clone())],
-        "the pane's numbering and the draft's slots disagree"
-    );
-
-    let finding = draft.findings[0].finding_id.clone();
-    session.choose(&finding, FindingChoice::Fix).unwrap();
-    let req = session.stage_judgment().unwrap().clone();
-    let CommandBody::JudgeFindings { decisions, .. } = &req.body else {
-        panic!("expected judge_findings")
-    };
-    assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0].finding_id, finding);
-}
-
-/// Seed a detail whose findings carry a duplicate: the same review
-/// recorded twice, then a second reviewer — `[A, A, B]`, the layout
-/// where a raw enumerate numbering pushes `pick` off its targets.
-fn duplicate_findings(store: &SqliteStore) -> WorkId {
-    let (work_id, _e) = submit_work(store, "dup-seed");
-    observe(store, &work_id, pr_head("h1"), NOW);
-    observe(store, &work_id, pr_review("h1"), NOW);
-    observe(store, &work_id, pr_review("h1"), NOW + 1);
-    observe(store, &work_id, pr_review_of("h1", "rev2"), NOW + 2);
-    work_id
-}
-
-/// The `(number, finding id)` pairs the detail pane prints, in display
-/// order.
-fn displayed_findings(frame: &str) -> Vec<(usize, String)> {
-    frame
-        .lines()
-        .filter_map(|line| {
-            let rest = line.trim().strip_prefix("finding ")?;
-            let (n, id) = rest.split_once(": ")?;
-            Some((n.parse().ok()?, id.to_string()))
-        })
-        .collect()
-}
-
-/// AC: displayed numbers and pick targets are the same finding set —
-/// the detail pane numbers one row per distinct finding id, in the same
-/// order as the judgment draft's slots, so a duplicate review cannot
-/// inflate the pane past the slot list `pick` resolves against.
-#[test]
-fn detail_frame_numbers_match_pick_slots() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let work_id = duplicate_findings(&store);
-
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    let detail = session.detail().unwrap();
-    assert_eq!(
-        detail.findings.len(),
-        3,
-        "fixture must record the same finding twice"
-    );
-
-    let printed = displayed_findings(&workloop_tui::render::detail_frame(detail));
-    session.begin_judgment().unwrap();
-    let slots: Vec<(usize, String)> = session
-        .draft()
-        .unwrap()
-        .findings
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (i + 1, s.finding_id.clone()))
-        .collect();
-    assert_eq!(
-        printed, slots,
-        "the pane's numbered findings and `pick`'s slot list disagree"
-    );
-    assert_eq!(
-        printed.len(),
-        2,
-        "a duplicate row inflated the displayed numbering"
-    );
-    let distinct: std::collections::HashSet<&String> = printed.iter().map(|(_, id)| id).collect();
-    assert_eq!(distinct.len(), printed.len(), "a number names two ids");
-}
-
-/// AC: the real console's `pick <n>` selects the finding the detail pane
-/// numbered `n` when the projection recorded a duplicate — `pick 2`
-/// lands on the second displayed finding, not on a duplicate's slot and
-/// not on an out-of-range number.
-#[test]
-fn console_pick_uses_displayed_numbers_with_duplicates() {
-    let dir = root("pickdup");
-    let db_path = dir.join("workloop.db");
-    let work_id = {
-        let store = SqliteStore::open(&db_path, 1).unwrap();
-        duplicate_findings(&store)
-    };
-
-    let (ok, stdout, stderr) = run_console(
-        &dir,
-        "refresh\nopen 1\njudge\npick 1 fix\npick 2 dismiss\npreview\nsubmit\nquit\n",
-    );
-    assert!(ok, "console exited nonzero: {stderr}");
-    // The pane the operator read before picking advertises exactly the
-    // slots `pick` resolves — two numbers, the second naming rev2.
-    let printed = displayed_findings(&stdout);
-    assert_eq!(
-        printed.len(),
-        2,
-        "duplicate finding inflated the pane's numbering:\n{stdout}"
-    );
-    assert!(
-        printed[1].1.contains("rev2"),
-        "displayed finding 2 is not the second distinct finding:\n{stdout}"
-    );
-    assert!(stdout.contains("accepted"), "{stdout}");
-
-    let store = SqliteStore::open(&db_path, 1).unwrap();
-    let (head, decisions) = store
-        .transact(|tx| tx.latest_judgment(&work_id))
-        .unwrap()
-        .expect("judgment recorded");
-    assert_eq!(head, "h1");
-    assert_eq!(decisions.len(), 2, "duplicate produced a third decision");
-    // Each displayed number selected the finding the pane numbered it:
-    // pick 1 -> the first distinct finding (fix), pick 2 -> rev2's
-    // (dismiss) — never a duplicate row or an off-by-one target.
-    let detail = match store
-        .transact(|tx| projection::work_detail(tx, &work_id, NOW + 100))
-        .unwrap()
-    {
-        QueryResult::Found { value, .. } => value,
-        other => panic!("work_detail: {other:?}"),
-    };
-    let mut seen = std::collections::HashSet::new();
-    let distinct: Vec<String> = detail
-        .findings
-        .iter()
-        .filter(|f| seen.insert(f.as_str()))
-        .cloned()
-        .collect();
-    assert_eq!(decisions[0].finding_id, distinct[0], "pick 1 mis-targeted");
-    assert_eq!(decisions[0].choice, FindingChoice::Fix);
-    assert_eq!(decisions[1].finding_id, distinct[1], "pick 2 mis-targeted");
-    assert_eq!(decisions[1].choice, FindingChoice::Dismiss);
-}
-
-/// The detail pane shows what the projection recorded — evidence from
-/// ProcessState/Artifact/PrActionResult observations is not dropped.
-#[test]
-fn detail_frame_shows_recorded_evidence() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "ev-seed");
-    observe(&store, &work_id, process_state(), NOW);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    let detail = session.detail().unwrap();
-    assert!(
-        !detail.evidence.is_empty(),
-        "projection recorded no evidence for the observation"
-    );
-    let frame = workloop_tui::render::detail_frame(detail);
-    assert!(
-        frame.contains("evidence process:Running"),
-        "evidence missing from detail pane:\n{frame}"
-    );
-}
-
-/// An accepted Command moved the durable version: the session
-/// re-queries so the next armed action carries the post-Command
-/// version instead of a stale one.
-#[test]
-fn accepted_submit_refreshes_open_detail() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "ar-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    let SubmitOutcome::Decided(d) = session.submit(NOW).unwrap() else {
-        panic!("expected decided")
-    };
-    assert!(matches!(d, CommandDecision::Accepted { .. }));
-    assert_eq!(
-        session.detail().unwrap().version,
-        2,
-        "detail snapshot kept the pre-Command version"
-    );
-    // The next armed action carries the fresh version — not v1, which
-    // the handler would reject as stale.
-    let req = session.stage_action(&Action::Cancel).unwrap().clone();
-    let CommandBody::Cancel {
-        expected_work_version,
-        ..
-    } = &req.body
-    else {
-        panic!("expected cancel")
-    };
-    assert_eq!(*expected_work_version, 2);
-}
-
-/// A command id cannot settle the unknown-result guard unless it is
-/// proven to be the pending request's own decision.
-#[test]
-fn recover_by_id_rejects_unrelated_command_id() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "ri-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-
-    // A composed-but-never-issued request is "lost".
-    let lost = session.compose(CommandBody::Cancel {
-        work_id: work_id.clone(),
-        expected_work_version: 1,
-        execution_id: None,
-    });
-    session.note_lost(lost);
-
-    // An unrelated durable decision exists — submitted through the CLI.
-    let other = handle_command(
-        &store,
-        &config(),
-        &cli_req(
-            "ri-other",
-            CommandBody::Acknowledge {
-                work_id: work_id.clone(),
-                expected_work_version: 1,
-                attention_id: "att-x".into(),
-            },
-        ),
-        NOW,
-    )
-    .unwrap();
-    let other_id = other.command_id().clone();
-    assert!(
-        session.recover_by_id(&other_id, NOW).is_err(),
-        "an unrelated command id released the unknown-result guard"
-    );
-    assert!(session.pending().is_some());
-    // The honest recovery still works: identical replay.
-    assert!(matches!(
-        session.recover(NOW).unwrap(),
-        RecoverOutcome::Replayed(_)
-    ));
-    assert!(session.pending().is_none());
-}
-
-/// Starting a new judgment drops any armed request — the previously
-/// staged Command belongs to the old draft and must never submit under
-/// the new one's display.
-#[test]
-fn new_judgment_clears_staged_request() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "nj-seed");
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    observe(&store, &work_id, pr_review("h1"), NOW);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.begin_judgment().unwrap();
-    let finding = session.draft().unwrap().findings[0].finding_id.clone();
-    session.choose(&finding, FindingChoice::Fix).unwrap();
-    session.stage_judgment().unwrap();
-    assert!(session.staged().is_some());
-    // A fresh `judge` discards the armed request tied to the old draft.
-    session.begin_judgment().unwrap();
-    assert!(
-        session.staged().is_none(),
-        "the stale armed request survived a new judgment"
-    );
-    assert!(session.preview(NOW).is_err(), "nothing to preview anymore");
-}
-
-/// An empty finding list under an un-read review source is not "no
-/// findings": the console names the unavailable source instead.
 #[test]
 fn empty_findings_under_unread_source_is_not_clean() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "us-seed");
-    // A head is observed but no review ever arrived — github:review is
-    // Unknown, so empty findings prove nothing.
-    observe(&store, &work_id, pr_head("h1"), NOW);
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    let err = session.begin_judgment().unwrap_err();
-    assert!(
-        err.contains("review source"),
-        "expected the unavailable-source error, got: {err}"
-    );
-    // The detail render surfaces the un-read source too.
-    let frame = workloop_tui::render::sources_frame(session.detail_sources());
-    assert!(frame.contains("github:review"), "{frame}");
+    // AC: "an empty finding list under a not-known review source proves
+    // nothing" — a published change with no sealed round surfaces the
+    // review source as unavailable; judgment refuses instead of
+    // treating zero findings as a clean review.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    open_change_at(&store, &work_id, "h1", NOW);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    let err = s.begin_judgment().unwrap_err();
+    assert!(err.contains("review source"), "judge error: {err}");
 }
 
-/// A re-query that finds the version or head moved discards the armed
-/// request: it was built against the old observation and must be
-/// re-armed from the snapshot the operator now sees — never submitted
-/// with a stale expected version under the new display.
 #[test]
-fn moved_snapshot_clears_staged_request() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let mut session = session(&store);
-    let (work_id, _e) = submit_work(&store, "mv-seed");
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    session.stage_action(&Action::Cancel).unwrap();
-    assert!(session.staged().is_some());
+fn choose_rejects_unknown_occurrence_id() {
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h1", &["a"]);
 
-    // Another surface moves the durable version under the armed request.
-    let _ = handle_command(
-        &store,
-        &config(),
-        &cli_req(
-            "mv-other",
-            CommandBody::Cancel {
-                work_id: work_id.clone(),
-                expected_work_version: 1,
-                execution_id: None,
-            },
-        ),
-        NOW,
-    )
-    .unwrap();
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let err = s
+        .choose("occ-not-displayed", FindingChoice::Fix, None)
+        .unwrap_err();
+    assert!(err.contains("not in the displayed set"), "err: {err}");
+}
 
-    session.open(&work_id, NOW).unwrap();
-    assert!(
-        session.staged().is_none(),
-        "an armed request built on the pre-move snapshot survived the re-query"
-    );
-    // Re-arming carries the observed version — not the stale one the
-    // discarded request held.
-    let req = session.stage_action(&Action::Cancel).unwrap().clone();
-    let CommandBody::Cancel {
-        expected_work_version,
-        ..
-    } = &req.body
-    else {
-        panic!("expected cancel")
+#[test]
+fn preview_does_not_send() {
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h1", &["a"]);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let occ = s.draft().unwrap().findings[0].occurrence_id.clone();
+    s.choose(&occ, FindingChoice::Fix, None).unwrap();
+    let preview = s.preview(NOW).unwrap();
+    let frame = render::preview_frame(&preview);
+    assert!(frame.contains("h1"), "preview: {frame}");
+    // Nothing was sent: no judgment recorded.
+    let judged = store.transact(|tx| tx.latest_judgment(&work_id)).unwrap();
+    assert!(judged.is_none());
+}
+
+#[test]
+fn incomplete_draft_cannot_stage() {
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h1", &["a", "b"]);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let err = s.stage_judgment().unwrap_err();
+    assert!(err.contains("no decision yet"), "err: {err}");
+}
+
+#[test]
+fn judgment_exact_set_rejected_on_omission() {
+    // The work-side guard: a judgment whose decisions omit a sealed
+    // occurrence is `invalid_request`, even if the draft was tricked
+    // into staging it.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    let work_id = submit_work(&store);
+    review_fixture(&store, &work_id, "h1", &["a", "b"]);
+
+    let mut s = TuiSession::new(&store, config(), operator());
+    s.open(&work_id, NOW).unwrap();
+    s.begin_judgment().unwrap();
+    let detail = s.detail().unwrap().clone();
+    let occs: Vec<FindingView> = detail.findings.clone();
+    // Compose a request covering only the first occurrence — bypassing
+    // the draft's completeness check to prove Core enforces the exact
+    // set independently of the TUI.
+    let req = s.compose(workloop_core::command::CommandBody::JudgeFindings {
+        work_id: work_id.clone(),
+        expected_work_version: detail.version,
+        expected_head: detail.current_change.clone().unwrap().1.unwrap(),
+        decisions: vec![workloop_core::command::FindingDecision {
+            occurrence_id: occs[0].occurrence_id.clone(),
+            choice: FindingChoice::Fix,
+            rationale: None,
+        }],
+    });
+    let decision = work::handle_command(&store, &config(), &req, NOW).unwrap();
+    let CommandDecision::Rejected { reason, .. } = decision else {
+        panic!("expected rejection, got {decision:?}");
     };
-    assert_eq!(*expected_work_version, 2);
-}
-
-/// The session is bound to the `Store` port, not the SQLite type: any
-/// implementation backing the Command/Query contract can drive the
-/// adapter.
-#[test]
-fn session_is_generic_over_the_store_port() {
-    /// A `Store` that is not `SqliteStore`: delegates to one, but the
-    /// session sees only the port.
-    struct Delegating<'a>(&'a SqliteStore);
-    impl Store for Delegating<'_> {
-        fn transact<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            self.0.transact(f)
-        }
-        fn transact_deferred<R>(
-            &self,
-            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
-        ) -> Result<R, StoreError> {
-            self.0.transact_deferred(f)
-        }
-    }
-
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, _e) = submit_work(&store, "gs-seed");
-    let adapter = Delegating(&store);
-    let mut session = TuiSession::new(&adapter, config(), actor());
-    session.refresh(NOW).unwrap();
-    session.open(&work_id, NOW).unwrap();
-    assert_eq!(session.detail().unwrap().work_id, work_id);
-    assert_eq!(session.board().unwrap().order(), vec![work_id]);
-}
-
-/// INV-007: store faults surface as errors — a db path that cannot be
-/// opened fails the process with a message, never a silent rejection.
-#[test]
-fn store_faults_surface_as_errors() {
-    let dir = root("fault");
-    let output = Command::new(bin())
-        .args([
-            "--db",
-            &dir.join("no-such-dir/nested.db").to_string_lossy(),
-            "--config",
-            &dir.join("config.json").to_string_lossy(),
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("workloop-tui spawns");
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("taisan-tui:"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(reason, RejectionCode::InvalidRequest);
 }

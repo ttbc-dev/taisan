@@ -1,30 +1,85 @@
 //! The `work` decision core: evaluates Commands against the store snapshot
 //! and emits `Effect`s the store applies in the same transaction. The store
 //! enforces structure; everything here is policy — transition legality,
-//! versions, budgets, and gates.
+//! versions, budgets, capability guards, and gates.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::command::{
     CommandBody, CommandDecision, CommandEffect, CommandId, CommandRequest, FindingChoice,
-    PrHeadSha, RejectionCode, WorkVersion, payload_digest,
+    RejectionCode, WorkVersion, canonical_payload, payload_digest,
 };
 use crate::domain::*;
+use crate::identity::{
+    ActorRole, CommitRevision, DiffTarget, EvidenceRef, HostActorRef, HostBinding, HostCapability,
+    IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
+};
 use crate::observation::{
-    ActionResult, ArtifactFact, CheckConclusion, Observation, ObservationFact, Outcome,
-    ProcessStateFact, ReviewVerdict,
+    ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
+    NormalizedEffectFact, Observation, ObservationFact, Outcome, ProcessStateFact, RefRelation,
 };
-use crate::store::{
-    Effect, PrAction, PrActionIntent, PrActionStatus, ReadView, Store, StoreError, TxView,
-};
+use crate::store::{Effect, HostAction, HostActionIntent, ReadView, Store, StoreError, TxView};
+
+/// The resolved installation binding template: which host installation,
+/// repository, adapter contract, and role actors every accepted Work
+/// binds to. The Work's binding is a frozen copy recorded at acceptance;
+/// later installation changes cannot retarget it.
+#[derive(Debug, Clone)]
+pub struct HostTemplate {
+    pub adapter: crate::identity::AdapterId,
+    pub repository: RepositoryRef,
+    pub contract_version: u32,
+    /// One binding per role; `publication` is required for any Work
+    /// that may publish.
+    pub actors: Vec<RoleBinding>,
+}
 
 /// Installation-level configuration supplied by the composition root.
 #[derive(Debug, Clone)]
 pub struct WorkloopConfig {
-    /// Used for the branch reservation when a Work names no issue refs.
-    pub default_repository: String,
+    pub host: HostTemplate,
+    /// Capabilities the installation declares as supported and
+    /// authorized. A Work whose required set is not covered is rejected
+    /// at submit; runtime capability reports may further deny.
+    pub declared_capabilities: BTreeSet<HostCapability>,
+    /// Lane policy stamped into every spec snapshot.
+    pub lanes: LanePolicy,
+    /// Named host checks the completion gate requires on the current
+    /// target; stamped into every spec snapshot.
+    pub required_checks: Vec<String>,
     pub allowed_effects: AllowedEffects,
     pub budget: ExecutionBudget,
+    /// The Work-wide recovery policy stamped at acceptance.
+    pub policy: WorkPolicy,
+}
+
+/// The capability set every publishable Work needs, plus `issue_read`
+/// for source-bound Work.
+fn required_capabilities(sources: &[SourceSnapshot]) -> BTreeSet<HostCapability> {
+    let mut caps = BTreeSet::from([
+        HostCapability::RepositoryRead,
+        HostCapability::PushRef,
+        HostCapability::ChangeRequestCreate,
+        HostCapability::ChangeRequestRead,
+        HostCapability::ChecksRead,
+        HostCapability::ReviewFindingsRead,
+    ]);
+    if !sources.is_empty() {
+        caps.insert(HostCapability::IssueRead);
+    }
+    caps
+}
+
+/// The capability a host action requires.
+fn action_capability(action: &HostAction) -> HostCapability {
+    match action {
+        HostAction::PushRef { .. } => HostCapability::PushRef,
+        HostAction::OpenChangeRequest { .. } => HostCapability::ChangeRequestCreate,
+        HostAction::UpdateChangeRequest { .. } => HostCapability::ChangeRequestUpdate,
+        HostAction::PostComment { .. } => HostCapability::CommentCreate,
+    }
 }
 
 /// Handle one Command: idempotency check → validation → decide → apply →
@@ -37,6 +92,7 @@ pub fn handle_command(
     now_unix_seconds: i64,
 ) -> Result<CommandDecision, StoreError> {
     let digest = payload_digest(&req.origin, &req.actor, &req.idempotency_key, &req.body);
+    let canonical = canonical_payload(&req.origin, &req.actor, &req.idempotency_key, &req.body);
 
     store.transact(|tx| {
         if let Some((stored_digest, decision)) =
@@ -58,7 +114,14 @@ pub fn handle_command(
                 req.body.work_id().cloned(),
                 vec!["same idempotency key with a different payload".into()],
             )?;
-            tx.save_decision(&req.origin, &req.actor, &conflict_key, &digest, &decision)?;
+            tx.save_decision(
+                &req.origin,
+                &req.actor,
+                &conflict_key,
+                &digest,
+                &canonical,
+                &decision,
+            )?;
             return Ok(decision);
         }
 
@@ -69,6 +132,7 @@ pub fn handle_command(
             &req.actor,
             &req.idempotency_key,
             &digest,
+            &canonical,
             &decision,
         )?;
         Ok(decision)
@@ -96,7 +160,7 @@ pub enum PreviewAvailability {
 pub struct ActionPreview {
     pub availability: PreviewAvailability,
     pub observed_work_version: Option<WorkVersion>,
-    pub observed_pr_head: Option<PrHeadSha>,
+    pub observed_head: Option<CommitRevision>,
     pub reasons: Vec<RejectionCode>,
     pub evidence: Vec<String>,
 }
@@ -197,11 +261,11 @@ fn observed(tx: &dyn ReadView, req: &CommandRequest) -> Result<ActionPreview, St
         .transpose()?
         .flatten()
         .map(|w| w.version);
-    let observed_pr_head = work_id.map(|w| tx.latest_pr_head(w)).transpose()?.flatten();
+    let observed_head = work_id.map(|w| latest_head(tx, w)).transpose()?.flatten();
     Ok(ActionPreview {
         availability: PreviewAvailability::Unknown,
         observed_work_version,
-        observed_pr_head,
+        observed_head,
         reasons: vec![],
         evidence: vec![],
     })
@@ -254,12 +318,14 @@ fn conflict_rejection(
         StoreError::ConstraintConflict { .. }
         | StoreError::StateConflict { .. }
         | StoreError::NoFreeSlot => None,
-        // An internal store fault is not a decision about the work.
+        // An internal or format fault is not a decision about the work.
         // Retrying it and then persisting an Ineligible rejection would
         // harden a transient failure into a durable, forever-replayed
         // answer under the caller's idempotency key; it must reach the
         // caller instead.
-        StoreError::Internal { .. } => return Err(err.clone()),
+        StoreError::Internal { .. } | StoreError::UnsupportedFormat { .. } => {
+            return Err(err.clone());
+        }
     };
     match code {
         Some(c) => Ok(Some(rejected_now(
@@ -331,21 +397,104 @@ fn check_work(
 }
 
 /// The `{workspace, (repository, branch)}` pair a Work's Executions reserve.
-pub fn work_resources(work: &Work, config: &WorkloopConfig) -> Vec<WriteResource> {
-    let repository = work
-        .issue_refs
-        .first()
-        .map(|r| r.repository.clone())
-        .unwrap_or_else(|| config.default_repository.clone());
+/// The branch reservation binds the Work's recorded repository — the
+/// binding, not a caller-supplied path.
+pub fn work_resources(work: &Work) -> Vec<WriteResource> {
     vec![
         WriteResource::Workspace {
             workspace_id: format!("ws-{}", work.id.0),
         },
         WriteResource::Branch {
-            repository,
+            repository: work.binding.repository.clone(),
             branch: format!("work/{}", work.id.0),
         },
     ]
+}
+
+/// The latest head observed for the Work's change request, ordered by
+/// observed time with insertion order breaking ties — the same rule
+/// every head comparison uses.
+fn latest_head(tx: &dyn ReadView, work_id: &WorkId) -> Result<Option<CommitRevision>, StoreError> {
+    Ok(current_target(tx, work_id)?.map(|t| t.head))
+}
+
+/// The Work's current diff target, derived from persisted evidence:
+/// the change request its `open_change_request` receipt opened, the
+/// latest observed head for it, and the latest target-branch revision.
+/// `None` until the change request exists.
+pub(crate) fn current_target(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<Option<DiffTarget>, StoreError> {
+    let observations = tx.observations_for_work(work_id)?;
+    let work = tx.work(work_id)?;
+    let Some(work) = work else { return Ok(None) };
+    // The change request the Work's own open receipt recorded on the
+    // bound repository.
+    let mut change: Option<(crate::identity::ChangeRequestRef, String)> = None;
+    for o in &observations {
+        if let ObservationFact::HostActionResult { effects, .. } = &o.fact {
+            for e in effects {
+                if let NormalizedEffectFact::ChangeOpened {
+                    change: c,
+                    target_branch,
+                    ..
+                } = e
+                    && c.repository == work.binding.repository
+                {
+                    change = Some((c.clone(), target_branch.clone()));
+                }
+            }
+        }
+    }
+    let Some((change, target_branch)) = change else {
+        return Ok(None);
+    };
+    // The latest ChangeHead for that change, ordered by observed time
+    // with insertion order breaking ties.
+    let head = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::ChangeHead { change: c, head: h } = &o.fact
+                && c == &change
+            {
+                Some((o.observed_unix_seconds, index, h.clone()))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(t, i, _)| (*t, *i))
+        .map(|(_, _, h)| h);
+    let Some(head) = head else {
+        return Ok(None);
+    };
+    // Latest target-branch revision, so a target-only move changes the
+    // diff target without any head change.
+    let target_revision = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::BranchState {
+                repository,
+                branch,
+                state: BranchState::At { revision },
+            } = &o.fact
+                && repository == &work.binding.repository
+                && branch == &target_branch
+            {
+                return Some((o.observed_unix_seconds, index, revision.clone()));
+            }
+            None
+        })
+        .max_by_key(|(t, i, _)| (*t, *i))
+        .map(|(_, _, r)| r);
+    Ok(Some(DiffTarget {
+        change,
+        head,
+        base: None,
+        target_revision,
+    }))
 }
 
 type Verdict = Result<(CommandDecision, Vec<Effect>), StoreError>;
@@ -359,14 +508,15 @@ fn decide(
     match &req.body {
         CommandBody::Submit {
             intent,
-            issue_refs,
+            sources,
             constraints,
             verification_argv,
         } => decide_submit(
             tx,
             config,
+            req,
             intent,
-            issue_refs,
+            sources,
             constraints,
             verification_argv,
         ),
@@ -391,7 +541,13 @@ fn decide(
             work_id,
             expected_work_version,
             execution_id,
-        } => decide_resume(tx, work_id, *expected_work_version, execution_id),
+        } => decide_resume(
+            tx,
+            work_id,
+            *expected_work_version,
+            execution_id,
+            now_unix_seconds,
+        ),
         CommandBody::Cancel {
             work_id,
             expected_work_version,
@@ -412,73 +568,166 @@ fn decide(
         CommandBody::JudgeFindings {
             work_id,
             expected_work_version,
-            expected_pr_head,
+            expected_head,
             decisions,
         } => decide_judge(
             tx,
+            req,
             work_id,
             *expected_work_version,
-            expected_pr_head,
+            expected_head,
             decisions,
         ),
         CommandBody::ReleaseJudgment {
             work_id,
             expected_work_version,
-            expected_pr_head,
-        } => decide_release_judgment(tx, work_id, *expected_work_version, expected_pr_head),
+            expected_head,
+        } => decide_release_judgment(
+            tx,
+            work_id,
+            *expected_work_version,
+            expected_head,
+            now_unix_seconds,
+        ),
     }
 }
 
 fn decide_submit(
     tx: &mut dyn TxView,
     config: &WorkloopConfig,
+    req: &CommandRequest,
     intent: &str,
-    issue_refs: &[GitHubIssueRef],
+    sources: &[SourceSnapshot],
     constraints: &[String],
     verification_argv: &[Vec<String>],
 ) -> Verdict {
+    // Capability guard: the binding's required set must be declared as
+    // supported by this installation. An undeclared capability can never
+    // silently authorize an effect later.
+    let required = required_capabilities(sources);
+    let missing: Vec<HostCapability> = required
+        .iter()
+        .filter(|c| !config.declared_capabilities.contains(*c))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Ok((
+            rejected(
+                tx,
+                RejectionCode::UnsupportedCapability,
+                None,
+                missing.iter().map(|c| c.name().to_string()).collect(),
+            )?,
+            vec![],
+        ));
+    }
+    // A source issue already claimed by live Work is a conflict — the
+    // overlap rule that keeps one owner per issue.
+    for s in sources {
+        if let Some(owner) = tx.issue_claim(&s.issue)? {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::Ineligible,
+                    Some(owner.clone()),
+                    vec![format!("issue {} already claimed by {}", s.issue, owner.0)],
+                ),
+                vec![],
+            ));
+        }
+    }
+    // Source issue membership must be unique within the submission.
+    let seen: BTreeSet<&IssueRef> = sources.iter().map(|s| &s.issue).collect();
+    if seen.len() != sources.len() {
+        return Ok((
+            rejected(
+                tx,
+                RejectionCode::InvalidRequest,
+                None,
+                vec!["duplicate source issue".into()],
+            )?,
+            vec![],
+        ));
+    }
+
+    let binding = HostBinding::new(
+        config.host.adapter.clone(),
+        config.host.repository.clone(),
+        config.host.contract_version,
+        required,
+        config.host.actors.clone(),
+    )
+    .map_err(|e| StoreError::Internal { detail: e })?;
+
     let seq = tx.alloc_seq()?;
+    let spec_payload = SpecPayload {
+        intent: intent.to_string(),
+        sources: sources.to_vec(),
+        constraints: constraints.to_vec(),
+        verification_argv: verification_argv.to_vec(),
+        required_checks: config.required_checks.clone(),
+        lanes: config.lanes.clone(),
+    };
+    let payload_json = serde_json::to_value(&spec_payload).map_err(|e| StoreError::Internal {
+        detail: format!("spec payload: {e}"),
+    })?;
+    let spec = SpecSnapshot {
+        work_id: WorkId(String::new()),
+        revision: 1,
+        payload: spec_payload,
+        digest: sha256_hex("spec-v1", &canonical_json(&payload_json)),
+        approved_by: req.actor.clone(),
+        recorded_seq: seq,
+    };
     let work = Work {
         id: WorkId(tx.alloc_id("w")?),
         version: 1,
-        revision: 1,
-        intent: intent.to_string(),
-        issue_refs: issue_refs.to_vec(),
-        constraints: constraints.to_vec(),
-        verification_argv: verification_argv.to_vec(),
+        binding,
+        spec: 1,
+        approved_spec: 1,
+        source_gate: if sources.is_empty() {
+            SourceGate::NotApplicable
+        } else {
+            SourceGate::NeedsCheck
+        },
+        policy: config.policy.clone(),
         created_seq: seq,
     };
-    let execution = Execution {
-        id: ExecutionId(tx.alloc_id("e")?),
-        work_id: work.id.clone(),
-        ordinal: 0,
-        state: ExecutionState::Queued,
-        waiting_reason: None,
-        desired_action: None,
-        terminal_code: None,
-        pause_reason: None,
-        outcome: None,
-        enqueued_seq: seq,
-        allowed_effects: config.allowed_effects.clone(),
-        input: InvocationInput {
+    let mut spec = spec;
+    spec.work_id = work.id.clone();
+    let execution = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        0,
+        seq,
+        InvocationInput {
             input: serde_json::json!({
-                "intent": work.intent,
-                "constraints": work.constraints,
-                "verification_argv": work.verification_argv,
+                "intent": spec.payload.intent,
+                "constraints": spec.payload.constraints,
+                "verification_argv": spec.payload.verification_argv,
             }),
             resume: false,
             next_execution_input: None,
             previous_execution_outcome: None,
         },
-        budget: config.budget.clone(),
-        invocations_used: 0,
-        review_rounds_used: 0,
-        started_seq: None,
-        started_unix_seconds: None,
-        recovery_attempts_used: 0,
-        recovery_deadline_unix_seconds: None,
-        uncertain_since_unix_seconds: None,
-    };
+    )?;
+    let issue_refs = spec
+        .payload
+        .sources
+        .iter()
+        .map(|s| WorkIssueRef {
+            work_id: work.id.clone(),
+            issue: s.issue.clone(),
+        })
+        .collect();
+    let claims: Vec<IssueRef> = spec
+        .payload
+        .sources
+        .iter()
+        .map(|s| s.issue.clone())
+        .collect();
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
         CommandDecision::Accepted {
@@ -491,10 +740,53 @@ fn decide_submit(
             committed_at: seq,
         },
         vec![
-            Effect::InsertWork { work },
+            Effect::InsertWork {
+                work: work.clone(),
+                spec,
+                issue_refs,
+                claims,
+                usage: WorkUsage::new(&work.id),
+            },
             Effect::InsertExecution { execution },
         ],
     ))
+}
+
+fn new_execution(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    work: &Work,
+    spec: &SpecPayload,
+    ordinal: u32,
+    seq: EventSequence,
+    input: InvocationInput,
+) -> Result<Execution, StoreError> {
+    let _ = spec;
+    Ok(Execution {
+        id: ExecutionId(tx.alloc_id("e")?),
+        work_id: work.id.clone(),
+        ordinal,
+        state: ExecutionState::Queued,
+        waiting_reason: None,
+        desired_action: None,
+        terminal_code: None,
+        pause_reason: None,
+        repair_prerequisites: vec![],
+        outcome: None,
+        enqueued_seq: seq,
+        allowed_effects: config.allowed_effects.clone(),
+        input,
+        budget: config.budget.clone(),
+        invocations_used: 0,
+        review_rounds_used: 0,
+        started_seq: None,
+        started_unix_seconds: None,
+        recovery_attempts_used: 0,
+        recovery_deadline_unix_seconds: None,
+        uncertain_since_unix_seconds: None,
+        paused_since_unix_seconds: None,
+        next_role: None,
+    })
 }
 
 /// An external claim names only `(repository, branch)` pairs; the managed
@@ -682,8 +974,27 @@ fn decide_retry(
             vec![],
         ));
     }
+    // The successor Execution re-acquires the Work's source claims;
+    // they were released at terminal settlement. A newer Work owning
+    // any of them blocks the retry.
+    let issue_refs = tx.issue_refs(work_id)?;
+    for issue in &issue_refs {
+        if let Some(owner) = tx.issue_claim(issue)?
+            && &owner != work_id
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::Ineligible,
+                    Some(owner.clone()),
+                    vec![format!("issue {} now owned by {}", issue, owner.0)],
+                ),
+                vec![],
+            ));
+        }
+    }
     // Acceptance-time reservation pre-check; dispatch rechecks atomically.
-    let resources = work_resources(&work, config);
+    let resources = work_resources(&work);
     for res in &resources {
         if let Some(existing) = tx.reservation(&res.key())?
             && !is_expired(&existing, now_unix_seconds)
@@ -700,53 +1011,115 @@ fn decide_retry(
         }
     }
     let seq = tx.alloc_seq()?;
-    let execution = Execution {
-        id: ExecutionId(tx.alloc_id("e")?),
-        work_id: work_id.clone(),
-        ordinal: current.ordinal + 1,
-        state: ExecutionState::Queued,
-        waiting_reason: None,
-        desired_action: None,
-        terminal_code: None,
-        pause_reason: None,
-        outcome: None,
-        enqueued_seq: seq,
-        allowed_effects: current.allowed_effects.clone(),
-        input: InvocationInput {
+    let spec = tx
+        .spec(work_id, Some(work.spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "work without spec".into(),
+        })?;
+    let execution = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        current.ordinal + 1,
+        seq,
+        InvocationInput {
             input: current.input.input.clone(),
             resume: false,
             next_execution_input: current.input.next_execution_input.clone(),
             previous_execution_outcome: current.outcome.clone(),
         },
-        budget: config.budget.clone(),
-        invocations_used: 0,
-        review_rounds_used: 0,
-        started_seq: None,
-        started_unix_seconds: None,
-        recovery_attempts_used: 0,
-        recovery_deadline_unix_seconds: None,
-        uncertain_since_unix_seconds: None,
-    };
+    )?;
+    let mut next_work = work.clone();
+    next_work.version += 1;
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
         CommandDecision::Accepted {
             command_id,
             work_id: Some(work_id.clone()),
-            work_version: Some(work.version + 1),
+            work_version: Some(next_work.version),
             effect: CommandEffect::ExecutionCreated {
                 execution_id: execution.id.clone(),
             },
             committed_at: seq,
         },
         vec![
-            Effect::BumpWorkVersion {
-                work_id: work_id.clone(),
+            Effect::UpdateWork {
+                work: next_work,
                 expected: work.version,
-                next: work.version + 1,
             },
             Effect::InsertExecution { execution },
+            Effect::InsertIssueClaims {
+                work_id: work_id.clone(),
+                issues: issue_refs,
+            },
         ],
     ))
+}
+
+/// Whether a paused Execution's typed repair prerequisites are
+/// satisfied. An unsatisfiable prerequisite keeps the Work held.
+fn prerequisites_satisfied(
+    tx: &dyn ReadView,
+    work: &Work,
+    execution: &Execution,
+    now_unix_seconds: i64,
+) -> Result<Vec<String>, StoreError> {
+    let mut unmet = Vec::new();
+    for p in &execution.repair_prerequisites {
+        match p {
+            RepairPrerequisite::SpecReapproval => {
+                // `resume` can never create a new approved spec revision.
+                unmet.push("spec reapproval required".into());
+            }
+            RepairPrerequisite::SourceRead => {
+                if work.source_gate != SourceGate::Matches {
+                    unmet.push("source read still does not match the approved spec".into());
+                }
+            }
+            RepairPrerequisite::Capability { capability } => {
+                if !capability_held(tx, &work.binding.repository.host, capability)? {
+                    unmet.push(format!(
+                        "capability {} is not authorized",
+                        capability.name()
+                    ));
+                }
+            }
+            RepairPrerequisite::Artifact { name } => {
+                let present = tx
+                    .observations_for_execution(&execution.id)?
+                    .iter()
+                    .any(|o| {
+                        matches!(
+                            &o.fact,
+                            ObservationFact::Artifact {
+                                required_artifact,
+                                state: ArtifactFact::Present { .. },
+                                ..
+                            } if required_artifact == name
+                        )
+                    });
+                if !present {
+                    unmet.push(format!("artifact {name} not present"));
+                }
+            }
+            RepairPrerequisite::EffectResolution { action_id } => {
+                let outstanding = tx.action_intents()?.iter().any(|i| {
+                    &i.action_id == action_id
+                        && matches!(
+                            i.status,
+                            HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+                        )
+                });
+                if outstanding {
+                    unmet.push(format!("effect {action_id} still unresolved"));
+                }
+            }
+            RepairPrerequisite::OperatorDecision => {}
+        }
+    }
+    let _ = now_unix_seconds;
+    Ok(unmet)
 }
 
 fn decide_resume(
@@ -754,6 +1127,7 @@ fn decide_resume(
     work_id: &WorkId,
     expected_version: WorkVersion,
     execution_id: &ExecutionId,
+    now_unix_seconds: i64,
 ) -> Verdict {
     let work = match check_work(tx, work_id, expected_version)? {
         Ok(w) => w,
@@ -784,6 +1158,15 @@ fn decide_resume(
             vec![],
         ));
     }
+    // Typed prerequisites: a repair pause releases only when the recorded
+    // prerequisites are satisfied.
+    let unmet = prerequisites_satisfied(tx, &work, &execution, now_unix_seconds)?;
+    if !unmet.is_empty() {
+        return Ok((
+            rejected_now(tx, RejectionCode::Ineligible, Some(work_id.clone()), unmet),
+            vec![],
+        ));
+    }
     // A spent budget is terminal, not requeueable: `queued` or `paused` with
     // the bound exhausted goes to `failed` with the limit recorded. The
     // shared predicate keeps this entry point on the same rule as
@@ -801,67 +1184,96 @@ fn decide_resume(
             evidence_refs: vec![],
             recorded_seq: seq,
         });
+        let mut effects = close_pause_effects(tx, &work, &execution, now_unix_seconds)?;
+        let mut next_work = work.clone();
+        next_work.version += 1;
+        effects.insert(
+            0,
+            Effect::UpdateWork {
+                work: next_work.clone(),
+                expected: work.version,
+            },
+        );
+        effects.push(Effect::UpdateExecution {
+            execution: next,
+            expected_state: ExecutionState::Paused,
+        });
+        effects.push(Effect::ReleaseSlot {
+            execution_id: execution.id.clone(),
+        });
+        effects.push(Effect::DeleteReservations {
+            resource_keys: resources_keys_of(tx, &execution)?,
+            holder: ReservationHolder::Execution {
+                execution_id: execution.id.clone(),
+            },
+        });
+        effects.push(Effect::ReleaseIssueClaims {
+            work_id: work_id.clone(),
+        });
+        effects.push(Effect::ClearDeferral {
+            execution_id: execution.id.clone(),
+        });
         return Ok((
             CommandDecision::Accepted {
                 command_id,
                 work_id: Some(work_id.clone()),
-                work_version: Some(work.version + 1),
+                work_version: Some(next_work.version),
                 effect: CommandEffect::StateChanged,
                 committed_at: seq,
             },
-            vec![
-                Effect::BumpWorkVersion {
-                    work_id: work_id.clone(),
-                    expected: work.version,
-                    next: work.version + 1,
-                },
-                Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: ExecutionState::Paused,
-                },
-                Effect::ReleaseSlot {
-                    execution_id: execution.id.clone(),
-                },
-                Effect::DeleteReservations {
-                    resource_keys: resources_keys_of(tx, &work, &execution)?,
-                    holder: ReservationHolder::Execution {
-                        execution_id: execution.id.clone(),
-                    },
-                },
-                Effect::ClearDeferral {
-                    execution_id: execution.id.clone(),
-                },
-            ],
+            effects,
         ));
     }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Queued;
     next.enqueued_seq = seq;
+    next.pause_reason = None;
+    next.repair_prerequisites = vec![];
+    next.paused_since_unix_seconds = None;
+    let mut next_work = work.clone();
+    next_work.version += 1;
+    let mut effects = close_pause_effects(tx, &work, &execution, now_unix_seconds)?;
+    effects.push(Effect::UpdateWork {
+        work: next_work.clone(),
+        expected: work.version,
+    });
+    effects.push(Effect::UpdateExecution {
+        execution: next,
+        expected_state: ExecutionState::Paused,
+    });
+    effects.push(Effect::ClearDeferral {
+        execution_id: execution_id.clone(),
+    });
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
         CommandDecision::Accepted {
             command_id,
             work_id: Some(work_id.clone()),
-            work_version: Some(work.version + 1),
+            work_version: Some(next_work.version),
             effect: CommandEffect::StateChanged,
             committed_at: seq,
         },
-        vec![
-            Effect::BumpWorkVersion {
-                work_id: work_id.clone(),
-                expected: work.version,
-                next: work.version + 1,
-            },
-            Effect::UpdateExecution {
-                execution: next,
-                expected_state: ExecutionState::Paused,
-            },
-            Effect::ClearDeferral {
-                execution_id: execution_id.clone(),
-            },
-        ],
+        effects,
     ))
+}
+
+/// Usage-accounting effects for leaving `paused`: the elapsed pause
+/// counts as human-decision waiting, not automatic usage.
+fn close_pause_effects(
+    tx: &dyn ReadView,
+    work: &Work,
+    execution: &Execution,
+    now_unix_seconds: i64,
+) -> Result<Vec<Effect>, StoreError> {
+    if let Some(paused_since) = execution.paused_since_unix_seconds {
+        let mut usage = tx
+            .work_usage(&work.id)?
+            .unwrap_or_else(|| WorkUsage::new(&work.id));
+        usage.human_wait_seconds_total += (now_unix_seconds - paused_since).max(0) as u64;
+        return Ok(vec![Effect::UpdateWorkUsage { usage }]);
+    }
+    Ok(vec![])
 }
 
 fn decide_cancel(
@@ -908,10 +1320,14 @@ fn decide_cancel(
     }
     let seq = tx.alloc_seq()?;
     let command_id = CommandId(tx.alloc_id("cmd")?);
-    let bump = Effect::BumpWorkVersion {
-        work_id: work_id.clone(),
+    let mut next_work = work.clone();
+    next_work.version += 1;
+    let bump = Effect::UpdateWork {
+        work: next_work.clone(),
         expected: work.version,
-        next: work.version + 1,
+    };
+    let release_claims = Effect::ReleaseIssueClaims {
+        work_id: work_id.clone(),
     };
     // A no-op arm reports the stored version — returning a version the
     // commit did not produce would strand the caller's next precondition.
@@ -945,6 +1361,7 @@ fn decide_cancel(
             Ok(accept(
                 vec![
                     bump,
+                    release_claims,
                     Effect::UpdateExecution {
                         execution: next,
                         expected_state: ExecutionState::Queued,
@@ -956,13 +1373,13 @@ fn decide_cancel(
                         execution_id: execution.id.clone(),
                     },
                     Effect::DeleteReservations {
-                        resource_keys: resources_keys_of(tx, &work, &execution)?,
+                        resource_keys: resources_keys_of(tx, &execution)?,
                         holder: ReservationHolder::Execution {
                             execution_id: execution.id.clone(),
                         },
                     },
                 ],
-                work.version + 1,
+                next_work.version,
             ))
         }
         ExecutionState::Paused => {
@@ -980,18 +1397,19 @@ fn decide_cancel(
             Ok(accept(
                 vec![
                     bump,
+                    release_claims,
                     Effect::UpdateExecution {
                         execution: next,
                         expected_state: ExecutionState::Paused,
                     },
                     Effect::DeleteReservations {
-                        resource_keys: resources_keys_of(tx, &work, &execution)?,
+                        resource_keys: resources_keys_of(tx, &execution)?,
                         holder: ReservationHolder::Execution {
                             execution_id: execution.id.clone(),
                         },
                     },
                 ],
-                work.version + 1,
+                next_work.version,
             ))
         }
         ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
@@ -1006,7 +1424,7 @@ fn decide_cancel(
                         expected_state: execution.state.clone(),
                     },
                 ],
-                work.version + 1,
+                next_work.version,
             ))
         }
         ExecutionState::Uncertain => {
@@ -1021,7 +1439,7 @@ fn decide_cancel(
                             expected_state: ExecutionState::Uncertain,
                         },
                     ],
-                    work.version + 1,
+                    next_work.version,
                 ))
             } else {
                 // Desired fail/cancel already in progress: accepted no-op.
@@ -1035,11 +1453,7 @@ fn decide_cancel(
     }
 }
 
-fn resources_keys_of(
-    tx: &dyn ReadView,
-    _work: &Work,
-    execution: &Execution,
-) -> Result<Vec<String>, StoreError> {
+fn resources_keys_of(tx: &dyn ReadView, execution: &Execution) -> Result<Vec<String>, StoreError> {
     Ok(tx
         .reservations()?
         .into_iter()
@@ -1104,11 +1518,76 @@ fn decide_acknowledge(
     ))
 }
 
+/// The sealed round covering the caller's expected head, or a rejection.
+/// A judgment binds the round's exact target — a head that moved, or a
+/// target that moved under an identical head, is stale.
+fn current_round_for(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+    expected_head: &CommitRevision,
+) -> Result<Result<(ReviewRound, Vec<FindingOccurrence>), CommandDecision>, StoreError> {
+    let Some(target) = current_target(tx, work_id)? else {
+        return Ok(Err(CommandDecision::Rejected {
+            command_id: CommandId("cmd-unknown".into()),
+            reason: RejectionCode::SourceUnavailable,
+            current_work_id: Some(work_id.clone()),
+            current_version: None,
+            evidence: vec![format!("no observed change target for {}", work_id.0)],
+            committed_at: tx.last_seq()?,
+        }));
+    };
+    if &target.head != expected_head {
+        return Ok(Err(CommandDecision::Rejected {
+            command_id: CommandId("cmd-unknown".into()),
+            reason: RejectionCode::StaleHead,
+            current_work_id: Some(work_id.clone()),
+            current_version: None,
+            evidence: vec![format!("current head {}", target.head)],
+            committed_at: tx.last_seq()?,
+        }));
+    }
+    let Some(round) = tx.latest_round(work_id)? else {
+        return Ok(Err(CommandDecision::Rejected {
+            command_id: CommandId("cmd-unknown".into()),
+            reason: RejectionCode::SourceUnavailable,
+            current_work_id: Some(work_id.clone()),
+            current_version: None,
+            evidence: vec!["no sealed review round".into()],
+            committed_at: tx.last_seq()?,
+        }));
+    };
+    if round.target != target {
+        return Ok(Err(CommandDecision::Rejected {
+            command_id: CommandId("cmd-unknown".into()),
+            reason: RejectionCode::StaleHead,
+            current_work_id: Some(work_id.clone()),
+            current_version: None,
+            evidence: vec![format!(
+                "sealed round target does not match current target {}",
+                target.head
+            )],
+            committed_at: tx.last_seq()?,
+        }));
+    }
+    if !round.completeness.starts_with("complete") {
+        return Ok(Err(CommandDecision::Rejected {
+            command_id: CommandId("cmd-unknown".into()),
+            reason: RejectionCode::Ineligible,
+            current_work_id: Some(work_id.clone()),
+            current_version: None,
+            evidence: vec!["latest review round is incomplete".into()],
+            committed_at: tx.last_seq()?,
+        }));
+    }
+    Ok(Ok((round.clone(), tx.occurrences(&round.id)?)))
+}
+
 fn decide_judge(
     tx: &mut dyn TxView,
+    req: &CommandRequest,
     work_id: &WorkId,
     expected_version: WorkVersion,
-    expected_pr_head: &str,
+    expected_head: &CommitRevision,
     decisions: &[crate::command::FindingDecision],
 ) -> Verdict {
     let work = match check_work(tx, work_id, expected_version)? {
@@ -1118,94 +1597,117 @@ fn decide_judge(
             return Ok((d, vec![]));
         }
     };
-    // The judgment's head must equal the latest head observed in persisted
-    // evidence: a caller-supplied head with no observation is unverifiable,
-    // and a stale one is not the head this judgment is about.
-    let Some(observed) = tx.latest_pr_head(work_id)? else {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::SourceUnavailable,
-                Some(work_id.clone()),
-                vec![format!("no observed PR head for {}", work_id.0)],
-            ),
-            vec![],
-        ));
+    let (round, occurrences) = match current_round_for(tx, work_id, expected_head)? {
+        Ok(pair) => pair,
+        Err(mut d) => {
+            fix_command_id(tx, &mut d);
+            if let CommandDecision::Rejected {
+                current_version, ..
+            } = &mut d
+            {
+                *current_version = Some(work.version);
+            }
+            return Ok((d, vec![]));
+        }
     };
-    if observed != expected_pr_head {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::StalePrHead,
-                Some(work_id.clone()),
-                vec![observed],
-            ),
-            vec![],
-        ));
+    // Exact-set coverage: the decision set must equal the sealed
+    // occurrence id set — omissions and unknown occurrences cannot
+    // quietly pass.
+    let occurrence_ids: BTreeSet<&str> = occurrences.iter().map(|o| o.id.as_str()).collect();
+    let mut decided: BTreeSet<&str> = BTreeSet::new();
+    for d in decisions {
+        if !occurrence_ids.contains(d.occurrence_id.as_str()) {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!("unknown occurrence {}", d.occurrence_id)],
+                ),
+                vec![],
+            ));
+        }
+        if !decided.insert(d.occurrence_id.as_str()) {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!("duplicate occurrence {}", d.occurrence_id)],
+                ),
+                vec![],
+            ));
+        }
+        if matches!(d.choice, FindingChoice::Dismiss | FindingChoice::Accept)
+            && d.rationale.as_deref().unwrap_or("").is_empty()
+        {
+            return Ok((
+                rejected_now(
+                    tx,
+                    RejectionCode::InvalidRequest,
+                    Some(work_id.clone()),
+                    vec![format!(
+                        "occurrence {} requires a rationale for {}",
+                        d.occurrence_id, "dismiss/accept"
+                    )],
+                ),
+                vec![],
+            ));
+        }
     }
-    if decisions.is_empty() {
+    let missing: Vec<&str> = occurrence_ids.difference(&decided).copied().collect();
+    if !missing.is_empty() {
         return Ok((
             rejected_now(
                 tx,
                 RejectionCode::InvalidRequest,
                 Some(work_id.clone()),
-                vec!["judge_findings requires at least one decision".into()],
+                missing
+                    .iter()
+                    .map(|id| format!("undecided occurrence {id}"))
+                    .collect(),
             ),
             vec![],
         ));
     }
-    let mut seen = std::collections::BTreeSet::new();
-    for d in decisions {
-        if !seen.insert(&d.finding_id) {
-            return Ok((
-                rejected_now(
-                    tx,
-                    RejectionCode::InvalidRequest,
-                    Some(work_id.clone()),
-                    vec![format!("duplicate finding_id {}", d.finding_id)],
-                ),
-                vec![],
-            ));
-        }
-        if !matches!(
-            d.choice,
-            FindingChoice::Fix
-                | FindingChoice::Dismiss
-                | FindingChoice::Accept
-                | FindingChoice::Wait
-        ) {
-            return Ok((
-                rejected_now(
-                    tx,
-                    RejectionCode::InvalidRequest,
-                    Some(work_id.clone()),
-                    vec![],
-                ),
-                vec![],
-            ));
-        }
+    if occurrences.is_empty() && !decisions.is_empty() {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::InvalidRequest,
+                Some(work_id.clone()),
+                vec!["decisions for an empty round".into()],
+            ),
+            vec![],
+        ));
     }
     let seq = tx.alloc_seq()?;
+    let judgment = RoundJudgment {
+        id: tx.alloc_id("jdg")?,
+        work_id: work_id.clone(),
+        round_id: round.id.clone(),
+        set_digest: round.set_digest.clone(),
+        decisions: decisions.to_vec(),
+        actor_id: req.actor.external_id.clone(),
+        seq,
+    };
+    let mut next_work = work.clone();
+    next_work.version += 1;
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
         CommandDecision::Accepted {
             command_id,
             work_id: Some(work_id.clone()),
-            work_version: Some(work.version + 1),
+            work_version: Some(next_work.version),
             effect: CommandEffect::StateChanged,
             committed_at: seq,
         },
         vec![
-            Effect::BumpWorkVersion {
-                work_id: work_id.clone(),
+            Effect::UpdateWork {
+                work: next_work,
                 expected: work.version,
-                next: work.version + 1,
             },
-            Effect::InsertJudgment {
-                work_id: work_id.clone(),
-                expected_pr_head: expected_pr_head.to_string(),
-                decisions: decisions.to_vec(),
-            },
+            Effect::InsertRoundJudgment { judgment },
         ],
     ))
 }
@@ -1214,7 +1716,8 @@ fn decide_release_judgment(
     tx: &mut dyn TxView,
     work_id: &WorkId,
     expected_version: WorkVersion,
-    expected_pr_head: &str,
+    expected_head: &CommitRevision,
+    now_unix_seconds: i64,
 ) -> Verdict {
     // Releases the human gate: valid on a paused Execution, requeues it.
     let work = match check_work(tx, work_id, expected_version)? {
@@ -1246,82 +1749,76 @@ fn decide_release_judgment(
             vec![],
         ));
     }
-    // The gate releases only against a recorded judgment for the head the
-    // caller expects; a stale-head release must not requeue the work.
-    let Some((recorded_head, _decisions)) = tx.latest_judgment(work_id)? else {
+    // The gate releases only against a recorded judgment on the sealed
+    // round for the caller's expected head — and that head must still be
+    // the current target, or the pause must not release against a head
+    // the operator never saw.
+    let (round, _) = match current_round_for(tx, work_id, expected_head)? {
+        Ok(pair) => pair,
+        Err(mut d) => {
+            fix_command_id(tx, &mut d);
+            if let CommandDecision::Rejected {
+                current_version, ..
+            } = &mut d
+            {
+                *current_version = Some(work.version);
+            }
+            return Ok((d, vec![]));
+        }
+    };
+    let Some(judgment) = tx.judgment_for_round(&round.id)? else {
         return Ok((
             rejected_now(
                 tx,
                 RejectionCode::Ineligible,
                 Some(work_id.clone()),
-                vec!["no recorded judgment to release".into()],
+                vec!["no recorded judgment on the current round".into()],
             ),
             vec![],
         ));
     };
-    if recorded_head != expected_pr_head {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::StalePrHead,
-                Some(work_id.clone()),
-                vec![recorded_head],
-            ),
-            vec![],
-        ));
-    }
-    // A recorded judgment alone is not sufficient: the head must also be
-    // the one still observed, or the world moved after the judgment and the
-    // pause must not release against a head the operator never saw.
-    let Some(observed) = tx.latest_pr_head(work_id)? else {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::SourceUnavailable,
-                Some(work_id.clone()),
-                vec![format!("no observed PR head for {}", work_id.0)],
-            ),
-            vec![],
-        ));
-    };
-    if observed != expected_pr_head {
-        return Ok((
-            rejected_now(
-                tx,
-                RejectionCode::StalePrHead,
-                Some(work_id.clone()),
-                vec![observed],
-            ),
-            vec![],
-        ));
-    }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Queued;
     next.enqueued_seq = seq;
+    next.pause_reason = None;
+    next.repair_prerequisites = vec![];
+    next.paused_since_unix_seconds = None;
+    // `fix` dispositions route the next admission to the bounded fix
+    // account; terminal dispositions leave the normal Coding role.
+    next.next_role = if judgment
+        .decisions
+        .iter()
+        .any(|d| d.choice == FindingChoice::Fix)
+    {
+        Some(InvocationRole::Fix)
+    } else {
+        None
+    };
+    let mut next_work = work.clone();
+    next_work.version += 1;
+    let mut effects = close_pause_effects(tx, &work, &execution, now_unix_seconds)?;
+    effects.push(Effect::UpdateWork {
+        work: next_work.clone(),
+        expected: work.version,
+    });
+    effects.push(Effect::UpdateExecution {
+        execution: next,
+        expected_state: ExecutionState::Paused,
+    });
+    effects.push(Effect::ClearDeferral {
+        execution_id: execution.id.clone(),
+    });
     let command_id = CommandId(tx.alloc_id("cmd")?);
     Ok((
         CommandDecision::Accepted {
             command_id,
             work_id: Some(work_id.clone()),
-            work_version: Some(work.version + 1),
+            work_version: Some(next_work.version),
             effect: CommandEffect::StateChanged,
             committed_at: seq,
         },
-        vec![
-            Effect::BumpWorkVersion {
-                work_id: work_id.clone(),
-                expected: work.version,
-                next: work.version + 1,
-            },
-            Effect::UpdateExecution {
-                execution: next,
-                expected_state: ExecutionState::Paused,
-            },
-            Effect::ClearDeferral {
-                execution_id: execution.id.clone(),
-            },
-        ],
+        effects,
     ))
 }
 
@@ -1343,21 +1840,22 @@ pub fn admit_queued(
     execution_id: &ExecutionId,
     now_unix_seconds: i64,
 ) -> Result<Option<Execution>, StoreError> {
-    admit_queued_role(
-        tx,
-        config,
-        execution_id,
-        InvocationRole::Coding,
-        now_unix_seconds,
-    )
+    let Some(execution) = tx.execution(execution_id)? else {
+        return Ok(None);
+    };
+    let role = execution
+        .next_role
+        .clone()
+        .unwrap_or(InvocationRole::Coding);
+    admit_queued_role(tx, config, execution_id, role, now_unix_seconds)
 }
 
 /// Admission for one Invocation role: the single seam every request creation
 /// passes, so the budget bounds are enforced no matter which caller emits
-/// the request. A Review admission consumes both counters; a Coding one
-/// consumes only `invocations_used`. The head-bound judgment gate is
-/// rechecked here too, so a judgment recorded for an older PR head can
-/// never authorize a request after the head moves.
+/// the request. A Review admission consumes both counters; a Fix one is
+/// also charged to the Work-wide fix account. The head-bound judgment
+/// gate is rechecked here too, so a judgment recorded for an older target
+/// can never authorize a request after the target moves.
 pub fn admit_queued_role(
     tx: &mut dyn TxView,
     config: &WorkloopConfig,
@@ -1382,6 +1880,21 @@ pub fn admit_queued_role(
     // by partial mutation. No counter increments and no request is emitted.
     if !execution.accepts_invocation(&role) {
         if let Some(limit) = execution.budget_exhaustion(&role) {
+            // An outstanding host write must reconcile before the terminal
+            // outcome is recorded (lifecycle.md): intents are
+            // delivery-bound and the outbox drain would still apply a
+            // pending write under a recorded failure.
+            if !crate::projection::outstanding_actions(tx, &work.id)?.is_empty() {
+                tx.apply(&Effect::RecordDeferral {
+                    execution_id: execution.id.clone(),
+                    reason: "outbox_reconciliation".into(),
+                    diagnostic: format!(
+                        "terminal {} defers until outstanding host writes reconcile",
+                        limit.terminal_code()
+                    ),
+                })?;
+                return Ok(None);
+            }
             fail_terminal(tx, &execution, limit.terminal_code(), &limit.detail())?;
             tx.apply(&Effect::ClearDeferral {
                 execution_id: execution.id.clone(),
@@ -1390,37 +1903,97 @@ pub fn admit_queued_role(
         return Ok(None);
     }
 
-    // The human-judgment gate is bound to the PR head it was decided on: a
-    // judgment recorded while this Execution waited in the queue must not
-    // authorize a worker once the head moves (`PR head changes while
-    // queued`). This rechecks the same persisted evidence `release_judgment`
-    // compared; a head that moved past the recorded judgment needs a fresh
-    // decision, so the Execution pauses without reserving capacity and
-    // without emitting a request.
-    if let Some((judgment_head, _)) = tx.latest_judgment(&work.id)?
-        && let Some(observed) = tx.latest_pr_head(&work.id)?
-        && judgment_head != observed
+    // Source gate: dispatch runs only on approved, matched sources. A
+    // needed check is a deferral (the loop owes a source read); a changed
+    // or unavailable source holds the Execution for repair.
+    match work.source_gate {
+        SourceGate::NotApplicable | SourceGate::Matches => {}
+        SourceGate::NeedsCheck => {
+            tx.apply(&Effect::RecordDeferral {
+                execution_id: execution_id.clone(),
+                reason: "source_check".into(),
+                diagnostic: "awaiting authoritative source read".into(),
+            })?;
+            return Ok(None);
+        }
+        SourceGate::Unavailable => {
+            return pause_for_repair(
+                tx,
+                &execution,
+                "source_unavailable",
+                "source read unavailable; a fresh matching read is required",
+                vec![RepairPrerequisite::SourceRead],
+                now_unix_seconds,
+            );
+        }
+        SourceGate::Changed => {
+            return pause_for_repair(
+                tx,
+                &execution,
+                "source_changed",
+                "source changed after spec approval; a new spec revision and reapproval are required",
+                vec![RepairPrerequisite::SpecReapproval],
+                now_unix_seconds,
+            );
+        }
+    }
+    if work.spec != work.approved_spec {
+        return pause_for_repair(
+            tx,
+            &execution,
+            "spec_unapproved",
+            "current spec is not the approved revision",
+            vec![RepairPrerequisite::SpecReapproval],
+            now_unix_seconds,
+        );
+    }
+
+    // The judgment gate binds the exact sealed target: a judgment recorded
+    // while this Execution waited must not authorize a writer after the
+    // target moves. The gate fails closed whenever the latest sealed round
+    // is not the judged round — a moved head, a moved target branch, or a
+    // grown finding set all supersede the recorded judgment — or when the
+    // judged round's target no longer matches the current diff target.
+    if let Some(judgment) = tx.latest_judgment(&work.id)?
+        && let Some(target) = current_target(tx, &work.id)?
     {
-        let mut next = execution.clone();
-        next.state = ExecutionState::Paused;
-        next.pause_reason = Some(format!(
-            "pr head moved after judgment: decided {judgment_head}, observed {observed}; \
-             a new human judgment is required"
-        ));
-        tx.apply(&Effect::UpdateExecution {
-            execution: next,
-            expected_state: ExecutionState::Queued,
-        })?;
-        tx.apply(&Effect::ClearDeferral {
-            execution_id: execution.id.clone(),
-        })?;
-        return Ok(None);
+        let current = tx
+            .latest_round(&work.id)?
+            .is_some_and(|round| round.id == judgment.round_id && round.target == target);
+        if !current {
+            return pause_for_repair(
+                tx,
+                &execution,
+                "target_moved_after_judgment",
+                "the sealed target the recorded judgment binds no longer matches the current diff target; a new judgment is required",
+                vec![RepairPrerequisite::OperatorDecision],
+                now_unix_seconds,
+            );
+        }
+    }
+
+    // Work-wide fix bound: a fix dispatch beyond the recorded account is a
+    // hold for human action, not another automatic attempt.
+    if role == InvocationRole::Fix {
+        let usage = tx
+            .work_usage(&work.id)?
+            .unwrap_or_else(|| WorkUsage::new(&work.id));
+        if usage.fix_invocations_used >= work.policy.max_fix_invocations {
+            return pause_for_repair(
+                tx,
+                &execution,
+                "fix_budget_exhausted",
+                "Work-wide fix invocation bound reached; human action required",
+                vec![RepairPrerequisite::OperatorDecision],
+                now_unix_seconds,
+            );
+        }
     }
 
     // Atomic recheck: another writer may have claimed since acceptance. A
     // reservation this Execution itself holds (a paused/resumed Execution
     // retains its claims) is already-held, not a conflict.
-    let resources = work_resources(&work, config);
+    let resources = work_resources(&work);
     for res in &resources {
         if let Some(existing) = tx.reservation(&res.key())? {
             if matches!(
@@ -1467,6 +2040,7 @@ pub fn admit_queued_role(
         work_id: work.id.clone(),
         execution_id: execution.id.clone(),
         role: role.clone(),
+        spec_revision: work.spec,
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
     };
     let mut next = execution.clone();
@@ -1481,10 +2055,23 @@ pub fn admit_queued_role(
     if role == InvocationRole::Review {
         next.review_rounds_used += 1;
     }
+    next.next_role = None;
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
         expected_state: ExecutionState::Queued,
     })?;
+    // Work-wide accounting: first dispatch anchors automatic time; a fix
+    // admission charges the fix account.
+    let mut usage = tx
+        .work_usage(&work.id)?
+        .unwrap_or_else(|| WorkUsage::new(&work.id));
+    if usage.first_dispatch_unix_seconds.is_none() {
+        usage.first_dispatch_unix_seconds = Some(now_unix_seconds);
+    }
+    if role == InvocationRole::Fix {
+        usage.fix_invocations_used += 1;
+    }
+    tx.apply(&Effect::UpdateWorkUsage { usage })?;
     if !holds_slot {
         tx.apply(&Effect::ClaimSlot {
             execution_id: execution_id.clone(),
@@ -1510,7 +2097,95 @@ pub fn admit_queued_role(
     tx.apply(&Effect::ClearDeferral {
         execution_id: execution_id.clone(),
     })?;
+    let _ = config;
     Ok(Some(next))
+}
+
+/// Pause a queued Execution for a repairable hold, recording the typed
+/// prerequisites and the immutable recovery decision.
+fn pause_for_repair(
+    tx: &mut dyn TxView,
+    execution: &Execution,
+    classification: &str,
+    detail: &str,
+    prerequisites: Vec<RepairPrerequisite>,
+    now_unix_seconds: i64,
+) -> Result<Option<Execution>, StoreError> {
+    let mut next = execution.clone();
+    next.state = ExecutionState::Paused;
+    next.pause_reason = Some(detail.to_string());
+    next.repair_prerequisites = prerequisites.clone();
+    next.paused_since_unix_seconds = Some(now_unix_seconds);
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: ExecutionState::Queued,
+    })?;
+    tx.apply(&Effect::ClearDeferral {
+        execution_id: execution.id.clone(),
+    })?;
+    let usage = tx
+        .work_usage(&execution.work_id)?
+        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+    let seq = tx.alloc_seq()?;
+    tx.apply(&Effect::InsertRecoveryDecision {
+        decision: RecoveryDecision {
+            id: new_id("rd"),
+            work_id: execution.work_id.clone(),
+            execution_id: Some(execution.id.clone()),
+            classification: classification.into(),
+            signature: None,
+            prerequisites,
+            detail: detail.into(),
+            usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+            seq,
+        },
+    })?;
+    Ok(None)
+}
+
+/// The latest capability state a report recorded for (host, capability);
+/// `None` means no report exists — the capability is unconfirmed.
+fn capability_held(
+    tx: &dyn ReadView,
+    host: &crate::identity::HostInstanceId,
+    capability: &HostCapability,
+) -> Result<bool, StoreError> {
+    Ok(match capability_state(tx, host, capability)? {
+        Some(entry) => entry.usable(),
+        None => false,
+    })
+}
+
+fn capability_state(
+    tx: &dyn ReadView,
+    host: &crate::identity::HostInstanceId,
+    capability: &HostCapability,
+) -> Result<Option<crate::observation::CapabilityEntry>, StoreError> {
+    let mut latest: Option<(i64, usize, crate::observation::CapabilityEntry)> = None;
+    for (index, o) in tx.all_observations()?.iter().enumerate() {
+        if let ObservationFact::CapabilityReport {
+            host: report_host,
+            capabilities,
+        } = &o.fact
+            && report_host == host
+        {
+            for entry in capabilities {
+                if &entry.capability == capability {
+                    let key = (o.observed_unix_seconds, index, entry.clone());
+                    latest = Some(match latest {
+                        Some(old)
+                            if old.0 > o.observed_unix_seconds
+                                || (old.0 == o.observed_unix_seconds && old.1 > index) =>
+                        {
+                            old
+                        }
+                        _ => key,
+                    });
+                }
+            }
+        }
+    }
+    Ok(latest.map(|(_, _, e)| e))
 }
 
 /// What happened to an ingested Observation.
@@ -1522,9 +2197,10 @@ pub enum IngestReceipt {
     Rejected(String),
 }
 
-/// Slice-0 completion policy: a coding Invocation's required artifacts,
-/// an applied `publish_pr` intent, and check + review evidence covering
-/// the same current head produce `succeeded`.
+/// Slice-0+ completion policy: a coding Invocation's required artifacts,
+/// the required stage effects applied (ref published, change request
+/// opened), and check + review + lane evidence covering the same current
+/// target produce `succeeded`.
 pub fn handle_observation(
     store: &impl Store,
     config: &WorkloopConfig,
@@ -1551,13 +2227,12 @@ pub fn handle_observation(
 /// Only the observations dedupe index classifies an insert as a replay;
 /// every other uniqueness violation is a real invariant breach and must
 /// propagate instead of being mistaken for a duplicate delivery. SQLite
-/// reports the violated columns (`observations.source_event_id`), not
-/// the index name.
+/// reports the violated index name for a partial unique index.
 pub fn is_dedupe_conflict(e: &StoreError) -> bool {
     matches!(
         e,
         StoreError::ConstraintConflict { detail }
-            if detail.contains("observations.source_event_id")
+            if detail.contains("observations_dedupe")
     )
 }
 
@@ -1571,31 +2246,61 @@ fn assess(
 ) -> Result<(), StoreError> {
     // Outbox reconciliation is delivery-bound, not execution-bound: the
     // intent's result must be recorded even when no active Execution can
-    // be resolved (e.g. the Execution already went terminal), otherwise a
-    // pending intent blocks the outbox forever.
-    if let ObservationFact::PrActionResult {
-        action_id, result, ..
+    // be resolved, otherwise a pending intent blocks the outbox forever.
+    if let ObservationFact::HostActionResult {
+        action_id,
+        authenticated_actor,
+        status,
+        effects,
     } = &obs.fact
     {
-        let status = match result {
-            ActionResult::Applied => PrActionStatus::Applied,
-            ActionResult::Failed => PrActionStatus::Failed,
-            ActionResult::Unknown => PrActionStatus::Unknown,
-        };
-        tx.apply(&Effect::UpdateActionIntent {
-            action_id: action_id.clone(),
-            status,
-        })?;
+        reconcile_intent(
+            tx,
+            action_id,
+            authenticated_actor.clone(),
+            status.clone(),
+            effects.clone(),
+            now_unix_seconds,
+        )?;
+    }
+    // Source facts move the source gate regardless of execution state.
+    if let ObservationFact::Issue { .. } = &obs.fact
+        && let Some(work_id) = &obs.subject_work_id
+    {
+        assess_source_gate(tx, work_id, now_unix_seconds)?;
+    }
+    // A complete review seals an immutable round; the seal itself bumps
+    // the Work's evidence generation when the occurrence set differs.
+    if let ObservationFact::Review { .. } = &obs.fact
+        && let Some(work_id) = &obs.subject_work_id
+    {
+        seal_round(tx, obs, work_id, now_unix_seconds)?;
+    }
+    // Material progress resets the equivalent-failure streak and stamps
+    // the no-progress clock.
+    if is_material_progress(&obs.fact)
+        && let Some(work_id) = &obs.subject_work_id
+    {
+        let mut usage = tx
+            .work_usage(work_id)?
+            .unwrap_or_else(|| WorkUsage::new(work_id));
+        usage.last_progress_unix_seconds = Some(now_unix_seconds);
+        usage.equivalent_failure_streak = 0;
+        usage.equivalent_signature = None;
+        tx.apply(&Effect::UpdateWorkUsage { usage })?;
     }
     let execution = match (&obs.subject_execution_id, &obs.subject_work_id) {
         (Some(execution_id), _) => tx.execution(execution_id)?,
         (None, Some(work_id))
             if matches!(
                 &obs.fact,
-                ObservationFact::PrChecks { .. }
-                    | ObservationFact::PrReview { .. }
-                    | ObservationFact::PrHead { .. }
-                    | ObservationFact::PrActionResult { .. }
+                ObservationFact::Check { .. }
+                    | ObservationFact::Review { .. }
+                    | ObservationFact::ChangeHead { .. }
+                    | ObservationFact::BranchState { .. }
+                    | ObservationFact::HostActionResult { .. }
+                    | ObservationFact::Issue { .. }
+                    | ObservationFact::Assessment { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -1630,6 +2335,8 @@ fn assess(
                 let mut next = execution.clone();
                 next.state = ExecutionState::Paused;
                 next.pause_reason = Some("repair: launch refused before spawn".into());
+                next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+                next.paused_since_unix_seconds = Some(now_unix_seconds);
                 tx.apply(&Effect::UpdateExecution {
                     execution: next,
                     expected_state: ExecutionState::Ready,
@@ -1643,10 +2350,10 @@ fn assess(
         ObservationFact::Artifact { state, .. } => {
             assess_artifact(tx, config, &execution, state, now_unix_seconds)
         }
-        ObservationFact::PrActionResult { result, .. } => {
+        ObservationFact::HostActionResult { status, .. } => {
             // The intent status was already updated above; only the
             // execution-facing transitions remain.
-            if result == &ActionResult::Applied && execution.state == ExecutionState::Waiting {
+            if status == &HostActionStatus::Applied && execution.state == ExecutionState::Waiting {
                 let mut next = execution.clone();
                 next.waiting_reason = Some(WaitingReason::Ci);
                 tx.apply(&Effect::UpdateExecution {
@@ -1654,17 +2361,32 @@ fn assess(
                     expected_state: execution.state.clone(),
                 })?;
             }
-            if result == &ActionResult::Failed && execution.state == ExecutionState::Waiting {
-                let mut next = execution.clone();
-                next.state = ExecutionState::Paused;
-                next.pause_reason = Some("repair: GitHub action failed after head recheck".into());
-                tx.apply(&Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: execution.state.clone(),
-                })?;
-                tx.apply(&Effect::ReleaseSlot {
-                    execution_id: execution.id.clone(),
-                })?;
+            if matches!(status, HostActionStatus::Failed { .. })
+                && execution.state == ExecutionState::Waiting
+            {
+                // A definite no-effect failure is safe to retry, bounded
+                // by the Work's transport account.
+                let work = tx
+                    .work(&execution.work_id)?
+                    .ok_or_else(|| StoreError::Internal {
+                        detail: "execution without work".into(),
+                    })?;
+                let mut usage = tx
+                    .work_usage(&execution.work_id)?
+                    .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+                usage.transport_retries_used += 1;
+                let over = usage.transport_retries_used > work.policy.transport_max_retries;
+                tx.apply(&Effect::UpdateWorkUsage { usage })?;
+                if over {
+                    pause_waiting(
+                        tx,
+                        &execution,
+                        "transport_exhausted",
+                        "transport retry bound reached; human action required",
+                        vec![RepairPrerequisite::OperatorDecision],
+                        now_unix_seconds,
+                    )?;
+                }
             }
             // A terminal settle that deferred on this outstanding effect
             // may complete now — but only when every writer is already
@@ -1687,12 +2409,539 @@ fn assess(
             }
             Ok(())
         }
+        ObservationFact::Review { .. } => {
+            // A fresh complete round with undecided occurrences pauses
+            // for human judgment.
+            if execution.state == ExecutionState::Waiting
+                && let Some(round) = tx.latest_round(&execution.work_id)?
+                && round.completeness == "complete"
+            {
+                let occurrences = tx.occurrences(&round.id)?;
+                let judged = tx.judgment_for_round(&round.id)?.is_some_and(|j| {
+                    j.decisions
+                        .iter()
+                        .all(|d| matches!(d.choice, FindingChoice::Accept | FindingChoice::Dismiss))
+                });
+                if !occurrences.is_empty() && !judged {
+                    pause_waiting(
+                        tx,
+                        &execution,
+                        "review_findings",
+                        "review findings require human disposition",
+                        vec![RepairPrerequisite::OperatorDecision],
+                        now_unix_seconds,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
         _ => Ok(()),
     }?;
     let Some(current) = tx.execution(&execution.id)? else {
         return Ok(());
     };
     assess_completion(tx, &current)
+}
+
+/// Record the reconciled intent status. `applied` requires a normalized
+/// effect fact matching the intent's immutable payload; an unsupported
+/// `applied` claim is recorded as `unknown` — invalid evidence can never
+/// mark an intent applied.
+fn reconcile_intent(
+    tx: &mut dyn TxView,
+    action_id: &str,
+    authenticated_actor: Option<HostActorRef>,
+    status: HostActionStatus,
+    effects: Vec<NormalizedEffectFact>,
+    _now: i64,
+) -> Result<(), StoreError> {
+    let Some(intent) = tx
+        .action_intents()?
+        .into_iter()
+        .find(|i| i.action_id == action_id)
+    else {
+        return Ok(());
+    };
+    let recorded = match status {
+        HostActionStatus::Applied if effect_matches(&intent, &effects) => HostActionStatus::Applied,
+        HostActionStatus::Applied => HostActionStatus::Unknown {
+            reason: "applied claim carried no matching effect fact".into(),
+        },
+        other => other,
+    };
+    // A receipt authenticated as a different actor than the binding
+    // authorized is invalid evidence — record it as unknown.
+    let recorded = if recorded == HostActionStatus::Applied
+        && authenticated_actor
+            .as_ref()
+            .is_some_and(|a| a != &intent.actor)
+    {
+        HostActionStatus::Unknown {
+            reason: "receipt authenticated a different actor than the binding".into(),
+        }
+    } else {
+        recorded
+    };
+    tx.apply(&Effect::UpdateHostActionIntent {
+        action_id: action_id.to_string(),
+        status: recorded,
+        authenticated_actor,
+        effects,
+    })
+}
+
+/// Whether the receipt's normalized facts contain one matching the
+/// intent's immutable payload.
+fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -> bool {
+    effects.iter().any(|e| match (&intent.action, e) {
+        (
+            HostAction::PushRef {
+                branch, produced, ..
+            },
+            NormalizedEffectFact::RefPublished {
+                repository,
+                branch: ref_branch,
+                produced: ref_produced,
+                observed,
+                relation,
+            },
+        ) => {
+            repository == &intent.repository
+                && ref_branch == branch
+                && ref_produced == produced
+                && observed.repository == produced.repository
+                && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
+        }
+        (
+            HostAction::OpenChangeRequest { source_branch, .. },
+            NormalizedEffectFact::ChangeOpened {
+                change,
+                source_branch: opened_source,
+                ..
+            },
+        ) => change.repository == intent.repository && opened_source == source_branch,
+        (
+            HostAction::UpdateChangeRequest {
+                change,
+                expected_head,
+                ..
+            },
+            NormalizedEffectFact::MetadataUpdated {
+                change: updated,
+                head,
+                ..
+            },
+        ) => updated == change && head == expected_head,
+        (
+            HostAction::PostComment {
+                change,
+                expected_head,
+                marker,
+                ..
+            },
+            NormalizedEffectFact::CommentPosted {
+                change: commented,
+                marker: comment_marker,
+                target,
+                ..
+            },
+        ) => {
+            commented == change
+                && comment_marker == marker
+                && target.as_ref().is_none_or(|t| &t.head == expected_head)
+        }
+        _ => false,
+    })
+}
+
+/// Whether the fact marks material progress (a valid artifact, a
+/// passing check, a landed effect).
+fn is_material_progress(fact: &ObservationFact) -> bool {
+    matches!(
+        fact,
+        ObservationFact::Artifact {
+            state: ArtifactFact::Present { .. },
+            ..
+        } | ObservationFact::Check {
+            conclusion: CheckConclusion::Success,
+            ..
+        } | ObservationFact::HostActionResult {
+            status: HostActionStatus::Applied,
+            ..
+        }
+    )
+}
+
+/// Recompute the source gate from the latest authoritative reads.
+/// `complete` coverage requires every spec source to carry a matching
+/// fresh read; a mismatch holds as `changed` (new spec + reapproval),
+/// an unavailable read holds as `unavailable`.
+fn assess_source_gate(
+    tx: &mut dyn TxView,
+    work_id: &WorkId,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let Some(work) = tx.work(work_id)? else {
+        return Ok(());
+    };
+    if matches!(work.source_gate, SourceGate::NotApplicable) {
+        return Ok(());
+    }
+    let spec = tx
+        .spec(work_id, Some(work.approved_spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "work without approved spec".into(),
+        })?;
+    let observations = tx.observations_for_work(work_id)?;
+    let mut latest: BTreeMap<&IssueRef, (i64, usize, &Observation)> = BTreeMap::new();
+    for (index, o) in observations.iter().enumerate() {
+        if let ObservationFact::Issue { issue, .. } = &o.fact {
+            let replace = latest
+                .get(issue)
+                .is_none_or(|(t, i, _)| (*t, *i) < (o.observed_unix_seconds, index));
+            if replace {
+                latest.insert(issue, (o.observed_unix_seconds, index, o));
+            }
+        }
+    }
+    let mut gate = SourceGate::Matches;
+    for source in &spec.payload.sources {
+        match latest.get(&source.issue) {
+            None => {
+                gate = gate.min_gate(SourceGate::NeedsCheck);
+            }
+            Some((_, _, o)) => match &o.fact {
+                ObservationFact::Issue {
+                    source_revision,
+                    content_digest,
+                    state,
+                    ..
+                } => {
+                    if state == &IssueState::Unavailable {
+                        gate = gate.min_gate(SourceGate::Unavailable);
+                    } else if state == &IssueState::Closed
+                        || source_revision != &source.source_revision
+                        || content_digest != &source.content_digest
+                    {
+                        gate = gate.min_gate(SourceGate::Changed);
+                    }
+                }
+                _ => unreachable!(),
+            },
+        }
+    }
+    if gate != work.source_gate {
+        let mut next_work = work.clone();
+        next_work.source_gate = gate;
+        next_work.version += 1;
+        tx.apply(&Effect::UpdateWork {
+            work: next_work,
+            expected: work.version,
+        })?;
+        // A changed/unavailable source also pauses a queued or running
+        // Execution for repair; `Matches` unblocks through the normal
+        // dispatch scan.
+        if matches!(gate, SourceGate::Changed | SourceGate::Unavailable)
+            && let Some(execution) = tx.active_execution(work_id)?
+            && matches!(
+                execution.state,
+                ExecutionState::Queued
+                    | ExecutionState::Ready
+                    | ExecutionState::Running
+                    | ExecutionState::Waiting
+            )
+        {
+            let (classification, detail, prereq) = match gate {
+                SourceGate::Changed => (
+                    "source_changed",
+                    "source changed after spec approval; a new spec revision and reapproval are required",
+                    RepairPrerequisite::SpecReapproval,
+                ),
+                _ => (
+                    "source_unavailable",
+                    "source read unavailable; a fresh matching read is required",
+                    RepairPrerequisite::SourceRead,
+                ),
+            };
+            let mut next = execution.clone();
+            let expected = next.state.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some(detail.into());
+            next.repair_prerequisites = vec![prereq.clone()];
+            next.paused_since_unix_seconds = Some(now_unix_seconds);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: expected,
+            })?;
+            let usage = tx
+                .work_usage(work_id)?
+                .unwrap_or_else(|| WorkUsage::new(work_id));
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertRecoveryDecision {
+                decision: RecoveryDecision {
+                    id: new_id("rd"),
+                    work_id: work_id.clone(),
+                    execution_id: Some(execution.id.clone()),
+                    classification: classification.into(),
+                    signature: None,
+                    prerequisites: vec![prereq],
+                    detail: detail.into(),
+                    usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                    seq,
+                },
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Seal an immutable review round for a complete review fact. An
+/// identical set on the same target is idempotent; a changed set — the
+/// same-head finding growth case — installs a new round and bumps the
+/// Work's evidence generation.
+fn seal_round(
+    tx: &mut dyn TxView,
+    obs: &Observation,
+    work_id: &WorkId,
+    _now: i64,
+) -> Result<(), StoreError> {
+    let ObservationFact::Review {
+        target,
+        source,
+        source_revision,
+        completeness,
+        occurrences,
+    } = &obs.fact
+    else {
+        return Ok(());
+    };
+    if !completeness.is_complete() {
+        // An incomplete review is recorded as evidence but never seals a
+        // round; it can satisfy nothing.
+        return Ok(());
+    }
+    let mut set_material: Vec<(String, String)> = occurrences
+        .iter()
+        .map(|o| {
+            (
+                o.source_key.clone(),
+                o.content_digest.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    set_material.sort();
+    set_material.dedup();
+    let set_digest = sha256_hex(
+        "round-v1",
+        canonical_json(&serde_json::json!({
+            "target": target,
+            "occurrences": set_material,
+        }))
+        .as_slice(),
+    );
+    if let Some(latest) = tx.latest_round(work_id)?
+        && latest.target == *target
+        && latest.set_digest == set_digest
+        && latest.completeness == "complete"
+    {
+        // Idempotent redelivery of the identical set.
+        return Ok(());
+    }
+    let seq = tx.alloc_seq()?;
+    let generation = tx
+        .latest_round(work_id)?
+        .map(|r| r.generation + 1)
+        .unwrap_or(0);
+    let round = ReviewRound {
+        id: new_id("round"),
+        work_id: work_id.clone(),
+        target: target.clone(),
+        source: source.clone(),
+        source_revision: source_revision.clone(),
+        completeness: match completeness {
+            Completeness::Complete => "complete".to_string(),
+            Completeness::Partial { reason } => format!("partial:{reason}"),
+            Completeness::Unavailable { reason } => format!("unavailable:{reason}"),
+        },
+        set_digest,
+        generation,
+        seq,
+    };
+    let occurrences: Vec<FindingOccurrence> = occurrences
+        .iter()
+        .enumerate()
+        .map(|(i, o)| FindingOccurrence {
+            id: format!("occ-{}-{i}", round.id),
+            round_id: round.id.clone(),
+            source_key: o.source_key.clone(),
+            content_digest: o.content_digest.clone(),
+            severity: o.severity.clone(),
+            position: o.position.clone(),
+            thread_id: o.thread_id.clone(),
+        })
+        .collect();
+    tx.apply(&Effect::InsertReviewRound { round, occurrences })?;
+    // Evidence generation changed: bump the Work version so every
+    // precondition on the old evidence surface is stale.
+    if let Some(work) = tx.work(work_id)? {
+        let mut next_work = work.clone();
+        next_work.version += 1;
+        tx.apply(&Effect::UpdateWork {
+            work: next_work,
+            expected: work.version,
+        })?;
+    }
+    Ok(())
+}
+
+/// A failed check on the current head counts toward the equivalent-
+/// failure bound; reaching it pauses for human action.
+fn assess_check_failure(
+    tx: &mut dyn TxView,
+    execution: &Execution,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
+    let Some(target) = current_target(tx, &work.id)? else {
+        return Ok(());
+    };
+    let observations = tx.observations_for_work(&work.id)?;
+    // The latest conclusion per named check on the current head.
+    let mut latest: BTreeMap<&str, (i64, usize, CheckConclusion)> = BTreeMap::new();
+    for (index, o) in observations.iter().enumerate() {
+        if let ObservationFact::Check {
+            change,
+            head,
+            check_id,
+            conclusion,
+            ..
+        } = &o.fact
+            && change == &target.change
+            && head == &target.head
+        {
+            let replace = latest
+                .get(check_id.as_str())
+                .is_none_or(|(t, i, _)| (*t, *i) < (o.observed_unix_seconds, index));
+            if replace {
+                latest.insert(
+                    check_id.as_str(),
+                    (o.observed_unix_seconds, index, conclusion.clone()),
+                );
+            }
+        }
+    }
+    // Equivalent-failure signature: stage + stable criterion + category.
+    let spec = tx.spec(&work.id, Some(work.approved_spec))?;
+    let Some(spec) = spec else { return Ok(()) };
+    for check_id in &spec.payload.required_checks {
+        if latest
+            .get(check_id.as_str())
+            .is_some_and(|(_, _, c)| c == &CheckConclusion::Failure)
+        {
+            let signature = format!("check:{check_id}:failure");
+            let mut usage = tx
+                .work_usage(&work.id)?
+                .unwrap_or_else(|| WorkUsage::new(&work.id));
+            if usage.equivalent_signature.as_deref() == Some(signature.as_str()) {
+                usage.equivalent_failure_streak += 1;
+            } else {
+                usage.equivalent_failure_streak = 1;
+                usage.equivalent_signature = Some(signature.clone());
+            }
+            let over = usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit;
+            tx.apply(&Effect::UpdateWorkUsage { usage })?;
+            if over
+                && matches!(
+                    execution.state,
+                    ExecutionState::Queued
+                        | ExecutionState::Ready
+                        | ExecutionState::Running
+                        | ExecutionState::Waiting
+                )
+            {
+                let mut next = execution.clone();
+                let expected = next.state.clone();
+                next.state = ExecutionState::Paused;
+                next.pause_reason = Some(format!(
+                    "equivalent failures for {check_id} reached the policy limit"
+                ));
+                next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+                next.paused_since_unix_seconds = Some(now_unix_seconds);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: expected,
+                })?;
+                let usage = tx
+                    .work_usage(&work.id)?
+                    .unwrap_or_else(|| WorkUsage::new(&work.id));
+                let seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertRecoveryDecision {
+                    decision: RecoveryDecision {
+                        id: new_id("rd"),
+                        work_id: work.id.clone(),
+                        execution_id: Some(execution.id.clone()),
+                        classification: "equivalent_failure".into(),
+                        signature: Some(signature),
+                        prerequisites: vec![RepairPrerequisite::OperatorDecision],
+                        detail: format!(
+                            "equivalent failures for {check_id} reached the policy limit"
+                        ),
+                        usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                        seq,
+                    },
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pause a waiting Execution for repair: releases the compute slot but
+/// retains resource reservations (the writer's effects may still be
+/// outstanding).
+fn pause_waiting(
+    tx: &mut dyn TxView,
+    execution: &Execution,
+    classification: &str,
+    detail: &str,
+    prerequisites: Vec<RepairPrerequisite>,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let mut next = execution.clone();
+    next.state = ExecutionState::Paused;
+    next.pause_reason = Some(detail.to_string());
+    next.repair_prerequisites = prerequisites.clone();
+    next.paused_since_unix_seconds = Some(now_unix_seconds);
+    tx.apply(&Effect::UpdateExecution {
+        execution: next,
+        expected_state: execution.state.clone(),
+    })?;
+    tx.apply(&Effect::ReleaseSlot {
+        execution_id: execution.id.clone(),
+    })?;
+    let usage = tx
+        .work_usage(&execution.work_id)?
+        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+    let seq = tx.alloc_seq()?;
+    tx.apply(&Effect::InsertRecoveryDecision {
+        decision: RecoveryDecision {
+            id: new_id("rd"),
+            work_id: execution.work_id.clone(),
+            execution_id: Some(execution.id.clone()),
+            classification: classification.into(),
+            signature: None,
+            prerequisites,
+            detail: detail.into(),
+            usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+            seq,
+        },
+    })?;
+    Ok(())
 }
 
 fn mark_invocation(
@@ -1817,9 +3066,9 @@ fn settle_after_writer_gone(
         .clone()
         .unwrap_or(DesiredAction::Fail);
     // Terminal settlement waits for outstanding outbox effects to
-    // reconcile (lifecycle.md): a pending or unknown GitHub write must
+    // reconcile (lifecycle.md): a pending or unknown host write must
     // not be drained after a recorded cancellation/failure. The
-    // `pr_action_result` observation re-drives this settle once the
+    // `host_action_result` observation re-drives this settle once the
     // intent is resolved.
     if matches!(desired, DesiredAction::Cancel | DesiredAction::Fail)
         && !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty()
@@ -1856,6 +3105,8 @@ fn settle_after_writer_gone(
         DesiredAction::Continue => {
             next.state = ExecutionState::Paused;
             next.pause_reason = Some("recoverable_stop".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(now_unix_seconds);
             false
         }
     };
@@ -1869,20 +3120,17 @@ fn settle_after_writer_gone(
         execution_id: execution.id.clone(),
     })?;
     if release_reservations {
-        let work = tx
-            .work(&execution.work_id)?
-            .ok_or_else(|| StoreError::Internal {
-                detail: "execution without work".into(),
-            })?;
         tx.apply(&Effect::DeleteReservations {
-            resource_keys: resources_keys_of(tx, &work, execution)?,
+            resource_keys: resources_keys_of(tx, execution)?,
             holder: ReservationHolder::Execution {
                 execution_id: execution.id.clone(),
             },
         })?;
+        tx.apply(&Effect::ReleaseIssueClaims {
+            work_id: execution.work_id.clone(),
+        })?;
     }
     let _ = config;
-    let _ = now_unix_seconds;
     Ok(())
 }
 
@@ -1896,7 +3144,7 @@ fn assess_artifact(
     match state {
         // Required evidence missing after a confirmed exit → bounded
         // recovery. The deadline is durable from the first transition in.
-        ArtifactFact::Missing | ArtifactFact::Corrupt
+        ArtifactFact::Missing | ArtifactFact::Corrupt { .. }
             if execution.state == ExecutionState::Waiting
                 || execution.state == ExecutionState::Running =>
         {
@@ -1912,7 +3160,7 @@ fn assess_artifact(
                 expected_state: execution.state.clone(),
             })
         }
-        ArtifactFact::Present
+        ArtifactFact::Present { .. }
             if execution.state == ExecutionState::Waiting
                 || execution.state == ExecutionState::Running =>
         {
@@ -1922,11 +3170,13 @@ fn assess_artifact(
     }
 }
 
-/// Once the coding Invocation's evidence is complete, record the publish
-/// intent — the outbox row exists before any GitHub write is attempted.
+/// Once the coding Invocation's evidence is complete, record the next
+/// stage effect intent — the outbox row exists before any host write is
+/// attempted. Stage effects chain on each other's receipts: `push_ref`
+/// first, then `open_change_request` once the ref is published.
 fn maybe_publish(
     tx: &mut dyn TxView,
-    config: &WorkloopConfig,
+    _config: &WorkloopConfig,
     execution: &Execution,
     _now_unix_seconds: i64,
 ) -> Result<(), StoreError> {
@@ -1940,24 +3190,15 @@ fn maybe_publish(
     let Some(latest) = invocations.last() else {
         return Ok(());
     };
-    if latest.state != InvocationState::Done
-        || !crate::projection::artifacts_complete(tx, &execution.id, latest)?
-    {
+    if latest.state != InvocationState::Done {
+        return Ok(());
+    }
+    let artifact_digests = artifact_digests(tx, &execution.id, latest)?;
+    if artifact_digests.is_empty() {
         return Ok(());
     }
     let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
     if !outstanding.is_empty() {
-        return Ok(());
-    }
-    // An already-recorded publish intent covers this Work — applied,
-    // pending, or unresolved — so a repeated artifact observation must
-    // not queue a second PR. Only a failed intent lets a fresh pass
-    // re-issue after repair.
-    if tx.action_intents()?.iter().any(|i| {
-        i.work_id == execution.work_id
-            && matches!(i.action, PrAction::PublishPr { .. })
-            && i.status != PrActionStatus::Failed
-    }) {
         return Ok(());
     }
     let work = tx
@@ -1965,36 +3206,175 @@ fn maybe_publish(
         .ok_or_else(|| StoreError::Internal {
             detail: "execution without work".into(),
         })?;
-    let repository = work
-        .issue_refs
-        .first()
-        .map(|r| r.repository.clone())
-        .unwrap_or_else(|| config.default_repository.clone());
-    let action_id = tx.alloc_id("act")?;
-    tx.apply(&Effect::InsertPrActionIntent {
-        intent: PrActionIntent {
-            action_id,
-            work_id: work.id.clone(),
-            repository,
-            action: PrAction::PublishPr {
-                branch: format!("work/{}", work.id.0),
-                title: work.intent.chars().take(70).collect(),
-                body: String::new(),
+    let intents = tx.action_intents()?;
+    let work_intents: Vec<&HostActionIntent> =
+        intents.iter().filter(|i| i.work_id == work.id).collect();
+    // Stage 1: push_ref. Produced revision = the published artifact's
+    // digest interpreted as an object id on the bound repository.
+    let branch = format!("work/{}", work.id.0);
+    let push = work_intents
+        .iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }));
+    let push_applied = push.is_some_and(|i| i.status == HostActionStatus::Applied);
+    if !push_applied {
+        if push.is_some_and(|i| matches!(i.status, HostActionStatus::Failed { .. })) {
+            // Re-issue is allowed only while the transport account has
+            // retries left (the receipt handler pauses when spent).
+            let usage = tx
+                .work_usage(&work.id)?
+                .unwrap_or_else(|| WorkUsage::new(&work.id));
+            if usage.transport_retries_used > work.policy.transport_max_retries {
+                return Ok(());
+            }
+        }
+        let produced =
+            CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
+                .map_err(|e| StoreError::Internal { detail: e })?;
+        return record_intent(
+            tx,
+            &work,
+            ActorRole::Publication,
+            HostAction::PushRef {
+                branch: branch.clone(),
+                produced,
             },
-            status: PrActionStatus::Pending,
+            execution,
+        );
+    }
+    // Stage 2: open_change_request once the ref is published.
+    let opened = work_intents.iter().any(|i| {
+        matches!(i.action, HostAction::OpenChangeRequest { .. })
+            && i.status == HostActionStatus::Applied
+    });
+    if opened {
+        return Ok(());
+    }
+    if work_intents.iter().any(|i| {
+        matches!(i.action, HostAction::OpenChangeRequest { .. })
+            && !matches!(i.status, HostActionStatus::Failed { .. })
+    }) {
+        // A pending/unknown open intent is outstanding; wait for its receipt.
+        return Ok(());
+    }
+    let spec = tx
+        .spec(&work.id, Some(work.approved_spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "work without spec".into(),
+        })?;
+    record_intent(
+        tx,
+        &work,
+        ActorRole::Publication,
+        HostAction::OpenChangeRequest {
+            source_branch: branch,
+            target_branch: "main".into(),
+            title: spec.payload.intent.chars().take(70).collect(),
+            body: String::new(),
+        },
+        execution,
+    )
+}
+
+/// Record one stage effect intent. The capability guard runs here — an
+/// effect is only authorized when the latest capability report holds
+/// the required capability; missing, denied, or unknown reports record
+/// nothing and the Execution keeps waiting.
+fn record_intent(
+    tx: &mut dyn TxView,
+    work: &Work,
+    role: ActorRole,
+    action: HostAction,
+    execution: &Execution,
+) -> Result<(), StoreError> {
+    let capability = action_capability(&action);
+    if !capability_held(tx, &work.binding.repository.host, &capability)? {
+        // The capability is unconfirmed or denied: the effect is not
+        // authorized. Keep waiting for a report (or a repair decision);
+        // never record an unauthorized intent.
+        return Ok(());
+    }
+    let actor = work
+        .binding
+        .actor_for(role)
+        .ok_or_else(|| StoreError::Internal {
+            detail: format!("binding has no actor for role {}", role.name()),
+        })?
+        .clone();
+    let payload = serde_json::to_value(&action).unwrap_or_default();
+    let seq = tx.alloc_seq()?;
+    tx.apply(&Effect::InsertHostActionIntent {
+        intent: HostActionIntent {
+            action_id: new_id("act"),
+            work_id: work.id.clone(),
+            host: work.binding.repository.host.clone(),
+            repository: work.binding.repository.clone(),
+            role,
+            actor,
+            action,
+            payload_digest: sha256_hex("intent-v1", &canonical_json(&payload)),
+            status: HostActionStatus::Pending,
+            authenticated_actor: None,
+            effects: vec![],
+            created_seq: seq,
         },
     })?;
     let mut next = execution.clone();
-    next.waiting_reason = Some(WaitingReason::GithubWrite);
+    next.waiting_reason = Some(WaitingReason::HostWrite);
     tx.apply(&Effect::UpdateExecution {
         execution: next,
         expected_state: execution.state.clone(),
     })
 }
 
-/// `succeeded` requires an applied `publish_pr` intent, the latest check +
-/// review evidence covering the current head, and no unresolved writer,
-/// gate, or outgoing action.
+/// The digests of `Present` artifacts covering every required artifact
+/// of the invocation; empty when the set is not yet complete and valid.
+/// A `Present` fact with a missing or mismatched digest is invalid and
+/// never completes the set.
+fn artifact_digests(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    invocation: &Invocation,
+) -> Result<Vec<String>, StoreError> {
+    let observations = tx.observations_for_execution(execution_id)?;
+    let mut digests = Vec::new();
+    for required in &invocation.required_artifacts {
+        let mut latest: Option<(i64, usize, &ArtifactFact)> = None;
+        for (index, o) in observations.iter().enumerate() {
+            if let ObservationFact::Artifact {
+                invocation_id,
+                required_artifact,
+                state,
+            } = &o.fact
+                && invocation_id == &invocation.id
+                && required_artifact == &required.kind
+            {
+                let replace =
+                    latest.is_none_or(|(t, i, _)| (t, i) < (o.observed_unix_seconds, index));
+                if replace {
+                    latest = Some((o.observed_unix_seconds, index, state));
+                }
+            }
+        }
+        match latest {
+            Some((_, _, ArtifactFact::Present { digest }))
+                if !digest.is_empty()
+                    && required
+                        .expected_digest
+                        .as_ref()
+                        .is_none_or(|expected| expected == digest) =>
+            {
+                digests.push(digest.clone())
+            }
+            _ => return Ok(vec![]),
+        }
+    }
+    Ok(digests)
+}
+
+/// `succeeded` requires the required stage effects applied, the declared
+/// checks passing on the current target, the enabled lanes satisfied by
+/// their exact evidence, and no unresolved writer, gate, or outgoing
+/// action. Evidence references are typed and nonempty.
 fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), StoreError> {
     if execution.state != ExecutionState::Waiting {
         return Ok(());
@@ -2005,60 +3385,138 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
     }
-    if !invocations
-        .iter()
-        .any(|i| i.role == InvocationRole::Coding && i.state == InvocationState::Done)
-    {
+    if !invocations.iter().any(|i| {
+        matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
+            && i.state == InvocationState::Done
+    }) {
         return Ok(());
     }
     for invocation in &invocations {
         if invocation.state == InvocationState::Done
-            && !crate::projection::artifacts_complete(tx, &execution.id, invocation)?
+            && artifact_digests(tx, &execution.id, invocation)?.is_empty()
         {
             return Ok(());
         }
     }
-    // Completion means the change was published as one PR; success
-    // evidence before (or without) an applied publish intent is early.
-    let published = tx.action_intents()?.iter().any(|i| {
-        i.work_id == execution.work_id
-            && matches!(i.action, PrAction::PublishPr { .. })
-            && i.status == PrActionStatus::Applied
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
+    let spec = tx
+        .spec(&work.id, Some(work.approved_spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "work without spec".into(),
+        })?;
+    // Required stage effects: a `push_ref` whose receipt proves the
+    // produced revision landed, and an `open_change_request` whose
+    // receipt opened the change. Both must be `applied` with matching
+    // normalized facts — recorded at receipt time.
+    let intents = tx.action_intents()?;
+    let push_applied = intents.iter().any(|i| {
+        i.work_id == work.id
+            && matches!(i.action, HostAction::PushRef { .. })
+            && i.status == HostActionStatus::Applied
     });
-    if !published {
+    let open_applied = intents.iter().any(|i| {
+        i.work_id == work.id
+            && matches!(i.action, HostAction::OpenChangeRequest { .. })
+            && i.status == HostActionStatus::Applied
+    });
+    if !(push_applied && open_applied) {
         return Ok(());
     }
-    let observations = tx.observations_for_work(&execution.work_id)?;
-    // Same observed-time-ordered provenance the judgment gate compares, so
-    // completion and judge/release always measure against one head.
-    let Some(head) = tx.latest_pr_head(&execution.work_id)? else {
+    if intents.iter().any(|i| {
+        i.work_id == work.id
+            && matches!(
+                i.status,
+                HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+            )
+    }) {
+        return Ok(());
+    }
+    let Some(target) = current_target(tx, &work.id)? else {
         return Ok(());
     };
-    // Only the latest check and review recorded for the current head
-    // count, ranked by observed time (later insertion breaks ties) — a
-    // superseded approval must not complete the work, and a delayed
-    // delivery observed earlier must not outrank newer evidence.
-    let checks_ok = latest_observed_ok(&observations, |fact| match fact {
-        ObservationFact::PrChecks {
-            head_sha,
+    let observations = tx.observations_for_work(&work.id)?;
+    // Declared checks: latest conclusion per named check on the current
+    // head must be `success`.
+    let mut checks: BTreeMap<&str, (i64, usize, CheckConclusion)> = BTreeMap::new();
+    for (index, o) in observations.iter().enumerate() {
+        if let ObservationFact::Check {
+            change,
+            head,
+            check_id,
             conclusion,
             ..
-        } if head_sha == &head => Some(conclusion == &CheckConclusion::Success),
-        _ => None,
-    })
-    .unwrap_or(false);
-    let review_ok = latest_observed_ok(&observations, |fact| match fact {
-        ObservationFact::PrReview {
-            head_sha, verdict, ..
-        } if head_sha == &head => Some(verdict == &ReviewVerdict::Approve),
-        _ => None,
-    })
-    .unwrap_or(false);
-    if !(checks_ok && review_ok) {
-        return Ok(());
+        } = &o.fact
+            && change == &target.change
+            && head == &target.head
+        {
+            let replace = checks
+                .get(check_id.as_str())
+                .is_none_or(|(t, i, _)| (*t, *i) < (o.observed_unix_seconds, index));
+            if replace {
+                checks.insert(
+                    check_id.as_str(),
+                    (o.observed_unix_seconds, index, conclusion.clone()),
+                );
+            }
+        }
     }
-    if !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty() {
-        return Ok(());
+    for check_id in &spec.payload.required_checks {
+        if !checks
+            .get(check_id.as_str())
+            .is_some_and(|(_, _, c)| c == &CheckConclusion::Success)
+        {
+            return Ok(());
+        }
+    }
+    // Review lane: the current sealed complete round for this target has
+    // zero occurrences, or every occurrence is dispositioned
+    // accept/dismiss in a judgment on that round.
+    if spec.payload.lanes.code_review {
+        let Some(round) = tx.latest_round(&work.id)? else {
+            return Ok(());
+        };
+        if round.target != target || round.completeness != "complete" {
+            return Ok(());
+        }
+        let occurrences = tx.occurrences(&round.id)?;
+        if !occurrences.is_empty() {
+            let Some(judgment) = tx.judgment_for_round(&round.id)? else {
+                return Ok(());
+            };
+            let all_resolved = judgment
+                .decisions
+                .iter()
+                .all(|d| matches!(d.choice, FindingChoice::Accept | FindingChoice::Dismiss));
+            if !all_resolved {
+                return Ok(());
+            }
+        }
+    }
+    // Invariant lane: a complete assessment on the current target whose
+    // every item is positive. Disabled lanes count nothing either way.
+    if spec.payload.lanes.invariant_check {
+        let ok = observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Assessment {
+                    target: t,
+                    complete: true,
+                    items,
+                    ..
+                } if t == &target
+                    && !items.is_empty()
+                    && items.iter().all(|i| {
+                        i.verdict == crate::observation::AssessmentVerdict::Positive
+                    })
+            )
+        });
+        if !ok {
+            return Ok(());
+        }
     }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
@@ -2067,8 +3525,8 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     next.outcome = Some(Outcome {
         state: ExecutionState::Succeeded,
         code: Some("succeeded".into()),
-        detail: Some(format!("verified head {head}")),
-        evidence_refs: vec![],
+        detail: Some(format!("verified target {}", target.head)),
+        evidence_refs: completion_evidence(tx, &work, &spec, execution, &target)?,
         recorded_seq: seq,
     });
     tx.apply(&Effect::UpdateExecution {
@@ -2078,35 +3536,73 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     tx.apply(&Effect::ReleaseSlot {
         execution_id: execution.id.clone(),
     })?;
-    let work = tx
-        .work(&execution.work_id)?
-        .ok_or_else(|| StoreError::Internal {
-            detail: "execution without work".into(),
-        })?;
     tx.apply(&Effect::DeleteReservations {
-        resource_keys: resources_keys_of(tx, &work, execution)?,
+        resource_keys: resources_keys_of(tx, execution)?,
         holder: ReservationHolder::Execution {
             execution_id: execution.id.clone(),
         },
     })?;
+    tx.apply(&Effect::ReleaseIssueClaims {
+        work_id: work.id.clone(),
+    })?;
     Ok(())
 }
 
-/// Latest classification by observed time among `classify` matches, with
-/// the store's insertion order (`observations_for_work`'s `ORDER BY id`)
-/// breaking ties — the same `observed_unix_seconds DESC, id DESC` rule
-/// `latest_pr_head` uses, so a delayed delivery inserted later but
-/// observed earlier never outranks newer evidence.
-fn latest_observed_ok(
-    observations: &[Observation],
-    classify: impl Fn(&ObservationFact) -> Option<bool>,
-) -> Option<bool> {
-    observations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, o)| classify(&o.fact).map(|ok| ((o.observed_unix_seconds, index), ok)))
-        .max_by_key(|(key, _)| *key)
-        .map(|(_, ok)| ok)
+/// The typed evidence references a success Outcome must carry: the
+/// approved spec, each valid artifact, each applied stage effect, the
+/// current-target check and round/assessment records.
+fn completion_evidence(
+    tx: &dyn ReadView,
+    work: &Work,
+    spec: &SpecSnapshot,
+    execution: &Execution,
+    target: &DiffTarget,
+) -> Result<Vec<EvidenceRef>, StoreError> {
+    let mut refs = vec![
+        EvidenceRef {
+            id: format!("spec:{}:{}", work.id.0, spec.revision),
+            digest: spec.digest.clone(),
+        },
+        EvidenceRef {
+            id: format!("target:{}", work.id.0),
+            digest: sha256_hex(
+                "target-v1",
+                &canonical_json(&serde_json::to_value(target).unwrap_or_default()),
+            ),
+        },
+    ];
+    for invocation in tx.invocations_for_execution(&execution.id)? {
+        if invocation.state != InvocationState::Done {
+            continue;
+        }
+        for (required, digest) in invocation
+            .required_artifacts
+            .iter()
+            .zip(artifact_digests(tx, &execution.id, &invocation)?.iter())
+        {
+            refs.push(EvidenceRef {
+                id: format!("artifact:{}:{}", invocation.id.0, required.kind),
+                digest: digest.clone(),
+            });
+        }
+    }
+    for intent in tx.action_intents()? {
+        if intent.work_id == work.id && intent.status == HostActionStatus::Applied {
+            refs.push(EvidenceRef {
+                id: format!("action:{}", intent.action_id),
+                digest: intent.payload_digest.clone(),
+            });
+        }
+    }
+    if let Some(round) = tx.latest_round(&work.id)?
+        && round.target == *target
+    {
+        refs.push(EvidenceRef {
+            id: format!("round:{}", round.id),
+            digest: round.set_digest.clone(),
+        });
+    }
+    Ok(refs)
 }
 
 /// The internal dispatch scan: queued Executions in committed enqueue
@@ -2157,8 +3653,9 @@ pub fn dispatch_once(
 }
 
 /// Timed decisions the loop owes the store: runtime limits, recovery
-/// bounds, and budget exhaustion. Each is a committed decision checked
-/// against the stored limit and the observed clock — never silent.
+/// bounds, the Work-wide automatic-time ceiling, and budget exhaustion.
+/// Each is a committed decision checked against the stored limit and
+/// the observed clock — never silent.
 pub fn sweep(
     store: &impl Store,
     config: &WorkloopConfig,
@@ -2199,6 +3696,7 @@ pub fn sweep(
                             execution: next,
                             expected_state: execution.state.clone(),
                         })?;
+                        continue;
                     }
                 }
                 ExecutionState::Queued => {
@@ -2206,6 +3704,49 @@ pub fn sweep(
                     // none configured. Queue time never consumes runtime.
                 }
                 _ => {}
+            }
+            // The Work-wide automatic-time ceiling: cumulative automatic
+            // seconds across the whole Execution chain. It supplements
+            // the per-Execution runtime bound and prohibits new attempts;
+            // it does not itself establish termination.
+            if matches!(
+                execution.state,
+                ExecutionState::Queued
+                    | ExecutionState::Ready
+                    | ExecutionState::Running
+                    | ExecutionState::Waiting
+            ) {
+                let work = tx.work(&execution.work_id)?;
+                let usage = tx.work_usage(&execution.work_id)?;
+                if let (Some(work), Some(usage)) = (work, usage)
+                    && let Some(first) = usage.first_dispatch_unix_seconds
+                {
+                    let automatic = (now_unix_seconds - first).max(0) as u64
+                        - usage
+                            .human_wait_seconds_total
+                            .min((now_unix_seconds - first).max(0) as u64);
+                    if automatic > work.policy.automatic_time_limit_seconds {
+                        match execution.state {
+                            ExecutionState::Queued => {
+                                fail_terminal(
+                                    tx,
+                                    &execution,
+                                    "automatic_time_exhausted",
+                                    "Work-wide automatic time limit reached",
+                                )?;
+                            }
+                            _ => {
+                                let mut next = execution.clone();
+                                next.state = ExecutionState::Stopping;
+                                next.desired_action = Some(DesiredAction::Fail);
+                                tx.apply(&Effect::UpdateExecution {
+                                    execution: next,
+                                    expected_state: execution.state.clone(),
+                                })?;
+                            }
+                        }
+                    }
+                }
             }
         }
         let _ = config;
@@ -2219,20 +3760,14 @@ fn fail_terminal(
     code: &str,
     detail: &str,
 ) -> Result<(), StoreError> {
-    // Terminal failure also waits for outstanding outbox effects to
-    // reconcile (lifecycle.md); the next sweep or admission pass
-    // re-checks once the intent is resolved.
-    if !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty() {
-        return Ok(());
-    }
     let seq = tx.alloc_seq()?;
     let mut next = execution.clone();
     next.state = ExecutionState::Failed;
-    next.terminal_code = Some(code.into());
+    next.terminal_code = Some(code.to_string());
     next.outcome = Some(Outcome {
         state: ExecutionState::Failed,
-        code: Some(code.into()),
-        detail: Some(detail.into()),
+        code: Some(code.to_string()),
+        detail: Some(detail.to_string()),
         evidence_refs: vec![],
         recorded_seq: seq,
     });
@@ -2243,15 +3778,29 @@ fn fail_terminal(
     tx.apply(&Effect::ReleaseSlot {
         execution_id: execution.id.clone(),
     })?;
-    let work = tx
-        .work(&execution.work_id)?
-        .ok_or_else(|| StoreError::Internal {
-            detail: "execution without work".into(),
-        })?;
     tx.apply(&Effect::DeleteReservations {
-        resource_keys: resources_keys_of(tx, &work, execution)?,
+        resource_keys: resources_keys_of(tx, execution)?,
         holder: ReservationHolder::Execution {
             execution_id: execution.id.clone(),
+        },
+    })?;
+    tx.apply(&Effect::ReleaseIssueClaims {
+        work_id: execution.work_id.clone(),
+    })?;
+    let usage = tx
+        .work_usage(&execution.work_id)?
+        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+    tx.apply(&Effect::InsertRecoveryDecision {
+        decision: RecoveryDecision {
+            id: new_id("rd"),
+            work_id: execution.work_id.clone(),
+            execution_id: Some(execution.id.clone()),
+            classification: "budget".into(),
+            signature: None,
+            prerequisites: vec![],
+            detail: format!("{code}: {detail}"),
+            usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+            seq,
         },
     })?;
     Ok(())

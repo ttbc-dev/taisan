@@ -43,7 +43,8 @@ fn usage() -> &'static str {
   refresh            re-query work_list/capacity/attention and redraw the board
   open <work|n>      open a Work by id or board row number; shows detail+findings
   judge              start a judgment over the open work's head-scoped findings
-  pick <n> <choice>  decide one finding: fix | dismiss | accept | wait
+  pick <n> <choice> [rationale]  decide one finding: fix | dismiss | accept | wait
+                     (dismiss/accept require a rationale)
   cancel|retry|resume|release   arm that Command on the open work
   ack <attention_id> arm an acknowledge Command
   preview            advisory preflight of the armed request (work::preview)
@@ -150,20 +151,25 @@ fn dispatch<S: Store>(
         "pick" => {
             let n: usize = rest
                 .first()
-                .ok_or("pick <n> <choice>")?
+                .ok_or("pick <n> <choice> [rationale]")?
                 .parse()
                 .map_err(|_| "pick <n>: n must be a number".to_string())?;
-            let choice = parse_choice(rest.get(1).ok_or("pick <n> <choice>")?)?;
-            let finding_id = {
+            let choice = parse_choice(rest.get(1).ok_or("pick <n> <choice> [rationale]")?)?;
+            let rationale = if rest.len() > 2 {
+                Some(rest[2..].join(" "))
+            } else {
+                None
+            };
+            let occurrence_id = {
                 let draft = session.draft().ok_or("run judge first")?;
                 draft
                     .findings
                     .get(n.wrapping_sub(1))
                     .ok_or_else(|| format!("no finding #{n} in the displayed set"))?
-                    .finding_id
+                    .occurrence_id
                     .clone()
             };
-            session.choose(&finding_id, choice)?;
+            session.choose(&occurrence_id, choice, rationale)?;
             println!("{}", render::draft_frame(session.draft().expect("draft")));
         }
         "cancel" | "retry" | "resume" | "release" => {
@@ -191,7 +197,7 @@ fn dispatch<S: Store>(
                 if let CommandDecision::Rejected { reason, .. } = &decision
                     && matches!(
                         reason,
-                        workloop_core::command::RejectionCode::StalePrHead
+                        workloop_core::command::RejectionCode::StaleHead
                             | workloop_core::command::RejectionCode::StaleWorkVersion
                     )
                 {

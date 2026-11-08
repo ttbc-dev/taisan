@@ -2,23 +2,39 @@
 //! stop / recovery paths over real processes (`docs/v0.1.md`: Launch,
 //! Stop proof, Recovery rows).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{
-    ActionResult, ArtifactFact, Observation, ObservationFact, ProcessStateFact,
-};
+use workloop_core::identity::*;
+use workloop_core::observation::*;
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, HostAction, Store};
 use workloop_core::work::{
-    WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
+    HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
 };
 use workloop_exec::supervisor::{PosixProcessControl, StopRecord, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
+
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn artifact(kind: &str) -> RequiredArtifact {
+    RequiredArtifact {
+        kind: kind.into(),
+        path: kind.into(),
+        expected_digest: None,
+    }
+}
 
 fn fixture_bin() -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,10 +52,32 @@ fn tmp_root(tag: &str) -> PathBuf {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host: host(),
+                    actor: HostActorId::trusted("pub-agent"),
+                },
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: true,
             network: false,
         },
         budget: ExecutionBudget {
@@ -47,7 +85,41 @@ fn config() -> WorkloopConfig {
             artifact_recovery_seconds: 60,
             ..ExecutionBudget::default()
         },
+        policy: WorkPolicy::default(),
     }
+}
+
+/// A `publish` stage effect is recorded only under an authorized
+/// capability — the supervisor tests grant the fixture host the
+/// publication capabilities once per store.
+fn authorize(store: &SqliteStore) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: None,
+            fact: ObservationFact::CapabilityReport {
+                host: host(),
+                capabilities: vec![
+                    CapabilityEntry {
+                        capability: HostCapability::PushRef,
+                        support: CapabilityState::Supported,
+                        authorization: CapabilityState::Authorized,
+                    },
+                    CapabilityEntry {
+                        capability: HostCapability::ChangeRequestCreate,
+                        support: CapabilityState::Supported,
+                        authorization: CapabilityState::Authorized,
+                    },
+                ],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
 }
 
 fn actor() -> Actor {
@@ -71,10 +143,7 @@ fn submit(key: &str) -> CommandRequest {
         key,
         CommandBody::Submit {
             intent: "do the thing".into(),
-            issue_refs: vec![GitHubIssueRef {
-                repository: "local/repo".into(),
-                number: 1,
-            }],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },
@@ -119,6 +188,7 @@ fn submit_and_admit_with(
         }
         other => panic!("submit rejected: {other:?}"),
     };
+    authorize(store);
     let admitted = store
         .transact(|tx| admit_queued(tx, cfg, &eid, NOW))
         .unwrap();
@@ -468,7 +538,7 @@ fn live_process_is_rereported_running_after_a_lost_running_observation() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Running,
                     process_identity: Some(identity.clone()),
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
@@ -539,7 +609,7 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Running,
                     process_identity: Some(identity.clone()),
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
@@ -571,7 +641,7 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
     assert_eq!(e.state, ExecutionState::Waiting);
     assert_eq!(
         e.waiting_reason,
-        Some(WaitingReason::GithubWrite),
+        Some(WaitingReason::HostWrite),
         "artifact evidence queued the publish intent"
     );
     assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
@@ -752,7 +822,7 @@ fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Done,
                     process_identity: None,
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
@@ -783,7 +853,7 @@ fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
             matches!(
                 &o.fact,
                 ObservationFact::Artifact {
-                    state: ArtifactFact::Present,
+                    state: ArtifactFact::Present { .. },
                     ..
                 }
             )
@@ -819,7 +889,7 @@ fn failed_artifact_promotion_is_not_reported_present() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Done,
                     process_identity: None,
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
@@ -852,7 +922,7 @@ fn failed_artifact_promotion_is_not_reported_present() {
             matches!(
                 &o.fact,
                 ObservationFact::Artifact {
-                    state: ArtifactFact::Present,
+                    state: ArtifactFact::Present { .. },
                     ..
                 }
             )
@@ -879,8 +949,7 @@ fn clean_exit_records_artifact_and_publish_intent() {
     for _ in 0..40 {
         sup.run_once(&store, NOW).unwrap();
         let e = execution(&store, &eid);
-        if e.state == ExecutionState::Waiting
-            && e.waiting_reason == Some(WaitingReason::GithubWrite)
+        if e.state == ExecutionState::Waiting && e.waiting_reason == Some(WaitingReason::HostWrite)
         {
             break;
         }
@@ -889,7 +958,7 @@ fn clean_exit_records_artifact_and_publish_intent() {
     let e = execution(&store, &eid);
     assert_eq!(
         e.waiting_reason,
-        Some(WaitingReason::GithubWrite),
+        Some(WaitingReason::HostWrite),
         "publish intent outstanding"
     );
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
@@ -904,26 +973,32 @@ fn cancel_while_waiting_settles_once_no_writer_remains() {
     let root = tmp_root("waitcancel");
     let (w, eid) = submit_and_admit(&store, "k-w1");
     let sup = supervisor("clean-exit", root);
-    // The writer exits cleanly: Exited -> Waiting(GithubWrite) with the
+    // The writer exits cleanly: Exited -> Waiting(HostWrite) with the
     // Invocation already Done — no unresolved writer remains.
     for _ in 0..40 {
         sup.run_once(&store, NOW).unwrap();
         let e = execution(&store, &eid);
-        if e.state == ExecutionState::Waiting
-            && e.waiting_reason == Some(WaitingReason::GithubWrite)
+        if e.state == ExecutionState::Waiting && e.waiting_reason == Some(WaitingReason::HostWrite)
         {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(execution(&store, &eid).state, ExecutionState::Waiting);
-    let action_id = store
+    let intent = store
         .transact(|tx| tx.action_intents())
         .unwrap()
         .into_iter()
         .next()
-        .expect("publish intent recorded")
-        .action_id;
+        .expect("publish intent recorded");
+    let action_id = intent.action_id.clone();
+    let HostAction::PushRef {
+        branch: intent_branch,
+        produced: intent_produced,
+    } = &intent.action
+    else {
+        panic!("the stage effect is a push_ref intent: {intent:?}")
+    };
     cancel(&store, &w, "k-w2");
     assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
     // Stop proof is immediate (no unresolved writer), but the pending
@@ -945,20 +1020,31 @@ fn cancel_while_waiting_settles_once_no_writer_remains() {
         (1, 2),
         "slot and writer-resource claims stay held while the effect is outstanding"
     );
-    // The outbox reconciles the intent (the fixture adapter opened the
-    // PR before cancellation was recorded). Only then may the deferred
-    // terminal decision land — cancellation does not undo the PR.
+    // The outbox reconciles the intent (the adapter published the ref
+    // before cancellation was recorded). Only then may the deferred
+    // terminal decision land — cancellation does not undo the write.
     handle_observation(
         &store,
         &config(),
         &Observation {
-            source_event_id: Some("gh:pr-action-1".into()),
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "test".into(),
+                event_id: "host:action-1".into(),
+            }),
             subject_work_id: Some(w.clone()),
             subject_execution_id: Some(eid.clone()),
-            fact: ObservationFact::PrActionResult {
+            fact: ObservationFact::HostActionResult {
                 action_id,
-                action_kind: "publish_pr".into(),
-                result: ActionResult::Applied,
+                authenticated_actor: None,
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::RefPublished {
+                    repository: repo(),
+                    branch: intent_branch.clone(),
+                    produced: intent_produced.clone(),
+                    observed: intent_produced.clone(),
+                    relation: RefRelation::Equal,
+                }],
             },
             observed_unix_seconds: NOW,
         },
@@ -1016,7 +1102,7 @@ fn unknown_inspection_maps_to_uncertain() {
         .unwrap()
         .remove(0);
     let obs = Observation {
-        source_event_id: None,
+        delivery: None,
         subject_work_id: Some(w.clone()),
         subject_execution_id: Some(eid.clone()),
         fact: ObservationFact::ProcessState {
@@ -1080,7 +1166,7 @@ fn failed_finish_reports_are_replayed_after_restart() {
         let invocation = store
             .transact(|tx| {
                 let mut invocation = tx.invocations_for_execution(&eid)?.remove(0);
-                invocation.required_artifacts.push("second.json".into());
+                invocation.required_artifacts.push(artifact("second.json"));
                 tx.apply(&Effect::UpdateInvocation {
                     invocation: invocation.clone(),
                     expected_state: InvocationState::Running,
@@ -1126,7 +1212,7 @@ fn failed_finish_reports_are_replayed_after_restart() {
             .unwrap();
         for required in ["artifact.json", "second.json"] {
             assert!(facts.iter().any(|obs| matches!(&obs.fact,
-                ObservationFact::Artifact { required_artifact, state: ArtifactFact::Present, .. }
+                ObservationFact::Artifact { required_artifact, state: ArtifactFact::Present { .. }, .. }
                     if required_artifact == required)));
         }
         assert!(facts.iter().any(|obs| matches!(
@@ -1138,7 +1224,7 @@ fn failed_finish_reports_are_replayed_after_restart() {
         )));
         assert_eq!(
             execution(&store, &eid).waiting_reason,
-            Some(WaitingReason::GithubWrite)
+            Some(WaitingReason::HostWrite)
         );
         assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
     }
@@ -1328,7 +1414,7 @@ fn repeated_liveness_transitions_recover_without_poll_observation_growth() {
             &store,
             &config(),
             &Observation {
-                source_event_id: None,
+                delivery: None,
                 subject_work_id: Some(work_id.clone()),
                 subject_execution_id: Some(eid.clone()),
                 fact: ObservationFact::ProcessState {
@@ -1769,7 +1855,11 @@ fn a_workers_done_claim_alone_releases_nothing() {
         &store,
         &config(),
         &Observation {
-            source_event_id: Some("worker:done-claim".into()),
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "test".into(),
+                event_id: "worker:done-claim".into(),
+            }),
             subject_work_id: Some(w.clone()),
             subject_execution_id: Some(eid.clone()),
             fact: ObservationFact::ProcessState {
@@ -1879,7 +1969,11 @@ fn an_exited_report_settles_a_requested_stop() {
         &store,
         &config(),
         &Observation {
-            source_event_id: Some("sup:exited-settle".into()),
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "test".into(),
+                event_id: "sup:exited-settle".into(),
+            }),
             subject_work_id: Some(w.clone()),
             subject_execution_id: Some(eid.clone()),
             fact: ObservationFact::ProcessState {

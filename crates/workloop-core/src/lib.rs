@@ -1,5 +1,6 @@
 pub mod command;
 pub mod domain;
+pub mod identity;
 pub mod observation;
 pub mod ports;
 pub mod projection;

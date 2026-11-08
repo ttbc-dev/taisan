@@ -193,7 +193,8 @@ impl<'a, S: Store> TuiSession<'a, S> {
         let same = self.draft.as_ref().is_some_and(|d| {
             d.work_id == detail.work_id
                 && d.work_version == detail.version
-                && detail.current_pr.as_ref().and_then(|(_, h)| h.as_ref()) == Some(&d.pr_head)
+                && detail.current_change.as_ref().and_then(|(_, h)| h.as_ref())
+                    == Some(&d.expected_head)
                 && d.covers(&detail.findings)
         });
         if !same {
@@ -204,8 +205,8 @@ impl<'a, S: Store> TuiSession<'a, S> {
         }
         let moved = self.detail.as_ref().is_some_and(|prev| {
             prev.version != detail.version
-                || prev.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
-                    != detail.current_pr.as_ref().and_then(|(_, h)| h.as_ref())
+                || prev.current_change.as_ref().and_then(|(_, h)| h.as_ref())
+                    != detail.current_change.as_ref().and_then(|(_, h)| h.as_ref())
                 || prev
                     .findings
                     .iter()
@@ -241,9 +242,12 @@ impl<'a, S: Store> TuiSession<'a, S> {
             let review_unread = self
                 .detail_sources
                 .iter()
-                .any(|s| s.source == "github:review" && s.availability != Availability::Known);
+                .any(|s| s.source.starts_with("review") && s.availability != Availability::Known);
             if detail.findings.is_empty()
-                && detail.current_pr.as_ref().is_some_and(|(_, h)| h.is_some())
+                && detail
+                    .current_change
+                    .as_ref()
+                    .is_some_and(|(_, h)| h.is_some())
                 && review_unread
             {
                 return Err("review source not read — an empty finding list proves nothing".into());
@@ -255,11 +259,17 @@ impl<'a, S: Store> TuiSession<'a, S> {
         Ok(self.draft.as_ref().expect("just set"))
     }
 
-    /// Record a choice for one displayed finding id. Any change invalidates
-    /// the staged request — a new one is armed with a fresh key.
-    pub fn choose(&mut self, finding_id: &str, choice: FindingChoice) -> Result<(), String> {
+    /// Record a choice for one displayed occurrence id, with the
+    /// rationale dismiss/accept requires. Any change invalidates the
+    /// staged request — a new one is armed with a fresh key.
+    pub fn choose(
+        &mut self,
+        occurrence_id: &str,
+        choice: FindingChoice,
+        rationale: Option<String>,
+    ) -> Result<(), String> {
         let draft = self.draft.as_mut().ok_or("no judgment in progress")?;
-        draft.choose(finding_id, choice)?;
+        draft.choose(occurrence_id, choice, rationale)?;
         self.staged = None;
         Ok(())
     }
@@ -316,11 +326,11 @@ impl<'a, S: Store> TuiSession<'a, S> {
             Action::ReleaseJudgment => CommandBody::ReleaseJudgment {
                 work_id,
                 expected_work_version,
-                expected_pr_head: detail
-                    .current_pr
+                expected_head: detail
+                    .current_change
                     .as_ref()
                     .and_then(|(_, h)| h.clone())
-                    .ok_or("no observed PR head to release against")?,
+                    .ok_or("no observed change head to release against")?,
             },
             Action::Acknowledge { attention_id } => CommandBody::Acknowledge {
                 work_id,
@@ -531,7 +541,7 @@ impl<'a, S: Store> TuiSession<'a, S> {
                 }
             }
             CommandDecision::Rejected {
-                reason: RejectionCode::StalePrHead | RejectionCode::StaleWorkVersion,
+                reason: RejectionCode::StaleHead | RejectionCode::StaleWorkVersion,
                 current_work_id,
                 ..
             } => {

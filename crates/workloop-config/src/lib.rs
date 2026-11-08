@@ -9,8 +9,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use workloop_core::domain::{Actor, ActorKind, AllowedEffects, ExecutionBudget};
-use workloop_core::work::WorkloopConfig;
+use workloop_core::domain::{
+    Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy,
+};
+use workloop_core::identity::{
+    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
+    RepositoryRef, RoleBinding,
+};
+use workloop_core::work::{HostTemplate, WorkloopConfig};
 
 /// The on-disk installation record. Fields an adapter does not use
 /// pass through untouched, so a file either adapter wrote stays valid
@@ -19,8 +25,29 @@ use workloop_core::work::WorkloopConfig;
 pub struct Installation {
     pub actor_id: String,
     pub actor_kind: String,
+    /// The bound host instance id (opaque; never a display alias).
+    #[serde(default = "default_host_instance")]
+    pub host_instance: String,
+    /// The bound repository's stable opaque id.
     #[serde(default = "default_repository")]
     pub repository: String,
+    /// The host adapter identity (e.g. `github`).
+    #[serde(default = "default_adapter")]
+    pub adapter: String,
+    /// The adapter contract version this installation speaks.
+    #[serde(default)]
+    pub contract_version: u32,
+    /// Capabilities this installation declares as supported and
+    /// authorized for its bound actors.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Host actors bound per role; `publication` is required for any
+    /// publishable Work.
+    #[serde(default)]
+    pub host_actors: std::collections::BTreeMap<String, String>,
+    /// Named host checks the completion gate requires.
+    #[serde(default)]
+    pub required_checks: Vec<String>,
     #[serde(default = "default_capacity")]
     pub capacity: u32,
     #[serde(default)]
@@ -31,10 +58,20 @@ pub struct Installation {
     pub allowed_effects: Option<AllowedEffects>,
     #[serde(default)]
     pub budget: Option<ExecutionBudget>,
+    #[serde(default)]
+    pub lanes: Option<LanePolicy>,
+    #[serde(default)]
+    pub policy: Option<WorkPolicy>,
 }
 
+fn default_host_instance() -> String {
+    "host-local".into()
+}
 fn default_repository() -> String {
-    "local/repo".into()
+    "local-repo".into()
+}
+fn default_adapter() -> String {
+    "fixture".into()
 }
 fn default_capacity() -> u32 {
     1
@@ -233,12 +270,37 @@ fn load_or_create_with(
     let installation = Installation {
         actor_id: format!("actor-{}", uuidish()),
         actor_kind: "human".into(),
+        host_instance: default_host_instance(),
         repository: default_repository(),
+        adapter: default_adapter(),
+        contract_version: 0,
+        // The default fixture adapter supports reads plus the publication
+        // writes a recorded intent may need; operators narrow this list to
+        // least privilege for a real installation.
+        capabilities: vec![
+            "repository_read".into(),
+            "push_ref".into(),
+            "change_request_create".into(),
+            "change_request_read".into(),
+            "change_request_update".into(),
+            "comment_create".into(),
+            "checks_read".into(),
+            "review_findings_read".into(),
+            "issue_read".into(),
+        ],
+        // A binding requires at least one role: the default installation
+        // publishes through a single fixture actor.
+        host_actors: [("publication".into(), "fixture-agent".into())]
+            .into_iter()
+            .collect(),
+        required_checks: vec![],
         capacity: default_capacity(),
         worker_argv: vec![],
         workspace_root: default_workspace_root(),
         allowed_effects: None,
         budget: None,
+        lanes: None,
+        policy: None,
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
@@ -275,15 +337,52 @@ impl Installation {
     }
 
     /// The `work`-level config derived from the installation record.
+    /// Unparsable host identity fields fall back to empty actors so a
+    /// misconfigured installation fails admission, never silently binds
+    /// to a different host.
     pub fn workloop_config(&self) -> WorkloopConfig {
+        let host = HostInstanceId::trusted(self.host_instance.clone());
+        let repository =
+            RepositoryRef::new(host.clone(), RepositoryId::trusted(self.repository.clone()));
+        let actors = self
+            .host_actors
+            .iter()
+            .filter_map(|(role, actor)| {
+                let role = ActorRole::from_name(role)?;
+                Some(RoleBinding {
+                    role,
+                    actor: HostActorRef {
+                        host: host.clone(),
+                        actor: HostActorId::trusted(actor.clone()),
+                    },
+                    // The credential source is installation configuration;
+                    // the record's value names it, never a secret value.
+                    credential_ref: "default".to_string(),
+                })
+            })
+            .collect();
+        let declared_capabilities = self
+            .capabilities
+            .iter()
+            .filter_map(|c| HostCapability::from_name(c))
+            .collect();
         WorkloopConfig {
-            default_repository: self.repository.clone(),
+            host: HostTemplate {
+                adapter: AdapterId::trusted(self.adapter.clone()),
+                repository,
+                contract_version: self.contract_version,
+                actors,
+            },
+            declared_capabilities,
+            lanes: self.lanes.clone().unwrap_or_default(),
+            required_checks: self.required_checks.clone(),
             allowed_effects: self.allowed_effects.clone().unwrap_or(AllowedEffects {
                 workspace_write: true,
-                github_write: false,
+                host_write: false,
                 network: false,
             }),
             budget: self.budget.clone().unwrap_or_default(),
+            policy: self.policy.clone().unwrap_or_default(),
         }
     }
 }

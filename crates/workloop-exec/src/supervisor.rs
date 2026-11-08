@@ -13,7 +13,9 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use workloop_core::domain::*;
-use workloop_core::observation::{ArtifactFact, Observation, ObservationFact, ProcessStateFact};
+use workloop_core::observation::{
+    ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
+};
 use workloop_core::ports::{
     ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
 };
@@ -662,18 +664,30 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }))?;
         let workspace = self.workspace_of(&request.work_id);
         for required in &invocation.required_artifacts {
-            let present = artifact_present(&workspace, required);
+            let digest = artifact_digest(&workspace, &required.path);
+            // A present artifact must carry its exact payload digest; an
+            // unexpected payload is corrupt evidence, never present.
+            let state = match digest {
+                Some(digest)
+                    if required
+                        .expected_digest
+                        .as_ref()
+                        .is_none_or(|expected| expected == &digest) =>
+                {
+                    ArtifactFact::Present { digest }
+                }
+                Some(_) => ArtifactFact::Corrupt {
+                    reason: Some("payload digest does not match the declared expectation".into()),
+                },
+                None => ArtifactFact::Missing,
+            };
             self.report(
                 store,
                 &request,
                 ObservationFact::Artifact {
                     invocation_id: invocation.id.clone(),
-                    required_artifact: required.clone(),
-                    state: if present {
-                        ArtifactFact::Present
-                    } else {
-                        ArtifactFact::Missing
-                    },
+                    required_artifact: required.kind.clone(),
+                    state,
                 },
                 now_unix_seconds,
             )?;
@@ -995,10 +1009,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             // Recover from workspace + checkpoints + worker-runtime store.
             let workspace = self.workspace_of(&execution.work_id);
-            let mut recovered: Vec<(String, PathBuf)> = Vec::new();
+            let mut recovered: Vec<(RequiredArtifact, PathBuf)> = Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 for required in &invocation.required_artifacts {
-                    if let Some(dir) = find_artifact(&workspace, required) {
+                    if let Some(dir) = find_artifact(&workspace, &required.path) {
                         recovered.push((required.clone(), dir));
                     }
                 }
@@ -1026,20 +1040,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         // itself truncates it), and only a verified
                         // artifact may be reported present.
                         if dir != &workspace
-                            && std::fs::copy(dir.join(required), workspace.join(required)).is_err()
+                            && std::fs::copy(
+                                dir.join(&required.path),
+                                workspace.join(&required.path),
+                            )
+                            .is_err()
                         {
                             continue;
                         }
-                        if !artifact_present(&workspace, required) {
-                            continue;
-                        }
+                        let digest = match artifact_digest(&workspace, &required.path) {
+                            Some(digest)
+                                if required
+                                    .expected_digest
+                                    .as_ref()
+                                    .is_none_or(|expected| expected == &digest) =>
+                            {
+                                digest
+                            }
+                            _ => continue,
+                        };
                         self.report(
                             store,
                             &request,
                             ObservationFact::Artifact {
                                 invocation_id: invocation.id.clone(),
-                                required_artifact: required.clone(),
-                                state: ArtifactFact::Present,
+                                required_artifact: required.kind.clone(),
+                                state: ArtifactFact::Present { digest },
                             },
                             _now_unix_seconds,
                         )?;
@@ -1081,7 +1107,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         serde_json::to_string(&fact)
             .unwrap_or_default()
             .hash(&mut h);
-        let mut source_event_id = format!("sup:{:x}", h.finish());
+        let mut event_id = format!("sup:{:x}", h.finish());
         if let ObservationFact::ProcessState { invocation_id, .. } = &fact {
             let (generation, repeated) = store.transact(|tx| {
                 let observations = tx.observations_for_execution(&request.execution_id)?;
@@ -1094,8 +1120,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     })
                     .collect();
                 let repeated = process_facts.last().is_some_and(|last| {
-                    last.source_event_id.as_ref().is_some_and(|id| {
-                        id == &source_event_id || id.starts_with(&format!("{source_event_id}:"))
+                    last.delivery.as_ref().is_some_and(|d| {
+                        d.event_id == event_id || d.event_id.starts_with(&format!("{event_id}:"))
                     })
                 });
                 Ok((process_facts.len(), repeated))
@@ -1103,10 +1129,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             if repeated {
                 return Ok(());
             }
-            source_event_id = format!("{source_event_id}:{generation}");
+            event_id = format!("{event_id}:{generation}");
         }
         let obs = Observation {
-            source_event_id: Some(source_event_id),
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "supervisor".into(),
+                event_id,
+            }),
             subject_work_id: Some(request.work_id.clone()),
             subject_execution_id: Some(request.execution_id.clone()),
             fact,
@@ -1191,18 +1221,42 @@ fn persist_intent_row(
     Ok(intent)
 }
 
-fn required_artifacts(request: &InvocationRequest) -> Vec<String> {
+fn required_artifacts(request: &InvocationRequest) -> Vec<RequiredArtifact> {
     request
         .payload
         .get("required_artifacts")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(|v| {
+                    if let Some(name) = v.as_str() {
+                        return Some(RequiredArtifact {
+                            kind: name.to_string(),
+                            path: name.to_string(),
+                            expected_digest: None,
+                        });
+                    }
+                    let kind = v.get("kind").and_then(|k| k.as_str())?;
+                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(kind);
+                    Some(RequiredArtifact {
+                        kind: kind.to_string(),
+                        path: path.to_string(),
+                        expected_digest: v
+                            .get("expected_digest")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string),
+                    })
+                })
                 .collect()
         })
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(|| vec!["artifact.json".to_string()])
+        .filter(|v: &Vec<RequiredArtifact>| !v.is_empty())
+        .unwrap_or_else(|| {
+            vec![RequiredArtifact {
+                kind: "artifact.json".to_string(),
+                path: "artifact.json".to_string(),
+                expected_digest: None,
+            }]
+        })
 }
 
 /// Whether `name` exists in the workspace root, checkpoints, or the
@@ -1225,12 +1279,19 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn artifact_present(workspace: &Path, name: &str) -> bool {
+/// The payload digest of an artifact in the workspace root; `None` when
+/// it is absent or unreadable. Presence is never reported without a
+/// digest — the fact's `Present` state carries it.
+fn artifact_digest(workspace: &Path, name: &str) -> Option<String> {
     let candidate = workspace.join(name);
-    candidate.is_file()
-        && std::fs::metadata(&candidate)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
+    if !candidate.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&candidate).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(sha256_hex("artifact-v1", &bytes))
 }
 
 /// Test hook: write a line into a workspace artifact (used by harness
@@ -1289,13 +1350,25 @@ mod tests {
             PathBuf::from("/unused"),
             vec![],
             workloop_core::work::WorkloopConfig {
-                default_repository: "local/repo".into(),
+                host: workloop_core::work::HostTemplate {
+                    adapter: workloop_core::identity::AdapterId::trusted("fixture"),
+                    repository: workloop_core::identity::RepositoryRef::new(
+                        workloop_core::identity::HostInstanceId::trusted("host-local"),
+                        workloop_core::identity::RepositoryId::trusted("local-repo"),
+                    ),
+                    contract_version: 0,
+                    actors: vec![],
+                },
+                declared_capabilities: Default::default(),
+                lanes: Default::default(),
+                required_checks: vec![],
                 allowed_effects: AllowedEffects {
                     workspace_write: true,
-                    github_write: false,
+                    host_write: false,
                     network: false,
                 },
                 budget: ExecutionBudget::default(),
+                policy: WorkPolicy::default(),
             },
         );
         let identity = ProcessIdentity {
