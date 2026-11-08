@@ -269,7 +269,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
     let installation = load_or_create(&config_path)?;
     let actor = installation.actor();
-    let config = installation.workloop_config();
+    let config = installation.workloop_config()?;
     let store =
         SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
     let key = || {

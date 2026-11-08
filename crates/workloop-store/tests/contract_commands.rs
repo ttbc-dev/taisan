@@ -7,7 +7,9 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
-use workloop_core::work::{HostTemplate, WorkloopConfig, dispatch_once, handle_command};
+use workloop_core::work::{
+    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command,
+};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -3425,6 +3427,123 @@ fn config_with_issue_read() -> WorkloopConfig {
     let mut c = config();
     c.declared_capabilities.insert(HostCapability::IssueRead);
     c
+}
+
+/// Regression: a `DeliveryScope::Local` delivery has no host column, and
+/// a NULL key dedupes nothing under SQLite UNIQUE semantics — the
+/// dedupe index must still collapse a repeated (scope, source,
+/// event_id) delivery.
+#[test]
+fn repeated_local_delivery_is_deduplicated() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let obs = |event_id: &str| Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: event_id.into(),
+        }),
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::ChangeHead {
+            change: change(),
+            head: rev("h-1"),
+        },
+        observed_unix_seconds: NOW,
+    };
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-1"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-1"), NOW).unwrap(),
+        IngestReceipt::Duplicate,
+        "the identical local delivery must dedupe, not insert twice"
+    );
+    // A different event id under the same scope and source is new data.
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-2"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+}
+
+/// Regression (source gate): an unverified source defers admission, a
+/// matching authoritative read unblocks it, and a changed read pauses
+/// the Execution for repair — dispatch never runs on `NeedsCheck` or
+/// `Changed` sources.
+#[test]
+fn source_gate_defers_admits_and_pauses_on_change() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = SourceSnapshot {
+        issue: issue(9),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let d = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-gate", vec![source]),
+        NOW,
+    )
+    .unwrap();
+    let (work_id, eid) = accepted_with_execution(&d);
+    // NeedsCheck: dispatch owes a source read and defers admission.
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(
+                tx.execution(&eid)?.unwrap().state,
+                ExecutionState::Queued,
+                "unverified source holds admission"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let read = |revision: &str, digest: &str, state: IssueState| Observation {
+        delivery: None,
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: None,
+        fact: ObservationFact::Issue {
+            issue: issue(9),
+            source_revision: revision.into(),
+            content_digest: digest.into(),
+            state,
+        },
+        observed_unix_seconds: NOW,
+    };
+    // A matching read resolves the gate to Matches; dispatch admits.
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &read("rev-1", "digest-1", IssueState::Open),
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(tx.execution(&eid)?.unwrap().state, ExecutionState::Ready);
+            Ok(())
+        })
+        .unwrap();
+    // A later read showing changed content pauses the Execution for
+    // repair — a live Execution never runs on a stale spec.
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &read("rev-2", "digest-2", IssueState::Open),
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(tx.execution(&eid)?.unwrap().state, ExecutionState::Paused);
+            Ok(())
+        })
+        .unwrap();
 }
 
 /// Regression (acceptance): a capability the installation never

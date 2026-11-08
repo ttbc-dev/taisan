@@ -1274,7 +1274,10 @@ impl TxView for Tx<'_> {
                         event_id,
                     }) => (
                         Some("local".to_string()),
-                        None,
+                        // A NULL host key would dedupe nothing: SQLite
+                        // treats NULLs as distinct in UNIQUE indexes, so
+                        // every local redelivery would insert again.
+                        Some(String::new()),
                         Some(source.clone()),
                         Some(event_id.clone()),
                     ),

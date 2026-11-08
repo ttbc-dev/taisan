@@ -2227,12 +2227,14 @@ pub fn handle_observation(
 /// Only the observations dedupe index classifies an insert as a replay;
 /// every other uniqueness violation is a real invariant breach and must
 /// propagate instead of being mistaken for a duplicate delivery. SQLite
-/// reports the violated index name for a partial unique index.
+/// reports the violated index by its column list for a column-keyed
+/// unique index, and `delivery_event_id` appears in no other
+/// constraint.
 pub fn is_dedupe_conflict(e: &StoreError) -> bool {
     matches!(
         e,
         StoreError::ConstraintConflict { detail }
-            if detail.contains("observations_dedupe")
+            if detail.contains("observations.delivery_event_id")
     )
 }
 

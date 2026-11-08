@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::command::{CommandDecision, CommandId, FindingChoice};
+use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
 use crate::identity::{ChangeRequestRef, CommitRevision};
 use crate::observation::{
@@ -644,26 +644,6 @@ pub fn artifacts_complete(
                     && req.expected_digest.as_ref().is_none_or(|e| e == digest)
             )
         })
-    }))
-}
-
-/// Whether every occurrence on the latest sealed round is dispositioned
-/// `accept`/`dismiss` — the review-lane pass condition.
-pub fn review_lane_satisfied(tx: &dyn ReadView, work_id: &WorkId) -> Result<bool, StoreError> {
-    let Some(round) = tx.latest_round(work_id)? else {
-        return Ok(false);
-    };
-    if round.completeness != "complete" {
-        return Ok(false);
-    }
-    let occurrences = tx.occurrences(&round.id)?;
-    if occurrences.is_empty() {
-        return Ok(true);
-    }
-    Ok(tx.judgment_for_round(&round.id)?.is_some_and(|j| {
-        j.decisions
-            .iter()
-            .all(|d| matches!(d.choice, FindingChoice::Accept | FindingChoice::Dismiss))
     }))
 }
 

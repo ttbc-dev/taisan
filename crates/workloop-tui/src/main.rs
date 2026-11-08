@@ -72,7 +72,11 @@ fn run(args: Args) -> Result<(), String> {
         .unwrap_or_else(|| args.db.with_extension("config.json"));
     let installation = load_or_create(&config_path)?;
     let store = SqliteStore::open(&args.db, installation.capacity).map_err(|e| e.to_string())?;
-    let mut session = TuiSession::new(&store, installation.workloop_config(), installation.actor());
+    let mut session = TuiSession::new(
+        &store,
+        installation.workloop_config()?,
+        installation.actor(),
+    );
     session.refresh(now())?;
     let mut selected: Option<WorkId> = None;
 

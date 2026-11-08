@@ -96,3 +96,65 @@ fn foreign_empty_or_malformed_config_errors() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An installation file written before capability/actor declarations
+/// existed still parses — serde defaults fill empty values — but it
+/// must be refused at the boundary to `WorkloopConfig`, not silently
+/// turned into a config that rejects every Submit.
+#[test]
+fn legacy_config_without_declarations_is_refused() {
+    let dir = root("install-legacy");
+    let path = dir.join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "actor_id": "actor-legacy",
+            "actor_kind": "human",
+            "host_instance": "host-local",
+            "repository": "local-repo",
+            "adapter": "fixture"
+        }"#,
+    )
+    .unwrap();
+    let installation = load_or_create(&path).unwrap();
+    let err = installation.workloop_config().unwrap_err();
+    assert!(
+        err.contains("capabilities"),
+        "expected the declaration error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Identity fields are external input: empty, oversized, or
+/// control-character values are rejected at the boundary instead of
+/// silently binding Work to a misconfigured host.
+#[test]
+fn invalid_identity_fields_are_refused() {
+    let dir = root("install-invalid-id");
+    let path = dir.join("config.json");
+    let installation = load_or_create(&path).unwrap();
+
+    for (field, value) in [
+        ("host_instance", ""),
+        ("repository", "bad\nrepo"),
+        ("adapter", "\t"),
+    ] {
+        let mut i = installation.clone();
+        match field {
+            "host_instance" => i.host_instance = value.into(),
+            "repository" => i.repository = value.into(),
+            _ => i.adapter = value.into(),
+        }
+        let err = i.workloop_config().unwrap_err();
+        assert!(err.contains(field), "expected {field} error: {err}");
+    }
+
+    // An unknown role name is a hard error too, never a silently
+    // dropped binding.
+    let mut i = installation.clone();
+    i.host_actors.insert("bogus".into(), "agent".into());
+    let err = i.workloop_config().unwrap_err();
+    assert!(err.contains("bogus"), "expected role error: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

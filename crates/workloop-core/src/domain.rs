@@ -96,13 +96,18 @@ pub fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
             }
             serde_json::Value::Object(map) => {
                 out.push(b'{');
-                for (i, (k, val)) in map.iter().enumerate() {
+                // Sort keys explicitly — serde_json's Map only orders
+                // when `preserve_order` is off, and a transitive feature
+                // flip must never change the canonical bytes.
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for (i, k) in keys.iter().enumerate() {
                     if i > 0 {
                         out.push(b',');
                     }
                     out.extend_from_slice(serde_json::to_string(k).expect("key json").as_bytes());
                     out.push(b':');
-                    write(val, out);
+                    write(map.get(*k).expect("key from map.keys()"), out);
                 }
                 out.push(b'}');
             }
@@ -681,4 +686,20 @@ pub struct RoundJudgment {
     pub decisions: Vec<crate::command::FindingDecision>,
     pub actor_id: String,
     pub seq: EventSequence,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Canonicalization must not depend on serde_json's map ordering:
+    /// two maps built in different insertion orders canonicalize
+    /// identically even if a transitive `preserve_order` feature flip
+    /// changes iteration order.
+    #[test]
+    fn canonical_json_is_order_independent() {
+        let forward = serde_json::json!({"a": 1, "b": {"x": 2, "y": 3}, "c": [4, 5]});
+        let backward = serde_json::json!({"c": [4, 5], "b": {"y": 3, "x": 2}, "a": 1});
+        assert_eq!(canonical_json(&forward), canonical_json(&backward));
+    }
 }

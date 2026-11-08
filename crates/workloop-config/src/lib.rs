@@ -4,6 +4,7 @@
 //! TUI can never drift on the file they must agree on — whichever
 //! adapter creates it, the other adopts it.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -337,38 +338,61 @@ impl Installation {
     }
 
     /// The `work`-level config derived from the installation record.
-    /// Unparsable host identity fields fall back to empty actors so a
-    /// misconfigured installation fails admission, never silently binds
-    /// to a different host.
-    pub fn workloop_config(&self) -> WorkloopConfig {
-        let host = HostInstanceId::trusted(self.host_instance.clone());
-        let repository =
-            RepositoryRef::new(host.clone(), RepositoryId::trusted(self.repository.clone()));
-        let actors = self
-            .host_actors
-            .iter()
-            .filter_map(|(role, actor)| {
-                let role = ActorRole::from_name(role)?;
-                Some(RoleBinding {
-                    role,
-                    actor: HostActorRef {
-                        host: host.clone(),
-                        actor: HostActorId::trusted(actor.clone()),
-                    },
-                    // The credential source is installation configuration;
-                    // the record's value names it, never a secret value.
-                    credential_ref: "default".to_string(),
-                })
-            })
-            .collect();
-        let declared_capabilities = self
-            .capabilities
-            .iter()
-            .filter_map(|c| HostCapability::from_name(c))
-            .collect();
-        WorkloopConfig {
+    /// The installation file is external input: every identity string,
+    /// role name, and capability name is validated at this boundary —
+    /// an unparseable value is a hard error, never a silently degraded
+    /// or mis-bound configuration.
+    pub fn workloop_config(&self) -> Result<WorkloopConfig, String> {
+        let host = HostInstanceId::new(self.host_instance.clone())
+            .map_err(|e| format!("installation host_instance: {e}"))?;
+        let repository_id = RepositoryId::new(self.repository.clone())
+            .map_err(|e| format!("installation repository: {e}"))?;
+        let repository = RepositoryRef::new(host.clone(), repository_id);
+        let adapter = AdapterId::new(self.adapter.clone())
+            .map_err(|e| format!("installation adapter: {e}"))?;
+        let mut actors = Vec::with_capacity(self.host_actors.len());
+        for (role, actor) in &self.host_actors {
+            let role_name = role.clone();
+            let role = ActorRole::from_name(&role_name)
+                .ok_or_else(|| format!("installation host_actors: unknown role '{role_name}'"))?;
+            actors.push(RoleBinding {
+                role,
+                actor: HostActorRef {
+                    host: host.clone(),
+                    actor: HostActorId::new(actor.clone())
+                        .map_err(|e| format!("installation host_actors[{role_name}]: {e}"))?,
+                },
+                // The credential source is installation configuration;
+                // the record's value names it, never a secret value.
+                credential_ref: "default".to_string(),
+            });
+        }
+        let mut declared_capabilities = BTreeSet::new();
+        for c in &self.capabilities {
+            declared_capabilities.insert(
+                HostCapability::from_name(c)
+                    .ok_or_else(|| format!("installation capabilities: unknown '{c}'"))?,
+            );
+        }
+        // An installation file that pre-dates capability/actor
+        // declarations deserializes to empty sets via serde defaults;
+        // refusing at this boundary beats every Submit failing with an
+        // unexplained capability rejection later.
+        if declared_capabilities.is_empty() {
+            return Err(
+                "installation declares no capabilities — regenerate the config \
+                 or declare the supported capability set"
+                    .into(),
+            );
+        }
+        if actors.is_empty() {
+            return Err("installation binds no host actors — regenerate the config \
+                 or bind a host actor to each required role"
+                .into());
+        }
+        Ok(WorkloopConfig {
             host: HostTemplate {
-                adapter: AdapterId::trusted(self.adapter.clone()),
+                adapter,
                 repository,
                 contract_version: self.contract_version,
                 actors,
@@ -383,7 +407,7 @@ impl Installation {
             }),
             budget: self.budget.clone().unwrap_or_default(),
             policy: self.policy.clone().unwrap_or_default(),
-        }
+        })
     }
 }
 

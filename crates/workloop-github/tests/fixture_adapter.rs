@@ -788,39 +788,11 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
 #[test]
 fn host_write_denied_leaves_the_outbox_pending() {
     let store = SqliteStore::in_memory(1).unwrap();
-    // The Work is accepted without host writes: the recorded execution
-    // grant, not the adapter's view, decides whether the drain may
-    // attempt the intent.
-    let mut cfg = config();
-    cfg.allowed_effects.host_write = false;
-    let d = handle_command(
-        &store,
-        &cfg,
-        &CommandRequest {
-            actor: Actor {
-                kind: ActorKind::Human,
-                external_id: "op".into(),
-            },
-            origin: Origin("cli".into()),
-            idempotency_key: "k-g8".into(),
-            body: CommandBody::Submit {
-                intent: "do the thing".into(),
-                sources: vec![],
-                constraints: vec![],
-                verification_argv: vec![],
-            },
-        },
-        NOW,
-    )
-    .unwrap();
-    let CommandDecision::Accepted {
-        work_id: Some(work_id),
-        effect: CommandEffect::WorkCreated { execution_id },
-        ..
-    } = d
-    else {
-        panic!("submit: {d:?}")
-    };
+    // The Work was admitted under a permissive installation, so the
+    // recorded execution grant allows the write — but the
+    // installation-level grant is the outermost control: a revoked
+    // `host_write` stops the drain even for a granted execution.
+    let (work_id, _eid) = submit(&store, "k-g8");
     let action_id = insert_intent(
         &store,
         &work_id,
@@ -829,26 +801,18 @@ fn host_write_denied_leaves_the_outbox_pending() {
             produced: rev("head-1"),
         },
     );
+    let mut read_only = config();
+    read_only.allowed_effects.host_write = false;
     let mut gh = FixtureGithub::new();
-    gh.apply_outbox(&store, &cfg, NOW).unwrap();
+    gh.apply_outbox(&store, &read_only, NOW).unwrap();
     assert!(
         gh.applied().is_empty(),
         "no host mutation while host_write is denied"
     );
     assert_eq!(intent_status(&store, &action_id), HostActionStatus::Pending);
-    // The same recorded intent applies once the execution's grant allows
-    // the write — denial defers, it never reclassifies.
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&execution_id)?.unwrap();
-            e.allowed_effects.host_write = true;
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Queued,
-            })
-        })
-        .unwrap();
-    gh.apply_outbox(&store, &cfg, NOW).unwrap();
+    // The same recorded intent applies once the installation grants the
+    // write — denial defers, it never reclassifies.
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-1"]);
     assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
 }

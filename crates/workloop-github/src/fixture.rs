@@ -76,6 +76,12 @@ impl FixtureGithub {
         // skipped for the rest of this pass — it neither loops the pass
         // forever nor blocks later independent intents (a retried stuck
         // intent may resolve on the next pass).
+        // The installation-level grant is the outermost control: a
+        // revoked `host_write` stops the drain even for executions that
+        // were admitted under a more permissive configuration.
+        if !config.allowed_effects.host_write {
+            return Ok(());
+        }
         let mut attempted = std::collections::HashSet::new();
         loop {
             let next = store.transact(|tx| {
