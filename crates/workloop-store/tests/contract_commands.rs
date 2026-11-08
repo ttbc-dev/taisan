@@ -3349,6 +3349,19 @@ fn unversioned_store_file_is_archive_only() {
         Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
         Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
     }
+    // The refusal must not mutate the archive: journal mode stays the
+    // file's own and no WAL sidecars appear.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "a refused archive must not be re-journaled");
+    }
+    assert!(
+        !db.with_extension("db-wal").exists() && !db.with_extension("db-shm").exists(),
+        "a refused open must not leave WAL sidecars"
+    );
 }
 
 /// Regression (acceptance): a store file stamped with a newer format
@@ -3464,6 +3477,50 @@ fn repeated_local_delivery_is_deduplicated() {
         workloop_core::work::handle_observation(&store, &config(), &obs("ev-2"), NOW).unwrap(),
         IngestReceipt::Recorded
     );
+}
+
+/// Regression: a delivery that reuses (scope, source, event_id) with a
+/// different fact is a producer conflict — rejected and visible, never
+/// folded into the recorded row the way a replay is.
+#[test]
+fn delivery_conflict_with_different_content_is_rejected() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let obs = |head: &str| Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: "ev-conflict".into(),
+        }),
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::ChangeHead {
+            change: change(),
+            head: rev(head),
+        },
+        observed_unix_seconds: NOW,
+    };
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("h-1"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+    match workloop_core::work::handle_observation(&store, &config(), &obs("h-2"), NOW).unwrap() {
+        IngestReceipt::Rejected(_) => {}
+        other => panic!("expected Rejected for conflicting content, got {other:?}"),
+    }
+    // The recorded row is still the first fact — nothing was folded in.
+    store
+        .transact(|tx| {
+            let obs = tx.all_observations()?;
+            assert_eq!(obs.len(), 1);
+            assert!(
+                matches!(&obs[0].fact, ObservationFact::ChangeHead { head, .. }
+                    if head == &rev("h-1")),
+                "stored fact: {:?}",
+                obs[0].fact
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 
 /// Regression (source gate): an unverified source defers admission, a
@@ -3596,6 +3653,35 @@ fn claimed_source_issue_rejects_the_overlap() {
             assert!(evidence.iter().any(|e| e.contains(&owner.0)));
         }
         _ => unreachable!(),
+    }
+    // The display number never participates in identity: naming the
+    // same repository/issue id with a different or absent display number
+    // still hits the existing claim.
+    for (key, display) in [
+        ("k-overlap-renumbered", Some(99)),
+        ("k-overlap-nodisplay", None),
+    ] {
+        let renamed = SourceSnapshot {
+            issue: IssueRef {
+                repository: repo(),
+                issue: IssueId::trusted("issue-7"),
+                display_number: display,
+            },
+            source_revision: "rev-1".into(),
+            content_digest: "digest-1".into(),
+        };
+        let d = handle_command(
+            &store,
+            &config_with_issue_read(),
+            &submit_with_sources(key, vec![renamed]),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            reject_reason(&d),
+            RejectionCode::Ineligible,
+            "display_number {display:?} must not bypass the claim"
+        );
     }
     // A different issue on the same repository is a distinct identity —
     // it submits cleanly.

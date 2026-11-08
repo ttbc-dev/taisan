@@ -2216,10 +2216,30 @@ pub fn handle_observation(
             Ok(IngestReceipt::Recorded)
         })
         .or_else(|e| {
-            if is_dedupe_conflict(&e) {
+            if !is_dedupe_conflict(&e) {
+                return Err(e);
+            }
+            // The delivery identity already has a recorded observation.
+            // A byte-identical fact is a replay; a different fact under
+            // the same identity is a producer conflict — like a changed
+            // payload under one idempotency key, it is rejected, never
+            // silently folded into the recorded row.
+            let stored = store.transact(|tx| {
+                Ok(tx
+                    .all_observations()?
+                    .into_iter()
+                    .find(|o| o.delivery == obs.delivery))
+            })?;
+            let same_fact = stored.is_some_and(|existing| {
+                canonical_json(&serde_json::to_value(&existing.fact).unwrap_or_default())
+                    == canonical_json(&serde_json::to_value(&obs.fact).unwrap_or_default())
+            });
+            if same_fact {
                 Ok(IngestReceipt::Duplicate)
             } else {
-                Err(e)
+                Ok(IngestReceipt::Rejected(
+                    "delivery identity reused with different content".into(),
+                ))
             }
         })
 }
@@ -2516,13 +2536,22 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
                 && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
         }
         (
-            HostAction::OpenChangeRequest { source_branch, .. },
+            HostAction::OpenChangeRequest {
+                source_branch,
+                target_branch,
+                ..
+            },
             NormalizedEffectFact::ChangeOpened {
                 change,
                 source_branch: opened_source,
+                target_branch: opened_target,
                 ..
             },
-        ) => change.repository == intent.repository && opened_source == source_branch,
+        ) => {
+            change.repository == intent.repository
+                && opened_source == source_branch
+                && opened_target == target_branch
+        }
         (
             HostAction::UpdateChangeRequest {
                 change,

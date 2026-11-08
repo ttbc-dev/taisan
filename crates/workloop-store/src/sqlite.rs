@@ -58,7 +58,10 @@ impl SqliteStore {
         // SQLITE_BUSY; a residual timeout still maps to `StoreError::Internal`,
         // which callers propagate without persisting a rejection.
         conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // foreign_keys is per-connection state; journal_mode persists in
+        // the file header, so it is deferred until after the format gate
+        // — a refused file must not be mutated.
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(internal)?;
 
         // Format gate (identity-storage): refuse anything that is not the
@@ -72,6 +75,7 @@ impl SqliteStore {
                 detail: format!("store format {version} is newer than supported {FORMAT_VERSION}"),
             });
         }
+        let mut bootstrapping = false;
         if version == 0 {
             let has_tables: bool = conn
                 .query_row(
@@ -88,14 +92,28 @@ impl SqliteStore {
                         .into(),
                 });
             }
-            conn.execute_batch(SCHEMA).map_err(internal)?;
-            conn.pragma_update(None, "user_version", FORMAT_VERSION)
+            bootstrapping = true;
+        }
+        // journal_mode cannot change inside a transaction, so it is set
+        // here — only for a file the gate accepted.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(internal)?;
+        if bootstrapping {
+            // Bootstrap is one transaction: schema, format version, and
+            // the store_meta row land together or not at all, so a crash
+            // can never leave a table-bearing version-0 file (refused as
+            // a legacy archive on next open) or a v1 store without a
+            // store_id.
+            let tx = conn.unchecked_transaction().map_err(internal)?;
+            tx.execute_batch(SCHEMA).map_err(internal)?;
+            tx.pragma_update(None, "user_version", FORMAT_VERSION)
                 .map_err(internal)?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO store_meta (key, value) VALUES ('store_id', ?1)",
                 params![new_id("store")],
             )
             .map_err(internal)?;
+            tx.commit().map_err(internal)?;
         }
         // Seed the fixed slot rows once; claiming is an UPDATE inside the
         // caller's transaction.
@@ -171,10 +189,11 @@ fn opt_de_row<T: serde::de::DeserializeOwned>(
     s.map(|v| de_row(&v)).transpose()
 }
 
-/// Issue identity key: the opaque composite `IssueRef` canonicalized —
-/// never the display number.
+/// Issue identity key: repository + opaque issue id — never the display
+/// number, which is presentational and must not participate in claims.
 fn issue_key(issue: &workloop_core::identity::IssueRef) -> String {
-    json(issue).unwrap_or_else(|_| unreachable!("IssueRef serializes"))
+    json(&(issue.repository.clone(), issue.issue.as_str()))
+        .unwrap_or_else(|_| unreachable!("issue key serializes"))
 }
 
 struct Tx<'t> {

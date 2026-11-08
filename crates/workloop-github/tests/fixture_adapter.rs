@@ -11,7 +11,7 @@ use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{
-    HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
+    HostTemplate, IngestReceipt, WorkloopConfig, admit_queued, handle_command, handle_observation,
 };
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
@@ -815,6 +815,56 @@ fn host_write_denied_leaves_the_outbox_pending() {
     gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-1"]);
     assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+}
+
+/// A receipt that claims the change opened into a different target
+/// branch than the immutable intent authorized does not satisfy the
+/// effect match — applied evidence binds the whole payload.
+#[test]
+fn open_receipt_for_a_different_target_branch_is_unknown() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-wrong-target");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: "work/w-1".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    let receipt = handle_observation(
+        &store,
+        &config(),
+        &obs(
+            &work_id,
+            &eid,
+            Some("open-target-mismatch"),
+            NOW,
+            ObservationFact::HostActionResult {
+                action_id: action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("head-1"),
+                    source_branch: "work/w-1".into(),
+                    target_branch: "develop".into(),
+                }],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(receipt, IngestReceipt::Recorded);
+    assert!(
+        matches!(
+            intent_status(&store, &action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "a different target branch is not the recorded effect"
+    );
 }
 
 #[test]
