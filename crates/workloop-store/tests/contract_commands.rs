@@ -3400,3 +3400,93 @@ fn reopened_store_round_trips_new_format_records() {
         })
         .unwrap();
 }
+
+fn issue(number: u64) -> IssueRef {
+    IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted(format!("issue-{number}")),
+        display_number: Some(number),
+    }
+}
+
+fn submit_with_sources(key: &str, sources: Vec<SourceSnapshot>) -> CommandRequest {
+    req(
+        key,
+        CommandBody::Submit {
+            intent: "do the thing".into(),
+            sources,
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    )
+}
+
+fn config_with_issue_read() -> WorkloopConfig {
+    let mut c = config();
+    c.declared_capabilities.insert(HostCapability::IssueRead);
+    c
+}
+
+/// Regression (acceptance): a capability the installation never
+/// declared can never be satisfied — submit rejects, never degrades
+/// the requirement.
+#[test]
+fn missing_declared_capability_rejects_submit() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut c = config();
+    c.declared_capabilities
+        .remove(&HostCapability::ReviewFindingsRead);
+    let d = handle_command(&store, &c, &submit("k-cap"), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::UnsupportedCapability);
+}
+
+/// Regression (acceptance): one Work owns a scoped source issue — a
+/// second submission overlapping a live claim is refused and names the
+/// owning Work.
+#[test]
+fn claimed_source_issue_rejects_the_overlap() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = |n: u64| SourceSnapshot {
+        issue: issue(n),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let first = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-own", vec![source(7)]),
+        NOW,
+    )
+    .unwrap();
+    let (owner, _) = accepted_with_execution(&first);
+    let second = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-overlap", vec![source(7)]),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&second), RejectionCode::Ineligible);
+    match &second {
+        CommandDecision::Rejected {
+            current_work_id,
+            evidence,
+            ..
+        } => {
+            assert_eq!(current_work_id.as_ref(), Some(&owner));
+            assert!(evidence.iter().any(|e| e.contains(&owner.0)));
+        }
+        _ => unreachable!(),
+    }
+    // A different issue on the same repository is a distinct identity —
+    // it submits cleanly.
+    accepted(
+        &handle_command(
+            &store,
+            &config_with_issue_read(),
+            &submit_with_sources("k-other", vec![source(8)]),
+            NOW,
+        )
+        .unwrap(),
+    );
+}
