@@ -23029,11 +23029,11 @@
    ],
    "targets": [
     {
-     "document": "docs/v0.1.md",
-     "anchor": "",
+     "document": "docs/closure-requirements.md",
+     "anchor": "r48",
      "owner_issue": 56,
      "acceptance_id": "I56-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Path-filtered PR verification gate with supersede cancellation and bounded checks",
@@ -23539,11 +23539,11 @@
    ],
    "targets": [
     {
-     "document": "docs/v0.1.md",
-     "anchor": "",
+     "document": "docs/closure-requirements.md",
+     "anchor": "r70",
      "owner_issue": 56,
      "acceptance_id": "I56-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Projection never fabricates unknowns and never faults the normal settled-record/non-terminal-card intermediate",
@@ -24302,11 +24302,11 @@
    ],
    "targets": [
     {
-     "document": "docs/v0.1.md",
-     "anchor": "",
+     "document": "docs/closure-requirements.md",
+     "anchor": "r102",
      "owner_issue": 56,
      "acceptance_id": "I56-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "Attention [source-symbol] axis derives who acts next from closed stop/verdict vocabulary and fails closed to unknown",
@@ -26973,11 +26973,11 @@
    ],
    "targets": [
     {
-     "document": "docs/v0.1.md",
-     "anchor": "",
+     "document": "docs/closure-requirements.md",
+     "anchor": "r214",
      "owner_issue": 56,
      "acceptance_id": "I56-AC2",
-     "state": "planned"
+     "state": "specified"
     }
    ],
    "title": "The console presents only projected facts and keeps unknown, unobserved and known-absent states visibly distinct: counts never fabricate zeros, detail/wait fetch states never render as 'none', stalene",

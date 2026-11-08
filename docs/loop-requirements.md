@@ -206,7 +206,7 @@ Planned proof: saturate a pass beyond 120 s — unfinished items report `tick.de
 
 Intake-mode rollback non-destructive — mechanism omitted (no intake modes); retained: a config or mode change never destroys in-flight Work, which keeps its saved effective policy.
 
-Clause: [loop model](execution-loop.md#loop-model); [installation config](installation-config.md#credential-rotation-and-actor-replacement). Suite: LP-04.
+Clause: [loop model](execution-loop.md#loop-model); [installation config](installation-config.md#rotation-renewal-and-binding-preservation). Suite: LP-04.
 
 Planned proof: flip configuration mid-execution — in-flight Work proceeds under its recorded binding.
 
@@ -262,7 +262,7 @@ Planned proof: crash after reading a source but before commit — the next pass 
 
 Bounded subprocess termination — worker stop kills the complete recorded process group on deadline; semantics owned by [worker protocol](worker-protocol.md).
 
-Clause: F3/F4; [worker protocol](worker-protocol.md#stop-proof-and-uncertainty). Suite: LP-12, LP-13.
+Clause: F3/F4; [worker protocol](worker-protocol.md#process-descendants-and-stop-proof). Suite: LP-12, LP-13.
 
 Planned proof: an escaped descendant group is terminated by recorded identity; unrelated processes untouched.
 
@@ -390,7 +390,7 @@ Planned proof: corrupt the attention basis — the item withholds/flags `unknown
 
 Publish-capable dispatch verifies role identity before launch — dispatch revalidates actor/capability binding per [installation config](installation-config.md).
 
-Clause: [phases](execution-loop.md#tick-phases-in-order) 2; [installation config](installation-config.md#roles-and-bindings). Suite: LP-04.
+Clause: [phases](execution-loop.md#tick-phases-in-order) 2; [installation config](installation-config.md#roles-and-permission-matrix). Suite: LP-04.
 
 Planned proof: remove the publication role binding — dispatch holds with `unsupported`/`denied`, never launches unbound.
 
@@ -598,7 +598,7 @@ Planned proof: hold W1 — W2's queue position is unchanged; dispatch order rema
 
 Capability-gated selection — mechanism omitted (no reselect); retained: admission/dispatch is capability-gated per [installation config](installation-config.md).
 
-Clause: [phases](execution-loop.md#tick-phases-in-order) 2; [installation config](installation-config.md#capability-matrix). Suite: LP-04.
+Clause: [phases](execution-loop.md#tick-phases-in-order) 2; [installation config](installation-config.md#roles-and-permission-matrix). Suite: LP-04.
 
 Planned proof: an undeclared capability at dispatch — `unsupported`, no launch.
 
@@ -694,7 +694,7 @@ Planned proof: crash between enqueue decision and commit — the persisted key r
 
 Claimant-only liveness across blocking stages — process liveness is judged only by recorded claimant identity; worker-protocol supervision owns the mechanics.
 
-Clause: F3/F4; [worker protocol](worker-protocol.md#stop-proof-and-uncertainty). Suite: LP-11, LP-12.
+Clause: F3/F4; [worker protocol](worker-protocol.md#process-descendants-and-stop-proof). Suite: LP-11, LP-12.
 
 Planned proof: a foreign process with a recycled PID cannot prove liveness; heartbeat loss alone never kills.
 
@@ -734,7 +734,7 @@ Planned proof: resume with a missing continuation record — rejection names the
 
 Terminal remote cleanup fenced retries — mechanism omitted (no remote destroy); retained: cleanup retries are bounded and fenced by recorded state (retention's two-phase reclaim).
 
-Clause: [retention policy](retention-policy.md#two-phase-reclamation). Suite: cited RT suite.
+Clause: [retention policy](retention-policy.md#scheduling-and-ownership). Suite: cited RT suite.
 
 Planned proof: a failed delete retries bounded times under the `reclaiming` fence; three consecutive failures escalate.
 
