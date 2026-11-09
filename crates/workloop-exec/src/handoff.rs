@@ -210,14 +210,35 @@ pub fn drive(
                 attempt: 0,
                 recorded_seq: 0,
             };
-            store.transact(|tx| {
+            match store.transact(|tx| {
                 h.recorded_seq = tx.alloc_seq()?;
-                tx.apply(&Effect::UpsertHandoff { handoff: h.clone() })
-            })?;
-            h
+                tx.apply(&Effect::UpsertHandoff {
+                    handoff: h.clone(),
+                    expected_seq: 0,
+                })
+            }) {
+                Ok(()) => h,
+                // A concurrent supervisor created the row first —
+                // continue from their committed row, never overwrite.
+                Err(StoreError::ConstraintConflict { .. }) => store
+                    .transact(|tx| tx.artifact_handoff(artifact_id))?
+                    .unwrap_or(h),
+                Err(e) => return Err(e.into()),
+            }
         }
     };
-    advance(store, layout, &mut handoff, seed, max_attempts)?;
+    if let Err(e) = advance(store, layout, &mut handoff, seed, max_attempts) {
+        // A compare-and-set conflict means another supervisor
+        // advanced the row — the sweep re-reads it next pass instead
+        // of aborting this one.
+        if matches!(
+            e,
+            HandoffError::Store(StoreError::ConstraintConflict { .. })
+        ) {
+            return Ok(handoff);
+        }
+        return Err(e);
+    }
     if handoff.state == HandoffState::Acknowledged {
         run_verifications(store, layout, &handoff, seed)?;
     }
@@ -351,9 +372,14 @@ fn advance(
 
 fn persist(store: &impl Store, handoff: &mut ArtifactHandoff) -> Result<(), StoreError> {
     store.transact(|tx| {
+        // The write is a compare-and-set on the seq this row was read
+        // at — a concurrent supervisor's write lands first, and this
+        // becomes a conflict instead of regressing the row.
+        let expected_seq = handoff.recorded_seq;
         handoff.recorded_seq = tx.alloc_seq()?;
         tx.apply(&Effect::UpsertHandoff {
             handoff: handoff.clone(),
+            expected_seq,
         })
     })
 }

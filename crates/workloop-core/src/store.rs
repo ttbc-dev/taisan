@@ -143,8 +143,13 @@ pub enum Effect {
     /// Full-row upsert of the durable artifact-handoff record. Each
     /// stage transition commits inside the caller's transaction, so a
     /// crash leaves the last committed stage — never a torn row.
+    /// `expected_seq` is the `recorded_seq` the writer read (0 for a
+    /// row believed absent): a row concurrently advanced past it
+    /// makes the write a `ConstraintConflict`, never a silent
+    /// regression.
     UpsertHandoff {
         handoff: ArtifactHandoff,
+        expected_seq: EventSequence,
     },
     /// Immutable result of one declared verification argv run against
     /// the handed-off commit. Unique per `(artifact_id, requirement)`.

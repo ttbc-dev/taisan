@@ -1709,15 +1709,23 @@ impl TxView for Tx<'_> {
                     params![request_id],
                 )?;
             }
-            Effect::UpsertHandoff { handoff } => {
-                self.exec(
+            Effect::UpsertHandoff {
+                handoff,
+                expected_seq,
+            } => {
+                // Compare-and-set on recorded_seq: a concurrent
+                // supervisor's write first lands here, and the loser's
+                // write becomes a conflict instead of regressing the
+                // row it read before doing its git work.
+                let n = self.exec(
                     "INSERT INTO artifact_handoffs (artifact_id, invocation_id, \
                      request_id, work_id, execution_id, base, produced, \
                      manifest_digest, state, invalid_reason, attempt, \
                      recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                      ON CONFLICT(artifact_id) DO UPDATE SET base=?6, produced=?7, \
                      manifest_digest=?8, state=?9, invalid_reason=?10, \
-                     attempt=?11, recorded_seq=?12",
+                     attempt=?11, recorded_seq=?12 \
+                     WHERE artifact_handoffs.recorded_seq=?13",
                     params![
                         handoff.artifact_id,
                         handoff.invocation_id.0,
@@ -1731,8 +1739,17 @@ impl TxView for Tx<'_> {
                         handoff.invalid_reason,
                         handoff.attempt,
                         handoff.recorded_seq,
+                        expected_seq,
                     ],
                 )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "artifact_handoffs {} advanced concurrently",
+                            handoff.artifact_id
+                        ),
+                    });
+                }
             }
             Effect::InsertVerificationResult { result } => {
                 // One row per (artifact, requirement): a retried

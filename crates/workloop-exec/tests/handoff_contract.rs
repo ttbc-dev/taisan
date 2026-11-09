@@ -14,7 +14,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{IssueState, Observation, ObservationFact};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome};
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
 };
@@ -251,8 +251,15 @@ fn row(store: &SqliteStore, artifact_id: &str) -> Option<ArtifactHandoff> {
 fn persist(store: &SqliteStore, handoff: &ArtifactHandoff) {
     store
         .transact(|tx| {
+            // Test rewinds write whatever the current row is — the
+            // compare-and-set expects the seq the row sits at now.
+            let expected_seq = tx
+                .artifact_handoff(&handoff.artifact_id)?
+                .map(|h| h.recorded_seq)
+                .unwrap_or(0);
             tx.apply(&Effect::UpsertHandoff {
                 handoff: handoff.clone(),
+                expected_seq,
             })
         })
         .unwrap();
@@ -278,6 +285,7 @@ fn seed_export_started(store: &SqliteStore, invocation: &Invocation, w: &WorkId,
                     attempt: 1,
                     recorded_seq: seq,
                 },
+                expected_seq: 0,
             })
         })
         .unwrap();
@@ -1242,4 +1250,42 @@ fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
         Some("recovery_exhausted"),
         "a lost workspace converges on the bound, not on a crashed sweep"
     );
+}
+
+/// Two supervisors must not clobber one row: a write carrying a stale
+/// expected seq is a conflict, never a silent regression — the loser's
+/// write is refused and the committed state stands.
+#[test]
+fn a_stale_handoff_write_is_a_conflict_not_a_regression() {
+    let root = tmp_root("cas");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-cas");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-cas");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+
+    // A writer holding a stale read writes back a regressed row — the
+    // compare-and-set refuses it.
+    let mut stale = h.clone();
+    stale.state = HandoffState::ExportStarted;
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: stale,
+                expected_seq: h.recorded_seq - 1,
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "stale write is a conflict: {err:?}"
+    );
+    let h2 = row(&store, &aid).unwrap();
+    assert_eq!(h2.state, HandoffState::Acknowledged);
+    assert_eq!(h2.recorded_seq, h.recorded_seq);
 }
