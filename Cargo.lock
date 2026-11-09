@@ -651,6 +651,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "workloop-selector"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "workloop-core",
+]
+
+[[package]]
 name = "workloop-store"
 version = "0.0.0"
 dependencies = [
