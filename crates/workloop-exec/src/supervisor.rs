@@ -140,21 +140,29 @@ impl ProcessControlPort for PosixProcessControl {
         let mut by_ppid: HashMap<i32, Vec<(i32, i32, String)>> = HashMap::new();
         let mut all = HashMap::new();
         for line in table.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.is_empty() {
-                continue;
-            }
-            if f.len() != 8 {
+            // Numeric prefix fields, then the locale-dependent lstart
+            // string — its token count varies (e.g. ja_JP pads days
+            // <10 with a space), so it is never field-counted.
+            let mut it = line.split_whitespace();
+            let (Some(pid_s), Some(ppid_s), Some(pgid_s)) = (it.next(), it.next(), it.next())
+            else {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return Err(format!("incomplete process-table row: {line}"));
+            };
+            let lstart_raw = it.collect::<Vec<_>>().join(" ");
+            if lstart_raw.is_empty() {
                 return Err(format!("incomplete process-table row: {line}"));
             }
             let (Ok(pid), Ok(ppid), Ok(pgid)) = (
-                f[0].parse::<i32>(),
-                f[1].parse::<i32>(),
-                f[2].parse::<i32>(),
+                pid_s.parse::<i32>(),
+                ppid_s.parse::<i32>(),
+                pgid_s.parse::<i32>(),
             ) else {
                 return Err(format!("invalid process-table row: {line}"));
             };
-            let lstart = normalize_lstart(&f[3..].join(" "));
+            let lstart = normalize_lstart(&lstart_raw);
             by_ppid
                 .entry(ppid)
                 .or_default()
@@ -190,20 +198,27 @@ impl ProcessControlPort for PosixProcessControl {
             .map_err(|e| format!("group enumeration failed: {e}"))?;
         let mut out = Vec::new();
         for line in table.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.is_empty() {
-                continue;
-            }
-            if f.len() != 7 {
+            // Same variable-width lstart handling as
+            // `snapshot_descendants`: pid/pgid are numeric prefixes,
+            // everything after is the start time.
+            let mut it = line.split_whitespace();
+            let (Some(pid_s), Some(g_s)) = (it.next(), it.next()) else {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                return Err(format!("incomplete process-table row: {line}"));
+            };
+            let lstart = it.collect::<Vec<_>>().join(" ");
+            if lstart.is_empty() {
                 return Err(format!("incomplete process-table row: {line}"));
             }
-            let (Ok(pid), Ok(g)) = (f[0].parse::<i32>(), f[1].parse::<i32>()) else {
+            let (Ok(pid), Ok(g)) = (pid_s.parse::<i32>(), g_s.parse::<i32>()) else {
                 return Err(format!("invalid process-table row: {line}"));
             };
             if g == pgid {
                 out.push(ProcessIdentity {
                     pid,
-                    started_at: normalize_lstart(&f[2..].join(" ")),
+                    started_at: normalize_lstart(&lstart),
                     pgid: Some(g),
                 });
             }
@@ -305,6 +320,11 @@ impl ProcessControlPort for PosixProcessControl {
 pub enum ExecError {
     Store(StoreError),
     Io(std::io::Error),
+    /// A handoff precondition could not be evaluated (e.g. the
+    /// workspace's base branch is unreadable); surfaces instead of
+    /// silently recording an empty base that would skip ancestry
+    /// checks.
+    Handoff(String),
 }
 
 impl std::fmt::Display for ExecError {
@@ -312,6 +332,7 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Handoff(d) => write!(f, "handoff: {d}"),
         }
     }
 }
@@ -342,6 +363,7 @@ pub enum StopRecord {
 }
 
 /// Result of proving an exited writer's whole recorded tree is stopped.
+#[derive(Debug, PartialEq, Eq)]
 enum TreeProof {
     /// Every recorded identity inspected stopped: the exit fact may be
     /// reported.
@@ -533,7 +555,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // the workspace repo itself. `SourceSnapshot.source_revision`
         // is a host issue-version token, not a git commit.
         let branch = format!("work/{}", work_id.0);
-        let base = crate::handoff::derive_base(&self.workspace_of(&work_id), &branch);
+        let base = crate::handoff::derive_base(&self.workspace_of(&work_id), &branch)
+            .map_err(|e| ExecError::Handoff(e.to_string()))?;
         Ok(Some((
             crate::handoff::HandoffSeed {
                 invocation,
@@ -788,7 +811,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             match self.port.inspect(&identity) {
                 ProcessEvidence::Stopped { .. } => {
-                    match self.prove_tree_stopped(&invocation, None)? {
+                    // A persisted intent may name an escapee absent
+                    // from every live snapshot — it is part of the
+                    // proof set here too, not only in drive_stops.
+                    let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
+                    match self.prove_tree_stopped(&invocation, intent.as_ref())? {
                         TreeProof::Proven => {
                             self.port.reap(identity.pid);
                             self.finish_invocation(store, &invocation, now_unix_seconds)?;
@@ -916,7 +943,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// leader — always plus the persisted descendant snapshot and the
     /// leader's current process-group members (orphans reparent out of
     /// the ppid tree but keep the group). A failed group enumeration is
-    /// an error, not an empty set, so a gap cannot pass as proof.
+    /// an error, not an empty set, so a gap cannot pass as proof. A
+    /// group whose owner pid was recycled by an unrelated process is
+    /// attributed foreign and excluded — its members are never ours to
+    /// inspect or signal.
     fn proof_identities(
         &self,
         invocation: &Invocation,
@@ -936,14 +966,26 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 out.push(id.clone());
             }
         }
-        if let Some(pgid) = invocation
-            .process_identity
-            .as_ref()
-            .and_then(|leader| leader.pgid)
+        if let Some(leader) = &invocation.process_identity
+            && let Some(pgid) = leader.pgid
         {
-            for id in self.port.group_members(pgid)? {
-                if !out.iter().any(|i| i.pid == id.pid) {
-                    out.push(id);
+            // pgid == the leader's pid (spawn sets process_group(0)), so
+            // the owner slot attributes the group: a live process at
+            // pgid whose start differs from the recorded leader's means
+            // the number was recycled by an unrelated process — that
+            // group is not ours to inspect or signal. An absent owner
+            // is a straggler-held group of ours (or, at the documented
+            // harness boundary, a recycled group whose own leader
+            // already exited).
+            let members = self.port.group_members(pgid)?;
+            let foreign = members
+                .iter()
+                .any(|m| m.pid == pgid && m.started_at != leader.started_at);
+            if !foreign {
+                for id in members {
+                    if !out.iter().any(|i| i.pid == id.pid) {
+                        out.push(id);
+                    }
                 }
             }
         }
@@ -1511,35 +1553,38 @@ impl<P: ProcessControlPort> Supervisor<P> {
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
         match ev {
-            ProcessEvidence::Stopped { .. } => match self.prove_tree_stopped(invocation, None)? {
-                TreeProof::Proven => {
-                    if let Some(id) = &invocation.process_identity {
-                        self.port.reap(id.pid);
+            ProcessEvidence::Stopped { .. } => {
+                let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
+                match self.prove_tree_stopped(invocation, intent.as_ref())? {
+                    TreeProof::Proven => {
+                        if let Some(id) = &invocation.process_identity {
+                            self.port.reap(id.pid);
+                        }
+                        self.finish_invocation(store, invocation, now_unix_seconds)
                     }
-                    self.finish_invocation(store, invocation, now_unix_seconds)
+                    TreeProof::Withheld => Ok(()),
+                    TreeProof::Uncertain => {
+                        let id = invocation
+                            .process_identity
+                            .clone()
+                            .unwrap_or(ProcessIdentity {
+                                pid: -1,
+                                started_at: String::new(),
+                                pgid: None,
+                            });
+                        self.report(
+                            store,
+                            request,
+                            ObservationFact::ProcessState {
+                                invocation_id: invocation.id.clone(),
+                                process_identity: format!("{}@{}", id.pid, id.started_at),
+                                state: ProcessStateFact::Unknown,
+                            },
+                            now_unix_seconds,
+                        )
+                    }
                 }
-                TreeProof::Withheld => Ok(()),
-                TreeProof::Uncertain => {
-                    let id = invocation
-                        .process_identity
-                        .clone()
-                        .unwrap_or(ProcessIdentity {
-                            pid: -1,
-                            started_at: String::new(),
-                            pgid: None,
-                        });
-                    self.report(
-                        store,
-                        request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: format!("{}@{}", id.pid, id.started_at),
-                            state: ProcessStateFact::Unknown,
-                        },
-                        now_unix_seconds,
-                    )
-                }
-            },
+            }
             ProcessEvidence::Alive { .. } => {
                 // Same re-assertion as the poll path: a reconciled
                 // request whose Running report was lost must still move
@@ -1780,6 +1825,167 @@ mod tests {
                 reason: "process table unavailable".into()
             }
         );
+    }
+
+    /// A scripted group for the recycled-pgid boundary: members are
+    /// returned verbatim and every signal is recorded so a test can
+    /// assert foreign members are never signalled. `inspect` honours
+    /// the identity check — a pid that lives under a different start
+    /// time is a reuse, not the recorded process.
+    struct ScriptedGroup {
+        members: Vec<ProcessIdentity>,
+        alive: Vec<ProcessIdentity>,
+        signaled: std::sync::Mutex<Vec<i32>>,
+    }
+
+    impl ProcessControlPort for ScriptedGroup {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn expected")
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            panic!("no snapshot expected")
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(self.members.clone())
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            match self
+                .alive
+                .iter()
+                .find(|a| a.pid == id.pid && a.started_at == id.started_at)
+            {
+                Some(found) => ProcessEvidence::Alive {
+                    identity: found.clone(),
+                },
+                None => ProcessEvidence::Stopped {
+                    identity: id.clone(),
+                    exit_code: Some(0),
+                },
+            }
+        }
+        fn signal_verified(&self, id: &ProcessIdentity, _: i32) -> SignalOutcome {
+            self.signaled.lock().unwrap().push(id.pid);
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    fn scripted_config() -> workloop_core::work::WorkloopConfig {
+        workloop_core::work::WorkloopConfig {
+            host: workloop_core::work::HostTemplate {
+                adapter: workloop_core::identity::AdapterId::trusted("fixture"),
+                repository: workloop_core::identity::RepositoryRef::new(
+                    workloop_core::identity::HostInstanceId::trusted("host-local"),
+                    workloop_core::identity::RepositoryId::trusted("local-repo"),
+                ),
+                contract_version: 1,
+                actors: vec![],
+            },
+            declared_capabilities: Default::default(),
+            lanes: Default::default(),
+            required_checks: vec![],
+            allowed_effects: AllowedEffects {
+                workspace_write: true,
+                host_write: false,
+                network: false,
+            },
+            budget: ExecutionBudget::default(),
+            policy: WorkPolicy::default(),
+        }
+    }
+
+    fn group_invocation(leader: &ProcessIdentity) -> Invocation {
+        Invocation {
+            id: InvocationId("inv-g".into()),
+            request_id: "req-g".into(),
+            execution_id: ExecutionId("e-g".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Running,
+            process_identity: Some(leader.clone()),
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        }
+    }
+
+    /// After the leader is reaped, its pid can be recycled as the owner
+    /// of a *different* group carrying the same pgid number. Those
+    /// members are not ours: excluded from the proof and never
+    /// signalled.
+    #[test]
+    fn a_recycled_group_owner_excludes_foreign_members() {
+        let leader = ProcessIdentity {
+            pid: 9,
+            started_at: "leader start".into(),
+            pgid: Some(9),
+        };
+        let foreign = vec![
+            ProcessIdentity {
+                pid: 9,
+                started_at: "foreign start".into(),
+                pgid: Some(9),
+            },
+            ProcessIdentity {
+                pid: 700,
+                started_at: "foreign start".into(),
+                pgid: Some(9),
+            },
+        ];
+        let sup = Supervisor::new(
+            ScriptedGroup {
+                members: foreign.clone(),
+                alive: foreign,
+                signaled: std::sync::Mutex::new(vec![]),
+            },
+            PathBuf::from("/unused"),
+            vec![],
+            scripted_config(),
+        );
+        let invocation = group_invocation(&leader);
+        assert_eq!(
+            sup.prove_tree_stopped(&invocation, None).unwrap(),
+            TreeProof::Proven
+        );
+        assert!(
+            sup.port.signaled.lock().unwrap().is_empty(),
+            "a foreign group member must never be signalled"
+        );
+    }
+
+    /// A group whose owner pid is absent is still ours — stragglers
+    /// hold the pgid after the leader is reaped — so its members are
+    /// inspected and re-signalled.
+    #[test]
+    fn an_ownerless_group_is_still_ours_to_signal() {
+        let leader = ProcessIdentity {
+            pid: 9,
+            started_at: "leader start".into(),
+            pgid: Some(9),
+        };
+        let straggler = ProcessIdentity {
+            pid: 700,
+            started_at: "straggler start".into(),
+            pgid: Some(9),
+        };
+        let sup = Supervisor::new(
+            ScriptedGroup {
+                members: vec![straggler.clone()],
+                alive: vec![straggler],
+                signaled: std::sync::Mutex::new(vec![]),
+            },
+            PathBuf::from("/unused"),
+            vec![],
+            scripted_config(),
+        );
+        let invocation = group_invocation(&leader);
+        assert_eq!(
+            sup.prove_tree_stopped(&invocation, None).unwrap(),
+            TreeProof::Withheld
+        );
+        assert_eq!(*sup.port.signaled.lock().unwrap(), vec![700]);
     }
 
     #[test]

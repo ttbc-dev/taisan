@@ -93,7 +93,9 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, Handoff
         .arg("-c")
         .arg("credential.helper=")
         .arg("-c")
-        .arg("protocol.allow=user")
+        .arg("protocol.allow=never")
+        .arg("-c")
+        .arg("protocol.file.allow=always")
         .args(args)
         .output()?)
 }
@@ -130,27 +132,34 @@ fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffEr
 /// writer started from). A spec's `source_revision` is a host
 /// issue-version token — never a commit — so it cannot bound git
 /// ancestry; the durable record lives in `artifact_handoffs.base`.
-/// Empty means the workspace records no base branch to bound against.
-/// When `branch` shares no history with the base branch, the base ref
-/// itself is returned — it can never be an ancestor of `branch`, so the
-/// export's stale check classifies the foreign history `stale_base`.
-pub fn derive_base(workspace: &Path, branch: &str) -> String {
-    let Ok(refs) = git(
+/// Empty means the workspace records no base branch to bound against —
+/// a git failure is an error, never a silent empty (an empty base
+/// skips both the stale-base and nothing-produced checks). When
+/// `branch` shares no history with the base branch, the base ref
+/// itself is returned — it can never be an ancestor of `branch`, so
+/// the export's stale check classifies the foreign history
+/// `stale_base`.
+pub fn derive_base(workspace: &Path, branch: &str) -> Result<String, HandoffError> {
+    let refs = git(
         workspace,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-    ) else {
-        return String::new();
-    };
+    )?;
     let Some(base_ref) = refs
         .lines()
         .find(|r| !r.is_empty() && *r != branch && !r.starts_with("work/"))
     else {
-        return String::new();
+        return Ok(String::new());
     };
     match git_output(workspace, &["merge-base", base_ref, branch]) {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) if out.status.code() == Some(1) => base_ref.to_string(),
-        _ => String::new(),
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) if out.status.code() == Some(1) => Ok(base_ref.to_string()),
+        Ok(out) => Err(HandoffError::Transport(format!(
+            "merge-base {base_ref} {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+        Err(e) => Err(e),
     }
 }
 
@@ -227,13 +236,16 @@ fn run_verifications(
     if seed.verification_argv.is_empty() {
         return Ok(());
     }
-    // Recorded terminal results are final; `Inconclusive` is retried —
-    // an inconclusive run (spawn/worktree/timeout failure) never
-    // satisfies or exhausts a declared requirement.
-    let recorded: std::collections::HashMap<String, VerificationOutcome> = store
+    // Recorded terminal results are final *for the same argv and
+    // produced commit* — the requirement slot is an index, and a new
+    // spec revision can change the argv behind it, so argv (and
+    // produced) must match before a Pass/Fail covers the requirement.
+    // `Inconclusive` is retried — an inconclusive run (spawn, worktree,
+    // or timeout failure) never satisfies or exhausts a requirement.
+    let recorded: std::collections::HashMap<String, VerificationResult> = store
         .transact(|tx| tx.verification_results(&handoff.artifact_id))?
         .into_iter()
-        .map(|r| (r.requirement, r.result))
+        .map(|r| (r.requirement.clone(), r))
         .collect();
     let scratch = layout.out_dir_of(handoff);
     for (i, argv) in seed.verification_argv.iter().enumerate() {
@@ -241,10 +253,14 @@ fn run_verifications(
             continue;
         }
         let requirement = format!("verification_argv[{i}]");
-        if matches!(
-            recorded.get(&requirement),
-            Some(VerificationOutcome::Pass | VerificationOutcome::Fail)
-        ) {
+        if let Some(r) = recorded.get(&requirement)
+            && matches!(
+                r.result,
+                VerificationOutcome::Pass | VerificationOutcome::Fail
+            )
+            && r.argv == *argv
+            && Some(&r.produced) == handoff.produced.as_ref()
+        {
             continue;
         }
         verify(

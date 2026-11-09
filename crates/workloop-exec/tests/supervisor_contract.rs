@@ -947,6 +947,138 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
     );
 }
 
+/// The poll path owns the proof once an Execution leaves `Stopping`
+/// (e.g. an Uncertain pass on a deferred Cancel): a `setsid` escapee
+/// that only the durable intent still names must be inspected — and
+/// re-signalled — before the exit fact can settle and release
+/// capacity.
+#[test]
+fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
+    use std::path::Path;
+    use std::sync::Mutex;
+    use workloop_core::ports::SpawnError;
+
+    struct IntentEscapee {
+        escapee: ProcessIdentity,
+        signaled: Mutex<Vec<i32>>,
+    }
+    impl ProcessControlPort for IntentEscapee {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the poll path")
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        // The escapee `setsid`'d out of the group: enumeration cannot
+        // cover it — only the durable intent does.
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            if id.pid == self.escapee.pid {
+                ProcessEvidence::Alive {
+                    identity: self.escapee.clone(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: id.clone(),
+                    exit_code: Some(0),
+                }
+            }
+        }
+        fn signal_verified(&self, id: &ProcessIdentity, _: i32) -> SignalOutcome {
+            self.signaled.lock().unwrap().push(id.pid);
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("pollintent");
+    let (_w, eid) = submit_and_admit(&store, "k-pi1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_800_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_800_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_800_002,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    // The writer is recorded Running and the Execution left Stopping
+    // for a live state — the poll path owns its exit fact now.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-pi1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Running;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })?;
+            // The durable intent from the earlier stop drive names the
+            // escapee — the only record that still covers it.
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertStopIntent {
+                intent: StopIntent {
+                    invocation_id: InvocationId("inv-pi1".into()),
+                    identities: vec![leader.clone(), escapee.clone()],
+                    recorded_seq: seq,
+                },
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(
+        IntentEscapee {
+            escapee: escapee.clone(),
+            signaled: Mutex::new(vec![]),
+        },
+        root,
+        vec![],
+        config(),
+    );
+    sup.poll_invocations(&store, NOW).unwrap();
+    assert!(
+        sup.port.signaled.lock().unwrap().contains(&escapee.pid),
+        "the intent-recorded escapee must be re-signalled, not ignored"
+    );
+    let invocation = store
+        .transact(|tx| tx.invocation_for_request(&request_id))
+        .unwrap()
+        .expect("invocation");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Running,
+        "a live intent-recorded writer withholds the exit fact"
+    );
+}
+
 // ---- Artifact recovery (#10) ----
 
 #[test]

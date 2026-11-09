@@ -1104,3 +1104,62 @@ fn a_source_bound_work_derives_base_from_the_workspace() {
     );
     assert_eq!(h.state, HandoffState::Acknowledged);
 }
+
+/// The requirement slot is an index into the *current* spec's argv —
+/// a spec revision that changes the command behind `verification_argv[0]`
+/// creates a new requirement the recorded Pass does not cover. The new
+/// argv runs against the produced commit and replaces the stale row.
+#[test]
+fn a_changed_verification_argv_is_rerun() {
+    let root = tmp_root("argvchange");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-argv");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-argv");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["sh".into(), "-c".into(), "true".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+
+    // The spec now declares a different command for the same slot.
+    s.verification_argv = vec![vec!["sh".into(), "-c".into(), "exit 7".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1, "the new argv replaces the stale row");
+    assert_eq!(results[0].argv, vec!["sh", "-c", "exit 7"]);
+    assert_eq!(
+        results[0].result,
+        VerificationOutcome::Fail,
+        "the changed argv ran — the old Pass never covers it"
+    );
+}
+
+/// A workspace whose git metadata is unreadable surfaces as an error —
+/// never a silently empty base that would skip the stale-base and
+/// nothing-produced checks and acknowledge a foreign commit.
+#[test]
+fn an_unreadable_workspace_base_is_an_error() {
+    let root = tmp_root("badbase");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-badbase");
+    let ws_root = root.join("ws");
+    let ws_dir = ws_root.join(format!("ws-{}", w.0));
+    std::fs::create_dir_all(ws_dir.join(".git")).unwrap();
+    let layout = HandoffLayout {
+        repository: bare_repo(&root),
+        workspace_root: ws_root.clone(),
+        out_root: root.join("out"),
+    };
+    let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
+    let invocation = done_invocation(&e, "inv-badbase");
+    insert_invocation(&store, &invocation);
+    assert!(
+        sup.drive_handoffs(&store).is_err(),
+        "a failed base derivation surfaces; it is never an empty base"
+    );
+    assert!(row(&store, &artifact_id(&invocation)).is_none());
+}
