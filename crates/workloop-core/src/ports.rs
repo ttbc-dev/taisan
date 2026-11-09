@@ -78,6 +78,13 @@ pub trait ProcessControlPort {
     /// authorize signaling from a partial descendant snapshot.
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String>;
 
+    /// Every process currently belonging to `pgid`. Used to cover orphan
+    /// writers still in the leader's group after it exits: they reparent
+    /// out of the ppid tree `snapshot_descendants` walks but keep the
+    /// recorded group. A failed enumeration is an error — never an empty
+    /// proof set — so a gap cannot masquerade as "nothing left".
+    fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String>;
+
     /// Read the current state of one recorded identity.
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence;
 

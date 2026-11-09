@@ -2103,6 +2103,7 @@ fn recording_an_invocation_consumes_only_its_request() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             },
             Effect::MarkRequestConsumed {
@@ -2172,6 +2173,7 @@ fn recording_an_invocation_without_a_request_row_leaves_pending_alone() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             },
             Effect::MarkRequestConsumed {
@@ -2733,6 +2735,7 @@ fn recorded_invocation(eid: &ExecutionId, id: &str) -> Invocation {
         process_identity: None,
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     }
 }
 

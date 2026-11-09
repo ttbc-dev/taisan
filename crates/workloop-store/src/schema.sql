@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS invocations (
     role TEXT NOT NULL,
     state TEXT NOT NULL,
     process_identity TEXT,
+    -- Write-capable descendants recorded while the leader was alive;
+    -- every recorded identity must inspect stopped before an exit fact.
+    descendants TEXT NOT NULL DEFAULT '[]',
     required_artifacts TEXT NOT NULL,
     evidence_refs TEXT NOT NULL
 );
@@ -234,6 +237,40 @@ CREATE TABLE IF NOT EXISTS stop_intents (
     invocation_id TEXT PRIMARY KEY,
     identities TEXT NOT NULL,
     recorded_seq INTEGER NOT NULL
+);
+
+-- Durable artifact handoff (worker-protocol): export_started → bundle →
+-- quarantine import → ref → acknowledged. `state` drives crash recovery;
+-- `attempt` counts recovery attempts against the artifact-recovery bound.
+CREATE TABLE IF NOT EXISTS artifact_handoffs (
+    artifact_id TEXT PRIMARY KEY,
+    invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id),
+    request_id TEXT NOT NULL,
+    work_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    base TEXT NOT NULL,
+    produced TEXT,
+    manifest_digest TEXT,
+    state TEXT NOT NULL,
+    invalid_reason TEXT,
+    attempt INTEGER NOT NULL,
+    recorded_seq INTEGER NOT NULL
+);
+
+-- One bounded result per declared verification argv on a handed-off
+-- artifact; each argv runs on an independent clean worktree of the
+-- exact produced commit.
+CREATE TABLE IF NOT EXISTS verification_results (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL REFERENCES artifact_handoffs(artifact_id),
+    requirement TEXT NOT NULL,
+    argv TEXT NOT NULL,
+    produced TEXT NOT NULL,
+    environment_digest TEXT NOT NULL,
+    result TEXT NOT NULL,
+    output TEXT NOT NULL,
+    recorded_seq INTEGER NOT NULL,
+    UNIQUE (artifact_id, requirement)
 );
 
 CREATE TABLE IF NOT EXISTS deferrals (

@@ -147,6 +147,7 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
                         process_identity: None,
                         required_artifacts,
                         evidence_refs: vec![],
+                        descendants: vec![],
                     },
                 })?;
             }

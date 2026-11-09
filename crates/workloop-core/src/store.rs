@@ -140,6 +140,17 @@ pub enum Effect {
     MarkRequestConsumed {
         request_id: String,
     },
+    /// Full-row upsert of the durable artifact-handoff record. Each
+    /// stage transition commits inside the caller's transaction, so a
+    /// crash leaves the last committed stage — never a torn row.
+    UpsertHandoff {
+        handoff: ArtifactHandoff,
+    },
+    /// Immutable result of one declared verification argv run against
+    /// the handed-off commit. Unique per `(artifact_id, requirement)`.
+    InsertVerificationResult {
+        result: VerificationResult,
+    },
 }
 
 /// Reconciliation state of a recorded outbox action.
@@ -344,6 +355,23 @@ pub trait ReadView {
     fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError>;
 
     fn stop_intent(&self, invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError>;
+
+    /// The durable handoff record for one artifact id; `None` = absent.
+    fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError>;
+    /// An Invocation carries at most one handoff (UNIQUE in the store).
+    fn handoff_for_invocation(
+        &self,
+        invocation_id: &InvocationId,
+    ) -> Result<Option<ArtifactHandoff>, StoreError>;
+    /// Rows the recovery sweep must advance: everything not yet
+    /// `acknowledged` or `invalid`.
+    fn incomplete_handoffs(&self) -> Result<Vec<ArtifactHandoff>, StoreError>;
+
+    /// Recorded verification results for one handed-off artifact.
+    fn verification_results(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Vec<VerificationResult>, StoreError>;
 
     /// Recorded dispatch deferrals, keyed by Execution — the `capacity`
     /// Query's explanation of queue stalls.
