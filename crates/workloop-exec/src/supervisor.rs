@@ -182,6 +182,35 @@ impl ProcessControlPort for PosixProcessControl {
         Ok(out)
     }
 
+    fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String> {
+        // pid, pgid, lstart(5 fields). Orphans keep the leader's group
+        // after reparenting, which is exactly the coverage the ppid-tree
+        // snapshot cannot give once the leader is gone.
+        let table = ps_output(&["-Ao", "pid=,pgid=,lstart="])
+            .map_err(|e| format!("group enumeration failed: {e}"))?;
+        let mut out = Vec::new();
+        for line in table.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.is_empty() {
+                continue;
+            }
+            if f.len() != 7 {
+                return Err(format!("incomplete process-table row: {line}"));
+            }
+            let (Ok(pid), Ok(g)) = (f[0].parse::<i32>(), f[1].parse::<i32>()) else {
+                return Err(format!("invalid process-table row: {line}"));
+            };
+            if g == pgid {
+                out.push(ProcessIdentity {
+                    pid,
+                    started_at: normalize_lstart(&f[2..].join(" ")),
+                    pgid: Some(g),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
         let lstart = match lstart_of(identity.pid) {
             // The pid is gone; this identity no longer exists.
@@ -312,6 +341,19 @@ pub enum StopRecord {
     Unknown { reason: String },
 }
 
+/// Result of proving an exited writer's whole recorded tree is stopped.
+enum TreeProof {
+    /// Every recorded identity inspected stopped: the exit fact may be
+    /// reported.
+    Proven,
+    /// Live stragglers were re-signaled; the exit fact stays withheld so
+    /// capacity can never release while a recorded writer survives.
+    Withheld,
+    /// Inspection was inconclusive for at least one recorded identity;
+    /// the caller reports `Unknown` so the Execution holds ownership.
+    Uncertain,
+}
+
 /// The execution supervisor: consumes approved requests, spawns workers,
 /// drives stop intents to stop proof, and runs bounded artifact recovery.
 /// Start and stop for one request are serialized through a per-request
@@ -324,6 +366,9 @@ pub struct Supervisor<P: ProcessControlPort> {
     pub worker_argv: Vec<String>,
     /// The installation config `work` decisions are made against.
     pub config: workloop_core::work::WorkloopConfig,
+    /// Durable artifact-handoff layout; `None` keeps the file-artifact
+    /// path only (fixture harnesses without git workspaces).
+    pub handoff: Option<crate::handoff::HandoffLayout>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -339,8 +384,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
             workspace_root,
             worker_argv,
             config,
+            handoff: None,
             locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure durable handoff transport (handoff repository + out
+    /// root) for Workspaces carrying git objects.
+    pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
+        self.handoff = Some(layout);
+        self
     }
 
     fn lock_for(&self, key: &str) -> Arc<Mutex<()>> {
@@ -369,8 +422,102 @@ impl<P: ProcessControlPort> Supervisor<P> {
         self.consume_requests(store, now_unix_seconds)?;
         self.poll_invocations(store, now_unix_seconds)?;
         self.drive_stops(store, now_unix_seconds)?;
+        self.drive_handoffs(store)?;
         self.run_recovery(store, now_unix_seconds)?;
         Ok(())
+    }
+
+    /// Durable artifact handoff: resume every incomplete row (the
+    /// restart path re-derives seeds from recorded ids) and open rows
+    /// for Done invocations whose workspace carries git objects. Runs
+    /// only when a handoff layout is configured; export is reached only
+    /// after confirmed exit and stop proof — the point at which a
+    /// finished Invocation becomes `Done`.
+    pub fn drive_handoffs(&self, store: &impl Store) -> Result<(), ExecError> {
+        let Some(layout) = &self.handoff else {
+            return Ok(());
+        };
+        let mut seeds: Vec<(String, crate::handoff::HandoffSeed, u32)> = Vec::new();
+        // Rows already in flight resume first: a crash mid-export leaves
+        // the row to advance from its last committed stage.
+        for row in store.transact(|tx| tx.incomplete_handoffs())? {
+            let Some(invocation) =
+                store.transact(|tx| tx.invocation_for_request(&row.request_id))?
+            else {
+                continue;
+            };
+            if let Some((seed, bound)) = self.handoff_seed(store, &invocation)? {
+                seeds.push((row.artifact_id.clone(), seed, bound));
+            }
+        }
+        // Done invocations on nonterminal executions may need a row.
+        // A non-git workspace keeps the file-artifact path untouched.
+        for execution in store.transact(|tx| tx.nonterminal_executions())? {
+            if !self.workspace_of(&execution.work_id).join(".git").exists() {
+                continue;
+            }
+            for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
+                if invocation.state != InvocationState::Done
+                    || invocation.required_artifacts.is_empty()
+                {
+                    continue;
+                }
+                let Some((seed, bound)) = self.handoff_seed(store, &invocation)? else {
+                    continue;
+                };
+                for required in &invocation.required_artifacts {
+                    let artifact_id = format!("{}/{}", invocation.id.0, required.kind);
+                    if seeds.iter().any(|(id, ..)| id == &artifact_id) {
+                        continue;
+                    }
+                    seeds.push((artifact_id, seed.clone(), bound));
+                }
+            }
+        }
+        for (artifact_id, seed, bound) in seeds {
+            // A transport failure must not wedge the whole sweep; the
+            // row's last committed stage stands until the next pass.
+            let _ = crate::handoff::drive(store, layout, &artifact_id, &seed, bound);
+        }
+        Ok(())
+    }
+
+    /// The ambient launch context a handoff row does not carry: base
+    /// revision, branch, and declared verification argv, plus the
+    /// execution's artifact-recovery bound.
+    fn handoff_seed(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+    ) -> Result<Option<(crate::handoff::HandoffSeed, u32)>, ExecError> {
+        let found = store.transact(|tx| {
+            let Some(execution) = tx.execution(&invocation.execution_id)? else {
+                return Ok(None);
+            };
+            let Some(work) = tx.work(&execution.work_id)? else {
+                return Ok(None);
+            };
+            let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
+                return Ok(None);
+            };
+            let base = spec
+                .payload
+                .sources
+                .first()
+                .map(|s| s.source_revision.clone())
+                .unwrap_or_default();
+            Ok(Some((
+                crate::handoff::HandoffSeed {
+                    invocation: invocation.clone(),
+                    base,
+                    branch: format!("work/{}", work.id.0),
+                    work_id: work.id.clone(),
+                    verification_argv: spec.payload.verification_argv.clone(),
+                },
+                execution.budget.artifact_recovery_attempts,
+            )))
+        })?;
+        Ok(found)
     }
 
     /// Replay the durable request log: for each unconsumed request either
@@ -440,6 +587,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             role: request.role.clone(),
             state: InvocationState::Prepared,
             process_identity: None,
+            descendants: vec![],
             required_artifacts: required_artifacts(request),
             evidence_refs: vec![],
         };
@@ -480,10 +628,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let argv = self.worker_argv.clone();
         match self.port.spawn(&argv, &workspace) {
             Ok(identity) => {
+                // Descendant coverage starts at launch: a writer that
+                // escapes its tree before the first poll is still a
+                // recorded identity the exit proof must account for. A
+                // failed table read is not a launch failure — the
+                // intent-time snapshot re-covers on the stop path.
+                let descendants = self
+                    .port
+                    .snapshot_descendants(identity.pid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.pid != identity.pid)
+                    .collect();
                 store.transact(|tx| {
                     let mut next = invocation.clone();
                     next.state = InvocationState::Running;
                     next.process_identity = Some(identity.clone());
+                    next.descendants = descendants;
                     tx.apply(&Effect::UpdateInvocation {
                         invocation: next,
                         expected_state: InvocationState::Prepared,
@@ -601,10 +762,38 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             match self.port.inspect(&identity) {
                 ProcessEvidence::Stopped { .. } => {
-                    self.port.reap(identity.pid);
-                    self.finish_invocation(store, &invocation, now_unix_seconds)?;
+                    match self.prove_tree_stopped(&invocation, None)? {
+                        TreeProof::Proven => {
+                            self.port.reap(identity.pid);
+                            self.finish_invocation(store, &invocation, now_unix_seconds)?;
+                        }
+                        // Live stragglers were re-signaled; the exit fact
+                        // is withheld until the whole tree proves stopped.
+                        TreeProof::Withheld => {}
+                        TreeProof::Uncertain => {
+                            let request = store
+                                .transact(|tx| tx.request(&invocation.request_id))?
+                                .ok_or(ExecError::Store(StoreError::Internal {
+                                    detail: "invocation without request".into(),
+                                }))?;
+                            self.report(
+                                store,
+                                &request,
+                                ObservationFact::ProcessState {
+                                    invocation_id: invocation.id.clone(),
+                                    process_identity: format!(
+                                        "{}@{}",
+                                        identity.pid, identity.started_at
+                                    ),
+                                    state: ProcessStateFact::Unknown,
+                                },
+                                now_unix_seconds,
+                            )?;
+                        }
+                    }
                 }
                 ProcessEvidence::Alive { .. } => {
+                    self.refresh_descendants(store, &invocation)?;
                     // Re-assert liveness. A crash (or failed observation
                     // commit) between persisting the running identity and
                     // reporting ProcessState::Running would otherwise
@@ -647,6 +836,120 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
         Ok(())
+    }
+
+    /// Refresh the durable descendant snapshot while the leader is alive.
+    /// Escapees are cheapest to record while they are still children; a
+    /// failed or unchanged table read leaves the stored set alone.
+    fn refresh_descendants(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+    ) -> Result<(), ExecError> {
+        let Some(leader) = &invocation.process_identity else {
+            return Ok(());
+        };
+        let Ok(mut snap) = self.port.snapshot_descendants(leader.pid) else {
+            return Ok(());
+        };
+        snap.retain(|i| i.pid != leader.pid);
+        snap.sort_by_key(|i| i.pid);
+        let mut recorded = invocation.descendants.clone();
+        recorded.sort_by_key(|i| i.pid);
+        if recorded
+            .iter()
+            .zip(&snap)
+            .all(|(a, b)| a.pid == b.pid && a.started_at == b.started_at)
+            && recorded.len() == snap.len()
+        {
+            return Ok(());
+        }
+        let mut next = invocation.clone();
+        next.descendants = snap;
+        match store.transact(|tx| {
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: next,
+                expected_state: invocation.state.clone(),
+            })
+        }) {
+            Ok(()) | Err(StoreError::ConstraintConflict { .. }) => Ok(()),
+            Err(e) => Err(ExecError::Store(e)),
+        }
+    }
+
+    /// The identities whose stop must be proven before the exit fact:
+    /// the stop intent's snapshot when one exists, else the recorded
+    /// leader — always plus the persisted descendant snapshot and the
+    /// leader's current process-group members (orphans reparent out of
+    /// the ppid tree but keep the group). A failed group enumeration is
+    /// an error, not an empty set, so a gap cannot pass as proof.
+    fn proof_identities(
+        &self,
+        invocation: &Invocation,
+        intent: Option<&StopIntent>,
+    ) -> Result<Vec<ProcessIdentity>, String> {
+        let mut out: Vec<ProcessIdentity> =
+            intent.map(|i| i.identities.clone()).unwrap_or_default();
+        if out.is_empty() {
+            out.extend(invocation.process_identity.iter().cloned());
+        } else if let Some(leader) = &invocation.process_identity
+            && !out.iter().any(|i| i.pid == leader.pid)
+        {
+            out.push(leader.clone());
+        }
+        for id in &invocation.descendants {
+            if !out.iter().any(|i| i.pid == id.pid) {
+                out.push(id.clone());
+            }
+        }
+        if let Some(pgid) = invocation
+            .process_identity
+            .as_ref()
+            .and_then(|leader| leader.pgid)
+        {
+            for id in self.port.group_members(pgid)? {
+                if !out.iter().any(|i| i.pid == id.pid) {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Inspect every identity the exit fact depends on; live stragglers
+    /// are re-signaled under re-verification. `Withheld` means at least
+    /// one writer is still alive; `Uncertain` means a lookup failed.
+    fn prove_tree_stopped(
+        &self,
+        invocation: &Invocation,
+        intent: Option<&StopIntent>,
+    ) -> Result<TreeProof, ExecError> {
+        let identities = match self.proof_identities(invocation, intent) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(TreeProof::Uncertain),
+        };
+        let mut withheld = false;
+        let mut uncertain = false;
+        for id in &identities {
+            match self.port.inspect(id) {
+                ProcessEvidence::Stopped { .. } => {}
+                ProcessEvidence::Alive { identity } => {
+                    withheld = true;
+                    self.port.signal_verified(&identity, libc::SIGKILL);
+                }
+                ProcessEvidence::Unknown { .. } => {
+                    withheld = true;
+                    uncertain = true;
+                }
+            }
+        }
+        Ok(if uncertain {
+            TreeProof::Uncertain
+        } else if withheld {
+            TreeProof::Withheld
+        } else {
+            TreeProof::Proven
+        })
     }
 
     /// Save every artifact fact before the exit fact resolves the writer.
@@ -745,14 +1048,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 if invocation.state.is_unresolved_writer() {
                     continue;
                 }
-                let identities: Vec<ProcessIdentity> =
-                    match store.transact(|tx| tx.stop_intent(&invocation.id))? {
-                        Some(intent) => intent.identities,
-                        None => invocation.process_identity.iter().cloned().collect(),
-                    };
-                let unproven = identities
-                    .iter()
-                    .any(|id| !matches!(self.port.inspect(id), ProcessEvidence::Stopped { .. }));
+                let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
+                let unproven = match self.proof_identities(invocation, intent.as_ref()) {
+                    Ok(identities) => identities.iter().any(|id| {
+                        !matches!(self.port.inspect(id), ProcessEvidence::Stopped { .. })
+                    }),
+                    // A gap in enumeration is inconclusive, not proof.
+                    Err(_) => true,
+                };
                 if unproven {
                     unresolved.push(invocation.clone());
                 }
@@ -808,8 +1111,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     continue;
                 };
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
-                let identities = match intent {
-                    Some(recorded) => recorded.identities,
+                let identities = match &intent {
+                    Some(recorded) => recorded.identities.clone(),
                     None => match self.request_stop(store, &invocation, &identity)? {
                         StopReceipt::Requested | StopReceipt::AlreadyStopped => store
                             .transact(|tx| tx.stop_intent(&invocation.id))?
@@ -818,10 +1121,21 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         StopReceipt::Unknown { .. } => continue,
                     },
                 };
-                // Stop proof = inspecting every recorded identity.
+                // Stop proof = inspecting every recorded identity: the
+                // intent's snapshot, the persisted descendant snapshot,
+                // and the leader's current group members. A failed group
+                // enumeration is inconclusive — never proof.
                 let mut all_stopped = true;
                 let mut any_unknown = false;
-                for id in &identities {
+                let proof = match self.proof_identities(&invocation, intent.as_ref()) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        all_stopped = false;
+                        any_unknown = true;
+                        identities
+                    }
+                };
+                for id in &proof {
                     match self.port.inspect(id) {
                         ProcessEvidence::Stopped { .. } => {}
                         ProcessEvidence::Alive { .. } => {
@@ -1157,12 +1471,35 @@ impl<P: ProcessControlPort> Supervisor<P> {
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
         match ev {
-            ProcessEvidence::Stopped { .. } => {
-                if let Some(id) = &invocation.process_identity {
-                    self.port.reap(id.pid);
+            ProcessEvidence::Stopped { .. } => match self.prove_tree_stopped(invocation, None)? {
+                TreeProof::Proven => {
+                    if let Some(id) = &invocation.process_identity {
+                        self.port.reap(id.pid);
+                    }
+                    self.finish_invocation(store, invocation, now_unix_seconds)
                 }
-                self.finish_invocation(store, invocation, now_unix_seconds)
-            }
+                TreeProof::Withheld => Ok(()),
+                TreeProof::Uncertain => {
+                    let id = invocation
+                        .process_identity
+                        .clone()
+                        .unwrap_or(ProcessIdentity {
+                            pid: -1,
+                            started_at: String::new(),
+                            pgid: None,
+                        });
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::ProcessState {
+                            invocation_id: invocation.id.clone(),
+                            process_identity: format!("{}@{}", id.pid, id.started_at),
+                            state: ProcessStateFact::Unknown,
+                        },
+                        now_unix_seconds,
+                    )
+                }
+            },
             ProcessEvidence::Alive { .. } => {
                 // Same re-assertion as the poll path: a reconciled
                 // request whose Running report was lost must still move
@@ -1333,6 +1670,9 @@ mod tests {
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
             Err("process table unavailable".into())
         }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Err("process table unavailable".into())
+        }
         fn inspect(&self, _: &ProcessIdentity) -> ProcessEvidence {
             panic!("no inspect expected")
         }
@@ -1387,6 +1727,7 @@ mod tests {
             process_identity: Some(identity.clone()),
             required_artifacts: vec![],
             evidence_refs: vec![],
+            descendants: vec![],
         };
         let receipt = sup
             .stop_unless_persisted(&invocation, &identity, |_| {

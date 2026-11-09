@@ -3,4 +3,5 @@
 //! reports process/artifact Observations. It never decides lifecycle state —
 //! that stays in `work`.
 
+pub mod handoff;
 pub mod supervisor;

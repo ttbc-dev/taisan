@@ -408,6 +408,7 @@ fn persist_failure_sends_no_signal() {
         process_identity: Some(leader.clone()),
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     };
     let receipt = sup
         .stop_unless_persisted(&invocation, &leader, |_| {
@@ -485,6 +486,7 @@ fn crash_near_spawn_leaves_uncertain_with_no_second_writer() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -540,6 +542,7 @@ fn live_process_is_rereported_running_after_a_lost_running_observation() {
                     process_identity: Some(identity.clone()),
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -611,6 +614,7 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
                     process_identity: Some(identity.clone()),
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -824,6 +828,7 @@ fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -891,6 +896,7 @@ fn failed_artifact_promotion_is_not_reported_present() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -1251,6 +1257,9 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             }
             Ok(vec![identity])
         }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
         fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
             if self.condition == "unknown" {
                 ProcessEvidence::Unknown {
@@ -1300,6 +1309,7 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             process_identity: Some(identity.clone()),
             required_artifacts: vec![],
             evidence_refs: vec![],
+            descendants: vec![],
         };
         let persisted = Cell::new(false);
         let receipt = sup
@@ -1331,6 +1341,9 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             unreachable!()
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
             Ok(vec![])
         }
         fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
@@ -1376,6 +1389,7 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             process_identity: Some(identity.clone()),
             required_artifacts: vec![],
             evidence_refs: vec![],
+            descendants: vec![],
         };
         let sup = Supervisor::new(
             SignalPort(signal),
@@ -1517,6 +1531,7 @@ fn stop_intent_is_durable_before_the_first_signal() {
         process_identity: Some(leader.clone()),
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     };
     let receipt = sup
         .stop_unless_persisted(&invocation, &leader, |mut intent| {
@@ -2026,6 +2041,7 @@ fn a_missing_pid_keeps_the_execution_uncertain_and_releases_nothing() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
