@@ -606,6 +606,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "workloop-contract-worker"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "workloop-core"
 version = "0.0.0"
 dependencies = [

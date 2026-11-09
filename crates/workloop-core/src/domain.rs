@@ -509,6 +509,13 @@ pub struct Invocation {
     /// Host-observable identity — pid plus a start-time verifier so a reused
     /// pid is never mistaken for this writer.
     pub process_identity: Option<ProcessIdentity>,
+    /// The write-capable descendant snapshot captured while the leader was
+    /// alive and refreshed on liveness observations. A `setsid` escapee or
+    /// orphan that later reparents out of the tree — and possibly out of
+    /// the leader's group — stays a recorded identity that must verify
+    /// stopped before the exit fact may be reported.
+    #[serde(default)]
+    pub descendants: Vec<ProcessIdentity>,
     pub required_artifacts: Vec<RequiredArtifact>,
     pub evidence_refs: Vec<String>,
 }
@@ -609,6 +616,85 @@ pub struct RequiredArtifact {
     pub path: String,
     #[serde(default)]
     pub expected_digest: Option<String>,
+}
+
+/// Durable state of one artifact handoff
+/// (`export_started → bundle → quarantine import → ref → acknowledged`).
+/// An absent artifact has no row; an in-flight, invalid, or acknowledged
+/// artifact is distinguished by `state` (+ `invalid_reason`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffState {
+    /// `export_started` recorded; the bundle may or may not exist.
+    ExportStarted,
+    /// Bundle written and verified; import not yet committed.
+    BundleWritten,
+    /// `artifact_handoffs` row committed with the quarantine import and
+    /// manifest digest; the durable ref is not yet established.
+    Imported,
+    /// Store row committed *and* the handoff ref resolves to `produced`
+    /// — the only state that releases the workspace/bundle for
+    /// retention-policy reclamation.
+    Acknowledged,
+    /// Handoff cannot produce a valid artifact (corrupt bundle, stale
+    /// base, digest mismatch, exhausted recovery); `invalid_reason`
+    /// carries the closed reason.
+    Invalid,
+}
+
+/// One durable artifact-handoff record. `attempt` counts export/import
+/// recovery attempts against the artifact-recovery bound — separate
+/// from `max_invocations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactHandoff {
+    pub artifact_id: String,
+    pub invocation_id: InvocationId,
+    pub request_id: String,
+    pub work_id: WorkId,
+    pub execution_id: ExecutionId,
+    /// The request-recorded base revision `produced` must descend from.
+    pub base: String,
+    /// The produced commit; `None` until a verified export names it.
+    pub produced: Option<String>,
+    /// SHA-256 of the canonical manifest, set at `imported`.
+    pub manifest_digest: Option<String>,
+    pub state: HandoffState,
+    /// Closed reason when `state == Invalid` (`corrupt_bundle`,
+    /// `stale_base`, `digest_mismatch`, `recovery_exhausted`, ...).
+    pub invalid_reason: Option<String>,
+    pub attempt: u32,
+    pub recorded_seq: EventSequence,
+}
+
+/// What one declared verification argv did on the handed-off commit.
+/// `Inconclusive` is a runner/environment failure — distinct from a
+/// check that ran and failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationOutcome {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+/// One bounded verification run: a declared argv executed on an
+/// independent clean worktree of the exact produced commit. Unique per
+/// `(artifact_id, requirement)` — a rerun replaces nothing; the record
+/// is written once the outcome is known.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationResult {
+    pub id: String,
+    pub artifact_id: String,
+    /// Identity of the declared requirement (e.g. `verification_argv[0]`).
+    pub requirement: String,
+    pub argv: Vec<String>,
+    /// The exact commit the run materialized — never a branch name.
+    pub produced: String,
+    /// Digest over the run environment descriptor (argv + produced).
+    pub environment_digest: String,
+    pub result: VerificationOutcome,
+    pub output: String,
+    pub recorded_seq: EventSequence,
 }
 
 /// A host-side source issue this Work is bound to: immutable membership

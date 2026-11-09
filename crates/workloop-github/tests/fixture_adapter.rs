@@ -217,6 +217,7 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
             process_identity: None,
             required_artifacts: vec![artifact("artifact.json")],
             evidence_refs: vec![],
+            descendants: vec![],
         },
     })?;
     tx.apply(&Effect::InsertObservation {
@@ -655,6 +656,7 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -1234,6 +1236,7 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
