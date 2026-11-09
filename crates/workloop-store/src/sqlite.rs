@@ -1053,7 +1053,10 @@ impl ReadView for Tx<'_> {
         invocation_id: &InvocationId,
     ) -> Result<Option<ArtifactHandoff>, StoreError> {
         self.query_opt(
-            &format!("SELECT {HANDOFF_COLS} FROM artifact_handoffs WHERE invocation_id=?1"),
+            &format!(
+                "SELECT {HANDOFF_COLS} FROM artifact_handoffs \
+                 WHERE invocation_id=?1 ORDER BY artifact_id"
+            ),
             params![invocation_id.0],
             handoff_from_row,
         )

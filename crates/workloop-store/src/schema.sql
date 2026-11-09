@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS stop_intents (
 -- `attempt` counts recovery attempts against the artifact-recovery bound.
 CREATE TABLE IF NOT EXISTS artifact_handoffs (
     artifact_id TEXT PRIMARY KEY,
-    invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id),
+    invocation_id TEXT NOT NULL REFERENCES invocations(id),
     request_id TEXT NOT NULL,
     work_id TEXT NOT NULL,
     execution_id TEXT NOT NULL,

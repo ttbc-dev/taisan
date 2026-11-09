@@ -655,3 +655,103 @@ fn only_a_proven_dead_invocation_exports() {
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert!(h.produced.is_some());
 }
+
+/// A persistent transport failure — `git bundle create` cannot write —
+/// is charged against the artifact-recovery bound: the row settles
+/// `invalid(recovery_exhausted)` instead of wedging `export_started`
+/// while the workspace stays retained forever.
+#[test]
+fn transport_failure_charges_the_recovery_bound() {
+    let root = tmp_root("transport-bound");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-tbound");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-tb");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // The out directory exists but is not writable: every
+    // `git bundle create` into it fails as a transport error.
+    let out_dir = layout.out_root.join(&e.0).join(&invocation.id.0);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut perms = std::fs::metadata(&out_dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&out_dir, perms).unwrap();
+
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    let first = row(&store, &aid).expect("row");
+    assert_eq!(first.state, HandoffState::ExportStarted);
+    assert_eq!(first.attempt, 2, "the transport failure is charged");
+
+    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    let h = row(&store, &aid).unwrap();
+    assert_eq!(h.state, HandoffState::Invalid);
+    assert_eq!(h.invalid_reason.as_deref(), Some("recovery_exhausted"));
+}
+
+/// An Invocation declaring several required artifacts gets one durable
+/// handoff row per artifact — a second artifact is never silently
+/// dropped behind the first's row.
+#[test]
+fn each_required_artifact_gets_its_own_handoff() {
+    let root = tmp_root("multi-artifact");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-multi");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let mut invocation = done_invocation(&e, "inv-multi");
+    invocation.required_artifacts.push(RequiredArtifact {
+        kind: "log".into(),
+        path: "run.log".into(),
+        expected_digest: None,
+    });
+    insert_invocation(&store, &invocation);
+    let s = seed(&invocation, &w, &base);
+    for kind in ["patch", "log"] {
+        let aid = format!("{}/{kind}", invocation.id.0);
+        let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+        assert_eq!(h.state, HandoffState::Acknowledged);
+        assert_eq!(h.artifact_id, aid);
+        assert_eq!(
+            git(&layout.repository, &["rev-parse", &artifact_ref(&aid)]),
+            produced
+        );
+    }
+}
+
+/// Once the artifact is acknowledged, every declared verification argv
+/// runs on the handed-off commit and is recorded; re-driving skips
+/// recorded requirements instead of duplicating rows.
+#[test]
+fn an_acknowledged_handoff_runs_declared_verification() {
+    let root = tmp_root("verify-wired");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vwired");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vw");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["git".into(), "rev-parse".into(), "HEAD".into()]];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].requirement, "verification_argv[0]");
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert_eq!(results[0].produced, produced);
+
+    // Re-driving the acknowledged row records nothing twice.
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .len(),
+        1
+    );
+}

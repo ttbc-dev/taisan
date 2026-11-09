@@ -475,9 +475,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
         for (artifact_id, seed, bound) in seeds {
-            // A transport failure must not wedge the whole sweep; the
-            // row's last committed stage stands until the next pass.
-            let _ = crate::handoff::drive(store, layout, &artifact_id, &seed, bound);
+            // A charged transport retry is not an error to the sweep —
+            // but a store or filesystem failure must surface, never be
+            // counted as a successful pass.
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
+                Ok(_) | Err(crate::handoff::HandoffError::Transport(_)) => {}
+                Err(crate::handoff::HandoffError::Store(e)) => {
+                    return Err(ExecError::Store(e));
+                }
+                Err(crate::handoff::HandoffError::Io(e)) => return Err(ExecError::Io(e)),
+            }
         }
         Ok(())
     }

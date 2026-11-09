@@ -80,8 +80,9 @@ impl From<std::io::Error> for HandoffError {
 /// The export-side git profile (docs/worker-protocol.md): hooks and
 /// fsmonitor disabled, no credential helpers, file protocol only — the
 /// workspace's own config, hooks, and attributes never run trusted code.
-fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
-    let output = Command::new("git")
+/// Every git invocation in this module goes through here.
+fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, HandoffError> {
+    Ok(Command::new("git")
         .arg("-C")
         .arg(dir)
         .arg("-c")
@@ -93,7 +94,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
         .arg("-c")
         .arg("protocol.allow=user")
         .args(args)
-        .output()?;
+        .output()?)
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
+    let output = git_output(dir, args)?;
     if !output.status.success() {
         return Err(HandoffError::Transport(format!(
             "git {}: {}",
@@ -104,15 +109,30 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `git merge-base --is-ancestor` distinguishes a real descendant (0)
+/// from a non-descendant (1); any other exit is a transport failure,
+/// never a quiet "no".
+fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
+    let out = git_output(dir, &["merge-base", "--is-ancestor", base, produced])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(HandoffError::Transport(format!(
+            "merge-base --is-ancestor: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
+}
+
 /// `git bundle verify` must pass *and* list the produced commit — a
 /// verified bundle for the wrong tip is corrupt for this artifact.
-fn verify_bundle(bundle: &Path, produced: &str) -> bool {
-    let Ok(out) = Command::new("git")
-        .arg("bundle")
-        .arg("verify")
-        .arg(bundle)
-        .output()
-    else {
+/// Runs inside the installation-owned repository with the same
+/// hardened profile as every other git call.
+fn verify_bundle(repo: &Path, bundle: &Path, produced: &str) -> bool {
+    let Ok(out) = git_output(
+        repo,
+        &["bundle", "verify", bundle.to_str().unwrap_or_default()],
+    ) else {
         return false;
     };
     out.status.success()
@@ -132,7 +152,7 @@ pub fn drive(
     seed: &HandoffSeed,
     max_attempts: u32,
 ) -> Result<ArtifactHandoff, HandoffError> {
-    let existing = store.transact(|tx| tx.handoff_for_invocation(&seed.invocation.id))?;
+    let existing = store.transact(|tx| tx.artifact_handoff(artifact_id))?;
     let mut handoff = match existing {
         Some(h) => h,
         None => {
@@ -159,7 +179,49 @@ pub fn drive(
         }
     };
     advance(store, layout, &mut handoff, seed, max_attempts)?;
+    if handoff.state == HandoffState::Acknowledged {
+        run_verifications(store, layout, &handoff, seed)?;
+    }
     Ok(handoff)
+}
+
+/// Each declared verification argv runs once per artifact on the exact
+/// produced commit. Already-recorded requirements are skipped, so a
+/// crash between runs resumes without duplicating results; an empty
+/// argv has nothing to spawn.
+fn run_verifications(
+    store: &impl Store,
+    layout: &HandoffLayout,
+    handoff: &ArtifactHandoff,
+    seed: &HandoffSeed,
+) -> Result<(), HandoffError> {
+    if seed.verification_argv.is_empty() {
+        return Ok(());
+    }
+    let recorded: std::collections::HashSet<String> = store
+        .transact(|tx| tx.verification_results(&handoff.artifact_id))?
+        .into_iter()
+        .map(|r| r.requirement)
+        .collect();
+    let scratch = layout.out_dir_of(handoff);
+    for (i, argv) in seed.verification_argv.iter().enumerate() {
+        if argv.is_empty() {
+            continue;
+        }
+        let requirement = format!("verification_argv[{i}]");
+        if recorded.contains(&requirement) {
+            continue;
+        }
+        verify(
+            store,
+            layout,
+            &handoff.artifact_id,
+            &requirement,
+            argv,
+            &scratch,
+        )?;
+    }
+    Ok(())
 }
 
 /// What `drive` needs beyond the durable row: the launch context that
@@ -188,13 +250,27 @@ fn advance(
     max_attempts: u32,
 ) -> Result<(), HandoffError> {
     loop {
-        match handoff.state {
-            HandoffState::ExportStarted => {
-                export_stage(store, layout, handoff, seed, max_attempts)?
-            }
-            HandoffState::BundleWritten => import_stage(store, layout, handoff, seed)?,
-            HandoffState::Imported => acknowledge_stage(store, layout, handoff)?,
+        let step = match handoff.state {
+            HandoffState::ExportStarted => export_stage(store, layout, handoff, seed, max_attempts),
+            HandoffState::BundleWritten => import_stage(store, layout, handoff, seed),
+            HandoffState::Imported => acknowledge_stage(store, layout, handoff),
             HandoffState::Acknowledged | HandoffState::Invalid => return Ok(()),
+        };
+        match step {
+            // A transport failure is charged against the recovery bound:
+            // the row either retries on the next sweep or settles
+            // invalid — it never wedges non-terminal forever while the
+            // workspace stays retained.
+            Err(HandoffError::Transport(_)) => {
+                if handoff.attempt >= max_attempts {
+                    return mark_invalid(store, handoff, "recovery_exhausted");
+                }
+                handoff.attempt += 1;
+                persist(store, handoff)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+            Ok(()) => {}
         }
         if matches!(
             handoff.state,
@@ -263,22 +339,11 @@ fn export_stage(
     // Stale check: produced must descend from the recorded base. A spec
     // without source pins records no base — the export covers the whole
     // produced history and the stale check does not apply.
-    if !handoff.base.is_empty() {
-        let descends = Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["merge-base", "--is-ancestor"])
-            .arg(&handoff.base)
-            .arg(&produced)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !descends {
-            return mark_invalid(store, handoff, "stale_base");
-        }
+    if !handoff.base.is_empty() && !is_ancestor(&workspace, &handoff.base, &produced)? {
+        return mark_invalid(store, handoff, "stale_base");
     }
 
-    if !(bundle.exists() && verify_bundle(&bundle, &produced)) {
+    if !(bundle.exists() && verify_bundle(&layout.repository, &bundle, &produced)) {
         if bundle.exists() {
             // Truncated/corrupt partial: not evidence — remove and
             // re-export within the bound.
@@ -304,7 +369,7 @@ fn export_stage(
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&bundle);
         })?;
-        if !verify_bundle(&bundle, &produced) {
+        if !verify_bundle(&layout.repository, &bundle, &produced) {
             let _ = std::fs::remove_file(&bundle);
             handoff.attempt += 1;
             if handoff.attempt >= max_attempts {
@@ -334,7 +399,7 @@ fn import_stage(
         return mark_invalid(store, handoff, "missing_produced");
     };
     let bundle = layout.out_dir_of(handoff).join("export.bundle");
-    if !bundle.exists() || !verify_bundle(&bundle, &produced) {
+    if !bundle.exists() || !verify_bundle(&layout.repository, &bundle, &produced) {
         // The transport body is gone/corrupt after commit — re-export
         // from the still-retained workspace rather than trusting
         // anything else.

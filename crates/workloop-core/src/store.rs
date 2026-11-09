@@ -358,7 +358,8 @@ pub trait ReadView {
 
     /// The durable handoff record for one artifact id; `None` = absent.
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError>;
-    /// An Invocation carries at most one handoff (UNIQUE in the store).
+    /// The first recorded handoff row for an Invocation; an Invocation
+    /// may carry one handoff per required artifact.
     fn handoff_for_invocation(
         &self,
         invocation_id: &InvocationId,
