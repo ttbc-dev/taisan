@@ -6,7 +6,8 @@
 //! directory stay retained until `acknowledged` (row *and* ref).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use workloop_core::domain::*;
 use workloop_core::store::{Effect, Store, StoreError};
@@ -124,6 +125,35 @@ fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffEr
     }
 }
 
+/// Recover the handoff `base`: the fork point of the managed `branch`
+/// against the workspace's non-work local branch (the checkout the
+/// writer started from). A spec's `source_revision` is a host
+/// issue-version token — never a commit — so it cannot bound git
+/// ancestry; the durable record lives in `artifact_handoffs.base`.
+/// Empty means the workspace records no base branch to bound against.
+/// When `branch` shares no history with the base branch, the base ref
+/// itself is returned — it can never be an ancestor of `branch`, so the
+/// export's stale check classifies the foreign history `stale_base`.
+pub fn derive_base(workspace: &Path, branch: &str) -> String {
+    let Ok(refs) = git(
+        workspace,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    ) else {
+        return String::new();
+    };
+    let Some(base_ref) = refs
+        .lines()
+        .find(|r| !r.is_empty() && *r != branch && !r.starts_with("work/"))
+    else {
+        return String::new();
+    };
+    match git_output(workspace, &["merge-base", base_ref, branch]) {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) if out.status.code() == Some(1) => base_ref.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// `git bundle verify` must pass *and* list the produced commit — a
 /// verified bundle for the wrong tip is corrupt for this artifact.
 /// Runs inside the installation-owned repository with the same
@@ -141,10 +171,10 @@ fn verify_bundle(repo: &Path, bundle: &Path, produced: &str) -> bool {
 }
 
 /// Start or resume the handoff for one finished Invocation's required
-/// artifact. `seed.base` is the spec-recorded revision `produced` must
-/// descend from; `artifact_id` is the required-artifact identity.
-/// `max_attempts` bounds export/import retries — counting here is
-/// separate from `max_invocations`.
+/// artifact. `seed.base` is the workspace-derived fork point `produced`
+/// must descend from; `artifact_id` is the required-artifact identity.
+/// `max_attempts` bounds export/import transport attempts — counting
+/// here is separate from `max_invocations`.
 pub fn drive(
     store: &impl Store,
     layout: &HandoffLayout,
@@ -172,7 +202,6 @@ pub fn drive(
             };
             store.transact(|tx| {
                 h.recorded_seq = tx.alloc_seq()?;
-                h.attempt = 1;
                 tx.apply(&Effect::UpsertHandoff { handoff: h.clone() })
             })?;
             h
@@ -186,9 +215,9 @@ pub fn drive(
 }
 
 /// Each declared verification argv runs once per artifact on the exact
-/// produced commit. Already-recorded requirements are skipped, so a
-/// crash between runs resumes without duplicating results; an empty
-/// argv has nothing to spawn.
+/// produced commit. Recorded terminal results are final, so a crash
+/// between runs resumes without duplicating evidence; an inconclusive
+/// run is retried; an empty argv has nothing to spawn.
 fn run_verifications(
     store: &impl Store,
     layout: &HandoffLayout,
@@ -198,10 +227,13 @@ fn run_verifications(
     if seed.verification_argv.is_empty() {
         return Ok(());
     }
-    let recorded: std::collections::HashSet<String> = store
+    // Recorded terminal results are final; `Inconclusive` is retried —
+    // an inconclusive run (spawn/worktree/timeout failure) never
+    // satisfies or exhausts a declared requirement.
+    let recorded: std::collections::HashMap<String, VerificationOutcome> = store
         .transact(|tx| tx.verification_results(&handoff.artifact_id))?
         .into_iter()
-        .map(|r| r.requirement)
+        .map(|r| (r.requirement, r.result))
         .collect();
     let scratch = layout.out_dir_of(handoff);
     for (i, argv) in seed.verification_argv.iter().enumerate() {
@@ -209,7 +241,10 @@ fn run_verifications(
             continue;
         }
         let requirement = format!("verification_argv[{i}]");
-        if recorded.contains(&requirement) {
+        if matches!(
+            recorded.get(&requirement),
+            Some(VerificationOutcome::Pass | VerificationOutcome::Fail)
+        ) {
             continue;
         }
         verify(
@@ -229,8 +264,9 @@ fn run_verifications(
 #[derive(Debug, Clone)]
 pub struct HandoffSeed {
     pub invocation: Invocation,
-    /// Spec-recorded base revision the produced commit must descend
-    /// from (`SourceSnapshot.source_revision`).
+    /// Fork point of the managed branch in the workspace repo (see
+    /// [`derive_base`]) — the revision `produced` must descend from.
+    /// Empty when the workspace records no base branch.
     pub base: String,
     /// Work branch the worker committed on (`work/<work_id>`).
     pub branch: String,
@@ -250,6 +286,16 @@ fn advance(
     max_attempts: u32,
 ) -> Result<(), HandoffError> {
     loop {
+        // `attempt` counts *failed* transport attempts, so a bound of N
+        // performs exactly N: the entry check refuses attempt N+1 and
+        // settles the row instead of silently consuming it.
+        if !matches!(
+            handoff.state,
+            HandoffState::Acknowledged | HandoffState::Invalid
+        ) && handoff.attempt >= max_attempts
+        {
+            return mark_invalid(store, handoff, "recovery_exhausted");
+        }
         let step = match handoff.state {
             HandoffState::ExportStarted => export_stage(store, layout, handoff, seed, max_attempts),
             HandoffState::BundleWritten => import_stage(store, layout, handoff, seed),
@@ -262,9 +308,6 @@ fn advance(
             // invalid — it never wedges non-terminal forever while the
             // workspace stays retained.
             Err(HandoffError::Transport(_)) => {
-                if handoff.attempt >= max_attempts {
-                    return mark_invalid(store, handoff, "recovery_exhausted");
-                }
                 handoff.attempt += 1;
                 persist(store, handoff)?;
                 return Ok(());
@@ -311,8 +354,8 @@ fn mark_invalid(
 
 /// `export_started`: produce (or re-validate) the bundle. A crashed
 /// export leaves an absent or truncated bundle — both re-export, never
-/// trusted. A bundle that verifies is reused; `attempt` was already
-/// charged when the row was created.
+/// trusted. A bundle that verifies is reused. Transport failures
+/// propagate to the driver, which charges them against the bound.
 fn export_stage(
     store: &impl Store,
     layout: &HandoffLayout,
@@ -324,17 +367,7 @@ fn export_stage(
     let bundle = out_dir.join("export.bundle");
     let workspace = layout.workspace_of(&handoff.work_id);
 
-    let produced = match git(&workspace, &["rev-parse", "--verify", &seed.branch]) {
-        Ok(p) => p,
-        Err(_) => {
-            if handoff.attempt >= max_attempts {
-                return mark_invalid(store, handoff, "recovery_exhausted");
-            }
-            handoff.attempt += 1;
-            persist(store, handoff)?;
-            return Ok(());
-        }
-    };
+    let produced = git(&workspace, &["rev-parse", "--verify", &seed.branch])?;
 
     // Stale check: produced must descend from the recorded base. A spec
     // without source pins records no base — the export covers the whole
@@ -343,14 +376,22 @@ fn export_stage(
         return mark_invalid(store, handoff, "stale_base");
     }
 
+    // A branch that never moved past base produced nothing — for a
+    // Coding/Fix writer that is an absent artifact, not a handoff.
+    if matches!(
+        seed.invocation.role,
+        InvocationRole::Coding | InvocationRole::Fix
+    ) && !handoff.base.is_empty()
+        && produced == handoff.base
+    {
+        return mark_invalid(store, handoff, "nothing_produced");
+    }
+
     if !(bundle.exists() && verify_bundle(&layout.repository, &bundle, &produced)) {
         if bundle.exists() {
             // Truncated/corrupt partial: not evidence — remove and
             // re-export within the bound.
             std::fs::remove_file(&bundle)?;
-        }
-        if handoff.attempt >= max_attempts {
-            return mark_invalid(store, handoff, "recovery_exhausted");
         }
         std::fs::create_dir_all(&out_dir)?;
         // The bundle carries the work branch's full object closure so it
@@ -371,6 +412,8 @@ fn export_stage(
         })?;
         if !verify_bundle(&layout.repository, &bundle, &produced) {
             let _ = std::fs::remove_file(&bundle);
+            // A created bundle that does not verify is corrupt evidence,
+            // not transport: exhaust under its own reason.
             handoff.attempt += 1;
             if handoff.attempt >= max_attempts {
                 return mark_invalid(store, handoff, "corrupt_bundle");
@@ -448,8 +491,16 @@ fn acknowledge_stage(
     };
     let reference = artifact_ref(&handoff.artifact_id);
 
+    // Ref present from a crashed earlier pass: commit `acknowledged`
+    // only when ref *and* manifest digest match — a stale digest under
+    // the right ref is retained as invalid, never acknowledged.
     match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
         Ok(current) if current == produced => {
+            let manifest = canonical_manifest(store, handoff, &produced, layout)?;
+            let digest = sha256_hex("artifact-manifest-v1", &canonical_json(&manifest));
+            if handoff.manifest_digest.as_deref() != Some(digest.as_str()) {
+                return mark_invalid(store, handoff, "digest_mismatch");
+            }
             handoff.state = HandoffState::Acknowledged;
             persist(store, handoff)?;
             return Ok(());
@@ -547,6 +598,63 @@ pub fn reclaimable(layout: &HandoffLayout, handoff: &ArtifactHandoff) -> bool {
     .unwrap_or(false)
 }
 
+/// Wall-clock bound for one verification command (docs/worker-protocol:
+/// the runner is bounded by its own per-command timeout).
+const VERIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+
+enum VerificationRun {
+    Finished(std::process::ExitStatus),
+    TimedOut,
+    SpawnFailed(std::io::Error),
+}
+
+/// Run the declared argv with a bounded wall clock. Output goes to
+/// `log_path`, not a pipe — a runner that writes more than the pipe
+/// buffer would block on write and never finish (the captured tail is
+/// read back after the child settles). A timed-out runner is killed and
+/// recorded `Inconclusive`; a signal-killed runner is `Inconclusive`
+/// too — an invented exit code is not evidence.
+fn run_verification_command(
+    argv: &[String],
+    cwd: &Path,
+    log_path: &Path,
+    timeout: Duration,
+) -> VerificationRun {
+    let log = match std::fs::File::create(log_path) {
+        Ok(f) => f,
+        Err(e) => return VerificationRun::SpawnFailed(e),
+    };
+    let log_err = match log.try_clone() {
+        Ok(f) => f,
+        Err(e) => return VerificationRun::SpawnFailed(e),
+    };
+    let mut child = match Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return VerificationRun::SpawnFailed(e),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return VerificationRun::Finished(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return VerificationRun::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => return VerificationRun::SpawnFailed(e),
+        }
+    }
+}
+
 /// Run one declared verification argv on an independent clean worktree
 /// of the exact produced commit and record the result. Runs only on an
 /// acknowledged handoff — never on a claim or an unverified tree.
@@ -557,6 +665,27 @@ pub fn verify(
     requirement: &str,
     argv: &[String],
     scratch: &Path,
+) -> Result<VerificationResult, HandoffError> {
+    verify_with_timeout(
+        store,
+        layout,
+        artifact_id,
+        requirement,
+        argv,
+        scratch,
+        VERIFICATION_COMMAND_TIMEOUT,
+    )
+}
+
+#[doc(hidden)]
+pub fn verify_with_timeout(
+    store: &impl Store,
+    layout: &HandoffLayout,
+    artifact_id: &str,
+    requirement: &str,
+    argv: &[String],
+    scratch: &Path,
+    timeout: Duration,
 ) -> Result<VerificationResult, HandoffError> {
     let handoff = store
         .transact(|tx| tx.artifact_handoff(artifact_id))?
@@ -590,11 +719,18 @@ pub fn verify(
 
     // Independent worktree of the exact commit; nothing inherits from
     // another command's checkout.
-    let worktree = scratch.join(format!(
-        "verify-{}-{}",
+    let tag = format!(
+        "{}-{}",
         artifact_id.replace('/', "-"),
         requirement.replace(['/', '[', ']'], "-")
-    ));
+    );
+    let worktree = scratch.join(format!("verify-{tag}"));
+    let log_path = scratch.join(format!("verify-out-{tag}.log"));
+    let _ = std::fs::create_dir_all(scratch);
+    // A crashed earlier run can leave a registered worktree whose
+    // directory was swept: prune stale registrations, clear the path,
+    // then add fresh — `worktree add` refuses a registered path.
+    let _ = git(&layout.repository, &["worktree", "prune"]);
     let _ = std::fs::remove_dir_all(&worktree);
     let (result, output) = match git(
         &layout.repository,
@@ -607,28 +743,28 @@ pub fn verify(
         ],
     ) {
         Ok(_) => {
-            let run = Command::new(&argv[0])
-                .args(&argv[1..])
-                .current_dir(&worktree)
-                .env_clear()
-                .env("PATH", std::env::var("PATH").unwrap_or_default())
-                .output();
+            let run = run_verification_command(argv, &worktree, &log_path, timeout);
+            let mut bytes = std::fs::read(&log_path).unwrap_or_default();
+            bytes.truncate(64 * 1024);
+            let captured = String::from_utf8_lossy(&bytes).into_owned();
             match run {
-                Ok(out) => {
-                    let mut bytes = out.stdout;
-                    bytes.extend_from_slice(&out.stderr);
-                    bytes.truncate(64 * 1024);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    (
-                        if out.status.success() {
-                            VerificationOutcome::Pass
-                        } else {
-                            VerificationOutcome::Fail
-                        },
-                        text,
-                    )
+                VerificationRun::Finished(status) => (
+                    match status.code() {
+                        Some(0) => VerificationOutcome::Pass,
+                        Some(_) => VerificationOutcome::Fail,
+                        // A signal-killed runner is incomplete, never a
+                        // fabricated exit code.
+                        None => VerificationOutcome::Inconclusive,
+                    },
+                    captured,
+                ),
+                VerificationRun::TimedOut => (
+                    VerificationOutcome::Inconclusive,
+                    format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
+                ),
+                VerificationRun::SpawnFailed(e) => {
+                    (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
                 }
-                Err(e) => (VerificationOutcome::Inconclusive, format!("spawn: {e}")),
             }
         }
         Err(e) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),

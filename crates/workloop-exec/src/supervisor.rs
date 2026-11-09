@@ -462,6 +462,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 {
                     continue;
                 }
+                // `Done` is a record, not stop proof — an unverified
+                // Exited observation (a worker's own done claim)
+                // resolves the Invocation the same way. Export opens
+                // only after every recorded identity inspects stopped;
+                // a live or uninspectable writer blocks export, and a
+                // live straggler is re-signaled, never bundled.
+                let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
+                match self.prove_tree_stopped(&invocation, intent.as_ref())? {
+                    TreeProof::Proven => {}
+                    TreeProof::Withheld | TreeProof::Uncertain => continue,
+                }
                 let Some((seed, bound)) = self.handoff_seed(store, &invocation)? else {
                     continue;
                 };
@@ -507,24 +518,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
                 return Ok(None);
             };
-            let base = spec
-                .payload
-                .sources
-                .first()
-                .map(|s| s.source_revision.clone())
-                .unwrap_or_default();
             Ok(Some((
-                crate::handoff::HandoffSeed {
-                    invocation: invocation.clone(),
-                    base,
-                    branch: format!("work/{}", work.id.0),
-                    work_id: work.id.clone(),
-                    verification_argv: spec.payload.verification_argv.clone(),
-                },
+                invocation.clone(),
+                work.id.clone(),
+                spec.payload.verification_argv.clone(),
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
-        Ok(found)
+        let Some((invocation, work_id, verification_argv, bound)) = found else {
+            return Ok(None);
+        };
+        // The handoff base is the managed branch's fork point — the
+        // revision the workspace was checked out at — recovered from
+        // the workspace repo itself. `SourceSnapshot.source_revision`
+        // is a host issue-version token, not a git commit.
+        let branch = format!("work/{}", work_id.0);
+        let base = crate::handoff::derive_base(&self.workspace_of(&work_id), &branch);
+        Ok(Some((
+            crate::handoff::HandoffSeed {
+                invocation,
+                base,
+                branch,
+                work_id,
+                verification_argv,
+            },
+            bound,
+        )))
     }
 
     /// Replay the durable request log: for each unconsumed request either

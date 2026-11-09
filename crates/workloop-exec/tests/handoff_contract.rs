@@ -7,17 +7,29 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, CommandRequest};
 use workloop_core::domain::*;
 use workloop_core::identity::*;
+use workloop_core::observation::{IssueState, Observation, ObservationFact};
+use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome};
 use workloop_core::store::{Effect, Store};
-use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
+use workloop_core::work::{
+    HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
+};
 use workloop_exec::handoff::{self, HandoffLayout, HandoffSeed, artifact_ref};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
+
+fn fixture_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-worker")
+        .to_string_lossy()
+        .into_owned()
+}
 
 fn tmp_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("workloop-handoff-{}-{}", tag, std::process::id()));
@@ -647,10 +659,11 @@ fn multibyte_verification_output_truncates_without_a_panic() {
     );
 }
 
-/// A writer that may still be live blocks export entirely: the
-/// supervisor opens handoff rows only for `Done` invocations (proven
-/// stopped). Workspaces without git objects keep the file-artifact
-/// path untouched.
+/// A writer that may still be live blocks export entirely: `Done` is a
+/// record, not stop proof — an unverified done claim resolves the
+/// Invocation while the writer may still run. A handoff row opens only
+/// after every recorded identity inspects stopped. Workspaces without
+/// git objects keep the file-artifact path untouched.
 #[test]
 fn only_a_proven_dead_invocation_exports() {
     let root = tmp_root("live-writer");
@@ -667,32 +680,38 @@ fn only_a_proven_dead_invocation_exports() {
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
         .with_handoff(layout);
+    let port = PosixProcessControl;
 
-    // Still running: no row is opened.
+    // A live recorded writer blocks export even when the Invocation is
+    // recorded `Done` (an unverified done claim resolves it the same).
+    let live_identity = port
+        .spawn(&[fixture_bin(), "hang".into()], &ws_dir)
+        .expect("spawn live writer");
     let mut live = done_invocation(&e, "inv-live");
-    live.state = InvocationState::Running;
-    live.process_identity = Some(ProcessIdentity {
-        pid: 1,
-        started_at: "x".into(),
-        pgid: None,
-    });
+    live.process_identity = Some(live_identity.clone());
     insert_invocation(&store, &live);
     sup.drive_handoffs(&store).unwrap();
-    assert!(row(&store, &artifact_id(&live)).is_none());
+    assert!(
+        row(&store, &artifact_id(&live)).is_none(),
+        "a Done record over a live writer opens no handoff row"
+    );
 
-    // Done (stop proof complete): the row opens and acknowledges.
-    let mut dead = live.clone();
-    dead.state = InvocationState::Done;
-    store
-        .transact(|tx| {
-            tx.apply(&Effect::UpdateInvocation {
-                invocation: dead.clone(),
-                expected_state: InvocationState::Running,
-            })
-        })
-        .unwrap();
+    // Once the recorded identity inspects stopped the row opens and
+    // acknowledges.
+    assert_eq!(port.signal_verified(&live_identity, 9), SignalOutcome::Sent);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !matches!(
+        port.inspect(&live_identity),
+        ProcessEvidence::Stopped { .. }
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live writer did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     sup.drive_handoffs(&store).unwrap();
-    let h = row(&store, &artifact_id(&dead)).expect("handoff row opened");
+    let h = row(&store, &artifact_id(&live)).expect("handoff row opened");
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert!(h.produced.is_some());
 }
@@ -724,12 +743,20 @@ fn transport_failure_charges_the_recovery_bound() {
     handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
     let first = row(&store, &aid).expect("row");
     assert_eq!(first.state, HandoffState::ExportStarted);
-    assert_eq!(first.attempt, 2, "the transport failure is charged");
+    assert_eq!(first.attempt, 1, "one charged failure, one attempt used");
 
+    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    let second = row(&store, &aid).expect("row");
+    assert_eq!(second.state, HandoffState::ExportStarted);
+    assert_eq!(second.attempt, 2, "the second attempt still runs");
+
+    // The bound refuses attempt N+1 — N charged failures settle the row
+    // without a further transport call.
     handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
     let h = row(&store, &aid).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("recovery_exhausted"));
+    assert_eq!(h.attempt, 2, "a bound of 2 performs 2 transport attempts");
 }
 
 /// An Invocation declaring several required artifacts gets one durable
@@ -795,4 +822,285 @@ fn an_acknowledged_handoff_runs_declared_verification() {
             .len(),
         1
     );
+}
+
+/// A Coding/Fix branch that never moved past base produced nothing —
+/// `nothing_produced` is a distinct classification, not an exportable
+/// artifact (docs/worker-protocol.md evidence table).
+#[test]
+fn a_branch_that_never_moved_is_nothing_produced() {
+    let root = tmp_root("nothingprod");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-noprod");
+    let (layout, ws_dir) = layout(&root, &w);
+    // Work branch exists but holds no commit beyond base.
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    git(&ws_dir, &["init", "-b", "main"]);
+    git(&ws_dir, &["config", "user.email", "t@t"]);
+    git(&ws_dir, &["config", "user.name", "t"]);
+    std::fs::write(ws_dir.join("seed.txt"), "base").unwrap();
+    git(&ws_dir, &["add", "."]);
+    git(&ws_dir, &["commit", "-m", "base"]);
+    let base = git(&ws_dir, &["rev-parse", "HEAD"]);
+    git(&ws_dir, &["checkout", "-b", &format!("work/{}", w.0)]);
+
+    let invocation = done_invocation(&e, "inv-noprod");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = row(&store, &aid).unwrap();
+    assert_eq!(h.state, HandoffState::Invalid);
+    assert_eq!(h.invalid_reason.as_deref(), Some("nothing_produced"));
+    assert!(
+        !ref_exists(&layout.repository, &artifact_ref(&aid)),
+        "an unchanged branch installs no artifact ref"
+    );
+}
+
+/// `imported` row + a present ref is not enough: the stored manifest
+/// digest must still match. A crashed pass that wrote the ref under a
+/// stale digest is classified invalid, never acknowledged.
+#[test]
+fn a_present_ref_with_a_stale_digest_is_not_acknowledged() {
+    let root = tmp_root("staledigest");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-sd");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-sd");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    assert!(ref_exists(&layout.repository, &artifact_ref(&aid)));
+
+    // The crash window: ref present, row still `imported` — with a
+    // corrupted manifest digest.
+    let mut h = row(&store, &aid).unwrap();
+    h.state = HandoffState::Imported;
+    h.manifest_digest = Some("stale".into());
+    persist(&store, &h);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = row(&store, &aid).unwrap();
+    assert_eq!(h.state, HandoffState::Invalid);
+    assert_eq!(h.invalid_reason.as_deref(), Some("digest_mismatch"));
+}
+
+/// A crashed verification leaves a registered worktree whose directory
+/// was swept: the next run prunes the stale registration instead of
+/// failing `worktree add` forever.
+#[test]
+fn a_stale_worktree_registration_does_not_wedge_verification() {
+    let root = tmp_root("stalewt");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-swt");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-swt");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+
+    // Recreate the crash residue: `worktree add` registered the path,
+    // then the process died before `worktree remove`; the directory was
+    // swept but the registration remains.
+    let scratch = layout.out_root.join(&e.0).join(&invocation.id.0);
+    let worktree = scratch.join(format!(
+        "verify-{}-{}",
+        aid.replace('/', "-"),
+        "verification_argv[0]".replace(['/', '[', ']'], "-")
+    ));
+    git(
+        &layout.repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            worktree.to_str().unwrap(),
+            &produced,
+        ],
+    );
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["git".into(), "rev-parse".into(), "HEAD".into()],
+        &scratch,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass);
+    assert_eq!(res.produced, produced);
+}
+
+/// An inconclusive run (spawn failure) is retried on the next pass —
+/// it neither satisfies nor exhausts the requirement. The retried
+/// result replaces the row; a terminal result is final.
+#[test]
+fn an_inconclusive_verification_is_retried() {
+    let root = tmp_root("inconclusive");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-inc");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-inc");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["no-such-verification-binary".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
+
+    s.verification_argv = vec![vec!["git".into(), "rev-parse".into(), "HEAD".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1, "one row per requirement");
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert_eq!(results[0].produced, produced);
+}
+
+/// A timed-out or signal-killed runner is `Inconclusive` — never a
+/// fabricated exit code (worker-protocol runner contract).
+#[test]
+fn a_timed_out_or_killed_runner_is_inconclusive() {
+    let root = tmp_root("verifyrun");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vt");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vt");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let timed_out = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["sh".into(), "-c".into(), "sleep 5".into()],
+        &scratch,
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);
+    assert!(timed_out.output.contains("timeout") || timed_out.output.contains("exceeded"));
+
+    let killed = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[1]",
+        &["sh".into(), "-c".into(), "kill -9 $$".into()],
+        &scratch,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(killed.result, VerificationOutcome::Inconclusive);
+}
+
+/// `source_revision` is a host issue-version token, not a git commit:
+/// a source-bound Work derives the handoff base from the managed
+/// branch's fork point in the workspace, and a valid produced commit
+/// acknowledges instead of exhausting retries as invalid.
+#[test]
+fn a_source_bound_work_derives_base_from_the_workspace() {
+    let root = tmp_root("sourcebound");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.declared_capabilities.insert(HostCapability::IssueRead);
+    let source = SourceSnapshot {
+        issue: IssueRef {
+            repository: repo(),
+            issue: IssueId::trusted("issue-1"),
+            display_number: Some(1),
+        },
+        source_revision: "issue-version-token".into(),
+        content_digest: "cd-1".into(),
+    };
+    let req = CommandRequest {
+        actor: Actor {
+            kind: ActorKind::Human,
+            external_id: "op".into(),
+        },
+        origin: Origin("cli".into()),
+        idempotency_key: "h-srcb".into(),
+        body: CommandBody::Submit {
+            intent: "produce an artifact".into(),
+            sources: vec![source.clone()],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    };
+    let d = handle_command(&store, &cfg, &req, NOW).unwrap();
+    let (w, e) = match d {
+        CommandDecision::Accepted {
+            work_id, effect, ..
+        } => (
+            work_id.unwrap(),
+            match effect {
+                CommandEffect::WorkCreated { execution_id } => execution_id,
+                other => panic!("unexpected effect {other:?}"),
+            },
+        ),
+        other => panic!("submit rejected: {other:?}"),
+    };
+    // The matching authoritative read settles the source gate.
+    handle_observation(
+        &store,
+        &cfg,
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::Issue {
+                issue: source.issue.clone(),
+                source_revision: source.source_revision.clone(),
+                content_digest: source.content_digest.clone(),
+                state: IssueState::Open,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(
+        store
+            .transact(|tx| admit_queued(tx, &cfg, &e, NOW))
+            .unwrap()
+            .is_some(),
+        "execution admitted"
+    );
+
+    let ws_root = root.join("ws");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let ws_dir = ws_root.join(format!("ws-{}", w.0));
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let layout = HandoffLayout {
+        repository: bare_repo(&root),
+        workspace_root: ws_root.clone(),
+        out_root: root.join("out"),
+    };
+    let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], cfg)
+        .with_handoff(layout.clone());
+
+    let invocation = done_invocation(&e, "inv-srcb");
+    insert_invocation(&store, &invocation);
+    sup.drive_handoffs(&store).unwrap();
+    let h = row(&store, &artifact_id(&invocation)).expect("handoff row opened");
+    assert_eq!(
+        h.base, base,
+        "the fork point of the managed branch, not the issue version token"
+    );
+    assert_eq!(h.state, HandoffState::Acknowledged);
 }

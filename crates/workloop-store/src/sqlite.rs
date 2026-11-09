@@ -1735,10 +1735,18 @@ impl TxView for Tx<'_> {
                 )?;
             }
             Effect::InsertVerificationResult { result } => {
+                // One row per (artifact, requirement): a retried
+                // inconclusive run replaces its previous record so the
+                // latest result is the evidence of record.
                 self.exec(
                     "INSERT INTO verification_results (id, artifact_id, \
                      requirement, argv, produced, environment_digest, result, \
-                     output, recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                     output, recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                     ON CONFLICT (artifact_id, requirement) DO UPDATE SET \
+                     id=excluded.id, argv=excluded.argv, produced=excluded.produced, \
+                     environment_digest=excluded.environment_digest, \
+                     result=excluded.result, output=excluded.output, \
+                     recorded_seq=excluded.recorded_seq",
                     params![
                         result.id,
                         result.artifact_id,
