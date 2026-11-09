@@ -545,6 +545,7 @@ fn stale_head_evidence_cannot_complete(
                     role: InvocationRole::Coding,
                     state: InvocationState::Done,
                     process_identity: None,
+                    descendants: vec![],
                     required_artifacts: vec![RequiredArtifact {
                         kind: "artifact".into(),
                         path: "artifact.json".into(),
