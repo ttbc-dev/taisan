@@ -103,10 +103,11 @@ pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
 
 /// The open Work's detail pane: version, executions, current head,
 /// head-scoped findings (numbered for `pick`), attention, evidence.
-/// Findings are numbered per distinct finding id — the same set, in the
-/// same order, as the judgment draft's slots — so the number printed
-/// beside a finding always names the slot `pick <n>` selects. A finding
-/// string recorded twice is one id and gets one number.
+/// Findings are numbered one row per recorded occurrence — the same
+/// set, in the same order, as the judgment draft's slots — so the
+/// number printed beside a finding always names the slot `pick <n>`
+/// selects. Two occurrences carrying the same source key are two rows
+/// and get two numbers.
 pub fn detail_frame(detail: &WorkDetailView) -> String {
     let mut out = String::new();
     out.push_str(&format!("work {} v{}\n", detail.work_id.0, detail.version));

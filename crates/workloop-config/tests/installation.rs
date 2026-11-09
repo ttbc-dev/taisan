@@ -158,3 +158,25 @@ fn invalid_identity_fields_are_refused() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The negotiated contract version is binding data: a fresh
+/// installation records version 1, and a versionless file is refused
+/// at the boundary rather than producing versionless host bindings.
+#[test]
+fn contract_version_zero_is_refused() {
+    let dir = root("install-version");
+    let path = dir.join("config.json");
+    let installation = load_or_create(&path).unwrap();
+    assert_eq!(installation.contract_version, 1, "fresh default is v1");
+    assert!(installation.workloop_config().is_ok());
+
+    let mut legacy = installation.clone();
+    legacy.contract_version = 0;
+    let err = legacy.workloop_config().unwrap_err();
+    assert!(
+        err.contains("contract_version"),
+        "expected the contract_version error: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -274,7 +274,9 @@ fn load_or_create_with(
         host_instance: default_host_instance(),
         repository: default_repository(),
         adapter: default_adapter(),
-        contract_version: 0,
+        // The adapter contract version this installation negotiates;
+        // version 0 is never a valid binding (docs/installation-config).
+        contract_version: 1,
         // The default fixture adapter supports reads plus the publication
         // writes a recorded intent may need; operators narrow this list to
         // least privilege for a real installation.
@@ -389,6 +391,15 @@ impl Installation {
             return Err("installation binds no host actors — regenerate the config \
                  or bind a host actor to each required role"
                 .into());
+        }
+        // A versionless binding can never be recorded: the installation
+        // must declare which adapter contract it negotiated.
+        if self.contract_version == 0 {
+            return Err(
+                "installation contract_version is 0 — regenerate the config or \
+                 declare the negotiated contract version"
+                    .into(),
+            );
         }
         Ok(WorkloopConfig {
             host: HostTemplate {

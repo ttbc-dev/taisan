@@ -28,7 +28,7 @@ fn config() -> WorkloopConfig {
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo")),
-            contract_version: 0,
+            contract_version: 1,
             actors: vec![RoleBinding {
                 role: ActorRole::Publication,
                 actor: HostActorRef {
@@ -201,6 +201,9 @@ impl ReadView for FailingTx<'_> {
         unimplemented!()
     }
     fn latest_round(&self, _work_id: &WorkId) -> Result<Option<ReviewRound>, StoreError> {
+        unimplemented!()
+    }
+    fn rounds_for_work(&self, _work_id: &WorkId) -> Result<Vec<ReviewRound>, StoreError> {
         unimplemented!()
     }
     fn occurrences(&self, _round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError> {

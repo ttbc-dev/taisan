@@ -367,6 +367,8 @@ pub trait ReadView {
 
     /// The most recently sealed review round for a Work, if any.
     fn latest_round(&self, work_id: &WorkId) -> Result<Option<ReviewRound>, StoreError>;
+    /// All sealed review rounds for a Work, oldest first.
+    fn rounds_for_work(&self, work_id: &WorkId) -> Result<Vec<ReviewRound>, StoreError>;
     /// The occurrence set of one sealed round.
     fn occurrences(&self, round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError>;
     /// The judgment recorded for one sealed round, if any.

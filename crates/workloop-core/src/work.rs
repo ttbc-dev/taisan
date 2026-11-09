@@ -430,17 +430,25 @@ pub(crate) fn applied_opened_change(
     let work = tx.work(work_id)?;
     let Some(work) = work else { return Ok(None) };
     let intents = tx.action_intents()?;
-    let applied: BTreeSet<&str> = intents
+    // Only a receipt naming an applied `open_change_request` intent can
+    // establish the diff target: a push or update receipt that happens to
+    // carry a `ChangeOpened` fact is still evidence of ITS recorded
+    // action, and the fact must match that intent's immutable payload.
+    let applied_open: std::collections::HashMap<&str, &HostActionIntent> = intents
         .iter()
-        .filter(|i| i.work_id == *work_id && i.status == HostActionStatus::Applied)
-        .map(|i| i.action_id.as_str())
+        .filter(|i| {
+            i.work_id == *work_id
+                && i.status == HostActionStatus::Applied
+                && matches!(i.action, HostAction::OpenChangeRequest { .. })
+        })
+        .map(|i| (i.action_id.as_str(), i))
         .collect();
     let mut change: Option<(crate::identity::ChangeRequestRef, String)> = None;
     for o in tx.observations_for_work(work_id)? {
         if let ObservationFact::HostActionResult {
             action_id, effects, ..
         } = &o.fact
-            && applied.contains(action_id.as_str())
+            && let Some(intent) = applied_open.get(action_id.as_str())
         {
             for e in effects {
                 if let NormalizedEffectFact::ChangeOpened {
@@ -449,6 +457,7 @@ pub(crate) fn applied_opened_change(
                     ..
                 } = e
                     && c.repository == work.binding.repository
+                    && effect_matches(intent, std::slice::from_ref(e))
                 {
                     change = Some((c.clone(), target_branch.clone()));
                 }
@@ -517,6 +526,21 @@ pub(crate) fn current_target(
         base: None,
         target_revision,
     }))
+}
+
+/// The latest sealed round binding this exact diff target, if any.
+/// Rounds are immutable per-target evidence: an out-of-order review for
+/// a superseded target is recorded, but it never masks the current
+/// target's evidence surface.
+pub(crate) fn latest_round_for_target(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+    target: &DiffTarget,
+) -> Result<Option<ReviewRound>, StoreError> {
+    Ok(tx
+        .rounds_for_work(work_id)?
+        .into_iter()
+        .rfind(|r| &r.target == target))
 }
 
 type Verdict = Result<(CommandDecision, Vec<Effect>), StoreError>;
@@ -1571,29 +1595,31 @@ fn current_round_for(
             committed_at: tx.last_seq()?,
         }));
     }
-    let Some(round) = tx.latest_round(work_id)? else {
+    let rounds = tx.rounds_for_work(work_id)?;
+    let Some(round) = rounds.iter().rfind(|r| r.target == target) else {
+        let (reason, evidence) = if rounds.is_empty() {
+            (
+                RejectionCode::SourceUnavailable,
+                vec!["no sealed review round".into()],
+            )
+        } else {
+            (
+                RejectionCode::StaleHead,
+                vec![format!(
+                    "sealed rounds cover no current target {}",
+                    target.head
+                )],
+            )
+        };
         return Ok(Err(CommandDecision::Rejected {
             command_id: CommandId("cmd-unknown".into()),
-            reason: RejectionCode::SourceUnavailable,
+            reason,
             current_work_id: Some(work_id.clone()),
             current_version: None,
-            evidence: vec!["no sealed review round".into()],
+            evidence,
             committed_at: tx.last_seq()?,
         }));
     };
-    if round.target != target {
-        return Ok(Err(CommandDecision::Rejected {
-            command_id: CommandId("cmd-unknown".into()),
-            reason: RejectionCode::StaleHead,
-            current_work_id: Some(work_id.clone()),
-            current_version: None,
-            evidence: vec![format!(
-                "sealed round target does not match current target {}",
-                target.head
-            )],
-            committed_at: tx.last_seq()?,
-        }));
-    }
     if !round.completeness.starts_with("complete") {
         return Ok(Err(CommandDecision::Rejected {
             command_id: CommandId("cmd-unknown".into()),
@@ -1982,9 +2008,8 @@ pub fn admit_queued_role(
     if let Some(judgment) = tx.latest_judgment(&work.id)?
         && let Some(target) = current_target(tx, &work.id)?
     {
-        let current = tx
-            .latest_round(&work.id)?
-            .is_some_and(|round| round.id == judgment.round_id && round.target == target);
+        let current = latest_round_for_target(tx, &work.id, &target)?
+            .is_some_and(|round| round.id == judgment.round_id);
         if !current {
             return pause_for_repair(
                 tx,
@@ -2506,9 +2531,12 @@ fn assess(
         }
         ObservationFact::Review { .. } => {
             // A fresh complete round with undecided occurrences pauses
-            // for human judgment.
+            // for human judgment. Only a round covering the current
+            // diff target counts — a stale-target review is recorded but
+            // cannot suspend the work.
             if execution.state == ExecutionState::Waiting
-                && let Some(round) = tx.latest_round(&execution.work_id)?
+                && let Some(target) = current_target(tx, &execution.work_id)?
+                && let Some(round) = latest_round_for_target(tx, &execution.work_id, &target)?
                 && round.completeness == "complete"
             {
                 let occurrences = tx.occurrences(&round.id)?;
@@ -2836,12 +2864,12 @@ fn seal_round(
         }))
         .as_slice(),
     );
-    if let Some(latest) = tx.latest_round(work_id)?
-        && latest.target == *target
+    if let Some(latest) = latest_round_for_target(tx, work_id, target)?
         && latest.set_digest == set_digest
         && latest.completeness == "complete"
     {
-        // Idempotent redelivery of the identical set.
+        // Idempotent redelivery of the identical set for this target;
+        // an unrelated newer round must not force a duplicate seal.
         return Ok(());
     }
     let seq = tx.alloc_seq()?;
@@ -2868,7 +2896,7 @@ fn seal_round(
         .iter()
         .enumerate()
         .map(|(i, o)| FindingOccurrence {
-            id: format!("occ-{}-{i}", round.id),
+            id: format!("occ-{}-{i:06}", round.id),
             round_id: round.id.clone(),
             source_key: o.source_key.clone(),
             content_digest: o.content_digest.clone(),
@@ -2878,9 +2906,14 @@ fn seal_round(
         })
         .collect();
     tx.apply(&Effect::InsertReviewRound { round, occurrences })?;
-    // Evidence generation changed: bump the Work version so every
-    // precondition on the old evidence surface is stale.
-    if let Some(work) = tx.work(work_id)? {
+    // Evidence for the CURRENT diff target changed: bump the Work
+    // version so every precondition on the old evidence surface is
+    // stale. A round sealed for a superseded or not-yet-current target
+    // is recorded evidence, not a current-state change — it invalidates
+    // nothing.
+    if current_target(tx, work_id)?.as_ref() == Some(target)
+        && let Some(work) = tx.work(work_id)?
+    {
         let mut next_work = work.clone();
         next_work.version += 1;
         tx.apply(&Effect::UpdateWork {
@@ -3538,10 +3571,10 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     // zero occurrences, or every occurrence is dispositioned
     // accept/dismiss in a judgment on that round.
     if spec.payload.lanes.code_review {
-        let Some(round) = tx.latest_round(&work.id)? else {
+        let Some(round) = latest_round_for_target(tx, &work.id, &target)? else {
             return Ok(());
         };
-        if round.target != target || round.completeness != "complete" {
+        if round.completeness != "complete" {
             return Ok(());
         }
         let occurrences = tx.occurrences(&round.id)?;
@@ -3656,9 +3689,7 @@ fn completion_evidence(
             });
         }
     }
-    if let Some(round) = tx.latest_round(&work.id)?
-        && round.target == *target
-    {
+    if let Some(round) = latest_round_for_target(tx, &work.id, target)? {
         refs.push(EvidenceRef {
             id: format!("round:{}", round.id),
             digest: round.set_digest.clone(),

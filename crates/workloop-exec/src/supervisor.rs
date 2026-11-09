@@ -1358,7 +1358,7 @@ mod tests {
                         workloop_core::identity::HostInstanceId::trusted("host-local"),
                         workloop_core::identity::RepositoryId::trusted("local-repo"),
                     ),
-                    contract_version: 0,
+                    contract_version: 1,
                     actors: vec![],
                 },
                 declared_capabilities: Default::default(),

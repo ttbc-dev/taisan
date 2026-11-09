@@ -598,7 +598,7 @@ mod tests {
             host: HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: repository(),
-                contract_version: 0,
+                contract_version: 1,
                 actors: vec![RoleBinding {
                     role: ActorRole::Publication,
                     actor: publisher(),
@@ -637,7 +637,7 @@ mod tests {
             host_instance: "host-local".into(),
             repository: "local-repo".into(),
             adapter: "fixture".into(),
-            contract_version: 0,
+            contract_version: 1,
             capabilities: vec![],
             host_actors: Default::default(),
             required_checks: vec![],

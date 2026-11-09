@@ -332,7 +332,10 @@ fn delayed_review_evidence_does_not_misrepresent_the_current_target() {
             NOW + 10,
         );
         // A stale-head review delivered late: recorded, never displaces
-        // the current target's evidence.
+        // the current target's evidence — and invalidates nothing.
+        let version_before = store
+            .transact(|tx| Ok(tx.work(&work_id)?.unwrap().version))
+            .unwrap();
         let stale_obs = Observation {
             delivery: None,
             subject_work_id: (!execution_scoped).then(|| work_id.clone()),
@@ -367,21 +370,48 @@ fn delayed_review_evidence_does_not_misrepresent_the_current_target() {
             assert_eq!(view.findings.len(), 1);
             assert_eq!(view.findings[0].source_key, "current-finding");
         } else {
-            // The stale work-scoped review seals a round that does not
-            // match the current target: the current target's review
-            // evidence is unavailable, never substituted by stale
-            // findings.
-            assert!(
-                view.findings.is_empty(),
-                "a stale round must not surface as current findings"
-            );
+            // The stale work-scoped review seals a round for a
+            // superseded target: recorded evidence that can neither
+            // displace nor mask the current target's round.
+            assert_eq!(view.findings.len(), 1);
+            assert_eq!(view.findings[0].source_key, "current-finding");
         }
         assert!(
             view.findings
                 .iter()
                 .all(|f| f.source_key != "stale-finding")
         );
+        // Evidence for a superseded target is not a current-state
+        // change: recorded, but the version preconditions stand.
+        assert_eq!(view.version, version_before);
     }
+}
+
+/// Regression: a round's occurrences return in review order even past
+/// nine findings — the generated id pads the index so `ORDER BY id`
+/// stays numeric (`occ-…-000010` must not sort before `occ-…-000002`).
+#[test]
+fn occurrence_order_stays_in_review_order_past_nine() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, execution_id) = submit(&store, "many-findings");
+    open_change(&store, &work_id, "sha-many", NOW);
+    let keys: Vec<String> = (0..12).map(|i| format!("f-{i:02}")).collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    seal_review(
+        &store,
+        &work_id,
+        "sha-many",
+        &refs,
+        Some(&execution_id),
+        NOW,
+    );
+    let view = found(store.transact(|tx| work_detail(tx, &work_id, NOW)).unwrap());
+    let order: Vec<&str> = view
+        .findings
+        .iter()
+        .map(|f| f.source_key.as_str())
+        .collect();
+    assert_eq!(order, refs, "occurrences must follow review order");
 }
 
 #[test]

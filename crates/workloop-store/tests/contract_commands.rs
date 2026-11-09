@@ -4256,3 +4256,128 @@ fn an_applied_push_retry_advances_the_chain() {
         })
         .unwrap();
 }
+
+/// Regression: a `ChangeOpened` effect riding along on a NON-open
+/// receipt (e.g. a verified push) cannot establish the diff target —
+/// adoption requires an applied `open_change_request` intent whose
+/// immutable payload the effect matches.
+#[test]
+fn a_smuggled_open_effect_in_a_push_receipt_creates_no_diff_target() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sm1"), NOW).unwrap());
+    apply_effects(
+        &store,
+        &[Effect::InsertHostActionIntent {
+            intent: HostActionIntent {
+                action_id: "act-smuggle".into(),
+                work_id: w.clone(),
+                host: host(),
+                repository: repo(),
+                role: ActorRole::Publication,
+                actor: publisher(),
+                action: HostAction::PushRef {
+                    branch: format!("work/{}", w.0),
+                    produced: rev("artifact-digest"),
+                },
+                payload_digest: "test".into(),
+                status: HostActionStatus::Pending,
+                authenticated_actor: None,
+                effects: vec![],
+                created_seq: 0,
+            },
+        }],
+    );
+    // The receipt legitimately verifies the push — and smuggles a
+    // fully-formed ChangeOpened alongside it.
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-smuggle".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![
+                    NormalizedEffectFact::RefPublished {
+                        repository: repo(),
+                        branch: format!("work/{}", w.0),
+                        produced: rev("artifact-digest"),
+                        observed: rev("artifact-digest"),
+                        relation: RefRelation::Equal,
+                    },
+                    NormalizedEffectFact::ChangeOpened {
+                        change: change(),
+                        head: rev("h-smuggled"),
+                        source_branch: format!("work/{}", w.0),
+                        target_branch: "main".into(),
+                    },
+                ],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let value = store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &w, NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = value else {
+        panic!("expected found")
+    };
+    assert!(
+        value.current_change.is_none(),
+        "a non-open receipt's ChangeOpened must not establish the diff target"
+    );
+    // The push itself still reconciled applied — only the smuggled
+    // effect is inadmissible.
+    store
+        .transact(|tx| {
+            let push = tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == "act-smuggle")
+                .unwrap();
+            assert_eq!(push.status, HostActionStatus::Applied);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a store file stamped with the CURRENT format version but
+/// holding a foreign schema is refused before any mutating pragma — the
+/// version stamp alone is not proof of the recognized schema.
+#[test]
+fn a_versioned_file_without_the_recognized_schema_is_refused() {
+    let root = temp_root("cutover-foreign-v1");
+    let db = root.join("store.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE foreign_rows (id TEXT);")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("schema"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
+    }
+    // The refusal must not mutate the foreign file: journal mode stays
+    // the file's own and no WAL sidecars appear.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "a refused v1 file must not be re-journaled");
+    }
+    assert!(
+        !db.with_extension("db-wal").exists() && !db.with_extension("db-shm").exists(),
+        "a refused open must not leave WAL sidecars"
+    );
+}

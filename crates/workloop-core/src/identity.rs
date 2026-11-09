@@ -348,6 +348,9 @@ impl HostBinding {
         required_capabilities: impl IntoIterator<Item = HostCapability>,
         actors: Vec<RoleBinding>,
     ) -> Result<Self, String> {
+        if contract_version == 0 {
+            return Err("host binding: contract_version must be greater than 0".into());
+        }
         let required_capabilities: BTreeSet<HostCapability> =
             required_capabilities.into_iter().collect();
         let roles: BTreeSet<ActorRole> = actors.iter().map(|a| a.role).collect();
@@ -476,5 +479,74 @@ impl SourceGate {
         } else {
             other
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Identity, ordering, and bucketing must not split on display
+    /// metadata: a renumbered or absent display number still names the
+    /// same issue and the same change request.
+    #[test]
+    fn identity_refs_ignore_the_display_number() {
+        let repo = RepositoryRef::new(HostInstanceId::trusted("h"), RepositoryId::trusted("r"));
+        let a = IssueRef {
+            repository: repo.clone(),
+            issue: IssueId::trusted("issue-1"),
+            display_number: Some(5),
+        };
+        let b = IssueRef {
+            repository: repo.clone(),
+            issue: IssueId::trusted("issue-1"),
+            display_number: None,
+        };
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        let mut set = std::collections::HashSet::new();
+        set.insert(a.clone());
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+
+        let c1 = ChangeRequestRef {
+            repository: repo.clone(),
+            change_request: ChangeRequestId::trusted("cr-1"),
+            display_number: Some(7),
+        };
+        let c2 = ChangeRequestRef {
+            repository: repo,
+            change_request: ChangeRequestId::trusted("cr-1"),
+            display_number: Some(9),
+        };
+        assert_eq!(c1, c2);
+        assert_eq!(c1.cmp(&c2), std::cmp::Ordering::Equal);
+    }
+
+    /// A versionless host binding is never representable: version 0 is
+    /// not a negotiated contract.
+    #[test]
+    fn host_binding_rejects_version_zero() {
+        let repository =
+            RepositoryRef::new(HostInstanceId::trusted("h"), RepositoryId::trusted("r"));
+        let actors = vec![RoleBinding {
+            role: ActorRole::Publication,
+            actor: HostActorRef {
+                host: HostInstanceId::trusted("h"),
+                actor: HostActorId::trusted("a"),
+            },
+            credential_ref: "cred".into(),
+        }];
+        assert!(
+            HostBinding::new(
+                AdapterId::trusted("fixture"),
+                repository.clone(),
+                0,
+                [],
+                actors.clone()
+            )
+            .is_err()
+        );
+        assert!(HostBinding::new(AdapterId::trusted("fixture"), repository, 1, [], actors).is_ok());
     }
 }

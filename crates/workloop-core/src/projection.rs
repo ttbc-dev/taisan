@@ -418,35 +418,36 @@ pub fn work_detail(
             .map(|(_, _, h)| h);
         (c, head)
     });
-    // Findings on the latest sealed round — but only while that round
-    // still binds the current diff target. A stale round's occurrences
-    // cannot be judged (`current_round_for` rejects them), so displaying
-    // them as the Work's actionable findings would misstate the
-    // evidence surface.
+    // Findings on the latest sealed round for the CURRENT diff target.
+    // Rounds sealed for superseded targets are recorded evidence but
+    // never mask or substitute the current surface — and a round that
+    // does not bind the current target cannot be judged anyway
+    // (`current_round_for` rejects it).
     let target = crate::work::current_target(tx, work_id)?;
     let mut findings = Vec::new();
     let mut judged = Vec::new();
     let mut current_round_id = None;
     let mut sources = vec![store_source()];
-    if let Some(round) = tx.latest_round(work_id)? {
-        let stale = target.as_ref().is_some_and(|t| round.target != *t);
-        if !stale {
-            current_round_id = Some(round.id.clone());
-            for o in tx.occurrences(&round.id)? {
-                findings.push(FindingView {
-                    occurrence_id: o.id,
-                    source_key: o.source_key,
-                });
-            }
-            if let Some(j) = tx.judgment_for_round(&round.id)? {
-                for d in &j.decisions {
-                    judged.push(format!("{}:{:?}", d.occurrence_id, d.choice));
-                }
+    let current_round = match &target {
+        Some(t) => crate::work::latest_round_for_target(tx, work_id, t)?,
+        None => None,
+    };
+    if let Some(round) = current_round {
+        current_round_id = Some(round.id.clone());
+        for o in tx.occurrences(&round.id)? {
+            findings.push(FindingView {
+                occurrence_id: o.id,
+                source_key: o.source_key,
+            });
+        }
+        if let Some(j) = tx.judgment_for_round(&round.id)? {
+            for d in &j.decisions {
+                judged.push(format!("{}:{:?}", d.occurrence_id, d.choice));
             }
         }
         sources.push(SourceStatus {
             source: format!("review:{}", round.source),
-            availability: if !stale && round.completeness == "complete" {
+            availability: if round.completeness == "complete" {
                 Availability::Known
             } else {
                 Availability::Unavailable

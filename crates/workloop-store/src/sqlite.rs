@@ -31,6 +31,35 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// The only store format this binary reads or writes.
 const FORMAT_VERSION: i64 = 1;
 
+/// The tables `SCHEMA` installs. A file stamped `user_version=1` must
+/// hold all of them before any mutating pragma runs — the version stamp
+/// alone is not proof the file is this store's format.
+const EXPECTED_TABLES: &[&str] = &[
+    "attention_acks",
+    "capacity_slots",
+    "commands",
+    "deferrals",
+    "event_log",
+    "executions",
+    "finding_occurrences",
+    "host_action_intents",
+    "id_counters",
+    "invocations",
+    "invocation_requests",
+    "issue_claims",
+    "observations",
+    "recovery_decisions",
+    "resource_reservations",
+    "review_rounds",
+    "round_judgments",
+    "specs",
+    "stop_intents",
+    "store_meta",
+    "work_issue_refs",
+    "work_usage",
+    "works",
+];
+
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
 /// set explicitly so the guarantee does not depend on the binding's default.
@@ -93,6 +122,29 @@ impl SqliteStore {
                 });
             }
             bootstrapping = true;
+        } else {
+            // A v1 stamp alone is not proof this is our store: verify the
+            // schema shape before any mutating pragma. A foreign or
+            // truncated file carrying version 1 is refused as unsupported
+            // — never WAL-flipped and seeded first.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                )
+                .map_err(internal)?;
+            let present: std::collections::HashSet<String> = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(internal)?
+                .collect::<Result<_, _>>()
+                .map_err(internal)?;
+            if !EXPECTED_TABLES.iter().all(|t| present.contains(*t)) {
+                return Err(StoreError::UnsupportedFormat {
+                    detail: "store file claims the current format but does \
+                             not hold the recognized schema"
+                        .into(),
+                });
+            }
         }
         // journal_mode cannot change inside a transaction, so it is set
         // here — only for a file the gate accepted.
@@ -980,6 +1032,16 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn rounds_for_work(&self, work_id: &WorkId) -> Result<Vec<ReviewRound>, StoreError> {
+        self.query_all(
+            "SELECT id, work_id, target, source, source_revision, completeness, \
+             set_digest, generation, seq FROM review_rounds \
+             WHERE work_id=?1 ORDER BY seq",
+            params![work_id.0],
+            round_from_row,
+        )
+    }
+
     fn occurrences(&self, round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError> {
         self.query_all(
             "SELECT id, round_id, source_key, content_digest, severity, \
@@ -1543,5 +1605,25 @@ impl TxView for Tx<'_> {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_tables_cover_the_declared_schema() {
+        let declared: std::collections::BTreeSet<String> = SCHEMA
+            .lines()
+            .filter_map(|l| l.strip_prefix("CREATE TABLE IF NOT EXISTS "))
+            .map(|l| l.split('(').next().unwrap().trim().to_string())
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = EXPECTED_TABLES.iter().copied().collect();
+        assert_eq!(
+            declared,
+            expected.into_iter().map(String::from).collect(),
+            "EXPECTED_TABLES drifted from schema.sql"
+        );
     }
 }
