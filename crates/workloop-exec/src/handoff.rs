@@ -790,9 +790,21 @@ pub fn verify_with_timeout(
         Ok(_) => {
             let env_root = scratch.join(format!("verify-env-{tag}"));
             let run = run_verification_command(argv, &worktree, &log_path, &env_root, timeout);
-            let mut bytes = std::fs::read(&log_path).unwrap_or_default();
-            bytes.truncate(64 * 1024);
-            let captured = String::from_utf8_lossy(&bytes).into_owned();
+            // Read back only the bounded tail — never the whole file:
+            // a large writer must not size the supervisor's memory.
+            const TAIL: u64 = 64 * 1024;
+            let captured = match std::fs::File::open(&log_path) {
+                Ok(f) => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    let mut r = std::io::BufReader::new(f);
+                    let _ = r.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
+                    let mut bytes = Vec::new();
+                    let _ = r.take(TAIL).read_to_end(&mut bytes);
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+                Err(_) => String::new(),
+            };
             match run {
                 VerificationRun::Finished(status) => (
                     match status.code() {

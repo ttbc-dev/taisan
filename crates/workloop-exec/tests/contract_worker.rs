@@ -218,6 +218,51 @@ fn contract_worker_refuses_a_host_write() {
     );
 }
 
+/// A committed symlink inside the workspace is a host write in
+/// disguise: `--file` resolving through it would write outside the
+/// sandbox root — reported and refused, never executed.
+#[test]
+fn contract_worker_refuses_a_write_through_a_workspace_symlink() {
+    let parent = tmp_root("denylink");
+    let ws = parent.join("ws");
+    let outside = parent.join("outside");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.join("escape.txt"), ws.join("target.txt")).unwrap();
+
+    let port = PosixProcessControl;
+    // A symlinked directory along the declared path.
+    let leader = spawn(
+        &contract_bin(),
+        &["clean-exit", "--file", "link/planted.txt"],
+        &ws,
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "refusal exit",
+    );
+    // A declared file that is itself a symlink.
+    let leader = spawn(
+        &contract_bin(),
+        &["clean-exit", "--file", "target.txt"],
+        &ws,
+    );
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "refusal exit",
+    );
+
+    assert!(
+        !outside.join("planted.txt").exists(),
+        "nothing is written through a symlinked directory"
+    );
+    assert!(
+        !outside.join("escape.txt").exists(),
+        "a symlinked target file is never followed outside"
+    );
+}
+
 fn host() -> HostInstanceId {
     HostInstanceId::trusted("fixture")
 }

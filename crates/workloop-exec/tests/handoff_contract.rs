@@ -1021,6 +1021,33 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
     )
     .unwrap();
     assert_eq!(empty.result, VerificationOutcome::Inconclusive);
+
+    // A large writer cannot size the recorded output — only the
+    // bounded tail is retained, never the whole log.
+    let loud = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[3]",
+        &[
+            "sh".into(),
+            "-c".into(),
+            "head -c 200000 /dev/zero | tr '\\0' 'x'; echo tail-marker".into(),
+        ],
+        &scratch,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert_eq!(loud.result, VerificationOutcome::Pass);
+    assert!(
+        loud.output.len() <= 66 * 1024,
+        "retained output is bounded: {}",
+        loud.output.len()
+    );
+    assert!(
+        loud.output.contains("tail-marker"),
+        "the tail is the retained portion"
+    );
 }
 
 /// `source_revision` is a host issue-version token, not a git commit:

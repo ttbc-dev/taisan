@@ -30,7 +30,8 @@ fn workspace() -> PathBuf {
 }
 
 /// `--file` names a path inside the managed workspace only. An
-/// absolute path or a `..` traversal is a denied host write: refuse it
+/// absolute path, a `..` traversal, or a committed symlink that
+/// resolves outside the workspace is a denied host write: refuse it
 /// outright — a Worker argument must never reach outside the sandbox
 /// root.
 fn declared_file(arg: Option<String>) -> Result<String, ()> {
@@ -40,6 +41,30 @@ fn declared_file(arg: Option<String>) -> Result<String, ()> {
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
     if ok { Ok(name) } else { Err(()) }
+}
+
+/// Resolve `name` under `ws`, verifying every existing component —
+/// a repository can commit symlinks, and a symlinked directory or
+/// target file pointing outside the workspace is a host write in
+/// disguise. Components that do not exist yet are created by the
+/// caller under a verified parent.
+fn resolve_inside(ws: &Path, name: &str) -> Option<PathBuf> {
+    let root = ws.canonicalize().ok()?;
+    let mut p = PathBuf::from(ws);
+    for comp in Path::new(name).components() {
+        p.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let resolved = p.canonicalize().ok()?;
+                if !resolved.starts_with(&root) {
+                    return None;
+                }
+                p = resolved;
+            }
+            _ => {}
+        }
+    }
+    Some(p)
 }
 
 fn report(fact: serde_json::Value) {
@@ -67,7 +92,12 @@ fn write_artifact(ws: &Path, name: &str) {
     let request = ws.join("request.json");
     let request_bytes = std::fs::read(&request).unwrap_or_default();
     let body = artifact_body(&request_bytes, name);
-    let path = ws.join(name);
+    let Some(path) = resolve_inside(ws, name) else {
+        // A committed symlink reaching outside the workspace is a
+        // host write — reported and refused like an absolute path.
+        report(serde_json::json!({"evidence": "denied-host-write"}));
+        std::process::exit(3);
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("artifact parent");
     }
@@ -147,7 +177,10 @@ fn main() {
                     report(serde_json::json!({"evidence": "denied-host-write"}));
                     std::process::exit(3);
                 });
-            let path = ws.join(file);
+            let Some(path) = resolve_inside(&ws, &file) else {
+                report(serde_json::json!({"evidence": "denied-host-write"}));
+                std::process::exit(3);
+            };
             loop {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
