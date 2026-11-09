@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Actor, EventSequence, ExecutionId, GitHubIssueRef, Origin, WorkId, WriteResource,
+    Actor, EventSequence, ExecutionId, Origin, WorkId, WriteResource, canonical_json, sha256_hex,
 };
+use crate::identity::{CommitRevision, SourceSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandId(pub String);
 
-pub type PrHeadSha = String;
 pub type WorkVersion = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,12 +19,16 @@ pub struct CommandRequest {
 }
 
 /// Commands on existing Work carry the version the caller saw.
+///
+/// `Submit` receives an already-resolved submission: source issues carry
+/// the authoritative `source_revision`/`content_digest` the boundary
+/// resolver observed. Core never resolves display references itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandBody {
     Submit {
         intent: String,
-        issue_refs: Vec<GitHubIssueRef>,
+        sources: Vec<SourceSnapshot>,
         constraints: Vec<String>,
         verification_argv: Vec<Vec<String>>,
     },
@@ -58,13 +62,13 @@ pub enum CommandBody {
     JudgeFindings {
         work_id: WorkId,
         expected_work_version: WorkVersion,
-        expected_pr_head: PrHeadSha,
+        expected_head: CommitRevision,
         decisions: Vec<FindingDecision>,
     },
     ReleaseJudgment {
         work_id: WorkId,
         expected_work_version: WorkVersion,
-        expected_pr_head: PrHeadSha,
+        expected_head: CommitRevision,
     },
 }
 
@@ -118,10 +122,17 @@ impl CommandBody {
     }
 }
 
+/// A per-occurrence disposition over one sealed review round. `decisions`
+/// submitted to `JudgeFindings` must cover the round's occurrence set
+/// exactly — omissions and unknown occurrences are `invalid_request`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingDecision {
-    pub finding_id: String,
+    /// The install-scoped occurrence id from the sealed round.
+    pub occurrence_id: String,
     pub choice: FindingChoice,
+    /// Required for `dismiss`/`accept`; recorded verbatim.
+    #[serde(default)]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,13 +150,17 @@ pub enum RejectionCode {
     InvalidRequest,
     Unauthorized,
     StaleWorkVersion,
-    StalePrHead,
+    /// The caller's expected head is not the current sealed target head.
+    StaleHead,
     Ineligible,
     OwnershipUncertain,
     CapacityExhausted,
     SourceUnavailable,
     IdempotencyConflict,
     ResourceConflict,
+    /// The Work's required capabilities are not declared as supported by
+    /// the installation, or a capability report denies them.
+    UnsupportedCapability,
 }
 
 /// What an accepted Command changed; recorded with the decision.
@@ -188,16 +203,20 @@ impl CommandDecision {
     }
 }
 
-/// Digest of the canonical command payload, stored with the decision so a
-/// key replay with a changed body is `idempotency_conflict`. FNV-1a over a
-/// deterministic serialization — change detection only, not a secret.
+/// The canonical payload bytes stored with the decision so replay
+/// compares bytes, not a lossy form.
+pub fn canonical_payload(origin: &Origin, actor: &Actor, key: &str, body: &CommandBody) -> Vec<u8> {
+    let value = serde_json::json!({
+        "origin": origin,
+        "actor": actor,
+        "idempotency_key": key,
+        "body": body,
+    });
+    canonical_json(&value)
+}
+
+/// Digest of the canonical command payload — SHA-256 over tagged canonical
+/// bytes. A key replay with a changed body is `idempotency_conflict`.
 pub fn payload_digest(origin: &Origin, actor: &Actor, key: &str, body: &CommandBody) -> String {
-    let canonical =
-        serde_json::to_string(&(origin, actor, key, body)).expect("command body serializes");
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in canonical.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    sha256_hex("command-v1", &canonical_payload(origin, actor, key, body))
 }

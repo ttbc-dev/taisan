@@ -1,5 +1,12 @@
--- workloop slice-0 store: current-state tables enforcing structural
+-- workloop v1 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
+-- `PRAGMA user_version = 1` marks the format; an unversioned slice-0
+-- database is archive-only and a newer version is refused at open.
+
+CREATE TABLE IF NOT EXISTS store_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS id_counters (
     prefix TEXT PRIMARY KEY,
@@ -18,12 +25,51 @@ CREATE TABLE IF NOT EXISTS event_log (
 CREATE TABLE IF NOT EXISTS works (
     id TEXT PRIMARY KEY,
     version INTEGER NOT NULL,
-    revision INTEGER NOT NULL,
-    intent TEXT NOT NULL,
-    issue_refs TEXT NOT NULL,
-    constraints_ TEXT NOT NULL,
-    verification_argv TEXT NOT NULL,
+    binding TEXT NOT NULL,
+    spec INTEGER NOT NULL,
+    approved_spec INTEGER NOT NULL,
+    source_gate TEXT NOT NULL,
+    policy TEXT NOT NULL,
     created_seq INTEGER NOT NULL
+);
+
+-- Immutable spec snapshots; existing rows are never mutated.
+CREATE TABLE IF NOT EXISTS specs (
+    work_id TEXT NOT NULL REFERENCES works(id),
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    recorded_seq INTEGER NOT NULL,
+    PRIMARY KEY (work_id, revision)
+);
+
+-- Immutable source membership recorded at acceptance.
+CREATE TABLE IF NOT EXISTS work_issue_refs (
+    work_id TEXT NOT NULL REFERENCES works(id),
+    issue_key TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    PRIMARY KEY (work_id, issue_key)
+);
+
+-- Active claims; a paused or terminal Work holds none.
+CREATE TABLE IF NOT EXISTS issue_claims (
+    issue_key TEXT PRIMARY KEY,
+    issue TEXT NOT NULL,
+    work_id TEXT NOT NULL REFERENCES works(id)
+);
+
+-- Durable Work-wide usage accounting.
+CREATE TABLE IF NOT EXISTS work_usage (
+    work_id TEXT PRIMARY KEY REFERENCES works(id),
+    fix_invocations_used INTEGER NOT NULL DEFAULT 0,
+    transport_retries_used INTEGER NOT NULL DEFAULT 0,
+    equivalent_failure_streak INTEGER NOT NULL DEFAULT 0,
+    equivalent_signature TEXT,
+    automatic_seconds_used INTEGER NOT NULL DEFAULT 0,
+    first_dispatch_unix_seconds INTEGER,
+    last_progress_unix_seconds INTEGER,
+    human_wait_seconds_total INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS executions (
@@ -35,6 +81,7 @@ CREATE TABLE IF NOT EXISTS executions (
     desired_action TEXT,
     terminal_code TEXT,
     pause_reason TEXT,
+    repair_prerequisites TEXT NOT NULL DEFAULT '[]',
     outcome TEXT,
     enqueued_seq INTEGER NOT NULL,
     allowed_effects TEXT NOT NULL,
@@ -47,6 +94,8 @@ CREATE TABLE IF NOT EXISTS executions (
     recovery_attempts_used INTEGER NOT NULL DEFAULT 0,
     recovery_deadline_unix_seconds INTEGER,
     uncertain_since_unix_seconds INTEGER,
+    paused_since_unix_seconds INTEGER,
+    next_role TEXT,
     UNIQUE (work_id, ordinal)
 );
 
@@ -72,22 +121,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_writer
     WHERE state IN ('prepared', 'running', 'unknown');
 
 -- `consumed` flips to 1 when the store records the Invocation for this
--- request (Effect::InsertInvocation); `pending_requests` reads it.
+-- request (Effect::MarkRequestConsumed); `pending_requests` reads it.
 CREATE TABLE IF NOT EXISTS invocation_requests (
     request_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
     execution_id TEXT NOT NULL REFERENCES executions(id),
     role TEXT NOT NULL,
+    spec_revision INTEGER NOT NULL,
     payload TEXT NOT NULL,
     consumed INTEGER NOT NULL DEFAULT 0
 );
 
+-- Durable Command decisions; the canonical payload bytes are stored
+-- verbatim so replay compares bytes, and the digest detects a reused
+-- key carrying a different payload.
 CREATE TABLE IF NOT EXISTS commands (
     origin TEXT NOT NULL,
     actor_kind TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     payload_digest TEXT NOT NULL,
+    canonical_payload BLOB NOT NULL,
     command_id TEXT NOT NULL UNIQUE,
     decision TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -109,7 +163,10 @@ CREATE TABLE IF NOT EXISTS capacity_slots (
 
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_event_id TEXT,
+    delivery_scope TEXT,
+    delivery_host TEXT,
+    delivery_source TEXT,
+    delivery_event_id TEXT,
     subject_work_id TEXT,
     subject_execution_id TEXT,
     fact TEXT NOT NULL,
@@ -118,15 +175,59 @@ CREATE TABLE IF NOT EXISTS observations (
 
 -- Dedupe keyed on delivery identity; rows without one never dedupe.
 CREATE UNIQUE INDEX IF NOT EXISTS observations_dedupe
-    ON observations (source_event_id)
-    WHERE source_event_id IS NOT NULL;
+    ON observations (delivery_scope, delivery_host, delivery_source,
+                     delivery_event_id)
+    WHERE delivery_event_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS pr_action_intents (
+-- Recorded host write intents; `pending`/`unknown` are outstanding
+-- effects a terminal state must not silently drain.
+CREATE TABLE IF NOT EXISTS host_action_intents (
     action_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
+    host TEXT NOT NULL,
     repository TEXT NOT NULL,
+    role TEXT NOT NULL,
+    actor TEXT NOT NULL,
     action TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
+    payload_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    authenticated_actor TEXT,
+    effects TEXT NOT NULL DEFAULT '[]',
+    created_seq INTEGER NOT NULL
+);
+
+-- Immutable review rounds; a changed occurrence set installs a new row.
+CREATE TABLE IF NOT EXISTS review_rounds (
+    id TEXT PRIMARY KEY,
+    work_id TEXT NOT NULL REFERENCES works(id),
+    target TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_revision TEXT,
+    completeness TEXT NOT NULL,
+    set_digest TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    seq INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS finding_occurrences (
+    id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES review_rounds(id),
+    source_key TEXT NOT NULL,
+    content_digest TEXT,
+    severity TEXT,
+    position TEXT,
+    thread_id TEXT
+);
+
+-- One immutable exact-set judgment per sealed round.
+CREATE TABLE IF NOT EXISTS round_judgments (
+    id TEXT PRIMARY KEY,
+    work_id TEXT NOT NULL,
+    round_id TEXT NOT NULL UNIQUE REFERENCES review_rounds(id),
+    set_digest TEXT NOT NULL,
+    decisions TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    seq INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS stop_intents (
@@ -150,10 +251,15 @@ CREATE TABLE IF NOT EXISTS attention_acks (
     PRIMARY KEY (work_id, attention_id, actor_id)
 );
 
-CREATE TABLE IF NOT EXISTS judgments (
+-- Immutable failure/recovery decision records.
+CREATE TABLE IF NOT EXISTS recovery_decisions (
+    id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
-    expected_pr_head TEXT NOT NULL,
-    decisions TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    PRIMARY KEY (work_id, expected_pr_head)
+    execution_id TEXT,
+    classification TEXT NOT NULL,
+    signature TEXT,
+    prerequisites TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    usage_after TEXT NOT NULL,
+    seq INTEGER NOT NULL
 );

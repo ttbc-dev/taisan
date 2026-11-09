@@ -9,6 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
+use workloop_core::identity::{
+    CommitRevision, IssueId, IssueRef, RepositoryId, RepositoryRef, SourceSnapshot,
+};
 use workloop_core::projection::{self, CommandResultLookup};
 use workloop_core::store::Store;
 use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command, sweep};
@@ -51,9 +54,20 @@ enum Commands {
     Submit {
         #[arg(long)]
         intent: String,
-        /// `repo:number`; repeatable.
+        /// `repo:number`; repeatable. Each declared issue is paired
+        /// (by position) with the authoritative `--issue-revision` and
+        /// `--issue-digest` the resolver observed — the CLI never
+        /// fabricates them.
         #[arg(long)]
         issue: Vec<String>,
+        /// Authoritative revision for the `--issue` at the same
+        /// position; repeatable, one per declared issue.
+        #[arg(long)]
+        issue_revision: Vec<String>,
+        /// Authoritative content digest for the `--issue` at the same
+        /// position; repeatable, one per declared issue.
+        #[arg(long)]
+        issue_digest: Vec<String>,
         #[arg(long)]
         constraint: Vec<String>,
         /// Verification command line; repeatable, space-separated.
@@ -87,17 +101,20 @@ enum Commands {
     JudgeFindings {
         #[command(flatten)]
         target: WorkTarget,
+        /// Exact head object id the displayed findings are scoped to.
         #[arg(long)]
-        pr_head: String,
-        /// `finding_id:fix|dismiss|accept|wait`; repeatable.
+        head: String,
+        /// `occurrence_id:fix|dismiss|accept|wait[:rationale]`;
+        /// repeatable.
         #[arg(long)]
         decision: Vec<String>,
     },
     ReleaseJudgment {
         #[command(flatten)]
         target: WorkTarget,
+        /// Exact head object id to release the judgment against.
         #[arg(long)]
-        pr_head: String,
+        head: String,
     },
     ClaimResources {
         /// `workspace:<id>` or `branch:<repo>:<name>`; repeatable.
@@ -154,19 +171,34 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-fn parse_issue(s: &str) -> Result<GitHubIssueRef, String> {
+fn parse_issue(
+    s: &str,
+    host: &workloop_core::identity::HostInstanceId,
+) -> Result<IssueRef, String> {
     let (repo, number) = s
         .rsplit_once(':')
         .ok_or_else(|| format!("issue '{s}': expected repo:number"))?;
-    Ok(GitHubIssueRef {
-        repository: repo.into(),
-        number: number
-            .parse()
-            .map_err(|_| format!("issue '{s}': bad number"))?,
+    let display_number: u64 = number
+        .parse()
+        .map_err(|_| format!("issue '{s}': bad number"))?;
+    Ok(IssueRef {
+        repository: RepositoryRef::new(
+            host.clone(),
+            RepositoryId::new(repo).map_err(|e| format!("issue '{s}': {e}"))?,
+        ),
+        issue: IssueId::trusted(number),
+        display_number: Some(display_number),
     })
 }
 
-fn parse_resource(s: &str) -> Result<WriteResource, String> {
+fn parse_head(s: &str, repository: &RepositoryRef) -> Result<CommitRevision, String> {
+    CommitRevision::new(repository.clone(), s).map_err(|e| format!("head '{s}': {e}"))
+}
+
+fn parse_resource(
+    s: &str,
+    host: &workloop_core::identity::HostInstanceId,
+) -> Result<WriteResource, String> {
     if let Some(id) = s.strip_prefix("workspace:") {
         return Ok(WriteResource::Workspace {
             workspace_id: id.into(),
@@ -177,7 +209,10 @@ fn parse_resource(s: &str) -> Result<WriteResource, String> {
             .split_once(':')
             .ok_or_else(|| format!("resource '{s}': expected branch:<repo>:<name>"))?;
         return Ok(WriteResource::Branch {
-            repository: repo.into(),
+            repository: RepositoryRef::new(
+                host.clone(),
+                RepositoryId::new(repo).map_err(|e| format!("resource '{s}': {e}"))?,
+            ),
             branch: branch.into(),
         });
     }
@@ -187,9 +222,13 @@ fn parse_resource(s: &str) -> Result<WriteResource, String> {
 }
 
 fn parse_decision(s: &str) -> Result<FindingDecision, String> {
-    let (id, choice) = s
-        .rsplit_once(':')
-        .ok_or_else(|| format!("decision '{s}': expected finding_id:choice"))?;
+    let (id, rest) = s
+        .split_once(':')
+        .ok_or_else(|| format!("decision '{s}': expected occurrence_id:choice[:rationale]"))?;
+    let (choice, rationale) = match rest.split_once(':') {
+        Some((choice, rationale)) => (choice, Some(rationale.to_string())),
+        None => (rest, None),
+    };
     let choice = match choice {
         "fix" => FindingChoice::Fix,
         "dismiss" => FindingChoice::Dismiss,
@@ -198,8 +237,9 @@ fn parse_decision(s: &str) -> Result<FindingDecision, String> {
         other => return Err(format!("decision '{s}': unknown choice '{other}'")),
     };
     Ok(FindingDecision {
-        finding_id: id.into(),
+        occurrence_id: id.into(),
         choice,
+        rationale,
     })
 }
 
@@ -229,7 +269,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
     let installation = load_or_create(&config_path)?;
     let actor = installation.actor();
-    let config = installation.workloop_config();
+    let config = installation.workloop_config()?;
     let store =
         SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
     let key = || {
@@ -248,15 +288,36 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Submit {
             intent,
             issue,
+            issue_revision,
+            issue_digest,
             constraint,
             verification,
         } => {
+            if issue.len() != issue_revision.len() || issue.len() != issue_digest.len() {
+                return Err(format!(
+                    "each --issue needs a paired --issue-revision and --issue-digest \
+                     ({} issues, {} revisions, {} digests)",
+                    issue.len(),
+                    issue_revision.len(),
+                    issue_digest.len()
+                ));
+            }
+            let host = &config.host.repository.host;
+            let sources = issue
+                .iter()
+                .zip(&issue_revision)
+                .zip(&issue_digest)
+                .map(|((s, revision), digest)| {
+                    Ok(SourceSnapshot {
+                        issue: parse_issue(s, host)?,
+                        source_revision: revision.clone(),
+                        content_digest: digest.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             let body = CommandBody::Submit {
                 intent,
-                issue_refs: issue
-                    .iter()
-                    .map(|s| parse_issue(s))
-                    .collect::<Result<_, _>>()?,
+                sources,
                 constraints: constraint,
                 verification_argv: verification.iter().map(|s| shlex_split(s)).collect(),
             };
@@ -314,13 +375,13 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::JudgeFindings {
             target,
-            pr_head,
+            head,
             decision,
         } => {
             let body = CommandBody::JudgeFindings {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_pr_head: pr_head,
+                expected_head: parse_head(&head, &config.host.repository)?,
                 decisions: decision
                     .iter()
                     .map(|s| parse_decision(s))
@@ -331,11 +392,11 @@ fn run(cli: Cli) -> Result<(), String> {
                     .map_err(|e| e.to_string())?,
             );
         }
-        Commands::ReleaseJudgment { target, pr_head } => {
+        Commands::ReleaseJudgment { target, head } => {
             let body = CommandBody::ReleaseJudgment {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_pr_head: pr_head,
+                expected_head: parse_head(&head, &config.host.repository)?,
             };
             print(
                 &handle_command(&store, &config, &request(body), now())
@@ -349,7 +410,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let body = CommandBody::ClaimResources {
                 resources: resource
                     .iter()
-                    .map(|s| parse_resource(s))
+                    .map(|s| parse_resource(s, &config.host.repository.host))
                     .collect::<Result<_, _>>()?,
                 ttl_seconds,
             };
@@ -362,7 +423,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let body = CommandBody::ReleaseResources {
                 resources: resource
                     .iter()
-                    .map(|s| parse_resource(s))
+                    .map(|s| parse_resource(s, &config.host.repository.host))
                     .collect::<Result<_, _>>()?,
             };
             print(
@@ -509,18 +570,63 @@ fn run_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workloop_core::store::{Effect, PrAction, PrActionIntent, PrActionStatus};
-    use workloop_core::work::admit_queued;
+    use workloop_core::identity::{
+        ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, HostActorId, HostActorRef,
+        HostCapability, HostInstanceId, RoleBinding,
+    };
+    use workloop_core::observation::HostActionStatus;
+    use workloop_core::store::{Effect, HostAction, HostActionIntent};
+    use workloop_core::work::{HostTemplate, admit_queued};
+
+    fn host_instance() -> HostInstanceId {
+        HostInstanceId::trusted("host-local")
+    }
+
+    fn repository() -> RepositoryRef {
+        RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo"))
+    }
+
+    fn publisher() -> HostActorRef {
+        HostActorRef {
+            host: host_instance(),
+            actor: HostActorId::trusted("bot-pub"),
+        }
+    }
 
     fn config() -> WorkloopConfig {
         WorkloopConfig {
-            default_repository: "local/repo".into(),
+            host: HostTemplate {
+                adapter: AdapterId::trusted("fixture"),
+                repository: repository(),
+                contract_version: 1,
+                actors: vec![RoleBinding {
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    credential_ref: "default".into(),
+                }],
+            },
+            declared_capabilities: [
+                HostCapability::RepositoryRead,
+                HostCapability::PushRef,
+                HostCapability::ChangeRequestCreate,
+                HostCapability::ChangeRequestRead,
+                HostCapability::ChangeRequestUpdate,
+                HostCapability::CommentCreate,
+                HostCapability::ChecksRead,
+                HostCapability::ReviewFindingsRead,
+                HostCapability::IssueRead,
+            ]
+            .into_iter()
+            .collect(),
+            lanes: Default::default(),
+            required_checks: vec![],
             allowed_effects: AllowedEffects {
                 workspace_write: true,
-                github_write: true,
+                host_write: true,
                 network: false,
             },
             budget: ExecutionBudget::default(),
+            policy: WorkPolicy::default(),
         }
     }
 
@@ -528,12 +634,20 @@ mod tests {
         Installation {
             actor_id: "actor-test".into(),
             actor_kind: "human".into(),
-            repository: "local/repo".into(),
+            host_instance: "host-local".into(),
+            repository: "local-repo".into(),
+            adapter: "fixture".into(),
+            contract_version: 1,
+            capabilities: vec![],
+            host_actors: Default::default(),
+            required_checks: vec![],
             capacity: 2,
             worker_argv: vec![],
             workspace_root: "workspaces".into(),
             allowed_effects: None,
             budget: None,
+            lanes: None,
+            policy: None,
         }
     }
 
@@ -550,7 +664,7 @@ mod tests {
                 idempotency_key: key.into(),
                 body: CommandBody::Submit {
                     intent: format!("intent-{key}"),
-                    issue_refs: vec![],
+                    sources: vec![],
                     constraints: vec![],
                     verification_argv: vec![],
                 },
@@ -570,13 +684,13 @@ mod tests {
     }
 
     /// The realistic drain context for an outstanding publish intent:
-    /// admitted, then waiting on the GitHub write.
-    fn force_waiting_on_github_write(store: &SqliteStore, eid: &ExecutionId) {
+    /// admitted, then waiting on the host write.
+    fn force_waiting_on_host_write(store: &SqliteStore, eid: &ExecutionId) {
         store
             .transact(|tx| {
                 let mut e = tx.execution(eid)?.unwrap();
                 e.state = ExecutionState::Waiting;
-                e.waiting_reason = Some(WaitingReason::GithubWrite);
+                e.waiting_reason = Some(WaitingReason::HostWrite);
                 tx.apply(&Effect::UpdateExecution {
                     execution: e,
                     expected_state: ExecutionState::Ready,
@@ -585,21 +699,25 @@ mod tests {
             .unwrap();
     }
 
-    fn queue_publish(store: &SqliteStore, work_id: &WorkId) {
+    fn queue_intent(store: &SqliteStore, work_id: &WorkId, action: HostAction) {
         store
             .transact(|tx| {
                 let action_id = tx.alloc_id("act")?;
-                tx.apply(&Effect::InsertPrActionIntent {
-                    intent: PrActionIntent {
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
                         action_id,
                         work_id: work_id.clone(),
-                        repository: "local/repo".into(),
-                        action: PrAction::PublishPr {
-                            branch: format!("work/{}", work_id.0),
-                            title: "t".into(),
-                            body: String::new(),
-                        },
-                        status: PrActionStatus::Pending,
+                        host: host_instance(),
+                        repository: repository(),
+                        role: ActorRole::Publication,
+                        actor: publisher(),
+                        action,
+                        payload_digest: "test-digest".into(),
+                        status: HostActionStatus::Pending,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
                     },
                 })?;
                 Ok(())
@@ -607,8 +725,29 @@ mod tests {
             .unwrap();
     }
 
+    fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
+        queue_intent(
+            store,
+            work_id,
+            HostAction::OpenChangeRequest {
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+        );
+    }
+
+    fn change_for(number: u64) -> ChangeRequestRef {
+        ChangeRequestRef {
+            repository: repository(),
+            change_request: ChangeRequestId::trusted(format!("cr-{number}")),
+            display_number: Some(number),
+        }
+    }
+
     #[test]
-    fn github_state_persists_across_ticks_of_one_run() {
+    fn host_state_persists_across_ticks_of_one_run() {
         let store = SqliteStore::in_memory(2).unwrap();
         let config = config();
         let installation = installation();
@@ -618,54 +757,53 @@ mod tests {
             store
                 .transact(|tx| admit_queued(tx, &config, eid, now()).map(|_| ()))
                 .unwrap();
-            force_waiting_on_github_write(&store, eid);
+            force_waiting_on_host_write(&store, eid);
         }
 
         // One fixture for the whole run, as `run` keeps it across ticks.
         let mut github = FixtureGithub::new();
 
-        // Tick 1: work 1 publishes its PR.
-        queue_publish(&store, &w1);
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
-        assert_eq!(github.applied(), &["publish_pr:local/repo:1"]);
-
-        // Tick 2: work 2 publishes later — its PR number must continue,
-        // not restart at 1 and collide with work 1's.
-        queue_publish(&store, &w2);
+        // Tick 1: work 1 opens its change request.
+        queue_open_change(&store, &w1);
         run_tick(&store, &config, &installation, None, &mut github).unwrap();
         assert_eq!(
             github.applied(),
-            &["publish_pr:local/repo:1", "publish_pr:local/repo:2"]
+            &["open_change:host-local/local-repo:cr-1"]
         );
 
-        // Tick 3: an UpdatePr head recheck matches the head published in
-        // tick 1 — impossible against a fixture that forgot tick 1.
-        store
-            .transact(|tx| {
-                let action_id = tx.alloc_id("act")?;
-                tx.apply(&Effect::InsertPrActionIntent {
-                    intent: PrActionIntent {
-                        action_id,
-                        work_id: w1.clone(),
-                        repository: "local/repo".into(),
-                        action: PrAction::UpdatePr {
-                            number: 1,
-                            expected_head: format!("work/{}-head", w1.0),
-                            body: "edited".into(),
-                        },
-                        status: PrActionStatus::Pending,
-                    },
-                })?;
-                Ok(())
-            })
-            .unwrap();
+        // Tick 2: work 2 opens later — its change number must continue,
+        // not restart at 1 and collide with work 1's.
+        queue_open_change(&store, &w2);
         run_tick(&store, &config, &installation, None, &mut github).unwrap();
         assert_eq!(
             github.applied(),
             &[
-                "publish_pr:local/repo:1",
-                "publish_pr:local/repo:2",
-                "update_pr:local/repo:1"
+                "open_change:host-local/local-repo:cr-1",
+                "open_change:host-local/local-repo:cr-2"
+            ]
+        );
+
+        // Tick 3: an UpdateChangeRequest head recheck matches the head
+        // recorded in tick 1 — impossible against a fixture that forgot
+        // tick 1.
+        let head = CommitRevision::new(repository(), format!("work/{}-head", w1.0)).unwrap();
+        queue_intent(
+            &store,
+            &w1,
+            HostAction::UpdateChangeRequest {
+                change: change_for(1),
+                expected_head: head,
+                title: None,
+                body: Some("edited".into()),
+            },
+        );
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        assert_eq!(
+            github.applied(),
+            &[
+                "open_change:host-local/local-repo:cr-1",
+                "open_change:host-local/local-repo:cr-2",
+                "update_change:host-local/local-repo:cr-1"
             ]
         );
     }

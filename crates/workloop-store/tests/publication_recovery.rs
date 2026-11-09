@@ -1,23 +1,96 @@
+use std::collections::BTreeSet;
+
 use workloop_core::command::*;
 use workloop_core::domain::*;
+use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
-use workloop_core::work::{WorkloopConfig, admit_queued, handle_command, handle_observation};
+use workloop_core::work::{
+    HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
+};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
 
-#[test]
-fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
-    let config = WorkloopConfig {
-        default_repository: "local/repo".into(),
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn config() -> WorkloopConfig {
+    WorkloopConfig {
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host: host(),
+                    actor: HostActorId::trusted("pub-agent"),
+                },
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: true,
+            host_write: true,
             network: false,
         },
         budget: ExecutionBudget::default(),
-    };
+        policy: WorkPolicy::default(),
+    }
+}
+
+fn artifact(kind: &str) -> RequiredArtifact {
+    RequiredArtifact {
+        kind: kind.into(),
+        path: kind.into(),
+        expected_digest: None,
+    }
+}
+
+/// The capability report authorizing `push_ref` on the bound host —
+/// without it no stage-effect intent is ever recorded.
+fn authorize(store: &SqliteStore, capability: HostCapability) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: None,
+            fact: ObservationFact::CapabilityReport {
+                host: host(),
+                capabilities: vec![CapabilityEntry {
+                    capability,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+#[test]
+fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
+    let config = config();
     let store = SqliteStore::in_memory(1).unwrap();
     let decision = handle_command(
         &store,
@@ -31,7 +104,7 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
             idempotency_key: "submit".into(),
             body: CommandBody::Submit {
                 intent: "continue the change".into(),
-                issue_refs: vec![],
+                sources: vec![],
                 constraints: vec![],
                 verification_argv: vec![],
             },
@@ -56,12 +129,12 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
                 (
                     earlier.clone(),
                     InvocationState::Done,
-                    vec!["earlier.json".into()],
+                    vec![artifact("earlier.json")],
                 ),
                 (
                     current.clone(),
                     InvocationState::Running,
-                    vec!["first.json".into(), "second.json".into()],
+                    vec![artifact("first.json"), artifact("second.json")],
                 ),
             ] {
                 tx.apply(&Effect::InsertInvocation {
@@ -79,13 +152,15 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
             }
             tx.apply(&Effect::InsertObservation {
                 observation: Observation {
-                    source_event_id: None,
+                    delivery: None,
                     subject_work_id: Some(work.clone()),
                     subject_execution_id: Some(execution_id.clone()),
                     fact: ObservationFact::Artifact {
                         invocation_id: earlier,
                         required_artifact: "earlier.json".into(),
-                        state: ArtifactFact::Present,
+                        state: ArtifactFact::Present {
+                            digest: "earlier-digest".into(),
+                        },
                     },
                     observed_unix_seconds: NOW,
                 },
@@ -98,12 +173,14 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
             })
         })
         .unwrap();
+    // The stage effect requires an authorized push_ref capability.
+    authorize(&store, HostCapability::PushRef);
     let emit = |fact| {
         handle_observation(
             &store,
             &config,
             &Observation {
-                source_event_id: None,
+                delivery: None,
                 subject_work_id: Some(work.clone()),
                 subject_execution_id: Some(execution_id.clone()),
                 fact,
@@ -121,7 +198,9 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
     emit(ObservationFact::Artifact {
         invocation_id: current.clone(),
         required_artifact: "first.json".into(),
-        state: ArtifactFact::Present,
+        state: ArtifactFact::Present {
+            digest: "first-digest".into(),
+        },
     });
     assert_eq!(
         store.transact(|tx| tx.action_intents()).unwrap().len(),
@@ -141,9 +220,11 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
     emit(ObservationFact::Artifact {
         invocation_id: current,
         required_artifact: "second.json".into(),
-        state: ArtifactFact::Present,
+        state: ArtifactFact::Present {
+            digest: "second-digest".into(),
+        },
     });
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
     assert_eq!(intents.len(), 1);
-    assert!(matches!(intents[0].action, PrAction::PublishPr { .. }));
+    assert!(matches!(intents[0].action, HostAction::PushRef { .. }));
 }

@@ -1,25 +1,84 @@
 //! Contract tests: Commands, Admission, Reservations from docs/v0.1.md.
 
+use std::collections::BTreeSet;
+
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{
-    CheckConclusion, Observation, ObservationFact, Outcome, ReviewVerdict,
+use workloop_core::identity::*;
+use workloop_core::observation::*;
+use workloop_core::store::*;
+use workloop_core::work::{
+    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command,
 };
-use workloop_core::store::{Effect, PrAction, PrActionIntent, PrActionStatus, Store};
-use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
 
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+fn target(head: &str) -> DiffTarget {
+    DiffTarget {
+        change: change(),
+        head: rev(head),
+        base: None,
+        target_revision: None,
+    }
+}
+
+fn publisher() -> HostActorRef {
+    HostActorRef {
+        host: host(),
+        actor: HostActorId::trusted("pub-agent"),
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: publisher(),
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec!["ci".into()],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: true,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     }
 }
 
@@ -48,10 +107,7 @@ fn submit(key: &str) -> CommandRequest {
         key,
         CommandBody::Submit {
             intent: "do the thing".into(),
-            issue_refs: vec![GitHubIssueRef {
-                repository: "local/repo".into(),
-                number: 1,
-            }],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },
@@ -132,20 +188,98 @@ fn force_state(store: &SqliteStore, id: &ExecutionId, to: ExecutionState) {
     );
 }
 
-/// Record the persisted PR-head evidence `judge_findings` and
-/// `release_judgment` must compare against — the adapter's Observation.
-fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i64) {
+/// Record the persisted open+head evidence `judge_findings` and
+/// `release_judgment` compare against: the applied `open_change_request`
+/// intent, its `ChangeOpened` receipt inside a `HostActionResult`, then
+/// the head observation.
+fn seed_change(store: &SqliteStore, work_id: &WorkId, head: &str, observed_at: i64) {
+    // Only an applied intent validates the receipt — tests that record
+    // their own `act-open` intent keep their own status.
+    let already = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == "act-open"))
+        })
+        .unwrap();
+    if !already {
+        apply_effects(
+            store,
+            &[Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-open".into(),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq: 0,
+                },
+            }],
+        );
+    }
+    apply_effects(
+        store,
+        &[
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::HostActionResult {
+                        action_id: "act-open".into(),
+                        authenticated_actor: Some(publisher()),
+                        status: HostActionStatus::Applied,
+                        effects: vec![NormalizedEffectFact::ChangeOpened {
+                            change: change(),
+                            head: rev(head),
+                            source_branch: format!("work/{}", work_id.0),
+                            target_branch: "main".into(),
+                        }],
+                    },
+                    observed_unix_seconds: observed_at,
+                },
+            },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::ChangeHead {
+                        change: change(),
+                        head: rev(head),
+                    },
+                    observed_unix_seconds: observed_at,
+                },
+            },
+        ],
+    );
+}
+
+/// Record only a fresh head observation for the already-opened change —
+/// the adapter's `ChangeHead` for a moved head.
+fn seed_head(store: &SqliteStore, work_id: &WorkId, head: &str, observed_at: i64) {
     apply_effects(
         store,
         &[Effect::InsertObservation {
             observation: Observation {
-                source_event_id: None,
+                delivery: None,
                 subject_work_id: Some(work_id.clone()),
                 subject_execution_id: None,
-                fact: ObservationFact::PrHead {
-                    repository: "local/repo".into(),
-                    number: 1,
-                    head_sha: sha.into(),
+                fact: ObservationFact::ChangeHead {
+                    change: change(),
+                    head: rev(head),
                 },
                 observed_unix_seconds: observed_at,
             },
@@ -153,25 +287,102 @@ fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i
     );
 }
 
-/// Same evidence recorded against one of the Work's Executions instead of
-/// the Work itself; `latest_pr_head` must resolve it either way.
-fn seed_pr_head_for_execution(store: &SqliteStore, execution_id: &ExecutionId, sha: &str) {
-    apply_effects(
+/// Deliver a complete review collection: seals the immutable round for
+/// the given head and bumps the Work version.
+fn seal_review(store: &SqliteStore, work_id: &WorkId, head: &str, source_keys: &[&str]) {
+    workloop_core::work::handle_observation(
         store,
-        &[Effect::InsertObservation {
-            observation: Observation {
-                source_event_id: None,
-                subject_work_id: None,
-                subject_execution_id: Some(execution_id.clone()),
-                fact: ObservationFact::PrHead {
-                    repository: "local/repo".into(),
-                    number: 1,
-                    head_sha: sha.into(),
-                },
-                observed_unix_seconds: NOW,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::Review {
+                target: target(head),
+                source: "reviewer".into(),
+                source_revision: None,
+                completeness: Completeness::Complete,
+                occurrences: source_keys
+                    .iter()
+                    .map(|key| OccurrenceInput {
+                        source_key: key.to_string(),
+                        content_digest: None,
+                        severity: None,
+                        position: None,
+                        thread_id: None,
+                    })
+                    .collect(),
             },
-        }],
-    );
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// The occurrence ids of the Work's latest sealed round — the exact set
+/// a `JudgeFindings` decision list must cover.
+fn occurrence_ids(store: &SqliteStore, work_id: &WorkId) -> Vec<String> {
+    store
+        .transact(|tx| {
+            let Some(round) = tx.latest_round(work_id)? else {
+                return Ok(vec![]);
+            };
+            Ok(tx
+                .occurrences(&round.id)?
+                .into_iter()
+                .map(|o| o.id)
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
+}
+
+/// A `JudgeFindings` request covering every occurrence of the current
+/// sealed round with `choice`.
+fn judge_request(
+    store: &SqliteStore,
+    key: &str,
+    work_id: &WorkId,
+    version: WorkVersion,
+    head: &str,
+    choice: FindingChoice,
+) -> CommandRequest {
+    let decisions = occurrence_ids(store, work_id)
+        .into_iter()
+        .map(|occurrence_id| FindingDecision {
+            occurrence_id,
+            choice: choice.clone(),
+            rationale: match choice {
+                FindingChoice::Accept | FindingChoice::Dismiss => Some("accepted".into()),
+                _ => None,
+            },
+        })
+        .collect();
+    req(
+        key,
+        CommandBody::JudgeFindings {
+            work_id: work_id.clone(),
+            expected_work_version: version,
+            expected_head: rev(head),
+            decisions,
+        },
+    )
+}
+
+fn release_request(
+    key: &str,
+    work_id: &WorkId,
+    version: WorkVersion,
+    head: &str,
+) -> CommandRequest {
+    req(
+        key,
+        CommandBody::ReleaseJudgment {
+            work_id: work_id.clone(),
+            expected_work_version: version,
+            expected_head: rev(head),
+        },
+    )
 }
 
 /// Drive one Command through `handle_command` twice and prove the second
@@ -399,7 +610,7 @@ fn cancel_queued_is_terminal_and_second_cancel_is_noop() {
 
 fn branch_res() -> WriteResource {
     WriteResource::Branch {
-        repository: "local/repo".into(),
+        repository: repo(),
         branch: "wip/main".into(),
     }
 }
@@ -508,7 +719,7 @@ fn earlier_external_claim_defers_queued_execution() {
     // An external writer claims the work branch before dispatch.
     let claim = CommandBody::ClaimResources {
         resources: vec![WriteResource::Branch {
-            repository: "local/repo".into(),
+            repository: repo(),
             branch: format!("work/{}", work_id.0),
         }],
         ttl_seconds: 300,
@@ -542,6 +753,7 @@ fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
         work_id: w1,
         execution_id: e1.clone(),
         role: InvocationRole::Coding,
+        spec_revision: 1,
         payload: serde_json::json!({}),
     };
     apply_effects(&store, &[Effect::InsertRequest { request: seeded }]);
@@ -673,44 +885,49 @@ fn release_judgment_requires_a_matching_recorded_judgment() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("j1"), NOW).unwrap());
     force_state(&store, &e1, ExecutionState::Paused);
-    let release = |head: &str, version: u64| CommandBody::ReleaseJudgment {
-        work_id: work_id.clone(),
-        expected_work_version: version,
-        expected_pr_head: head.into(),
-    };
 
-    // Nothing recorded yet.
-    let d = handle_command(&store, &config(), &req("j2", release("h1", 1)), NOW).unwrap();
-    assert_eq!(reject_reason(&d), RejectionCode::Ineligible);
+    // Nothing observed yet: no change request exists, so the release is
+    // source-unavailable rather than stale.
+    let d = handle_command(
+        &store,
+        &config(),
+        &release_request("j2", &work_id, 1, "h1"),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::SourceUnavailable);
 
-    // The adapter must record the head before a judgment may bind to it.
-    seed_pr_head(&store, &work_id, "h1", NOW);
+    // The adapter recorded the head; the round must be sealed before a
+    // judgment may bind to it.
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
     accepted(
         &handle_command(
             &store,
             &config(),
-            &req(
-                "j3",
-                CommandBody::JudgeFindings {
-                    work_id: work_id.clone(),
-                    expected_work_version: 1,
-                    expected_pr_head: "h1".into(),
-                    decisions: vec![FindingDecision {
-                        finding_id: "f1".into(),
-                        choice: FindingChoice::Fix,
-                    }],
-                },
-            ),
+            &judge_request(&store, "j3", &work_id, 2, "h1", FindingChoice::Fix),
             NOW,
         )
         .unwrap(),
     );
 
     // A stale head cannot release the recorded judgment.
-    let d = handle_command(&store, &config(), &req("j4", release("h2", 2)), NOW).unwrap();
-    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
+    let d = handle_command(
+        &store,
+        &config(),
+        &release_request("j4", &work_id, 3, "h2"),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StaleHead);
 
-    let d = handle_command(&store, &config(), &req("j5", release("h1", 2)), NOW).unwrap();
+    let d = handle_command(
+        &store,
+        &config(),
+        &release_request("j5", &work_id, 3, "h1"),
+        NOW,
+    )
+    .unwrap();
     accepted(&d);
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
 }
@@ -1080,36 +1297,36 @@ fn judge_findings_replays_the_same_decision() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("jf1"), NOW).unwrap());
-    seed_pr_head(&store, &work_id, "h1", NOW);
-    let decisions = vec![FindingDecision {
-        finding_id: "f1".into(),
-        choice: FindingChoice::Fix,
-    }];
-    let judge = req(
-        "jf2",
-        CommandBody::JudgeFindings {
-            work_id: work_id.clone(),
-            expected_work_version: 1,
-            expected_pr_head: "h1".into(),
-            decisions: decisions.clone(),
-        },
-    );
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
+    let judge = judge_request(&store, "jf2", &work_id, 2, "h1", FindingChoice::Fix);
+    let decisions = match &judge.body {
+        CommandBody::JudgeFindings { decisions, .. } => decisions.clone(),
+        other => panic!("expected judge body, got {other:?}"),
+    };
     let d = assert_replay_locked(&store, &judge, NOW, NOW);
     accepted(&d);
-    // A re-decision would be StaleWorkVersion (now version 2) or collide on
-    // the judgment's (work_id, expected_pr_head) primary key.
+    // A re-decision would be StaleWorkVersion (now version 3) or collide on
+    // the judgment's primary key.
     let work = store
         .transact(|tx| tx.work(&work_id))
         .unwrap()
         .expect("work exists");
-    assert_eq!(work.version, 2, "replay must not bump to version 3");
-    let (head, recorded) = store
+    assert_eq!(work.version, 3, "replay must not bump to version 4");
+    let recorded = store
         .transact(|tx| tx.latest_judgment(&work_id))
         .unwrap()
         .expect("judgment recorded");
-    assert_eq!(head, "h1");
+    let round = store
+        .transact(|tx| tx.latest_round(&work_id))
+        .unwrap()
+        .expect("round recorded");
     assert_eq!(
-        serde_json::to_string(&recorded).unwrap(),
+        recorded.round_id, round.id,
+        "one judgment on the sealed round"
+    );
+    assert_eq!(
+        serde_json::to_string(&recorded.decisions).unwrap(),
         serde_json::to_string(&decisions).unwrap(),
         "one judgment with the original decisions"
     );
@@ -1121,48 +1338,31 @@ fn release_judgment_replays_the_same_decision() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("rj1"), NOW).unwrap());
     force_state(&store, &e1, ExecutionState::Paused);
-    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
     accepted(
         &handle_command(
             &store,
             &config(),
-            &req(
-                "rj2",
-                CommandBody::JudgeFindings {
-                    work_id: work_id.clone(),
-                    expected_work_version: 1,
-                    expected_pr_head: "h1".into(),
-                    decisions: vec![FindingDecision {
-                        finding_id: "f1".into(),
-                        choice: FindingChoice::Accept,
-                    }],
-                },
-            ),
+            &judge_request(&store, "rj2", &work_id, 2, "h1", FindingChoice::Accept),
             NOW,
         )
         .unwrap(),
     );
-    let release = req(
-        "rj3",
-        CommandBody::ReleaseJudgment {
-            work_id: work_id.clone(),
-            expected_work_version: 2,
-            expected_pr_head: "h1".into(),
-        },
-    );
+    let release = release_request("rj3", &work_id, 3, "h1");
     let d = assert_replay_locked(&store, &release, NOW, NOW);
     accepted(&d);
     let committed_at = match &d {
         CommandDecision::Accepted { committed_at, .. } => *committed_at,
         other => panic!("expected accepted, got {other:?}"),
     };
-    // Re-deciding now would be StaleWorkVersion (the Work is version 3) or
+    // Re-deciding now would be StaleWorkVersion (the Work is version 4) or
     // Ineligible (the Execution is no longer paused).
     let work = store
         .transact(|tx| tx.work(&work_id))
         .unwrap()
         .expect("work exists");
-    assert_eq!(work.version, 3, "replay must not bump to version 4");
+    assert_eq!(work.version, 4, "replay must not bump to version 5");
     let e = read_execution(&store, &e1);
     assert_eq!(e.state, ExecutionState::Queued);
     assert_eq!(
@@ -1171,7 +1371,7 @@ fn release_judgment_replays_the_same_decision() {
     );
 }
 
-// ---- Converge round 3: invocation-budget bounds + PR-head provenance ----
+// ---- Converge round 3: invocation-budget bounds + head provenance ----
 
 fn budget_config(max_invocations: u32, max_review_rounds: u32) -> WorkloopConfig {
     config_with_budget(ExecutionBudget {
@@ -1179,21 +1379,6 @@ fn budget_config(max_invocations: u32, max_review_rounds: u32) -> WorkloopConfig
         max_review_rounds,
         ..ExecutionBudget::default()
     })
-}
-
-fn judge_req(key: &str, work_id: &WorkId, version: u64, head: &str) -> CommandRequest {
-    req(
-        key,
-        CommandBody::JudgeFindings {
-            work_id: work_id.clone(),
-            expected_work_version: version,
-            expected_pr_head: head.into(),
-            decisions: vec![FindingDecision {
-                finding_id: "f1".into(),
-                choice: FindingChoice::Fix,
-            }],
-        },
-    )
 }
 
 fn rejection_evidence(d: &CommandDecision) -> Vec<String> {
@@ -1383,13 +1568,27 @@ fn judge_rejects_head_with_no_observation() {
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("jn1"), NOW).unwrap());
 
-    let d = handle_command(&store, &config(), &judge_req("jn2", &work_id, 1, "h1"), NOW).unwrap();
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "jn2",
+            CommandBody::JudgeFindings {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                expected_head: rev("h1"),
+                decisions: vec![],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
     assert_eq!(reject_reason(&d), RejectionCode::SourceUnavailable);
     assert!(
         rejection_evidence(&d)
             .iter()
             .any(|e| e.contains(&work_id.0)),
-        "evidence names the Work with no observed head"
+        "evidence names the Work with no observed change"
     );
     let work = store
         .transact(|tx| tx.work(&work_id))
@@ -1410,13 +1609,26 @@ fn judge_rejects_arbitrary_head() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("ja1"), NOW).unwrap());
-    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_change(&store, &work_id, "h1", NOW);
 
-    let d = handle_command(&store, &config(), &judge_req("ja2", &work_id, 1, "h2"), NOW).unwrap();
-    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
-    assert_eq!(
-        rejection_evidence(&d),
-        vec!["h1".to_string()],
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "ja2",
+            CommandBody::JudgeFindings {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                expected_head: rev("h2"),
+                decisions: vec![],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::StaleHead);
+    assert!(
+        rejection_evidence(&d).iter().any(|e| e.contains("h1")),
         "evidence names the observed head"
     );
     let work = store
@@ -1436,24 +1648,41 @@ fn judge_rejects_arbitrary_head() {
 #[test]
 fn judge_accepts_the_observed_head() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, e1) =
+    let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("jc1"), NOW).unwrap());
-    // The adapter recorded the head against the Execution; the provenance
-    // read must resolve it through the Work either way.
-    seed_pr_head_for_execution(&store, &e1, "h1");
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
 
-    let d = handle_command(&store, &config(), &judge_req("jc2", &work_id, 1, "h1"), NOW).unwrap();
+    let d = handle_command(
+        &store,
+        &config(),
+        &judge_request(&store, "jc2", &work_id, 2, "h1", FindingChoice::Fix),
+        NOW,
+    )
+    .unwrap();
     accepted(&d);
     let work = store
         .transact(|tx| tx.work(&work_id))
         .unwrap()
         .expect("work exists");
-    assert_eq!(work.version, 2);
-    let (head, _) = store
+    assert_eq!(work.version, 3);
+    let judgment = store
         .transact(|tx| tx.latest_judgment(&work_id))
         .unwrap()
         .expect("judgment recorded");
-    assert_eq!(head, "h1", "the judgment carries the observed head");
+    let round = store
+        .transact(|tx| tx.latest_round(&work_id))
+        .unwrap()
+        .expect("round recorded");
+    assert_eq!(
+        judgment.round_id, round.id,
+        "the judgment binds the sealed round"
+    );
+    assert_eq!(
+        round.target.head,
+        rev("h1"),
+        "the judgment's round carries the observed head"
+    );
 }
 
 #[test]
@@ -1461,32 +1690,31 @@ fn release_rejects_head_changed_after_judgment() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("hc1"), NOW).unwrap());
-    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
     accepted(
-        &handle_command(&store, &config(), &judge_req("hc2", &work_id, 1, "h1"), NOW).unwrap(),
+        &handle_command(
+            &store,
+            &config(),
+            &judge_request(&store, "hc2", &work_id, 2, "h1", FindingChoice::Fix),
+            NOW,
+        )
+        .unwrap(),
     );
-    // The PR moves after the judgment was accepted.
-    seed_pr_head(&store, &work_id, "h2", NOW + 10);
+    // The change head moves after the judgment was accepted.
+    seed_head(&store, &work_id, "h2", NOW + 10);
     force_state(&store, &e1, ExecutionState::Paused);
 
     let d = handle_command(
         &store,
         &config(),
-        &req(
-            "hc3",
-            CommandBody::ReleaseJudgment {
-                work_id: work_id.clone(),
-                expected_work_version: 2,
-                expected_pr_head: "h1".into(),
-            },
-        ),
+        &release_request("hc3", &work_id, 3, "h1"),
         NOW,
     )
     .unwrap();
-    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
-    assert_eq!(
-        rejection_evidence(&d),
-        vec!["h2".to_string()],
+    assert_eq!(reject_reason(&d), RejectionCode::StaleHead);
+    assert!(
+        rejection_evidence(&d).iter().any(|e| e.contains("h2")),
         "evidence names the head that moved"
     );
     assert_eq!(
@@ -1498,7 +1726,7 @@ fn release_rejects_head_changed_after_judgment() {
         .transact(|tx| tx.work(&work_id))
         .unwrap()
         .expect("work exists");
-    assert_eq!(work.version, 2, "no version bump for the rejection");
+    assert_eq!(work.version, 3, "no version bump for the rejection");
 }
 
 #[test]
@@ -1507,13 +1735,14 @@ fn stale_head_observation_cannot_move_head_backward() {
     let (work_id, _) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("sb1"), NOW).unwrap());
     // A delayed delivery for the older head arrives after the newer one.
-    seed_pr_head(&store, &work_id, "h2", NOW + 10);
-    seed_pr_head(&store, &work_id, "h1", NOW + 5);
+    seed_change(&store, &work_id, "h2", NOW + 10);
+    seed_head(&store, &work_id, "h1", NOW + 5);
+    seal_review(&store, &work_id, "h2", &["f1"]);
 
     let d = handle_command(
         &store,
         &config(),
-        &judge_req("sb2", &work_id, 1, "h2"),
+        &judge_request(&store, "sb2", &work_id, 2, "h2", FindingChoice::Fix),
         NOW + 10,
     )
     .unwrap();
@@ -1522,14 +1751,21 @@ fn stale_head_observation_cannot_move_head_backward() {
     let d = handle_command(
         &store,
         &config(),
-        &judge_req("sb3", &work_id, 2, "h1"),
+        &req(
+            "sb3",
+            CommandBody::JudgeFindings {
+                work_id: work_id.clone(),
+                expected_work_version: 3,
+                expected_head: rev("h1"),
+                decisions: vec![],
+            },
+        ),
         NOW + 15,
     )
     .unwrap();
-    assert_eq!(reject_reason(&d), RejectionCode::StalePrHead);
-    assert_eq!(
-        rejection_evidence(&d),
-        vec!["h2".to_string()],
+    assert_eq!(reject_reason(&d), RejectionCode::StaleHead);
+    assert!(
+        rejection_evidence(&d).iter().any(|e| e.contains("h2")),
         "the delayed h1 observation never becomes the current head"
     );
 }
@@ -1548,6 +1784,7 @@ fn admission_rolls_back_on_request_persistence_failure() {
                 work_id: work_id.clone(),
                 execution_id: e1.clone(),
                 role: InvocationRole::Coding,
+                spec_revision: 1,
                 payload: serde_json::json!({}),
             },
         }],
@@ -1667,7 +1904,7 @@ fn cancel_from_queued_leaves_foreign_claims_alone() {
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("cr4"), NOW).unwrap());
     let work_branch = WriteResource::Branch {
-        repository: "local/repo".into(),
+        repository: repo(),
         branch: format!("work/{}", work_id.0),
     };
     let mut claim = req(
@@ -1712,54 +1949,55 @@ fn cancel_from_queued_leaves_foreign_claims_alone() {
     );
 }
 
-// ---- Converge round 1: admission rechecks the judgment's PR head ----
+// ---- Converge round 1: admission rechecks the judgment's head ----
 
-/// `release_judgment` requeues E1 under the head it verified, but the head
-/// can move while E1 waits in the queue. Dispatch admission must recheck the
-/// recorded judgment against the currently observed head before saving the
-/// Invocation request: a judgment for the old head cannot authorize a worker
-/// on the new head, and the moved-head state pauses for a fresh judgment
-/// without reserving capacity or emitting a request.
+/// `release_judgment` requeues E1 under the target it verified, but the
+/// target can move while E1 waits in the queue. Dispatch admission must
+/// recheck the recorded judgment against the currently derived target
+/// before saving the Invocation request: a judgment on the old round
+/// cannot authorize a worker on the new target, and the moved-target
+/// state pauses for a fresh judgment without reserving capacity or
+/// emitting a request.
 #[test]
 fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("ah1"), NOW).unwrap());
-    seed_pr_head(&store, &work_id, "h1", NOW);
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["f1"]);
 
     // Human-gate cycle: pause, judge on h1, release — E1 requeues under the
-    // judgment bound to h1.
+    // judgment bound to the h1 round.
     force_state(&store, &e1, ExecutionState::Paused);
     accepted(
-        &handle_command(&store, &config(), &judge_req("ah2", &work_id, 1, "h1"), NOW).unwrap(),
+        &handle_command(
+            &store,
+            &config(),
+            &judge_request(&store, "ah2", &work_id, 2, "h1", FindingChoice::Fix),
+            NOW,
+        )
+        .unwrap(),
     );
     accepted(
         &handle_command(
             &store,
             &config(),
-            &req(
-                "ah3",
-                CommandBody::ReleaseJudgment {
-                    work_id: work_id.clone(),
-                    expected_work_version: 2,
-                    expected_pr_head: "h1".into(),
-                },
-            ),
+            &release_request("ah3", &work_id, 3, "h1"),
             NOW,
         )
         .unwrap(),
     );
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
 
-    // The PR head moves while E1 waits in the queue.
-    seed_pr_head(&store, &work_id, "h2", NOW + 10);
+    // The change head moves while E1 waits in the queue.
+    seed_head(&store, &work_id, "h2", NOW + 10);
 
     // Dispatch must not authorize a worker on the stale h1 judgment.
     store
         .transact(|tx| {
             assert!(
                 workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 20)?.is_none(),
-                "a judgment for the old head cannot authorize admission"
+                "a judgment for the old target cannot authorize admission"
             );
             Ok(())
         })
@@ -1768,25 +2006,27 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
     assert_eq!(
         e.state,
         ExecutionState::Paused,
-        "a moved head re-pauses for a fresh judgment"
+        "a moved target re-pauses for a fresh judgment"
     );
-    let reason = e.pause_reason.expect("pause reason recorded");
-    assert!(
-        reason.contains("h1") && reason.contains("h2"),
-        "the pause names both the decided and observed heads, got: {reason}"
+    assert_eq!(
+        e.repair_prerequisites,
+        vec![RepairPrerequisite::OperatorDecision],
+        "the pause is a human-decision repair, not an automatic retry"
     );
     let (slots, requests) = store
         .transact(|tx| Ok((tx.slot_holders()?.len(), tx.pending_requests()?.len())))
         .unwrap();
-    assert_eq!(slots, 0, "the stale-head pause reserves no capacity");
+    assert_eq!(slots, 0, "the stale-target pause reserves no capacity");
     assert_eq!(requests, 0, "no Invocation request is saved");
 
-    // A fresh judgment on h2 releases the gate; admission then proceeds.
+    // A fresh sealed round and judgment on h2 releases the gate; admission
+    // then proceeds.
+    seal_review(&store, &work_id, "h2", &["f2"]);
     accepted(
         &handle_command(
             &store,
             &config(),
-            &judge_req("ah4", &work_id, 3, "h2"),
+            &judge_request(&store, "ah4", &work_id, 5, "h2", FindingChoice::Fix),
             NOW + 30,
         )
         .unwrap(),
@@ -1795,14 +2035,7 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
         &handle_command(
             &store,
             &config(),
-            &req(
-                "ah5",
-                CommandBody::ReleaseJudgment {
-                    work_id: work_id.clone(),
-                    expected_work_version: 4,
-                    expected_pr_head: "h2".into(),
-                },
-            ),
+            &release_request("ah5", &work_id, 6, "h2"),
             NOW + 30,
         )
         .unwrap(),
@@ -1811,7 +2044,7 @@ fn admission_refuses_to_honor_a_judgment_for_a_moved_head() {
         .transact(|tx| {
             assert!(
                 workloop_core::work::admit_queued(tx, &config(), &e1, NOW + 40)?.is_some(),
-                "the current-head judgment admits"
+                "the current-target judgment admits"
             );
             Ok(())
         })
@@ -1859,18 +2092,23 @@ fn recording_an_invocation_consumes_only_its_request() {
     // `execution` records the Invocation before launch — the consumption.
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: Invocation {
-                id: InvocationId("inv-1".into()),
-                request_id: consumed_id.clone(),
-                execution_id: e1.clone(),
-                role: InvocationRole::Coding,
-                state: InvocationState::Prepared,
-                process_identity: None,
-                required_artifacts: vec![],
-                evidence_refs: vec![],
+        &[
+            Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-1".into()),
+                    request_id: consumed_id.clone(),
+                    execution_id: e1.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Prepared,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                },
             },
-        }],
+            Effect::MarkRequestConsumed {
+                request_id: consumed_id.clone(),
+            },
+        ],
     );
     assert!(
         pending_request_ids(&store).is_empty(),
@@ -1923,18 +2161,23 @@ fn recording_an_invocation_without_a_request_row_leaves_pending_alone() {
         .unwrap();
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: Invocation {
-                id: InvocationId("inv-orphan".into()),
-                request_id: format!("{}:inv:ghost", e1.0),
-                execution_id: e1.clone(),
-                role: InvocationRole::Coding,
-                state: InvocationState::Done,
-                process_identity: None,
-                required_artifacts: vec![],
-                evidence_refs: vec![],
+        &[
+            Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-orphan".into()),
+                    request_id: format!("{}:inv:ghost", e1.0),
+                    execution_id: e1.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                },
             },
-        }],
+            Effect::MarkRequestConsumed {
+                request_id: format!("{}:inv:ghost", e1.0),
+            },
+        ],
     );
     assert_eq!(
         pending_request_ids(&store),
@@ -1961,7 +2204,7 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
             CommandBody::ClaimResources { ttl_seconds, .. } => *ttl_seconds += 1,
             CommandBody::ReleaseResources { resources } => {
                 resources.push(WriteResource::Branch {
-                    repository: "local/repo".into(),
+                    repository: repo(),
                     branch: "wip/other".into(),
                 });
             }
@@ -1979,12 +2222,11 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
             } => *expected_work_version = 99,
             CommandBody::Acknowledge { attention_id, .. } => *attention_id = "att-other".into(),
             CommandBody::JudgeFindings { decisions, .. } => decisions.push(FindingDecision {
-                finding_id: "f-other".into(),
+                occurrence_id: "occ-other".into(),
                 choice: FindingChoice::Wait,
+                rationale: None,
             }),
-            CommandBody::ReleaseJudgment {
-                expected_pr_head, ..
-            } => *expected_pr_head = "h2".into(),
+            CommandBody::ReleaseJudgment { expected_head, .. } => *expected_head = rev("h2"),
         }
     }
 
@@ -2115,18 +2357,15 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
         let (work_id, _) = accepted_with_execution(
             &handle_command(&store, &config(), &submit("mx-judge-seed"), NOW).unwrap(),
         );
-        seed_pr_head(&store, &work_id, "h1", NOW);
-        let (original, mutant) = pair(req(
+        seed_change(&store, &work_id, "h1", NOW);
+        seal_review(&store, &work_id, "h1", &["f1"]);
+        let (original, mutant) = pair(judge_request(
+            &store,
             "mx-judge",
-            CommandBody::JudgeFindings {
-                work_id,
-                expected_work_version: 1,
-                expected_pr_head: "h1".into(),
-                decisions: vec![FindingDecision {
-                    finding_id: "f1".into(),
-                    choice: FindingChoice::Fix,
-                }],
-            },
+            &work_id,
+            2,
+            "h1",
+            FindingChoice::Fix,
         ));
         cases.push(("judge_findings", store, original, mutant));
     }
@@ -2136,35 +2375,25 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
             &handle_command(&store, &config(), &submit("mx-rj-seed"), NOW).unwrap(),
         );
         force_state(&store, &e1, ExecutionState::Paused);
-        seed_pr_head(&store, &work_id, "h1", NOW);
+        seed_change(&store, &work_id, "h1", NOW);
+        seal_review(&store, &work_id, "h1", &["f1"]);
         accepted(
             &handle_command(
                 &store,
                 &config(),
-                &req(
+                &judge_request(
+                    &store,
                     "mx-rj-judge",
-                    CommandBody::JudgeFindings {
-                        work_id: work_id.clone(),
-                        expected_work_version: 1,
-                        expected_pr_head: "h1".into(),
-                        decisions: vec![FindingDecision {
-                            finding_id: "f1".into(),
-                            choice: FindingChoice::Accept,
-                        }],
-                    },
+                    &work_id,
+                    2,
+                    "h1",
+                    FindingChoice::Accept,
                 ),
                 NOW,
             )
             .unwrap(),
         );
-        let (original, mutant) = pair(req(
-            "mx-release-judgment",
-            CommandBody::ReleaseJudgment {
-                work_id,
-                expected_work_version: 2,
-                expected_pr_head: "h1".into(),
-            },
-        ));
+        let (original, mutant) = pair(release_request("mx-release-judgment", &work_id, 3, "h1"));
         cases.push(("release_judgment", store, original, mutant));
     }
     assert_eq!(cases.len(), 9, "one case per CommandBody kind");
@@ -2196,7 +2425,7 @@ fn every_command_kind_conflicts_on_a_payload_change_under_the_same_key() {
     }
 }
 
-// ---- PR-head coverage: cancel versions, judgment replay surface,
+// ---- Head coverage: cancel versions, judgment replay surface,
 // launch refusal, and work-scoped completion evidence ----
 
 #[test]
@@ -2317,25 +2546,6 @@ fn judgments_bind_to_the_recorded_head() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, e1) =
         accepted_with_execution(&handle_command(&store, &config(), &submit("j1"), NOW).unwrap());
-    let emit_head = |head: &str| {
-        workloop_core::work::handle_observation(
-            &store,
-            &config(),
-            &Observation {
-                source_event_id: None,
-                subject_work_id: Some(work_id.clone()),
-                subject_execution_id: Some(e1.clone()),
-                fact: ObservationFact::PrHead {
-                    repository: "local/repo".into(),
-                    number: 1,
-                    head_sha: head.into(),
-                },
-                observed_unix_seconds: NOW,
-            },
-            NOW,
-        )
-        .unwrap();
-    };
     let judge = |key: &str, head: &str, version: u64| {
         handle_command(
             &store,
@@ -2345,11 +2555,15 @@ fn judgments_bind_to_the_recorded_head() {
                 CommandBody::JudgeFindings {
                     work_id: work_id.clone(),
                     expected_work_version: version,
-                    expected_pr_head: head.into(),
-                    decisions: vec![FindingDecision {
-                        finding_id: "f1".into(),
-                        choice: FindingChoice::Accept,
-                    }],
+                    expected_head: rev(head),
+                    decisions: occurrence_ids(&store, &work_id)
+                        .into_iter()
+                        .map(|occurrence_id| FindingDecision {
+                            occurrence_id,
+                            choice: FindingChoice::Accept,
+                            rationale: Some("accepted".into()),
+                        })
+                        .collect(),
                 },
             ),
             NOW,
@@ -2360,14 +2574,7 @@ fn judgments_bind_to_the_recorded_head() {
         handle_command(
             &store,
             &config(),
-            &req(
-                key,
-                CommandBody::ReleaseJudgment {
-                    work_id: work_id.clone(),
-                    expected_work_version: version,
-                    expected_pr_head: head.into(),
-                },
-            ),
+            &release_request(key, &work_id, version, head),
             NOW,
         )
         .unwrap()
@@ -2378,30 +2585,33 @@ fn judgments_bind_to_the_recorded_head() {
         reject_reason(&judge("j2", "sha-x", 1)),
         RejectionCode::SourceUnavailable
     );
-    emit_head("sha-x");
+    seed_change(&store, &work_id, "sha-x", NOW);
     // A judgment for a different head than the recorded one is stale.
     assert_eq!(
         reject_reason(&judge("j3", "sha-old", 1)),
-        RejectionCode::StalePrHead
+        RejectionCode::StaleHead
     );
-    // The current-head judgment is recorded.
-    accepted(&judge("j4", "sha-x", 1));
+    // The current-head judgment is recorded against the sealed round.
+    seal_review(&store, &work_id, "sha-x", &["f1"]);
+    accepted(&judge("j4", "sha-x", 2));
     force_state(&store, &e1, ExecutionState::Paused);
     // The head moved under the recorded judgment: releasing it is stale.
-    emit_head("sha-y");
+    seed_head(&store, &work_id, "sha-y", NOW + 10);
     assert_eq!(
-        reject_reason(&release("j5", "sha-x", 2)),
-        RejectionCode::StalePrHead
+        reject_reason(&release("j5", "sha-x", 3)),
+        RejectionCode::StaleHead
     );
-    // The new head has no recorded judgment — the recorded judgment is for
-    // the old head, so the gate stays shut as stale.
+    // The new head has no sealed round yet — the recorded round is for the
+    // old target, so the gate stays shut as stale.
     assert_eq!(
-        reject_reason(&release("j6", "sha-y", 2)),
-        RejectionCode::StalePrHead
+        reject_reason(&release("j6", "sha-y", 3)),
+        RejectionCode::StaleHead
     );
-    // A judgment on the current head lets release requeue the Execution.
-    accepted(&judge("j7", "sha-y", 2));
-    accepted(&release("j8", "sha-y", 3));
+    // A sealed round and judgment on the current head lets release
+    // requeue the Execution.
+    seal_review(&store, &work_id, "sha-y", &["f2"]);
+    accepted(&judge("j7", "sha-y", 4));
+    accepted(&release("j8", "sha-y", 5));
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Queued);
 }
 #[test]
@@ -2531,7 +2741,7 @@ fn launch_refused(store: &SqliteStore, eid: &ExecutionId, invocation_id: &Invoca
         store,
         &config(),
         &Observation {
-            source_event_id: None,
+            delivery: None,
             subject_work_id: None,
             subject_execution_id: Some(eid.clone()),
             fact: ObservationFact::LaunchRefused {
@@ -2670,24 +2880,72 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
     force_state(&store, &e1, ExecutionState::Waiting);
     let mut invocation = recorded_invocation(&e1, "sc1-coding");
     invocation.state = InvocationState::Done;
-    apply_effects(&store, &[Effect::InsertInvocation { invocation }]);
-    // Completion requires the applied publish intent for the Work.
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
     apply_effects(
         &store,
-        &[Effect::InsertPrActionIntent {
-            intent: PrActionIntent {
-                action_id: "act-sc1".into(),
-                work_id: w.clone(),
-                repository: "local/repo".into(),
-                action: PrAction::PublishPr {
-                    branch: format!("work/{}", w.0),
-                    title: "sc1".into(),
-                    body: String::new(),
+        &[
+            Effect::InsertInvocation { invocation },
+            // The artifact evidence for the required artifact.
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("sc1-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Present {
+                            digest: "artifact-digest".into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
                 },
-                status: PrActionStatus::Applied,
             },
-        }],
+        ],
     );
+    // Completion requires the applied publish intents for the Work.
+    for (action_id, action) in [
+        (
+            "act-sc1-push",
+            HostAction::PushRef {
+                branch: format!("work/{}", w.0),
+                produced: rev("artifact-digest"),
+            },
+        ),
+        (
+            "act-sc1-open",
+            HostAction::OpenChangeRequest {
+                source_branch: format!("work/{}", w.0),
+                target_branch: "main".into(),
+                title: "sc1".into(),
+                body: String::new(),
+            },
+        ),
+    ] {
+        apply_effects(
+            &store,
+            &[Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: action_id.into(),
+                    work_id: w.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action,
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq: 0,
+                },
+            }],
+        );
+    }
     // A delivery that names only the Work: the fact type makes the
     // execution subject optional, and it must still be assessed.
     let emit = |fact: ObservationFact| {
@@ -2695,7 +2953,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             &store,
             &config(),
             &Observation {
-                source_event_id: None,
+                delivery: None,
                 subject_work_id: Some(w.clone()),
                 subject_execution_id: None,
                 fact,
@@ -2705,14 +2963,26 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         )
         .unwrap();
     };
-    emit(ObservationFact::PrHead {
-        repository: "local/repo".into(),
-        number: 1,
-        head_sha: "sha-1".into(),
+    emit(ObservationFact::HostActionResult {
+        action_id: "act-sc1-open".into(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::ChangeOpened {
+            change: change(),
+            head: rev("sha-1"),
+            source_branch: format!("work/{}", w.0),
+            target_branch: "main".into(),
+        }],
     });
-    emit(ObservationFact::PrChecks {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
+    emit(ObservationFact::ChangeHead {
+        change: change(),
+        head: rev("sha-1"),
+    });
+    emit(ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: "ci".into(),
+        producer: publisher(),
         conclusion: CheckConclusion::Success,
     });
     assert_eq!(
@@ -2720,17 +2990,33 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         ExecutionState::Waiting,
         "checks alone are not completion evidence"
     );
-    emit(ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
-        reviewer: "rev".into(),
-        verdict: ReviewVerdict::Approve,
+    emit(ObservationFact::Review {
+        target: target("sha-1"),
+        source: "rev".into(),
+        source_revision: None,
+        completeness: Completeness::Complete,
+        occurrences: vec![],
+    });
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "the invariant lane still needs a positive assessment"
+    );
+    emit(ObservationFact::Assessment {
+        target: target("sha-1"),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Positive,
+            refs: vec![],
+        }],
     });
     let e = read_execution(&store, &e1);
     assert_eq!(
         e.state,
         ExecutionState::Succeeded,
-        "work-scoped check + review evidence completes the Work"
+        "work-scoped check + review + assessment evidence completes the Work"
     );
     let outcome = e.outcome.expect("completion records an outcome");
     assert_eq!(outcome.code.as_deref(), Some("succeeded"));
@@ -2743,18 +3029,21 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         outcome.detail
     );
     // Further work-scoped deliveries against the terminal Work are inert.
-    emit(ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
-        reviewer: "rev2".into(),
-        verdict: ReviewVerdict::Approve,
+    emit(ObservationFact::Assessment {
+        target: target("sha-1"),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Positive,
+            refs: vec![],
+        }],
     });
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
 }
 
 #[test]
 fn completion_requires_artifacts_publication_and_resolved_writers() {
-    use workloop_core::observation::{ArtifactFact, ArtifactFact::Present};
     for scenario in [
         "no_coding",
         "missing",
@@ -2777,21 +3066,27 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                     } else {
                         InvocationState::Done
                     };
-                    invocation.required_artifacts = vec!["artifact.json".into()];
+                    invocation.required_artifacts = vec![RequiredArtifact {
+                        kind: "artifact.json".into(),
+                        path: "artifact.json".into(),
+                        expected_digest: None,
+                    }];
                     tx.apply(&Effect::InsertInvocation { invocation })?;
                     if scenario != "missing" {
                         tx.apply(&Effect::InsertObservation {
                             observation: Observation {
-                                source_event_id: None,
+                                delivery: None,
                                 subject_work_id: Some(w.clone()),
                                 subject_execution_id: Some(eid.clone()),
                                 fact: ObservationFact::Artifact {
                                     invocation_id: InvocationId("coding".into()),
                                     required_artifact: "artifact.json".into(),
                                     state: if scenario == "corrupt" {
-                                        ArtifactFact::Corrupt
+                                        ArtifactFact::Corrupt { reason: None }
                                     } else {
-                                        Present
+                                        ArtifactFact::Present {
+                                            digest: "artifact-digest".into(),
+                                        }
                                     },
                                 },
                                 observed_unix_seconds: NOW,
@@ -2799,44 +3094,84 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                         })?;
                     }
                 }
-                tx.apply(&Effect::InsertPrActionIntent {
-                    intent: PrActionIntent {
-                        action_id: "publish".into(),
-                        work_id: w.clone(),
-                        repository: "local/repo".into(),
-                        action: PrAction::PublishPr {
+                for (action_id, action, status) in [
+                    (
+                        "act-push",
+                        HostAction::PushRef {
                             branch: format!("work/{}", w.0),
+                            produced: rev("artifact-digest"),
+                        },
+                        HostActionStatus::Applied,
+                    ),
+                    (
+                        "act-open",
+                        HostAction::OpenChangeRequest {
+                            source_branch: format!("work/{}", w.0),
+                            target_branch: "main".into(),
                             title: "change".into(),
                             body: String::new(),
                         },
-                        status: if scenario == "unpublished" {
-                            PrActionStatus::Failed
+                        if scenario == "unpublished" {
+                            HostActionStatus::Failed {
+                                reason: "declined".into(),
+                            }
                         } else {
-                            PrActionStatus::Applied
+                            HostActionStatus::Applied
                         },
-                    },
-                })
+                    ),
+                ] {
+                    tx.apply(&Effect::InsertHostActionIntent {
+                        intent: HostActionIntent {
+                            action_id: action_id.into(),
+                            work_id: w.clone(),
+                            host: host(),
+                            repository: repo(),
+                            role: ActorRole::Publication,
+                            actor: publisher(),
+                            action,
+                            payload_digest: "test".into(),
+                            status,
+                            authenticated_actor: None,
+                            effects: vec![],
+                            created_seq: 0,
+                        },
+                    })?;
+                }
+                Ok(())
             })
             .unwrap();
-        seed_pr_head(&store, &w, "head", NOW);
+        seed_change(&store, &w, "head", NOW);
         for fact in [
-            ObservationFact::PrChecks {
-                repository: "local/repo".into(),
-                head_sha: "head".into(),
+            ObservationFact::Check {
+                change: change(),
+                head: rev("head"),
+                check_id: "ci".into(),
+                producer: publisher(),
                 conclusion: CheckConclusion::Success,
             },
-            ObservationFact::PrReview {
-                repository: "local/repo".into(),
-                head_sha: "head".into(),
-                reviewer: "reviewer".into(),
-                verdict: ReviewVerdict::Approve,
+            ObservationFact::Review {
+                target: target("head"),
+                source: "reviewer".into(),
+                source_revision: None,
+                completeness: Completeness::Complete,
+                occurrences: vec![],
+            },
+            ObservationFact::Assessment {
+                target: target("head"),
+                set_digest: "invariants".into(),
+                complete: true,
+                items: vec![AssessmentItem {
+                    id: "inv-1".into(),
+                    verdict: AssessmentVerdict::Positive,
+                    refs: vec![],
+                }],
             },
         ] {
             workloop_core::work::handle_observation(
                 &store,
                 &config(),
                 &Observation {
-                    source_event_id: None,
+                    delivery: None,
                     subject_work_id: Some(w.clone()),
                     subject_execution_id: None,
                     fact,
@@ -2905,16 +3240,1144 @@ fn dispatch_state_conflict_defers_only_the_conflicted_execution() {
         })
         .unwrap();
     connection
-        .execute_batch("DROP TRIGGER refuse_first_admission")
+        .execute_batch("DROP TRIGGER refuse_first_admission;")
         .unwrap();
-    assert_eq!(
-        store
-            .transact(|tx| dispatch_once(tx, &config(), NOW + 1))
-            .unwrap(),
-        vec![first.clone()]
+}
+
+fn temp_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "workloop-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// Regression (acceptance): a target-branch-only move makes the sealed
+/// round's recorded target stale — the head did not move, the diff
+/// target did, and a judgment against the old set is refused.
+#[test]
+fn target_branch_move_stales_the_sealed_round() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("k-target-move"), NOW).unwrap(),
     );
-    assert_eq!(read_execution(&store, &first).state, ExecutionState::Ready);
-    drop(connection);
-    drop(store);
-    std::fs::remove_dir_all(root).unwrap();
+    seed_change(&store, &work_id, "h1", NOW);
+    seal_review(&store, &work_id, "h1", &["a"]);
+    // The target branch advances under an unchanged head.
+    apply_effects(
+        &store,
+        &[Effect::InsertObservation {
+            observation: Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::BranchState {
+                    repository: repo(),
+                    branch: "main".into(),
+                    state: BranchState::At {
+                        revision: rev("main-2"),
+                    },
+                },
+                observed_unix_seconds: NOW + 1,
+            },
+        }],
+    );
+    let decision = handle_command(
+        &store,
+        &config(),
+        &judge_request(&store, "j-tm", &work_id, 2, "h1", FindingChoice::Fix),
+        NOW + 2,
+    )
+    .unwrap();
+    assert_eq!(
+        reject_reason(&decision),
+        RejectionCode::StaleHead,
+        "a target-branch move stales the round's recorded target"
+    );
+}
+
+/// Regression (acceptance): a `ChangeOpened` receipt for a different
+/// repository is never adopted as the Work's change — repository
+/// identity, not receipt shape, binds a change to the Work.
+#[test]
+fn foreign_repository_receipt_is_not_the_works_target() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("k-foreign"), NOW).unwrap(),
+    );
+    let foreign_repo = RepositoryRef::new(host(), RepositoryId::trusted("other-repo"));
+    let foreign_change = ChangeRequestRef {
+        repository: foreign_repo.clone(),
+        change_request: ChangeRequestId::trusted("cr-9"),
+        display_number: Some(9),
+    };
+    let foreign_head = CommitRevision::new(foreign_repo, "f-head").expect("valid revision");
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::HostActionResult {
+                        action_id: "act-foreign".into(),
+                        authenticated_actor: Some(publisher()),
+                        status: HostActionStatus::Applied,
+                        effects: vec![NormalizedEffectFact::ChangeOpened {
+                            change: foreign_change.clone(),
+                            head: foreign_head.clone(),
+                            source_branch: "work/other".into(),
+                            target_branch: "main".into(),
+                        }],
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::ChangeHead {
+                        change: foreign_change,
+                        head: foreign_head,
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    let decision = handle_command(
+        &store,
+        &config(),
+        &judge_request(&store, "j-f", &work_id, 1, "f-head", FindingChoice::Fix),
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        reject_reason(&decision),
+        RejectionCode::SourceUnavailable,
+        "a foreign-repository change is never the Work's target"
+    );
+}
+
+/// Regression (acceptance): archive/new-store cutover — a pre-v1 file
+/// that already carries user tables is refused, never upgraded in
+/// place; the operator archives it and starts a new store.
+#[test]
+fn unversioned_store_file_is_archive_only() {
+    let root = temp_root("cutover-legacy");
+    let db = root.join("store.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE legacy_rows (id TEXT);")
+            .unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("archive"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
+    }
+    // The refusal must not mutate the archive: journal mode stays the
+    // file's own and no WAL sidecars appear.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "a refused archive must not be re-journaled");
+    }
+    assert!(
+        !db.with_extension("db-wal").exists() && !db.with_extension("db-shm").exists(),
+        "a refused open must not leave WAL sidecars"
+    );
+}
+
+/// Regression (acceptance): a store file stamped with a newer format
+/// version is refused rather than read leniently.
+#[test]
+fn a_newer_store_format_is_refused() {
+    let root = temp_root("cutover-newer");
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", 99i64).unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("99"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
+    }
+}
+
+/// Regression (acceptance): new-format records survive a reopen — the
+/// durable Work row, the recorded decision, and the idempotent replay
+/// are all intact on a fresh handle.
+#[test]
+fn reopened_store_round_trips_new_format_records() {
+    let root = temp_root("reopen-integrity");
+    let db = root.join("store.db");
+    let request = submit("k-reopen");
+    let (work_id, execution_id) = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
+    };
+    let store = SqliteStore::open(&db, 1).unwrap();
+    // The same submission replays the recorded decision — no new Work,
+    // no new Execution, no version bump.
+    let replayed = handle_command(&store, &config(), &request, NOW + 10).unwrap();
+    let (replayed_work, replayed_execution) = accepted_with_execution(&replayed);
+    assert_eq!(replayed_work, work_id);
+    assert_eq!(replayed_execution, execution_id);
+    store
+        .transact(|tx| {
+            let work = tx.work(&work_id)?.expect("work row survives reopen");
+            assert_eq!(work.version, 1);
+            assert_eq!(work.binding.repository, repo());
+            assert!(tx.spec(&work_id, None)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn issue(number: u64) -> IssueRef {
+    IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted(format!("issue-{number}")),
+        display_number: Some(number),
+    }
+}
+
+fn submit_with_sources(key: &str, sources: Vec<SourceSnapshot>) -> CommandRequest {
+    req(
+        key,
+        CommandBody::Submit {
+            intent: "do the thing".into(),
+            sources,
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    )
+}
+
+fn config_with_issue_read() -> WorkloopConfig {
+    let mut c = config();
+    c.declared_capabilities.insert(HostCapability::IssueRead);
+    c
+}
+
+/// Regression: a `DeliveryScope::Local` delivery has no host column, and
+/// a NULL key dedupes nothing under SQLite UNIQUE semantics — the
+/// dedupe index must still collapse a repeated (scope, source,
+/// event_id) delivery.
+#[test]
+fn repeated_local_delivery_is_deduplicated() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let obs = |event_id: &str| Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: event_id.into(),
+        }),
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::ChangeHead {
+            change: change(),
+            head: rev("h-1"),
+        },
+        observed_unix_seconds: NOW,
+    };
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-1"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-1"), NOW).unwrap(),
+        IngestReceipt::Duplicate,
+        "the identical local delivery must dedupe, not insert twice"
+    );
+    // A different event id under the same scope and source is new data.
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("ev-2"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+}
+
+/// Regression: a delivery that reuses (scope, source, event_id) with a
+/// different fact is a producer conflict — rejected and visible, never
+/// folded into the recorded row the way a replay is.
+#[test]
+fn delivery_conflict_with_different_content_is_rejected() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let obs = |head: &str| Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: "ev-conflict".into(),
+        }),
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::ChangeHead {
+            change: change(),
+            head: rev(head),
+        },
+        observed_unix_seconds: NOW,
+    };
+    assert_eq!(
+        workloop_core::work::handle_observation(&store, &config(), &obs("h-1"), NOW).unwrap(),
+        IngestReceipt::Recorded
+    );
+    match workloop_core::work::handle_observation(&store, &config(), &obs("h-2"), NOW).unwrap() {
+        IngestReceipt::Rejected(_) => {}
+        other => panic!("expected Rejected for conflicting content, got {other:?}"),
+    }
+    // The recorded row is still the first fact — nothing was folded in.
+    store
+        .transact(|tx| {
+            let obs = tx.all_observations()?;
+            assert_eq!(obs.len(), 1);
+            assert!(
+                matches!(&obs[0].fact, ObservationFact::ChangeHead { head, .. }
+                    if head == &rev("h-1")),
+                "stored fact: {:?}",
+                obs[0].fact
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression (source gate): an unverified source defers admission, a
+/// matching authoritative read unblocks it, and a changed read pauses
+/// the Execution for repair — dispatch never runs on `NeedsCheck` or
+/// `Changed` sources.
+#[test]
+fn source_gate_defers_admits_and_pauses_on_change() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = SourceSnapshot {
+        issue: issue(9),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let d = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-gate", vec![source]),
+        NOW,
+    )
+    .unwrap();
+    let (work_id, eid) = accepted_with_execution(&d);
+    // NeedsCheck: dispatch owes a source read and defers admission.
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(
+                tx.execution(&eid)?.unwrap().state,
+                ExecutionState::Queued,
+                "unverified source holds admission"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let read = |revision: &str, digest: &str, state: IssueState| Observation {
+        delivery: None,
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: None,
+        fact: ObservationFact::Issue {
+            issue: issue(9),
+            source_revision: revision.into(),
+            content_digest: digest.into(),
+            state,
+        },
+        observed_unix_seconds: NOW,
+    };
+    // A matching read resolves the gate to Matches; dispatch admits.
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &read("rev-1", "digest-1", IssueState::Open),
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(tx.execution(&eid)?.unwrap().state, ExecutionState::Ready);
+            Ok(())
+        })
+        .unwrap();
+    // A later read showing changed content stops the live writer for
+    // repair — a live Execution never runs on a stale spec, and the pause
+    // lands only after writer-stop proof (lifecycle.md).
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &read("rev-2", "digest-2", IssueState::Open),
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| {
+            let e = tx.execution(&eid)?.unwrap();
+            assert_eq!(
+                e.state,
+                ExecutionState::Stopping,
+                "an active Execution stops the writer before pausing"
+            );
+            assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+            assert_eq!(
+                e.repair_prerequisites,
+                vec![RepairPrerequisite::SpecReapproval]
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Writer-stop proof settles the Execution to paused, releasing the
+    // slot while keeping the recorded continuation.
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId("inv-gate".into()),
+                process_identity: "1@1".into(),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| {
+            let e = tx.execution(&eid)?.unwrap();
+            assert_eq!(e.state, ExecutionState::Paused);
+            assert_eq!(
+                e.repair_prerequisites,
+                vec![RepairPrerequisite::SpecReapproval]
+            );
+            assert!(
+                e.pause_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("source changed")),
+                "the recorded repair reason survives the settle"
+            );
+            assert!(e.paused_since_unix_seconds.is_some());
+            assert!(e.desired_action.is_none());
+            assert_eq!(
+                tx.slot_holders()?.len(),
+                0,
+                "the slot is released once writer safety is proven"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression (acceptance): a capability the installation never
+/// declared can never be satisfied — submit rejects, never degrades
+/// the requirement.
+#[test]
+fn missing_declared_capability_rejects_submit() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut c = config();
+    c.declared_capabilities
+        .remove(&HostCapability::ReviewFindingsRead);
+    let d = handle_command(&store, &c, &submit("k-cap"), NOW).unwrap();
+    assert_eq!(reject_reason(&d), RejectionCode::UnsupportedCapability);
+}
+
+/// Regression (acceptance): one Work owns a scoped source issue — a
+/// second submission overlapping a live claim is refused and names the
+/// owning Work.
+#[test]
+fn claimed_source_issue_rejects_the_overlap() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = |n: u64| SourceSnapshot {
+        issue: issue(n),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let first = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-own", vec![source(7)]),
+        NOW,
+    )
+    .unwrap();
+    let (owner, _) = accepted_with_execution(&first);
+    let second = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-overlap", vec![source(7)]),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(reject_reason(&second), RejectionCode::Ineligible);
+    match &second {
+        CommandDecision::Rejected {
+            current_work_id,
+            evidence,
+            ..
+        } => {
+            assert_eq!(current_work_id.as_ref(), Some(&owner));
+            assert!(evidence.iter().any(|e| e.contains(&owner.0)));
+        }
+        _ => unreachable!(),
+    }
+    // The display number never participates in identity: naming the
+    // same repository/issue id with a different or absent display number
+    // still hits the existing claim.
+    for (key, display) in [
+        ("k-overlap-renumbered", Some(99)),
+        ("k-overlap-nodisplay", None),
+    ] {
+        let renamed = SourceSnapshot {
+            issue: IssueRef {
+                repository: repo(),
+                issue: IssueId::trusted("issue-7"),
+                display_number: display,
+            },
+            source_revision: "rev-1".into(),
+            content_digest: "digest-1".into(),
+        };
+        let d = handle_command(
+            &store,
+            &config_with_issue_read(),
+            &submit_with_sources(key, vec![renamed]),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            reject_reason(&d),
+            RejectionCode::Ineligible,
+            "display_number {display:?} must not bypass the claim"
+        );
+    }
+    // A different issue on the same repository is a distinct identity —
+    // it submits cleanly.
+    accepted(
+        &handle_command(
+            &store,
+            &config_with_issue_read(),
+            &submit_with_sources("k-other", vec![source(8)]),
+            NOW,
+        )
+        .unwrap(),
+    );
+}
+
+/// Regression: the publish chain advances on the receipt alone — an
+/// applied `push_ref` receipt records the `open_change_request` intent
+/// without the supervisor re-emitting artifact or process evidence.
+#[test]
+fn an_applied_push_receipt_records_the_next_stage_intent() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pc1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pc1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    // Evidence lands: the stage-1 push intent is recorded.
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    let push_id = store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let push = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+                .expect("stage-1 push intent recorded");
+            assert_eq!(push.status, HostActionStatus::Pending);
+            assert!(
+                !intents
+                    .iter()
+                    .any(|i| matches!(i.action, HostAction::OpenChangeRequest { .. })),
+                "no open intent before the push lands"
+            );
+            Ok(push.action_id.clone())
+        })
+        .unwrap();
+    // The applied receipt alone advances the chain to stage 2.
+    emit(ObservationFact::HostActionResult {
+        action_id: push_id,
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::RefPublished {
+            repository: repo(),
+            branch: format!("work/{}", w.0),
+            produced: rev("artifact-digest"),
+            observed: rev("artifact-digest"),
+            relation: RefRelation::Equal,
+        }],
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let open = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::OpenChangeRequest { .. }))
+                .expect("the receipt recorded the open intent");
+            assert_eq!(open.status, HostActionStatus::Pending);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: the equivalent-failure streak signs the whole failing set.
+/// Two failing required checks must still reach the limit — signing each
+/// check separately would alternate the signature and never pause.
+#[test]
+fn equivalent_failures_pause_on_the_failing_set() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut c = config();
+    c.required_checks = vec!["ci".into(), "lint".into()];
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &c, &submit("ef1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.equivalent_failure_limit = 2;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "ef1-coding");
+    invocation.state = InvocationState::Done;
+    apply_effects(&store, &[Effect::InsertInvocation { invocation }]);
+    seed_change(&store, &w, "sha-1", NOW);
+    let check = |check_id: &str, producer: &str| ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: check_id.into(),
+        producer: HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted(producer),
+        },
+        conclusion: CheckConclusion::Failure,
+    };
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &c,
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(check("ci", "ci-agent"));
+    emit(check("lint", "ci-agent"));
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "one pass under the limit only counts the streak"
+    );
+    emit(check("ci", "ci-agent-2"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Stopping,
+        "the failing set recurring reaches the limit; the writer stops first"
+    );
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+    // Writer-stop proof settles the pause and releases the slot.
+    emit(ObservationFact::ProcessState {
+        invocation_id: InvocationId("ef1-coding".into()),
+        process_identity: "1@1".into(),
+        state: ProcessStateFact::Exited,
+    });
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.repair_prerequisites,
+        vec![RepairPrerequisite::OperatorDecision]
+    );
+}
+
+/// Regression: `display_number` is presentation metadata — a source read
+/// that omits or renumbers it still identifies the same issue and
+/// resolves the gate.
+#[test]
+fn source_read_matches_regardless_of_display_number() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = SourceSnapshot {
+        issue: issue(9),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let d = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-disp", vec![source]),
+        NOW,
+    )
+    .unwrap();
+    let (work_id, eid) = accepted_with_execution(&d);
+    let mut renumbered = issue(9);
+    renumbered.display_number = None;
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::Issue {
+                issue: renumbered,
+                source_revision: "rev-1".into(),
+                content_digest: "digest-1".into(),
+                state: IssueState::Open,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(
+                tx.execution(&eid)?.unwrap().state,
+                ExecutionState::Ready,
+                "an absent display_number still identifies the declared issue"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a verified open is a receipt whose action_id names a
+/// recorded intent reconciled to `applied`. A receipt carrying
+/// `ChangeOpened` under an unrecorded or failed action is an attempt,
+/// never a diff target.
+#[test]
+fn unverified_open_receipt_cannot_create_a_diff_target() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uv1"), NOW).unwrap());
+    // A receipt naming no recorded intent — fabricated evidence.
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-fabricated".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("sha-fab"),
+                    source_branch: format!("work/{}", w.0),
+                    target_branch: "main".into(),
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    // A receipt naming an intent that reconciled to failed.
+    store
+        .transact(|tx| {
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-failed".into(),
+                    work_id: w.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", w.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Failed {
+                        reason: "declined".into(),
+                    },
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-failed".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("sha-fab2"),
+                    source_branch: format!("work/{}", w.0),
+                    target_branch: "main".into(),
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let value = store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &w, NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = value else {
+        panic!("expected found")
+    };
+    assert!(
+        value.current_change.is_none(),
+        "unverified receipts never establish the diff target"
+    );
+    store
+        .transact(|tx| {
+            let failed = tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == "act-failed")
+                .unwrap();
+            assert!(
+                matches!(failed.status, HostActionStatus::Failed { .. }),
+                "a late applied claim cannot resurrect a failed intent"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a failed push re-issues while retries remain, and the
+/// applied retry — not the oldest intent — advances the chain to
+/// `open_change_request` without recording a third push.
+#[test]
+fn an_applied_push_retry_advances_the_chain() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pr1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_max_retries = 3;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pr1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    let pushes = |store: &SqliteStore| {
+        store
+            .transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+    };
+    assert_eq!(pushes(&store).len(), 1);
+    // First push fails definitively: the receipt re-issues a retry.
+    emit(ObservationFact::HostActionResult {
+        action_id: pushes(&store)[0].action_id.clone(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Failed {
+            reason: "declined".into(),
+        },
+        effects: vec![],
+    });
+    let retry = pushes(&store);
+    assert_eq!(retry.len(), 2, "the failed push re-issues under the bound");
+    // The retry's applied receipt advances the chain — the old failed
+    // intent must not pin stage 1 open forever.
+    emit(ObservationFact::HostActionResult {
+        action_id: retry[1].action_id.clone(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::RefPublished {
+            repository: repo(),
+            branch: format!("work/{}", w.0),
+            produced: rev("artifact-digest"),
+            observed: rev("artifact-digest"),
+            relation: RefRelation::Equal,
+        }],
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            assert_eq!(
+                intents
+                    .iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .count(),
+                2,
+                "no third push once the retry landed"
+            );
+            let open = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::OpenChangeRequest { .. }))
+                .expect("the applied retry records the open intent");
+            assert_eq!(open.status, HostActionStatus::Pending);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a `ChangeOpened` effect riding along on a NON-open
+/// receipt (e.g. a verified push) cannot establish the diff target —
+/// adoption requires an applied `open_change_request` intent whose
+/// immutable payload the effect matches.
+#[test]
+fn a_smuggled_open_effect_in_a_push_receipt_creates_no_diff_target() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sm1"), NOW).unwrap());
+    apply_effects(
+        &store,
+        &[Effect::InsertHostActionIntent {
+            intent: HostActionIntent {
+                action_id: "act-smuggle".into(),
+                work_id: w.clone(),
+                host: host(),
+                repository: repo(),
+                role: ActorRole::Publication,
+                actor: publisher(),
+                action: HostAction::PushRef {
+                    branch: format!("work/{}", w.0),
+                    produced: rev("artifact-digest"),
+                },
+                payload_digest: "test".into(),
+                status: HostActionStatus::Pending,
+                authenticated_actor: None,
+                effects: vec![],
+                created_seq: 0,
+            },
+        }],
+    );
+    // The receipt legitimately verifies the push — and smuggles a
+    // fully-formed ChangeOpened alongside it.
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-smuggle".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![
+                    NormalizedEffectFact::RefPublished {
+                        repository: repo(),
+                        branch: format!("work/{}", w.0),
+                        produced: rev("artifact-digest"),
+                        observed: rev("artifact-digest"),
+                        relation: RefRelation::Equal,
+                    },
+                    NormalizedEffectFact::ChangeOpened {
+                        change: change(),
+                        head: rev("h-smuggled"),
+                        source_branch: format!("work/{}", w.0),
+                        target_branch: "main".into(),
+                    },
+                ],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let value = store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &w, NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = value else {
+        panic!("expected found")
+    };
+    assert!(
+        value.current_change.is_none(),
+        "a non-open receipt's ChangeOpened must not establish the diff target"
+    );
+    // The push itself still reconciled applied — only the smuggled
+    // effect is inadmissible.
+    store
+        .transact(|tx| {
+            let push = tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == "act-smuggle")
+                .unwrap();
+            assert_eq!(push.status, HostActionStatus::Applied);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a store file stamped with the CURRENT format version but
+/// holding a foreign schema is refused before any mutating pragma — the
+/// version stamp alone is not proof of the recognized schema.
+#[test]
+fn a_versioned_file_without_the_recognized_schema_is_refused() {
+    let root = temp_root("cutover-foreign-v1");
+    let db = root.join("store.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE foreign_rows (id TEXT);")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("schema"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
+    }
+    // The refusal must not mutate the foreign file: journal mode stays
+    // the file's own and no WAL sidecars appear.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "a refused v1 file must not be re-journaled");
+    }
+    assert!(
+        !db.with_extension("db-wal").exists() && !db.with_extension("db-shm").exists(),
+        "a refused open must not leave WAL sidecars"
+    );
 }

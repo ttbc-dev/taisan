@@ -125,9 +125,17 @@ fn deferred_read_does_not_wait_on_write_lock() {
 /// an immediate transaction would spend waiting on the lock.
 #[test]
 fn preview_fails_fast_under_held_write_lock() {
+    use std::collections::BTreeSet;
+
     use workloop_core::command::{CommandBody, CommandRequest};
-    use workloop_core::domain::{Actor, ActorKind, AllowedEffects, ExecutionBudget, Origin};
-    use workloop_core::work::{WorkloopConfig, preview};
+    use workloop_core::domain::{
+        Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, Origin, WorkPolicy,
+    };
+    use workloop_core::identity::{
+        ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId,
+        RepositoryId, RepositoryRef, RoleBinding,
+    };
+    use workloop_core::work::{HostTemplate, WorkloopConfig, preview};
 
     let root = std::env::temp_dir().join(format!(
         "workloop-store-preview-busy-{}",
@@ -152,14 +160,38 @@ fn preview_fails_fast_under_held_write_lock() {
     });
     ready_rx.recv().unwrap();
 
+    let host = HostInstanceId::trusted("test-host");
     let config = WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: RepositoryRef::new(host.clone(), RepositoryId::trusted("local-repo")),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host,
+                    actor: HostActorId::trusted("pub-agent"),
+                },
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: false,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     };
     // `Submit` allocates sequence and IDs inside the pass — the first
     // write the deferred transaction attempts cannot upgrade while A
@@ -173,7 +205,7 @@ fn preview_fails_fast_under_held_write_lock() {
         idempotency_key: "pv-busy".into(),
         body: CommandBody::Submit {
             intent: "intent".into(),
-            issue_refs: vec![],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },

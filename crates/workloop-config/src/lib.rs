@@ -4,13 +4,20 @@
 //! TUI can never drift on the file they must agree on — whichever
 //! adapter creates it, the other adopts it.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use workloop_core::domain::{Actor, ActorKind, AllowedEffects, ExecutionBudget};
-use workloop_core::work::WorkloopConfig;
+use workloop_core::domain::{
+    Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy,
+};
+use workloop_core::identity::{
+    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
+    RepositoryRef, RoleBinding,
+};
+use workloop_core::work::{HostTemplate, WorkloopConfig};
 
 /// The on-disk installation record. Fields an adapter does not use
 /// pass through untouched, so a file either adapter wrote stays valid
@@ -19,8 +26,29 @@ use workloop_core::work::WorkloopConfig;
 pub struct Installation {
     pub actor_id: String,
     pub actor_kind: String,
+    /// The bound host instance id (opaque; never a display alias).
+    #[serde(default = "default_host_instance")]
+    pub host_instance: String,
+    /// The bound repository's stable opaque id.
     #[serde(default = "default_repository")]
     pub repository: String,
+    /// The host adapter identity (e.g. `github`).
+    #[serde(default = "default_adapter")]
+    pub adapter: String,
+    /// The adapter contract version this installation speaks.
+    #[serde(default)]
+    pub contract_version: u32,
+    /// Capabilities this installation declares as supported and
+    /// authorized for its bound actors.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Host actors bound per role; `publication` is required for any
+    /// publishable Work.
+    #[serde(default)]
+    pub host_actors: std::collections::BTreeMap<String, String>,
+    /// Named host checks the completion gate requires.
+    #[serde(default)]
+    pub required_checks: Vec<String>,
     #[serde(default = "default_capacity")]
     pub capacity: u32,
     #[serde(default)]
@@ -31,10 +59,20 @@ pub struct Installation {
     pub allowed_effects: Option<AllowedEffects>,
     #[serde(default)]
     pub budget: Option<ExecutionBudget>,
+    #[serde(default)]
+    pub lanes: Option<LanePolicy>,
+    #[serde(default)]
+    pub policy: Option<WorkPolicy>,
 }
 
+fn default_host_instance() -> String {
+    "host-local".into()
+}
 fn default_repository() -> String {
-    "local/repo".into()
+    "local-repo".into()
+}
+fn default_adapter() -> String {
+    "fixture".into()
 }
 fn default_capacity() -> u32 {
     1
@@ -233,12 +271,39 @@ fn load_or_create_with(
     let installation = Installation {
         actor_id: format!("actor-{}", uuidish()),
         actor_kind: "human".into(),
+        host_instance: default_host_instance(),
         repository: default_repository(),
+        adapter: default_adapter(),
+        // The adapter contract version this installation negotiates;
+        // version 0 is never a valid binding (docs/installation-config).
+        contract_version: 1,
+        // The default fixture adapter supports reads plus the publication
+        // writes a recorded intent may need; operators narrow this list to
+        // least privilege for a real installation.
+        capabilities: vec![
+            "repository_read".into(),
+            "push_ref".into(),
+            "change_request_create".into(),
+            "change_request_read".into(),
+            "change_request_update".into(),
+            "comment_create".into(),
+            "checks_read".into(),
+            "review_findings_read".into(),
+            "issue_read".into(),
+        ],
+        // A binding requires at least one role: the default installation
+        // publishes through a single fixture actor.
+        host_actors: [("publication".into(), "fixture-agent".into())]
+            .into_iter()
+            .collect(),
+        required_checks: vec![],
         capacity: default_capacity(),
         worker_argv: vec![],
         workspace_root: default_workspace_root(),
         allowed_effects: None,
         budget: None,
+        lanes: None,
+        policy: None,
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
@@ -275,16 +340,85 @@ impl Installation {
     }
 
     /// The `work`-level config derived from the installation record.
-    pub fn workloop_config(&self) -> WorkloopConfig {
-        WorkloopConfig {
-            default_repository: self.repository.clone(),
+    /// The installation file is external input: every identity string,
+    /// role name, and capability name is validated at this boundary —
+    /// an unparseable value is a hard error, never a silently degraded
+    /// or mis-bound configuration.
+    pub fn workloop_config(&self) -> Result<WorkloopConfig, String> {
+        let host = HostInstanceId::new(self.host_instance.clone())
+            .map_err(|e| format!("installation host_instance: {e}"))?;
+        let repository_id = RepositoryId::new(self.repository.clone())
+            .map_err(|e| format!("installation repository: {e}"))?;
+        let repository = RepositoryRef::new(host.clone(), repository_id);
+        let adapter = AdapterId::new(self.adapter.clone())
+            .map_err(|e| format!("installation adapter: {e}"))?;
+        let mut actors = Vec::with_capacity(self.host_actors.len());
+        for (role, actor) in &self.host_actors {
+            let role_name = role.clone();
+            let role = ActorRole::from_name(&role_name)
+                .ok_or_else(|| format!("installation host_actors: unknown role '{role_name}'"))?;
+            actors.push(RoleBinding {
+                role,
+                actor: HostActorRef {
+                    host: host.clone(),
+                    actor: HostActorId::new(actor.clone())
+                        .map_err(|e| format!("installation host_actors[{role_name}]: {e}"))?,
+                },
+                // The credential source is installation configuration;
+                // the record's value names it, never a secret value.
+                credential_ref: "default".to_string(),
+            });
+        }
+        let mut declared_capabilities = BTreeSet::new();
+        for c in &self.capabilities {
+            declared_capabilities.insert(
+                HostCapability::from_name(c)
+                    .ok_or_else(|| format!("installation capabilities: unknown '{c}'"))?,
+            );
+        }
+        // An installation file that pre-dates capability/actor
+        // declarations deserializes to empty sets via serde defaults;
+        // refusing at this boundary beats every Submit failing with an
+        // unexplained capability rejection later.
+        if declared_capabilities.is_empty() {
+            return Err(
+                "installation declares no capabilities — regenerate the config \
+                 or declare the supported capability set"
+                    .into(),
+            );
+        }
+        if actors.is_empty() {
+            return Err("installation binds no host actors — regenerate the config \
+                 or bind a host actor to each required role"
+                .into());
+        }
+        // A versionless binding can never be recorded: the installation
+        // must declare which adapter contract it negotiated.
+        if self.contract_version == 0 {
+            return Err(
+                "installation contract_version is 0 — regenerate the config or \
+                 declare the negotiated contract version"
+                    .into(),
+            );
+        }
+        Ok(WorkloopConfig {
+            host: HostTemplate {
+                adapter,
+                repository,
+                contract_version: self.contract_version,
+                actors,
+            },
+            declared_capabilities,
+            lanes: self.lanes.clone().unwrap_or_default(),
+            required_checks: self.required_checks.clone(),
             allowed_effects: self.allowed_effects.clone().unwrap_or(AllowedEffects {
                 workspace_write: true,
-                github_write: false,
+                host_write: false,
                 network: false,
             }),
             budget: self.budget.clone().unwrap_or_default(),
-        }
+            policy: self.policy.clone().unwrap_or_default(),
+        })
     }
 }
 

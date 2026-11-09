@@ -2,8 +2,9 @@
 //! draft, and Command results. Pure functions over the Query snapshots
 //! — rendering is the only layer that knows about screen layout.
 
-use workloop_core::command::{CommandDecision, PrHeadSha};
+use workloop_core::command::CommandDecision;
 use workloop_core::domain::WorkId;
+use workloop_core::identity::CommitRevision;
 use workloop_core::projection::{Availability, SourceStatus, WorkDetailView, WorkPhase};
 use workloop_core::work::ActionPreview;
 
@@ -102,10 +103,11 @@ pub fn board_frame(board: &Board, selected: Option<&WorkId>) -> String {
 
 /// The open Work's detail pane: version, executions, current head,
 /// head-scoped findings (numbered for `pick`), attention, evidence.
-/// Findings are numbered per distinct finding id — the same set, in the
-/// same order, as the judgment draft's slots — so the number printed
-/// beside a finding always names the slot `pick <n>` selects. A finding
-/// string recorded twice is one id and gets one number.
+/// Findings are numbered one row per recorded occurrence — the same
+/// set, in the same order, as the judgment draft's slots — so the
+/// number printed beside a finding always names the slot `pick <n>`
+/// selects. Two occurrences carrying the same source key are two rows
+/// and get two numbers.
 pub fn detail_frame(detail: &WorkDetailView) -> String {
     let mut out = String::new();
     out.push_str(&format!("work {} v{}\n", detail.work_id.0, detail.version));
@@ -115,16 +117,18 @@ pub fn detail_frame(detail: &WorkDetailView) -> String {
             e.execution_id.0, e.state, e.ownership
         ));
     }
-    if let Some((pr, head)) = &detail.current_pr {
+    if let Some((change, head)) = &detail.current_change {
         out.push_str(&format!(
-            "  pr {}#{} head {}\n",
-            pr.repository,
-            pr.number,
-            head.as_deref().unwrap_or("?")
+            "  change {} head {}\n",
+            change,
+            head.as_ref().map(|h| h.object.as_str()).unwrap_or("?")
         ));
     }
     for (i, f) in distinct_findings(detail).enumerate() {
-        out.push_str(&format!("  finding {}: {}\n", i + 1, f));
+        out.push_str(&format!("  finding {}: {}\n", i + 1, f.source_key));
+    }
+    for j in &detail.judged {
+        out.push_str(&format!("  judged {j}\n"));
     }
     for a in &detail.attention {
         out.push_str(&format!(
@@ -168,7 +172,7 @@ pub fn draft_frame(draft: &JudgmentDraft) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "judgment {} v{} head {}\n",
-        draft.work_id.0, draft.work_version, draft.pr_head
+        draft.work_id.0, draft.work_version, draft.expected_head.object
     ));
     for (i, slot) in draft.findings.iter().enumerate() {
         let choice = slot
@@ -176,7 +180,7 @@ pub fn draft_frame(draft: &JudgmentDraft) -> String {
             .as_ref()
             .map(|c| format!("{c:?}"))
             .unwrap_or_else(|| "-".into());
-        out.push_str(&format!("  {} {} [{}]\n", i + 1, slot.finding_id, choice));
+        out.push_str(&format!("  {} {} [{}]\n", i + 1, slot.source_key, choice));
     }
     out
 }
@@ -186,8 +190,8 @@ pub fn preview_frame(preview: &ActionPreview) -> String {
     if let Some(v) = preview.observed_work_version {
         out.push_str(&format!("  observed_work_version {v}\n"));
     }
-    if let Some(h) = &preview.observed_pr_head {
-        out.push_str(&format!("  observed_pr_head {h}\n"));
+    if let Some(h) = &preview.observed_head {
+        out.push_str(&format!("  observed_head {}\n", h.object));
     }
     for r in &preview.reasons {
         out.push_str(&format!("  reason {r:?}\n"));
@@ -225,10 +229,10 @@ pub fn decision_frame(decision: &CommandDecision) -> String {
 
 /// A pending request rendered as unknown — the display carries the key
 /// the operator can recover by, never a guessed outcome.
-pub fn pending_frame(idempotency_key: &str, head_hint: Option<&PrHeadSha>) -> String {
+pub fn pending_frame(idempotency_key: &str, head_hint: Option<&CommitRevision>) -> String {
     let mut out = format!("submit result: UNKNOWN (idempotency_key {idempotency_key})\n");
     if let Some(h) = head_hint {
-        out.push_str(&format!("  expected head at issue time {h}\n"));
+        out.push_str(&format!("  expected head at issue time {}\n", h.object));
     }
     out.push_str("  recover with: recover\n");
     out

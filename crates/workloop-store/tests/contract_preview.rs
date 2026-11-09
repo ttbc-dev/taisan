@@ -4,27 +4,83 @@
 //! decision, and never substitutes for the Command-time precondition
 //! check — `submit` still rechecks.
 
+use std::collections::BTreeSet;
+
 use workloop_core::command::*;
 use workloop_core::domain::*;
-use workloop_core::observation::{Observation, ObservationFact, ReviewVerdict};
+use workloop_core::identity::*;
+use workloop_core::observation::HostActionStatus;
+use workloop_core::observation::{Completeness, Observation, ObservationFact, OccurrenceInput};
 use workloop_core::projection::{self, CommandResultLookup, QueryResult};
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{
-    PreviewAvailability, WorkloopConfig, handle_command, handle_observation, preview,
+    HostTemplate, PreviewAvailability, WorkloopConfig, handle_command, handle_observation, preview,
 };
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
 
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+fn target(object: &str) -> DiffTarget {
+    DiffTarget {
+        change: change(),
+        head: rev(object),
+        base: None,
+        target_revision: None,
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host: host(),
+                    actor: HostActorId::trusted("pub-agent"),
+                },
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec![],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: false,
+            host_write: false,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
     }
 }
 
@@ -49,10 +105,7 @@ fn submit_req(key: &str) -> CommandRequest {
         key,
         CommandBody::Submit {
             intent: "do the thing".into(),
-            issue_refs: vec![GitHubIssueRef {
-                repository: "local/repo".into(),
-                number: 1,
-            }],
+            sources: vec![],
             constraints: vec![],
             verification_argv: vec![],
         },
@@ -71,45 +124,134 @@ fn seed_work(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
     }
 }
 
-fn seed_pr_head(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i64) {
+fn emit(store: &SqliteStore, work_id: &WorkId, fact: ObservationFact, at: i64) {
     handle_observation(
         store,
         &config(),
         &Observation {
-            source_event_id: None,
+            delivery: None,
             subject_work_id: Some(work_id.clone()),
             subject_execution_id: None,
-            fact: ObservationFact::PrHead {
-                repository: "local/repo".into(),
-                number: 1,
-                head_sha: sha.into(),
-            },
-            observed_unix_seconds: observed_at,
+            fact,
+            observed_unix_seconds: at,
         },
-        observed_at,
+        at,
     )
     .unwrap();
 }
 
-fn seed_pr_review(store: &SqliteStore, work_id: &WorkId, sha: &str, observed_at: i64) {
-    handle_observation(
+/// The applied intent the open receipt reconciles against — only a
+/// receipt naming a recorded applied intent validates the opened change.
+fn open_intent(store: &SqliteStore, work_id: &WorkId) {
+    store
+        .transact(|tx| {
+            if tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == "act-open")
+            {
+                return Ok(());
+            }
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-open".into(),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: HostActorRef {
+                        host: host(),
+                        actor: HostActorId::trusted("pub-agent"),
+                    },
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+}
+
+/// The change request the Work opened plus its observed head — the two
+/// facts `current_target` derives the judgeable diff target from.
+fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
+    open_intent(store, work_id);
+    emit(
         store,
-        &config(),
-        &Observation {
-            source_event_id: None,
-            subject_work_id: Some(work_id.clone()),
-            subject_execution_id: None,
-            fact: ObservationFact::PrReview {
-                repository: "local/repo".into(),
-                head_sha: sha.into(),
-                reviewer: "rev".into(),
-                verdict: ReviewVerdict::ChangesRequested,
-            },
-            observed_unix_seconds: observed_at,
+        work_id,
+        ObservationFact::HostActionResult {
+            action_id: "act-open".into(),
+            authenticated_actor: None,
+            status: workloop_core::observation::HostActionStatus::Applied,
+            effects: vec![
+                workloop_core::observation::NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev(object),
+                    source_branch: format!("work/{}", work_id.0),
+                    target_branch: "main".into(),
+                },
+            ],
         },
-        observed_at,
-    )
-    .unwrap();
+        at,
+    );
+    emit(
+        store,
+        work_id,
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev(object),
+        },
+        at,
+    );
+}
+
+/// A complete review over `source_keys` on `object`'s target — seals an
+/// immutable round and bumps the Work's version.
+fn seal_review(store: &SqliteStore, work_id: &WorkId, object: &str, source_keys: &[&str], at: i64) {
+    emit(
+        store,
+        work_id,
+        ObservationFact::Review {
+            target: target(object),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: source_keys
+                .iter()
+                .map(|key| OccurrenceInput {
+                    source_key: (*key).into(),
+                    content_digest: None,
+                    severity: None,
+                    position: None,
+                    thread_id: None,
+                })
+                .collect(),
+        },
+        at,
+    );
+}
+
+/// The occurrence ids a `JudgeFindings` must cover exactly.
+fn occurrence_ids(store: &SqliteStore, work_id: &WorkId) -> Vec<String> {
+    store
+        .transact(|tx| {
+            let round = tx.latest_round(work_id)?.expect("a sealed round");
+            Ok(tx
+                .occurrences(&round.id)?
+                .into_iter()
+                .map(|o| o.id)
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
 }
 
 fn last_seq(store: &SqliteStore) -> i64 {
@@ -224,7 +366,8 @@ fn preview_mirrors_decision_outcome() {
     assert_eq!(p.reasons, vec![RejectionCode::StaleWorkVersion]);
     assert_eq!(p.observed_work_version, Some(1));
 
-    // A judgment with no observed head cannot be evaluated → unknown.
+    // A judgment with no observed change target cannot be evaluated →
+    // unknown.
     let p = preview(
         &store,
         &config(),
@@ -233,11 +376,8 @@ fn preview_mirrors_decision_outcome() {
             CommandBody::JudgeFindings {
                 work_id: work_id.clone(),
                 expected_work_version: 1,
-                expected_pr_head: "h1".into(),
-                decisions: vec![FindingDecision {
-                    finding_id: "f1".into(),
-                    choice: FindingChoice::Fix,
-                }],
+                expected_head: rev("h1"),
+                decisions: vec![],
             },
         ),
         NOW,
@@ -245,7 +385,7 @@ fn preview_mirrors_decision_outcome() {
     .unwrap();
     assert_eq!(p.availability, PreviewAvailability::Unknown);
     assert_eq!(p.reasons, vec![RejectionCode::SourceUnavailable]);
-    assert_eq!(p.observed_pr_head, None);
+    assert_eq!(p.observed_head, None);
 
     // A stored accepted decision previews as available under the same
     // key and payload; a changed payload previews idempotency_conflict.
@@ -280,8 +420,9 @@ fn preview_mirrors_decision_outcome() {
 fn preview_reports_observed_head() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _e) = seed_work(&store, "ph-seed");
-    seed_pr_head(&store, &work_id, "h9", NOW);
-    seed_pr_review(&store, &work_id, "h9", NOW);
+    open_change(&store, &work_id, "h9", NOW);
+    seal_review(&store, &work_id, "h9", &["f1"], NOW);
+    let ids = occurrence_ids(&store, &work_id);
     let p = preview(
         &store,
         &config(),
@@ -289,19 +430,23 @@ fn preview_reports_observed_head() {
             "ph-judge",
             CommandBody::JudgeFindings {
                 work_id: work_id.clone(),
-                expected_work_version: 1,
-                expected_pr_head: "h9".into(),
-                decisions: vec![FindingDecision {
-                    finding_id: "f1".into(),
-                    choice: FindingChoice::Dismiss,
-                }],
+                expected_work_version: 2,
+                expected_head: rev("h9"),
+                decisions: ids
+                    .iter()
+                    .map(|occurrence_id| FindingDecision {
+                        occurrence_id: occurrence_id.clone(),
+                        choice: FindingChoice::Dismiss,
+                        rationale: Some("not a defect".into()),
+                    })
+                    .collect(),
             },
         ),
         NOW,
     )
     .unwrap();
     assert_eq!(p.availability, PreviewAvailability::Available);
-    assert_eq!(p.observed_pr_head.as_deref(), Some("h9"));
+    assert_eq!(p.observed_head, Some(rev("h9")));
 }
 
 /// The advisory surface never replaces the acceptance-time check: a
@@ -348,40 +493,45 @@ fn preview_never_substitutes_for_submit() {
 
 /// INV-011: preview runs the apply pass too — a Command whose effects
 /// violate a store constraint previews blocked with the same code the
-/// submit rejects with, never `available`. Re-judging a head that
+/// submit rejects with, never `available`. Re-judging a round that
 /// already has a judgment passes `decide` but fails the `judgments`
 /// uniqueness constraint at apply time.
 #[test]
 fn preview_mirrors_apply_time_rejection() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _e) = seed_work(&store, "pj-seed");
-    seed_pr_head(&store, &work_id, "h9", NOW);
-    seed_pr_review(&store, &work_id, "h9", NOW);
+    open_change(&store, &work_id, "h9", NOW);
+    seal_review(&store, &work_id, "h9", &["f1"], NOW);
+    let ids = occurrence_ids(&store, &work_id);
+    let decisions = |choice: FindingChoice| {
+        ids.iter()
+            .map(|occurrence_id| FindingDecision {
+                occurrence_id: occurrence_id.clone(),
+                choice: choice.clone(),
+                rationale: Some("rationale".into()),
+            })
+            .collect::<Vec<_>>()
+    };
 
     let judge = CommandBody::JudgeFindings {
         work_id: work_id.clone(),
-        expected_work_version: 1,
-        expected_pr_head: "h9".into(),
-        decisions: vec![FindingDecision {
-            finding_id: "f1".into(),
-            choice: FindingChoice::Fix,
-        }],
+        expected_work_version: 2,
+        expected_head: rev("h9"),
+        decisions: decisions(FindingChoice::Fix),
     };
     let d = handle_command(&store, &config(), &req("pj-first", judge), NOW).unwrap();
     assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
 
-    // Re-judging the same head: decide passes (head and version match),
-    // but the judgments uniqueness constraint rejects it at apply time.
+    // Re-judging the same round: decide passes (head and version match),
+    // but the round_judgments uniqueness constraint rejects it at apply
+    // time.
     let rejudge = req(
         "pj-again",
         CommandBody::JudgeFindings {
             work_id: work_id.clone(),
-            expected_work_version: 2,
-            expected_pr_head: "h9".into(),
-            decisions: vec![FindingDecision {
-                finding_id: "f1".into(),
-                choice: FindingChoice::Dismiss,
-            }],
+            expected_work_version: 3,
+            expected_head: rev("h9"),
+            decisions: decisions(FindingChoice::Dismiss),
         },
     );
 

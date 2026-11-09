@@ -9,17 +9,56 @@
 //! only reading, and a write they perform upgrades the snapshot — failing
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
+//!
+//! `PRAGMA user_version` is the format gate: `1` is the only supported
+//! version. An unversioned database with user tables is a slice-0 file —
+//! archive-only, refused at open — and a newer version is refused.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use workloop_core::command::{CommandDecision, CommandId, FindingDecision, PrHeadSha};
+use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::observation::Observation;
-use workloop_core::store::{Deferral, Effect, PrActionIntent, ReadView, Store, StoreError, TxView};
+use workloop_core::identity::{HostInstanceId, StoreId};
+use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
+use workloop_core::store::{
+    Deferral, Effect, HostActionIntent, ReadView, Store, StoreError, TxView,
+};
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// The only store format this binary reads or writes.
+const FORMAT_VERSION: i64 = 1;
+
+/// The tables `SCHEMA` installs. A file stamped `user_version=1` must
+/// hold all of them before any mutating pragma runs — the version stamp
+/// alone is not proof the file is this store's format.
+const EXPECTED_TABLES: &[&str] = &[
+    "attention_acks",
+    "capacity_slots",
+    "commands",
+    "deferrals",
+    "event_log",
+    "executions",
+    "finding_occurrences",
+    "host_action_intents",
+    "id_counters",
+    "invocations",
+    "invocation_requests",
+    "issue_claims",
+    "observations",
+    "recovery_decisions",
+    "resource_reservations",
+    "review_rounds",
+    "round_judgments",
+    "specs",
+    "stop_intents",
+    "store_meta",
+    "work_issue_refs",
+    "work_usage",
+    "works",
+];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -48,9 +87,86 @@ impl SqliteStore {
         // SQLITE_BUSY; a residual timeout still maps to `StoreError::Internal`,
         // which callers propagate without persisting a rejection.
         conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // foreign_keys is per-connection state; journal_mode persists in
+        // the file header, so it is deferred until after the format gate
+        // — a refused file must not be mutated.
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(internal)?;
-        conn.execute_batch(SCHEMA).map_err(internal)?;
+
+        // Format gate (identity-storage): refuse anything that is not the
+        // current format or an empty file. An unversioned database with
+        // user tables is a pre-v1 slice-0 file — archive-only.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(internal)?;
+        if version != 0 && version != FORMAT_VERSION {
+            return Err(StoreError::UnsupportedFormat {
+                detail: format!("store format {version} is newer than supported {FORMAT_VERSION}"),
+            });
+        }
+        let mut bootstrapping = false;
+        if version == 0 {
+            let has_tables: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if has_tables {
+                return Err(StoreError::UnsupportedFormat {
+                    detail: "unversioned store file (pre-v1 format); \
+                             archive it and start a new store"
+                        .into(),
+                });
+            }
+            bootstrapping = true;
+        } else {
+            // A v1 stamp alone is not proof this is our store: verify the
+            // schema shape before any mutating pragma. A foreign or
+            // truncated file carrying version 1 is refused as unsupported
+            // — never WAL-flipped and seeded first.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                )
+                .map_err(internal)?;
+            let present: std::collections::HashSet<String> = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(internal)?
+                .collect::<Result<_, _>>()
+                .map_err(internal)?;
+            if !EXPECTED_TABLES.iter().all(|t| present.contains(*t)) {
+                return Err(StoreError::UnsupportedFormat {
+                    detail: "store file claims the current format but does \
+                             not hold the recognized schema"
+                        .into(),
+                });
+            }
+        }
+        // journal_mode cannot change inside a transaction, so it is set
+        // here — only for a file the gate accepted.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(internal)?;
+        if bootstrapping {
+            // Bootstrap is one transaction: schema, format version, and
+            // the store_meta row land together or not at all, so a crash
+            // can never leave a table-bearing version-0 file (refused as
+            // a legacy archive on next open) or a v1 store without a
+            // store_id.
+            let tx = conn.unchecked_transaction().map_err(internal)?;
+            tx.execute_batch(SCHEMA).map_err(internal)?;
+            tx.pragma_update(None, "user_version", FORMAT_VERSION)
+                .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('store_id', ?1)",
+                params![new_id("store")],
+            )
+            .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
         // Seed the fixed slot rows once; claiming is an UPDATE inside the
         // caller's transaction.
         for slot in 0..capacity {
@@ -123,6 +239,13 @@ fn opt_de_row<T: serde::de::DeserializeOwned>(
     s: Option<String>,
 ) -> Result<Option<T>, rusqlite::Error> {
     s.map(|v| de_row(&v)).transpose()
+}
+
+/// Issue identity key: repository + opaque issue id — never the display
+/// number, which is presentational and must not participate in claims.
+fn issue_key(issue: &workloop_core::identity::IssueRef) -> String {
+    json(&(issue.repository.clone(), issue.issue.as_str()))
+        .unwrap_or_else(|_| unreachable!("issue key serializes"))
 }
 
 struct Tx<'t> {
@@ -217,26 +340,30 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> Result<Execution, rusqlite::Er
         desired_action: opt_untag(row.get::<_, Option<String>>(5)?)?,
         terminal_code: row.get(6)?,
         pause_reason: row.get(7)?,
-        outcome: opt_de_row(row.get::<_, Option<String>>(8)?)?,
-        enqueued_seq: row.get(9)?,
-        allowed_effects: de_row(&row.get::<_, String>(10)?)?,
-        input: de_row(&row.get::<_, String>(11)?)?,
-        budget: de_row(&row.get::<_, String>(12)?)?,
-        invocations_used: row.get(13)?,
-        review_rounds_used: row.get(14)?,
-        started_seq: row.get(15)?,
-        started_unix_seconds: row.get(16)?,
-        recovery_attempts_used: row.get(17)?,
-        recovery_deadline_unix_seconds: row.get(18)?,
-        uncertain_since_unix_seconds: row.get(19)?,
+        repair_prerequisites: de_row(&row.get::<_, String>(8)?)?,
+        outcome: opt_de_row(row.get::<_, Option<String>>(9)?)?,
+        enqueued_seq: row.get(10)?,
+        allowed_effects: de_row(&row.get::<_, String>(11)?)?,
+        input: de_row(&row.get::<_, String>(12)?)?,
+        budget: de_row(&row.get::<_, String>(13)?)?,
+        invocations_used: row.get(14)?,
+        review_rounds_used: row.get(15)?,
+        started_seq: row.get(16)?,
+        started_unix_seconds: row.get(17)?,
+        recovery_attempts_used: row.get(18)?,
+        recovery_deadline_unix_seconds: row.get(19)?,
+        uncertain_since_unix_seconds: row.get(20)?,
+        paused_since_unix_seconds: row.get(21)?,
+        next_role: opt_untag(row.get::<_, Option<String>>(22)?)?,
     })
 }
 
 const EXECUTION_COLS: &str = "id, work_id, ordinal, state, waiting_reason, \
-    desired_action, terminal_code, pause_reason, outcome, enqueued_seq, \
-    allowed_effects, input, budget, invocations_used, review_rounds_used, \
-    started_seq, started_unix_seconds, recovery_attempts_used, \
-    recovery_deadline_unix_seconds, uncertain_since_unix_seconds";
+    desired_action, terminal_code, pause_reason, repair_prerequisites, outcome, \
+    enqueued_seq, allowed_effects, input, budget, invocations_used, \
+    review_rounds_used, started_seq, started_unix_seconds, \
+    recovery_attempts_used, recovery_deadline_unix_seconds, \
+    uncertain_since_unix_seconds, paused_since_unix_seconds, next_role";
 
 const INVOCATION_COLS: &str = "id, request_id, execution_id, role, state, \
     process_identity, required_artifacts, evidence_refs";
@@ -260,28 +387,143 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqli
         work_id: WorkId(row.get::<_, String>(1)?),
         execution_id: ExecutionId(row.get::<_, String>(2)?),
         role: untag(&row.get::<_, String>(3)?)?,
-        payload: de_row(&row.get::<_, String>(4)?)?,
+        spec_revision: row.get(4)?,
+        payload: de_row(&row.get::<_, String>(5)?)?,
     })
 }
 
 fn observation_from_row(row: &rusqlite::Row<'_>) -> Result<Observation, rusqlite::Error> {
+    let scope: Option<String> = row.get(0)?;
+    let host: Option<String> = row.get(1)?;
+    let source: Option<String> = row.get(2)?;
+    let event_id: Option<String> = row.get(3)?;
+    let delivery = match (scope.as_deref(), host, source, event_id) {
+        (Some("host"), Some(h), Some(s), Some(e)) => Some(DeliveryId {
+            scope: DeliveryScope::Host {
+                host: HostInstanceId::trusted(h),
+            },
+            source: s,
+            event_id: e,
+        }),
+        (Some("local"), _, Some(s), Some(e)) => Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: s,
+            event_id: e,
+        }),
+        _ => None,
+    };
     Ok(Observation {
-        source_event_id: row.get(0)?,
-        subject_work_id: row.get::<_, Option<String>>(1)?.map(WorkId),
-        subject_execution_id: row.get::<_, Option<String>>(2)?.map(ExecutionId),
-        fact: de_row(&row.get::<_, String>(3)?)?,
-        observed_unix_seconds: row.get(4)?,
+        delivery,
+        subject_work_id: row.get::<_, Option<String>>(4)?.map(WorkId),
+        subject_execution_id: row.get::<_, Option<String>>(5)?.map(ExecutionId),
+        fact: de_row(&row.get::<_, String>(6)?)?,
+        observed_unix_seconds: row.get(7)?,
     })
 }
+
+const OBSERVATION_COLS: &str = "delivery_scope, delivery_host, delivery_source, \
+    delivery_event_id, subject_work_id, subject_execution_id, fact, \
+    observed_unix_seconds";
+
+fn work_from_row(row: &rusqlite::Row<'_>) -> Result<Work, rusqlite::Error> {
+    Ok(Work {
+        id: WorkId(row.get::<_, String>(0)?),
+        version: row.get::<_, u64>(1)?,
+        binding: de_row(&row.get::<_, String>(2)?)?,
+        spec: row.get(3)?,
+        approved_spec: row.get(4)?,
+        source_gate: untag(&row.get::<_, String>(5)?)?,
+        policy: de_row(&row.get::<_, String>(6)?)?,
+        created_seq: row.get(7)?,
+    })
+}
+
+const WORK_COLS: &str =
+    "id, version, binding, spec, approved_spec, source_gate, policy, created_seq";
+
+fn spec_from_row(row: &rusqlite::Row<'_>) -> Result<SpecSnapshot, rusqlite::Error> {
+    Ok(SpecSnapshot {
+        work_id: WorkId(row.get::<_, String>(0)?),
+        revision: row.get(1)?,
+        payload: de_row(&row.get::<_, String>(2)?)?,
+        digest: row.get(3)?,
+        approved_by: de_row(&row.get::<_, String>(4)?)?,
+        recorded_seq: row.get(5)?,
+    })
+}
+
+fn intent_from_row(row: &rusqlite::Row<'_>) -> Result<HostActionIntent, rusqlite::Error> {
+    Ok(HostActionIntent {
+        action_id: row.get(0)?,
+        work_id: WorkId(row.get::<_, String>(1)?),
+        host: HostInstanceId::trusted(row.get::<_, String>(2)?),
+        repository: de_row(&row.get::<_, String>(3)?)?,
+        role: untag(&row.get::<_, String>(4)?)?,
+        actor: de_row(&row.get::<_, String>(5)?)?,
+        action: de_row(&row.get::<_, String>(6)?)?,
+        payload_digest: row.get(7)?,
+        status: de_row(&row.get::<_, String>(8)?)?,
+        authenticated_actor: opt_de_row(row.get::<_, Option<String>>(9)?)?,
+        effects: de_row(&row.get::<_, String>(10)?)?,
+        created_seq: row.get(11)?,
+    })
+}
+
+fn round_from_row(row: &rusqlite::Row<'_>) -> Result<ReviewRound, rusqlite::Error> {
+    Ok(ReviewRound {
+        id: row.get(0)?,
+        work_id: WorkId(row.get::<_, String>(1)?),
+        target: de_row(&row.get::<_, String>(2)?)?,
+        source: row.get(3)?,
+        source_revision: row.get(4)?,
+        completeness: row.get(5)?,
+        set_digest: row.get(6)?,
+        generation: row.get(7)?,
+        seq: row.get(8)?,
+    })
+}
+
+fn judgment_from_row(row: &rusqlite::Row<'_>) -> Result<RoundJudgment, rusqlite::Error> {
+    Ok(RoundJudgment {
+        id: row.get(0)?,
+        work_id: WorkId(row.get::<_, String>(1)?),
+        round_id: row.get(2)?,
+        set_digest: row.get(3)?,
+        decisions: de_row(&row.get::<_, String>(4)?)?,
+        actor_id: row.get(5)?,
+        seq: row.get(6)?,
+    })
+}
+
+fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error> {
+    Ok(WorkUsage {
+        work_id: WorkId(row.get::<_, String>(0)?),
+        fix_invocations_used: row.get(1)?,
+        transport_retries_used: row.get(2)?,
+        equivalent_failure_streak: row.get(3)?,
+        equivalent_signature: row.get(4)?,
+        automatic_seconds_used: row.get(5)?,
+        first_dispatch_unix_seconds: row.get(6)?,
+        last_progress_unix_seconds: row.get(7)?,
+        human_wait_seconds_total: row.get(8)?,
+    })
+}
+
+const USAGE_COLS: &str = "work_id, fix_invocations_used, transport_retries_used, \
+    equivalent_failure_streak, equivalent_signature, automatic_seconds_used, \
+    first_dispatch_unix_seconds, last_progress_unix_seconds, \
+    human_wait_seconds_total";
 
 fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     tx.exec(
         "INSERT INTO executions (id, work_id, ordinal, state, waiting_reason, \
-         desired_action, terminal_code, pause_reason, outcome, enqueued_seq, \
-         allowed_effects, input, budget, invocations_used, review_rounds_used, \
-         started_seq, started_unix_seconds, recovery_attempts_used, \
-         recovery_deadline_unix_seconds, uncertain_since_unix_seconds) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+         desired_action, terminal_code, pause_reason, repair_prerequisites, \
+         outcome, enqueued_seq, allowed_effects, input, budget, \
+         invocations_used, review_rounds_used, started_seq, \
+         started_unix_seconds, recovery_attempts_used, \
+         recovery_deadline_unix_seconds, uncertain_since_unix_seconds, \
+         paused_since_unix_seconds, next_role) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![
             e.id.0,
             e.work_id.0,
@@ -291,6 +533,7 @@ fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
             e.desired_action.as_ref().map(tag),
             e.terminal_code,
             e.pause_reason,
+            json(&e.repair_prerequisites)?,
             e.outcome.as_ref().map(json).transpose()?,
             e.enqueued_seq,
             json(&e.allowed_effects)?,
@@ -303,6 +546,8 @@ fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
             e.recovery_attempts_used,
             e.recovery_deadline_unix_seconds,
             e.uncertain_since_unix_seconds,
+            e.paused_since_unix_seconds,
+            e.next_role.as_ref().map(tag),
         ],
     )?;
     Ok(())
@@ -315,12 +560,13 @@ fn update_execution(
 ) -> Result<(), StoreError> {
     let n = tx.exec(
         "UPDATE executions SET state=?4, waiting_reason=?5, desired_action=?6, \
-         terminal_code=?7, pause_reason=?8, outcome=?9, enqueued_seq=?10, \
-         allowed_effects=?11, input=?12, budget=?13, invocations_used=?14, \
-         review_rounds_used=?15, started_seq=?16, started_unix_seconds=?17, \
-         recovery_attempts_used=?18, recovery_deadline_unix_seconds=?19, \
-         uncertain_since_unix_seconds=?20 \
-         WHERE id=?1 AND work_id=?2 AND ordinal=?3 AND state=?21",
+         terminal_code=?7, pause_reason=?8, repair_prerequisites=?9, outcome=?10, \
+         enqueued_seq=?11, allowed_effects=?12, input=?13, budget=?14, \
+         invocations_used=?15, review_rounds_used=?16, started_seq=?17, \
+         started_unix_seconds=?18, recovery_attempts_used=?19, \
+         recovery_deadline_unix_seconds=?20, uncertain_since_unix_seconds=?21, \
+         paused_since_unix_seconds=?22, next_role=?23 \
+         WHERE id=?1 AND work_id=?2 AND ordinal=?3 AND state=?24",
         params![
             e.id.0,
             e.work_id.0,
@@ -330,6 +576,7 @@ fn update_execution(
             e.desired_action.as_ref().map(tag),
             e.terminal_code,
             e.pause_reason,
+            json(&e.repair_prerequisites)?,
             e.outcome.as_ref().map(json).transpose()?,
             e.enqueued_seq,
             json(&e.allowed_effects)?,
@@ -342,6 +589,8 @@ fn update_execution(
             e.recovery_attempts_used,
             e.recovery_deadline_unix_seconds,
             e.uncertain_since_unix_seconds,
+            e.paused_since_unix_seconds,
+            e.next_role.as_ref().map(tag),
             tag(expected),
         ],
     )?;
@@ -366,7 +615,84 @@ fn update_execution(
     Ok(())
 }
 
+fn update_work(tx: &Tx<'_>, work: &Work, expected: u64) -> Result<(), StoreError> {
+    let n = tx.exec(
+        "UPDATE works SET version=?2, binding=?3, spec=?4, approved_spec=?5, \
+         source_gate=?6, policy=?7 WHERE id=?1 AND version=?8",
+        params![
+            work.id.0,
+            work.version,
+            json(&work.binding)?,
+            work.spec,
+            work.approved_spec,
+            tag(&work.source_gate),
+            json(&work.policy)?,
+            expected,
+        ],
+    )?;
+    if n == 0 {
+        let current: u64 = tx
+            .tx
+            .query_row(
+                "SELECT version FROM works WHERE id=?1",
+                params![work.id.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(0);
+        return Err(StoreError::VersionConflict {
+            work_id: work.id.clone(),
+            current_version: current,
+        });
+    }
+    Ok(())
+}
+
+fn insert_spec(tx: &Tx<'_>, spec: &SpecSnapshot) -> Result<(), StoreError> {
+    tx.exec(
+        "INSERT INTO specs (work_id, revision, payload, digest, approved_by, \
+         recorded_seq) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            spec.work_id.0,
+            spec.revision,
+            json(&spec.payload)?,
+            spec.digest,
+            json(&spec.approved_by)?,
+            spec.recorded_seq,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_claims(
+    tx: &Tx<'_>,
+    work_id: &WorkId,
+    issues: &[workloop_core::identity::IssueRef],
+) -> Result<(), StoreError> {
+    for issue in issues {
+        tx.exec(
+            "INSERT INTO issue_claims (issue_key, issue, work_id) \
+             VALUES (?1,?2,?3)",
+            params![issue_key(issue), json(issue)?, work_id.0],
+        )?;
+    }
+    Ok(())
+}
+
 impl ReadView for Tx<'_> {
+    fn store_id(&self) -> Result<StoreId, StoreError> {
+        let s: String = self
+            .tx
+            .query_row(
+                "SELECT value FROM store_meta WHERE key='store_id'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(StoreId::trusted(s))
+    }
+
     fn stored_decision(
         &self,
         origin: &Origin,
@@ -395,22 +721,33 @@ impl ReadView for Tx<'_> {
 
     fn work(&self, work_id: &WorkId) -> Result<Option<Work>, StoreError> {
         self.query_opt(
-            "SELECT id, version, revision, intent, issue_refs, constraints_, \
-             verification_argv, created_seq FROM works WHERE id=?1",
+            &format!("SELECT {WORK_COLS} FROM works WHERE id=?1"),
             params![work_id.0],
-            |row| {
-                Ok(Work {
-                    id: WorkId(row.get::<_, String>(0)?),
-                    version: row.get::<_, u64>(1)?,
-                    revision: row.get(2)?,
-                    intent: row.get(3)?,
-                    issue_refs: de_row(&row.get::<_, String>(4)?)?,
-                    constraints: de_row(&row.get::<_, String>(5)?)?,
-                    verification_argv: de_row(&row.get::<_, String>(6)?)?,
-                    created_seq: row.get(7)?,
-                })
-            },
+            work_from_row,
         )
+    }
+
+    fn spec(
+        &self,
+        work_id: &WorkId,
+        revision: Option<SpecRevision>,
+    ) -> Result<Option<SpecSnapshot>, StoreError> {
+        match revision {
+            Some(rev) => self.query_opt(
+                "SELECT work_id, revision, payload, digest, approved_by, \
+                 recorded_seq FROM specs WHERE work_id=?1 AND revision=?2",
+                params![work_id.0, rev],
+                spec_from_row,
+            ),
+            None => self.query_opt(
+                "SELECT s.work_id, s.revision, s.payload, s.digest, \
+                 s.approved_by, s.recorded_seq FROM specs s \
+                 JOIN works w ON w.id = s.work_id AND w.spec = s.revision \
+                 WHERE s.work_id=?1",
+                params![work_id.0],
+                spec_from_row,
+            ),
+        }
     }
 
     fn execution(&self, execution_id: &ExecutionId) -> Result<Option<Execution>, StoreError> {
@@ -448,6 +785,36 @@ impl ReadView for Tx<'_> {
             ),
             [],
             execution_from_row,
+        )
+    }
+
+    fn issue_refs(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<workloop_core::identity::IssueRef>, StoreError> {
+        self.query_all(
+            "SELECT issue FROM work_issue_refs WHERE work_id=?1 ORDER BY issue_key",
+            params![work_id.0],
+            |row| de_row(&row.get::<_, String>(0)?),
+        )
+    }
+
+    fn issue_claim(
+        &self,
+        issue: &workloop_core::identity::IssueRef,
+    ) -> Result<Option<WorkId>, StoreError> {
+        self.query_opt(
+            "SELECT work_id FROM issue_claims WHERE issue_key=?1",
+            params![issue_key(issue)],
+            |row| Ok(WorkId(row.get::<_, String>(0)?)),
+        )
+    }
+
+    fn work_usage(&self, work_id: &WorkId) -> Result<Option<WorkUsage>, StoreError> {
+        self.query_opt(
+            &format!("SELECT {USAGE_COLS} FROM work_usage WHERE work_id=?1"),
+            params![work_id.0],
+            usage_from_row,
         )
     }
 
@@ -503,25 +870,17 @@ impl ReadView for Tx<'_> {
 
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError> {
         self.query_all(
-            "SELECT request_id, work_id, execution_id, role, payload \
-             FROM invocation_requests WHERE consumed=0 ORDER BY rowid",
+            "SELECT request_id, work_id, execution_id, role, spec_revision, \
+             payload FROM invocation_requests WHERE consumed=0 ORDER BY rowid",
             [],
-            |row| {
-                Ok(InvocationRequest {
-                    request_id: row.get(0)?,
-                    work_id: WorkId(row.get::<_, String>(1)?),
-                    execution_id: ExecutionId(row.get::<_, String>(2)?),
-                    role: untag(&row.get::<_, String>(3)?)?,
-                    payload: de_row(&row.get::<_, String>(4)?)?,
-                })
-            },
+            request_from_row,
         )
     }
 
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
         self.query_opt(
-            "SELECT request_id, work_id, execution_id, role, payload \
-             FROM invocation_requests WHERE request_id=?1",
+            "SELECT request_id, work_id, execution_id, role, spec_revision, \
+             payload FROM invocation_requests WHERE request_id=?1",
             params![request_id],
             request_from_row,
         )
@@ -562,21 +921,9 @@ impl ReadView for Tx<'_> {
 
     fn works(&self) -> Result<Vec<Work>, StoreError> {
         self.query_all(
-            "SELECT id, version, revision, intent, issue_refs, constraints_, \
-             verification_argv, created_seq FROM works ORDER BY created_seq",
+            &format!("SELECT {WORK_COLS} FROM works ORDER BY created_seq"),
             [],
-            |row| {
-                Ok(Work {
-                    id: WorkId(row.get::<_, String>(0)?),
-                    version: row.get::<_, u64>(1)?,
-                    revision: row.get(2)?,
-                    intent: row.get(3)?,
-                    issue_refs: de_row(&row.get::<_, String>(4)?)?,
-                    constraints: de_row(&row.get::<_, String>(5)?)?,
-                    verification_argv: de_row(&row.get::<_, String>(6)?)?,
-                    created_seq: row.get(7)?,
-                })
-            },
+            work_from_row,
         )
     }
 
@@ -635,9 +982,10 @@ impl ReadView for Tx<'_> {
         execution_id: &ExecutionId,
     ) -> Result<Vec<Observation>, StoreError> {
         self.query_all(
-            "SELECT source_event_id, subject_work_id, subject_execution_id, \
-             fact, observed_unix_seconds FROM observations \
-             WHERE subject_execution_id=?1 ORDER BY id",
+            &format!(
+                "SELECT {OBSERVATION_COLS} FROM observations \
+                 WHERE subject_execution_id=?1 ORDER BY id"
+            ),
             params![execution_id.0],
             observation_from_row,
         )
@@ -645,77 +993,113 @@ impl ReadView for Tx<'_> {
 
     fn observations_for_work(&self, work_id: &WorkId) -> Result<Vec<Observation>, StoreError> {
         self.query_all(
-            "SELECT source_event_id, subject_work_id, subject_execution_id, \
-             fact, observed_unix_seconds FROM observations \
-             WHERE subject_work_id=?1 \
-                OR subject_execution_id IN (SELECT id FROM executions WHERE work_id=?1) \
-             ORDER BY id",
+            &format!(
+                "SELECT {OBSERVATION_COLS} FROM observations \
+                 WHERE subject_work_id=?1 \
+                    OR subject_execution_id IN (SELECT id FROM executions WHERE work_id=?1) \
+                 ORDER BY id"
+            ),
             params![work_id.0],
             observation_from_row,
         )
     }
 
-    fn action_intents(&self) -> Result<Vec<PrActionIntent>, StoreError> {
+    fn all_observations(&self) -> Result<Vec<Observation>, StoreError> {
         self.query_all(
-            "SELECT action_id, work_id, repository, action, status \
-             FROM pr_action_intents ORDER BY rowid",
+            &format!("SELECT {OBSERVATION_COLS} FROM observations ORDER BY id"),
             [],
+            observation_from_row,
+        )
+    }
+
+    fn action_intents(&self) -> Result<Vec<HostActionIntent>, StoreError> {
+        self.query_all(
+            "SELECT action_id, work_id, host, repository, role, actor, action, \
+             payload_digest, status, authenticated_actor, effects, created_seq \
+             FROM host_action_intents ORDER BY rowid",
+            [],
+            intent_from_row,
+        )
+    }
+
+    fn latest_round(&self, work_id: &WorkId) -> Result<Option<ReviewRound>, StoreError> {
+        self.query_opt(
+            "SELECT id, work_id, target, source, source_revision, completeness, \
+             set_digest, generation, seq FROM review_rounds \
+             WHERE work_id=?1 ORDER BY seq DESC LIMIT 1",
+            params![work_id.0],
+            round_from_row,
+        )
+    }
+
+    fn rounds_for_work(&self, work_id: &WorkId) -> Result<Vec<ReviewRound>, StoreError> {
+        self.query_all(
+            "SELECT id, work_id, target, source, source_revision, completeness, \
+             set_digest, generation, seq FROM review_rounds \
+             WHERE work_id=?1 ORDER BY seq",
+            params![work_id.0],
+            round_from_row,
+        )
+    }
+
+    fn occurrences(&self, round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError> {
+        self.query_all(
+            "SELECT id, round_id, source_key, content_digest, severity, \
+             position, thread_id FROM finding_occurrences \
+             WHERE round_id=?1 ORDER BY id",
+            params![round_id],
             |row| {
-                Ok(PrActionIntent {
-                    action_id: row.get(0)?,
-                    work_id: WorkId(row.get::<_, String>(1)?),
-                    repository: row.get(2)?,
-                    action: de_row(&row.get::<_, String>(3)?)?,
-                    status: untag(&row.get::<_, String>(4)?)?,
+                Ok(FindingOccurrence {
+                    id: row.get(0)?,
+                    round_id: row.get(1)?,
+                    source_key: row.get(2)?,
+                    content_digest: row.get(3)?,
+                    severity: row.get(4)?,
+                    position: row.get(5)?,
+                    thread_id: row.get(6)?,
                 })
             },
         )
     }
 
-    fn judgments(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Vec<(String, Vec<workloop_core::command::FindingDecision>)>, StoreError> {
+    fn judgment_for_round(&self, round_id: &str) -> Result<Option<RoundJudgment>, StoreError> {
+        self.query_opt(
+            "SELECT id, work_id, round_id, set_digest, decisions, actor_id, seq \
+             FROM round_judgments WHERE round_id=?1",
+            params![round_id],
+            judgment_from_row,
+        )
+    }
+
+    fn latest_judgment(&self, work_id: &WorkId) -> Result<Option<RoundJudgment>, StoreError> {
+        self.query_opt(
+            "SELECT id, work_id, round_id, set_digest, decisions, actor_id, seq \
+             FROM round_judgments WHERE work_id=?1 ORDER BY seq DESC LIMIT 1",
+            params![work_id.0],
+            judgment_from_row,
+        )
+    }
+
+    fn recovery_decisions(&self, work_id: &WorkId) -> Result<Vec<RecoveryDecision>, StoreError> {
         self.query_all(
-            "SELECT expected_pr_head, decisions FROM judgments \
+            "SELECT id, work_id, execution_id, classification, signature, \
+             prerequisites, detail, usage_after, seq FROM recovery_decisions \
              WHERE work_id=?1 ORDER BY seq",
             params![work_id.0],
-            |row| Ok((row.get(0)?, de_row(&row.get::<_, String>(1)?)?)),
+            |row| {
+                Ok(RecoveryDecision {
+                    id: row.get(0)?,
+                    work_id: WorkId(row.get::<_, String>(1)?),
+                    execution_id: row.get::<_, Option<String>>(2)?.map(ExecutionId),
+                    classification: row.get(3)?,
+                    signature: row.get(4)?,
+                    prerequisites: de_row(&row.get::<_, String>(5)?)?,
+                    detail: row.get(6)?,
+                    usage_after: de_row(&row.get::<_, String>(7)?)?,
+                    seq: row.get(8)?,
+                })
+            },
         )
-    }
-
-    fn latest_judgment(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Option<(PrHeadSha, Vec<FindingDecision>)>, StoreError> {
-        self.query_opt(
-            "SELECT expected_pr_head, decisions FROM judgments \
-             WHERE work_id=?1 ORDER BY seq DESC LIMIT 1",
-            params![work_id.0],
-            |row| Ok((row.get::<_, String>(0)?, de_row(&row.get::<_, String>(1)?)?)),
-        )
-    }
-
-    fn latest_pr_head(&self, work_id: &WorkId) -> Result<Option<PrHeadSha>, StoreError> {
-        // Order by observed time (tie-break insertion id), not insertion
-        // order: a delayed webhook for an older head must never become the
-        // current head. Subject may be the Work or one of its Executions.
-        let facts = self.query_all(
-            "SELECT fact FROM observations \
-             WHERE subject_work_id = ?1 \
-                OR subject_execution_id IN (SELECT id FROM executions WHERE work_id = ?1) \
-             ORDER BY observed_unix_seconds DESC, id DESC",
-            params![work_id.0],
-            |row| row.get::<_, String>(0),
-        )?;
-        for fact in facts {
-            let parsed: workloop_core::observation::ObservationFact =
-                serde_json::from_str(&fact).map_err(internal)?;
-            if let workloop_core::observation::ObservationFact::PrHead { head_sha, .. } = parsed {
-                return Ok(Some(head_sha));
-            }
-        }
-        Ok(None)
     }
 
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
@@ -776,48 +1160,62 @@ impl TxView for Tx<'_> {
             params!["effect", json(effect)?],
         )?;
         match effect {
-            Effect::InsertWork { work } => {
+            Effect::InsertWork {
+                work,
+                spec,
+                issue_refs,
+                claims,
+                usage,
+            } => {
                 self.exec(
-                    "INSERT INTO works (id, version, revision, intent, issue_refs, \
-                     constraints_, verification_argv, created_seq) \
+                    "INSERT INTO works (id, version, binding, spec, \
+                     approved_spec, source_gate, policy, created_seq) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         work.id.0,
                         work.version,
-                        work.revision,
-                        work.intent,
-                        json(&work.issue_refs)?,
-                        json(&work.constraints)?,
-                        json(&work.verification_argv)?,
+                        json(&work.binding)?,
+                        work.spec,
+                        work.approved_spec,
+                        tag(&work.source_gate),
+                        json(&work.policy)?,
                         work.created_seq,
                     ],
                 )?;
-            }
-            Effect::BumpWorkVersion {
-                work_id,
-                expected,
-                next,
-            } => {
-                let n = self.exec(
-                    "UPDATE works SET version=?1 WHERE id=?2 AND version=?3",
-                    params![next, work_id.0, expected],
-                )?;
-                if n == 0 {
-                    let current: u64 = self
-                        .tx
-                        .query_row(
-                            "SELECT version FROM works WHERE id=?1",
-                            params![work_id.0],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .map_err(map_err)?
-                        .unwrap_or(0);
-                    return Err(StoreError::VersionConflict {
-                        work_id: work_id.clone(),
-                        current_version: current,
-                    });
+                insert_spec(self, spec)?;
+                for r in issue_refs {
+                    self.exec(
+                        "INSERT INTO work_issue_refs (work_id, issue_key, issue) \
+                         VALUES (?1,?2,?3)",
+                        params![r.work_id.0, issue_key(&r.issue), json(&r.issue)?],
+                    )?;
                 }
+                insert_claims(self, &work.id, claims)?;
+                self.exec(
+                    "INSERT INTO work_usage (work_id, fix_invocations_used, \
+                     transport_retries_used, equivalent_failure_streak, \
+                     equivalent_signature, automatic_seconds_used, \
+                     first_dispatch_unix_seconds, last_progress_unix_seconds, \
+                     human_wait_seconds_total) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        usage.work_id.0,
+                        usage.fix_invocations_used,
+                        usage.transport_retries_used,
+                        usage.equivalent_failure_streak,
+                        usage.equivalent_signature,
+                        usage.automatic_seconds_used,
+                        usage.first_dispatch_unix_seconds,
+                        usage.last_progress_unix_seconds,
+                        usage.human_wait_seconds_total,
+                    ],
+                )?;
+            }
+            Effect::UpdateWork { work, expected } => {
+                update_work(self, work, *expected)?;
+            }
+            Effect::InsertSpec { spec } => {
+                insert_spec(self, spec)?;
             }
             Effect::InsertExecution { execution } => {
                 write_execution(self, execution)?;
@@ -846,12 +1244,9 @@ impl TxView for Tx<'_> {
                 )?;
             }
             Effect::InsertReservation { reservation } => {
-                // Plain INSERT: a live row conflicts on the PK; `work`
-                // deletes an expired claim (by its own holder) first.
                 self.exec(
-                    "INSERT INTO resource_reservations \
-                     (resource_key, resource, holder, expires_at_unix_seconds) \
-                     VALUES (?1,?2,?3,?4)",
+                    "INSERT INTO resource_reservations (resource_key, resource, \
+                     holder, expires_at_unix_seconds) VALUES (?1,?2,?3,?4)",
                     params![
                         reservation.resource_key,
                         json(&reservation.resource)?,
@@ -864,11 +1259,12 @@ impl TxView for Tx<'_> {
                 resource_keys,
                 holder,
             } => {
+                let holder_json = json(holder)?;
                 for key in resource_keys {
                     self.exec(
                         "DELETE FROM resource_reservations \
                          WHERE resource_key=?1 AND holder=?2",
-                        params![key, json(holder)?],
+                        params![key, holder_json],
                     )?;
                 }
             }
@@ -885,23 +1281,23 @@ impl TxView for Tx<'_> {
             }
             Effect::InsertRequest { request } => {
                 self.exec(
-                    "INSERT INTO invocation_requests \
-                     (request_id, work_id, execution_id, role, payload) \
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO invocation_requests (request_id, work_id, \
+                     execution_id, role, spec_revision, payload) \
+                     VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
                         request.request_id,
                         request.work_id.0,
                         request.execution_id.0,
                         tag(&request.role),
+                        request.spec_revision,
                         json(&request.payload)?,
                     ],
                 )?;
             }
             Effect::InsertInvocation { invocation } => {
                 self.exec(
-                    "INSERT INTO invocations \
-                     (id, request_id, execution_id, role, state, \
-                      process_identity, required_artifacts, evidence_refs) \
+                    "INSERT INTO invocations (id, request_id, execution_id, role, \
+                     state, process_identity, required_artifacts, evidence_refs) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         invocation.id.0,
@@ -913,14 +1309,6 @@ impl TxView for Tx<'_> {
                         json(&invocation.required_artifacts)?,
                         json(&invocation.evidence_refs)?,
                     ],
-                )?;
-                // Recording the Invocation is the durable consumption of its
-                // request (`execution` records an Invocation before launch);
-                // `pending_requests` must never re-offer it. A request row
-                // that is absent matches nothing and is not an error.
-                self.exec(
-                    "UPDATE invocation_requests SET consumed=1 WHERE request_id=?1",
-                    params![invocation.request_id],
                 )?;
             }
             Effect::UpdateInvocation {
@@ -942,18 +1330,50 @@ impl TxView for Tx<'_> {
                 )?;
                 if n == 0 {
                     return Err(StoreError::ConstraintConflict {
-                        detail: format!("invocation {} not in expected state", invocation.id.0),
+                        detail: format!(
+                            "invocation {} no longer in state {:?}",
+                            invocation.id.0, expected_state
+                        ),
                     });
                 }
             }
             Effect::InsertObservation { observation } => {
+                let (scope, host, source, event_id) = match &observation.delivery {
+                    Some(DeliveryId {
+                        scope: DeliveryScope::Host { host },
+                        source,
+                        event_id,
+                    }) => (
+                        Some("host".to_string()),
+                        Some(host.as_str().to_string()),
+                        Some(source.clone()),
+                        Some(event_id.clone()),
+                    ),
+                    Some(DeliveryId {
+                        scope: DeliveryScope::Local,
+                        source,
+                        event_id,
+                    }) => (
+                        Some("local".to_string()),
+                        // A NULL host key would dedupe nothing: SQLite
+                        // treats NULLs as distinct in UNIQUE indexes, so
+                        // every local redelivery would insert again.
+                        Some(String::new()),
+                        Some(source.clone()),
+                        Some(event_id.clone()),
+                    ),
+                    None => (None, None, None, None),
+                };
                 self.exec(
-                    "INSERT INTO observations \
-                     (source_event_id, subject_work_id, subject_execution_id, \
-                      fact, observed_unix_seconds) \
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO observations (delivery_scope, delivery_host, \
+                     delivery_source, delivery_event_id, subject_work_id, \
+                     subject_execution_id, fact, observed_unix_seconds) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
-                        observation.source_event_id,
+                        scope,
+                        host,
+                        source,
+                        event_id,
                         observation.subject_work_id.as_ref().map(|w| w.0.clone()),
                         observation
                             .subject_execution_id
@@ -966,8 +1386,8 @@ impl TxView for Tx<'_> {
             }
             Effect::InsertStopIntent { intent } => {
                 self.exec(
-                    "INSERT INTO stop_intents (invocation_id, identities, recorded_seq) \
-                     VALUES (?1,?2,?3)",
+                    "INSERT INTO stop_intents (invocation_id, identities, \
+                     recorded_seq) VALUES (?1,?2,?3)",
                     params![
                         intent.invocation_id.0,
                         json(&intent.identities)?,
@@ -975,58 +1395,154 @@ impl TxView for Tx<'_> {
                     ],
                 )?;
             }
-            Effect::InsertPrActionIntent { intent } => {
+            Effect::InsertHostActionIntent { intent } => {
                 self.exec(
-                    "INSERT INTO pr_action_intents \
-                     (action_id, work_id, repository, action, status) \
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO host_action_intents (action_id, work_id, host, \
+                     repository, role, actor, action, payload_digest, status, \
+                     authenticated_actor, effects, created_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
                         intent.action_id,
                         intent.work_id.0,
-                        intent.repository,
+                        intent.host.as_str(),
+                        json(&intent.repository)?,
+                        tag(&intent.role),
+                        json(&intent.actor)?,
                         json(&intent.action)?,
-                        tag(&intent.status),
+                        intent.payload_digest,
+                        json(&intent.status)?,
+                        intent.authenticated_actor.as_ref().map(json).transpose()?,
+                        json(&intent.effects)?,
+                        intent.created_seq,
                     ],
                 )?;
             }
-            Effect::MarkRequestConsumed { request_id } => {
-                // Idempotent: recording the Invocation may already have
-                // flipped `consumed` in the same commit, and at-least-once
-                // delivery re-marks on replay. Only an absent request row
-                // is a constraint conflict.
-                let n = self.exec(
-                    "UPDATE invocation_requests SET consumed=1 WHERE request_id=?1",
-                    params![request_id],
+            Effect::UpdateHostActionIntent {
+                action_id,
+                status,
+                authenticated_actor,
+                effects,
+            } => {
+                self.exec(
+                    "UPDATE host_action_intents SET status=?2, \
+                     authenticated_actor=?3, effects=?4 WHERE action_id=?1",
+                    params![
+                        action_id,
+                        json(status)?,
+                        authenticated_actor.as_ref().map(json).transpose()?,
+                        json(effects)?,
+                    ],
                 )?;
-                if n == 0 {
-                    return Err(StoreError::ConstraintConflict {
-                        detail: format!("request {request_id} missing"),
-                    });
+            }
+            Effect::InsertReviewRound { round, occurrences } => {
+                self.exec(
+                    "INSERT INTO review_rounds (id, work_id, target, source, \
+                     source_revision, completeness, set_digest, generation, seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        round.id,
+                        round.work_id.0,
+                        json(&round.target)?,
+                        round.source,
+                        round.source_revision,
+                        round.completeness,
+                        round.set_digest,
+                        round.generation,
+                        round.seq,
+                    ],
+                )?;
+                for o in occurrences {
+                    self.exec(
+                        "INSERT INTO finding_occurrences (id, round_id, \
+                         source_key, content_digest, severity, position, \
+                         thread_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            o.id,
+                            o.round_id,
+                            o.source_key,
+                            o.content_digest,
+                            o.severity,
+                            o.position,
+                            o.thread_id,
+                        ],
+                    )?;
                 }
             }
-            Effect::UpdateActionIntent { action_id, status } => {
-                let n = self.exec(
-                    "UPDATE pr_action_intents SET status=?2 WHERE action_id=?1",
-                    params![action_id, tag(status)],
+            Effect::InsertRoundJudgment { judgment } => {
+                self.exec(
+                    "INSERT INTO round_judgments (id, work_id, round_id, \
+                     set_digest, decisions, actor_id, seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        judgment.id,
+                        judgment.work_id.0,
+                        judgment.round_id,
+                        judgment.set_digest,
+                        json(&judgment.decisions)?,
+                        judgment.actor_id,
+                        judgment.seq,
+                    ],
                 )?;
-                if n == 0 {
-                    return Err(StoreError::ConstraintConflict {
-                        detail: format!("unknown action_id {action_id}"),
-                    });
-                }
+            }
+            Effect::InsertIssueClaims { work_id, issues } => {
+                insert_claims(self, work_id, issues)?;
+            }
+            Effect::ReleaseIssueClaims { work_id } => {
+                self.exec(
+                    "DELETE FROM issue_claims WHERE work_id=?1",
+                    params![work_id.0],
+                )?;
+            }
+            Effect::UpdateWorkUsage { usage } => {
+                self.exec(
+                    "UPDATE work_usage SET fix_invocations_used=?2, \
+                     transport_retries_used=?3, equivalent_failure_streak=?4, \
+                     equivalent_signature=?5, automatic_seconds_used=?6, \
+                     first_dispatch_unix_seconds=?7, \
+                     last_progress_unix_seconds=?8, \
+                     human_wait_seconds_total=?9 WHERE work_id=?1",
+                    params![
+                        usage.work_id.0,
+                        usage.fix_invocations_used,
+                        usage.transport_retries_used,
+                        usage.equivalent_failure_streak,
+                        usage.equivalent_signature,
+                        usage.automatic_seconds_used,
+                        usage.first_dispatch_unix_seconds,
+                        usage.last_progress_unix_seconds,
+                        usage.human_wait_seconds_total,
+                    ],
+                )?;
+            }
+            Effect::InsertRecoveryDecision { decision } => {
+                self.exec(
+                    "INSERT INTO recovery_decisions (id, work_id, execution_id, \
+                     classification, signature, prerequisites, detail, \
+                     usage_after, seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        decision.id,
+                        decision.work_id.0,
+                        decision.execution_id.as_ref().map(|e| e.0.clone()),
+                        decision.classification,
+                        decision.signature,
+                        json(&decision.prerequisites)?,
+                        decision.detail,
+                        json(&decision.usage_after)?,
+                        decision.seq,
+                    ],
+                )?;
             }
             Effect::RecordDeferral {
                 execution_id,
                 reason,
                 diagnostic,
             } => {
-                let seq = self.alloc_seq()?;
                 self.exec(
-                    "INSERT OR REPLACE INTO deferrals \
-                     (execution_id, reason, diagnostic, since_seq) \
-                     VALUES (?1,?2,?3, \
-                        COALESCE((SELECT since_seq FROM deferrals WHERE execution_id=?1), ?4))",
-                    params![execution_id.0, reason, diagnostic, seq],
+                    "INSERT INTO deferrals (execution_id, reason, diagnostic, \
+                     since_seq) VALUES (?1,?2,?3,?4) \
+                     ON CONFLICT(execution_id) DO UPDATE SET \
+                     reason=?2, diagnostic=?3",
+                    params![execution_id.0, reason, diagnostic, self.last_seq()?],
                 )?;
             }
             Effect::ClearDeferral { execution_id } => {
@@ -1040,23 +1556,19 @@ impl TxView for Tx<'_> {
                 attention_id,
                 actor_id,
             } => {
-                let seq = self.alloc_seq()?;
+                // Acknowledgement is a no-op upsert: a repeat of the same
+                // (work, attention, actor) key is idempotent, never a
+                // constraint conflict.
                 self.exec(
-                    "INSERT OR REPLACE INTO attention_acks \
-                     (work_id, attention_id, actor_id, seq) VALUES (?1,?2,?3,?4)",
-                    params![work_id.0, attention_id, actor_id, seq],
+                    "INSERT OR IGNORE INTO attention_acks (work_id, attention_id, \
+                     actor_id, seq) VALUES (?1,?2,?3,?4)",
+                    params![work_id.0, attention_id, actor_id, self.last_seq()?],
                 )?;
             }
-            Effect::InsertJudgment {
-                work_id,
-                expected_pr_head,
-                decisions,
-            } => {
-                let seq = self.alloc_seq()?;
+            Effect::MarkRequestConsumed { request_id } => {
                 self.exec(
-                    "INSERT INTO judgments (work_id, expected_pr_head, decisions, seq) \
-                     VALUES (?1,?2,?3,?4)",
-                    params![work_id.0, expected_pr_head, json(decisions)?, seq],
+                    "UPDATE invocation_requests SET consumed=1 WHERE request_id=?1",
+                    params![request_id],
                 )?;
             }
         }
@@ -1069,20 +1581,25 @@ impl TxView for Tx<'_> {
         actor: &Actor,
         idempotency_key: &str,
         payload_digest: &str,
+        canonical_payload: &[u8],
         decision: &CommandDecision,
     ) -> Result<(), StoreError> {
+        let command_id = match decision {
+            CommandDecision::Accepted { command_id, .. } => command_id.0.clone(),
+            CommandDecision::Rejected { command_id, .. } => command_id.0.clone(),
+        };
         self.exec(
-            "INSERT INTO commands \
-             (origin, actor_kind, actor_id, idempotency_key, payload_digest, \
-              command_id, decision, seq) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO commands (origin, actor_kind, actor_id, \
+             idempotency_key, payload_digest, canonical_payload, command_id, \
+             decision, seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 origin.0,
                 tag(&actor.kind),
                 actor.external_id,
                 idempotency_key,
                 payload_digest,
-                decision.command_id().0.clone(),
+                canonical_payload,
+                command_id,
                 json(decision)?,
                 self.last_seq()?,
             ],
@@ -1096,12 +1613,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_sets_a_busy_timeout() {
-        let store = SqliteStore::in_memory(1).unwrap();
-        let guard = store.conn.lock().unwrap();
-        let ms: i64 = guard
-            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(ms, i64::try_from(BUSY_TIMEOUT.as_millis()).unwrap());
+    fn expected_tables_cover_the_declared_schema() {
+        let declared: std::collections::BTreeSet<String> = SCHEMA
+            .lines()
+            .filter_map(|l| l.strip_prefix("CREATE TABLE IF NOT EXISTS "))
+            .map(|l| l.split('(').next().unwrap().trim().to_string())
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = EXPECTED_TABLES.iter().copied().collect();
+        assert_eq!(
+            declared,
+            expected.into_iter().map(String::from).collect(),
+            "EXPECTED_TABLES drifted from schema.sql"
+        );
     }
 }

@@ -1,26 +1,96 @@
-//! Fixture GitHub adapter contract tests (`docs/v0.1.md`: outbox-first
-//! writes, head recheck before `update_pr`/`post_pr_comment`, synthetic
-//! Observations, unknown-result reconciliation by action ID).
+//! Fixture host adapter contract: `apply_outbox` drains only recorded
+//! `HostActionIntent` rows, re-checks the synthetic remote head
+//! immediately before each write, and reports every result as a
+//! `host_action_result` Observation reconciled by action ID.
+
+use std::collections::BTreeSet;
 
 use workloop_core::command::*;
 use workloop_core::domain::*;
+use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
-use workloop_core::work::{WorkloopConfig, admit_queued, handle_command};
+use workloop_core::work::{
+    HostTemplate, IngestReceipt, WorkloopConfig, admit_queued, handle_command, handle_observation,
+};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
 
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+fn target(object: &str) -> DiffTarget {
+    DiffTarget {
+        change: change(),
+        head: rev(object),
+        base: None,
+        target_revision: None,
+    }
+}
+
+fn publisher() -> HostActorRef {
+    HostActorRef {
+        host: host(),
+        actor: HostActorId::trusted("pub-agent"),
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        default_repository: "local/repo".into(),
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: publisher(),
+                credential_ref: "cred-publication".into(),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec!["ci".into()],
         allowed_effects: AllowedEffects {
             workspace_write: true,
-            github_write: true,
+            host_write: true,
             network: false,
         },
         budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
+    }
+}
+
+fn artifact(kind: &str) -> RequiredArtifact {
+    RequiredArtifact {
+        kind: kind.into(),
+        path: kind.into(),
+        expected_digest: None,
     }
 }
 
@@ -36,8 +106,8 @@ fn submit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
             origin: Origin("cli".into()),
             idempotency_key: key.into(),
             body: CommandBody::Submit {
-                intent: "ship it".into(),
-                issue_refs: vec![],
+                intent: "do the thing".into(),
+                sources: vec![],
                 constraints: vec![],
                 verification_argv: vec![],
             },
@@ -56,17 +126,61 @@ fn submit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
     (work_id.unwrap(), execution_id)
 }
 
-fn insert_intent(store: &SqliteStore, work_id: &WorkId, action: PrAction) -> String {
+/// Authorize the capabilities a recorded stage effect needs.
+fn authorize(store: &SqliteStore, capabilities: &[HostCapability]) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: None,
+            fact: ObservationFact::CapabilityReport {
+                host: host(),
+                capabilities: capabilities
+                    .iter()
+                    .map(|capability| CapabilityEntry {
+                        capability: *capability,
+                        support: CapabilityState::Supported,
+                        authorization: CapabilityState::Authorized,
+                    })
+                    .collect(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+fn insert_intent(store: &SqliteStore, work_id: &WorkId, action: HostAction) -> String {
+    insert_intent_with(store, work_id, action, HostActionStatus::Pending)
+}
+
+fn insert_intent_with(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    action: HostAction,
+    status: HostActionStatus,
+) -> String {
     store
         .transact(|tx| {
             let action_id = tx.alloc_id("act")?;
-            tx.apply(&Effect::InsertPrActionIntent {
-                intent: PrActionIntent {
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
                     action_id: action_id.clone(),
                     work_id: work_id.clone(),
-                    repository: "local/repo".into(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
                     action,
-                    status: PrActionStatus::Pending,
+                    payload_digest: "test".into(),
+                    status,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
                 },
             })?;
             Ok(action_id)
@@ -74,7 +188,7 @@ fn insert_intent(store: &SqliteStore, work_id: &WorkId, action: PrAction) -> Str
         .unwrap()
 }
 
-fn intent_status(store: &SqliteStore, action_id: &str) -> PrActionStatus {
+fn intent_status(store: &SqliteStore, action_id: &str) -> HostActionStatus {
     store
         .transact(|tx| {
             Ok(tx
@@ -101,10 +215,106 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
             role: InvocationRole::Coding,
             state: InvocationState::Done,
             process_identity: None,
-            required_artifacts: vec![],
+            required_artifacts: vec![artifact("artifact.json")],
             evidence_refs: vec![],
         },
+    })?;
+    tx.apply(&Effect::InsertObservation {
+        observation: Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: InvocationId(format!("{}-coding", eid.0)),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Present {
+                    digest: "artifact-digest".into(),
+                },
+            },
+            observed_unix_seconds: NOW,
+        },
     })
+}
+
+/// Shared setup for completion-vs-evidence contract tests: an admitted
+/// Execution parked in `Waiting/Ci` with applied push_ref and
+/// open_change_request intents, so completion turns solely on the
+/// current-target evidence lanes.
+fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    let (work_id, eid) = submit(store, key);
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Waiting;
+            e.waiting_reason = Some(WaitingReason::Ci);
+            record_finished_coding(tx, &eid)?;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })?;
+            for (action_id, action) in [
+                (
+                    "act-pub-push",
+                    HostAction::PushRef {
+                        branch: format!("work/{}", work_id.0),
+                        produced: rev("artifact-digest"),
+                    },
+                ),
+                (
+                    "act-pub-open",
+                    HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "t".into(),
+                        body: "b".into(),
+                    },
+                ),
+            ] {
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
+                        action_id: action_id.into(),
+                        work_id: work_id.clone(),
+                        host: host(),
+                        repository: repo(),
+                        role: ActorRole::Publication,
+                        actor: publisher(),
+                        action,
+                        payload_digest: "test".into(),
+                        status: HostActionStatus::Applied,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
+                    },
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    (work_id, eid)
+}
+
+fn obs(
+    work_id: &WorkId,
+    eid: &ExecutionId,
+    event: Option<&str>,
+    at: i64,
+    fact: ObservationFact,
+) -> Observation {
+    Observation {
+        delivery: event.map(|event_id| DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: event_id.into(),
+        }),
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact,
+        observed_unix_seconds: at,
+    }
 }
 
 #[test]
@@ -117,27 +327,28 @@ fn publish_writes_only_from_a_recorded_intent_and_reports_applied() {
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PublishPr {
-            branch: "work/w-1".into(),
+        HostAction::OpenChangeRequest {
+            source_branch: "work/w-1".into(),
+            target_branch: "main".into(),
             title: "t".into(),
             body: "b".into(),
         },
     );
     // The intent row exists before the simulated write happens.
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Pending);
 
     let mut gh = FixtureGithub::new();
     gh.apply_outbox(&store, &config(), NOW).unwrap();
 
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
-    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+    assert_eq!(gh.applied(), &["open_change:test-host/local-repo:cr-1"]);
     // The write surfaced the fresh head as an Observation.
     let heads = store
         .transact(|tx| {
             Ok(tx
                 .observations_for_work(&work_id)?
                 .iter()
-                .filter(|o| matches!(o.fact, ObservationFact::PrHead { .. }))
+                .filter(|o| matches!(o.fact, ObservationFact::ChangeHead { .. }))
                 .count())
         })
         .unwrap();
@@ -152,12 +363,17 @@ fn head_mismatch_aborts_the_write_and_surfaces_the_fresh_head() {
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();
     // The realistic drain context: the execution is waiting on its
-    // outstanding GitHub write.
+    // outstanding host write, and the Work's recorded transport account
+    // is spent, so the definite failure pauses for repair.
     store
         .transact(|tx| {
+            let mut w = tx.work(&work_id)?.unwrap();
+            let expected = w.version;
+            w.policy.transport_max_retries = 0;
+            tx.apply(&Effect::UpdateWork { work: w, expected })?;
             let mut e = tx.execution(&eid)?.unwrap();
             e.state = ExecutionState::Waiting;
-            e.waiting_reason = Some(WaitingReason::GithubWrite);
+            e.waiting_reason = Some(WaitingReason::HostWrite);
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
@@ -166,32 +382,67 @@ fn head_mismatch_aborts_the_write_and_surfaces_the_fresh_head() {
         .unwrap();
     let mut gh = FixtureGithub::new();
     // The remote moved since the intent was recorded.
-    gh.set_head("local/repo", 7, "sha-new");
+    gh.set_head("cr-1", "sha-new");
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::UpdatePr {
-            number: 7,
-            expected_head: "sha-old".into(),
-            body: "edited body".into(),
+        HostAction::UpdateChangeRequest {
+            change: change(),
+            expected_head: rev("sha-old"),
+            title: Some("edited".into()),
+            body: Some("edited body".into()),
         },
     );
     gh.apply_outbox(&store, &config(), NOW).unwrap();
 
     assert!(gh.applied().is_empty(), "no write on head mismatch");
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Failed);
-    // A fresh pr_head Observation records the actual remote head, and no
-    // automatic re-issue is attempted.
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Failed {
+            reason: "expected head moved".into()
+        }
+    );
+    // A fresh change_head Observation records the actual remote head,
+    // and no automatic re-issue is attempted.
     let observations = store
         .transact(|tx| tx.observations_for_work(&work_id))
         .unwrap();
     assert!(observations.iter().any(|o| matches!(
         &o.fact,
-        ObservationFact::PrHead { number: 7, head_sha, .. } if head_sha == "sha-new"
+        ObservationFact::ChangeHead { change: c, head }
+            if c.change_request.as_str() == "cr-1" && head.object == "sha-new"
     )));
+    // The exhausted transport account stops the writer before pausing:
+    // the Execution parks in `stopping` with a recorded `pause` desire
+    // until writer-stop proof settles it.
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("transport")
+    );
+    gh.emit(
+        &store,
+        &config(),
+        Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId("inv-head".into()),
+                process_identity: "1@1".into(),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Paused);
-    assert!(e.pause_reason.as_deref().unwrap_or("").contains("repair"));
 }
 
 #[test]
@@ -199,183 +450,175 @@ fn head_match_applies_the_write() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, _eid) = submit(&store, "k-g3");
     let mut gh = FixtureGithub::new();
-    gh.set_head("local/repo", 9, "sha-x");
+    gh.set_head("cr-1", "sha-x");
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PostPrComment {
-            number: 9,
-            expected_head: "sha-x".into(),
+        HostAction::PostComment {
+            change: change(),
+            expected_head: rev("sha-x"),
+            marker: "workloop".into(),
             body: "hello".into(),
         },
     );
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied(), &["post_pr_comment:local/repo:9"]);
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(gh.applied(), &["post_comment:test-host/local-repo:cr-1"]);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
 }
 
 #[test]
 fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "k-g4");
-    let action_id = insert_intent(
+    let action_id = insert_intent_with(
         &store,
         &work_id,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "b".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-x"),
         },
+        HostActionStatus::Pending,
     );
     // Simulate a lost write: the transport reports the result unknown.
     store
         .transact(|tx| {
-            tx.apply(&Effect::UpdateActionIntent {
+            tx.apply(&Effect::UpdateHostActionIntent {
                 action_id: action_id.clone(),
-                status: PrActionStatus::Unknown,
+                status: HostActionStatus::Unknown {
+                    reason: "transport dropped".into(),
+                },
+                authenticated_actor: None,
+                effects: vec![],
             })
         })
         .unwrap();
-    let gh = FixtureGithub::new();
+    let mut gh = FixtureGithub::new();
     // The outbox drain does not retry an `unknown` intent — it is
     // outstanding until reconciled by action ID.
-    let mut gh = gh;
     gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert!(gh.applied().is_empty());
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Unknown);
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown {
+            reason: "transport dropped".into()
+        }
+    );
     let outstanding = store
         .transact(|tx| workloop_core::projection::outstanding_actions(tx, &work_id))
         .unwrap();
     assert_eq!(outstanding, vec![action_id.clone()]);
 
-    // Reconciliation arrives keyed by the same action ID.
-    workloop_core::work::handle_observation(
+    // Reconciliation arrives keyed by the same action ID with the
+    // normalized effect the intent authorized.
+    handle_observation(
         &store,
         &config(),
         &Observation {
-            source_event_id: None,
+            delivery: None,
             subject_work_id: Some(work_id.clone()),
             subject_execution_id: Some(eid),
-            fact: ObservationFact::PrActionResult {
+            fact: ObservationFact::HostActionResult {
                 action_id: action_id.clone(),
-                action_kind: "publish_pr".into(),
-                result: ActionResult::Applied,
+                authenticated_actor: None,
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::RefPublished {
+                    repository: repo(),
+                    branch: "b".into(),
+                    produced: rev("head-x"),
+                    observed: rev("head-x"),
+                    relation: RefRelation::Equal,
+                }],
             },
             observed_unix_seconds: NOW,
         },
         NOW,
     )
     .unwrap();
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
 }
 
 #[test]
 fn head_bound_evidence_drives_success_only_for_the_current_head() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "k-g5");
-    store
-        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
-        .unwrap();
-    // Move the execution into waiting(ci) the way a clean exit +
-    // publish intent would.
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&eid)?.unwrap();
-            e.state = ExecutionState::Waiting;
-            e.waiting_reason = Some(WaitingReason::Ci);
-            record_finished_coding(tx, &eid)?;
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Ready,
-            })?;
-            // Completion requires the published PR: the applied
-            // publish intent the outbox would have produced.
-            tx.apply(&Effect::InsertPrActionIntent {
-                intent: PrActionIntent {
-                    action_id: "act-pub-1".into(),
-                    work_id: work_id.clone(),
-                    repository: "local/repo".into(),
-                    action: PrAction::PublishPr {
-                        branch: "work/w-1".into(),
-                        title: "t".into(),
-                        body: "b".into(),
-                    },
-                    status: PrActionStatus::Applied,
-                },
-            })
-        })
-        .unwrap();
+    let (work_id, eid) = waiting_with_applied_publish(&store, "k-g5");
     let gh = FixtureGithub::new();
-    let obs = |fact| Observation {
-        source_event_id: None,
-        subject_work_id: Some(work_id.clone()),
-        subject_execution_id: Some(eid.clone()),
-        fact,
-        observed_unix_seconds: NOW,
+    let emit = |fact: ObservationFact| {
+        gh.emit(&store, &config(), obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
     };
-    // The head already moved; evidence bound to the old head must not
-    // authorize the new one.
-    gh.emit(
-        &store,
-        &config(),
-        obs(ObservationFact::PrHead {
-            repository: "local/repo".into(),
-            number: 1,
-            head_sha: "new".into(),
-        }),
-        NOW,
-    )
-    .unwrap();
-    gh.emit(
-        &store,
-        &config(),
-        obs(ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "old".into(),
+    // The opened change and its current head.
+    emit(ObservationFact::ChangeHead {
+        change: change(),
+        head: rev("new"),
+    });
+    emit(ObservationFact::HostActionResult {
+        action_id: "act-pub-open".into(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::ChangeOpened {
+            change: change(),
+            head: rev("new"),
+            source_branch: format!("work/{}", work_id.0),
+            target_branch: "main".into(),
+        }],
+    });
+    // Evidence bound to a superseded target must not authorize the
+    // current one.
+    let stale_evidence = |emit: &dyn Fn(ObservationFact)| {
+        emit(ObservationFact::Check {
+            change: change(),
+            head: rev("old"),
+            check_id: "ci".into(),
+            producer: publisher(),
             conclusion: CheckConclusion::Success,
-        }),
-        NOW,
-    )
-    .unwrap();
-    gh.emit(
-        &store,
-        &config(),
-        obs(ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "old".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::Approve,
-        }),
-        NOW,
-    )
-    .unwrap();
+        });
+        emit(ObservationFact::Review {
+            target: target("old"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        });
+        emit(ObservationFact::Assessment {
+            target: target("old"),
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        });
+    };
+    stale_evidence(&emit);
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Waiting);
 
     // Evidence covering the current head completes it.
-    gh.emit(
-        &store,
-        &config(),
-        obs(ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "new".into(),
-            conclusion: CheckConclusion::Success,
-        }),
-        NOW,
-    )
-    .unwrap();
-    gh.emit(
-        &store,
-        &config(),
-        obs(ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "new".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::Approve,
-        }),
-        NOW,
-    )
-    .unwrap();
+    emit(ObservationFact::Check {
+        change: change(),
+        head: rev("new"),
+        check_id: "ci".into(),
+        producer: publisher(),
+        conclusion: CheckConclusion::Success,
+    });
+    emit(ObservationFact::Review {
+        target: target("new"),
+        source: "reviewer".into(),
+        source_revision: None,
+        completeness: Completeness::Complete,
+        occurrences: vec![],
+    });
+    emit(ObservationFact::Assessment {
+        target: target("new"),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Positive,
+            refs: vec![],
+        }],
+    });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Succeeded);
 }
@@ -384,6 +627,10 @@ fn head_bound_evidence_drives_success_only_for_the_current_head() {
 fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "k-g6");
+    authorize(
+        &store,
+        &[HostCapability::PushRef, HostCapability::ChangeRequestCreate],
+    );
     store
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();
@@ -406,7 +653,7 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Done,
                     process_identity: None,
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
@@ -420,32 +667,53 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
         })
         .unwrap();
     let mut gh = FixtureGithub::new();
-    let obs = |id: &str| Observation {
-        source_event_id: Some(id.into()),
+    let artifact_obs = |id: &str| Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: id.into(),
+        }),
         subject_work_id: Some(work_id.clone()),
         subject_execution_id: Some(eid.clone()),
         fact: ObservationFact::Artifact {
             invocation_id: InvocationId("inv-1".into()),
             required_artifact: "artifact.json".into(),
-            state: ArtifactFact::Present,
+            state: ArtifactFact::Present {
+                digest: "artifact-digest".into(),
+            },
         },
         observed_unix_seconds: NOW,
     };
-    // First report queues the publish intent; the outbox applies it.
-    gh.emit(&store, &config(), obs("art-1"), NOW).unwrap();
+    // First report queues the push intent; the outbox applies it and its
+    // applied receipt records the open intent, which the same drain
+    // applies — the receipt alone advances the chain.
+    gh.emit(&store, &config(), artifact_obs("art-1"), NOW)
+        .unwrap();
     assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied().len(), 1, "one PR published");
-    // A repeat of the same fact under a new delivery id must not queue
-    // a second publish — the applied intent already covers this work.
-    gh.emit(&store, &config(), obs("art-2"), NOW).unwrap();
-    gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert_eq!(
-        store.transact(|tx| tx.action_intents()).unwrap().len(),
-        1,
-        "no second publish intent"
+        gh.applied().len(),
+        2,
+        "the applied push receipt recorded and drained the open intent"
     );
-    assert_eq!(gh.applied().len(), 1, "still one PR published");
+    // A repeat of the same fact under a new delivery id is inert: no
+    // second push and no second open.
+    gh.emit(&store, &config(), artifact_obs("art-2"), NOW)
+        .unwrap();
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    let pushes = gh
+        .applied()
+        .iter()
+        .filter(|a| a.starts_with("push_ref:"))
+        .count();
+    assert_eq!(pushes, 1, "no second publish intent");
+    let opens = gh
+        .applied()
+        .iter()
+        .filter(|a| a.starts_with("open_change:"))
+        .count();
+    assert_eq!(opens, 1);
+    assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 2);
 }
 
 #[test]
@@ -455,10 +723,9 @@ fn terminal_execution_still_authorizes_outstanding_effect_reconciliation() {
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/terminal".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-t"),
         },
     );
     store
@@ -473,8 +740,8 @@ fn terminal_execution_still_authorizes_outstanding_effect_reconciliation() {
         .unwrap();
     let mut gh = FixtureGithub::new();
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-t"]);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
     assert_eq!(
         store
             .transact(|tx| tx.execution(&eid))
@@ -490,19 +757,20 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "execution-denial");
     let actions = [
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/restricted".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-r"),
         },
-        PrAction::UpdatePr {
-            number: 7,
-            expected_head: "head".into(),
-            body: "edited".into(),
+        HostAction::UpdateChangeRequest {
+            change: change(),
+            expected_head: rev("head"),
+            title: Some("edited".into()),
+            body: None,
         },
-        PrAction::PostPrComment {
-            number: 7,
-            expected_head: "head".into(),
+        HostAction::PostComment {
+            change: change(),
+            expected_head: rev("head"),
+            marker: "workloop".into(),
             body: "comment".into(),
         },
     ];
@@ -513,7 +781,7 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
     store
         .transact(|tx| {
             let mut execution = tx.execution(&eid)?.unwrap();
-            execution.allowed_effects.github_write = false;
+            execution.allowed_effects.host_write = false;
             tx.apply(&Effect::UpdateExecution {
                 execution,
                 expected_state: ExecutionState::Queued,
@@ -521,192 +789,186 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
         })
         .unwrap();
     let mut gh = FixtureGithub::new();
-    gh.set_head("local/repo", 7, "head");
+    gh.set_head("cr-1", "head");
     gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert!(gh.applied().is_empty());
     for id in &ids {
-        assert_eq!(intent_status(&store, id), PrActionStatus::Pending);
+        assert_eq!(intent_status(&store, id), HostActionStatus::Pending);
     }
 
     let (allowed_work, _) = submit(&store, "execution-allowed");
     let allowed_id = insert_intent(
         &store,
         &allowed_work,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/allowed".into(),
-            title: "allowed".into(),
-            body: "b".into(),
+            produced: rev("head-a"),
         },
     );
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied(), &["publish_pr:local/repo:8"]);
-    assert_eq!(intent_status(&store, &allowed_id), PrActionStatus::Applied);
+    assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-a"]);
+    assert_eq!(
+        intent_status(&store, &allowed_id),
+        HostActionStatus::Applied
+    );
 }
 
 #[test]
-fn github_write_denied_leaves_the_outbox_pending() {
+fn host_write_denied_leaves_the_outbox_pending() {
     let store = SqliteStore::in_memory(1).unwrap();
+    // The Work was admitted under a permissive installation, so the
+    // recorded execution grant allows the write — but the
+    // installation-level grant is the outermost control: a revoked
+    // `host_write` stops the drain even for a granted execution.
     let (work_id, _eid) = submit(&store, "k-g8");
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/w-1".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-1"),
         },
     );
-    // The installation default: GitHub writes are not granted.
-    let read_only = WorkloopConfig {
-        default_repository: "local/repo".into(),
-        allowed_effects: AllowedEffects {
-            workspace_write: true,
-            github_write: false,
-            network: false,
-        },
-        budget: ExecutionBudget::default(),
-    };
+    let mut read_only = config();
+    read_only.allowed_effects.host_write = false;
     let mut gh = FixtureGithub::new();
     gh.apply_outbox(&store, &read_only, NOW).unwrap();
     assert!(
         gh.applied().is_empty(),
-        "no GitHub mutation while github_write is denied"
+        "no host mutation while host_write is denied"
     );
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Pending);
     // The same recorded intent applies once the installation grants the
     // write — denial defers, it never reclassifies.
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-1"]);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+}
+
+/// A receipt that claims the change opened into a different target
+/// branch than the immutable intent authorized does not satisfy the
+/// effect match — applied evidence binds the whole payload.
+#[test]
+fn open_receipt_for_a_different_target_branch_is_unknown() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-wrong-target");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: "work/w-1".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    let receipt = handle_observation(
+        &store,
+        &config(),
+        &obs(
+            &work_id,
+            &eid,
+            Some("open-target-mismatch"),
+            NOW,
+            ObservationFact::HostActionResult {
+                action_id: action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("head-1"),
+                    source_branch: "work/w-1".into(),
+                    target_branch: "develop".into(),
+                }],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(receipt, IngestReceipt::Recorded);
+    assert!(
+        matches!(
+            intent_status(&store, &action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "a different target branch is not the recorded effect"
+    );
 }
 
 #[test]
-fn superseded_head_evidence_does_not_complete_the_work() {
+fn superseded_check_evidence_does_not_complete_the_work() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (work_id, eid) = submit(&store, "k-g7");
-    store
-        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
-        .unwrap();
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&eid)?.unwrap();
-            e.state = ExecutionState::Waiting;
-            e.waiting_reason = Some(WaitingReason::Ci);
-            record_finished_coding(tx, &eid)?;
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Ready,
-            })?;
-            tx.apply(&Effect::InsertPrActionIntent {
-                intent: PrActionIntent {
-                    action_id: "act-pub-2".into(),
-                    work_id: work_id.clone(),
-                    repository: "local/repo".into(),
-                    action: PrAction::PublishPr {
-                        branch: "work/w-1".into(),
-                        title: "t".into(),
-                        body: "b".into(),
-                    },
-                    status: PrActionStatus::Applied,
-                },
-            })
-        })
-        .unwrap();
+    let (work_id, eid) = waiting_with_applied_publish(&store, "k-g7");
     let gh = FixtureGithub::new();
-    let obs = |fact| Observation {
-        source_event_id: None,
-        subject_work_id: Some(work_id.clone()),
-        subject_execution_id: Some(eid.clone()),
-        fact,
-        observed_unix_seconds: NOW,
+    let emit = |fact: ObservationFact| {
+        gh.emit(&store, &config(), obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
     };
-    let emit = |fact| gh.emit(&store, &config(), obs(fact), NOW).unwrap();
-    emit(ObservationFact::PrHead {
-        repository: "local/repo".into(),
-        number: 3,
-        head_sha: "sha-1".into(),
+    emit(ObservationFact::HostActionResult {
+        action_id: "act-pub-open".into(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::ChangeOpened {
+            change: change(),
+            head: rev("sha-1"),
+            source_branch: format!("work/{}", work_id.0),
+            target_branch: "main".into(),
+        }],
     });
-    // A superseded success/approve must not complete the work: only the
-    // latest fact recorded for the current head decides.
-    emit(ObservationFact::PrChecks {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
+    emit(ObservationFact::ChangeHead {
+        change: change(),
+        head: rev("sha-1"),
+    });
+    // A superseded success must not complete the work: only the latest
+    // check recorded for the current head decides.
+    emit(ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: "ci".into(),
+        producer: publisher(),
         conclusion: CheckConclusion::Success,
     });
-    emit(ObservationFact::PrChecks {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
+    emit(ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: "ci".into(),
+        producer: publisher(),
         conclusion: CheckConclusion::Failure,
     });
-    emit(ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
-        reviewer: "rev".into(),
-        verdict: ReviewVerdict::Approve,
+    emit(ObservationFact::Review {
+        target: target("sha-1"),
+        source: "reviewer".into(),
+        source_revision: None,
+        completeness: Completeness::Complete,
+        occurrences: vec![],
     });
-    emit(ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
-        reviewer: "rev".into(),
-        verdict: ReviewVerdict::ChangesRequested,
+    emit(ObservationFact::Assessment {
+        target: target("sha-1"),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Positive,
+            refs: vec![],
+        }],
     });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(
         e.state,
         ExecutionState::Waiting,
-        "superseded approval cannot complete"
+        "the latest check is a failure; superseded success cannot complete"
     );
-    // A fresh pass over the same head still completes once the latest
-    // check and review are green.
-    emit(ObservationFact::PrChecks {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
+    // A fresh pass over the same head completes once the latest check is
+    // green again.
+    emit(ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: "ci".into(),
+        producer: publisher(),
         conclusion: CheckConclusion::Success,
-    });
-    emit(ObservationFact::PrReview {
-        repository: "local/repo".into(),
-        head_sha: "sha-1".into(),
-        reviewer: "rev".into(),
-        verdict: ReviewVerdict::Approve,
     });
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(e.state, ExecutionState::Succeeded);
-}
-
-/// Shared setup for completion-vs-evidence contract tests: an admitted
-/// Execution parked in `Waiting/Ci` with an applied `publish_pr` intent,
-/// so completion turns solely on check/review evidence for the head.
-fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
-    let (work_id, eid) = submit(store, key);
-    store
-        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
-        .unwrap();
-    store
-        .transact(|tx| {
-            let mut e = tx.execution(&eid)?.unwrap();
-            e.state = ExecutionState::Waiting;
-            e.waiting_reason = Some(WaitingReason::Ci);
-            record_finished_coding(tx, &eid)?;
-            tx.apply(&Effect::UpdateExecution {
-                execution: e,
-                expected_state: ExecutionState::Ready,
-            })?;
-            tx.apply(&Effect::InsertPrActionIntent {
-                intent: PrActionIntent {
-                    action_id: "act-pub-delayed".into(),
-                    work_id: work_id.clone(),
-                    repository: "local/repo".into(),
-                    action: PrAction::PublishPr {
-                        branch: "work/w-1".into(),
-                        title: "t".into(),
-                        body: "b".into(),
-                    },
-                    status: PrActionStatus::Applied,
-                },
-            })
-        })
-        .unwrap();
-    (work_id, eid)
 }
 
 #[test]
@@ -714,34 +976,73 @@ fn delayed_check_success_cannot_complete_the_work() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = waiting_with_applied_publish(&store, "k-g11");
     let gh = FixtureGithub::new();
-    let obs = |event: &str, at: i64, fact: ObservationFact| Observation {
-        source_event_id: Some(event.into()),
-        subject_work_id: Some(work_id.clone()),
-        subject_execution_id: Some(eid.clone()),
-        fact,
-        observed_unix_seconds: at,
-    };
     let emit = |event: &str, at: i64, fact: ObservationFact| {
-        gh.emit(&store, &config(), obs(event, at, fact), at)
-            .unwrap()
+        gh.emit(
+            &store,
+            &config(),
+            obs(&work_id, &eid, Some(event), at, fact),
+            at,
+        )
+        .unwrap()
     };
+    emit(
+        "opened",
+        NOW,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
     emit(
         "head-1",
         NOW,
-        ObservationFact::PrHead {
-            repository: "local/repo".into(),
-            number: 3,
-            head_sha: "sha-1".into(),
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev("sha-1"),
         },
     );
     // The current verdict for the head: a failing check observed at t+20.
     emit(
         "checks-fail",
         NOW + 20,
-        ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
+        ObservationFact::Check {
+            change: change(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
             conclusion: CheckConclusion::Failure,
+        },
+    );
+    emit(
+        "review-ok",
+        NOW + 20,
+        ObservationFact::Review {
+            target: target("sha-1"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
+    emit(
+        "assess-ok",
+        NOW + 20,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
         },
     );
     // A delayed delivery of an older green arrives after it and is still
@@ -751,20 +1052,12 @@ fn delayed_check_success_cannot_complete_the_work() {
     emit(
         "checks-late-ok",
         NOW + 10,
-        ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
+        ObservationFact::Check {
+            change: change(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
             conclusion: CheckConclusion::Success,
-        },
-    );
-    emit(
-        "review-ok",
-        NOW + 20,
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::Approve,
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
@@ -783,7 +1076,7 @@ fn delayed_check_success_cannot_complete_the_work() {
             o.observed_unix_seconds == NOW + 10
                 && matches!(
                     &o.fact,
-                    ObservationFact::PrChecks {
+                    ObservationFact::Check {
                         conclusion: CheckConclusion::Success,
                         ..
                     }
@@ -795,9 +1088,11 @@ fn delayed_check_success_cannot_complete_the_work() {
     emit(
         "checks-ok-new",
         NOW + 30,
-        ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
+        ObservationFact::Check {
+            change: change(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
             conclusion: CheckConclusion::Success,
         },
     );
@@ -806,77 +1101,97 @@ fn delayed_check_success_cannot_complete_the_work() {
 }
 
 #[test]
-fn delayed_review_approval_cannot_complete_the_work() {
+fn delayed_review_on_a_superseded_target_does_not_complete_the_work() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = waiting_with_applied_publish(&store, "k-g12");
     let gh = FixtureGithub::new();
-    let obs = |event: &str, at: i64, fact: ObservationFact| Observation {
-        source_event_id: Some(event.into()),
-        subject_work_id: Some(work_id.clone()),
-        subject_execution_id: Some(eid.clone()),
-        fact,
-        observed_unix_seconds: at,
-    };
     let emit = |event: &str, at: i64, fact: ObservationFact| {
-        gh.emit(&store, &config(), obs(event, at, fact), at)
-            .unwrap()
+        gh.emit(
+            &store,
+            &config(),
+            obs(&work_id, &eid, Some(event), at, fact),
+            at,
+        )
+        .unwrap()
     };
+    emit(
+        "opened",
+        NOW,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
     emit(
         "head-1",
         NOW,
-        ObservationFact::PrHead {
-            repository: "local/repo".into(),
-            number: 3,
-            head_sha: "sha-1".into(),
-        },
-    );
-    // The current verdict for the head: changes requested at t+20.
-    emit(
-        "review-changes",
-        NOW + 20,
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::ChangesRequested,
+        ObservationFact::ChangeHead {
+            change: change(),
+            head: rev("sha-1"),
         },
     );
     emit(
         "checks-ok",
         NOW + 20,
-        ObservationFact::PrChecks {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
+        ObservationFact::Check {
+            change: change(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
             conclusion: CheckConclusion::Success,
         },
     );
-    // A delayed approval observed earlier arrives last: recorded as
-    // evidence, but the newer ChangesRequested still decides.
     emit(
-        "review-late-ok",
+        "assess-ok",
+        NOW + 20,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+    // A delayed review over a superseded head arrives last: recorded as
+    // evidence and sealed as its own round, but a round bound to a stale
+    // target never satisfies the current-target review lane.
+    emit(
+        "review-late",
         NOW + 10,
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::Approve,
+        ObservationFact::Review {
+            target: target("sha-0"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(
         e.state,
         ExecutionState::Waiting,
-        "a delayed approval observed earlier cannot complete over the newer changes-requested"
+        "a round sealed over a superseded target cannot complete the current one"
     );
-    // A genuinely newer approval still completes the work.
+    // A review over the current head seals a matching round and completes.
     emit(
-        "review-ok-new",
+        "review-current",
         NOW + 30,
-        ObservationFact::PrReview {
-            repository: "local/repo".into(),
-            head_sha: "sha-1".into(),
-            reviewer: "rev".into(),
-            verdict: ReviewVerdict::Approve,
+        ObservationFact::Review {
+            target: target("sha-1"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
         },
     );
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
@@ -893,10 +1208,9 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/w-1".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-9"),
         },
     );
     store
@@ -918,13 +1232,13 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
                     role: InvocationRole::Coding,
                     state: InvocationState::Done,
                     process_identity: None,
-                    required_artifacts: vec!["artifact.json".into()],
+                    required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
             e.state = ExecutionState::Waiting;
-            e.waiting_reason = Some(WaitingReason::GithubWrite);
+            e.waiting_reason = Some(WaitingReason::HostWrite);
             tx.apply(&Effect::UpdateExecution {
                 execution: e,
                 expected_state: ExecutionState::Ready,
@@ -976,7 +1290,7 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
         &store,
         &config(),
         Observation {
-            source_event_id: None,
+            delivery: None,
             subject_work_id: Some(work_id.clone()),
             subject_execution_id: Some(eid.clone()),
             fact: ObservationFact::ProcessState {
@@ -998,14 +1312,14 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
         ExecutionState::Stopping,
         "terminal settlement defers while the publish intent is outstanding"
     );
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
-    // The outbox drains the intent: the PR opens, its result
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Pending);
+    // The outbox drains the intent: the ref is published, its result
     // reconciles the row, and the deferred cancellation lands only
     // after that reconciliation.
     let mut gh = gh;
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied(), &["publish_pr:local/repo:1"]);
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-9"]);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(
         e.state,
@@ -1025,10 +1339,9 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
     let action_id = insert_intent(
         &store,
         &work_id,
-        PrAction::PublishPr {
+        HostAction::PushRef {
             branch: "work/w-1".into(),
-            title: "t".into(),
-            body: "b".into(),
+            produced: rev("head-10"),
         },
     );
     store
@@ -1043,8 +1356,8 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
         .unwrap();
     // The budget is exhausted, but the work still has an outstanding
     // outbox effect: the terminal failure defers to reconciliation
-    // (lifecycle.md) instead of recording failure under a pending PR
-    // write the drain would still execute.
+    // (lifecycle.md) instead of recording failure under a pending write
+    // the drain would still execute.
     store
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();
@@ -1054,12 +1367,12 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
         ExecutionState::Queued,
         "terminal failure defers while the publish intent is outstanding"
     );
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Pending);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Pending);
     // Once the outbox reconciles the intent, the next admission pass
     // records the exhausted budget.
     let mut gh = FixtureGithub::new();
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(intent_status(&store, &action_id), PrActionStatus::Applied);
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
     store
         .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
         .unwrap();

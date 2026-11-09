@@ -1,6 +1,6 @@
-//! Fixture GitHub adapter: records `PrActionIntent` outbox rows and emits
-//! synthetic `pr_head`/`pr_checks`/`pr_review`/`pr_action_result`
-//! Observations under test control.
+//! Fixture host adapter: records `HostActionIntent` outbox rows and emits
+//! synthetic `change_head`/`host_action_result` Observations under test
+//! control.
 //!
 //! The adapter never mutates Execution state itself — every fact goes
 //! through `work::handle_observation` so the outbox row, the head
@@ -9,18 +9,23 @@
 
 use std::collections::BTreeMap;
 
-use workloop_core::observation::{ActionResult, Observation, ObservationFact};
-use workloop_core::store::{PrAction, PrActionStatus, Store, StoreError};
+use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
+use workloop_core::observation::{
+    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+};
+use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
-/// An in-memory GitHub the tests steer. `apply_outbox` drains recorded
+/// An in-memory host the tests steer. `apply_outbox` drains recorded
 /// intents in outbox order; each write re-reads the synthetic remote head
 /// immediately before applying, so an expected-head mismatch is detected
 /// exactly where a real adapter would detect it.
 #[derive(Debug, Default)]
 pub struct FixtureGithub {
-    /// `(repository, number)` → current head SHA.
-    prs: BTreeMap<(String, u64), String>,
+    /// `change_request_id` → current head object id.
+    changes: BTreeMap<String, String>,
+    /// `branch` → current head object id.
+    branches: BTreeMap<String, String>,
     next_number: u64,
     /// The write history, for test assertions.
     applied: Vec<String>,
@@ -31,19 +36,18 @@ impl FixtureGithub {
         Self::default()
     }
 
-    /// Test control: what the synthetic remote believes the PR head is.
-    pub fn set_head(&mut self, repository: &str, number: u64, head_sha: &str) {
-        self.prs
-            .insert((repository.to_string(), number), head_sha.to_string());
-        self.next_number = self.next_number.max(number);
+    /// Test control: what the synthetic remote believes the change head is.
+    pub fn set_head(&mut self, change_id: &str, head_object: &str) {
+        self.changes
+            .insert(change_id.to_string(), head_object.to_string());
     }
 
     pub fn applied(&self) -> &[String] {
         &self.applied
     }
 
-    /// Feed a synthetic Observation (pr_head, pr_checks, pr_review, an
-    /// externally-supplied pr_action_result…) through the same ingest
+    /// Feed a synthetic Observation (change_head, check, review, an
+    /// externally-supplied host_action_result…) through the same ingest
     /// pipeline a webhook delivery would use.
     pub fn emit(
         &self,
@@ -57,29 +61,32 @@ impl FixtureGithub {
 
     /// Attempt every outstanding (`pending`) outbox intent, in order.
     /// Each action's result — `applied`, `failed`, or `unknown` — is
-    /// recorded as a `pr_action_result` Observation keyed by action ID;
+    /// recorded as a `host_action_result` Observation keyed by action ID;
     /// `unknown` stays outstanding until reconciled.
     ///
-    /// Both the installation and the Execution must grant `github_write`.
-    /// Denied intents stay `pending`. This fixture performs no network I/O.
+    /// The Execution must grant `host_write`. Denied intents stay
+    /// `pending`. This fixture performs no network I/O.
     pub fn apply_outbox(
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
-        if !config.allowed_effects.github_write {
-            return Ok(());
-        }
         // Attempts are tracked so an intent that cannot make progress is
         // skipped for the rest of this pass — it neither loops the pass
         // forever nor blocks later independent intents (a retried stuck
         // intent may resolve on the next pass).
+        // The installation-level grant is the outermost control: a
+        // revoked `host_write` stops the drain even for executions that
+        // were admitted under a more permissive configuration.
+        if !config.allowed_effects.host_write {
+            return Ok(());
+        }
         let mut attempted = std::collections::HashSet::new();
         loop {
             let next = store.transact(|tx| {
                 Ok(tx.action_intents()?.into_iter().find(|i| {
-                    i.status == PrActionStatus::Pending && !attempted.contains(&i.action_id)
+                    i.status == HostActionStatus::Pending && !attempted.contains(&i.action_id)
                 }))
             })?;
             let Some(intent) = next else { return Ok(()) };
@@ -92,7 +99,7 @@ impl FixtureGithub {
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
-        intent: workloop_core::store::PrActionIntent,
+        intent: HostActionIntent,
         now: i64,
     ) -> Result<(), StoreError> {
         let work_id = intent.work_id.clone();
@@ -105,75 +112,126 @@ impl FixtureGithub {
         let Some(execution) = execution else {
             return Ok(());
         };
-        if !execution.allowed_effects.github_write {
+        if !execution.allowed_effects.host_write {
             return Ok(());
         }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
-            source_event_id: None,
+            delivery: None,
             subject_work_id: Some(work_id.clone()),
             subject_execution_id: execution_id.clone(),
             fact,
             observed_unix_seconds: now,
         };
+        let result =
+            |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
+                ObservationFact::HostActionResult {
+                    action_id,
+                    authenticated_actor: Some(intent.actor.clone()),
+                    status,
+                    effects,
+                }
+            };
 
         match &intent.action {
-            PrAction::PublishPr { branch, .. } => {
-                self.next_number += 1;
-                let number = self.next_number;
-                let head = format!("{}-head", branch);
-                self.prs
-                    .insert((intent.repository.clone(), number), head.clone());
-                self.applied
-                    .push(format!("publish_pr:{}:{}", intent.repository, number));
-                // The write produced a fresh remote fact: the PR head.
+            HostAction::PushRef { branch, produced } => {
+                self.branches
+                    .insert(branch.clone(), produced.object.clone());
+                self.applied.push(format!(
+                    "push_ref:{}:{}",
+                    intent.repository, produced.object
+                ));
                 self.emit(
                     store,
                     config,
-                    obs(ObservationFact::PrHead {
-                        repository: intent.repository.clone(),
-                        number,
-                        head_sha: head,
-                    }),
-                    now,
-                )?;
-                self.emit(
-                    store,
-                    config,
-                    obs(ObservationFact::PrActionResult {
-                        action_id: intent.action_id,
-                        action_kind: "publish_pr".into(),
-                        result: ActionResult::Applied,
-                    }),
+                    obs(result(
+                        intent.action_id,
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::RefPublished {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            produced: produced.clone(),
+                            observed: produced.clone(),
+                            relation: RefRelation::Equal,
+                        }],
+                    )),
                     now,
                 )?;
             }
-            PrAction::UpdatePr {
-                number,
-                expected_head,
+            HostAction::OpenChangeRequest {
+                source_branch,
+                target_branch,
                 ..
+            } => {
+                self.next_number += 1;
+                let change = ChangeRequestRef {
+                    repository: intent.repository.clone(),
+                    change_request: ChangeRequestId::trusted(format!("cr-{}", self.next_number)),
+                    display_number: Some(self.next_number),
+                };
+                let head_object = self
+                    .branches
+                    .get(source_branch)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{source_branch}-head"));
+                self.changes.insert(
+                    change.change_request.as_str().to_string(),
+                    head_object.clone(),
+                );
+                self.applied.push(format!(
+                    "open_change:{}:{}",
+                    intent.repository, change.change_request
+                ));
+                let head = CommitRevision::new(intent.repository.clone(), head_object)
+                    .map_err(|detail| StoreError::Internal { detail })?;
+                self.emit(
+                    store,
+                    config,
+                    obs(ObservationFact::ChangeHead {
+                        change: change.clone(),
+                        head: head.clone(),
+                    }),
+                    now,
+                )?;
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id,
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::ChangeOpened {
+                            change,
+                            head,
+                            source_branch: source_branch.clone(),
+                            target_branch: target_branch.clone(),
+                        }],
+                    )),
+                    now,
+                )?;
             }
-            | PrAction::PostPrComment {
-                number,
+            HostAction::UpdateChangeRequest {
+                change,
                 expected_head,
                 ..
             } => {
-                let kind = match &intent.action {
-                    PrAction::UpdatePr { .. } => "update_pr",
-                    _ => "post_pr_comment",
-                };
-                let actual = self.prs.get(&(intent.repository.clone(), *number)).cloned();
-                if actual.as_deref() == Some(expected_head.as_str()) {
-                    self.applied
-                        .push(format!("{kind}:{}:{number}", intent.repository));
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    self.applied.push(format!(
+                        "update_change:{}:{}",
+                        intent.repository, change.change_request
+                    ));
                     self.emit(
                         store,
                         config,
-                        obs(ObservationFact::PrActionResult {
-                            action_id: intent.action_id.clone(),
-                            action_kind: kind.into(),
-                            result: ActionResult::Applied,
-                        }),
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Applied,
+                            vec![NormalizedEffectFact::MetadataUpdated {
+                                change: change.clone(),
+                                head: expected_head.clone(),
+                                fields_digest: "fixture".into(),
+                            }],
+                        )),
                         now,
                     )?;
                 } else {
@@ -183,25 +241,71 @@ impl FixtureGithub {
                     self.emit(
                         store,
                         config,
-                        obs(ObservationFact::PrActionResult {
-                            action_id: intent.action_id.clone(),
-                            action_kind: kind.into(),
-                            result: ActionResult::Failed,
-                        }),
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
                         now,
                     )?;
                     if let Some(head) = actual {
                         self.emit(
                             store,
                             config,
-                            obs(ObservationFact::PrHead {
-                                repository: intent.repository.clone(),
-                                number: *number,
-                                head_sha: head,
+                            obs(ObservationFact::ChangeHead {
+                                change: change.clone(),
+                                head: CommitRevision::new(intent.repository.clone(), head)
+                                    .map_err(|detail| StoreError::Internal { detail })?,
                             }),
                             now,
                         )?;
                     }
+                }
+            }
+            HostAction::PostComment {
+                change,
+                expected_head,
+                marker,
+                ..
+            } => {
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    self.applied.push(format!(
+                        "post_comment:{}:{}",
+                        intent.repository, change.change_request
+                    ));
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Applied,
+                            vec![NormalizedEffectFact::CommentPosted {
+                                change: change.clone(),
+                                comment_id: format!("c-{}", intent.action_id),
+                                actor: intent.actor.clone(),
+                                marker: marker.clone(),
+                                body_digest: "fixture".into(),
+                                target: None,
+                            }],
+                        )),
+                        now,
+                    )?;
+                } else {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
                 }
             }
         }

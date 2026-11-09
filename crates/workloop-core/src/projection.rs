@@ -1,13 +1,16 @@
-//! Read-only derived state over the store. Queries never refresh GitHub or
-//! start a worker; every view is shaped from saved Work/Execution/Invocation
-//! records and Observations — there is no separate card state.
+//! Read-only derived state over the store. Queries never refresh the host
+//! or start a worker; every view is shaped from saved Work/Execution/
+//! Invocation records and Observations — there is no separate card state.
 
 use serde::{Deserialize, Serialize};
 
 use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
-use crate::observation::{ArtifactFact, ObservationFact, Outcome, ProcessStateFact};
-use crate::store::{Deferral, PrActionStatus, ReadView, StoreError};
+use crate::identity::{ChangeRequestRef, CommitRevision};
+use crate::observation::{
+    ArtifactFact, HostActionStatus, ObservationFact, Outcome, ProcessStateFact,
+};
+use crate::store::{Deferral, ReadView, StoreError};
 
 /// Whether a source's evidence could actually be read. An unavailable or
 /// unknown source is not evidence of a clean result — an empty finding
@@ -83,10 +86,13 @@ pub struct ExecutionView {
     pub outcome: Option<Outcome>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrRef {
-    pub repository: String,
-    pub number: u64,
+/// One finding the detail pane displays: the occurrence id a
+/// `JudgeFindings` decision names, plus the source-supplied key for
+/// display. Identity is the occurrence id, never the display text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FindingView {
+    pub occurrence_id: String,
+    pub source_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,9 +101,15 @@ pub struct WorkDetailView {
     pub version: u64,
     pub current_execution_id: Option<ExecutionId>,
     pub executions: Vec<ExecutionView>,
-    pub current_pr: Option<(PrRef, Option<String>)>,
-    /// Findings bound to the current head; older revisions stay in evidence.
-    pub findings: Vec<String>,
+    /// The change request the Work opened and its latest observed head.
+    pub current_change: Option<(ChangeRequestRef, Option<CommitRevision>)>,
+    /// The Work's latest sealed review round's occurrences; older
+    /// revisions stay in evidence.
+    pub findings: Vec<FindingView>,
+    /// The sealed round id those findings belong to.
+    pub current_round_id: Option<String>,
+    /// Judgments already recorded on the latest round's occurrence ids.
+    pub judged: Vec<String>,
     pub outcome: Option<Outcome>,
     pub attention: Vec<AttentionView>,
     pub evidence: Vec<String>,
@@ -236,7 +248,12 @@ fn attention_views(
             evidence: execution
                 .outcome
                 .as_ref()
-                .map(|o| o.evidence_refs.clone())
+                .map(|o| {
+                    o.evidence_refs
+                        .iter()
+                        .map(|r| r.id.clone())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default(),
             investigation_threshold_seconds: threshold,
             next_actor: "operator".into(),
@@ -284,6 +301,24 @@ fn attention_views(
             }
         }
         _ => {}
+    }
+    // No-progress: durable usage says nothing material happened inside the
+    // policy window. Attention only — never proof of termination.
+    if matches!(
+        execution.state,
+        ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting
+    ) && let (Some(work), Some(usage)) = (tx.work(work_id)?, tx.work_usage(work_id)?)
+        && let Some(first) = usage.first_dispatch_unix_seconds
+    {
+        let last = usage.last_progress_unix_seconds.unwrap_or(first);
+        if now_unix_seconds - last >= work.policy.no_progress_seconds as i64 {
+            push(
+                "no_progress",
+                format!("{last}+{}", work.policy.no_progress_seconds),
+                Some(work.policy.no_progress_seconds),
+                "investigate progress; the Work has produced no material evidence",
+            );
+        }
     }
     Ok(out)
 }
@@ -365,52 +400,66 @@ pub fn work_detail(
     let outcome = current.as_ref().and_then(|e| e.outcome.clone());
 
     let observations = tx.observations_for_work(work_id)?;
-    let current_pr = observations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, obs)| match &obs.fact {
-            ObservationFact::PrHead {
-                repository,
-                number,
-                head_sha,
-            } => Some((
-                (obs.observed_unix_seconds, index),
-                (
-                    PrRef {
-                        repository: repository.clone(),
-                        number: *number,
-                    },
-                    Some(head_sha.clone()),
-                ),
-            )),
-            _ => None,
-        })
-        .max_by_key(|(order, _)| *order)
-        .map(|(_, pr)| pr);
+    // The opened change request (verified receipts only — the same gate
+    // `current_target` applies) and its latest observed head.
+    let change: Option<ChangeRequestRef> =
+        crate::work::applied_opened_change(tx, work_id)?.map(|(c, _)| c);
+    let current_change = change.map(|c| {
+        let head = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, obs)| match &obs.fact {
+                ObservationFact::ChangeHead { change: hc, head } if hc == &c => {
+                    Some((obs.observed_unix_seconds, index, head.clone()))
+                }
+                _ => None,
+            })
+            .max_by_key(|(t, i, _)| (*t, *i))
+            .map(|(_, _, h)| h);
+        (c, head)
+    });
+    // Findings on the latest sealed round for the CURRENT diff target.
+    // Rounds sealed for superseded targets are recorded evidence but
+    // never mask or substitute the current surface — and a round that
+    // does not bind the current target cannot be judged anyway
+    // (`current_round_for` rejects it).
+    let target = crate::work::current_target(tx, work_id)?;
     let mut findings = Vec::new();
+    let mut judged = Vec::new();
+    let mut current_round_id = None;
     let mut sources = vec![store_source()];
-    if let Some((_, Some(head))) = &current_pr {
-        let mut has_review_for_head = false;
-        for obs in &observations {
-            if let ObservationFact::PrReview {
-                head_sha,
-                reviewer,
-                verdict,
-                ..
-            } = &obs.fact
-                && head_sha == head
-            {
-                has_review_for_head = true;
-                findings.push(format!("review by {reviewer} at {head_sha}: {verdict:?}"));
+    let current_round = match &target {
+        Some(t) => crate::work::latest_round_for_target(tx, work_id, t)?,
+        None => None,
+    };
+    if let Some(round) = current_round {
+        current_round_id = Some(round.id.clone());
+        for o in tx.occurrences(&round.id)? {
+            findings.push(FindingView {
+                occurrence_id: o.id,
+                source_key: o.source_key,
+            });
+        }
+        if let Some(j) = tx.judgment_for_round(&round.id)? {
+            for d in &j.decisions {
+                judged.push(format!("{}:{:?}", d.occurrence_id, d.choice));
             }
         }
         sources.push(SourceStatus {
-            source: "github:review".into(),
-            availability: if has_review_for_head {
+            source: format!("review:{}", round.source),
+            availability: if round.completeness == "complete" {
                 Availability::Known
             } else {
-                Availability::Unknown
+                Availability::Unavailable
             },
+            observed_unix_seconds: None,
+        });
+    } else if current_change.is_some() {
+        // A published change with no sealed round: the review evidence
+        // has not been read — an empty finding list proves nothing.
+        sources.push(SourceStatus {
+            source: "review".into(),
+            availability: Availability::Unavailable,
             observed_unix_seconds: None,
         });
     }
@@ -426,9 +475,12 @@ pub fn work_detail(
                 state,
                 ..
             } => evidence.push(format!("artifact:{required_artifact}:{state:?}")),
-            ObservationFact::PrActionResult {
-                action_id, result, ..
-            } => evidence.push(format!("pr_action:{action_id}:{result:?}")),
+            ObservationFact::HostActionResult {
+                action_id, status, ..
+            } => evidence.push(format!("host_action:{action_id}:{status:?}")),
+            ObservationFact::Issue { issue, state, .. } => {
+                evidence.push(format!("issue:{issue}:{state:?}"))
+            }
             _ => {}
         }
     }
@@ -439,8 +491,10 @@ pub fn work_detail(
             version: work.version,
             current_execution_id: current.map(|e| e.id),
             executions,
-            current_pr,
+            current_change,
             findings,
+            current_round_id,
+            judged,
             outcome,
             attention,
             evidence,
@@ -550,14 +604,18 @@ pub fn outstanding_actions(tx: &dyn ReadView, work_id: &WorkId) -> Result<Vec<St
         .into_iter()
         .filter(|i| {
             &i.work_id == work_id
-                && matches!(i.status, PrActionStatus::Pending | PrActionStatus::Unknown)
+                && matches!(
+                    i.status,
+                    HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+                )
         })
         .map(|i| i.action_id)
         .collect())
 }
 
 /// Whether recorded evidence covers a clean exit: every required artifact
-/// of the Invocation was reported `Present`.
+/// of the Invocation was reported `Present` with a digest matching any
+/// declared expectation.
 pub fn artifacts_complete(
     tx: &dyn ReadView,
     execution_id: &ExecutionId,
@@ -571,8 +629,11 @@ pub fn artifacts_complete(
                 ObservationFact::Artifact {
                     invocation_id,
                     required_artifact,
-                    state: ArtifactFact::Present,
-                } if invocation_id == &invocation.id && required_artifact == req
+                    state: ArtifactFact::Present { digest },
+                } if invocation_id == &invocation.id
+                    && required_artifact == &req.kind
+                    && !digest.is_empty()
+                    && req.expected_digest.as_ref().is_none_or(|e| e == digest)
             )
         })
     }))
