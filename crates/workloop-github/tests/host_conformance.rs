@@ -18,6 +18,7 @@ use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_github::fixture::FixtureGithub;
+use workloop_github::gitlab_fixture::GitlabFixture;
 use workloop_github::sparse_fixture::SparseHost;
 use workloop_store::sqlite::SqliteStore;
 
@@ -99,6 +100,30 @@ impl OutboxHost for FixtureGithub {
     }
     fn set_change_head(&mut self, _repository: &RepositoryRef, change_id: &str, head: &str) {
         self.set_head(change_id, head);
+    }
+    fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
+        self.emit(store, config, observation, NOW).unwrap();
+    }
+}
+
+impl OutboxHost for GitlabFixture {
+    fn declared_names(&self) -> BTreeSet<&'static str> {
+        GitlabFixture::declared_capabilities()
+            .iter()
+            .copied()
+            .collect()
+    }
+    fn apply(&mut self, store: &SqliteStore, config: &WorkloopConfig) {
+        self.apply_outbox(store, config, NOW).unwrap();
+    }
+    fn applied(&self) -> &[String] {
+        self.applied()
+    }
+    fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+        self.remote_head(repository, branch)
+    }
+    fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str) {
+        self.set_head(repository, change_id, head);
     }
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
         self.emit(store, config, observation, NOW).unwrap();
@@ -995,6 +1020,331 @@ fn sparse_host_runs_the_same_suite_within_its_declared_set() {
         vec!["HC-BASE-03/04 expected-head mismatch aborts head-bound writes"]
     );
     assert_eq!(covered_ids.len(), scenarios().len() - 1);
+}
+
+/// `GitlabFixture` — a remote model whose change-request identity is a
+/// per-project IID and whose head follows the source branch — runs the
+/// unchanged suite within its declared set. Its declared set differs
+/// from `FixtureGithub`'s (no `issue_read`) yet still covers every
+/// scenario's requirement list, so no row is skipped.
+#[test]
+fn gitlab_fixture_runs_the_same_suite_within_its_declared_set() {
+    let mut fixture = GitlabFixture::new();
+    let (covered_ids, skipped_ids) = run_suite(&mut fixture);
+    assert_eq!(skipped_ids, Vec::<&'static str>::new());
+    assert_eq!(covered_ids.len(), scenarios().len(), "{covered_ids:?}");
+}
+
+/// The capability difference is part of the contract surface: this
+/// fixture does not declare `issue_read`, so a source-bound Work is
+/// rejected `unsupported_capability` at admission — the declared set
+/// stays explicit, never an assumed default.
+#[test]
+fn gitlab_fixture_undeclared_issue_read_rejects_source_bound_work() {
+    let fixture = GitlabFixture::new();
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config_for(&fixture);
+    let d = handle_command(
+        &store,
+        &config,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("conformance".into()),
+            idempotency_key: "u92-issue-read".into(),
+            body: CommandBody::Submit {
+                intent: "needs issue_read".into(),
+                sources: vec![SourceSnapshot {
+                    issue: IssueRef {
+                        repository: repo(),
+                        issue: IssueId::trusted("1"),
+                        display_number: Some(1),
+                    },
+                    source_revision: "r1".into(),
+                    content_digest: "d1".into(),
+                }],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    match d {
+        CommandDecision::Rejected { reason, .. } => {
+            assert_eq!(reason, RejectionCode::UnsupportedCapability);
+        }
+        other => panic!("undeclared issue_read must reject: {other:?}"),
+    }
+}
+
+/// Approval and readiness are not in this contract version's
+/// vocabulary: neither a capability declaration nor an applied receipt
+/// for them is constructible, so an unsupported approval/ready can
+/// never be counted as applied — the unsupported state stays explicit
+/// at the type level on every conforming fixture.
+#[test]
+fn approval_and_ready_stay_explicitly_unsupported() {
+    for name in [
+        "approve",
+        "ready",
+        "mark_ready",
+        "review_feedback",
+        "request_changes",
+        "inline_comment",
+        "thread_reply",
+    ] {
+        assert_eq!(
+            HostCapability::from_name(name),
+            None,
+            "capability {name} cannot be declared in this contract version"
+        );
+    }
+    for action in [
+        serde_json::json!({ "action": "approve_change" }),
+        serde_json::json!({ "action": "mark_ready" }),
+        serde_json::json!({ "action": "resolve_thread" }),
+    ] {
+        assert!(
+            serde_json::from_value::<HostAction>(action.clone()).is_err(),
+            "action payload {action} cannot deserialize — no applied receipt is constructible"
+        );
+    }
+}
+
+/// On this host the IID namespace is per-project: the *first* merge
+/// request on two different repositories is `!1` on both — two change
+/// requests sharing `change_request` identity that stay distinct only
+/// through the scoped (repository, IID) pair. Receipts, remote reads,
+/// and head-bound writes must keep them apart.
+#[test]
+fn gitlab_fixture_reuses_iid_across_projects_without_aliasing() {
+    let mut fixture = GitlabFixture::new();
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config_for(&fixture);
+    let (work_a, _ea) = submit(&store, &config, "u92-iid-a");
+    let (work_b, _eb) = submit(&store, &config, "u92-iid-b");
+
+    // Both repositories open their first merge request: identical
+    // `!1` change-request identity, different scoped refs.
+    let mut opens = Vec::new();
+    for (work, repository, object) in [(&work_a, repo(), "head-a"), (&work_b, repo_b(), "head-b")] {
+        insert_intent(
+            &store,
+            work,
+            &repository,
+            HostAction::PushRef {
+                branch: format!("work/{object}"),
+                produced: rev_on(&repository, object),
+            },
+        );
+        let open_id = insert_intent(
+            &store,
+            work,
+            &repository,
+            HostAction::OpenChangeRequest {
+                source_branch: format!("work/{object}"),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+        );
+        opens.push(open_id);
+    }
+    fixture.apply(&store, &config);
+
+    let mut changes = Vec::new();
+    for open_id in &opens {
+        match &intent(&store, open_id).effects[..] {
+            [NormalizedEffectFact::ChangeOpened { change, .. }] => {
+                assert_eq!(change.display_number, Some(1));
+                changes.push(change.clone());
+            }
+            other => panic!("open receipt missing ChangeOpened: {other:?}"),
+        }
+    }
+    let [change_a, change_b] = &changes[..] else {
+        panic!("expected two opens")
+    };
+    assert_eq!(change_a.repository, repo());
+    assert_eq!(change_b.repository, repo_b());
+    // The unscoped identity collides exactly as it does on a real
+    // IID-numbered host — only the repository scope separates them.
+    assert_eq!(
+        change_a.change_request, change_b.change_request,
+        "both are `!1` in their own project namespace"
+    );
+    assert_ne!(
+        change_a, change_b,
+        "the scoped refs are different change requests"
+    );
+
+    // Moving repo A's `!1` head leaves repo B's `!1` untouched: the
+    // head-bound write against repo B's recorded head still applies,
+    // while the same write against repo A's old head aborts.
+    fixture.set_head(&repo(), change_a.change_request.as_str(), "moved-a");
+    let comment_b = insert_intent(
+        &store,
+        &work_b,
+        &repo_b(),
+        HostAction::PostComment {
+            change: change_b.clone(),
+            expected_head: rev_on(&repo_b(), "head-b"),
+            marker: "scope-check".into(),
+            body: "b".into(),
+        },
+    );
+    let comment_a = insert_intent(
+        &store,
+        &work_a,
+        &repo(),
+        HostAction::PostComment {
+            change: change_a.clone(),
+            expected_head: rev_on(&repo(), "head-a"),
+            marker: "scope-check".into(),
+            body: "b".into(),
+        },
+    );
+    fixture.apply(&store, &config);
+    assert_eq!(
+        intent(&store, &comment_b).status,
+        HostActionStatus::Applied,
+        "repo B's `!1` keeps its own head"
+    );
+    assert!(
+        matches!(
+            intent(&store, &comment_a).status,
+            HostActionStatus::Failed { .. }
+        ),
+        "repo A's `!1` saw its head move"
+    );
+}
+
+/// An `open_change_request` whose source branch does not exist on the
+/// remote is a `failed` receipt on this host — never an invented head,
+/// never an applied claim.
+#[test]
+fn gitlab_fixture_open_without_source_branch_is_a_failed_receipt() {
+    let mut fixture = GitlabFixture::new();
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config_for(&fixture);
+    let (work_id, _eid) = submit(&store, &config, "u92-open-absent");
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        &repo(),
+        HostAction::OpenChangeRequest {
+            source_branch: "work/never-pushed".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+    );
+    fixture.apply(&store, &config);
+    match intent(&store, &action_id).status {
+        HostActionStatus::Failed { ref reason } => {
+            assert!(
+                reason.contains("source branch"),
+                "absent branch fails explicitly: {reason}"
+            );
+        }
+        other => panic!("absent-branch open must not apply: {other:?}"),
+    }
+    assert!(fixture.applied().is_empty(), "no write landed");
+    assert!(
+        fixture.remote_head(&repo(), "work/never-pushed").is_none(),
+        "no head was invented"
+    );
+}
+
+/// The head follows the source branch: pushing again to an open merge
+/// request's source branch moves the change-request head, the remote
+/// reports the fresh head, and a head-bound write recorded against the
+/// superseded head aborts — the same contract outcome as a direct head
+/// move, produced by the push mechanism.
+#[test]
+fn push_to_an_open_merge_requests_source_branch_surfaces_the_new_head() {
+    let mut fixture = GitlabFixture::new();
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config_for(&fixture);
+    let (work_id, _eid) = submit(&store, &config, "u92-head-follow");
+    insert_intent(
+        &store,
+        &work_id,
+        &repo(),
+        HostAction::PushRef {
+            branch: "work/tracked".into(),
+            produced: rev("head-1"),
+        },
+    );
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        &repo(),
+        HostAction::OpenChangeRequest {
+            source_branch: "work/tracked".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+    );
+    fixture.apply(&store, &config);
+    let change = match &intent(&store, &open_id).effects[..] {
+        [NormalizedEffectFact::ChangeOpened { change, .. }] => change.clone(),
+        other => panic!("open receipt missing ChangeOpened: {other:?}"),
+    };
+
+    // A second push to the tracked branch moves the merge request's
+    // head — the remote reports it as a fresh change_head observation.
+    insert_intent(
+        &store,
+        &work_id,
+        &repo(),
+        HostAction::PushRef {
+            branch: "work/tracked".into(),
+            produced: rev("head-2"),
+        },
+    );
+    fixture.apply(&store, &config);
+    let heads: Vec<CommitRevision> = store
+        .transact(|tx| {
+            Ok(tx
+                .all_observations()?
+                .into_iter()
+                .filter_map(|o| match o.fact {
+                    ObservationFact::ChangeHead { change: c, head } if c == change => Some(head),
+                    _ => None,
+                })
+                .collect())
+        })
+        .unwrap();
+    assert!(
+        heads.iter().any(|h| h == &rev("head-2")),
+        "the moved head is reported: {heads:?}"
+    );
+
+    // A write recorded against the superseded head now aborts.
+    let update_id = insert_intent(
+        &store,
+        &work_id,
+        &repo(),
+        HostAction::UpdateChangeRequest {
+            change: change.clone(),
+            expected_head: rev("head-1"),
+            title: Some("edited".into()),
+            body: None,
+        },
+    );
+    fixture.apply(&store, &config);
+    assert!(
+        matches!(
+            intent(&store, &update_id).status,
+            HostActionStatus::Failed { .. }
+        ),
+        "the stale-head write aborts under the branch-following model"
+    );
 }
 
 /// An unsupported operation is reported as a failed receipt naming the

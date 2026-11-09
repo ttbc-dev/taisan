@@ -22,6 +22,11 @@ use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 /// exactly where a real adapter would detect it.
 #[derive(Debug, Default)]
 pub struct FixtureGithub {
+    /// When set, the adapter serves only this host instance: intents
+    /// recorded for another instance are left `pending` for their own
+    /// adapter — an effect never migrates across hosts. `None` drains
+    /// every intent (legacy test/driver behavior).
+    bound_host: Option<workloop_core::identity::HostInstanceId>,
     /// `change_request_id` → current head object id. Change-request ids
     /// are globally unique (the provider's stable identity), while
     /// display numbers are per-repository below.
@@ -41,6 +46,15 @@ pub struct FixtureGithub {
 impl FixtureGithub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bound to one host instance — the adapter drains only intents
+    /// recorded for `host`.
+    pub fn for_host(host: workloop_core::identity::HostInstanceId) -> Self {
+        Self {
+            bound_host: Some(host),
+            ..Self::default()
+        }
     }
 
     /// Test control: what the synthetic remote believes the change head is.
@@ -118,6 +132,16 @@ impl FixtureGithub {
         intent: HostActionIntent,
         now: i64,
     ) -> Result<(), StoreError> {
+        // Not this instance's intent: leave it pending for the adapter
+        // bound to the recorded host — an effect never migrates across
+        // host instances.
+        if self
+            .bound_host
+            .as_ref()
+            .is_some_and(|bound| *bound != intent.host)
+        {
+            return Ok(());
+        }
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
             Ok(tx
