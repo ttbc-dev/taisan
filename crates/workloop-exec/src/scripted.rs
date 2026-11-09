@@ -288,6 +288,22 @@ impl ProcessControlPort for ScriptedProcessControl {
         Ok(out)
     }
 
+    fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String> {
+        let s = self.state.lock().unwrap();
+        // Every process in the group — orphans that reparented out of
+        // the ppid tree keep the recorded group, exactly the coverage
+        // `snapshot_descendants` cannot give once the leader is gone.
+        Ok(s.procs
+            .iter()
+            .filter(|(_, p)| p.pgid == Some(pgid))
+            .map(|(pid, p)| ProcessIdentity {
+                pid: *pid,
+                started_at: p.started_at.clone(),
+                pgid: p.pgid,
+            })
+            .collect())
+    }
+
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
         let s = self.state.lock().unwrap();
         let Some(p) = s.procs.get(&identity.pid) else {

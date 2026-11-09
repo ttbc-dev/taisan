@@ -261,6 +261,13 @@ trait WorkerHandle {
     }
     /// Every writer this provider spawned exits now.
     fn exit_writers(&mut self);
+    /// Spawn a writer through the provider's own port, outside the
+    /// supervisor — models the first leg of a delivered-twice request:
+    /// a consumer that already recorded an identity for it.
+    fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity;
+    /// Whether the most recently spawned writer currently inspects
+    /// alive — a provider-neutral read on the recorded identity.
+    fn writer_alive(&self) -> bool;
     /// Toggle whether the recorded writer's liveness is uninspectable.
     /// Providers that cannot model this do not declare
     /// `liveness_unknown` and are skipped for the row.
@@ -269,6 +276,10 @@ trait WorkerHandle {
     fn fail_next_spawn(&mut self, f: SpawnFail);
     /// Spawn calls observed so far — the no-second-writer counter.
     fn spawns(&self) -> usize;
+    /// Signals the port verifiably delivered — the signal audit used to
+    /// prove a signal landed while settlement still waits. Providers
+    /// without a signal log do not declare `signal_audit`.
+    fn signals_sent(&self) -> usize;
     /// The managed workspace of a Work.
     fn workspace(&self, work: &WorkId) -> PathBuf;
     /// Block until the provider's writers have exited (a real process
@@ -309,6 +320,9 @@ impl ProcessControlPort for CountingPosix {
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
+    }
+    fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String> {
+        PosixProcessControl.group_members(pgid)
     }
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
         PosixProcessControl.inspect(identity)
@@ -385,6 +399,20 @@ impl WorkerHandle for PosixProvider {
             unsafe { libc::kill(id.pid, libc::SIGKILL) };
         }
     }
+    fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
+        self.sup
+            .port
+            .spawn(&self.sup.worker_argv.clone(), cwd)
+            .expect("direct spawn")
+    }
+    fn writer_alive(&self) -> bool {
+        self.spawned.borrow().last().is_some_and(|id| {
+            matches!(
+                PosixProcessControl.inspect(id),
+                ProcessEvidence::Alive { .. }
+            )
+        })
+    }
     fn set_liveness_unknown(&mut self, _on: bool) {
         unreachable!("PosixProvider does not declare liveness_unknown")
     }
@@ -402,6 +430,9 @@ impl WorkerHandle for PosixProvider {
     }
     fn spawns(&self) -> usize {
         self.spawned.borrow().len()
+    }
+    fn signals_sent(&self) -> usize {
+        unreachable!("PosixProvider does not declare signal_audit")
     }
     fn workspace(&self, work: &WorkId) -> PathBuf {
         self.sup.workspace_of(work)
@@ -446,6 +477,7 @@ impl WorkerProvider for ScriptedProvider {
             "liveness_unknown",
             "stop_signal",
             "spawn_count",
+            "signal_audit",
         ]
     }
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
@@ -495,6 +527,17 @@ impl WorkerHandle for ScriptedProvider {
     fn exit_writers(&mut self) {
         self.port.exit_all(0);
     }
+    fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
+        self.port
+            .spawn(&["scripted".into()], cwd)
+            .expect("direct spawn")
+    }
+    fn writer_alive(&self) -> bool {
+        self.port
+            .spawned()
+            .last()
+            .is_some_and(|id| matches!(self.port.inspect(id), ProcessEvidence::Alive { .. }))
+    }
     fn set_liveness_unknown(&mut self, on: bool) {
         let spawned = self.port.spawned();
         let leader = spawned.last().expect("a spawned writer").pid;
@@ -513,6 +556,9 @@ impl WorkerHandle for ScriptedProvider {
     }
     fn spawns(&self) -> usize {
         self.port.spawn_calls()
+    }
+    fn signals_sent(&self) -> usize {
+        self.port.signals().len()
     }
     fn workspace(&self, work: &WorkId) -> PathBuf {
         self.sup.workspace_of(work)
@@ -547,33 +593,77 @@ fn drive_until(
     panic!("timed out waiting for {what}");
 }
 
-/// WC-START-01: the same request delivered twice reconciles by request
-/// identity — one Invocation, one writer, no second spawn.
+/// WC-START-01: the same durable request delivered a second time — to
+/// a consumer that finds a recorded Invocation for it — reconciles by
+/// request identity: it inspects the recorded writer, never spawns
+/// another.
 fn duplicate_request_delivery_starts_no_second_writer(
     p: &mut dyn WorkerHandle,
     store: &SqliteStore,
 ) {
-    let (_w, eid) = submit_and_admit(store, &config(), "wc-start-1");
+    let (work_id, eid) = submit_and_admit(store, &config(), "wc-start-1");
+    let request = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request");
+    // The delivered-twice window: a first consumer already spawned and
+    // recorded a writer identity for this request, and the durable
+    // request is presented again while still unconsumed — the handoff
+    // mark was lost between delivery and consumption.
+    let ws = p.workspace(&work_id);
+    std::fs::create_dir_all(&ws).unwrap();
+    let identity = p.spawn_direct(&ws);
+    store
+        .transact(|tx| {
+            let inv_id = tx.alloc_id("inv")?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(inv_id),
+                    request_id: request.request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(identity),
+                    descendants: vec![],
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                },
+            })
+        })
+        .unwrap();
+    let spawns_before = p.spawns();
     p.consume(store);
     p.consume(store);
-    p.consume(store);
-    assert_eq!(p.spawns(), 1, "a replayed request never spawns again");
+    assert_eq!(
+        p.spawns(),
+        spawns_before,
+        "a re-delivered request reconciles the recorded writer — no second spawn"
+    );
     assert_eq!(
         invocations(store, &eid).len(),
         1,
         "one Invocation per request"
     );
+    // The reconcile path really ran: it inspected the recorded writer
+    // and re-asserted it running — it did not skip the request.
+    assert_eq!(execution(store, &eid).state, ExecutionState::Running);
     p.exit_writers();
 }
 
 /// WC-START-02: a start whose outcome was lost leaves the writer
-/// uncertain — never a silent NotStarted that permits a replacement.
+/// uncertain — never a silent not-started that permits a replacement.
+/// Repeated loop passes reconcile the unidentifiable Invocation through
+/// the poll path: uncertainty is re-reported, a second start never is.
 fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (_w, eid) = submit_and_admit(store, &config(), "wc-start-2");
     p.fail_next_spawn(SpawnFail::Unknown);
     p.consume(store);
-    p.consume(store);
-    p.consume(store);
+    // Re-drive the loop: the poll path re-reports the unidentifiable
+    // Invocation as unknown — reconciliation, never a second start.
+    p.pass(store);
+    p.pass(store);
     assert_eq!(
         p.spawns(),
         1,
@@ -586,6 +676,11 @@ fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store:
             && invocations[0].process_identity.is_none(),
         "an unrecorded start never claims a writer identity: {:?}",
         invocations[0].state
+    );
+    assert_eq!(
+        execution(store, &eid).state,
+        ExecutionState::Uncertain,
+        "the Execution stays uncertain — never silently not-started"
     );
 }
 
@@ -635,24 +730,55 @@ fn unknown_liveness_is_not_death(p: &mut dyn WorkerHandle, store: &SqliteStore) 
     p.exit_writers();
 }
 
-/// WC-STOP-01: a stop request/signal is not stop proof — the Execution
-/// reaches a terminal cancel only after every recorded writer is
-/// inspected stopped.
+/// WC-STOP-01: a cancel request is not terminal — while the recorded
+/// writer is provably alive the Execution sits in `stopping`, and it
+/// reaches `cancelled` only after the stop pass verifies the writer
+/// stopped.
 fn cancel_waits_for_stop_proof(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (work_id, eid) = submit_and_admit(store, &config(), "wc-stop-1");
     p.consume(store);
     assert_eq!(p.spawns(), 1);
     cancel(store, &work_id, "wc-stop-1-cancel");
-    // Drive only polls — no stop pass yet, so the writer is still alive
-    // and the Execution must not settle over it.
-    for _ in 0..3 {
-        p.poll(store);
-        assert_ne!(
-            execution(store, &eid).state,
-            ExecutionState::Cancelled,
-            "no terminal cancel while a writer may still write"
-        );
-    }
+    // Before any stop pass: the writer is provably still writing and the
+    // Execution has entered `stopping` — not a settled state.
+    assert!(
+        p.writer_alive(),
+        "the recorded writer is still writing before the stop pass"
+    );
+    assert_eq!(execution(store, &eid).state, ExecutionState::Stopping);
+    drive_until(p, store, "cancelled", || {
+        execution(store, &eid).state == ExecutionState::Cancelled
+    });
+    assert!(
+        !p.writer_alive(),
+        "settlement waited for the writer's verified stop"
+    );
+}
+
+/// WC-STOP-02: a delivered signal is not stop proof — while the
+/// writer's state cannot be verified, settlement waits even though the
+/// signal landed.
+fn a_delivered_signal_is_not_stop_proof(p: &mut dyn WorkerHandle, store: &SqliteStore) {
+    let (work_id, eid) = submit_and_admit(store, &config(), "wc-stop-2");
+    p.consume(store);
+    cancel(store, &work_id, "wc-stop-2-cancel");
+    // The signal is delivered behind the durable intent, but the
+    // writer's liveness read is unverifiable: the proof set can never
+    // confirm the stop.
+    p.set_liveness_unknown(true);
+    p.drive_stops(store);
+    assert!(
+        p.signals_sent() > 0,
+        "the stop signal was actually delivered"
+    );
+    assert_ne!(
+        execution(store, &eid).state,
+        ExecutionState::Cancelled,
+        "an unverifiable stop never settles — a delivered signal is not proof"
+    );
+    // Verification recovers: the signalled (now dead) writer inspects
+    // stopped and the Execution settles.
+    p.set_liveness_unknown(false);
     drive_until(p, store, "cancelled", || {
         execution(store, &eid).state == ExecutionState::Cancelled
     });
@@ -826,17 +952,16 @@ fn stale_revision_evidence_cannot_satisfy_current(_p: &mut dyn WorkerHandle, sto
     .unwrap();
     let e = execution(store, &eid);
     assert_eq!(
-        e.state,
-        ExecutionState::Waiting,
-        "a stale producer's artifact cannot satisfy the current Invocation"
+        e.waiting_reason,
+        Some(WaitingReason::Ci),
+        "a stale producer's artifact cannot satisfy the current \
+         Invocation — the wait reason never advances to HostWrite"
     );
     assert!(
-        store
-            .transact(|tx| tx.action_intents())
-            .unwrap()
-            .iter()
-            .all(|i| i.status == HostActionStatus::Pending),
-        "no effect authorized by stale evidence"
+        store.transact(|tx| tx.action_intents()).unwrap().is_empty(),
+        "no effect is authorized by stale evidence — had the stale \
+         Present fact satisfied the current set, a publish intent \
+         would exist"
     );
 }
 
@@ -925,6 +1050,18 @@ fn scenarios() -> Vec<WcScenario> {
             run: cancel_waits_for_stop_proof,
         },
         WcScenario {
+            id: "WC-STOP-02 a delivered signal is not stop proof",
+            requires: &[
+                "resident_writer",
+                "stop_signal",
+                "liveness_unknown",
+                "signal_audit",
+            ],
+            shape: WorkerShape::Resident,
+            config,
+            run: a_delivered_signal_is_not_stop_proof,
+        },
+        WcScenario {
             id: "WC-ART-01 missing artifact runs bounded recovery then fails",
             requires: &["no_artifact"],
             shape: WorkerShape::NoArtifact,
@@ -986,6 +1123,7 @@ fn posix_provider_runs_the_suite_within_its_declared_surface() {
         vec![
             "WC-START-02 unknown start outcome blocks a second writer",
             "WC-LIVE-01 unknown liveness is not death",
+            "WC-STOP-02 a delivered signal is not stop proof",
         ]
     );
     assert_eq!(
