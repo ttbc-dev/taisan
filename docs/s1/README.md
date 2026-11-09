@@ -20,10 +20,11 @@ authorization under the [implementation start gate](../design-closure.md#impleme
 
 ## Recorded decisions (owner, 2026-11-09)
 
-- **Isolated test repository**: `shimpeiws/coding-worker-smoke`. It was
-  removed from the coding-worker automation allowlist on 2026-11-09 so
-  the lanes never pick up seeded issues; the S1 installation allowlist
-  contains only this repository.
+- **Isolated test repository**: `shimpeiws/coding-worker-smoke`
+  (owner-designated S1 target recorded in the issue's decisions). It was
+  removed from the worker automation lane's repository allowlist on
+  2026-11-09 so the lanes never pick up seeded issues; the S1
+  installation allowlist contains only this repository.
 - **Credential**: a fine-grained PAT scoped to
   `shimpeiws/coding-worker-smoke` only (contents RW, pull requests RW,
   issues RW, checks R), recorded in installation config as a credential

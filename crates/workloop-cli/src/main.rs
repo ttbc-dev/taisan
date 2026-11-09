@@ -501,14 +501,20 @@ fn run(cli: Cli) -> i32 {
                 &store,
                 &config,
                 &installation,
-                &actor,
                 supervisor.as_ref(),
                 &mut github,
-                cli.idempotency_key.as_deref(),
             ) {
-                Ok(()) => 0,
-                Err(e) => emit(envelope::error_envelope(
+                Ok(list) => emit(envelope::query_envelope(
+                    &list,
+                    envelope::query_identity("run", &actor, cli.idempotency_key.as_deref()),
                     None,
+                )),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(envelope::query_identity(
+                        "run",
+                        &actor,
+                        cli.idempotency_key.as_deref(),
+                    )),
                     envelope::ErrorClass::Store,
                     &e,
                 )),
@@ -524,30 +530,40 @@ fn run(cli: Cli) -> i32 {
             // published in an earlier tick.
             let supervisor = build_supervisor(&config, &installation);
             let mut github = FixtureGithub::new();
+            let identity =
+                || envelope::query_identity("run", &actor, cli.idempotency_key.as_deref());
             let mut remaining = ticks;
+            let mut tick = 0u32;
             loop {
-                if let Err(e) = run_tick(
+                // stdout stays single-object: per-pass progress is a
+                // stderr diagnostic, and the envelope is emitted once
+                // when the bounded run finishes.
+                let list = match run_tick(
                     &store,
                     &config,
                     &installation,
-                    &actor,
                     supervisor.as_ref(),
                     &mut github,
-                    cli.idempotency_key.as_deref(),
                 ) {
-                    return emit(envelope::error_envelope(
-                        None,
-                        envelope::ErrorClass::Store,
-                        &e,
-                    ));
+                    Ok(list) => list,
+                    Err(e) => {
+                        return emit(envelope::error_envelope(
+                            Some(identity()),
+                            envelope::ErrorClass::Store,
+                            &e,
+                        ));
+                    }
+                };
+                tick += 1;
+                if let projection::QueryResult::Found { value, .. } = &list {
+                    eprintln!("taisan: tick {tick}: {} work item(s)", value.items.len());
                 }
                 if remaining == 1 {
-                    break;
+                    return emit(envelope::query_envelope(&list, identity(), None));
                 }
                 remaining = remaining.saturating_sub(1);
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
-            0
         }
         Commands::WorkList => {
             match store.transact_deferred(|tx| projection::work_list(tx, now())) {
@@ -665,11 +681,9 @@ fn run_tick(
     store: &SqliteStore,
     config: &WorkloopConfig,
     _installation: &Installation,
-    actor: &Actor,
     supervisor: Option<&Supervisor<PosixProcessControl>>,
     github: &mut FixtureGithub,
-    idempotency_key: Option<&str>,
-) -> Result<(), String> {
+) -> Result<projection::QueryResult<projection::WorkListView>, String> {
     let now = now();
     store
         .transact(|tx| dispatch_once(tx, config, now).map(|_| ()))
@@ -683,16 +697,9 @@ fn run_tick(
     sweep(store, config, now).map_err(|e| e.to_string())?;
     // Status output goes through the same read-only projection as the
     // query subcommands — never a raw store read.
-    let list = store
+    store
         .transact_deferred(|tx| projection::work_list(tx, now))
-        .map_err(|e| e.to_string())?;
-    let (env, _) = envelope::query_envelope(
-        &list,
-        envelope::query_identity("work_list", actor, idempotency_key),
-        None,
-    );
-    print(&env);
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -891,22 +898,9 @@ mod tests {
         // One fixture for the whole run, as `run` keeps it across ticks.
         let mut github = FixtureGithub::new();
 
-        let actor = Actor {
-            kind: ActorKind::Human,
-            external_id: "actor-test".into(),
-        };
         // Tick 1: work 1 opens its change request.
         queue_open_change(&store, &w1);
-        run_tick(
-            &store,
-            &config,
-            &installation,
-            &actor,
-            None,
-            &mut github,
-            None,
-        )
-        .unwrap();
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
         assert_eq!(
             github.applied(),
             &["open_change:host-local/local-repo:cr-1"]
@@ -915,16 +909,7 @@ mod tests {
         // Tick 2: work 2 opens later — its change number must continue,
         // not restart at 1 and collide with work 1's.
         queue_open_change(&store, &w2);
-        run_tick(
-            &store,
-            &config,
-            &installation,
-            &actor,
-            None,
-            &mut github,
-            None,
-        )
-        .unwrap();
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
         assert_eq!(
             github.applied(),
             &[
@@ -947,16 +932,7 @@ mod tests {
                 body: Some("edited".into()),
             },
         );
-        run_tick(
-            &store,
-            &config,
-            &installation,
-            &actor,
-            None,
-            &mut github,
-            None,
-        )
-        .unwrap();
+        run_tick(&store, &config, &installation, None, &mut github).unwrap();
         assert_eq!(
             github.applied(),
             &[

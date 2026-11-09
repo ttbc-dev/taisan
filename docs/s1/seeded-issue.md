@@ -33,8 +33,9 @@ Seeded issues must not carry any label an automation lane selects on.
 Before each run, the procedure verifies the seeded issue's label set is
 empty or disjoint from every lane-selection label in the target
 repository. Because `shimpeiws/coding-worker-smoke` was removed from
-the coding-worker automation allowlist (2026-11-09), lane intake never
-observes the seed; the label rule is the second, structural guarantee.
+the worker automation lane's repository allowlist (2026-11-09), lane
+intake never observes the seed; the label rule is the second,
+structural guarantee.
 
 ## Fixture procedure
 

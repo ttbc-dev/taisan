@@ -12,7 +12,7 @@ evidence approval).
 | Repository | `shimpeiws/coding-worker-smoke` |
 | Role | Dedicated S1 test repository owned by the installation operator |
 | Installation allowlist | Contains **only** this repository |
-| Automation isolation | Removed from the coding-worker automation allowlist on 2026-11-09 — seeded issues are never picked up by any automation lane |
+| Automation isolation | Removed from the worker automation lane's repository allowlist on 2026-11-09 — seeded issues are never picked up by any automation lane |
 
 A repository rename does not change the binding: Core binds the stable
 repository identity (host instance ID + stable repository ID), and the
@@ -77,11 +77,15 @@ installation config carries the current `HostCapability` vocabulary):
 | `checks_read` | Named check evidence bound to the examined head |
 | `review_findings_read` | Review findings bound to the head they examined |
 
-`thread_reply`, `thread_resolve`, `ready`, `approve`,
-`request_changes`, `review_feedback`, and `inline_comment` are declared
-**only if the accepted profile requires them** — an undeclared
-capability stays explicitly unsupported and can never be silently
-substituted by a comment or a mergeable flag.
+Optional capabilities are declared **only if the accepted profile
+requires them** — an undeclared capability stays explicitly unsupported
+and can never be silently substituted by a comment or a mergeable flag.
+The contract-level operations `thread_reply`, `ready`, `approve`,
+`request_changes`, `review_feedback`, and `inline_comment` are not yet
+in the closed `HostCapability` vocabulary (which today extends to
+`thread_resolve` and the names listed above), so an S1 profile cannot
+require them until the vocabulary grows — a profile that did would fail
+installation validation as unsupported.
 
 ## Runtime environment
 

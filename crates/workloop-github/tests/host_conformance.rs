@@ -335,6 +335,15 @@ fn expected_head_mismatch_aborts_write(
         store,
         &work_id,
         &repo(),
+        HostAction::PushRef {
+            branch: format!("work/{}", work_id.0),
+            produced: rev("head-1"),
+        },
+    );
+    insert_intent(
+        store,
+        &work_id,
+        &repo(),
         HostAction::OpenChangeRequest {
             source_branch: format!("work/{}", work_id.0),
             target_branch: "main".into(),
@@ -344,17 +353,21 @@ fn expected_head_mismatch_aborts_write(
     );
     fixture.apply(store, config);
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
-    let change = intents
+    let (change, opened_head) = intents
         .iter()
         .find_map(|i| {
             i.effects.iter().find_map(|f| match f {
-                NormalizedEffectFact::ChangeOpened { change, .. } => Some(change.clone()),
+                NormalizedEffectFact::ChangeOpened { change, head, .. } => {
+                    Some((change.clone(), head.clone()))
+                }
                 _ => None,
             })
         })
         .expect("opened change request");
 
-    // Move the remote head under the recorded intent.
+    // Move the remote head under the recorded intent. The guard is
+    // exercised only because the expected head really was the opened
+    // head — the mismatch must be caused by the move.
     fixture.set_change_head(&repo(), change.change_request.as_str(), "moved-head");
     insert_intent(
         store,
@@ -362,7 +375,7 @@ fn expected_head_mismatch_aborts_write(
         &repo(),
         HostAction::UpdateChangeRequest {
             change: change.clone(),
-            expected_head: rev("head-1"),
+            expected_head: opened_head.clone(),
             title: Some("edited".into()),
             body: None,
         },
@@ -394,7 +407,7 @@ fn expected_head_mismatch_aborts_write(
         &repo(),
         HostAction::PostComment {
             change: change.clone(),
-            expected_head: rev("head-1"),
+            expected_head: opened_head.clone(),
             marker: "conformance".into(),
             body: "b".into(),
         },

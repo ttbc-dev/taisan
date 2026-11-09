@@ -324,6 +324,27 @@ fn store_failure_is_exit_4() {
 }
 
 #[test]
+fn run_emits_one_envelope_across_ticks() {
+    let root = root("run");
+    run_at(
+        &root,
+        &["submit", "--intent", "x", "--idempotency-key", "k-r1"],
+    );
+    // A bounded run is one command result: exactly one envelope on
+    // stdout no matter how many ticks it drove; per-tick progress is
+    // a stderr diagnostic.
+    let output = output_at(&root, &["run", "--ticks", "2", "--interval-ms", "0"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let env = envelope(&output);
+    assert_eq!(env["status"], "accepted");
+    assert_eq!(env["command"]["kind"], "run");
+}
+
+#[test]
 fn source_unavailable_rejection_exits_5() {
     let root = root("unavailable");
     let decision = run_at(
