@@ -744,6 +744,24 @@ fn host_bindings_allowlist_and_capacity_are_validated() {
         "allowlist refusal leaked the pasted value: {err}"
     );
 
+    // Length ceilings are part of the shape predicate: a 300-byte
+    // entry and a 64-byte label are refused before acceptance.
+    for entry in [
+        format!("\"{}\"", "a".repeat(300)),
+        format!("\"{}.com\"", "a".repeat(64)),
+    ] {
+        let text = base_profile() + &format!("[verification.egress]\nallowlist = [{entry}]\n");
+        let err = parse_profile(&text).unwrap_err();
+        assert!(
+            err.contains("verification.egress.allowlist") && err.contains("bare host name"),
+            "expected the length bound to refuse the entry: {err}"
+        );
+    }
+
+    // A well-formed entry with hyphens, digits, and mixed case loads.
+    let text = base_profile() + "[verification.egress]\nallowlist = [\"registry.example-host1\"]\n";
+    parse_profile(&text).expect("a well-formed bare host name must load");
+
     // A zero-slot installation cannot dispatch.
     let text = "schema_version = 1\n\n[installation]\ncapacity_slots = 0\n";
     let err = parse_profile(text).unwrap_err();
