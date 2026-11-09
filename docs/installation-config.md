@@ -81,7 +81,7 @@ allowlist = ["crates.io", "static.crates.io"]
 # Work requirements compose with this floor at admission; callers cannot weaken it
 publication = ["repository_read", "branch_read", "push_ref",
                "change_request_read", "change_request_create",
-               "change_request_update", "comment_write", "mark_ready"]
+               "change_request_update", "comment_write", "ready"]
 review      = ["repository_read", "branch_read", "review_feedback",
                "inline_comment", "thread_reply", "thread_resolve"]
 discussion  = ["comment_read", "comment_write"]
@@ -97,7 +97,7 @@ Validation rules:
 - Every `credential_ref` must parse as a known provider (`env:`, `file:`, `command:`); file providers require an absolute path. Validation checks the reference's shape, never its value.
 - Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
 - `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
-- Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op.
+- Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op. Capability names come from the contract's capability set (`ready`, `thread_resolve`, ...), which deliberately differs from operation names (`mark_ready`, `resolve_thread`) — a capability selects an effect class, an operation names a concrete host action.
 - `recovery.transport.backoff_seconds` is the per-attempt wait schedule between transient-failure retries. `recovery.transport.backoff_jitter_ratio` (default `0.0`, range `0.0`–`1.0`) applies symmetric jitter: each scheduled wait is scaled by a per-attempt random factor in `1 ± ratio`. A `recovery.transport.max_retries` beyond the schedule length repeats the final element; a shorter retry count truncates the schedule. A `0` schedule entry is a valid immediate retry; `0` is still never silently "unlimited" for limit keys.
 - Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects.
 
