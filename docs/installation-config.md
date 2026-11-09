@@ -26,7 +26,7 @@ Status: concrete design for #53. This document specifies future Rust/configurati
 | `~/.local/share/taisan/handoff.git` | Installation-owned bare handoff repository | Durable artifact objects ([worker protocol](worker-protocol.md#artifact-handoff)) |
 | `~/.local/share/taisan/archive/` | Read-only legacy archives | `unlimited` retention default |
 
-Every path resolves through one fixed precedence: explicit flag, environment override, then the XDG default — never the ambient working directory. Configuration and state roots must be distinct from any managed workspace, and setup refuses a state root nested inside a workspace or vice versa.
+Every path resolves through one fixed precedence: explicit flag, environment override, then the XDG default — never the ambient working directory. A managed workspace nested inside the state root is the default layout; an explicit flag or environment override may also place the workspace root outside it (for example on a separate volume). What setup refuses is a configuration or state root nested inside the managed workspace root — workspace retention and cleanup must never be able to remove configuration or state, while nothing else needs to be kept out of the workspace tree.
 
 ## Configuration schema
 
