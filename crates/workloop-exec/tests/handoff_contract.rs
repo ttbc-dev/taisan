@@ -1048,6 +1048,31 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         loud.output.contains("tail-marker"),
         "the tail is the retained portion"
     );
+
+    // A timed-out runner's whole process group dies with it — a
+    // grandchild it spawned never survives past the recorded
+    // Inconclusive to keep writing.
+    let sentinel = scratch.join("grandchild-survived");
+    let group = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[4]",
+        &[
+            "sh".into(),
+            "-c".into(),
+            format!("(sleep 2 && touch '{}') & wait", sentinel.display()),
+        ],
+        &scratch,
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    assert_eq!(group.result, VerificationOutcome::Inconclusive);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !sentinel.exists(),
+        "the runner's grandchildren are killed with it"
+    );
 }
 
 /// `source_revision` is a host issue-version token, not a git commit:

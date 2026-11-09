@@ -263,6 +263,29 @@ fn contract_worker_refuses_a_write_through_a_workspace_symlink() {
     );
 }
 
+/// The fixed-name heartbeat takes the same write boundary: a
+/// committed `heartbeat.log` symlink is a host write — refused.
+#[test]
+fn contract_worker_reopen_refuses_a_symlinked_heartbeat() {
+    let parent = tmp_root("denyreopen");
+    let ws = parent.join("ws");
+    let outside = parent.join("outside");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(outside.join("heartbeat.log"), ws.join("heartbeat.log")).unwrap();
+
+    let leader = spawn(&contract_bin(), &["reopen"], &ws);
+    let port = PosixProcessControl;
+    wait_for(
+        || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
+        "refusal exit",
+    );
+    assert!(
+        !outside.join("heartbeat.log").exists(),
+        "the heartbeat is never written through the symlink"
+    );
+}
+
 fn host() -> HostInstanceId {
     HostInstanceId::trusted("fixture")
 }

@@ -105,7 +105,12 @@ fn write_artifact(ws: &Path, name: &str) {
 }
 
 fn heartbeat_forever(ws: &Path, interval: Duration) -> ! {
-    let path = ws.join("heartbeat.log");
+    let Some(path) = resolve_inside(ws, "heartbeat.log") else {
+        // A committed heartbeat.log symlink reaching outside the
+        // workspace is a host write — reported and refused.
+        report(serde_json::json!({"evidence": "denied-host-write"}));
+        std::process::exit(3);
+    };
     loop {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)

@@ -5,6 +5,7 @@
 //! transient transport, never the durable body. Workspace and out
 //! directory stay retained until `acknowledged` (row *and* ref).
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -680,6 +681,10 @@ fn run_verification_command(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
+        // Own process group so a timeout kill reaches grandchildren
+        // the runner spawned — the same containment the supervisor's
+        // own spawn applies.
+        .process_group(0)
         .spawn()
     {
         Ok(child) => child,
@@ -690,6 +695,10 @@ fn run_verification_command(
         match child.try_wait() {
             Ok(Some(status)) => return VerificationRun::Finished(status),
             Ok(None) if Instant::now() >= deadline => {
+                // The runner is its group leader: a group SIGKILL
+                // reaps every descendant it spawned, then the leader
+                // itself is reaped through the handle.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 return VerificationRun::TimedOut;
