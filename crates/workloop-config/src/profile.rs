@@ -77,8 +77,11 @@ fn checked_limit(
                 Err(format!("{key}: 'unlimited' is not permitted for this key"))
             }
         },
-        LimitInput::Str(s) => Err(format!(
-            "{key}: unknown limit value '{s}' — expected a positive integer or 'unlimited' (no unit suffix)"
+        // The pasted string is redacted: an operator can put anything
+        // here, and a load refusal must not carry it into logs or
+        // evidence. The key and the expected shape stay visible.
+        LimitInput::Str(_) => Err(format!(
+            "{key}: unknown limit value <redacted> — expected a positive integer or 'unlimited' (no unit suffix)"
         )),
     }
 }
@@ -554,16 +557,26 @@ impl Profile {
                     "verification.egress.allowlist[{index}]: must not be empty"
                 ));
             }
+            // Rejected entries are redacted like every other scalar a
+            // refusal refuses: the operator may have pasted anything
+            // here, so only the key and the rule leave this function.
             if entry.chars().any(|c| c.is_control() || c.is_whitespace()) {
                 return Err(format!(
-                    "verification.egress.allowlist[{index}]: '{entry}' must be a bare host name \
+                    "verification.egress.allowlist[{index}]: <redacted> must be a bare host name \
                      without whitespace"
                 ));
             }
             if entry.contains("://") {
                 return Err(format!(
-                    "verification.egress.allowlist[{index}]: '{entry}' must be a bare host name, \
+                    "verification.egress.allowlist[{index}]: <redacted> must be a bare host name, \
                      not a URL"
+                ));
+            }
+            if !is_bare_host_name(entry) {
+                return Err(format!(
+                    "verification.egress.allowlist[{index}]: <redacted> must be a bare host name — \
+                     labels of letters, digits, and hyphens separated by dots; never a wildcard, \
+                     port, or path"
                 ));
             }
         }
@@ -706,9 +719,32 @@ impl Profile {
     }
 }
 
+/// A bare host name for the egress allowlist: ASCII labels of
+/// letters, digits, and hyphens joined by dots, each label at most 63
+/// bytes and never hyphen-edged, the whole entry at most 253 bytes.
+/// A URL, port, path, wildcard, or any other punctuation never
+/// matches — the proxy resolves these entries as exact host names on
+/// the fixed CONNECT port, so a wildcard-like entry must be refused
+/// at the load boundary, never deferred to the proxy.
+fn is_bare_host_name(entry: &str) -> bool {
+    if entry.is_empty() || entry.len() > 253 {
+        return false;
+    }
+    entry.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
 /// Validate a `credential_ref`'s shape only — never its value. The
 /// three owner-approved providers are `env:`, `file:` (absolute path;
-/// `~` is never expanded), and `command:`.
+/// `~` is never expanded), and `command:`. Refusals name the role and
+/// the provider rule but never echo the reference: an operator may
+/// have pasted a live token here, and the load error must not carry
+/// it out of this module.
 fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> {
     if let Some(name) = credential_ref.strip_prefix("env:") {
         let valid = !name.is_empty()
@@ -719,7 +755,7 @@ fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> 
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !valid {
             return Err(format!(
-                "roles.{role}.credential_ref: invalid env: reference '{credential_ref}' — \
+                "roles.{role}.credential_ref: invalid env: reference <redacted> — \
                  environment identifier expected"
             ));
         }
@@ -729,7 +765,7 @@ fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> 
         if path.starts_with('~') || !Path::new(path).is_absolute() {
             return Err(format!(
                 "roles.{role}.credential_ref: file: requires an absolute path \
-                 (got '{credential_ref}') — '~' is not expanded"
+                 (got <redacted>) — '~' is not expanded"
             ));
         }
         return Ok(());
@@ -743,7 +779,7 @@ fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> 
         return Ok(());
     }
     Err(format!(
-        "roles.{role}.credential_ref: unknown provider in '{credential_ref}' — expected \
+        "roles.{role}.credential_ref: unknown provider in <redacted> — expected \
          env:, file:, or command:"
     ))
 }

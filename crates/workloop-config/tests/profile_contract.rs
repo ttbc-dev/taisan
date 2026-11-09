@@ -279,10 +279,12 @@ fn unknown_keys_are_refused_naming_the_key_without_mutation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A parse refusal names the offending key/line but never echoes the
-/// source line: a mistyped key carrying a live token must not leak its
-/// value into the returned error or any record built from it (the
-/// trust boundary says credential values never enter logs or evidence).
+/// A refusal names the offending key/line but never echoes the
+/// rejected value: a mistyped key, malformed line, wrongly-typed
+/// field, unknown credential provider, or invalid limit carrying a
+/// live token must not leak it into the returned error or any record
+/// built from it (the trust boundary says credential values never
+/// enter logs or evidence).
 #[test]
 fn parse_refusal_never_echoes_the_offending_line() {
     let dir = root("parse-secret");
@@ -331,6 +333,52 @@ fn parse_refusal_never_echoes_the_offending_line() {
     assert!(
         !err.contains(secret),
         "typed refusal leaked the pasted credential value: {err}"
+    );
+
+    // Semantic validation redacts the same way: a live token pasted
+    // as the whole `credential_ref` (no provider prefix) is refused
+    // with the role named, but the raw ref never leaves the loader.
+    let semantic = dir.join("semantic-secret.toml");
+    let semantic_text = base_profile().replace(
+        "credential_ref = \"env:TAISAN_TOKEN\"",
+        &format!("credential_ref = \"{secret}\""),
+    );
+    std::fs::write(&semantic, &semantic_text).unwrap();
+    let before = std::fs::read(&semantic).unwrap();
+    let err = load_profile(&semantic).unwrap_err();
+    assert!(
+        err.contains("roles.publication.credential_ref") && err.contains("unknown provider"),
+        "expected the key path and provider rule: {err}"
+    );
+    assert!(
+        !err.contains(secret),
+        "semantic refusal leaked the pasted credential value: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&semantic).unwrap(),
+        before,
+        "the refused load mutated semantic-secret.toml"
+    );
+
+    // A limit key must not echo an arbitrary pasted string either —
+    // only the key path and the expected shape are reported.
+    let limit = dir.join("limit-secret.toml");
+    let limit_text = base_profile() + &format!("[retention.cas]\nmax_age_seconds = \"{secret}\"\n");
+    std::fs::write(&limit, &limit_text).unwrap();
+    let before = std::fs::read(&limit).unwrap();
+    let err = load_profile(&limit).unwrap_err();
+    assert!(
+        err.contains("retention.cas.max_age_seconds"),
+        "expected the offending key path: {err}"
+    );
+    assert!(
+        !err.contains(secret),
+        "limit refusal leaked the pasted value: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&limit).unwrap(),
+        before,
+        "the refused load mutated limit-secret.toml"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -536,12 +584,16 @@ fn limit_values_follow_the_approved_policies() {
         "expected the key: {err}"
     );
 
-    // Unknown unit.
+    // Unknown unit — the key is named, the pasted string is redacted.
     let text = base_profile() + "[retention.cas]\nmax_age_seconds = \"30d\"\n";
     let err = parse_profile(&text).unwrap_err();
     assert!(
-        err.contains("retention.cas.max_age_seconds") && err.contains("30d"),
+        err.contains("retention.cas.max_age_seconds") && err.contains("unknown limit value"),
         "expected the key: {err}"
+    );
+    assert!(
+        !err.contains("30d"),
+        "limit refusal echoed the raw value: {err}"
     );
 
     // `unlimited` is accepted on a retention axis; the other axis keeps
@@ -656,11 +708,19 @@ fn host_bindings_allowlist_and_capacity_are_validated() {
     let err = parse_profile(&text).unwrap_err();
     assert!(err.contains("repositories[0]"), "expected the index: {err}");
 
-    // Allowlist entries must be bare host names.
+    // Allowlist entries must be bare host names: a wildcard, port,
+    // path, or malformed label is refused at the load boundary so the
+    // deny-by-default proxy never inherits a wildcard-like entry.
     for (entry, needle) in [
         ("\"\"", "must not be empty"),
         ("\"crates.io static\"", "whitespace"),
         ("\"https://crates.io\"", "not a URL"),
+        ("\"*\"", "bare host name"),
+        ("\"*.crates.io\"", "bare host name"),
+        ("\"crates.io:443\"", "bare host name"),
+        ("\"crates.io/api\"", "bare host name"),
+        ("\"-bad.example\"", "bare host name"),
+        ("\"example..com\"", "bare host name"),
     ] {
         let text = base_profile() + &format!("[verification.egress]\nallowlist = [{entry}]\n");
         let err = parse_profile(&text).unwrap_err();
@@ -669,6 +729,20 @@ fn host_bindings_allowlist_and_capacity_are_validated() {
             "expected allowlist {needle}: {err}"
         );
     }
+
+    // A secret pasted as an entry is refused without echoing its
+    // value — rejected scalars stay redacted like every other refusal.
+    let pasted = "ghp_live_secret_value_0123456789";
+    let text = base_profile() + &format!("[verification.egress]\nallowlist = [\"{pasted}\"]\n");
+    let err = parse_profile(&text).unwrap_err();
+    assert!(
+        err.contains("verification.egress.allowlist"),
+        "expected the key: {err}"
+    );
+    assert!(
+        !err.contains(pasted),
+        "allowlist refusal leaked the pasted value: {err}"
+    );
 
     // A zero-slot installation cannot dispatch.
     let text = "schema_version = 1\n\n[installation]\ncapacity_slots = 0\n";
