@@ -44,7 +44,7 @@ Reclaimable bodies are content that the metadata references by digest:
 
 ## Configuration
 
-Target keys, not implemented options. They follow [recovery policy](recovery-policy.md#configurable-policy-and-defaults): every key has a type, unit, default, range, and explicit disable semantics; unknown keys and invalid combinations fail at load.
+Target keys, not implemented options. They follow [recovery policy](recovery-policy.md#configurable-policy-and-defaults): every key has a type, unit, default, range, and explicit disable semantics; unknown keys and invalid combinations fail at load. The `retention.` prefix composes under the top-level `[retention]` TOML table — there is no `policy.` namespace.
 
 | Target key | Default | Meaning |
 | --- | --- | --- |

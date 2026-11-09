@@ -87,7 +87,7 @@ review      = ["repository_read", "branch_read", "review_feedback",
 discussion  = ["comment_read", "comment_write"]
 
 [recovery]  # keys defined by recovery-policy.md; defaults apply when omitted
-[policy.retention]  # keys defined by retention-policy.md
+[retention]  # keys defined by retention-policy.md
 ```
 
 Validation rules:
@@ -98,6 +98,7 @@ Validation rules:
 - Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
 - `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
 - Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op.
+- `recovery.transport.backoff_seconds` is the per-attempt wait schedule between transient-failure retries. `recovery.transport.backoff_jitter_ratio` (default `0.0`, range `0.0`–`1.0`) applies symmetric jitter: each scheduled wait is scaled by a per-attempt random factor in `1 ± ratio`. A `recovery.transport.max_retries` beyond the schedule length repeats the final element; a shorter retry count truncates the schedule. A `0` schedule entry is a valid immediate retry; `0` is still never silently "unlimited" for limit keys.
 - Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects.
 
 ## Credential references and secret hygiene
