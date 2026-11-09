@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use workloop_core::domain::WorkId;
 use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
 use workloop_core::observation::{
     HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
@@ -29,6 +30,28 @@ pub struct FixtureGithub {
     next_number: u64,
     /// The write history, for test assertions.
     applied: Vec<String>,
+}
+
+/// What one source-refresh pass read: head movements ingested, heads
+/// already matching the recorded facts, and sources left for the next
+/// pass because the tick/source deadline stopped the read.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SourceRefreshReport {
+    pub unchanged: usize,
+    pub ingested: usize,
+    pub deferred: Vec<String>,
+}
+
+/// What one host-outbox pass attempted, with the untouched remainder.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OutboxReport {
+    pub attempted: usize,
+    pub applied: usize,
+    pub failed: usize,
+    pub unknown: usize,
+    /// Pending in-scope intents not attempted because the per-tick
+    /// bound stopped the drain; they stay pending for the next pass.
+    pub deferred: Vec<String>,
 }
 
 impl FixtureGithub {
@@ -72,6 +95,22 @@ impl FixtureGithub {
         config: &WorkloopConfig,
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
+        self.apply_outbox_bounded(store, config, now_unix_seconds, None, usize::MAX)
+            .map(|_| ())
+    }
+
+    /// The bounded, optionally Work-scoped drain the loop's host-outbox
+    /// phase calls: at most `max_items` attempts per tick (the approved
+    /// ≤ 8/tick), only intents belonging to `scope` when one is given,
+    /// and the untouched remainder reported rather than silently left.
+    pub fn apply_outbox_bounded(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError> {
         // Attempts are tracked so an intent that cannot make progress is
         // skipped for the rest of this pass — it neither loops the pass
         // forever nor blocks later independent intents (a retried stuck
@@ -79,20 +118,146 @@ impl FixtureGithub {
         // The installation-level grant is the outermost control: a
         // revoked `host_write` stops the drain even for executions that
         // were admitted under a more permissive configuration.
+        let mut report = OutboxReport::default();
         if !config.allowed_effects.host_write {
-            return Ok(());
+            return Ok(report);
         }
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
         let mut attempted = std::collections::HashSet::new();
         loop {
+            if report.attempted >= max_items {
+                let pending: Vec<String> = store.transact(|tx| {
+                    Ok(tx
+                        .action_intents()?
+                        .into_iter()
+                        .filter(|i| {
+                            i.status == HostActionStatus::Pending
+                                && !attempted.contains(&i.action_id)
+                                && in_scope(i)
+                        })
+                        .map(|i| i.action_id)
+                        .collect())
+                })?;
+                report.deferred = pending;
+                break;
+            }
             let next = store.transact(|tx| {
                 Ok(tx.action_intents()?.into_iter().find(|i| {
-                    i.status == HostActionStatus::Pending && !attempted.contains(&i.action_id)
+                    i.status == HostActionStatus::Pending
+                        && !attempted.contains(&i.action_id)
+                        && in_scope(i)
                 }))
             })?;
-            let Some(intent) = next else { return Ok(()) };
-            attempted.insert(intent.action_id.clone());
+            let Some(intent) = next else { break };
+            let action_id = intent.action_id.clone();
+            attempted.insert(action_id.clone());
+            report.attempted += 1;
             self.attempt(store, config, intent, now_unix_seconds)?;
+            let status = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })?;
+            match status {
+                Some(HostActionStatus::Applied) => report.applied += 1,
+                Some(HostActionStatus::Failed { .. }) => report.failed += 1,
+                Some(HostActionStatus::Unknown { .. }) => report.unknown += 1,
+                // Denied or unchanged: counted as attempted, still pending.
+                _ => {}
+            }
         }
+        Ok(report)
+    }
+
+    /// Phase 1 (read-only source refresh): re-read every change head
+    /// this fixture knows for in-scope Works and ingest a `change_head`
+    /// Observation only when the synthetic remote head differs from the
+    /// store's latest recorded head for that change. The read-compare
+    /// makes the pass idempotent — a restart re-entering phase order
+    /// observes no movement and ingests nothing — and a deadline stops
+    /// the read before it starts the next source.
+    pub fn refresh_sources(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError> {
+        let now = clock();
+        let mut report = SourceRefreshReport::default();
+        // Attribute each known change to the Work that recorded an
+        // intent carrying it; an unattributable change is never read
+        // into this installation's facts.
+        let mut owners: BTreeMap<String, (WorkId, ChangeRequestRef)> = BTreeMap::new();
+        for intent in store.transact(|tx| tx.action_intents())? {
+            if let Some(work_id) = scope
+                && intent.work_id != *work_id
+            {
+                continue;
+            }
+            let mut note = |change: &ChangeRequestRef| {
+                owners.insert(
+                    change.change_request.as_str().to_string(),
+                    (intent.work_id.clone(), change.clone()),
+                );
+            };
+            if let HostAction::UpdateChangeRequest { change, .. } = &intent.action {
+                note(change);
+            }
+            for effect in &intent.effects {
+                match effect {
+                    NormalizedEffectFact::ChangeOpened { change, .. }
+                    | NormalizedEffectFact::MetadataUpdated { change, .. }
+                    | NormalizedEffectFact::CommentPosted { change, .. } => note(change),
+                    _ => {}
+                }
+            }
+        }
+        for (change_id, head) in &self.changes {
+            let Some((work_id, change)) = owners.get(change_id) else {
+                continue;
+            };
+            if let Some(d) = deadline {
+                let tick_now = clock();
+                if tick_now >= d {
+                    report.deferred.push(change_id.clone());
+                    continue;
+                }
+            }
+            let latest = latest_recorded_head(store, work_id, change)?;
+            if latest.as_deref() == Some(head.as_str()) {
+                report.unchanged += 1;
+                continue;
+            }
+            let execution = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(work_id)?
+                    .into_iter()
+                    .max_by_key(|e| e.ordinal))
+            })?;
+            let head_revision = CommitRevision::new(change.repository.clone(), head.clone())
+                .map_err(|detail| StoreError::Internal { detail })?;
+            self.emit(
+                store,
+                config,
+                Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: execution.map(|e| e.id),
+                    fact: ObservationFact::ChangeHead {
+                        change: change.clone(),
+                        head: head_revision,
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
+            report.ingested += 1;
+        }
+        Ok(report)
     }
 
     fn attempt(
@@ -311,4 +476,29 @@ impl FixtureGithub {
         }
         Ok(())
     }
+}
+
+/// The latest recorded `change_head` for one change, ordered by
+/// observed time then row order — the same "latest wins" rule the
+/// assessment paths use.
+fn latest_recorded_head(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> Result<Option<String>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::ChangeHead { change: c, head } = &o.fact
+                && c == change
+            {
+                Some((o.observed_unix_seconds, index, head.object.clone()))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(t, i, _)| (*t, *i))
+        .map(|(_, _, h)| h))
 }

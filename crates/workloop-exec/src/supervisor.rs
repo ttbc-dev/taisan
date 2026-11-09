@@ -97,6 +97,27 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
+impl PosixProcessControl {
+    /// Capture a reuse-resistant identity for an existing process —
+    /// the caller's own pid when claiming the run lease. Returns an
+    /// error when the identity cannot be verified; a lease is never
+    /// claimed under an unverifiable owner record.
+    pub fn identity_of(pid: i32) -> Result<ProcessIdentity, String> {
+        match lstart_of(pid) {
+            LstartLookup::Present(started_at) => {
+                let pgid = unsafe { libc::getpgid(pid) };
+                Ok(ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: if pgid > 0 { Some(pgid) } else { None },
+                })
+            }
+            LstartLookup::Absent => Err(format!("pid {pid} is not in the process table")),
+            LstartLookup::Failed(reason) => Err(reason),
+        }
+    }
+}
+
 impl ProcessControlPort for PosixProcessControl {
     fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
         let Some(program) = argv.first() else {
@@ -366,10 +387,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// each Execution waiting on artifact recovery. Reconciles by scanning
     /// the store — a wakeup is an at-least-once signal, not evidence.
     pub fn run_once(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
-        self.consume_requests(store, now_unix_seconds)?;
-        self.poll_invocations(store, now_unix_seconds)?;
-        self.drive_stops(store, now_unix_seconds)?;
-        self.run_recovery(store, now_unix_seconds)?;
+        self.run_once_scoped(store, now_unix_seconds, None)
+    }
+
+    /// One supervisor pass restricted to one Work for a diagnostic
+    /// `--work` pass: nothing outside the scope is launched, polled,
+    /// stopped or recovered.
+    pub fn run_once_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+    ) -> Result<(), ExecError> {
+        self.consume_requests_scoped(store, now_unix_seconds, scope)?;
+        self.poll_invocations_scoped(store, now_unix_seconds, scope)?;
+        self.drive_stops_scoped(store, now_unix_seconds, scope)?;
+        self.run_recovery_scoped(store, now_unix_seconds, scope)?;
         Ok(())
     }
 
@@ -381,7 +414,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        self.consume_requests_scoped(store, now_unix_seconds, None)
+    }
+
+    /// Replay the durable request log for one scope only: a scoped pass
+    /// never launches another Work's Invocation.
+    pub fn consume_requests_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+    ) -> Result<(), ExecError> {
         for request in store.transact(|tx| tx.pending_requests())? {
+            if let Some(work_id) = scope
+                && request.work_id != *work_id
+            {
+                continue;
+            }
             self.reconcile_or_start(store, &request, now_unix_seconds)?;
         }
         Ok(())
@@ -569,8 +618,29 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        self.poll_invocations_scoped(store, now_unix_seconds, None)
+    }
+
+    /// Inspect live invocations for one scope only.
+    pub fn poll_invocations_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+    ) -> Result<(), ExecError> {
         let unresolved = store.transact(|tx| tx.unresolved_invocations())?;
         for invocation in unresolved {
+            if let Some(work_id) = scope {
+                let belongs = store.transact(|tx| {
+                    Ok::<_, StoreError>(
+                        tx.execution(&invocation.execution_id)?
+                            .is_some_and(|e| &e.work_id == work_id),
+                    )
+                })?;
+                if !belongs {
+                    continue;
+                }
+            }
             let Some(identity) = invocation.process_identity.clone() else {
                 // Prepared but never identified: a crash near spawn left no
                 // provable answer — report unknown; `work` keeps the
@@ -713,8 +783,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// durable-intent → signal → inspect loop. A `requested` stop is never
     /// proof; only inspecting every recorded identity settles the state.
     pub fn drive_stops(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
+        self.drive_stops_scoped(store, now_unix_seconds, None)
+    }
+
+    /// Drive stop intents for one scope only.
+    pub fn drive_stops_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+    ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
             let wants_stop = match execution.state {
                 ExecutionState::Stopping => true,
                 ExecutionState::Uncertain => matches!(
@@ -994,13 +1079,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// One bounded recovery attempt per waiting Execution per pass. Each
     /// attempt is durable; exhaustion is decided by `work`'s sweep against
     /// the stored bound, not by this loop.
-    pub fn run_recovery(
+    pub fn run_recovery(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
+        self.run_recovery_scoped(store, now_unix_seconds, None)
+    }
+
+    /// Run one artifact-recovery attempt for one scope only.
+    pub fn run_recovery_scoped(
         &self,
         store: &impl Store,
         _now_unix_seconds: i64,
+        scope: Option<&WorkId>,
     ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
             if execution.state != ExecutionState::Waiting
                 || execution.waiting_reason != Some(WaitingReason::ArtifactRecovery)
             {

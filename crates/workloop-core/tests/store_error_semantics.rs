@@ -13,7 +13,7 @@ use workloop_core::identity::{
 };
 use workloop_core::observation::Observation;
 use workloop_core::store::{
-    Deferral, Effect, HostActionIntent, ReadView, Store, StoreError, TxView,
+    Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent, Store, StoreError, TxView,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 
@@ -216,6 +216,9 @@ impl ReadView for FailingTx<'_> {
         unimplemented!()
     }
     fn recovery_decisions(&self, _work_id: &WorkId) -> Result<Vec<RecoveryDecision>, StoreError> {
+        unimplemented!()
+    }
+    fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError> {
         unimplemented!()
     }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {

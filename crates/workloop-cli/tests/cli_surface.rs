@@ -69,8 +69,9 @@ fn command_and_query_surface_round_trip() {
     assert_eq!(items[0]["work_id"], work_id);
     assert_eq!(items[0]["phase"], "queued");
 
-    // run-once admits the queued execution (capacity 1).
-    run_at(&root, &["run-once"]);
+    // `run --once` admits the queued execution (capacity 1) through
+    // the single run verb.
+    run_at(&root, &["run", "--once"]);
     let detail = run_at(&root, &["work-detail", "--work", &work_id]);
     assert_eq!(
         detail["value"]["executions"][0]["state"], "ready",

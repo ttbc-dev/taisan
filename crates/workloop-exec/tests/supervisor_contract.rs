@@ -458,6 +458,44 @@ fn crash_after_ready_replays_the_request_exactly_once() {
 }
 
 #[test]
+fn scoped_supervision_launches_only_the_scoped_works_request() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let root = tmp_root("scoped");
+    let (w1, e1) = submit_and_admit(&store, "k-scope1");
+    let (w2, e2) = submit_and_admit(&store, "k-scope2");
+    let sup = supervisor("hang", root);
+
+    // A `--work` pass consumes only the named Work's durable request.
+    sup.consume_requests_scoped(&store, NOW, Some(&w1)).unwrap();
+    let inv1 = store
+        .transact(|tx| tx.invocations_for_execution(&e1))
+        .unwrap();
+    let inv2 = store
+        .transact(|tx| tx.invocations_for_execution(&e2))
+        .unwrap();
+    assert_eq!(inv1.len(), 1, "the scoped Work launched its writer");
+    assert!(
+        inv2.is_empty(),
+        "a scoped pass never launches another Work's writer"
+    );
+
+    // Cleanup: settle both Executions with stop proof.
+    cancel(&store, &w1, "k-scope3");
+    cancel(&store, &w2, "k-scope4");
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &e1).state == ExecutionState::Cancelled
+            && execution(&store, &e2).state == ExecutionState::Cancelled
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &e1).state, ExecutionState::Cancelled);
+    assert_eq!(execution(&store, &e2).state, ExecutionState::Cancelled);
+}
+
+#[test]
 fn crash_near_spawn_leaves_uncertain_with_no_second_writer() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("nearspawn");
