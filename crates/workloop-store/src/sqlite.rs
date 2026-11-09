@@ -12,7 +12,10 @@
 //!
 //! `PRAGMA user_version` is the format gate: `1` is the only supported
 //! version. An unversioned database with user tables is a slice-0 file —
-//! archive-only, refused at open — and a newer version is refused.
+//! archive-only, refused at open — and a newer version is refused. A v1
+//! file from the previous release (full base schema, none of this
+//! slice's additive tables) is upgraded in place; any other v1 file
+//! that is missing tables is foreign and refused.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -35,7 +38,9 @@ const FORMAT_VERSION: i64 = 1;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
-/// alone is not proof the file is this store's format.
+/// alone is not proof the file is this store's format — unless it is the
+/// previous release's v1 store, which holds every table except
+/// [`ADDITIVE_TABLES`] and is upgraded in place.
 const EXPECTED_TABLES: &[&str] = &[
     "attention_acks",
     "body_catalog",
@@ -64,6 +69,13 @@ const EXPECTED_TABLES: &[&str] = &[
     "work_usage",
     "works",
 ];
+
+/// The tables this slice added on top of the previous release's v1
+/// store. A v1 file missing only these is that earlier store — every
+/// other expected table is present — and is upgraded in place by
+/// installing them. A v1 file missing anything else is foreign and is
+/// refused exactly as before.
+const ADDITIVE_TABLES: &[&str] = &["body_catalog", "recovery_intents", "run_lease"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -165,6 +177,7 @@ impl SqliteStore {
             });
         }
         let mut bootstrapping = false;
+        let mut upgrading = false;
         if version == 0 {
             let has_tables: bool = conn
                 .query_row(
@@ -186,7 +199,11 @@ impl SqliteStore {
             // A v1 stamp alone is not proof this is our store: verify the
             // schema shape before any mutating pragma. A foreign or
             // truncated file carrying version 1 is refused as unsupported
-            // — never WAL-flipped and seeded first.
+            // — never WAL-flipped and seeded first. The one accepted
+            // difference is the previous release's store: it holds every
+            // expected table except the additive ones this slice installs,
+            // so it is upgraded in place instead of being locked out with
+            // a misleading "not the recognized schema" refusal.
             let mut stmt = conn
                 .prepare(
                     "SELECT name FROM sqlite_master \
@@ -198,12 +215,21 @@ impl SqliteStore {
                 .map_err(internal)?
                 .collect::<Result<_, _>>()
                 .map_err(internal)?;
-            if !EXPECTED_TABLES.iter().all(|t| present.contains(*t)) {
-                return Err(StoreError::UnsupportedFormat {
-                    detail: "store file claims the current format but does \
-                             not hold the recognized schema"
-                        .into(),
-                });
+            let missing: Vec<&str> = EXPECTED_TABLES
+                .iter()
+                .copied()
+                .filter(|t| !present.contains(*t))
+                .collect();
+            if !missing.is_empty() {
+                if missing.iter().all(|t| ADDITIVE_TABLES.contains(t)) {
+                    upgrading = true;
+                } else {
+                    return Err(StoreError::UnsupportedFormat {
+                        detail: "store file claims the current format but does \
+                                 not hold the recognized schema"
+                            .into(),
+                    });
+                }
             }
         }
         // journal_mode cannot change inside a transaction, so it is set
@@ -225,6 +251,15 @@ impl SqliteStore {
                 params![new_id("store")],
             )
             .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        } else if upgrading {
+            // Previous-release v1 store: install only the missing
+            // additive tables. `SCHEMA` is entirely `CREATE TABLE IF
+            // NOT EXISTS`, so a re-run is a no-op and a crash mid-way
+            // resumes on the next open. `user_version` stays 1 — the
+            // format did not change, the recognized table set grew.
+            let tx = conn.unchecked_transaction().map_err(internal)?;
+            tx.execute_batch(SCHEMA).map_err(internal)?;
             tx.commit().map_err(internal)?;
         }
         // Seed the fixed slot rows once; claiming is an UPDATE inside the

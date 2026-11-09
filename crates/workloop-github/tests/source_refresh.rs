@@ -237,7 +237,7 @@ fn the_outbox_stops_at_the_tick_bound_and_reports_the_remainder() {
     }
 
     let first = gh
-        .apply_outbox_bounded(&store, &config(), NOW, None, 2)
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 2)
         .unwrap();
     assert_eq!(first.attempted, 2);
     assert_eq!(first.applied, 2);
@@ -245,7 +245,7 @@ fn the_outbox_stops_at_the_tick_bound_and_reports_the_remainder() {
     assert_eq!(gh.applied().len(), 2);
 
     let second = gh
-        .apply_outbox_bounded(&store, &config(), NOW, None, 2)
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 2)
         .unwrap();
     assert_eq!(second.attempted, 1);
     assert!(second.deferred.is_empty());
@@ -258,13 +258,62 @@ fn the_outbox_stops_at_the_tick_bound_and_reports_the_remainder() {
 }
 
 #[test]
+fn a_tick_deadline_stops_the_outbox_drain_and_defers_the_remainder() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let mut gh = FixtureGithub::new();
+    for i in 0..3 {
+        let (w, e) = submit(&store, &format!("k-{i}"));
+        admit(&store, &e);
+        queue_open_change(&store, &w);
+    }
+
+    // Deadline already reached when the drain starts: the phase-entry
+    // style gate — no write is attempted, every pending intent is
+    // reported for the next pass.
+    let early = gh
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, Some(NOW), None, 8)
+        .unwrap();
+    assert_eq!(early.attempted, 0, "a late drain starts nothing");
+    assert_eq!(
+        early.deferred.len(),
+        3,
+        "every intent is reported, none dropped"
+    );
+    assert!(gh.applied().is_empty(), "no host write happened");
+
+    // Deadline passes mid-drain: the item that started runs, the rest
+    // of the loop checks the deadline before starting anything new.
+    let mut calls = 0u32;
+    let mid = gh
+        .apply_outbox_bounded(
+            &store,
+            &config(),
+            &mut || {
+                calls += 1;
+                if calls <= 2 { NOW } else { NOW + 60 }
+            },
+            Some(NOW + 30),
+            None,
+            8,
+        )
+        .unwrap();
+    assert_eq!(mid.attempted, 1, "the item started before the deadline");
+    assert_eq!(
+        mid.deferred.len(),
+        2,
+        "the remainder waits for the next pass"
+    );
+    assert_eq!(gh.applied().len(), 1);
+}
+
+#[test]
 fn a_scoped_outbox_never_touches_another_works_intent() {
     let (store, mut gh, w1, w2) = two_changes();
     // Fresh intents on both Works; drain only w1's scope.
     queue_open_change(&store, &w1);
     queue_open_change(&store, &w2);
     let report = gh
-        .apply_outbox_bounded(&store, &config(), NOW, Some(&w1), 8)
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, Some(&w1), 8)
         .unwrap();
     assert_eq!(report.attempted, 1, "only the scoped Work's intent ran");
     assert_eq!(report.applied, 1);

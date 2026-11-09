@@ -119,6 +119,71 @@ fn a_pinned_body_is_never_reclaimed() {
 }
 
 #[test]
+fn pin_creation_is_refused_once_the_body_leaves_present() {
+    let dir = root("pin-refuse");
+    let store = SqliteStore::in_memory(1).unwrap();
+
+    // A `reclaimed` body: the normal sweep path.
+    register(&store, &dir, "gone", NOW - 100, Some(NOW - 10), false, 8);
+    let report = store.retention_sweep(&params(), &dir, NOW).unwrap();
+    assert_eq!(report.reclaimed.len(), 1);
+    assert_eq!(store.body_state("gone").unwrap().unwrap().0, "reclaimed");
+    let err = store.set_body_pin("gone", true).unwrap_err();
+    assert!(format!("{err}").contains("unavailable"), "{err}");
+
+    // A `reclaiming` body: its delete always fails (the parent is a
+    // regular file), so the row sits in the two-phase middle state a
+    // pin must never be able to enter. Refusing the pin here is what
+    // closes the eligibility-marking vs deletion race: a pin can never
+    // land on a body the sweep has already claimed.
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, "block").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "stuck".into(),
+            category: "cas".into(),
+            path: blocker.join("child.blob").to_string_lossy().into_owned(),
+            bytes: 8,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+    let mut p = params();
+    p.interval_seconds = 1;
+    let second = store.retention_sweep(&p, &dir, NOW + 5).unwrap();
+    assert_eq!(
+        second.failed.len(),
+        1,
+        "the delete fails, leaving reclaiming"
+    );
+    assert_eq!(store.body_state("stuck").unwrap().unwrap().0, "reclaiming");
+    let err = store.set_body_pin("stuck", true).unwrap_err();
+    assert!(format!("{err}").contains("reclaiming"), "{err}");
+
+    // Clearing stays allowed in any state — it can only un-protect.
+    store.set_body_pin("gone", false).unwrap();
+    // A body that was never registered keeps the original error.
+    let err = store.set_body_pin("nope", true).unwrap_err();
+    assert!(format!("{err}").contains("not registered"), "{err}");
+
+    // Pin creation on a `present` body still succeeds and protects it.
+    let live = register(&store, &dir, "live", NOW - 100, Some(NOW - 10), false, 8);
+    store.set_body_pin("live", true).unwrap();
+    let third = store.retention_sweep(&p, &dir, NOW + 10).unwrap();
+    assert!(
+        third
+            .held
+            .iter()
+            .any(|h| h.body_id == "live" && h.reason == "pinned"),
+        "a pin created while present blocks the sweep: {:?}",
+        third.held
+    );
+    assert!(live.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn young_and_unattributed_bodies_are_not_eligible() {
     let dir = root("young");
     let store = SqliteStore::in_memory(1).unwrap();

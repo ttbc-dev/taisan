@@ -133,6 +133,14 @@ impl SqliteStore {
     }
 
     /// Set or clear a protective dependency pin on a registered body.
+    /// Pin *creation* is refused once the body leaves `present`
+    /// (`reclaiming`, `reclaimed`): the requester sees the body as
+    /// unavailable and follows ordinary missing-evidence rules. That
+    /// refusal closes the race between eligibility marking and
+    /// deletion — a pin can never land on a body the sweep has already
+    /// claimed, so no later pass can silently override it. Clearing a
+    /// pin stays allowed in any state: it is bookkeeping that can only
+    /// ever make a body *less* protected.
     pub fn set_body_pin(&self, body_id: &str, pinned: bool) -> Result<(), StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
@@ -140,15 +148,39 @@ impl SqliteStore {
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        let updated = tx
-            .execute(
-                "UPDATE body_catalog SET pinned=?2 WHERE body_id=?1",
-                params![body_id, i64::from(pinned)],
+        let updated = if pinned {
+            tx.execute(
+                "UPDATE body_catalog SET pinned=1 WHERE body_id=?1 AND state='present'",
+                params![body_id],
             )
-            .map_err(map_err)?;
+            .map_err(map_err)?
+        } else {
+            tx.execute(
+                "UPDATE body_catalog SET pinned=0 WHERE body_id=?1",
+                params![body_id],
+            )
+            .map_err(map_err)?
+        };
         if updated == 0 {
-            return Err(StoreError::ConstraintConflict {
-                detail: format!("body {body_id} is not registered"),
+            // Distinguish "never registered" from "registered but no
+            // longer present" so the caller can follow the right rule.
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM body_catalog WHERE body_id=?1",
+                    params![body_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_err)?;
+            return Err(match state {
+                None => StoreError::ConstraintConflict {
+                    detail: format!("body {body_id} is not registered"),
+                },
+                Some(state) => StoreError::ConstraintConflict {
+                    detail: format!(
+                        "body {body_id} is unavailable ({state}); pin creation is refused"
+                    ),
+                },
             });
         }
         tx.commit().map_err(internal)?;

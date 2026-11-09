@@ -264,16 +264,21 @@ pub fn run_pass(
 
     // Phase 3 — in-flight supervision (supervisor launches, polls and
     // drives stops; scoped passes never touch another Work's writers).
+    // Every supervision item loop checks the tick deadline before it
+    // starts new work; a pass cut short reports `tick.deadline` and the
+    // untouched items wait, durable, for the next pass.
     if gated!(2) {
-        let result = (|| -> Result<usize, String> {
+        let result = (|| -> Result<(usize, bool), String> {
             let before = pass
                 .store
                 .transact(|tx| tx.pending_requests())
                 .map_err(|e| e.to_string())?
                 .len();
+            let mut cut = false;
             if let Some(supervisor) = pass.supervisor {
-                supervisor
-                    .run_once_scoped(pass.store, clock(), scope)
+                let now = clock();
+                cut = supervisor
+                    .run_once_scoped(pass.store, now, scope, clock, Some(deadline))
                     .map_err(|e| e.to_string())?;
             }
             let after = pass
@@ -281,12 +286,15 @@ pub fn run_pass(
                 .transact(|tx| tx.pending_requests())
                 .map_err(|e| e.to_string())?
                 .len();
-            Ok(before.saturating_sub(after))
+            Ok((before.saturating_sub(after), cut))
         })();
         push!(match result {
-            Ok(consumed) => {
+            Ok((consumed, cut)) => {
                 let mut p = PhaseReport::completed(PHASES[2]);
                 p.processed = consumed;
+                if cut {
+                    p.reason = Some("tick.deadline".into());
+                }
                 p
             }
             Err(e) => PhaseReport::failed(PHASES[2], e),
@@ -294,14 +302,15 @@ pub fn run_pass(
     }
 
     // Phase 4 — host outbox (≤ 8 attempts per tick, then report the
-    // untouched remainder; the phase-entry deadline keeps a late pass
-    // from starting the drain at all).
+    // untouched remainder; the tick deadline is checked before every
+    // new item, so a late pass defers the drain instead of writing
+    // past the deadline).
     if gated!(3) {
-        let now = clock();
         let result = pass.host.apply_outbox_bounded(
             pass.store,
             pass.config,
-            now,
+            clock,
+            Some(deadline),
             scope,
             OUTBOX_ITEMS_PER_TICK,
         );
@@ -536,6 +545,8 @@ mod tests {
     use workloop_core::command::*;
     use workloop_core::domain::*;
     use workloop_core::identity::*;
+    use workloop_core::observation::HostActionStatus;
+    use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
 
     const NOW: i64 = 1_700_000_000;
@@ -751,6 +762,84 @@ mod tests {
             vec![
                 "deferred",
                 "deferred",
+                "completed",
+                "deferred",
+                "deferred",
+                "completed",
+            ],
+            "later gated phases defer; sweep and Attention still run: {:?}",
+            report.phases
+        );
+    }
+
+    #[test]
+    fn the_outbox_item_loop_stops_at_the_tick_deadline() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-outbox");
+        let cfg = config();
+        let action_id = store
+            .transact(|tx| {
+                let action_id = "act-outbox".to_string();
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
+                        action_id: action_id.clone(),
+                        work_id: w.clone(),
+                        host: cfg.host.repository.host.clone(),
+                        repository: cfg.host.repository.clone(),
+                        role: ActorRole::Publication,
+                        actor: cfg.host.actors[0].actor.clone(),
+                        action: HostAction::OpenChangeRequest {
+                            source_branch: format!("work/{}", w.0),
+                            target_branch: "main".into(),
+                            title: "t".into(),
+                            body: String::new(),
+                        },
+                        payload_digest: "digest".into(),
+                        status: HostActionStatus::Pending,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
+                    },
+                })?;
+                Ok(action_id)
+            })
+            .unwrap();
+        let settings = settings();
+        // Calls 1-7 (pass start, the phase gates, refresh, dispatch)
+        // stay inside the budget; the clock reaches the tick deadline
+        // exactly where the outbox item loop starts consulting it, so
+        // the drain must stop before its first write instead of
+        // running all 8 attempts past the deadline.
+        let mut calls = 0u32;
+        let report = run(&store, &settings, None, &mut || {
+            calls += 1;
+            if calls <= 7 { NOW } else { NOW + TICK as i64 }
+        });
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.phase, "host_outbox");
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(outbox.processed, 0, "no write starts after the deadline");
+        assert_eq!(
+            outbox.deferred,
+            vec![action_id.clone()],
+            "the untouched intent is reported for the next pass"
+        );
+        assert!(report.deadline_exceeded);
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].status,
+            HostActionStatus::Pending,
+            "the intent waits durable for the next pass"
+        );
+        assert_eq!(
+            statuses(&report),
+            vec![
+                "completed",
+                "completed",
+                "completed",
+                "completed",
                 "completed",
                 "deferred",
                 "deferred",

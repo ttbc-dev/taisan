@@ -466,7 +466,8 @@ fn scoped_supervision_launches_only_the_scoped_works_request() {
     let sup = supervisor("hang", root);
 
     // A `--work` pass consumes only the named Work's durable request.
-    sup.consume_requests_scoped(&store, NOW, Some(&w1)).unwrap();
+    sup.consume_requests_scoped(&store, NOW, Some(&w1), &mut || NOW, None)
+        .unwrap();
     let inv1 = store
         .transact(|tx| tx.invocations_for_execution(&e1))
         .unwrap();
@@ -493,6 +494,81 @@ fn scoped_supervision_launches_only_the_scoped_works_request() {
     }
     assert_eq!(execution(&store, &e1).state, ExecutionState::Cancelled);
     assert_eq!(execution(&store, &e2).state, ExecutionState::Cancelled);
+}
+
+#[test]
+fn a_tick_deadline_stops_supervision_before_starting_new_work() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let root = tmp_root("deadline");
+    let (_w1, e1) = submit_and_admit(&store, "k-d1");
+    let (_w2, e2) = submit_and_admit(&store, "k-d2");
+    let sup = supervisor("hang", root);
+
+    // Deadline already reached when the pass starts: nothing is
+    // launched, polled, signalled or recovered, and the pass reports
+    // that the deadline stopped it.
+    let cut = sup
+        .run_once_scoped(&store, NOW, None, &mut || NOW, Some(NOW))
+        .unwrap();
+    assert!(cut, "the pass reports the deadline stopped it");
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        2,
+        "no request was started"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&e1))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Deadline passes between two requests: the item loop checks before
+    // every item, so the first request is consumed and the second never
+    // starts. The first Execution is moved out of `Ready` first so its
+    // consumption abandons instead of spawning — this test starts no
+    // real writer.
+    let mut first = execution(&store, &e1);
+    first.state = ExecutionState::Stopping;
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateExecution {
+                execution: first.clone(),
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    let mut calls = 0u32;
+    sup.consume_requests_scoped(
+        &store,
+        NOW,
+        None,
+        &mut || {
+            calls += 1;
+            if calls == 1 { NOW } else { NOW + 60 }
+        },
+        Some(NOW + 30),
+    )
+    .unwrap();
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        1,
+        "the request behind the deadline never started"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&e1))
+            .unwrap()
+            .len(),
+        1,
+        "the request before the deadline was consumed"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.invocations_for_execution(&e2))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

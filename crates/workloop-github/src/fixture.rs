@@ -95,19 +95,31 @@ impl FixtureGithub {
         config: &WorkloopConfig,
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
-        self.apply_outbox_bounded(store, config, now_unix_seconds, None, usize::MAX)
-            .map(|_| ())
+        self.apply_outbox_bounded(
+            store,
+            config,
+            &mut || now_unix_seconds,
+            None,
+            None,
+            usize::MAX,
+        )
+        .map(|_| ())
     }
 
     /// The bounded, optionally Work-scoped drain the loop's host-outbox
     /// phase calls: at most `max_items` attempts per tick (the approved
     /// ≤ 8/tick), only intents belonging to `scope` when one is given,
     /// and the untouched remainder reported rather than silently left.
+    /// Like every other item loop, it checks `deadline` before starting
+    /// each new item — a drain that runs out of tick budget stops and
+    /// reports the rest for the next pass instead of writing past the
+    /// deadline.
     pub fn apply_outbox_bounded(
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
-        now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
         scope: Option<&WorkId>,
         max_items: usize,
     ) -> Result<OutboxReport, StoreError> {
@@ -122,10 +134,14 @@ impl FixtureGithub {
         if !config.allowed_effects.host_write {
             return Ok(report);
         }
+        let now = clock();
         let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
         let mut attempted = std::collections::HashSet::new();
         loop {
-            if report.attempted >= max_items {
+            // Both bounds stop the drain before the next item starts:
+            // the per-tick item budget and the tick deadline. Whichever
+            // trips, the untouched remainder is reported, never dropped.
+            if report.attempted >= max_items || deadline.is_some_and(|d| clock() >= d) {
                 let pending: Vec<String> = store.transact(|tx| {
                     Ok(tx
                         .action_intents()?
@@ -152,7 +168,7 @@ impl FixtureGithub {
             let action_id = intent.action_id.clone();
             attempted.insert(action_id.clone());
             report.attempted += 1;
-            self.attempt(store, config, intent, now_unix_seconds)?;
+            self.attempt(store, config, intent, now)?;
             let status = store.transact(|tx| {
                 Ok(tx
                     .action_intents()?

@@ -333,6 +333,14 @@ pub enum StopRecord {
     Unknown { reason: String },
 }
 
+/// The tick deadline, as every supervision item loop sees it: read the
+/// clock only when a deadline is actually set, and stop before starting
+/// the next item once it has been reached. `None` means unbounded — the
+/// clock is never consulted.
+fn deadline_reached(clock: &mut dyn FnMut() -> i64, deadline: Option<i64>) -> bool {
+    deadline.is_some_and(|d| clock() >= d)
+}
+
 /// The execution supervisor: consumes approved requests, spawns workers,
 /// drives stop intents to stop proof, and runs bounded artifact recovery.
 /// Start and stop for one request are serialized through a per-request
@@ -387,23 +395,48 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// each Execution waiting on artifact recovery. Reconciles by scanning
     /// the store — a wakeup is an at-least-once signal, not evidence.
     pub fn run_once(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
-        self.run_once_scoped(store, now_unix_seconds, None)
+        self.run_once_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+        .map(|_| ())
     }
 
     /// One supervisor pass restricted to one Work for a diagnostic
     /// `--work` pass: nothing outside the scope is launched, polled,
     /// stopped or recovered.
+    ///
+    /// Every item loop inside checks `deadline` before starting a new
+    /// item, and the pass checks it between the loops — a pass that runs
+    /// out of tick budget stops instead of launching, polling or
+    /// signalling past the deadline; the untouched items are durable and
+    /// wait for the next pass. `Ok(true)` means the deadline stopped the
+    /// pass before it exhausted its work.
     pub fn run_once_scoped(
         &self,
         store: &impl Store,
         now_unix_seconds: i64,
         scope: Option<&WorkId>,
-    ) -> Result<(), ExecError> {
-        self.consume_requests_scoped(store, now_unix_seconds, scope)?;
-        self.poll_invocations_scoped(store, now_unix_seconds, scope)?;
-        self.drive_stops_scoped(store, now_unix_seconds, scope)?;
-        self.run_recovery_scoped(store, now_unix_seconds, scope)?;
-        Ok(())
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<bool, ExecError> {
+        self.consume_requests_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.poll_invocations_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.drive_stops_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        Ok(deadline_reached(clock, deadline))
     }
 
     /// Replay the durable request log: for each unconsumed request either
@@ -414,18 +447,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
-        self.consume_requests_scoped(store, now_unix_seconds, None)
+        self.consume_requests_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
     }
 
     /// Replay the durable request log for one scope only: a scoped pass
-    /// never launches another Work's Invocation.
+    /// never launches another Work's Invocation. The deadline is checked
+    /// before each request starts, so a pass that runs out of tick budget
+    /// launches nothing further — the remaining requests stay durable.
     pub fn consume_requests_scoped(
         &self,
         store: &impl Store,
         now_unix_seconds: i64,
         scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
     ) -> Result<(), ExecError> {
         for request in store.transact(|tx| tx.pending_requests())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             if let Some(work_id) = scope
                 && request.work_id != *work_id
             {
@@ -618,18 +664,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
-        self.poll_invocations_scoped(store, now_unix_seconds, None)
+        self.poll_invocations_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
     }
 
-    /// Inspect live invocations for one scope only.
+    /// Inspect live invocations for one scope only. The deadline is
+    /// checked before each invocation is inspected: a poll that runs out
+    /// of tick budget stops with the rest untouched for the next pass.
     pub fn poll_invocations_scoped(
         &self,
         store: &impl Store,
         now_unix_seconds: i64,
         scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
     ) -> Result<(), ExecError> {
         let unresolved = store.transact(|tx| tx.unresolved_invocations())?;
         for invocation in unresolved {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             if let Some(work_id) = scope {
                 let belongs = store.transact(|tx| {
                     Ok::<_, StoreError>(
@@ -783,18 +842,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// durable-intent → signal → inspect loop. A `requested` stop is never
     /// proof; only inspecting every recorded identity settles the state.
     pub fn drive_stops(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
-        self.drive_stops_scoped(store, now_unix_seconds, None)
+        self.drive_stops_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
     }
 
-    /// Drive stop intents for one scope only.
+    /// Drive stop intents for one scope only. The deadline is checked
+    /// before each Execution's stop is driven: signalling is new work,
+    /// so a pass out of tick budget leaves the remaining Executions for
+    /// the next pass.
     pub fn drive_stops_scoped(
         &self,
         store: &impl Store,
         now_unix_seconds: i64,
         scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
     ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             if let Some(work_id) = scope
                 && execution.work_id != *work_id
             {
@@ -1080,18 +1153,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// attempt is durable; exhaustion is decided by `work`'s sweep against
     /// the stored bound, not by this loop.
     pub fn run_recovery(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
-        self.run_recovery_scoped(store, now_unix_seconds, None)
+        self.run_recovery_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
     }
 
-    /// Run one artifact-recovery attempt for one scope only.
+    /// Run one artifact-recovery attempt for one scope only. The
+    /// deadline is checked before each recovery attempt starts — an
+    /// attempt is new work, so a pass out of tick budget starts none.
     pub fn run_recovery_scoped(
         &self,
         store: &impl Store,
         _now_unix_seconds: i64,
         scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
     ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             if let Some(work_id) = scope
                 && execution.work_id != *work_id
             {
