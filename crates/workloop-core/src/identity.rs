@@ -108,12 +108,38 @@ impl fmt::Display for RepositoryRef {
 
 /// Issue identity inside one repository. `display_number` is
 /// presentation metadata and takes no part in identity comparison.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueRef {
     pub repository: RepositoryRef,
     pub issue: IssueId,
     #[serde(default)]
     pub display_number: Option<u64>,
+}
+
+// Identity, ordering, and bucketing all ignore `display_number`: the
+// same issue observed with a renumbered or absent display number is the
+// same issue.
+impl PartialEq for IssueRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.repository == other.repository && self.issue == other.issue
+    }
+}
+impl Eq for IssueRef {}
+impl PartialOrd for IssueRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for IssueRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.repository, &self.issue).cmp(&(&other.repository, &other.issue))
+    }
+}
+impl std::hash::Hash for IssueRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.repository.hash(state);
+        self.issue.hash(state);
+    }
 }
 
 impl fmt::Display for IssueRef {
@@ -122,13 +148,37 @@ impl fmt::Display for IssueRef {
     }
 }
 
-/// Change-request identity inside one repository.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Change-request identity inside one repository. `display_number` is
+/// presentation metadata and takes no part in identity comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeRequestRef {
     pub repository: RepositoryRef,
     pub change_request: ChangeRequestId,
     #[serde(default)]
     pub display_number: Option<u64>,
+}
+
+impl PartialEq for ChangeRequestRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.repository == other.repository && self.change_request == other.change_request
+    }
+}
+impl Eq for ChangeRequestRef {}
+impl PartialOrd for ChangeRequestRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ChangeRequestRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.repository, &self.change_request).cmp(&(&other.repository, &other.change_request))
+    }
+}
+impl std::hash::Hash for ChangeRequestRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.repository.hash(state);
+        self.change_request.hash(state);
+    }
 }
 
 impl fmt::Display for ChangeRequestRef {

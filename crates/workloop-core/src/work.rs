@@ -418,22 +418,30 @@ fn latest_head(tx: &dyn ReadView, work_id: &WorkId) -> Result<Option<CommitRevis
     Ok(current_target(tx, work_id)?.map(|t| t.head))
 }
 
-/// The Work's current diff target, derived from persisted evidence:
-/// the change request its `open_change_request` receipt opened, the
-/// latest observed head for it, and the latest target-branch revision.
-/// `None` until the change request exists.
-pub(crate) fn current_target(
+/// The change request and target branch a *verified* receipt opened
+/// for this Work: only an effect inside a `HostActionResult` whose
+/// `action_id` names a recorded intent reconciled to `applied` counts.
+/// A failed, unknown, or unrecorded receipt is evidence of an attempt —
+/// never of an opened change.
+pub(crate) fn applied_opened_change(
     tx: &dyn ReadView,
     work_id: &WorkId,
-) -> Result<Option<DiffTarget>, StoreError> {
-    let observations = tx.observations_for_work(work_id)?;
+) -> Result<Option<(crate::identity::ChangeRequestRef, String)>, StoreError> {
     let work = tx.work(work_id)?;
     let Some(work) = work else { return Ok(None) };
-    // The change request the Work's own open receipt recorded on the
-    // bound repository.
+    let intents = tx.action_intents()?;
+    let applied: BTreeSet<&str> = intents
+        .iter()
+        .filter(|i| i.work_id == *work_id && i.status == HostActionStatus::Applied)
+        .map(|i| i.action_id.as_str())
+        .collect();
     let mut change: Option<(crate::identity::ChangeRequestRef, String)> = None;
-    for o in &observations {
-        if let ObservationFact::HostActionResult { effects, .. } = &o.fact {
+    for o in tx.observations_for_work(work_id)? {
+        if let ObservationFact::HostActionResult {
+            action_id, effects, ..
+        } = &o.fact
+            && applied.contains(action_id.as_str())
+        {
             for e in effects {
                 if let NormalizedEffectFact::ChangeOpened {
                     change: c,
@@ -447,7 +455,21 @@ pub(crate) fn current_target(
             }
         }
     }
-    let Some((change, target_branch)) = change else {
+    Ok(change)
+}
+
+/// The Work's current diff target, derived from persisted evidence:
+/// the change request its `open_change_request` receipt opened, the
+/// latest observed head for it, and the latest target-branch revision.
+/// `None` until the change request exists.
+pub(crate) fn current_target(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<Option<DiffTarget>, StoreError> {
+    let observations = tx.observations_for_work(work_id)?;
+    let work = tx.work(work_id)?;
+    let Some(work) = work else { return Ok(None) };
+    let Some((change, target_branch)) = applied_opened_change(tx, work_id)? else {
         return Ok(None);
     };
     // The latest ChangeHead for that change, ordered by observed time
@@ -2536,6 +2558,16 @@ fn reconcile_intent(
     else {
         return Ok(());
     };
+    // Terminal reconciliation sticks: a late receipt cannot resurrect a
+    // failed intent or downgrade an applied one. `unknown` stays
+    // reconcilable — a later receipt for the same action_id is what
+    // resolves it.
+    if matches!(
+        intent.status,
+        HostActionStatus::Applied | HostActionStatus::Failed { .. }
+    ) {
+        return Ok(());
+    }
     let recorded = match status {
         HostActionStatus::Applied if effect_matches(&intent, &effects) => HostActionStatus::Applied,
         HostActionStatus::Applied => HostActionStatus::Unknown {
@@ -3231,19 +3263,30 @@ fn maybe_publish(
     // Stage 1: push_ref. Produced revision = the published artifact's
     // digest interpreted as an object id on the bound repository.
     let branch = format!("work/{}", work.id.0);
-    let push = work_intents
-        .iter()
-        .find(|i| matches!(i.action, HostAction::PushRef { .. }));
-    let push_applied = push.is_some_and(|i| i.status == HostActionStatus::Applied);
+    // Any applied push lands the ref — earlier failed retries must not
+    // keep the stage pinned open.
+    let push_applied = work_intents.iter().any(|i| {
+        matches!(i.action, HostAction::PushRef { .. }) && i.status == HostActionStatus::Applied
+    });
     if !push_applied {
-        if push.is_some_and(|i| matches!(i.status, HostActionStatus::Failed { .. })) {
-            // Re-issue is allowed only while the transport account has
-            // retries left (the receipt handler pauses when spent).
-            let usage = tx
-                .work_usage(&work.id)?
-                .unwrap_or_else(|| WorkUsage::new(&work.id));
-            if usage.transport_retries_used > work.policy.transport_max_retries {
-                return Ok(());
+        // A definitely-failed latest attempt re-issues while the
+        // transport account has retries left (the receipt handler pauses
+        // when spent). Pending/unknown pushes are already caught by the
+        // outstanding check above.
+        if let Some(latest_push) = work_intents
+            .iter()
+            .rfind(|i| matches!(i.action, HostAction::PushRef { .. }))
+        {
+            match latest_push.status {
+                HostActionStatus::Failed { .. } => {
+                    let usage = tx
+                        .work_usage(&work.id)?
+                        .unwrap_or_else(|| WorkUsage::new(&work.id));
+                    if usage.transport_retries_used > work.policy.transport_max_retries {
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
             }
         }
         let produced =

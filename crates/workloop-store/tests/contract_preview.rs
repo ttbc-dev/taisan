@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
+use workloop_core::observation::HostActionStatus;
 use workloop_core::observation::{Completeness, Observation, ObservationFact, OccurrenceInput};
 use workloop_core::projection::{self, CommandResultLookup, QueryResult};
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{
     HostTemplate, PreviewAvailability, WorkloopConfig, handle_command, handle_observation, preview,
 };
@@ -139,9 +140,51 @@ fn emit(store: &SqliteStore, work_id: &WorkId, fact: ObservationFact, at: i64) {
     .unwrap();
 }
 
+/// The applied intent the open receipt reconciles against — only a
+/// receipt naming a recorded applied intent validates the opened change.
+fn open_intent(store: &SqliteStore, work_id: &WorkId) {
+    store
+        .transact(|tx| {
+            if tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == "act-open")
+            {
+                return Ok(());
+            }
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-open".into(),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: HostActorRef {
+                        host: host(),
+                        actor: HostActorId::trusted("pub-agent"),
+                    },
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+}
+
 /// The change request the Work opened plus its observed head — the two
 /// facts `current_target` derives the judgeable diff target from.
 fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
+    open_intent(store, work_id);
     emit(
         store,
         work_id,
@@ -153,7 +196,7 @@ fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
                 workloop_core::observation::NormalizedEffectFact::ChangeOpened {
                     change: change(),
                     head: rev(object),
-                    source_branch: "work/w-1".into(),
+                    source_branch: format!("work/{}", work_id.0),
                     target_branch: "main".into(),
                 },
             ],

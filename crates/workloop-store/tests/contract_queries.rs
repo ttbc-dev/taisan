@@ -124,7 +124,46 @@ fn submit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
 
 /// The change the Work opened plus its observed head — the two facts
 /// `current_target` derives the diff target from.
+/// The applied intent the open receipt reconciles against — only a
+/// receipt naming a recorded applied intent validates the opened change.
+fn open_intent(store: &SqliteStore, work_id: &WorkId, action_id: &str) {
+    store
+        .transact(|tx| {
+            if tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == action_id)
+            {
+                return Ok(());
+            }
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: action_id.into(),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+}
+
 fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
+    open_intent(store, work_id, "act-open");
     for fact in [
         ObservationFact::HostActionResult {
             action_id: "act-open".into(),
@@ -133,7 +172,7 @@ fn open_change(store: &SqliteStore, work_id: &WorkId, object: &str, at: i64) {
             effects: vec![NormalizedEffectFact::ChangeOpened {
                 change: change(),
                 head: rev(object),
-                source_branch: "work/w-1".into(),
+                source_branch: format!("work/{}", work_id.0),
                 target_branch: "main".into(),
             }],
         },

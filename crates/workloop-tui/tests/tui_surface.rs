@@ -20,7 +20,7 @@ use workloop_core::observation::{
     OccurrenceInput,
 };
 use workloop_core::projection::FindingView;
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{self, HostTemplate, WorkloopConfig};
 use workloop_store::sqlite::SqliteStore;
 
@@ -160,9 +160,46 @@ fn observe(store: &SqliteStore, work_id: &WorkId, fact: ObservationFact, at: i64
     work::handle_observation(store, &config(), &obs, at).unwrap();
 }
 
-/// Publish the change request and record its head — the outbox receipt
-/// and the head observation together establish the diff target.
+/// Publish the change request and record its head — the applied intent,
+/// the outbox receipt, and the head observation together establish the
+/// diff target.
 fn open_change_at(store: &SqliteStore, work_id: &WorkId, sha: &str, at: i64) {
+    store
+        .transact(|tx| {
+            if tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == "act-open")
+            {
+                return Ok(());
+            }
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-open".into(),
+                    work_id: work_id.clone(),
+                    host: host_instance(),
+                    repository: repository(),
+                    role: ActorRole::Publication,
+                    actor: HostActorRef {
+                        host: host_instance(),
+                        actor: HostActorId::trusted("pub-agent"),
+                    },
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
     observe(
         store,
         work_id,
@@ -173,7 +210,7 @@ fn open_change_at(store: &SqliteStore, work_id: &WorkId, sha: &str, at: i64) {
             effects: vec![NormalizedEffectFact::ChangeOpened {
                 change: change(),
                 head: rev(sha),
-                source_branch: "work/demo".into(),
+                source_branch: format!("work/{}", work_id.0),
                 target_branch: "main".into(),
             }],
         },

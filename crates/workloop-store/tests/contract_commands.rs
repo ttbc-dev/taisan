@@ -189,9 +189,46 @@ fn force_state(store: &SqliteStore, id: &ExecutionId, to: ExecutionState) {
 }
 
 /// Record the persisted open+head evidence `judge_findings` and
-/// `release_judgment` compare against: the change's `ChangeOpened`
-/// receipt inside a `HostActionResult`, then the head observation.
+/// `release_judgment` compare against: the applied `open_change_request`
+/// intent, its `ChangeOpened` receipt inside a `HostActionResult`, then
+/// the head observation.
 fn seed_change(store: &SqliteStore, work_id: &WorkId, head: &str, observed_at: i64) {
+    // Only an applied intent validates the receipt — tests that record
+    // their own `act-open` intent keep their own status.
+    let already = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .iter()
+                .any(|i| i.action_id == "act-open"))
+        })
+        .unwrap();
+    if !already {
+        apply_effects(
+            store,
+            &[Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-open".into(),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", work_id.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Applied,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq: 0,
+                },
+            }],
+        );
+    }
     apply_effects(
         store,
         &[
@@ -3928,4 +3965,294 @@ fn equivalent_failures_pause_on_the_failing_set() {
         e.repair_prerequisites,
         vec![RepairPrerequisite::OperatorDecision]
     );
+}
+
+/// Regression: `display_number` is presentation metadata — a source read
+/// that omits or renumbers it still identifies the same issue and
+/// resolves the gate.
+#[test]
+fn source_read_matches_regardless_of_display_number() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let source = SourceSnapshot {
+        issue: issue(9),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    let d = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &submit_with_sources("k-disp", vec![source]),
+        NOW,
+    )
+    .unwrap();
+    let (work_id, eid) = accepted_with_execution(&d);
+    let mut renumbered = issue(9);
+    renumbered.display_number = None;
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::Issue {
+                issue: renumbered,
+                source_revision: "rev-1".into(),
+                content_digest: "digest-1".into(),
+                state: IssueState::Open,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            assert_eq!(
+                tx.execution(&eid)?.unwrap().state,
+                ExecutionState::Ready,
+                "an absent display_number still identifies the declared issue"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a verified open is a receipt whose action_id names a
+/// recorded intent reconciled to `applied`. A receipt carrying
+/// `ChangeOpened` under an unrecorded or failed action is an attempt,
+/// never a diff target.
+#[test]
+fn unverified_open_receipt_cannot_create_a_diff_target() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uv1"), NOW).unwrap());
+    // A receipt naming no recorded intent — fabricated evidence.
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-fabricated".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("sha-fab"),
+                    source_branch: format!("work/{}", w.0),
+                    target_branch: "main".into(),
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    // A receipt naming an intent that reconciled to failed.
+    store
+        .transact(|tx| {
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: "act-failed".into(),
+                    work_id: w.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::OpenChangeRequest {
+                        source_branch: format!("work/{}", w.0),
+                        target_branch: "main".into(),
+                        title: "seed".into(),
+                        body: String::new(),
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Failed {
+                        reason: "declined".into(),
+                    },
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: "act-failed".into(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::ChangeOpened {
+                    change: change(),
+                    head: rev("sha-fab2"),
+                    source_branch: format!("work/{}", w.0),
+                    target_branch: "main".into(),
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let value = store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &w, NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = value else {
+        panic!("expected found")
+    };
+    assert!(
+        value.current_change.is_none(),
+        "unverified receipts never establish the diff target"
+    );
+    store
+        .transact(|tx| {
+            let failed = tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == "act-failed")
+                .unwrap();
+            assert!(
+                matches!(failed.status, HostActionStatus::Failed { .. }),
+                "a late applied claim cannot resurrect a failed intent"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: a failed push re-issues while retries remain, and the
+/// applied retry — not the oldest intent — advances the chain to
+/// `open_change_request` without recording a third push.
+#[test]
+fn an_applied_push_retry_advances_the_chain() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pr1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_max_retries = 3;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pr1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    let pushes = |store: &SqliteStore| {
+        store
+            .transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+    };
+    assert_eq!(pushes(&store).len(), 1);
+    // First push fails definitively: the receipt re-issues a retry.
+    emit(ObservationFact::HostActionResult {
+        action_id: pushes(&store)[0].action_id.clone(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Failed {
+            reason: "declined".into(),
+        },
+        effects: vec![],
+    });
+    let retry = pushes(&store);
+    assert_eq!(retry.len(), 2, "the failed push re-issues under the bound");
+    // The retry's applied receipt advances the chain — the old failed
+    // intent must not pin stage 1 open forever.
+    emit(ObservationFact::HostActionResult {
+        action_id: retry[1].action_id.clone(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::RefPublished {
+            repository: repo(),
+            branch: format!("work/{}", w.0),
+            produced: rev("artifact-digest"),
+            observed: rev("artifact-digest"),
+            relation: RefRelation::Equal,
+        }],
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            assert_eq!(
+                intents
+                    .iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .count(),
+                2,
+                "no third push once the retry landed"
+            );
+            let open = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::OpenChangeRequest { .. }))
+                .expect("the applied retry records the open intent");
+            assert_eq!(open.status, HostActionStatus::Pending);
+            Ok(())
+        })
+        .unwrap();
 }

@@ -400,19 +400,10 @@ pub fn work_detail(
     let outcome = current.as_ref().and_then(|e| e.outcome.clone());
 
     let observations = tx.observations_for_work(work_id)?;
-    // The opened change request and its latest observed head.
-    let mut change: Option<ChangeRequestRef> = None;
-    for obs in &observations {
-        if let ObservationFact::HostActionResult { effects, .. } = &obs.fact {
-            for e in effects {
-                if let crate::observation::NormalizedEffectFact::ChangeOpened { change: c, .. } = e
-                    && c.repository == work.binding.repository
-                {
-                    change = Some(c.clone());
-                }
-            }
-        }
-    }
+    // The opened change request (verified receipts only — the same gate
+    // `current_target` applies) and its latest observed head.
+    let change: Option<ChangeRequestRef> =
+        crate::work::applied_opened_change(tx, work_id)?.map(|(c, _)| c);
     let current_change = change.map(|c| {
         let head = observations
             .iter()
