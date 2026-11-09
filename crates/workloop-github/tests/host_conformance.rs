@@ -736,8 +736,9 @@ fn scoped_identities_do_not_collide(
 ) {
     let (work_a, _ea) = submit(store, config, "hc-scope-a");
     let (work_b, _eb) = submit(store, config, "hc-scope-b");
+    let mut push_ids = Vec::new();
     for (work, repository, object) in [(&work_a, repo(), "head-a"), (&work_b, repo_b(), "head-b")] {
-        insert_intent(
+        push_ids.push(insert_intent(
             store,
             work,
             &repository,
@@ -745,18 +746,42 @@ fn scoped_identities_do_not_collide(
                 branch: "work/shared-name".into(),
                 produced: rev_on(&repository, object),
             },
-        );
+        ));
+    }
+    let mut open_ids = Vec::new();
+    for (work, repository) in [(&work_a, repo()), (&work_b, repo_b())] {
+        open_ids.push(insert_intent(
+            store,
+            work,
+            &repository,
+            HostAction::OpenChangeRequest {
+                source_branch: "work/shared-name".into(),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+        ));
     }
     fixture.apply(store, config);
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
     let mut bound = BTreeSet::new();
-    for i in &intents {
+    let mut display = std::collections::BTreeMap::new();
+    let mine: Vec<_> = intents
+        .iter()
+        .filter(|i| push_ids.contains(&i.action_id) || open_ids.contains(&i.action_id))
+        .collect();
+    assert_eq!(mine.len(), 4, "two pushes and two opens");
+    for i in mine {
         assert_eq!(i.status, HostActionStatus::Applied);
         match &i.effects[..] {
             [NormalizedEffectFact::RefPublished { repository, .. }] => {
                 bound.insert(repository.clone());
             }
-            other => panic!("push receipt missing binding: {other:?}"),
+            [NormalizedEffectFact::ChangeOpened { change, .. }] => {
+                bound.insert(change.repository.clone());
+                display.insert(change.repository.clone(), change.display_number);
+            }
+            other => panic!("receipt missing binding: {other:?}"),
         }
     }
     assert_eq!(
@@ -764,17 +789,26 @@ fn scoped_identities_do_not_collide(
         BTreeSet::from([repo(), repo_b()]),
         "each receipt keeps its own repository binding"
     );
-    assert!(
-        fixture
-            .applied()
-            .iter()
-            .any(|a| a.contains(&repo().to_string()))
+    // The remote itself kept the writes separate: identical branch
+    // names on two repositories each retain their own head object.
+    assert_eq!(
+        fixture.remote_head(&repo(), "work/shared-name"),
+        Some("head-a".to_string()),
+        "repo A's remote branch keeps its own head"
     );
-    assert!(
-        fixture
-            .applied()
-            .iter()
-            .any(|a| a.contains(&repo_b().to_string()))
+    assert_eq!(
+        fixture.remote_head(&repo_b(), "work/shared-name"),
+        Some("head-b".to_string()),
+        "repo B's remote branch keeps its own head"
+    );
+    // Display numbers are a per-repository namespace: repo B's first
+    // change request is #1 even though repo A has already numbered
+    // several — under a global counter it could not be 1.
+    assert_eq!(display.get(&repo_b()), Some(&Some(1)));
+    assert_ne!(
+        display.get(&repo()),
+        Some(&Some(1)),
+        "repo A's counter advanced independently"
     );
 }
 
