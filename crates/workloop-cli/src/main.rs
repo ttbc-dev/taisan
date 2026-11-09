@@ -3,6 +3,8 @@
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
 
+mod envelope;
+
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -254,24 +256,72 @@ fn print(value: &impl serde::Serialize) {
     );
 }
 
+/// Print the one JSON envelope for a result and hand back its exit code.
+/// Human diagnostics go to stderr only — stdout carries the object.
+fn emit(result: (envelope::Envelope, i32)) -> i32 {
+    let (env, code) = result;
+    if let Some(line) = envelope::diagnostic(&env) {
+        eprintln!("{line}");
+    }
+    print(&env);
+    code
+}
+
 pub(crate) fn main() {
-    let cli = Cli::parse();
-    if let Err(e) = run(cli) {
-        eprintln!("taisan: {e}");
-        std::process::exit(1);
+    let code = match Cli::try_parse() {
+        Ok(cli) => run(cli),
+        Err(e) => {
+            // --help/--version are display requests, not results.
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                0
+            } else {
+                emit(envelope::error_envelope(
+                    None,
+                    envelope::ErrorClass::Usage,
+                    &e.to_string(),
+                ))
+            }
+        }
+    };
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli) -> i32 {
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
-    let installation = load_or_create(&config_path)?;
+    let installation = match load_or_create(&config_path) {
+        Ok(i) => i,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
     let actor = installation.actor();
-    let config = installation.workloop_config()?;
-    let store =
-        SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
+    let config = match installation.workloop_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
+    let store = match SqliteStore::open(&cli.db, installation.capacity) {
+        Ok(s) => s,
+        Err(e) => return emit(envelope::store_error(&e)),
+    };
     let key = || {
         cli.idempotency_key
             .clone()
@@ -284,6 +334,33 @@ fn run(cli: Cli) -> Result<(), String> {
         body,
     };
 
+    // Input that cannot be shaped into a Command is a usage error: a
+    // bounded JSON envelope on stdout, exit 2, nothing recorded.
+    let usage = |kind: &str, message: &str| -> i32 {
+        emit(envelope::error_envelope(
+            Some(envelope::query_identity(
+                kind,
+                &actor,
+                cli.idempotency_key.as_deref(),
+            )),
+            envelope::ErrorClass::Usage,
+            message,
+        ))
+    };
+    // Every mutation runs through the same lost-response path: a handler
+    // error is resolved by `command-result` under the caller's replay
+    // identity before the CLI concludes anything.
+    let mutation = |req: CommandRequest| -> i32 {
+        let lookup = CommandResultLookup::ReplayKey {
+            origin: req.origin.clone(),
+            actor: req.actor.clone(),
+            idempotency_key: req.idempotency_key.clone(),
+        };
+        let outcome = handle_command(&store, &config, &req, now());
+        emit(envelope::mutation_envelope(&req, &outcome, || {
+            store.transact_deferred(|tx| projection::command_result(tx, &lookup))
+        }))
+    };
     match cli.command {
         Commands::Submit {
             intent,
@@ -294,16 +371,19 @@ fn run(cli: Cli) -> Result<(), String> {
             verification,
         } => {
             if issue.len() != issue_revision.len() || issue.len() != issue_digest.len() {
-                return Err(format!(
-                    "each --issue needs a paired --issue-revision and --issue-digest \
-                     ({} issues, {} revisions, {} digests)",
-                    issue.len(),
-                    issue_revision.len(),
-                    issue_digest.len()
-                ));
+                return usage(
+                    "submit",
+                    &format!(
+                        "each --issue needs a paired --issue-revision and --issue-digest \
+                         ({} issues, {} revisions, {} digests)",
+                        issue.len(),
+                        issue_revision.len(),
+                        issue_digest.len()
+                    ),
+                );
             }
             let host = &config.host.repository.host;
-            let sources = issue
+            let sources = match issue
                 .iter()
                 .zip(&issue_revision)
                 .zip(&issue_digest)
@@ -314,133 +394,125 @@ fn run(cli: Cli) -> Result<(), String> {
                         content_digest: digest.clone(),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            let body = CommandBody::Submit {
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(s) => s,
+                Err(m) => return usage("submit", &m),
+            };
+            mutation(request(CommandBody::Submit {
                 intent,
                 sources,
                 constraints: constraint,
                 verification_argv: verification.iter().map(|s| shlex_split(s)).collect(),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            }))
         }
         Commands::Retry {
             target,
             expected_execution,
-        } => {
-            let body = CommandBody::Retry {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                expected_execution_id: ExecutionId(expected_execution),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        Commands::Resume { target, execution } => {
-            let body = CommandBody::Resume {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                execution_id: ExecutionId(execution),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        Commands::Cancel { target, execution } => {
-            let body = CommandBody::Cancel {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                execution_id: execution.map(ExecutionId),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
+        } => mutation(request(CommandBody::Retry {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            expected_execution_id: ExecutionId(expected_execution),
+        })),
+        Commands::Resume { target, execution } => mutation(request(CommandBody::Resume {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            execution_id: ExecutionId(execution),
+        })),
+        Commands::Cancel { target, execution } => mutation(request(CommandBody::Cancel {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            execution_id: execution.map(ExecutionId),
+        })),
         Commands::Acknowledge { target, attention } => {
-            let body = CommandBody::Acknowledge {
+            mutation(request(CommandBody::Acknowledge {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
                 attention_id: attention,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            }))
         }
         Commands::JudgeFindings {
             target,
             head,
             decision,
         } => {
-            let body = CommandBody::JudgeFindings {
+            let expected_head = match parse_head(&head, &config.host.repository) {
+                Ok(h) => h,
+                Err(m) => return usage("judge-findings", &m),
+            };
+            let decisions = match decision
+                .iter()
+                .map(|s| parse_decision(s))
+                .collect::<Result<_, _>>()
+            {
+                Ok(d) => d,
+                Err(m) => return usage("judge-findings", &m),
+            };
+            mutation(request(CommandBody::JudgeFindings {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_head: parse_head(&head, &config.host.repository)?,
-                decisions: decision
-                    .iter()
-                    .map(|s| parse_decision(s))
-                    .collect::<Result<_, _>>()?,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+                expected_head,
+                decisions,
+            }))
         }
         Commands::ReleaseJudgment { target, head } => {
-            let body = CommandBody::ReleaseJudgment {
+            let expected_head = match parse_head(&head, &config.host.repository) {
+                Ok(h) => h,
+                Err(m) => return usage("release-judgment", &m),
+            };
+            mutation(request(CommandBody::ReleaseJudgment {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_head: parse_head(&head, &config.host.repository)?,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+                expected_head,
+            }))
         }
         Commands::ClaimResources {
             resource,
             ttl_seconds,
         } => {
-            let body = CommandBody::ClaimResources {
-                resources: resource
-                    .iter()
-                    .map(|s| parse_resource(s, &config.host.repository.host))
-                    .collect::<Result<_, _>>()?,
-                ttl_seconds,
+            let resources = match resource
+                .iter()
+                .map(|s| parse_resource(s, &config.host.repository.host))
+                .collect::<Result<_, _>>()
+            {
+                Ok(r) => r,
+                Err(m) => return usage("claim-resources", &m),
             };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            mutation(request(CommandBody::ClaimResources {
+                resources,
+                ttl_seconds,
+            }))
         }
         Commands::ReleaseResources { resource } => {
-            let body = CommandBody::ReleaseResources {
-                resources: resource
-                    .iter()
-                    .map(|s| parse_resource(s, &config.host.repository.host))
-                    .collect::<Result<_, _>>()?,
+            let resources = match resource
+                .iter()
+                .map(|s| parse_resource(s, &config.host.repository.host))
+                .collect::<Result<_, _>>()
+            {
+                Ok(r) => r,
+                Err(m) => return usage("release-resources", &m),
             };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            mutation(request(CommandBody::ReleaseResources { resources }))
         }
         Commands::RunOnce => {
             let supervisor = build_supervisor(&config, &installation);
             let mut github = FixtureGithub::new();
-            run_tick(
+            match run_tick(
                 &store,
                 &config,
                 &installation,
+                &actor,
                 supervisor.as_ref(),
                 &mut github,
-            )?;
+                cli.idempotency_key.as_deref(),
+            ) {
+                Ok(()) => 0,
+                Err(e) => emit(envelope::error_envelope(
+                    None,
+                    envelope::ErrorClass::Store,
+                    &e,
+                )),
+            }
         }
         Commands::Run { ticks, interval_ms } => {
             // One Supervisor across ticks: the per-request start/stop locks
@@ -454,43 +526,86 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut github = FixtureGithub::new();
             let mut remaining = ticks;
             loop {
-                run_tick(
+                if let Err(e) = run_tick(
                     &store,
                     &config,
                     &installation,
+                    &actor,
                     supervisor.as_ref(),
                     &mut github,
-                )?;
+                    cli.idempotency_key.as_deref(),
+                ) {
+                    return emit(envelope::error_envelope(
+                        None,
+                        envelope::ErrorClass::Store,
+                        &e,
+                    ));
+                }
                 if remaining == 1 {
                     break;
                 }
                 remaining = remaining.saturating_sub(1);
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
+            0
         }
         Commands::WorkList => {
-            let r = store
-                .transact_deferred(|tx| projection::work_list(tx, now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            match store.transact_deferred(|tx| projection::work_list(tx, now())) {
+                Ok(r) => emit(envelope::query_envelope(
+                    &r,
+                    envelope::query_identity("work_list", &actor, cli.idempotency_key.as_deref()),
+                    None,
+                )),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(envelope::query_identity(
+                        "work_list",
+                        &actor,
+                        cli.idempotency_key.as_deref(),
+                    )),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::WorkDetail { work } => {
-            let r = store
-                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work), now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("work_detail", &actor, cli.idempotency_key.as_deref());
+            match store
+                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work.clone()), now()))
+            {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, Some(work))),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::Attention { work } => {
-            let r = store
-                .transact_deferred(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("attention", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| {
+                projection::attention(tx, work.clone().map(WorkId).as_ref(), now())
+            }) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, work)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::Capacity => {
-            let r = store
-                .transact_deferred(|tx| projection::capacity(tx))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("capacity", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| projection::capacity(tx)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::CommandResult {
             command_id,
@@ -507,18 +622,24 @@ fn run(cli: Cli) -> Result<(), String> {
                     idempotency_key: replay_key,
                 },
                 _ => {
-                    return Err(
-                        "command-result needs --command-id or --origin + --replay-key".into(),
+                    return usage(
+                        "command-result",
+                        "command-result needs --command-id or --origin + --replay-key",
                     );
                 }
             };
-            let r = store
-                .transact_deferred(|tx| projection::command_result(tx, &lookup))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("command_result", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| projection::command_result(tx, &lookup)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
     }
-    Ok(())
 }
 
 fn build_supervisor(
@@ -544,8 +665,10 @@ fn run_tick(
     store: &SqliteStore,
     config: &WorkloopConfig,
     _installation: &Installation,
+    actor: &Actor,
     supervisor: Option<&Supervisor<PosixProcessControl>>,
     github: &mut FixtureGithub,
+    idempotency_key: Option<&str>,
 ) -> Result<(), String> {
     let now = now();
     store
@@ -563,7 +686,12 @@ fn run_tick(
     let list = store
         .transact_deferred(|tx| projection::work_list(tx, now))
         .map_err(|e| e.to_string())?;
-    print(&list);
+    let (env, _) = envelope::query_envelope(
+        &list,
+        envelope::query_identity("work_list", actor, idempotency_key),
+        None,
+    );
+    print(&env);
     Ok(())
 }
 
@@ -763,9 +891,22 @@ mod tests {
         // One fixture for the whole run, as `run` keeps it across ticks.
         let mut github = FixtureGithub::new();
 
+        let actor = Actor {
+            kind: ActorKind::Human,
+            external_id: "actor-test".into(),
+        };
         // Tick 1: work 1 opens its change request.
         queue_open_change(&store, &w1);
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        run_tick(
+            &store,
+            &config,
+            &installation,
+            &actor,
+            None,
+            &mut github,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             github.applied(),
             &["open_change:host-local/local-repo:cr-1"]
@@ -774,7 +915,16 @@ mod tests {
         // Tick 2: work 2 opens later — its change number must continue,
         // not restart at 1 and collide with work 1's.
         queue_open_change(&store, &w2);
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        run_tick(
+            &store,
+            &config,
+            &installation,
+            &actor,
+            None,
+            &mut github,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             github.applied(),
             &[
@@ -797,7 +947,16 @@ mod tests {
                 body: Some("edited".into()),
             },
         );
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        run_tick(
+            &store,
+            &config,
+            &installation,
+            &actor,
+            None,
+            &mut github,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             github.applied(),
             &[

@@ -3,3 +3,4 @@
 //! adapter runs the same contract tests against GitHub.
 
 pub mod fixture;
+pub mod sparse_fixture;
