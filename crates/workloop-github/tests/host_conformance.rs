@@ -58,7 +58,13 @@ trait OutboxHost {
     fn declared_names(&self) -> BTreeSet<&'static str>;
 
     fn apply(&mut self, store: &SqliteStore, config: &WorkloopConfig);
+    /// The write count, for assertions that an effect landed or did
+    /// not. The history's encoding is fixture-internal — scenarios
+    /// never pattern-match it.
     fn applied(&self) -> &[String];
+    /// The head the remote records for `(repository, branch)` — a
+    /// typed read so scoped-identity assertions need no string format.
+    fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String>;
     fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str);
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation);
 }
@@ -88,6 +94,9 @@ impl OutboxHost for FixtureGithub {
     fn applied(&self) -> &[String] {
         self.applied()
     }
+    fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+        self.remote_head(repository, branch)
+    }
     fn set_change_head(&mut self, _repository: &RepositoryRef, change_id: &str, head: &str) {
         self.set_head(change_id, head);
     }
@@ -108,6 +117,9 @@ impl OutboxHost for SparseHost {
     }
     fn applied(&self) -> &[String] {
         self.applied()
+    }
+    fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+        self.remote_head(repository, branch)
     }
     fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str) {
         self.set_head(repository, change_id, head);
@@ -282,10 +294,10 @@ fn baseline_effects_apply(
         }
         other => panic!("push receipt missing RefPublished fact: {other:?}"),
     }
+    assert_eq!(fixture.applied().len(), 1, "exactly one remote write");
     assert_eq!(
-        fixture.applied(),
-        &[format!("push_ref:{}:head-1", repo())],
-        "exactly one remote write"
+        fixture.remote_head(&repo(), &format!("work/{}", work_id.0)),
+        Some("head-1".to_string())
     );
 
     insert_intent(
@@ -313,11 +325,10 @@ fn baseline_effects_apply(
         }
         other => panic!("open receipt missing ChangeOpened fact: {other:?}"),
     }
-    assert!(
-        fixture
-            .applied()
-            .iter()
-            .any(|a| a.starts_with(&format!("open_change:{}:", repo())))
+    assert_eq!(
+        fixture.applied().len(),
+        2,
+        "push then open: two writes total"
     );
 }
 
@@ -368,6 +379,7 @@ fn expected_head_mismatch_aborts_write(
     // Move the remote head under the recorded intent. The guard is
     // exercised only because the expected head really was the opened
     // head — the mismatch must be caused by the move.
+    let writes_before = fixture.applied().len();
     fixture.set_change_head(&repo(), change.change_request.as_str(), "moved-head");
     insert_intent(
         store,
@@ -391,12 +403,10 @@ fn expected_head_mismatch_aborts_write(
         "moved head aborts the write: {:?}",
         update.status
     );
-    assert!(
-        !fixture
-            .applied()
-            .iter()
-            .any(|a| a.starts_with("update_change:")),
-        "no write landed at the wrong target"
+    assert_eq!(
+        fixture.applied().len(),
+        writes_before,
+        "the aborted update landed no write"
     );
 
     // The same guard binds comment writes: a comment posted against
@@ -423,12 +433,10 @@ fn expected_head_mismatch_aborts_write(
         "moved head aborts the comment write: {:?}",
         comment.status
     );
-    assert!(
-        !fixture
-            .applied()
-            .iter()
-            .any(|a| a.starts_with("post_comment:")),
-        "no comment landed at the wrong target"
+    assert_eq!(
+        fixture.applied().len(),
+        writes_before,
+        "the aborted comment write landed nothing either"
     );
 }
 

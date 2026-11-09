@@ -16,8 +16,11 @@ The suite parameterizes over two axes:
 
 - **Fixture implementation.** `FixtureGithub` (full baseline vocabulary)
   and `SparseHost` (baseline reads plus `push_ref` and
-  `change_request_create` only) are independent implementations with
-  different remote models — flat maps vs. a repository-scoped journal.
+  `change_request_create` only) are independent implementations —
+  both model the remote with repository-scoped keys, so identical
+  branch names on different repositories never collide, but they are
+  separate codebases with their own write-history encodings (which the
+  shared suite never pattern-matches).
   A row is covered for a fixture only by running the unchanged scenario
   against it.
 - **Declared capability set.** Each scenario lists the capabilities it

@@ -308,10 +308,12 @@ pub fn unknown_envelope(identity: CommandIdentity, detail: &str) -> (Envelope, i
 
 /// A mutation decision with the lost-response path applied: a handler
 /// error is followed by a `command_result` lookup under the caller's
-/// replay key. A recorded decision is emitted as the original result; a
-/// definitively absent decision is a plain store-class error; anything
-/// else — the decision exists or the read cannot be completed — stays
-/// `unknown` (the same rule the TUI session applies).
+/// replay key. A recorded decision is emitted as the original result —
+/// replaying the durable decision *is* the recovery here; a
+/// definitively absent decision is a plain store-class error; and an
+/// unreadable lookup result stays `unknown`. The TUI session differs
+/// deliberately: it stages a found-but-unread decision as `unknown`
+/// until the user runs `recover`, where the CLI emits it directly.
 pub fn mutation_envelope(
     req: &CommandRequest,
     outcome: &Result<CommandDecision, StoreError>,

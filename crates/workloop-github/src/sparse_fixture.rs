@@ -25,7 +25,9 @@ pub struct SparseHost {
     branches: BTreeMap<(String, String), String>,
     /// `(repository, change_request_id)` → head object id.
     changes: BTreeMap<(String, String), String>,
-    next_number: u64,
+    next_id: u64,
+    /// `repository` → next display number: a per-repository namespace.
+    next_number: BTreeMap<String, u64>,
     /// The write history, for test assertions.
     applied: Vec<String>,
 }
@@ -65,6 +67,18 @@ impl SparseHost {
 
     pub fn applied(&self) -> &[String] {
         &self.applied
+    }
+
+    /// The head the remote records for `(repository, branch)` — a typed
+    /// read independent of the write-history encoding.
+    pub fn remote_head(
+        &self,
+        repository: &workloop_core::identity::RepositoryRef,
+        branch: &str,
+    ) -> Option<String> {
+        self.branches
+            .get(&(repository.to_string(), branch.to_string()))
+            .cloned()
     }
 
     /// Feed a synthetic Observation through the same ingest pipeline a
@@ -190,11 +204,19 @@ impl SparseHost {
                 target_branch,
                 ..
             } => {
-                self.next_number += 1;
+                self.next_id += 1;
+                let display = {
+                    let n = self
+                        .next_number
+                        .entry(intent.repository.to_string())
+                        .or_insert(0);
+                    *n += 1;
+                    *n
+                };
                 let change = ChangeRequestRef {
                     repository: intent.repository.clone(),
-                    change_request: ChangeRequestId::trusted(format!("cr-{}", self.next_number)),
-                    display_number: Some(self.next_number),
+                    change_request: ChangeRequestId::trusted(format!("cr-{}", self.next_id)),
+                    display_number: Some(display),
                 };
                 let head_object = self
                     .branches
