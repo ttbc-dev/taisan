@@ -280,8 +280,17 @@ fn run(cli: Cli) -> Result<(), String> {
     let installation = load_or_create(&config_path)?;
     let actor = installation.actor();
     let config = installation.workloop_config()?;
+    // State lives beside the store file: CAS bodies, workspaces, out
+    // directories and the handoff repository all resolve under this one
+    // root. Resolve it once, at startup, so no pass depends on the
+    // process working directory.
+    let db_abs = std::path::absolute(&cli.db).map_err(|e| format!("db path: {e}"))?;
+    let state_root = db_abs
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     let store =
-        SqliteStore::open(&cli.db, installation.capacity).map_err(|e| format!("store: {e}"))?;
+        SqliteStore::open(&db_abs, installation.capacity).map_err(|e| format!("store: {e}"))?;
     let key = || {
         cli.idempotency_key
             .clone()
@@ -460,9 +469,8 @@ fn run(cli: Cli) -> Result<(), String> {
             // survive between ticks, or publishes in different ticks
             // restart at PR 1 and a head recheck can never match a PR
             // published in an earlier tick.
-            let supervisor = build_supervisor(&config, &installation);
+            let supervisor = build_supervisor(&config, &installation, &state_root);
             let mut github = FixtureGithub::new();
-            let workspace_root = PathBuf::from(&installation.workspace_root);
             // Single-flight: one lease covers the whole run, taken
             // before the first pass and released when this process ends.
             // A second `run` fails closed with `lock.held`; a crashed
@@ -479,7 +487,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         settings: &settings,
                         supervisor: supervisor.as_ref(),
                         host: &mut github,
-                        workspace_root: &workspace_root,
+                        state_root: &state_root,
                     },
                     scope.as_ref(),
                     &mut clock,
@@ -558,16 +566,29 @@ fn run(cli: Cli) -> Result<(), String> {
 fn build_supervisor(
     config: &WorkloopConfig,
     installation: &Installation,
+    state_root: &std::path::Path,
 ) -> Option<Supervisor<PosixProcessControl>> {
     if installation.worker_argv.is_empty() {
         return None;
     }
     Some(Supervisor::new(
         PosixProcessControl,
-        PathBuf::from(&installation.workspace_root),
+        installation_path(state_root, &installation.workspace_root),
         installation.worker_argv.clone(),
         config.clone(),
     ))
+}
+
+/// Resolve an installation-relative path against the one state root.
+/// An absolute configured path is used as-is; a relative one never
+/// resolves against the ambient working directory.
+fn installation_path(state_root: &std::path::Path, configured: &str) -> PathBuf {
+    let path = PathBuf::from(configured);
+    if path.is_absolute() {
+        path
+    } else {
+        state_root.join(path)
+    }
 }
 
 #[cfg(test)]
@@ -747,7 +768,7 @@ mod tests {
                 settings: &settings,
                 supervisor: None,
                 host,
-                workspace_root: std::path::Path::new("."),
+                state_root: std::path::Path::new("."),
             },
             None,
             &mut now,

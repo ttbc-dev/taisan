@@ -303,7 +303,7 @@ impl SqliteStore {
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
-        for candidate in &candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
             if reclaimed_count >= params.max_bodies {
                 if candidate.state == "present" {
                     report.eligible_remaining += 1;
@@ -314,8 +314,11 @@ impl SqliteStore {
                 // Deterministic oldest-first: the bound stops the pass;
                 // later (smaller) bodies wait for the next pass rather
                 // than reordering around this one.
-                report.eligible_remaining += 1;
-                continue;
+                report.eligible_remaining += candidates[index..]
+                    .iter()
+                    .filter(|c| c.state == "present")
+                    .count();
+                break;
             }
             let managed = match managed_path(&root_abs, &candidate.path) {
                 Ok(p) => p,

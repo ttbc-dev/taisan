@@ -7,6 +7,7 @@ use std::process::Command;
 
 use workloop_core::ports::ProcessControlPort;
 use workloop_exec::supervisor::PosixProcessControl;
+use workloop_store::retention::CatalogBody;
 use workloop_store::sqlite::{RunLeaseOwner, SqliteStore};
 
 const NOW: i64 = 1_700_000_000;
@@ -23,6 +24,10 @@ fn root(tag: &str) -> PathBuf {
 }
 
 fn run_cli(root: &Path, args: &[&str]) -> std::process::Output {
+    run_cli_from(root, None, args)
+}
+
+fn run_cli_from(root: &Path, cwd: Option<&Path>, args: &[&str]) -> std::process::Output {
     let db = root.join("workloop.db");
     let config = root.join("config.json");
     let mut full = vec![
@@ -32,10 +37,12 @@ fn run_cli(root: &Path, args: &[&str]) -> std::process::Output {
         config.to_string_lossy().into_owned(),
     ];
     full.extend(args.iter().map(|s| s.to_string()));
-    Command::new(bin())
-        .args(&full)
-        .output()
-        .expect("taisan runs")
+    let mut command = Command::new(bin());
+    command.args(&full);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.output().expect("taisan runs")
 }
 
 fn store(root: &Path) -> SqliteStore {
@@ -95,6 +102,67 @@ fn run_once_emits_one_eight_phase_tick_report_and_persists_it() {
     // The same pass is durable in the audit log.
     let store = store(&dir);
     assert_eq!(store.count_events("tick_report").unwrap(), 1);
+}
+
+#[test]
+fn the_retention_boundary_is_the_state_root_not_the_callers_cwd() {
+    let state = root("retention-state");
+    let elsewhere = root("retention-cwd");
+    let out = run_cli(&state, &["work-list"]);
+    assert!(out.status.success());
+
+    let store = store(&state);
+    let state_body = state.join("workspaces").join("case-1.blob");
+    std::fs::create_dir_all(state_body.parent().unwrap()).unwrap();
+    std::fs::write(&state_body, b"body").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "state-body".into(),
+            category: "cas".into(),
+            path: state_body.to_string_lossy().into_owned(),
+            bytes: 4,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+
+    let foreign_body = elsewhere.join("workspaces").join("case-1.blob");
+    std::fs::create_dir_all(foreign_body.parent().unwrap()).unwrap();
+    std::fs::write(&foreign_body, b"body").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "foreign-body".into(),
+            category: "cas".into(),
+            path: foreign_body.to_string_lossy().into_owned(),
+            bytes: 4,
+            registered_unix_seconds: NOW - 90,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+
+    let out = run_cli_from(&state, Some(&elsewhere), &["run", "--once"]);
+    assert!(
+        out.status.success(),
+        "run --once failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !state_body.exists(),
+        "a body under the installation state root is reclaimed regardless of the caller's cwd"
+    );
+    assert!(
+        foreign_body.exists(),
+        "a body under the caller's cwd is outside the installation state root"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let retention = &report["phases"][6];
+    assert_eq!(retention["phase"], "retention_sweep");
+    assert_eq!(retention["held"][0], "foreign-body:outside_root");
+
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&elsewhere);
 }
 
 #[test]

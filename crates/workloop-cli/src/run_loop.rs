@@ -170,7 +170,9 @@ pub struct Pass<'a> {
     pub settings: &'a PassSettings,
     pub supervisor: Option<&'a Supervisor<PosixProcessControl>>,
     pub host: &'a mut FixtureGithub,
-    pub workspace_root: &'a Path,
+    /// The installation state root: the one boundary every reclaimable
+    /// body (CAS, workspace, out directory, handoff object) lives under.
+    pub state_root: &'a Path,
 }
 
 /// Run exactly one bounded pass over the eight ordered phases.
@@ -396,9 +398,7 @@ pub fn run_pass(
                     max_bytes: r.max_bytes,
                     delete_error_limit: r.delete_error_limit,
                 };
-                let result = pass
-                    .store
-                    .retention_sweep(&params, pass.workspace_root, now);
+                let result = pass.store.retention_sweep(&params, pass.state_root, now);
                 push!(match result {
                     Ok(report) => retention_phase(report),
                     Err(e) => PhaseReport::failed(name, e),
@@ -640,7 +640,7 @@ mod tests {
                 settings,
                 supervisor: None,
                 host: &mut host,
-                workspace_root: std::path::Path::new("."),
+                state_root: std::path::Path::new("."),
             },
             scope,
             clock,

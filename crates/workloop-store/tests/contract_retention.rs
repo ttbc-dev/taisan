@@ -177,6 +177,51 @@ fn the_byte_bound_stops_before_paying_for_the_next_body() {
 }
 
 #[test]
+fn the_byte_bound_stops_the_pass_without_reordering_to_a_smaller_body() {
+    let dir = root("bound-bytes-order");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let oldest = register(&store, &dir, "oldest", NOW - 300, Some(NOW - 10), false, 60);
+    let blocked = register(
+        &store,
+        &dir,
+        "blocked",
+        NOW - 200,
+        Some(NOW - 10),
+        false,
+        60,
+    );
+    let smaller = register(
+        &store,
+        &dir,
+        "smaller",
+        NOW - 100,
+        Some(NOW - 10),
+        false,
+        10,
+    );
+
+    let mut p = params();
+    p.max_bytes = 100;
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+    assert_eq!(report.reclaimed.len(), 1);
+    assert_eq!(report.bytes_reclaimed, 60);
+    assert_eq!(
+        report.eligible_remaining, 2,
+        "the blocked body and every later body wait for the next pass"
+    );
+    assert!(!oldest.exists());
+    assert!(
+        blocked.exists(),
+        "the bound stops the pass rather than reordering around the blocked body"
+    );
+    assert!(
+        smaller.exists(),
+        "a newer smaller body is not reclaimed ahead of an older blocked one"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_missing_body_is_committed_as_reclaimed_missing() {
     let dir = root("missing");
     let store = SqliteStore::in_memory(1).unwrap();
