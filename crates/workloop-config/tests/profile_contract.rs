@@ -279,6 +279,63 @@ fn unknown_keys_are_refused_naming_the_key_without_mutation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A parse refusal names the offending key/line but never echoes the
+/// source line: a mistyped key carrying a live token must not leak its
+/// value into the returned error or any record built from it (the
+/// trust boundary says credential values never enter logs or evidence).
+#[test]
+fn parse_refusal_never_echoes_the_offending_line() {
+    let dir = root("parse-secret");
+    let secret = "ghp_live_secret_value_0123456789";
+    let text = format!(
+        "schema_version = 1\n\n[roles.publication]\nhost = \"h1\"\nactor = \"a\"\ncredential_ref = \"env:TAISAN_TOKEN\"\ntoken = \"{secret}\"\n"
+    );
+    let path = dir.join("config.toml");
+    std::fs::write(&path, &text).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let err = load_profile(&path).unwrap_err();
+    assert!(err.contains("token"), "expected the offending key: {err}");
+    assert!(
+        !err.contains(secret),
+        "refusal leaked the pasted credential value: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the refused load mutated config.toml"
+    );
+
+    // The syntax-error path must not echo the source line either: a
+    // value pasted on a malformed line stays out of the message.
+    let malformed = dir.join("malformed-secret.toml");
+    let malformed_text = format!("schema_version = 1\ntoken = \"{secret}\n");
+    std::fs::write(&malformed, &malformed_text).unwrap();
+    let err = load_profile(&malformed).unwrap_err();
+    assert!(
+        !err.contains(secret),
+        "syntax refusal leaked the pasted credential value: {err}"
+    );
+
+    // A secret in a wrongly-typed field must not leak through serde's
+    // "invalid type: string ..." message either; the key path stays.
+    let typed = dir.join("typed-secret.toml");
+    let typed_text =
+        format!("schema_version = 1\n\n[installation]\ncapacity_slots = \"{secret}\"\n");
+    std::fs::write(&typed, &typed_text).unwrap();
+    let err = load_profile(&typed).unwrap_err();
+    assert!(
+        err.contains("installation.capacity_slots"),
+        "expected the offending key path: {err}"
+    );
+    assert!(
+        !err.contains(secret),
+        "typed refusal leaked the pasted credential value: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `schema_version` is required and must equal the version this
 /// runtime understands: missing, corrupt, zero, and newer versions are
 /// refused without migration, file untouched (CF-01).

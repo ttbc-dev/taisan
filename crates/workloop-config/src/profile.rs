@@ -748,10 +748,100 @@ fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> 
     ))
 }
 
+/// Describe a syntax failure by location and parser message only. The
+/// parser's `Display` embeds the offending source line verbatim; that
+/// line may carry an operator-pasted credential, so it is never
+/// forwarded into a refusal, log, report, or evidence record.
+fn describe_syntax_error(text: &str, error: &toml::de::Error) -> String {
+    let message = error.message().trim_end();
+    match error.span() {
+        Some(span) => {
+            let (line, column) = line_column(text, span.start);
+            format!("config: invalid TOML at line {line}, column {column}: {message}")
+        }
+        None => format!("config: invalid TOML: {message}"),
+    }
+}
+
+/// 1-based line and column for a byte offset into `text`.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let mut line = 1;
+    let mut column = 1;
+    for (index, ch) in text.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+/// Render a typed-deserialization failure with its key path but
+/// without the scalar it rejected. Serde's message can quote the
+/// offending value (`invalid type: string "secret"`), so only the
+/// structural "what" and "expected" parts are kept.
+fn describe_data_error(error: &toml::de::Error) -> String {
+    let display = error.to_string();
+    let (message, path) = match display.split_once("\nin `") {
+        Some((message, path)) => (message, Some(path.trim().trim_matches('`').to_string())),
+        None => (display.as_str(), None),
+    };
+    let message = redact_serde_values(message.trim_end());
+    match path {
+        Some(path) => format!("config: {message} (in `{path}`)"),
+        None => format!("config: {message}"),
+    }
+}
+
+/// Drop operator-authored literals from a serde error message while
+/// keeping the key/variant names `unknown field`, `missing field`, and
+/// `duplicate field` report (those name schema keys, never values).
+fn redact_serde_values(message: &str) -> String {
+    for prefix in ["unknown field ", "missing field ", "duplicate field "] {
+        if message.starts_with(prefix) {
+            return message.to_string();
+        }
+    }
+    if let Some(tail) = message.split_once(", expected").map(|(_, tail)| tail) {
+        let kind = message
+            .split_once(": ")
+            .map(|(kind, _)| kind)
+            .unwrap_or("invalid value");
+        return format!("{kind}: <redacted>, expected{tail}");
+    }
+    message
+        .split(['"', '`'])
+        .enumerate()
+        .map(|(index, part)| {
+            if index % 2 == 1 {
+                "<redacted>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Parse and validate a `config.toml` document. Read-only: this
 /// function never writes, migrates, or repairs the source text.
+///
+/// Parsing is two-stage so refusals never echo file source: the text
+/// is first parsed into a TOML value (syntax errors are reported by
+/// line/column plus the parser's own bounded message), then
+/// deserialized from that value, whose errors name the offending key
+/// path without the raw line or any surrounding file text.
 pub fn parse_profile(text: &str) -> Result<Profile, String> {
-    let mut profile: Profile = toml::from_str(text).map_err(|e| format!("config: {e}"))?;
+    let document: toml::Value =
+        toml::from_str(text).map_err(|e| describe_syntax_error(text, &e))?;
+    let mut profile: Profile = document
+        .try_into()
+        .map_err(|e: toml::de::Error| describe_data_error(&e))?;
     profile.apply_documented_defaults();
     profile.validate()?;
     Ok(profile)
