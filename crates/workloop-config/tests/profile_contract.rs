@@ -142,11 +142,23 @@ fn documented_sanitized_example_loads_with_documented_defaults() {
         vec!["crates.io", "static.crates.io"]
     );
 
-    // Publication targets are the opaque ids — display metadata takes
-    // no part in the binding.
+    // Publication targets are the opaque repo ids keyed by the host
+    // instance identity — the stable `endpoint`, never the local
+    // `[hosts.h1]` table alias — and display metadata takes no part
+    // in the binding.
     assert_eq!(
         profile.publication_targets(),
-        vec![("h1".to_string(), "0123456789".to_string())]
+        vec![(
+            "https://api.github.com".to_string(),
+            "0123456789".to_string()
+        )]
+    );
+    assert!(
+        profile
+            .publication_targets()
+            .iter()
+            .all(|(host, _)| host != "h1"),
+        "the table alias must never stand in for host instance identity"
     );
 
     // Worker pins are carried unchanged.
@@ -559,6 +571,82 @@ credential_ref = "env:TAISAN_TOKEN"
     assert!(
         profile.publication_targets().is_empty(),
         "a source repository must never be a publication target"
+    );
+}
+
+/// A publication target keys on host instance identity — the declared
+/// `endpoint`, never the local `[hosts.<alias>]` table key — so two
+/// aliases on one endpoint name one target, retargeting the endpoint
+/// changes the identity, and a host without an endpoint contributes
+/// no target rather than falling back to the alias
+/// (docs/identity-storage.md host-instance rule).
+#[test]
+fn publication_targets_key_on_the_stable_endpoint_identity() {
+    // Two table aliases bound to one endpoint are one host instance:
+    // the same repository declared under both collapses to a single
+    // target, and neither alias appears as identity.
+    let text = r#"schema_version = 1
+
+[hosts.h1]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "0123456789"
+use = "publication"
+
+[hosts.h1-clone]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1-clone.repositories]]
+id = "0123456789"
+use = "publication"
+
+[roles.publication]
+host = "h1"
+actor = "taisan-publisher"
+credential_ref = "env:TAISAN_TOKEN"
+"#;
+    let profile = parse_profile(text).expect("two aliases on one endpoint must load");
+    assert_eq!(
+        profile.publication_targets(),
+        vec![(
+            "https://api.github.com".to_string(),
+            "0123456789".to_string()
+        )],
+        "one endpoint names one host instance, so the target collapses"
+    );
+
+    // Retargeting the endpoint changes the host instance identity:
+    // the target follows the endpoint, never the unchanged aliases.
+    let retargeted = text.replace(
+        "endpoint = \"https://api.github.com\"",
+        "endpoint = \"https://api.github.org\"",
+    );
+    let profile = parse_profile(&retargeted).expect("retargeted endpoints must load");
+    assert_eq!(
+        profile.publication_targets(),
+        vec![(
+            "https://api.github.org".to_string(),
+            "0123456789".to_string()
+        )],
+        "a changed endpoint must yield a changed host identity"
+    );
+
+    // A host deserialized without an endpoint (only reachable by
+    // bypassing `validate`, which requires one) contributes no
+    // target — the table alias is never a fallback identity.
+    let unvalidated: workloop_config::profile::Profile = toml::from_str(
+        "schema_version = 1\n\n[hosts.h1]\nadapter = \"github\"\ncontract_version = 1\n\n\
+         [[hosts.h1.repositories]]\nid = \"0123456789\"\nuse = \"publication\"\n",
+    )
+    .expect("a Profile without an endpoint deserializes; only parse_profile validates");
+    assert!(
+        unvalidated.publication_targets().is_empty(),
+        "an endpoint-less host must never contribute an alias-keyed target"
     );
 }
 

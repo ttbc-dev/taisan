@@ -15,6 +15,14 @@
 //! or migrated. Credential references are validated for shape only —
 //! values resolve later at the adapter boundary and never enter this
 //! module, Core, argv, logs, or evidence.
+//!
+//! Refusals draw one fixed line between identifiers and values:
+//! identifiers (unknown keys, key paths, host/role/capability names)
+//! are named so the operator's repair loop can locate the offending
+//! entry — that naming is the CF-01/CF-05 contract — while rejected
+//! scalar literals, `credential_ref` contents, and source lines are
+//! always redacted. A load refusal therefore never carries a secret
+//! *value* into a message, log, or evidence record.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -704,18 +712,30 @@ impl Profile {
     /// repositories never appear: source reads never authorize
     /// publication, so a publication intent aimed at one is refused
     /// structurally before any adapter call.
+    ///
+    /// The host half is the host instance identity — the declared
+    /// `endpoint`, never the local `[hosts.<alias>]` table key. Host
+    /// identity is distinct from a display alias and a changed
+    /// endpoint cannot reuse it (docs/identity-storage.md), so two
+    /// aliases on one endpoint name one target and a retargeted alias
+    /// names a different one. A host without an endpoint (impossible
+    /// after validation) contributes no target; the alias is never
+    /// substituted, and duplicate identity pairs collapse.
     pub fn publication_targets(&self) -> Vec<(String, String)> {
-        let mut targets = Vec::new();
-        for (host_name, host) in &self.hosts {
+        let mut targets = std::collections::BTreeSet::new();
+        for host in self.hosts.values() {
+            let Some(endpoint) = &host.endpoint else {
+                continue;
+            };
             for repository in &host.repositories {
                 if repository.use_.as_deref() == Some("publication")
                     && let Some(id) = &repository.id
                 {
-                    targets.push((host_name.clone(), id.clone()));
+                    targets.insert((endpoint.clone(), id.clone()));
                 }
             }
         }
-        targets
+        targets.into_iter().collect()
     }
 }
 
@@ -835,9 +855,13 @@ fn describe_data_error(error: &toml::de::Error) -> String {
     }
 }
 
-/// Drop operator-authored literals from a serde error message while
-/// keeping the key/variant names `unknown field`, `missing field`, and
-/// `duplicate field` report (those name schema keys, never values).
+/// Drop operator-authored literals from a serde error message. The
+/// `unknown field` name is *input*, not a schema key, and is kept
+/// deliberately: naming the offending key is the CF-01 contract, so
+/// an unknown key is located from the refusal exactly like any other
+/// config typo. `missing field` names a schema key. None of the
+/// prefixes carries a rejected *value* — the quoted and backticked
+/// literals after them are what this function removes.
 fn redact_serde_values(message: &str) -> String {
     for prefix in ["unknown field ", "missing field ", "duplicate field "] {
         if message.starts_with(prefix) {
