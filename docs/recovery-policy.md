@@ -13,7 +13,8 @@ The following names are target configuration keys, not implemented options. All 
 | Target key | Default | Meaning |
 | --- | --- | --- |
 | `recovery.transport.max_retries` | 3 | Retries after the initial transient-failure attempt |
-| `recovery.transport.backoff_seconds` | `[10, 30, 90]` | Waiting schedule, with configurable jitter; respect a valid server retry instruction without exceeding the remaining deadline |
+| `recovery.transport.backoff_seconds` | `[10, 30, 90]` | Waiting schedule; respect a valid server retry instruction without exceeding the remaining deadline |
+| `recovery.transport.backoff_jitter_ratio` | `0.0` | Symmetric jitter applied to each scheduled wait; `0.0` keeps the schedule deterministic |
 | `recovery.effect_reconcile_seconds` | 600 | Automatic reconciliation window for an unknown host effect; expiry requests human action, not a new write or a failed receipt |
 | `recovery.max_fix_invocations` | 3 | Work-wide automatic correction dispatches after initial implementation, including verification and review fixes |
 | `recovery.equivalent_failure_limit` | 2 | Consecutive equivalent failed validations after correction before human attention |

@@ -9,7 +9,7 @@ Status: owner-approved design closure from the #56 review. This document integra
 | R48 disposition | Re-modelled: the path-filtered gate mechanism is host-side CI configuration, outside taisan's control surface; the retained obligations (only declared named checks participate; superseding heads cancel stale assessment; check evidence is bounded and three-valued) are satisfied by existing clauses | Not deferred — there is no taisan mechanism to defer |
 | Code-review lane default | `on` | Resolves the setup decision left open in [evidence gates](evidence-gates.md) |
 | Backlog proposal | U0–U9 from the [implementation plan](implementation-plan.md#dependent-delivery-units), unchanged | With explicit authorization boundaries below |
-| Open items | `recovery.retry.backoff_seconds` jitter policy, `run --phase` filter, and the `waiting` reason name are non-blocking, resolved during implementation in the owning documents | Recorded, not silently chosen here |
+| Open items | `run --phase` filter and the `waiting` reason name are non-blocking, resolved during implementation in the owning documents; the backoff jitter policy was resolved under `recovery.transport.*` in [installation-config](installation-config.md) | Recorded, not silently chosen here |
 
 ## Consistency review: one owner per decision
 
@@ -123,7 +123,7 @@ The gate stays blocked while any retained requirement is unmapped (currently zer
 
 | Item | Owning document | Resolution point |
 | --- | --- | --- |
-| `recovery.retry.backoff_seconds` jitter policy | [installation-config](installation-config.md) | U2 config reference completion |
+| ~~`recovery.transport.backoff_seconds` jitter policy~~ | [installation-config](installation-config.md) | Resolved: symmetric `backoff_jitter_ratio` and last-element-repeating schedule semantics defined in the U2 config reference |
 | `run --phase` filter | [execution-loop](execution-loop.md) | U5; default remains no |
 | `waiting` reason name for export/verification progress | [worker-protocol](worker-protocol.md)/[execution-loop](execution-loop.md) | U4/U5 vocabulary finalization |
 
