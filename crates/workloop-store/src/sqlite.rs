@@ -44,6 +44,7 @@ const FORMAT_VERSION: i64 = 1;
 const EXPECTED_TABLES: &[&str] = &[
     "attention_acks",
     "body_catalog",
+    "body_pins",
     "capacity_slots",
     "commands",
     "deferrals",
@@ -75,7 +76,7 @@ const EXPECTED_TABLES: &[&str] = &[
 /// other expected table is present — and is upgraded in place by
 /// installing them. A v1 file missing anything else is foreign and is
 /// refused exactly as before.
-const ADDITIVE_TABLES: &[&str] = &["body_catalog", "recovery_intents", "run_lease"];
+const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -260,6 +261,20 @@ impl SqliteStore {
             // format did not change, the recognized table set grew.
             let tx = conn.unchecked_transaction().map_err(internal)?;
             tx.execute_batch(SCHEMA).map_err(internal)?;
+            // A pre-ledger store recorded protection as the bare
+            // `pinned` boolean. Reconstruct the ledger row under the
+            // unnamed `registered` dependency so the materialized flag
+            // and the row set agree, and so clearing an unrelated
+            // dependency can never silently un-protect the body.
+            tx.execute(
+                "INSERT INTO body_pins (body_id, dependency) \
+                 SELECT body_id, 'registered' FROM body_catalog AS c \
+                 WHERE c.pinned = 1 \
+                   AND NOT EXISTS (SELECT 1 FROM body_pins AS p \
+                                   WHERE p.body_id = c.body_id)",
+                [],
+            )
+            .map_err(internal)?;
             tx.commit().map_err(internal)?;
         }
         // Seed the fixed slot rows once; claiming is an UPDATE inside the

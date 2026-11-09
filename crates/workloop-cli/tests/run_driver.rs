@@ -355,3 +355,65 @@ fn a_bounded_multi_pass_run_reports_each_pass_and_stays_single_flight() {
     let store = store(&dir);
     assert_eq!(store.count_events("tick_report").unwrap(), 2);
 }
+
+#[test]
+fn a_sigint_finishes_the_phase_boundary_and_exits_gracefully() {
+    use std::io::BufReader;
+    use std::process::Stdio;
+
+    let dir = root("sigint");
+    let out = run_cli(&dir, &["work-list"]);
+    assert!(out.status.success());
+
+    let db = dir.join("workloop.db");
+    let config = dir.join("config.json");
+    let args = vec![
+        "--db".to_string(),
+        db.to_string_lossy().into_owned(),
+        "--config".to_string(),
+        config.to_string_lossy().into_owned(),
+        "run".into(),
+        "--interval".into(),
+        "30".into(),
+    ];
+    let mut child = Command::new(bin())
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("taisan run starts");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Consume the first tick report as soon as the pass that produced
+    // it has completed — the signal then arrives while the driver is
+    // between passes.
+    let mut reports = serde_json::Deserializer::from_reader(BufReader::new(stdout))
+        .into_iter::<serde_json::Value>();
+    let first = reports
+        .next()
+        .expect("the first pass reports")
+        .expect("one JSON object");
+    assert_eq!(first["kind"], "tick_report");
+    assert_eq!(first["phases"].as_array().unwrap().len(), 8);
+
+    // Without the handler the default disposition kills the driver
+    // mid-run; with it the process exits at the phase boundary with 0.
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    for item in reports {
+        item.expect("later reports stay JSON");
+    }
+    let status = child.wait().expect("the driver exits");
+    assert!(
+        status.success(),
+        "SIGINT finishes the phase boundary and exits 0: {status}"
+    );
+
+    // The graceful exit released the run lease: the next driver runs.
+    let out = run_cli(&dir, &["run", "--once"]);
+    assert!(
+        out.status.success(),
+        "after shutdown the next driver proceeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

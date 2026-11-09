@@ -15,9 +15,13 @@
 //! and Attention derivation always run because they decide protective,
 //! read-only outcomes rather than starting work. A phase-level
 //! infrastructure failure aborts the pass: remaining phases report
-//! `pass_aborted` and the failure surfaces once.
+//! `pass_aborted` and the failure surfaces once. A SIGINT/SIGTERM
+//! shutdown signal finishes the current phase boundary and exits —
+//! the remaining phases report `shutdown` and the next run re-enters
+//! through phase order; workers are never touched by the signal.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
@@ -48,6 +52,41 @@ pub const PHASES: [&str; 8] = [
 /// Owner-approved per-tick bounds the loop enforces around Core.
 pub const OUTBOX_ITEMS_PER_TICK: usize = 8;
 pub const RECOVERY_ITEMS_PER_TICK: usize = 16;
+
+/// Set by the SIGINT/SIGTERM handler, read at every phase boundary.
+/// The handler itself only stores this flag — a pass in progress runs
+/// to its current phase boundary and the driver exits between phases,
+/// never mid-phase.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_signal: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Whether a shutdown signal has been received.
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// Install the SIGINT/SIGTERM handler the `run` loop honors. With the
+/// handler in place a signal never takes the default disposition (an
+/// immediate mid-phase kill): it is recorded here and the loop exits
+/// at the next phase boundary, leaving every durable effect already
+/// committed by its store transaction.
+pub fn install_shutdown_handler() -> Result<(), String> {
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if libc::signal(
+                signal,
+                handle_shutdown_signal as *const () as libc::sighandler_t,
+            ) == libc::SIG_ERR as libc::sighandler_t
+            {
+                return Err(format!("cannot install a handler for signal {signal}"));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PhaseReport {
@@ -177,11 +216,14 @@ pub struct Pass<'a> {
 
 /// Run exactly one bounded pass over the eight ordered phases.
 /// `clock` is supplied by the caller so tests can script deadlines; in
-/// production it reads the wall clock.
+/// production it reads the wall clock. `shutdown` is checked at every
+/// phase boundary: when it reports true the current phase finishes and
+/// the remaining phases are reported `shutdown`, never started.
 pub fn run_pass(
     pass: &mut Pass<'_>,
     scope: Option<&WorkId>,
     clock: &mut dyn FnMut() -> i64,
+    shutdown: &dyn Fn() -> bool,
 ) -> TickReport {
     let started = clock();
     let deadline = started + pass.settings.loop_config.tick_deadline_seconds as i64;
@@ -191,12 +233,17 @@ pub fn run_pass(
 
     // Gated phases check the deadline before starting new work; once a
     // phase fails, every later phase reports `pass_aborted` instead of
-    // silently running on a broken pass.
+    // silently running on a broken pass. A shutdown signal is checked
+    // at the same boundary: the phase that was running finishes, the
+    // rest report `shutdown` and wait for the next run.
     macro_rules! gated {
         ($index:expr) => {{
             let name = PHASES[$index];
             if aborted {
                 phases.push(PhaseReport::skipped(name, "pass_aborted"));
+                false
+            } else if shutdown() {
+                phases.push(PhaseReport::skipped(name, "shutdown"));
                 false
             } else {
                 let now = clock();
@@ -330,11 +377,14 @@ pub fn run_pass(
     }
 
     // Phase 5 — timed sweep (clock-derived Core decisions; always runs —
-    // it stops work rather than starting it).
+    // it stops work rather than starting it — unless the pass is
+    // aborted or the driver is shutting down at this boundary).
     {
         let name = PHASES[4];
         if aborted {
             phases.push(PhaseReport::skipped(name, "pass_aborted"));
+        } else if shutdown() {
+            phases.push(PhaseReport::skipped(name, "shutdown"));
         } else {
             let now = clock();
             let result = sweep_scoped(pass.store, pass.config, now, scope);
@@ -342,6 +392,11 @@ pub fn run_pass(
                 Ok(r) => {
                     let mut p = PhaseReport::completed(name);
                     p.processed = r.examined;
+                    p.held = r
+                        .conflicts
+                        .iter()
+                        .map(|id| format!("{}:sweep_conflict", id.0))
+                        .collect();
                     p.reason = Some(format!(
                         "stops_recorded={} terminal_failures={}",
                         r.stops_recorded, r.terminal_failures
@@ -353,18 +408,18 @@ pub fn run_pass(
         }
     }
 
-    // Phase 6 — recovery scheduling (due intents, revalidated, bounded).
+    // Phase 6 — recovery scheduling (due intents, revalidated, bounded;
+    // every intent fires under its own transaction — a per-Work
+    // conflict is recorded against that Work, never pass-fatal).
     if gated!(5) {
         let store = pass.store;
-        let result = store.transact(|tx| {
-            consume_due_recovery_intents(
-                tx,
-                &mut *clock,
-                Some(deadline),
-                scope,
-                RECOVERY_ITEMS_PER_TICK,
-            )
-        });
+        let result = consume_due_recovery_intents(
+            store,
+            clock,
+            Some(deadline),
+            scope,
+            RECOVERY_ITEMS_PER_TICK,
+        );
         push!(match result {
             Ok(scan) => {
                 let mut p = PhaseReport::completed(PHASES[5]);
@@ -391,6 +446,8 @@ pub fn run_pass(
         let name = PHASES[6];
         if aborted {
             phases.push(PhaseReport::skipped(name, "pass_aborted"));
+        } else if shutdown() {
+            phases.push(PhaseReport::skipped(name, "shutdown"));
         } else if scope.is_some() {
             phases.push(PhaseReport::skipped(name, "work_scope"));
         } else {
@@ -417,11 +474,14 @@ pub fn run_pass(
     }
 
     // Phase 8 — Attention derivation (recomputed read-only; always runs —
-    // it starts no work and must reflect this pass's durable state).
+    // it starts no work and must reflect this pass's durable state —
+    // unless the pass is aborted or the driver is shutting down).
     {
         let name = PHASES[7];
         if aborted {
             phases.push(PhaseReport::skipped(name, "pass_aborted"));
+        } else if shutdown() {
+            phases.push(PhaseReport::skipped(name, "shutdown"));
         } else {
             let now = clock();
             let result = pass
@@ -655,6 +715,7 @@ mod tests {
             },
             scope,
             clock,
+            &|| false,
         )
     }
 
@@ -910,5 +971,67 @@ mod tests {
         assert_eq!(value["kind"], "tick_report");
         assert!(value["phases"].as_array().unwrap().len() == 8);
         assert_eq!(value["aborted"], false);
+    }
+
+    #[test]
+    fn a_shutdown_signal_stops_the_pass_at_the_phase_boundary() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let settings = settings();
+        // The signal lands at the boundary before phase 4: the first
+        // three phases finish the work they already started, the
+        // remaining five report `shutdown` and are never started —
+        // the unconditional sweep and Attention phases included.
+        let checks = std::cell::Cell::new(0u32);
+        let shutdown = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 3
+        };
+        let mut host = FixtureGithub::new();
+        let report = run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: std::path::Path::new("."),
+            },
+            None,
+            &mut || NOW,
+            &shutdown,
+        );
+        assert_eq!(
+            statuses(&report),
+            vec![
+                "completed",
+                "completed",
+                "completed",
+                "skipped",
+                "skipped",
+                "skipped",
+                "skipped",
+                "skipped",
+            ],
+            "the pass ends at the phase boundary: {:?}",
+            report.phases
+        );
+        for phase in &report.phases[3..] {
+            assert_eq!(phase.reason.as_deref(), Some("shutdown"), "{:?}", phase);
+        }
+        assert!(!report.aborted, "shutdown is not a phase failure");
+        assert!(!report.deadline_exceeded);
+        assert_eq!(report.abort_reason(), None);
+        assert_eq!(report.schema_version, "1");
+    }
+
+    #[test]
+    fn the_shutdown_handler_records_a_signal_without_killing_the_process() {
+        install_shutdown_handler().expect("the handler installs");
+        unsafe { libc::raise(libc::SIGINT) };
+        assert!(
+            shutdown_requested(),
+            "SIGINT is recorded for the next phase boundary instead of \
+             taking the default mid-phase kill disposition"
+        );
     }
 }

@@ -106,6 +106,10 @@ pub struct CatalogBody {
 impl SqliteStore {
     /// Register a managed body (producer-side tooling). Durable
     /// metadata only — registration never touches the filesystem.
+    /// A registration-time pin is recorded as a `body_pins` row under
+    /// the unnamed `registered` dependency; lifecycle sites that know
+    /// their obligation should pin with their own dependency id via
+    /// [`Self::set_body_pin`] instead.
     pub fn register_body(&self, body: &CatalogBody) -> Result<(), StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
@@ -128,61 +132,84 @@ impl SqliteStore {
             ],
         )
         .map_err(map_err)?;
+        if body.pinned {
+            tx.execute(
+                "INSERT OR IGNORE INTO body_pins (body_id, dependency) \
+                 VALUES (?1, 'registered')",
+                params![body.body_id],
+            )
+            .map_err(map_err)?;
+        }
         tx.commit().map_err(internal)?;
         Ok(())
     }
 
-    /// Set or clear a protective dependency pin on a registered body.
-    /// Pin *creation* is refused once the body leaves `present`
-    /// (`reclaiming`, `reclaimed`): the requester sees the body as
-    /// unavailable and follows ordinary missing-evidence rules. That
-    /// refusal closes the race between eligibility marking and
-    /// deletion — a pin can never land on a body the sweep has already
-    /// claimed, so no later pass can silently override it. Clearing a
-    /// pin stays allowed in any state: it is bookkeeping that can only
-    /// ever make a body *less* protected.
-    pub fn set_body_pin(&self, body_id: &str, pinned: bool) -> Result<(), StoreError> {
+    /// Set or clear ONE protective dependency pin on a registered body.
+    /// Pin bookkeeping is the `body_pins` ledger: each live dependency
+    /// is its own row, `pinned` is the materialized EXISTS of those
+    /// rows, and discharging one dependency deletes only its own row —
+    /// another dependency's protection survives. Pin *creation* is
+    /// refused once the body leaves `present` (`reclaiming`,
+    /// `reclaimed`): the requester sees the body as unavailable and
+    /// follows ordinary missing-evidence rules. That refusal closes the
+    /// race between eligibility marking and deletion — a pin can never
+    /// land on a body the sweep has already claimed, so no later pass
+    /// can silently override it. Clearing a dependency that does not
+    /// exist is an idempotent no-op; clearing stays allowed in any
+    /// state: it is bookkeeping that can only ever make a body *less*
+    /// protected.
+    pub fn set_body_pin(
+        &self,
+        body_id: &str,
+        dependency: &str,
+        pinned: bool,
+    ) -> Result<(), StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        let updated = if pinned {
-            tx.execute(
-                "UPDATE body_catalog SET pinned=1 WHERE body_id=?1 AND state='present'",
+        // Distinguish "never registered" from "registered but no
+        // longer present" before touching the ledger, so the caller
+        // follows the right rule.
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM body_catalog WHERE body_id=?1",
                 params![body_id],
+                |r| r.get(0),
             )
-            .map_err(map_err)?
-        } else {
-            tx.execute(
-                "UPDATE body_catalog SET pinned=0 WHERE body_id=?1",
-                params![body_id],
-            )
-            .map_err(map_err)?
+            .optional()
+            .map_err(map_err)?;
+        let Some(state) = state else {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!("body {body_id} is not registered"),
+            });
         };
-        if updated == 0 {
-            // Distinguish "never registered" from "registered but no
-            // longer present" so the caller can follow the right rule.
-            let state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM body_catalog WHERE body_id=?1",
-                    params![body_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_err)?;
-            return Err(match state {
-                None => StoreError::ConstraintConflict {
-                    detail: format!("body {body_id} is not registered"),
-                },
-                Some(state) => StoreError::ConstraintConflict {
-                    detail: format!(
-                        "body {body_id} is unavailable ({state}); pin creation is refused"
-                    ),
-                },
+        if pinned && state != "present" {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!("body {body_id} is unavailable ({state}); pin creation is refused"),
             });
         }
+        if pinned {
+            tx.execute(
+                "INSERT OR IGNORE INTO body_pins (body_id, dependency) VALUES (?1, ?2)",
+                params![body_id, dependency],
+            )
+            .map_err(map_err)?;
+        } else {
+            tx.execute(
+                "DELETE FROM body_pins WHERE body_id=?1 AND dependency=?2",
+                params![body_id, dependency],
+            )
+            .map_err(map_err)?;
+        }
+        tx.execute(
+            "UPDATE body_catalog SET pinned = EXISTS \
+             (SELECT 1 FROM body_pins WHERE body_id=?1) WHERE body_id=?1",
+            params![body_id],
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(internal)?;
         Ok(())
     }
@@ -343,9 +370,28 @@ impl SqliteStore {
                 continue;
             }
             if report.bytes_reclaimed.saturating_add(candidate.bytes) > params.max_bytes {
+                if candidate.bytes > params.max_bytes {
+                    // A body larger than the whole pass bound can
+                    // never fit any pass, so stopping here would
+                    // starve every later body forever (each pass would
+                    // trip on this same oldest candidate). Hold it
+                    // with its reason and keep the pass moving over
+                    // bodies that can fit; the operator's repair path
+                    // (raise the bound, or `retention cleanup` with an
+                    // override) reclaims it.
+                    report.held.push(HeldBody {
+                        body_id: candidate.body_id.clone(),
+                        reason: "exceeds_max_bytes".into(),
+                    });
+                    if candidate.state == "present" {
+                        report.eligible_remaining += 1;
+                    }
+                    continue;
+                }
                 // Deterministic oldest-first: the bound stops the pass;
                 // later (smaller) bodies wait for the next pass rather
-                // than reordering around this one.
+                // than reordering around this one. This candidate fits
+                // a fresh pass, so the next pass continues with it.
                 report.eligible_remaining += candidates[index..]
                     .iter()
                     .filter(|c| c.state == "present")

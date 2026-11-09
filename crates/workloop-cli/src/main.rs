@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use run_loop::{Pass, PassSettings, RunLeaseGuard, run_pass};
+use run_loop::{
+    Pass, PassSettings, RunLeaseGuard, install_shutdown_handler, run_pass, shutdown_requested,
+};
 use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
@@ -456,6 +458,10 @@ fn run(cli: Cli) -> Result<(), String> {
             interval,
             ticks,
         } => {
+            // SIGINT/SIGTERM finish the current phase boundary and
+            // exit; without the handler the default disposition would
+            // kill this process mid-phase.
+            install_shutdown_handler()?;
             let settings = PassSettings::from_installation(&installation)?;
             let interval = interval.unwrap_or(settings.loop_config.interval_seconds);
             if interval == 0 {
@@ -479,6 +485,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let _lease = RunLeaseGuard::acquire(&store, now()).map_err(|e| e.to_string())?;
             let mut passes_done = 0u32;
             loop {
+                if shutdown_requested() {
+                    break;
+                }
                 let mut clock = now;
                 let report = run_pass(
                     &mut Pass {
@@ -491,6 +500,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     },
                     scope.as_ref(),
                     &mut clock,
+                    &shutdown_requested,
                 );
                 // The pass leaves a durable tick report first, then the
                 // same report on stdout — one JSON object per pass.
@@ -507,7 +517,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 if once || (ticks != 0 && passes_done >= ticks) {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(interval));
+                // Sleep to the next pass in short slices so a signal
+                // during the idle gap exits promptly instead of after
+                // the full interval.
+                let mut remaining = interval;
+                while remaining > 0 && !shutdown_requested() {
+                    let slice = remaining.min(100);
+                    std::thread::sleep(std::time::Duration::from_millis(slice));
+                    remaining -= slice;
+                }
             }
         }
         Commands::WorkList => {
@@ -772,6 +790,7 @@ mod tests {
             },
             None,
             &mut now,
+            &|| false,
         )
     }
 

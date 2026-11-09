@@ -111,7 +111,7 @@ fn a_pinned_body_is_never_reclaimed() {
     assert_eq!(store.body_state("b1").unwrap().unwrap().0, "present");
 
     // Once the pin is discharged the same body becomes reclaimable.
-    store.set_body_pin("b1", false).unwrap();
+    store.set_body_pin("b1", "registered", false).unwrap();
     let after = store.retention_sweep(&params(), &dir, NOW + 20).unwrap();
     assert_eq!(after.reclaimed.len(), 1);
     assert!(!path.exists());
@@ -128,7 +128,7 @@ fn pin_creation_is_refused_once_the_body_leaves_present() {
     let report = store.retention_sweep(&params(), &dir, NOW).unwrap();
     assert_eq!(report.reclaimed.len(), 1);
     assert_eq!(store.body_state("gone").unwrap().unwrap().0, "reclaimed");
-    let err = store.set_body_pin("gone", true).unwrap_err();
+    let err = store.set_body_pin("gone", "gate:test", true).unwrap_err();
     assert!(format!("{err}").contains("unavailable"), "{err}");
 
     // A `reclaiming` body: its delete always fails (the parent is a
@@ -158,18 +158,18 @@ fn pin_creation_is_refused_once_the_body_leaves_present() {
         "the delete fails, leaving reclaiming"
     );
     assert_eq!(store.body_state("stuck").unwrap().unwrap().0, "reclaiming");
-    let err = store.set_body_pin("stuck", true).unwrap_err();
+    let err = store.set_body_pin("stuck", "gate:test", true).unwrap_err();
     assert!(format!("{err}").contains("reclaiming"), "{err}");
 
     // Clearing stays allowed in any state — it can only un-protect.
-    store.set_body_pin("gone", false).unwrap();
+    store.set_body_pin("gone", "gate:test", false).unwrap();
     // A body that was never registered keeps the original error.
-    let err = store.set_body_pin("nope", true).unwrap_err();
+    let err = store.set_body_pin("nope", "gate:test", true).unwrap_err();
     assert!(format!("{err}").contains("not registered"), "{err}");
 
     // Pin creation on a `present` body still succeeds and protects it.
     let live = register(&store, &dir, "live", NOW - 100, Some(NOW - 10), false, 8);
-    store.set_body_pin("live", true).unwrap();
+    store.set_body_pin("live", "gate:test", true).unwrap();
     let third = store.retention_sweep(&p, &dir, NOW + 10).unwrap();
     assert!(
         third
@@ -436,5 +436,140 @@ fn zero_bounds_are_refused_before_any_work() {
     let mut p = params();
     p.interval_seconds = 0;
     assert!(store.retention_sweep(&p, &dir, NOW).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_dependencies_discharge_independently() {
+    let dir = root("pin-deps");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let path = register(&store, &dir, "b1", NOW - 100, Some(NOW - 10), false, 8);
+    store.set_body_pin("b1", "handoff:ah-1", true).unwrap();
+    store.set_body_pin("b1", "gate:judgment-1", true).unwrap();
+
+    // Discharging one dependency must not drop the other's protection:
+    // the ledger keeps one row per dependency, not one boolean.
+    store.set_body_pin("b1", "handoff:ah-1", false).unwrap();
+    let report = store.retention_sweep(&params(), &dir, NOW).unwrap();
+    assert!(
+        report.reclaimed.is_empty(),
+        "the remaining dependency still protects the body"
+    );
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.body_id == "b1" && h.reason == "pinned"),
+        "{:?}",
+        report.held
+    );
+    assert!(path.exists());
+
+    // Discharging the last dependency makes the body eligible again.
+    store.set_body_pin("b1", "gate:judgment-1", false).unwrap();
+    let after = store.retention_sweep(&params(), &dir, NOW + 20).unwrap();
+    assert_eq!(after.reclaimed.len(), 1);
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_oversized_body_is_held_without_starving_the_sweep() {
+    let dir = root("oversized");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let oversized = register(
+        &store,
+        &dir,
+        "oversized",
+        NOW - 300,
+        Some(NOW - 10),
+        false,
+        200,
+    );
+    let small = register(&store, &dir, "small", NOW - 200, Some(NOW - 10), false, 10);
+
+    // A body larger than the whole pass bound can never fit any pass;
+    // stopping on it would starve every later body forever.
+    let mut p = params();
+    p.max_bytes = 100;
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+    assert_eq!(report.reclaimed.len(), 1, "the smaller body is reclaimed");
+    assert_eq!(report.reclaimed[0].body_id, "small");
+    assert!(
+        report.bytes_reclaimed <= p.max_bytes,
+        "the byte bound is never exceeded"
+    );
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.body_id == "oversized" && h.reason == "exceeds_max_bytes"),
+        "the oversized body is held with its reason: {:?}",
+        report.held
+    );
+    assert_eq!(
+        report.eligible_remaining, 1,
+        "the held body stays eligible for a raised bound"
+    );
+    assert!(oversized.exists());
+    assert!(!small.exists());
+
+    // The next pass keeps making progress instead of tripping on the
+    // same oldest candidate again.
+    let mut p2 = params();
+    p2.interval_seconds = 1;
+    p2.max_bytes = 100;
+    let again = store.retention_sweep(&p2, &dir, NOW + 5).unwrap();
+    assert!(again.reclaimed.is_empty());
+    assert!(
+        again
+            .held
+            .iter()
+            .any(|h| h.body_id == "oversized" && h.reason == "exceeds_max_bytes"),
+        "{:?}",
+        again.held
+    );
+    assert!(oversized.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pre_ledger_pin_survives_the_upgrade_and_beats_an_unrelated_clear() {
+    let dir = root("legacy-pin");
+    let db = dir.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let path = register(&store, &dir, "legacy", NOW - 100, Some(NOW - 10), true, 8);
+    drop(store);
+
+    // Roll the file back to the previous release's shape: protection
+    // was the bare `pinned` boolean, with no dependency ledger.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE body_pins;").unwrap();
+    }
+    let store = SqliteStore::open(&db, 1).expect("the previous-release shape upgrades");
+
+    // Clearing a dependency the body never had must not un-protect it:
+    // the upgrade reconstructed the ledger row from the boolean.
+    store
+        .set_body_pin("legacy", "gate:unrelated", false)
+        .unwrap();
+    let report = store.retention_sweep(&params(), &dir, NOW).unwrap();
+    assert!(report.reclaimed.is_empty());
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.body_id == "legacy" && h.reason == "pinned"),
+        "{:?}",
+        report.held
+    );
+    assert!(path.exists());
+
+    // The reconstructed dependency discharges normally.
+    store.set_body_pin("legacy", "registered", false).unwrap();
+    let after = store.retention_sweep(&params(), &dir, NOW + 20).unwrap();
+    assert_eq!(after.reclaimed.len(), 1);
+    assert!(!path.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

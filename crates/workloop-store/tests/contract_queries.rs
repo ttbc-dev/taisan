@@ -931,3 +931,95 @@ fn expired_external_claim_forfeits_exclusion() {
         .unwrap();
     assert_eq!(execution(&store, &eid).state, ExecutionState::Ready);
 }
+
+/// A store wrapper that fails exactly ONE transaction — the Nth
+/// `transact` call — so a test can inject a per-Work store conflict
+/// (or an infrastructure outage) at a precise item boundary.
+struct Injected<'a, S> {
+    inner: &'a S,
+    calls: std::cell::Cell<u32>,
+    fail_at: u32,
+    internal: bool,
+}
+
+impl<S: Store> Store for Injected<'_, S> {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        if n == self.fail_at {
+            return Err(if self.internal {
+                StoreError::Internal {
+                    detail: "injected store outage".into(),
+                }
+            } else {
+                StoreError::ConstraintConflict {
+                    detail: "injected per-item conflict".into(),
+                }
+            });
+        }
+        self.inner.transact(f)
+    }
+}
+
+fn two_admitted_executions(tag: &str) -> (SqliteStore, ExecutionId, ExecutionId) {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (_w1, e1) = submit(&store, &format!("{tag}-1"));
+    let (_w2, e2) = submit(&store, &format!("{tag}-2"));
+    for eid in [&e1, &e2] {
+        store
+            .transact(|tx| admit_queued(tx, &config(), eid, NOW).map(|_| ()))
+            .unwrap();
+    }
+    (store, e1, e2)
+}
+
+#[test]
+fn one_works_conflict_is_recorded_and_the_sweep_continues() {
+    let (store, e1, e2) = two_admitted_executions("sweep-conflict");
+    // Call 1 lists the nonterminal executions; call 2 is the first
+    // execution's own transaction — it fails with a store conflict.
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: false,
+    };
+    let over = NOW + (6 * 3600) + 1;
+    let report =
+        sweep(&injected, &config(), over).expect("a per-Work conflict is not a tick error");
+
+    assert_eq!(report.examined, 2, "both Works were examined");
+    assert_eq!(
+        report.stops_recorded, 1,
+        "the later Work still gets its decision: {report:?}"
+    );
+    assert_eq!(report.conflicts, vec![e1.clone()]);
+    // The conflicted Work is untouched — its attempt rolled back —
+    // while the independent Work's stop is committed.
+    assert_eq!(execution(&store, &e1).state, ExecutionState::Ready);
+    assert_eq!(execution(&store, &e2).state, ExecutionState::Stopping);
+    // The conflict is recorded against the Work, never swallowed.
+    let deferrals = store.transact(|tx| tx.deferrals()).unwrap();
+    let recorded = deferrals
+        .iter()
+        .find(|d| d.execution_id == e1)
+        .expect("the conflict is recorded against the Work");
+    assert_eq!(recorded.reason, "sweep_conflict");
+}
+
+#[test]
+fn an_infrastructure_failure_still_fails_the_sweep() {
+    let (store, _e1, _e2) = two_admitted_executions("sweep-outage");
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: true,
+    };
+    let over = NOW + (6 * 3600) + 1;
+    let err = sweep(&injected, &config(), over).unwrap_err();
+    assert!(matches!(err, StoreError::Internal { .. }), "{err}");
+}

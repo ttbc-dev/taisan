@@ -313,3 +313,14 @@ CREATE TABLE IF NOT EXISTS body_catalog (
     delete_failures INTEGER NOT NULL DEFAULT 0,
     reclaimed_unix_seconds INTEGER
 );
+
+-- Protective-dependency pin rows: one row per live dependency, so a
+-- body stays pinned while ANY row exists and discharging one
+-- dependency deletes only its own row. `body_catalog.pinned` is the
+-- materialized EXISTS of this table, updated in the same transaction
+-- as every ledger write.
+CREATE TABLE IF NOT EXISTS body_pins (
+    body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
+    dependency TEXT NOT NULL,
+    PRIMARY KEY (body_id, dependency)
+);

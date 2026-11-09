@@ -170,9 +170,7 @@ fn consume(
     limit: usize,
 ) -> RecoveryScan {
     let mut clock = || now;
-    store
-        .transact(|tx| consume_due_recovery_intents(tx, &mut clock, deadline, scope, limit))
-        .unwrap()
+    consume_due_recovery_intents(store, &mut clock, deadline, scope, limit).unwrap()
 }
 
 fn intent(store: &SqliteStore, intent_id: &str) -> RecoveryIntent {
@@ -576,4 +574,118 @@ fn intent_state_transitions_are_closed_and_idempotent() {
     let row = intent(&store, &intent_id);
     assert_eq!(row.state, RecoveryIntentState::Retired);
     assert_eq!(row.retirement_reason.as_deref(), Some("terminal"));
+}
+
+/// A store wrapper that fails exactly ONE transaction — the Nth
+/// `transact` call — with a chosen error, so a test can inject a
+/// per-Work store conflict (or an infrastructure outage) at a precise
+/// item boundary.
+struct Injected<'a, S> {
+    inner: &'a S,
+    calls: std::cell::Cell<u32>,
+    fail_at: u32,
+    internal: bool,
+}
+
+impl<S: Store> Store for Injected<'_, S> {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        if n == self.fail_at {
+            return Err(if self.internal {
+                StoreError::Internal {
+                    detail: "injected store outage".into(),
+                }
+            } else {
+                StoreError::ConstraintConflict {
+                    detail: "injected per-item conflict".into(),
+                }
+            });
+        }
+        self.inner.transact(f)
+    }
+}
+
+#[test]
+fn one_intents_conflict_is_recorded_against_its_work_and_the_rest_still_fire() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let (w1, e1) = submit(&store, "k-conflict-1");
+    let (w2, e2) = submit(&store, "k-conflict-2");
+    pause(&store, &e1, vec![]);
+    pause(&store, &e2, vec![]);
+    let i1 = schedule(&store, &w1, Some(&e1), "requeue", NOW);
+    let i2 = schedule(&store, &w2, Some(&e2), "requeue", NOW);
+
+    // Call 1 lists the due intents; call 2 is the first intent's own
+    // transaction — it fails with a store conflict, as a lost race
+    // with another writer would.
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: false,
+    };
+    let mut clock = || NOW;
+    let scan = consume_due_recovery_intents(&injected, &mut clock, None, None, 16)
+        .expect("a per-intent conflict is not a phase error");
+
+    assert_eq!(
+        scan.consumed, 1,
+        "the later independent intent still fires: {scan:?}"
+    );
+    assert_eq!(scan.requeued, 1);
+    assert!(
+        scan.held
+            .iter()
+            .any(|(id, reason)| id == &i1 && reason == "recovery_conflict"),
+        "{:?}",
+        scan.held
+    );
+    // The conflicted intent stays pending for the next pass, its
+    // Work's Execution is untouched, and the conflict is recorded
+    // against that Work instead of aborting the phase.
+    assert_eq!(
+        intent(&store, &i1).state,
+        RecoveryIntentState::Pending,
+        "the conflicted intent is never dropped"
+    );
+    assert_eq!(execution(&store, &e1).state, ExecutionState::Paused);
+    let deferrals = store.transact(|tx| tx.deferrals()).unwrap();
+    let recorded = deferrals
+        .iter()
+        .find(|d| d.execution_id == e1)
+        .expect("the conflict is recorded against the Work");
+    assert_eq!(recorded.reason, "recovery_conflict");
+    // The other Work requeued normally.
+    assert_eq!(intent(&store, &i2).state, RecoveryIntentState::Consumed);
+    assert_eq!(execution(&store, &e2).state, ExecutionState::Queued);
+}
+
+#[test]
+fn an_infrastructure_failure_still_fails_the_phase() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-outage");
+    pause(&store, &execution_id, vec![]);
+    schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    // An outage on the same transaction is NOT a per-item conflict:
+    // the store itself is unreadable, so the phase fails and the pass
+    // aborts instead of silently skipping Work.
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: true,
+    };
+    let mut clock = || NOW;
+    let err = consume_due_recovery_intents(&injected, &mut clock, None, None, 16).unwrap_err();
+    assert!(matches!(err, StoreError::Internal { .. }), "{err}");
+    assert_eq!(
+        intent(&store, "ri-1").state,
+        RecoveryIntentState::Pending,
+        "nothing fired from the failed pass"
+    );
 }

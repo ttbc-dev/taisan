@@ -3825,6 +3825,25 @@ pub struct SweepReport {
     pub stops_recorded: usize,
     /// Executions settled terminal by an exhausted bound.
     pub terminal_failures: usize,
+    /// Executions whose own transaction hit a store conflict; recorded
+    /// against them as a `sweep_conflict` deferral and left for the
+    /// next pass — one Work's conflict never aborts the phase.
+    pub conflicts: Vec<ExecutionId>,
+}
+
+/// A per-item store conflict: the world changed under this item's read
+/// (constraint, state, version, or capacity), so its attempt is rolled
+/// back and re-decided next pass. Everything else — a store that
+/// cannot be read or written at all — is a phase-level infrastructure
+/// failure and still aborts the pass.
+fn is_item_conflict(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::ConstraintConflict { .. }
+            | StoreError::StateConflict { .. }
+            | StoreError::VersionConflict { .. }
+            | StoreError::NoFreeSlot
+    )
 }
 
 /// Cumulative automatic seconds charged against the Work-wide ceiling:
@@ -3849,109 +3868,154 @@ pub fn sweep(
 }
 
 /// The sweep restricted to one Work for a diagnostic `--work` pass.
+///
+/// Each execution is processed under its OWN store transaction (the
+/// per-Work isolation the loop design requires): a conflict on one
+/// Work's attempt is rolled back, recorded against that Work as a
+/// `sweep_conflict` deferral, and the pass continues with the others.
+/// Only an infrastructure failure — the store itself unreadable —
+/// returns `Err` and aborts the phase.
 pub fn sweep_scoped(
     store: &impl Store,
     config: &WorkloopConfig,
     now_unix_seconds: i64,
     scope: Option<&WorkId>,
 ) -> Result<SweepReport, StoreError> {
-    store.transact(|tx| {
-        let mut report = SweepReport::default();
-        for execution in tx.nonterminal_executions()? {
-            if let Some(work_id) = scope
-                && execution.work_id != *work_id
-            {
-                continue;
+    let executions = store.transact(|tx| tx.nonterminal_executions())?;
+    let mut report = SweepReport::default();
+    for listed in executions {
+        if let Some(work_id) = scope
+            && listed.work_id != *work_id
+        {
+            continue;
+        }
+        report.examined += 1;
+        let execution_id = listed.id.clone();
+        match store.transact(|tx| sweep_one(tx, &execution_id, now_unix_seconds)) {
+            Ok(SweepOutcome::Absent | SweepOutcome::Unchanged) => {}
+            Ok(SweepOutcome::StopRecorded) => report.stops_recorded += 1,
+            Ok(SweepOutcome::TerminalFailure) => report.terminal_failures += 1,
+            Err(e) if is_item_conflict(&e) => {
+                store.transact(|tx| {
+                    tx.apply(&Effect::RecordDeferral {
+                        execution_id: execution_id.clone(),
+                        reason: "sweep_conflict".into(),
+                        diagnostic: e.to_string(),
+                    })
+                })?;
+                report.conflicts.push(execution_id);
             }
-            report.examined += 1;
-            match execution.state {
-                ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
-                    // Recovery bound is separate from the runtime budget.
-                    if matches!(
-                        execution.waiting_reason,
-                        Some(WaitingReason::ArtifactRecovery)
-                    ) {
-                        let exhausted = execution.recovery_attempts_used
-                            >= execution.budget.artifact_recovery_attempts
-                            || execution
-                                .recovery_deadline_unix_seconds
-                                .is_some_and(|d| now_unix_seconds > d);
-                        if exhausted {
-                            fail_terminal(
-                                tx,
-                                &execution,
-                                "artifact_recovery_exhausted",
-                                "bounded artifact recovery exhausted; WIP preserved",
-                            )?;
-                            report.terminal_failures += 1;
-                            continue;
-                        }
-                    }
-                    let over_runtime = execution.started_unix_seconds.is_some_and(|s| {
-                        now_unix_seconds - s > execution.budget.runtime_limit_seconds as i64
-                    });
-                    if over_runtime {
-                        let mut next = execution.clone();
-                        next.state = ExecutionState::Stopping;
-                        next.desired_action = Some(DesiredAction::Fail);
-                        tx.apply(&Effect::UpdateExecution {
-                            execution: next,
-                            expected_state: execution.state.clone(),
-                        })?;
-                        report.stops_recorded += 1;
-                        continue;
-                    }
-                }
-                ExecutionState::Queued => {
-                    // An absolute deadline would be checked here; v0.1 has
-                    // none configured. Queue time never consumes runtime.
-                }
-                _ => {}
-            }
-            // The Work-wide automatic-time ceiling: cumulative automatic
-            // seconds across the whole Execution chain. It supplements
-            // the per-Execution runtime bound and prohibits new attempts;
-            // it does not itself establish termination.
+            Err(e) => return Err(e),
+        }
+    }
+    let _ = config;
+    Ok(report)
+}
+
+/// What one execution's sweep attempt decided, or that it vanished
+/// between the list and its own transaction.
+#[derive(Debug, PartialEq, Eq)]
+enum SweepOutcome {
+    Absent,
+    Unchanged,
+    StopRecorded,
+    TerminalFailure,
+}
+
+/// One execution's sweep decision inside its own transaction. The
+/// execution is re-read here so a change committed after the list was
+/// taken is observed fresh, never acted on from a stale snapshot.
+fn sweep_one(
+    tx: &mut dyn TxView,
+    execution_id: &ExecutionId,
+    now_unix_seconds: i64,
+) -> Result<SweepOutcome, StoreError> {
+    let Some(execution) = tx.execution(execution_id)? else {
+        return Ok(SweepOutcome::Absent);
+    };
+    match execution.state {
+        ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
+            // Recovery bound is separate from the runtime budget.
             if matches!(
-                execution.state,
-                ExecutionState::Queued
-                    | ExecutionState::Ready
-                    | ExecutionState::Running
-                    | ExecutionState::Waiting
+                execution.waiting_reason,
+                Some(WaitingReason::ArtifactRecovery)
             ) {
-                let work = tx.work(&execution.work_id)?;
-                let usage = tx.work_usage(&execution.work_id)?;
-                if let (Some(work), Some(usage)) = (work, usage)
-                    && let Some(automatic) = automatic_seconds_used(&usage, now_unix_seconds)
-                    && automatic > work.policy.automatic_time_limit_seconds
-                {
-                    match execution.state {
-                        ExecutionState::Queued => {
-                            fail_terminal(
-                                tx,
-                                &execution,
-                                "automatic_time_exhausted",
-                                "Work-wide automatic time limit reached",
-                            )?;
-                            report.terminal_failures += 1;
-                        }
-                        _ => {
-                            let mut next = execution.clone();
-                            next.state = ExecutionState::Stopping;
-                            next.desired_action = Some(DesiredAction::Fail);
-                            tx.apply(&Effect::UpdateExecution {
-                                execution: next,
-                                expected_state: execution.state.clone(),
-                            })?;
-                            report.stops_recorded += 1;
-                        }
-                    }
+                let exhausted = execution.recovery_attempts_used
+                    >= execution.budget.artifact_recovery_attempts
+                    || execution
+                        .recovery_deadline_unix_seconds
+                        .is_some_and(|d| now_unix_seconds > d);
+                if exhausted {
+                    fail_terminal(
+                        tx,
+                        &execution,
+                        "artifact_recovery_exhausted",
+                        "bounded artifact recovery exhausted; WIP preserved",
+                    )?;
+                    return Ok(SweepOutcome::TerminalFailure);
+                }
+            }
+            let over_runtime = execution.started_unix_seconds.is_some_and(|s| {
+                now_unix_seconds - s > execution.budget.runtime_limit_seconds as i64
+            });
+            if over_runtime {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Stopping;
+                next.desired_action = Some(DesiredAction::Fail);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })?;
+                return Ok(SweepOutcome::StopRecorded);
+            }
+        }
+        ExecutionState::Queued => {
+            // An absolute deadline would be checked here; v0.1 has
+            // none configured. Queue time never consumes runtime.
+        }
+        _ => {}
+    }
+    // The Work-wide automatic-time ceiling: cumulative automatic
+    // seconds across the whole Execution chain. It supplements
+    // the per-Execution runtime bound and prohibits new attempts;
+    // it does not itself establish termination.
+    if matches!(
+        execution.state,
+        ExecutionState::Queued
+            | ExecutionState::Ready
+            | ExecutionState::Running
+            | ExecutionState::Waiting
+    ) {
+        let work = tx.work(&execution.work_id)?;
+        let usage = tx.work_usage(&execution.work_id)?;
+        if let (Some(work), Some(usage)) = (work, usage)
+            && let Some(automatic) = automatic_seconds_used(&usage, now_unix_seconds)
+            && automatic > work.policy.automatic_time_limit_seconds
+        {
+            match execution.state {
+                ExecutionState::Queued => {
+                    fail_terminal(
+                        tx,
+                        &execution,
+                        "automatic_time_exhausted",
+                        "Work-wide automatic time limit reached",
+                    )?;
+                    return Ok(SweepOutcome::TerminalFailure);
+                }
+                _ => {
+                    let mut next = execution.clone();
+                    next.state = ExecutionState::Stopping;
+                    next.desired_action = Some(DesiredAction::Fail);
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: execution.state.clone(),
+                    })?;
+                    return Ok(SweepOutcome::StopRecorded);
                 }
             }
         }
-        let _ = config;
-        Ok(report)
-    })
+    }
+    Ok(SweepOutcome::Unchanged)
 }
 
 fn fail_terminal(
@@ -4036,8 +4100,16 @@ pub struct RecoveryScan {
 /// Execution already progressing) stay `pending` with a reason — an
 /// automatic pass never overrules an explicit hold, never guesses an
 /// unknown `kind`, and never fires an intent twice.
+///
+/// Every intent fires under its OWN store transaction (the per-Work
+/// isolation the loop design requires): a conflict on one intent's
+/// attempt is rolled back, recorded against that Work's Execution as a
+/// `recovery_conflict` deferral, and the intent stays `pending` for
+/// the next pass while the remaining intents still fire. Only an
+/// infrastructure failure — the store itself unreadable — returns
+/// `Err` and aborts the phase.
 pub fn consume_due_recovery_intents(
-    tx: &mut dyn TxView,
+    store: &impl Store,
     clock: &mut dyn FnMut() -> i64,
     deadline: Option<i64>,
     scope: Option<&WorkId>,
@@ -4045,123 +4117,172 @@ pub fn consume_due_recovery_intents(
 ) -> Result<RecoveryScan, StoreError> {
     let mut scan = RecoveryScan::default();
     let now = clock();
-    for intent in tx.recovery_intents()? {
-        if intent.state != crate::store::RecoveryIntentState::Pending {
+    let intents = store.transact(|tx| tx.recovery_intents())?;
+    for listed in intents {
+        if listed.state != crate::store::RecoveryIntentState::Pending {
             continue;
         }
         if let Some(work_id) = scope
-            && intent.work_id != *work_id
+            && listed.work_id != *work_id
         {
             continue;
         }
-        if intent.due_at_unix_seconds > now {
+        if listed.due_at_unix_seconds > now {
             continue;
         }
         if let Some(d) = deadline {
             let tick_now = clock();
             if tick_now >= d {
-                scan.deferred.push(intent.intent_id.clone());
+                scan.deferred.push(listed.intent_id.clone());
                 continue;
             }
         }
         if scan.consumed + scan.retired >= limit {
             scan.held
-                .push((intent.intent_id.clone(), "recovery_limit".into()));
+                .push((listed.intent_id.clone(), "recovery_limit".into()));
             continue;
         }
-        if intent.kind != "requeue" {
+        if listed.kind != "requeue" {
             // Only the documented kind fires automatically; anything
             // else waits for its owning slice rather than being guessed.
             scan.held
-                .push((intent.intent_id.clone(), "unsupported_kind".into()));
+                .push((listed.intent_id.clone(), "unsupported_kind".into()));
             continue;
         }
-        let Some(execution_id) = intent.execution_id.clone() else {
-            retire_intent(tx, &intent.intent_id, "no_execution")?;
-            scan.retired += 1;
-            continue;
-        };
-        let Some(execution) = tx.execution(&execution_id)? else {
-            retire_intent(tx, &intent.intent_id, "execution_missing")?;
-            scan.retired += 1;
-            continue;
-        };
-        if matches!(
-            execution.state,
-            ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Cancelled
-        ) {
-            retire_intent(tx, &intent.intent_id, "execution_terminal")?;
-            scan.retired += 1;
-            continue;
-        }
-        if execution.state != ExecutionState::Paused {
-            // Already progressing (queued/ready/running/waiting/stopping/
-            // uncertain): a manual resume or another path owns the next
-            // move. The intent stays visible and pending, never forced.
-            scan.held
-                .push((intent.intent_id.clone(), "execution_active".into()));
-            continue;
-        }
-        if execution
-            .repair_prerequisites
-            .iter()
-            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision))
-        {
-            // An explicit human hold: automatic recovery must not
-            // release it, only an operator Command may.
-            scan.held
-                .push((intent.intent_id.clone(), "operator_hold".into()));
-            continue;
-        }
-        let Some(work) = tx.work(&intent.work_id)? else {
-            retire_intent(tx, &intent.intent_id, "work_missing")?;
-            scan.retired += 1;
-            continue;
-        };
-        let unmet = prerequisites_satisfied(tx, &work, &execution, now)?;
-        if !unmet.is_empty() {
-            scan.held
-                .push((intent.intent_id.clone(), "prerequisites_unmet".into()));
-            continue;
-        }
-        // Work-wide automatic-time ceiling: an exhausted budget can only
-        // hand off, never requeue (same rule as sweep and resume).
-        let usage = tx.work_usage(&work.id)?;
-        if let Some(usage) = usage
-            && let Some(automatic) = automatic_seconds_used(&usage, now)
-            && automatic > work.policy.automatic_time_limit_seconds
-        {
-            fail_terminal(
-                tx,
-                &execution,
-                "automatic_time_exhausted",
-                "Work-wide automatic time limit reached",
-            )?;
-            tx.apply(&Effect::UpdateRecoveryIntent {
-                intent_id: intent.intent_id.clone(),
-                state: crate::store::RecoveryIntentState::Consumed,
-                retirement_reason: None,
-            })?;
-            scan.consumed += 1;
-            scan.failed_terminal += 1;
-            continue;
-        }
-        if let Some((effects, _seq, _version)) =
-            paused_exhaustion_effects(tx, &work, &execution, now)?
-        {
-            for effect in &effects {
-                tx.apply(effect)?;
+        let intent_id = listed.intent_id.clone();
+        match store.transact(|tx| fire_due_intent(tx, &intent_id, now)) {
+            Ok(FireOutcome::Ignored) => {}
+            Ok(FireOutcome::Retired) => scan.retired += 1,
+            Ok(FireOutcome::Held(reason)) => scan.held.push((intent_id, reason)),
+            Ok(FireOutcome::Consumed {
+                requeued,
+                failed_terminal,
+            }) => {
+                scan.consumed += 1;
+                scan.requeued += usize::from(requeued);
+                scan.failed_terminal += usize::from(failed_terminal);
             }
-            tx.apply(&Effect::UpdateRecoveryIntent {
-                intent_id: intent.intent_id.clone(),
-                state: crate::store::RecoveryIntentState::Consumed,
-                retirement_reason: None,
-            })?;
-            scan.consumed += 1;
-            scan.failed_terminal += 1;
-            continue;
+            Err(e) if is_item_conflict(&e) => {
+                // The world changed under this intent's read: the
+                // conflict is recorded against the Work's Execution
+                // when it has one, and the intent stays pending for
+                // the next pass — never silently dropped, never
+                // allowed to abort the other items.
+                if let Some(execution_id) = &listed.execution_id {
+                    store.transact(|tx| {
+                        tx.apply(&Effect::RecordDeferral {
+                            execution_id: execution_id.clone(),
+                            reason: "recovery_conflict".into(),
+                            diagnostic: e.to_string(),
+                        })
+                    })?;
+                }
+                scan.held.push((intent_id, "recovery_conflict".into()));
+            }
+            Err(e) => return Err(e),
         }
-        let (effects, _seq, _version) = paused_requeue_effects(tx, &work, &execution, now)?;
+    }
+    Ok(scan)
+}
+
+/// What firing one intent inside its own transaction decided.
+#[derive(Debug, PartialEq, Eq)]
+enum FireOutcome {
+    /// The intent vanished or left `pending` between the list and this
+    /// transaction — another path already owned it.
+    Ignored,
+    Retired,
+    Held(String),
+    Consumed {
+        requeued: bool,
+        failed_terminal: bool,
+    },
+}
+
+/// Re-read one intent inside the firing transaction and apply the
+/// documented revalidation guards before any transition, so a stale
+/// list snapshot can never fire an intent twice or against a state
+/// that changed since the list was taken.
+fn fire_due_intent(
+    tx: &mut dyn TxView,
+    intent_id: &str,
+    now: i64,
+) -> Result<FireOutcome, StoreError> {
+    let Some(intent) = tx
+        .recovery_intents()?
+        .into_iter()
+        .find(|i| i.intent_id == intent_id)
+    else {
+        return Ok(FireOutcome::Ignored);
+    };
+    if intent.state != crate::store::RecoveryIntentState::Pending
+        || intent.due_at_unix_seconds > now
+    {
+        return Ok(FireOutcome::Ignored);
+    }
+    let Some(execution_id) = intent.execution_id.clone() else {
+        retire_intent(tx, &intent.intent_id, "no_execution")?;
+        return Ok(FireOutcome::Retired);
+    };
+    let Some(execution) = tx.execution(&execution_id)? else {
+        retire_intent(tx, &intent.intent_id, "execution_missing")?;
+        return Ok(FireOutcome::Retired);
+    };
+    if matches!(
+        execution.state,
+        ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Cancelled
+    ) {
+        retire_intent(tx, &intent.intent_id, "execution_terminal")?;
+        return Ok(FireOutcome::Retired);
+    }
+    if execution.state != ExecutionState::Paused {
+        // Already progressing (queued/ready/running/waiting/stopping/
+        // uncertain): a manual resume or another path owns the next
+        // move. The intent stays visible and pending, never forced.
+        return Ok(FireOutcome::Held("execution_active".into()));
+    }
+    if execution
+        .repair_prerequisites
+        .iter()
+        .any(|p| matches!(p, RepairPrerequisite::OperatorDecision))
+    {
+        // An explicit human hold: automatic recovery must not
+        // release it, only an operator Command may.
+        return Ok(FireOutcome::Held("operator_hold".into()));
+    }
+    let Some(work) = tx.work(&intent.work_id)? else {
+        retire_intent(tx, &intent.intent_id, "work_missing")?;
+        return Ok(FireOutcome::Retired);
+    };
+    let unmet = prerequisites_satisfied(tx, &work, &execution, now)?;
+    if !unmet.is_empty() {
+        return Ok(FireOutcome::Held("prerequisites_unmet".into()));
+    }
+    // Work-wide automatic-time ceiling: an exhausted budget can only
+    // hand off, never requeue (same rule as sweep and resume).
+    let usage = tx.work_usage(&work.id)?;
+    if let Some(usage) = usage
+        && let Some(automatic) = automatic_seconds_used(&usage, now)
+        && automatic > work.policy.automatic_time_limit_seconds
+    {
+        fail_terminal(
+            tx,
+            &execution,
+            "automatic_time_exhausted",
+            "Work-wide automatic time limit reached",
+        )?;
+        tx.apply(&Effect::UpdateRecoveryIntent {
+            intent_id: intent.intent_id.clone(),
+            state: crate::store::RecoveryIntentState::Consumed,
+            retirement_reason: None,
+        })?;
+        return Ok(FireOutcome::Consumed {
+            requeued: false,
+            failed_terminal: true,
+        });
+    }
+    if let Some((effects, _seq, _version)) = paused_exhaustion_effects(tx, &work, &execution, now)?
+    {
         for effect in &effects {
             tx.apply(effect)?;
         }
@@ -4170,10 +4291,24 @@ pub fn consume_due_recovery_intents(
             state: crate::store::RecoveryIntentState::Consumed,
             retirement_reason: None,
         })?;
-        scan.consumed += 1;
-        scan.requeued += 1;
+        return Ok(FireOutcome::Consumed {
+            requeued: false,
+            failed_terminal: true,
+        });
     }
-    Ok(scan)
+    let (effects, _seq, _version) = paused_requeue_effects(tx, &work, &execution, now)?;
+    for effect in &effects {
+        tx.apply(effect)?;
+    }
+    tx.apply(&Effect::UpdateRecoveryIntent {
+        intent_id: intent.intent_id.clone(),
+        state: crate::store::RecoveryIntentState::Consumed,
+        retirement_reason: None,
+    })?;
+    Ok(FireOutcome::Consumed {
+        requeued: true,
+        failed_terminal: false,
+    })
 }
 
 fn retire_intent(tx: &mut dyn TxView, intent_id: &str, reason: &str) -> Result<(), StoreError> {
