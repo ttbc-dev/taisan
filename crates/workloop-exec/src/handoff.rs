@@ -615,9 +615,10 @@ pub fn verify(
                 .output();
             match run {
                 Ok(out) => {
-                    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-                    text.push_str(&String::from_utf8_lossy(&out.stderr));
-                    text.truncate(64 * 1024);
+                    let mut bytes = out.stdout;
+                    bytes.extend_from_slice(&out.stderr);
+                    bytes.truncate(64 * 1024);
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
                     (
                         if out.status.success() {
                             VerificationOutcome::Pass

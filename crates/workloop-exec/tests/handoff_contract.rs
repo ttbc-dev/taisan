@@ -606,6 +606,47 @@ fn verification_runs_on_the_handed_off_commit() {
     );
 }
 
+/// Verification output bounded at 64 KiB is truncated at the byte level
+/// before lossy decoding — a multibyte codepoint straddling the bound
+/// must not panic String::truncate. `yes 'ああ'` emits a 7-byte line, so
+/// byte 65536 always lands mid-codepoint.
+#[test]
+fn multibyte_verification_output_truncates_without_a_panic() {
+    let root = tmp_root("verifyutf8");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-utf8");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-h11");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &[
+            "sh".into(),
+            "-c".into(),
+            "yes 'ああ' | head -c 70000".into(),
+        ],
+        &scratch,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass);
+    assert_eq!(res.produced, produced);
+    assert!(
+        res.output.len() <= 64 * 1024 + 8,
+        "bounded output: {} bytes",
+        res.output.len()
+    );
+}
+
 /// A writer that may still be live blocks export entirely: the
 /// supervisor opens handoff rows only for `Done` invocations (proven
 /// stopped). Workspaces without git objects keep the file-artifact

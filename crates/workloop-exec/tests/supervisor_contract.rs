@@ -730,6 +730,223 @@ fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
     );
 }
 
+/// A reparented escapee stays a recorded identity: refreshing the live
+/// ppid snapshot must union with the durable descendant set, never
+/// replace it — leaving the tree is not proof of stopping.
+#[test]
+fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
+    use std::path::Path;
+    use workloop_core::ports::SpawnError;
+
+    struct LiveTree(Vec<ProcessIdentity>);
+    impl ProcessControlPort for LiveTree {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the poll path")
+        }
+        // The escapee is absent: it reparented out of the leader's ppid
+        // tree, so the live snapshot can no longer see it.
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(self.0.clone())
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            ProcessEvidence::Alive {
+                identity: id.clone(),
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("refreshunion");
+    let (_w, eid) = submit_and_admit(&store, "k-ru1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_800_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_800_001),
+    };
+    let live_child = ProcessIdentity {
+        pid: 9_800_002,
+        started_at: "child start".into(),
+        pgid: Some(9_800_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_800_003,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-ru1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![escapee.clone()],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(LiveTree(vec![live_child.clone()]), root, vec![], config());
+    sup.run_once(&store, NOW).unwrap();
+    let descendants = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("invocation")
+        .descendants;
+    let pids: BTreeSet<i32> = descendants.iter().map(|i| i.pid).collect();
+    assert_eq!(
+        pids,
+        BTreeSet::from([live_child.pid, escapee.pid]),
+        "refresh unions the live tree with recorded escapees, never replacing them"
+    );
+}
+
+/// The snapshot persisted by `request_stop` in the same pass must be part
+/// of the stop proof. The escapee here is visible only to that fresh
+/// snapshot — it `setsid`'d out of the group and the recorded descendant
+/// list predates its spawn — so settling on the pre-stop identity set
+/// would release capacity under a live writer.
+#[test]
+fn fresh_stop_snapshot_is_proven_before_settling() {
+    use std::path::Path;
+    use std::sync::Mutex;
+    use workloop_core::ports::SpawnError;
+
+    struct FreshSnapshotEscapee {
+        escapee: ProcessIdentity,
+        inspected: Mutex<BTreeSet<i32>>,
+    }
+    impl ProcessControlPort for FreshSnapshotEscapee {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the stop path")
+        }
+        // The escapee is still a live child at stop time: the stop
+        // intent's snapshot records it.
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![self.escapee.clone()])
+        }
+        // …but it left the process group, so enumeration cannot cover it.
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            self.inspected.lock().unwrap().insert(id.pid);
+            if id.pid == self.escapee.pid {
+                ProcessEvidence::Alive {
+                    identity: self.escapee.clone(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: id.clone(),
+                    exit_code: Some(0),
+                }
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("freshsnap");
+    let (_w, eid) = submit_and_admit(&store, "k-fs1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_900_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_900_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_900_002,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    // The writer is recorded Running; its durable descendant snapshot
+    // predates the escapee's spawn, and the Execution is already Stopping.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-fs1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Stopping;
+            e.desired_action = Some(DesiredAction::Cancel);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(
+        FreshSnapshotEscapee {
+            escapee: escapee.clone(),
+            inspected: Mutex::new(BTreeSet::new()),
+        },
+        root,
+        vec![],
+        config(),
+    );
+    sup.drive_stops(&store, NOW).unwrap();
+    assert!(
+        sup.port.inspected.lock().unwrap().contains(&escapee.pid),
+        "the just-persisted snapshot must be inspected before settling"
+    );
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Stopping,
+        "a live writer the stale identity set missed must withhold the exit fact"
+    );
+}
+
 // ---- Artifact recovery (#10) ----
 
 #[test]

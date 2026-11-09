@@ -10,9 +10,12 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `1` is the only supported
-//! version. An unversioned database with user tables is a slice-0 file —
-//! archive-only, refused at open — and a newer version is refused.
+//! `PRAGMA user_version` is the format gate: `2` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` must carry the complete
+//! recognized v1 schema and upgrades additively at open; a stamped file
+//! whose schema is foreign or incomplete, an unversioned database with
+//! user tables (a slice-0 file — archive-only), and a newer version are
+//! all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;

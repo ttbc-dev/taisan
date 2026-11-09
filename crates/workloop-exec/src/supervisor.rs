@@ -860,6 +860,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         };
         snap.retain(|i| i.pid != leader.pid);
+        // Union, never replace: an escapee that reparented out of the
+        // ppid tree stays a recorded identity — leaving the live tree
+        // is not proof it stopped.
+        for recorded in &invocation.descendants {
+            if recorded.pid != leader.pid && !snap.iter().any(|i| i.pid == recorded.pid) {
+                snap.push(recorded.clone());
+            }
+        }
         snap.sort_by_key(|i| i.pid);
         let mut recorded = invocation.descendants.clone();
         recorded.sort_by_key(|i| i.pid);
@@ -1117,17 +1125,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                     continue;
                 };
-                let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
-                let identities = match &intent {
-                    Some(recorded) => recorded.identities.clone(),
+                let intent = match store.transact(|tx| tx.stop_intent(&invocation.id))? {
+                    Some(recorded) => Some(recorded),
                     None => match self.request_stop(store, &invocation, &identity)? {
-                        StopReceipt::Requested | StopReceipt::AlreadyStopped => store
-                            .transact(|tx| tx.stop_intent(&invocation.id))?
-                            .map(|i| i.identities)
-                            .unwrap_or_default(),
+                        // Re-read so the just-persisted snapshot is part
+                        // of the proof below — it may hold an escapee
+                        // neither the recorded descendants nor the live
+                        // group still cover.
+                        StopReceipt::Requested | StopReceipt::AlreadyStopped => {
+                            store.transact(|tx| tx.stop_intent(&invocation.id))?
+                        }
                         StopReceipt::Unknown { .. } => continue,
                     },
                 };
+                let identities = intent
+                    .as_ref()
+                    .map(|i| i.identities.clone())
+                    .unwrap_or_default();
                 // Stop proof = inspecting every recorded identity: the
                 // intent's snapshot, the persisted descendant snapshot,
                 // and the leader's current group members. A failed group

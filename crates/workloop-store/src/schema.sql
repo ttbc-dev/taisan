@@ -1,7 +1,8 @@
--- workloop v1 store: current-state tables enforcing structural
+-- workloop v2 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 1` marks the format; an unversioned slice-0
--- database is archive-only and a newer version is refused at open.
+-- `PRAGMA user_version = 2` marks the format; a stamped v1 file with
+-- the complete recognized schema upgrades additively at open, while an
+-- unversioned slice-0 database and a newer version are refused.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
