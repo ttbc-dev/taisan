@@ -320,11 +320,6 @@ impl ProcessControlPort for PosixProcessControl {
 pub enum ExecError {
     Store(StoreError),
     Io(std::io::Error),
-    /// A handoff precondition could not be evaluated (e.g. the
-    /// workspace's base branch is unreadable); surfaces instead of
-    /// silently recording an empty base that would skip ancestry
-    /// checks.
-    Handoff(String),
 }
 
 impl std::fmt::Display for ExecError {
@@ -332,7 +327,6 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
-            Self::Handoff(d) => write!(f, "handoff: {d}"),
         }
     }
 }
@@ -491,7 +485,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // a live or uninspectable writer blocks export, and a
                 // live straggler is re-signaled, never bundled.
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
-                match self.prove_tree_stopped(&invocation, intent.as_ref())? {
+                match self.prove_tree_stopped(store, &invocation, intent.as_ref())? {
                     TreeProof::Proven => {}
                     TreeProof::Withheld | TreeProof::Uncertain => continue,
                 }
@@ -550,13 +544,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let Some((invocation, work_id, verification_argv, bound)) = found else {
             return Ok(None);
         };
-        // The handoff base is the managed branch's fork point — the
-        // revision the workspace was checked out at — recovered from
-        // the workspace repo itself. `SourceSnapshot.source_revision`
-        // is a host issue-version token, not a git commit.
+        // The handoff base is derived inside the bounded export stage
+        // (the managed branch's fork point against the workspace's
+        // non-work local branch) — never from
+        // `SourceSnapshot.source_revision`, a host issue-version token,
+        // and never here, where a derivation failure would abort the
+        // sweep instead of converging on `recovery_exhausted`.
         let branch = format!("work/{}", work_id.0);
-        let base = crate::handoff::derive_base(&self.workspace_of(&work_id), &branch)
-            .map_err(|e| ExecError::Handoff(e.to_string()))?;
+        let base = String::new();
         Ok(Some((
             crate::handoff::HandoffSeed {
                 invocation,
@@ -815,7 +810,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     // from every live snapshot — it is part of the
                     // proof set here too, not only in drive_stops.
                     let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
-                    match self.prove_tree_stopped(&invocation, intent.as_ref())? {
+                    match self.prove_tree_stopped(store, &invocation, intent.as_ref())? {
                         TreeProof::Proven => {
                             self.port.reap(identity.pid);
                             self.finish_invocation(store, &invocation, now_unix_seconds)?;
@@ -995,8 +990,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// Inspect every identity the exit fact depends on; live stragglers
     /// are re-signaled under re-verification. `Withheld` means at least
     /// one writer is still alive; `Uncertain` means a lookup failed.
+    /// The first signal is always delivered behind a durable intent —
+    /// the proof set itself is the record, so a crash after the signal
+    /// still finds whom it targeted (this path runs on handoff and poll
+    /// sweeps where no intent may exist yet).
     fn prove_tree_stopped(
         &self,
+        store: &impl Store,
         invocation: &Invocation,
         intent: Option<&StopIntent>,
     ) -> Result<TreeProof, ExecError> {
@@ -1006,11 +1006,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
         };
         let mut withheld = false;
         let mut uncertain = false;
+        let mut intent_persisted = intent.is_some();
         for id in &identities {
             match self.port.inspect(id) {
                 ProcessEvidence::Stopped { .. } => {}
                 ProcessEvidence::Alive { identity } => {
                     withheld = true;
+                    if !intent_persisted {
+                        self.ensure_stop_intent(store, invocation, &identities)?;
+                        intent_persisted = true;
+                    }
                     self.port.signal_verified(&identity, libc::SIGKILL);
                 }
                 ProcessEvidence::Unknown { .. } => {
@@ -1026,6 +1031,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             TreeProof::Proven
         })
+    }
+
+    /// Persist the proof set as the stop intent when none exists — the
+    /// durable-intent-before-signal boundary for prove paths that find
+    /// a live writer without an earlier `request_stop`.
+    fn ensure_stop_intent(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        identities: &[ProcessIdentity],
+    ) -> Result<(), ExecError> {
+        store.transact(|tx| {
+            if tx.stop_intent(&invocation.id)?.is_none() {
+                let seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertStopIntent {
+                    intent: StopIntent {
+                        invocation_id: invocation.id.clone(),
+                        identities: identities.to_vec(),
+                        recorded_seq: seq,
+                    },
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Save every artifact fact before the exit fact resolves the writer.
@@ -1555,7 +1585,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         match ev {
             ProcessEvidence::Stopped { .. } => {
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
-                match self.prove_tree_stopped(invocation, intent.as_ref())? {
+                match self.prove_tree_stopped(store, invocation, intent.as_ref())? {
                     TreeProof::Proven => {
                         if let Some(id) = &invocation.process_identity {
                             self.port.reap(id.pid);
@@ -1945,8 +1975,9 @@ mod tests {
             scripted_config(),
         );
         let invocation = group_invocation(&leader);
+        let store = workloop_store::sqlite::SqliteStore::in_memory(1).unwrap();
         assert_eq!(
-            sup.prove_tree_stopped(&invocation, None).unwrap(),
+            sup.prove_tree_stopped(&store, &invocation, None).unwrap(),
             TreeProof::Proven
         );
         assert!(
@@ -1973,7 +2004,7 @@ mod tests {
         let sup = Supervisor::new(
             ScriptedGroup {
                 members: vec![straggler.clone()],
-                alive: vec![straggler],
+                alive: vec![straggler.clone()],
                 signaled: std::sync::Mutex::new(vec![]),
             },
             PathBuf::from("/unused"),
@@ -1981,11 +2012,19 @@ mod tests {
             scripted_config(),
         );
         let invocation = group_invocation(&leader);
+        let store = workloop_store::sqlite::SqliteStore::in_memory(1).unwrap();
         assert_eq!(
-            sup.prove_tree_stopped(&invocation, None).unwrap(),
+            sup.prove_tree_stopped(&store, &invocation, None).unwrap(),
             TreeProof::Withheld
         );
         assert_eq!(*sup.port.signaled.lock().unwrap(), vec![700]);
+        // The signal was delivered behind a durable intent naming the
+        // proof set — a crash after it still finds whom it targeted.
+        let intent = store
+            .transact(|tx| tx.stop_intent(&invocation.id))
+            .unwrap()
+            .expect("signalling without an intent is the bug this test guards");
+        assert!(intent.identities.contains(&straggler));
     }
 
     #[test]

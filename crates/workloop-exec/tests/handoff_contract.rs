@@ -1007,6 +1007,20 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
     )
     .unwrap();
     assert_eq!(killed.result, VerificationOutcome::Inconclusive);
+
+    // An empty argv is a spec defect — recorded Inconclusive like any
+    // other non-terminating attempt, never a panic.
+    let empty = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[2]",
+        &[],
+        &scratch,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(empty.result, VerificationOutcome::Inconclusive);
 }
 
 /// `source_revision` is a host issue-version token, not a git commit:
@@ -1138,11 +1152,12 @@ fn a_changed_verification_argv_is_rerun() {
     );
 }
 
-/// A workspace whose git metadata is unreadable surfaces as an error —
-/// never a silently empty base that would skip the stale-base and
-/// nothing-produced checks and acknowledge a foreign commit.
+/// A workspace whose git metadata is unreadable rides the bounded
+/// recovery path — never a sweep-aborting error and never a silently
+/// empty base that would skip the stale-base and nothing-produced
+/// checks and acknowledge a foreign commit.
 #[test]
-fn an_unreadable_workspace_base_is_an_error() {
+fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
     let root = tmp_root("badbase");
     let store = SqliteStore::in_memory(1).unwrap();
     let (w, e) = admit(&store, "h-badbase");
@@ -1157,9 +1172,22 @@ fn an_unreadable_workspace_base_is_an_error() {
     let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
     let invocation = done_invocation(&e, "inv-badbase");
     insert_invocation(&store, &invocation);
-    assert!(
-        sup.drive_handoffs(&store).is_err(),
-        "a failed base derivation surfaces; it is never an empty base"
+    let aid = artifact_id(&invocation);
+    // Each pass charges a transport attempt; the sweep itself never
+    // aborts (other rows and the recovery pass still run), and the
+    // workspace never gets an empty base.
+    for _ in 0..3 {
+        sup.drive_handoffs(&store).unwrap();
+    }
+    let h = row(&store, &aid).expect("handoff row opened");
+    assert_eq!(h.state, HandoffState::ExportStarted);
+    assert_eq!(h.attempt, 3, "each failed pass charged an attempt");
+    sup.drive_handoffs(&store).unwrap();
+    let h = row(&store, &aid).unwrap();
+    assert_eq!(h.state, HandoffState::Invalid);
+    assert_eq!(
+        h.invalid_reason.as_deref(),
+        Some("recovery_exhausted"),
+        "a lost workspace converges on the bound, not on a crashed sweep"
     );
-    assert!(row(&store, &artifact_id(&invocation)).is_none());
 }

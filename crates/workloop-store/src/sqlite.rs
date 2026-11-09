@@ -1715,7 +1715,7 @@ impl TxView for Tx<'_> {
                      request_id, work_id, execution_id, base, produced, \
                      manifest_digest, state, invalid_reason, attempt, \
                      recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
-                     ON CONFLICT(artifact_id) DO UPDATE SET produced=?7, \
+                     ON CONFLICT(artifact_id) DO UPDATE SET base=?6, produced=?7, \
                      manifest_digest=?8, state=?9, invalid_reason=?10, \
                      attempt=?11, recorded_seq=?12",
                     params![

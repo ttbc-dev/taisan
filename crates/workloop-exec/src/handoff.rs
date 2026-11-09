@@ -385,6 +385,16 @@ fn export_stage(
 
     let produced = git(&workspace, &["rev-parse", "--verify", &seed.branch])?;
 
+    // The durable base is derived here, inside the bounded stage —
+    // never from a host token, and never silently empty: a derivation
+    // failure is a transport failure charged to the bound, so a lost
+    // or unreadable workspace converges on `recovery_exhausted` like
+    // every other transport loss. An empty result is the honest
+    // "no base branch" case only.
+    if handoff.base.is_empty() {
+        handoff.base = derive_base(&workspace, &seed.branch)?;
+    }
+
     // Stale check: produced must descend from the recorded base. A spec
     // without source pins records no base — the export covers the whole
     // produced history and the stale check does not apply.
@@ -630,12 +640,25 @@ enum VerificationRun {
 /// read back after the child settles). A timed-out runner is killed and
 /// recorded `Inconclusive`; a signal-killed runner is `Inconclusive`
 /// too — an invented exit code is not evidence.
+///
+/// The environment is hygiene-only, per the worker-protocol mechanism
+/// table: an allowlisted env (PATH, a fresh HOME/TMPDIR, git config
+/// scrubbed of credential helpers) inside a clean worktree — required,
+/// not sufficient. Mount/PID/network namespace isolation is the
+/// separate Isolation slice, not part of this driver.
 fn run_verification_command(
     argv: &[String],
     cwd: &Path,
     log_path: &Path,
+    env_root: &Path,
     timeout: Duration,
 ) -> VerificationRun {
+    let Some(program) = argv.first() else {
+        return VerificationRun::SpawnFailed(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty verification argv",
+        ));
+    };
     let log = match std::fs::File::create(log_path) {
         Ok(f) => f,
         Err(e) => return VerificationRun::SpawnFailed(e),
@@ -644,11 +667,17 @@ fn run_verification_command(
         Ok(f) => f,
         Err(e) => return VerificationRun::SpawnFailed(e),
     };
-    let mut child = match Command::new(&argv[0])
+    let _ = std::fs::create_dir_all(env_root.join("home"));
+    let _ = std::fs::create_dir_all(env_root.join("tmp"));
+    let mut child = match Command::new(program)
         .args(&argv[1..])
         .current_dir(cwd)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", env_root.join("home"))
+        .env("TMPDIR", env_root.join("tmp"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
@@ -759,7 +788,8 @@ pub fn verify_with_timeout(
         ],
     ) {
         Ok(_) => {
-            let run = run_verification_command(argv, &worktree, &log_path, timeout);
+            let env_root = scratch.join(format!("verify-env-{tag}"));
+            let run = run_verification_command(argv, &worktree, &log_path, &env_root, timeout);
             let mut bytes = std::fs::read(&log_path).unwrap_or_default();
             bytes.truncate(64 * 1024);
             let captured = String::from_utf8_lossy(&bytes).into_owned();
