@@ -43,6 +43,25 @@ impl FixtureGithub {
         Self::default()
     }
 
+    /// The capability set this fixture declares for its bound actors:
+    /// the full baseline vocabulary the current fixture implements.
+    /// Scenarios that require an absent capability are skipped for this
+    /// fixture, never weakened.
+    pub fn declared_capabilities() -> &'static [&'static str] {
+        &[
+            "repository_read",
+            "branch_read",
+            "push_ref",
+            "change_request_create",
+            "change_request_read",
+            "change_request_update",
+            "comment_create",
+            "checks_read",
+            "review_findings_read",
+            "issue_read",
+        ]
+    }
+
     /// Test control: what the synthetic remote believes the change head is.
     pub fn set_head(&mut self, change_id: &str, head_object: &str) {
         self.changes
