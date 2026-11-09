@@ -1,0 +1,369 @@
+//! A second, independently implemented in-memory `ProcessControlPort`
+//! for the provider-parameterized Worker contract suite.
+//!
+//! `PosixProcessControl` proves the contract against real processes.
+//! `ScriptedProcessControl` replays a scripted process table —
+//! deterministic spawn outcomes, liveness reads, snapshot contents, and
+//! signal delivery — so the same suite scenarios run unchanged against a
+//! provider that can model outcomes no argv can produce (unknown
+//! identity capture, uninspectable liveness, snapshot failure).
+//!
+//! Artifact production is deliberately *not* scripted inside the port:
+//! a scripted "exit after write" performs real filesystem writes into
+//! the workspace `cwd`, so artifact presence is read back through the
+//! same path the supervisor uses for real workers.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use workloop_core::domain::ProcessIdentity;
+use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError};
+
+/// What the next `spawn` produces.
+#[derive(Debug, Clone)]
+pub enum SpawnPlan {
+    /// A writer that stays alive until a verified signal or `exit`.
+    Resident,
+    /// A writer that writes `artifacts` (`(name, content)`) into its
+    /// cwd at spawn, then exits with `exit_code`.
+    ExitAfterWrite {
+        artifacts: Vec<(String, String)>,
+        exit_code: i32,
+    },
+    /// Definitely no process exists — `SpawnError::Refused`.
+    Refused { reason: String },
+    /// Identity capture failed; the process may exist — in the model it
+    /// does (alive), matching a real spawn-then-crash.
+    Unknown { reason: String },
+}
+
+/// One recorded signal delivery — the suite's signal audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalRecord {
+    pub pid: Option<i32>,
+    pub pgid: Option<i32>,
+    pub signal: i32,
+}
+
+#[derive(Debug)]
+struct Proc {
+    started_at: String,
+    pgid: Option<i32>,
+    alive: bool,
+    exit_code: Option<i32>,
+    /// When set, `inspect` reports `Unknown` — an uninspectable process,
+    /// never silently dead.
+    inspect_unknown: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    next_pid: i32,
+    /// Process table: pid → modeled process. `reap` removes rows.
+    procs: BTreeMap<i32, Proc>,
+    /// Spawned leader identities, in spawn order.
+    spawned: Vec<ProcessIdentity>,
+    /// Every `spawn` call — including attempts that returned an error.
+    /// This is the suite's no-second-writer counter: an unknown start
+    /// outcome still consumed a start attempt.
+    spawn_calls: usize,
+    /// Queued outcomes consumed FIFO by `spawn`; the default applies
+    /// when the queue is empty.
+    plans: VecDeque<SpawnPlan>,
+    default_plan: Option<SpawnPlan>,
+    /// Write-capable descendants a leader may have (scripted tree for
+    /// `snapshot_descendants`).
+    children: BTreeMap<i32, Vec<i32>>,
+    /// Queued snapshot failures consumed FIFO.
+    snapshot_errors: VecDeque<String>,
+    /// Every accepted signal, in order — the write history a scenario
+    /// audits without pattern-matching internals.
+    signals: Vec<SignalRecord>,
+}
+
+/// An in-memory `ProcessControlPort`. Clone the handle to steer the
+/// model between supervisor passes; the port and the handle share one
+/// process table.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptedProcessControl {
+    state: Arc<Mutex<State>>,
+}
+
+impl ScriptedProcessControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue the outcome of the next `spawn`.
+    pub fn push_plan(&self, plan: SpawnPlan) {
+        self.state.lock().unwrap().plans.push_back(plan);
+    }
+
+    /// The outcome `spawn` produces when the queue is empty.
+    pub fn set_default_plan(&self, plan: SpawnPlan) {
+        self.state.lock().unwrap().default_plan = Some(plan);
+    }
+
+    /// Spawned leader identities in spawn order.
+    pub fn spawned(&self) -> Vec<ProcessIdentity> {
+        self.state.lock().unwrap().spawned.clone()
+    }
+
+    /// How many times `spawn` was invoked — the suite's
+    /// no-second-writer counter.
+    pub fn spawn_calls(&self) -> usize {
+        self.state.lock().unwrap().spawn_calls
+    }
+
+    /// Every recorded signal, in order.
+    pub fn signals(&self) -> Vec<SignalRecord> {
+        self.state.lock().unwrap().signals.clone()
+    }
+
+    /// Mark every tracked process stopped.
+    pub fn exit_all(&self, exit_code: i32) {
+        let mut s = self.state.lock().unwrap();
+        for p in s.procs.values_mut() {
+            p.alive = false;
+            p.exit_code = Some(exit_code);
+        }
+    }
+
+    /// Mark one process stopped.
+    pub fn exit(&self, pid: i32, exit_code: i32) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.alive = false;
+            p.exit_code = Some(exit_code);
+        }
+    }
+
+    /// Make `inspect` report `Unknown` for the pid until cleared — an
+    /// uninspectable writer that is neither proven alive nor dead.
+    pub fn set_inspect_unknown(&self, pid: i32, reason: Option<String>) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.inspect_unknown = reason;
+        }
+    }
+
+    /// Register a write-capable descendant of `leader` (e.g. a
+    /// setsid-escaped writer) so `snapshot_descendants` reports it.
+    pub fn adopt_child(&self, leader: i32) -> i32 {
+        let mut s = self.state.lock().unwrap();
+        let pid = s.next_pid;
+        s.next_pid += 1;
+        s.procs.insert(
+            pid,
+            Proc {
+                started_at: format!("scripted-lstart-{pid}"),
+                pgid: Some(pid), // escaped its leader's group
+                alive: true,
+                exit_code: None,
+                inspect_unknown: None,
+            },
+        );
+        s.children.entry(leader).or_default().push(pid);
+        pid
+    }
+
+    /// The next `snapshot_descendants` fails with this reason — an
+    /// incomplete process-table read that must not authorize signals.
+    pub fn fail_next_snapshot(&self, reason: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .snapshot_errors
+            .push_back(reason.to_string());
+    }
+}
+
+impl ProcessControlPort for ScriptedProcessControl {
+    fn spawn(&self, _argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+        let mut s = self.state.lock().unwrap();
+        s.spawn_calls += 1;
+        let plan = s
+            .plans
+            .pop_front()
+            .or_else(|| s.default_plan.clone())
+            .unwrap_or(SpawnPlan::Resident);
+        match plan {
+            SpawnPlan::Refused { reason } => Err(SpawnError::Refused { reason }),
+            SpawnPlan::Unknown { reason } => {
+                // The process exists in the model — a real spawn that
+                // crashed before identity capture leaves a live writer.
+                let pid = s.next_pid;
+                s.next_pid += 1;
+                let started_at = format!("scripted-lstart-{pid}");
+                s.procs.insert(
+                    pid,
+                    Proc {
+                        started_at: started_at.clone(),
+                        pgid: Some(pid),
+                        alive: true,
+                        exit_code: None,
+                        inspect_unknown: None,
+                    },
+                );
+                Err(SpawnError::Unknown { reason })
+            }
+            SpawnPlan::Resident | SpawnPlan::ExitAfterWrite { .. } => {
+                let pid = s.next_pid;
+                s.next_pid += 1;
+                let started_at = format!("scripted-lstart-{pid}");
+                let (alive, exit_code) = match &plan {
+                    SpawnPlan::Resident => (true, None),
+                    SpawnPlan::ExitAfterWrite {
+                        artifacts,
+                        exit_code,
+                    } => {
+                        // Real filesystem writes: the supervisor's
+                        // artifact read sees exactly what a real
+                        // worker's write would leave.
+                        for (name, content) in artifacts {
+                            let path: PathBuf = cwd.join(name);
+                            if let Some(parent) = path.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    SpawnError::Refused {
+                                        reason: format!("mkdir {parent:?}: {e}"),
+                                    }
+                                })?;
+                            }
+                            std::fs::write(&path, content).map_err(|e| SpawnError::Refused {
+                                reason: format!("write {path:?}: {e}"),
+                            })?;
+                        }
+                        (false, Some(*exit_code))
+                    }
+                    _ => unreachable!(),
+                };
+                let identity = ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: Some(pid),
+                };
+                s.procs.insert(
+                    pid,
+                    Proc {
+                        started_at: identity.started_at.clone(),
+                        pgid: identity.pgid,
+                        alive,
+                        exit_code,
+                        inspect_unknown: None,
+                    },
+                );
+                s.spawned.push(identity.clone());
+                Ok(identity)
+            }
+        }
+    }
+
+    fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
+        let s = self.state.lock().unwrap();
+        if let Some(reason) = s.snapshot_errors.front() {
+            let reason = reason.clone();
+            drop(s);
+            self.state.lock().unwrap().snapshot_errors.pop_front();
+            return Err(reason);
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![leader_pid];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(p) = s.procs.get(&pid) {
+                out.push(ProcessIdentity {
+                    pid,
+                    started_at: p.started_at.clone(),
+                    pgid: p.pgid,
+                });
+            }
+            if let Some(children) = s.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        Ok(out)
+    }
+
+    fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
+        let s = self.state.lock().unwrap();
+        let Some(p) = s.procs.get(&identity.pid) else {
+            // Absent from the process table is definitive.
+            return ProcessEvidence::Stopped {
+                identity: identity.clone(),
+                exit_code: None,
+            };
+        };
+        if let Some(reason) = &p.inspect_unknown {
+            // An incomplete liveness read is never a silent Stopped.
+            return ProcessEvidence::Unknown {
+                reason: reason.clone(),
+            };
+        }
+        if p.started_at != identity.started_at {
+            // Reused pid: the recorded process is gone.
+            return ProcessEvidence::Stopped {
+                identity: identity.clone(),
+                exit_code: None,
+            };
+        }
+        if p.alive {
+            ProcessEvidence::Alive {
+                identity: identity.clone(),
+            }
+        } else {
+            ProcessEvidence::Stopped {
+                identity: identity.clone(),
+                exit_code: p.exit_code,
+            }
+        }
+    }
+
+    fn signal_verified(&self, identity: &ProcessIdentity, signal: i32) -> SignalOutcome {
+        let mut s = self.state.lock().unwrap();
+        let Some(p) = s.procs.get_mut(&identity.pid) else {
+            return SignalOutcome::AlreadyGone;
+        };
+        if p.started_at != identity.started_at {
+            return SignalOutcome::SkippedStale;
+        }
+        if !p.alive {
+            return SignalOutcome::AlreadyGone;
+        }
+        p.alive = false;
+        s.signals.push(SignalRecord {
+            pid: Some(identity.pid),
+            pgid: None,
+            signal,
+        });
+        SignalOutcome::Sent
+    }
+
+    fn signal_group(&self, pgid: i32, signal: i32) -> SignalOutcome {
+        let mut s = self.state.lock().unwrap();
+        let mut hit = false;
+        for p in s.procs.values_mut() {
+            if p.pgid == Some(pgid) && p.alive {
+                p.alive = false;
+                hit = true;
+            }
+        }
+        if hit {
+            s.signals.push(SignalRecord {
+                pid: None,
+                pgid: Some(pgid),
+                signal,
+            });
+            SignalOutcome::Sent
+        } else {
+            SignalOutcome::AlreadyGone
+        }
+    }
+
+    fn reap(&self, pid: i32) {
+        self.state.lock().unwrap().procs.remove(&pid);
+    }
+}

@@ -630,6 +630,7 @@ dependencies = [
  "libc",
  "serde_json",
  "workloop-core",
+ "workloop-github",
  "workloop-store",
 ]
 
