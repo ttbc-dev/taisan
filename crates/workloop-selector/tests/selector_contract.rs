@@ -262,6 +262,29 @@ fn duplicates_collapse_and_conflicting_duplicates_are_refused() {
     assert_eq!(out.skipped[0].reason, SkipReason::ConflictingFacts);
 }
 
+/// A third fact matching an earlier one must not re-admit an Issue
+/// already recorded as conflicting — the conflict is a property of the
+/// snapshot read, not of pairwise comparison order.
+#[test]
+fn a_later_matching_fact_never_re_admits_a_conflicted_issue() {
+    let i = issue("repo-a", "i1");
+    let snapshot = SelectorSnapshot {
+        issues: vec![
+            fact(i.clone(), "r1", "d1", "t"),
+            fact(i.clone(), "r1", "d2", "t"),
+            fact(i.clone(), "r1", "d1", "t"),
+        ],
+        ..SelectorSnapshot::default()
+    };
+    let out = propose(&selector(), &snapshot, &policy(&["repo-a"]));
+    assert!(
+        out.proposals.is_empty(),
+        "a conflicted issue is ineligible no matter which later fact matches: {out:?}"
+    );
+    assert_eq!(out.skipped.len(), 1);
+    assert_eq!(out.skipped[0].reason, SkipReason::ConflictingFacts);
+}
+
 /// The proposal bound truncates deterministically: the lowest-sorted
 /// eligible issues win, and input order cannot change the cut.
 #[test]

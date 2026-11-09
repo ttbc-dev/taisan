@@ -188,6 +188,12 @@ pub fn propose(
     let mut facts: BTreeMap<&IssueRef, &IssueFact> = BTreeMap::new();
     let mut conflicts: BTreeSet<&IssueRef> = BTreeSet::new();
     for fact in &snapshot.issues {
+        // A recorded conflict is a property of the snapshot read, not of
+        // pairwise order: once two facts disagree on an identity, no
+        // later matching fact can re-admit it.
+        if conflicts.contains(&fact.issue) {
+            continue;
+        }
         match facts.get(&fact.issue) {
             None => {
                 facts.insert(&fact.issue, fact);

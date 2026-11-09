@@ -48,7 +48,7 @@ The suite parameterizes over two axes:
 | Row | Required semantics | Scenario / coverage |
 | --- | --- | --- |
 | WC-LIVE-01 | Uninspectable liveness is not death: the recorded writer keeps ownership, no replacement Invocation or spawn is attempted, and recovered liveness re-asserts the same running writer. | `unknown_liveness_is_not_death` (`ScriptedProvider`; skipped on `PosixProvider` — `liveness_unknown` not declared). |
-| WC-STOP-01 | A stop request/signal is not stop proof: the Execution reaches terminal `cancelled` only after every recorded writer is inspected stopped. | `cancel_waits_for_stop_proof` (both providers); descendant-snapshot coverage in the supervisor suite (`setsid_escapee_is_in_the_snapshot_and_signaled`, `orphan_writer`). |
+| WC-STOP-01 | A stop request/signal is not stop proof: the Execution reaches terminal `cancelled` only after every recorded writer is inspected stopped. | `cancel_waits_for_stop_proof` (both providers); descendant-snapshot coverage in the supervisor suite (`setsid_escapee_is_in_the_snapshot_and_signaled`, `setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit`). |
 
 ## Artifacts
 
