@@ -412,14 +412,37 @@ fn head_mismatch_aborts_the_write_and_surfaces_the_fresh_head() {
         ObservationFact::ChangeHead { change: c, head }
             if c.change_request.as_str() == "cr-1" && head.object == "sha-new"
     )));
+    // The exhausted transport account stops the writer before pausing:
+    // the Execution parks in `stopping` with a recorded `pause` desire
+    // until writer-stop proof settles it.
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
-    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
     assert!(
         e.pause_reason
             .as_deref()
             .unwrap_or("")
             .contains("transport")
     );
+    gh.emit(
+        &store,
+        &config(),
+        Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId("inv-head".into()),
+                process_identity: "1@1".into(),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
 }
 
 #[test]
@@ -661,15 +684,20 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
         },
         observed_unix_seconds: NOW,
     };
-    // First report queues the push intent; the outbox applies it and the
-    // next stage records the open intent.
+    // First report queues the push intent; the outbox applies it and its
+    // applied receipt records the open intent, which the same drain
+    // applies — the receipt alone advances the chain.
     gh.emit(&store, &config(), artifact_obs("art-1"), NOW)
         .unwrap();
     assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
     gh.apply_outbox(&store, &config(), NOW).unwrap();
-    assert_eq!(gh.applied().len(), 1, "one ref published");
-    // A repeat of the same fact under a new delivery id drives the next
-    // stage (open_change_request), never a second push.
+    assert_eq!(
+        gh.applied().len(),
+        2,
+        "the applied push receipt recorded and drained the open intent"
+    );
+    // A repeat of the same fact under a new delivery id is inert: no
+    // second push and no second open.
     gh.emit(&store, &config(), artifact_obs("art-2"), NOW)
         .unwrap();
     gh.apply_outbox(&store, &config(), NOW).unwrap();

@@ -719,7 +719,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 ExecutionState::Stopping => true,
                 ExecutionState::Uncertain => matches!(
                     execution.desired_action,
-                    Some(DesiredAction::Cancel) | Some(DesiredAction::Fail)
+                    Some(DesiredAction::Cancel)
+                        | Some(DesiredAction::Fail)
+                        | Some(DesiredAction::Pause)
                 ),
                 _ => false,
             };

@@ -1428,7 +1428,13 @@ fn decide_cancel(
             ))
         }
         ExecutionState::Uncertain => {
-            if execution.desired_action == Some(DesiredAction::Continue) {
+            if matches!(
+                execution.desired_action,
+                Some(DesiredAction::Cancel) | Some(DesiredAction::Fail)
+            ) {
+                // Desired fail/cancel already in progress: accepted no-op.
+                Ok(accept(vec![], work.version))
+            } else {
                 let mut next = execution.clone();
                 next.desired_action = Some(DesiredAction::Cancel);
                 Ok(accept(
@@ -1441,9 +1447,6 @@ fn decide_cancel(
                     ],
                     next_work.version,
                 ))
-            } else {
-                // Desired fail/cancel already in progress: accepted no-op.
-                Ok(accept(vec![], work.version))
             }
         }
         ExecutionState::Stopping => Ok(accept(vec![], work.version)),
@@ -2101,8 +2104,15 @@ pub fn admit_queued_role(
     Ok(Some(next))
 }
 
-/// Pause a queued Execution for a repairable hold, recording the typed
+/// Pause an Execution for a repairable hold, recording the typed
 /// prerequisites and the immutable recovery decision.
+///
+/// Writer safety comes first (lifecycle.md): a `queued` Execution holds
+/// no slot and no writer, so it pauses directly; an active Execution
+/// enters `stopping` with a recorded `pause` desired action and settles
+/// to `paused` only after writer-stop proof releases the slot. The pause
+/// reason and prerequisites are persisted on the row now so the settle
+/// lands on the recorded continuation.
 fn pause_for_repair(
     tx: &mut dyn TxView,
     execution: &Execution,
@@ -2111,18 +2121,46 @@ fn pause_for_repair(
     prerequisites: Vec<RepairPrerequisite>,
     now_unix_seconds: i64,
 ) -> Result<Option<Execution>, StoreError> {
-    let mut next = execution.clone();
-    next.state = ExecutionState::Paused;
-    next.pause_reason = Some(detail.to_string());
-    next.repair_prerequisites = prerequisites.clone();
-    next.paused_since_unix_seconds = Some(now_unix_seconds);
-    tx.apply(&Effect::UpdateExecution {
-        execution: next,
-        expected_state: ExecutionState::Queued,
-    })?;
-    tx.apply(&Effect::ClearDeferral {
-        execution_id: execution.id.clone(),
-    })?;
+    match execution.state {
+        ExecutionState::Queued => {
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some(detail.to_string());
+            next.repair_prerequisites = prerequisites.clone();
+            next.paused_since_unix_seconds = Some(now_unix_seconds);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: ExecutionState::Queued,
+            })?;
+            tx.apply(&Effect::ClearDeferral {
+                execution_id: execution.id.clone(),
+            })?;
+        }
+        ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting => {
+            let mut next = execution.clone();
+            next.state = ExecutionState::Stopping;
+            next.desired_action = Some(DesiredAction::Pause);
+            next.pause_reason = Some(detail.to_string());
+            next.repair_prerequisites = prerequisites.clone();
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state.clone(),
+            })?;
+        }
+        ExecutionState::Uncertain => {
+            let mut next = execution.clone();
+            next.desired_action = Some(DesiredAction::Pause);
+            next.pause_reason = Some(detail.to_string());
+            next.repair_prerequisites = prerequisites.clone();
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: ExecutionState::Uncertain,
+            })?;
+        }
+        // Stopping with another recorded desire, paused, and terminal
+        // states keep their recorded path.
+        _ => return Ok(None),
+    }
     let usage = tx
         .work_usage(&execution.work_id)?
         .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
@@ -2400,7 +2438,7 @@ fn assess(
                 let over = usage.transport_retries_used > work.policy.transport_max_retries;
                 tx.apply(&Effect::UpdateWorkUsage { usage })?;
                 if over {
-                    pause_waiting(
+                    pause_for_repair(
                         tx,
                         &execution,
                         "transport_exhausted",
@@ -2418,7 +2456,9 @@ fn assess(
                 || (execution.state == ExecutionState::Uncertain
                     && matches!(
                         execution.desired_action,
-                        Some(DesiredAction::Cancel) | Some(DesiredAction::Fail)
+                        Some(DesiredAction::Cancel)
+                            | Some(DesiredAction::Fail)
+                            | Some(DesiredAction::Pause)
                     ));
             if stop_pending {
                 let writers_unresolved = tx
@@ -2428,6 +2468,17 @@ fn assess(
                 if !writers_unresolved {
                     settle_after_writer_gone(tx, config, &execution, now_unix_seconds)?;
                 }
+            }
+            // A reconciled receipt is the only event that can advance the
+            // publish chain or free a bounded retry: `push_ref` applied
+            // unlocks `open_change_request`, and a failed receipt with
+            // transport retries left needs a re-issued intent. Re-read the
+            // Execution so a pause/settle recorded above is honored;
+            // `maybe_publish` re-checks every precondition itself.
+            if let Some(current) = tx.execution(&execution.id)?
+                && current.state == ExecutionState::Waiting
+            {
+                maybe_publish(tx, config, &current, now_unix_seconds)?;
             }
             Ok(())
         }
@@ -2445,7 +2496,7 @@ fn assess(
                         .all(|d| matches!(d.choice, FindingChoice::Accept | FindingChoice::Dismiss))
                 });
                 if !occurrences.is_empty() && !judged {
-                    pause_waiting(
+                    pause_for_repair(
                         tx,
                         &execution,
                         "review_findings",
@@ -2681,6 +2732,7 @@ fn assess_source_gate(
                     | ExecutionState::Ready
                     | ExecutionState::Running
                     | ExecutionState::Waiting
+                    | ExecutionState::Uncertain
             )
         {
             let (classification, detail, prereq) = match gate {
@@ -2695,33 +2747,14 @@ fn assess_source_gate(
                     RepairPrerequisite::SourceRead,
                 ),
             };
-            let mut next = execution.clone();
-            let expected = next.state.clone();
-            next.state = ExecutionState::Paused;
-            next.pause_reason = Some(detail.into());
-            next.repair_prerequisites = vec![prereq.clone()];
-            next.paused_since_unix_seconds = Some(now_unix_seconds);
-            tx.apply(&Effect::UpdateExecution {
-                execution: next,
-                expected_state: expected,
-            })?;
-            let usage = tx
-                .work_usage(work_id)?
-                .unwrap_or_else(|| WorkUsage::new(work_id));
-            let seq = tx.alloc_seq()?;
-            tx.apply(&Effect::InsertRecoveryDecision {
-                decision: RecoveryDecision {
-                    id: new_id("rd"),
-                    work_id: work_id.clone(),
-                    execution_id: Some(execution.id.clone()),
-                    classification: classification.into(),
-                    signature: None,
-                    prerequisites: vec![prereq],
-                    detail: detail.into(),
-                    usage_after: serde_json::to_value(&usage).unwrap_or_default(),
-                    seq,
-                },
-            })?;
+            pause_for_repair(
+                tx,
+                &execution,
+                classification,
+                detail,
+                vec![prereq],
+                now_unix_seconds,
+            )?;
         }
     }
     Ok(())
@@ -2867,111 +2900,52 @@ fn assess_check_failure(
         }
     }
     // Equivalent-failure signature: stage + stable criterion + category.
+    // The streak tracks ONE failure shape — the whole set of failing
+    // required checks. Signing each check separately would alternate the
+    // stored signature under multiple failures and never reach the limit.
     let spec = tx.spec(&work.id, Some(work.approved_spec))?;
     let Some(spec) = spec else { return Ok(()) };
-    for check_id in &spec.payload.required_checks {
-        if latest
-            .get(check_id.as_str())
-            .is_some_and(|(_, _, c)| c == &CheckConclusion::Failure)
-        {
-            let signature = format!("check:{check_id}:failure");
-            let mut usage = tx
-                .work_usage(&work.id)?
-                .unwrap_or_else(|| WorkUsage::new(&work.id));
-            if usage.equivalent_signature.as_deref() == Some(signature.as_str()) {
-                usage.equivalent_failure_streak += 1;
-            } else {
-                usage.equivalent_failure_streak = 1;
-                usage.equivalent_signature = Some(signature.clone());
-            }
-            let over = usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit;
-            tx.apply(&Effect::UpdateWorkUsage { usage })?;
-            if over
-                && matches!(
-                    execution.state,
-                    ExecutionState::Queued
-                        | ExecutionState::Ready
-                        | ExecutionState::Running
-                        | ExecutionState::Waiting
-                )
-            {
-                let mut next = execution.clone();
-                let expected = next.state.clone();
-                next.state = ExecutionState::Paused;
-                next.pause_reason = Some(format!(
-                    "equivalent failures for {check_id} reached the policy limit"
-                ));
-                next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
-                next.paused_since_unix_seconds = Some(now_unix_seconds);
-                tx.apply(&Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: expected,
-                })?;
-                let usage = tx
-                    .work_usage(&work.id)?
-                    .unwrap_or_else(|| WorkUsage::new(&work.id));
-                let seq = tx.alloc_seq()?;
-                tx.apply(&Effect::InsertRecoveryDecision {
-                    decision: RecoveryDecision {
-                        id: new_id("rd"),
-                        work_id: work.id.clone(),
-                        execution_id: Some(execution.id.clone()),
-                        classification: "equivalent_failure".into(),
-                        signature: Some(signature),
-                        prerequisites: vec![RepairPrerequisite::OperatorDecision],
-                        detail: format!(
-                            "equivalent failures for {check_id} reached the policy limit"
-                        ),
-                        usage_after: serde_json::to_value(&usage).unwrap_or_default(),
-                        seq,
-                    },
-                })?;
-            }
-        }
+    let mut failing: Vec<&str> = spec
+        .payload
+        .required_checks
+        .iter()
+        .map(|id| id.as_str())
+        .filter(|check_id| {
+            latest
+                .get(*check_id)
+                .is_some_and(|(_, _, c)| c == &CheckConclusion::Failure)
+        })
+        .collect();
+    failing.sort_unstable();
+    if failing.is_empty() {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// Pause a waiting Execution for repair: releases the compute slot but
-/// retains resource reservations (the writer's effects may still be
-/// outstanding).
-fn pause_waiting(
-    tx: &mut dyn TxView,
-    execution: &Execution,
-    classification: &str,
-    detail: &str,
-    prerequisites: Vec<RepairPrerequisite>,
-    now_unix_seconds: i64,
-) -> Result<(), StoreError> {
-    let mut next = execution.clone();
-    next.state = ExecutionState::Paused;
-    next.pause_reason = Some(detail.to_string());
-    next.repair_prerequisites = prerequisites.clone();
-    next.paused_since_unix_seconds = Some(now_unix_seconds);
-    tx.apply(&Effect::UpdateExecution {
-        execution: next,
-        expected_state: execution.state.clone(),
-    })?;
-    tx.apply(&Effect::ReleaseSlot {
-        execution_id: execution.id.clone(),
-    })?;
-    let usage = tx
-        .work_usage(&execution.work_id)?
-        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
-    let seq = tx.alloc_seq()?;
-    tx.apply(&Effect::InsertRecoveryDecision {
-        decision: RecoveryDecision {
-            id: new_id("rd"),
-            work_id: execution.work_id.clone(),
-            execution_id: Some(execution.id.clone()),
-            classification: classification.into(),
-            signature: None,
-            prerequisites,
-            detail: detail.into(),
-            usage_after: serde_json::to_value(&usage).unwrap_or_default(),
-            seq,
-        },
-    })?;
+    let signature = format!("checks:{}:failure", failing.join("+"));
+    let mut usage = tx
+        .work_usage(&work.id)?
+        .unwrap_or_else(|| WorkUsage::new(&work.id));
+    if usage.equivalent_signature.as_deref() == Some(signature.as_str()) {
+        usage.equivalent_failure_streak += 1;
+    } else {
+        usage.equivalent_failure_streak = 1;
+        usage.equivalent_signature = Some(signature.clone());
+    }
+    let over = usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit;
+    tx.apply(&Effect::UpdateWorkUsage { usage })?;
+    if over {
+        let detail = format!(
+            "equivalent failures for {} reached the policy limit",
+            failing.join(", ")
+        );
+        pause_for_repair(
+            tx,
+            execution,
+            "equivalent_failure",
+            &detail,
+            vec![RepairPrerequisite::OperatorDecision],
+            now_unix_seconds,
+        )?;
+    }
     Ok(())
 }
 
@@ -3137,6 +3111,20 @@ fn settle_after_writer_gone(
             next.state = ExecutionState::Paused;
             next.pause_reason = Some("recoverable_stop".into());
             next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(now_unix_seconds);
+            false
+        }
+        DesiredAction::Pause => {
+            // A repair pause recorded its reason and prerequisites when
+            // the Execution entered `stopping`; settle to `paused` now
+            // that writer safety is proven.
+            next.state = ExecutionState::Paused;
+            if next.pause_reason.is_none() {
+                next.pause_reason = Some("recoverable_stop".into());
+            }
+            if next.repair_prerequisites.is_empty() {
+                next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            }
             next.paused_since_unix_seconds = Some(now_unix_seconds);
             false
         }

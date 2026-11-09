@@ -3586,8 +3586,9 @@ fn source_gate_defers_admits_and_pauses_on_change() {
             Ok(())
         })
         .unwrap();
-    // A later read showing changed content pauses the Execution for
-    // repair — a live Execution never runs on a stale spec.
+    // A later read showing changed content stops the live writer for
+    // repair — a live Execution never runs on a stale spec, and the pause
+    // lands only after writer-stop proof (lifecycle.md).
     workloop_core::work::handle_observation(
         &store,
         &config_with_issue_read(),
@@ -3597,7 +3598,60 @@ fn source_gate_defers_admits_and_pauses_on_change() {
     .unwrap();
     store
         .transact(|tx| {
-            assert_eq!(tx.execution(&eid)?.unwrap().state, ExecutionState::Paused);
+            let e = tx.execution(&eid)?.unwrap();
+            assert_eq!(
+                e.state,
+                ExecutionState::Stopping,
+                "an active Execution stops the writer before pausing"
+            );
+            assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+            assert_eq!(
+                e.repair_prerequisites,
+                vec![RepairPrerequisite::SpecReapproval]
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Writer-stop proof settles the Execution to paused, releasing the
+    // slot while keeping the recorded continuation.
+    workloop_core::work::handle_observation(
+        &store,
+        &config_with_issue_read(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId("inv-gate".into()),
+                process_identity: "1@1".into(),
+                state: ProcessStateFact::Exited,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    store
+        .transact(|tx| {
+            let e = tx.execution(&eid)?.unwrap();
+            assert_eq!(e.state, ExecutionState::Paused);
+            assert_eq!(
+                e.repair_prerequisites,
+                vec![RepairPrerequisite::SpecReapproval]
+            );
+            assert!(
+                e.pause_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("source changed")),
+                "the recorded repair reason survives the settle"
+            );
+            assert!(e.paused_since_unix_seconds.is_some());
+            assert!(e.desired_action.is_none());
+            assert_eq!(
+                tx.slot_holders()?.len(),
+                0,
+                "the slot is released once writer safety is proven"
+            );
             Ok(())
         })
         .unwrap();
@@ -3693,5 +3747,185 @@ fn claimed_source_issue_rejects_the_overlap() {
             NOW,
         )
         .unwrap(),
+    );
+}
+
+/// Regression: the publish chain advances on the receipt alone — an
+/// applied `push_ref` receipt records the `open_change_request` intent
+/// without the supervisor re-emitting artifact or process evidence.
+#[test]
+fn an_applied_push_receipt_records_the_next_stage_intent() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("pc1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pc1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    // Evidence lands: the stage-1 push intent is recorded.
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    let push_id = store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let push = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+                .expect("stage-1 push intent recorded");
+            assert_eq!(push.status, HostActionStatus::Pending);
+            assert!(
+                !intents
+                    .iter()
+                    .any(|i| matches!(i.action, HostAction::OpenChangeRequest { .. })),
+                "no open intent before the push lands"
+            );
+            Ok(push.action_id.clone())
+        })
+        .unwrap();
+    // The applied receipt alone advances the chain to stage 2.
+    emit(ObservationFact::HostActionResult {
+        action_id: push_id,
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Applied,
+        effects: vec![NormalizedEffectFact::RefPublished {
+            repository: repo(),
+            branch: format!("work/{}", w.0),
+            produced: rev("artifact-digest"),
+            observed: rev("artifact-digest"),
+            relation: RefRelation::Equal,
+        }],
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let open = intents
+                .iter()
+                .find(|i| matches!(i.action, HostAction::OpenChangeRequest { .. }))
+                .expect("the receipt recorded the open intent");
+            assert_eq!(open.status, HostActionStatus::Pending);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Regression: the equivalent-failure streak signs the whole failing set.
+/// Two failing required checks must still reach the limit — signing each
+/// check separately would alternate the signature and never pause.
+#[test]
+fn equivalent_failures_pause_on_the_failing_set() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut c = config();
+    c.required_checks = vec!["ci".into(), "lint".into()];
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &c, &submit("ef1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.equivalent_failure_limit = 2;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "ef1-coding");
+    invocation.state = InvocationState::Done;
+    apply_effects(&store, &[Effect::InsertInvocation { invocation }]);
+    seed_change(&store, &w, "sha-1", NOW);
+    let check = |check_id: &str, producer: &str| ObservationFact::Check {
+        change: change(),
+        head: rev("sha-1"),
+        check_id: check_id.into(),
+        producer: HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted(producer),
+        },
+        conclusion: CheckConclusion::Failure,
+    };
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &c,
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(check("ci", "ci-agent"));
+    emit(check("lint", "ci-agent"));
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "one pass under the limit only counts the streak"
+    );
+    emit(check("ci", "ci-agent-2"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Stopping,
+        "the failing set recurring reaches the limit; the writer stops first"
+    );
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+    // Writer-stop proof settles the pause and releases the slot.
+    emit(ObservationFact::ProcessState {
+        invocation_id: InvocationId("ef1-coding".into()),
+        process_identity: "1@1".into(),
+        state: ProcessStateFact::Exited,
+    });
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.repair_prerequisites,
+        vec![RepairPrerequisite::OperatorDecision]
     );
 }

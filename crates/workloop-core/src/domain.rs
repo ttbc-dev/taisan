@@ -155,6 +155,10 @@ pub enum WaitingReason {
 #[serde(rename_all = "snake_case")]
 pub enum DesiredAction {
     Continue,
+    /// Stop the writer, then park the Execution `paused` for repair —
+    /// the recorded `repair_prerequisites` on the Execution carry the
+    /// continuation.
+    Pause,
     Cancel,
     Fail,
 }
