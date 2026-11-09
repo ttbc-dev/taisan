@@ -23,8 +23,10 @@ The suite parameterizes over two axes:
   argv can produce (a spawn whose identity capture was lost, an
   uninspectable process). Both sit behind the same `ProcessControlPort`
   and drive the same `Supervisor` passes; scenario assertions bind the
-  durable store only — invocations, executions, and host-action intents
-  — never provider internals.
+  durable store — invocations, executions, and host-action intents —
+  plus facts observable at the port boundary (spawn count, delivered
+  signals, recorded writer liveness), never provider internals beyond
+  what the port itself exposes.
 - **Declared model surface.** Each provider lists the outcomes it can
   express (`spawn_unknown`, `liveness_unknown`, `stop_signal`, …) and
   each scenario lists the surface it requires. A scenario runs only
@@ -42,7 +44,7 @@ The suite parameterizes over two axes:
 | --- | --- | --- |
 | WC-START-01 | A second delivery of the same durable request — the delivered-twice window where a consumer already recorded a writer identity for it — reconciles by request identity: the recorded writer is inspected and re-asserted running, one Invocation, no second spawn. | `duplicate_request_delivery_starts_no_second_writer` (both providers; the first leg spawns through the provider's own port so the recorded identity is real). |
 | WC-START-02 | A start whose outcome was lost (`SpawnError::Unknown`) leaves the writer uncertain — never a silent not-started that permits a replacement. The Invocation records no process identity and no second start is attempted. | `unknown_start_outcome_blocks_a_second_writer` (`ScriptedProvider`; skipped on `PosixProvider` — `spawn_unknown` not declared). |
-| WC-START-03 | A definitely-refused start (`SpawnError::Refused`) pauses the Execution and releases the slot; no writer exists. Refusal is distinct from uncertainty. | `refused_start_pauses_without_a_writer` (both providers). |
+| WC-START-03 | A definitely-refused start (`SpawnError::Refused`) pauses the Execution and produces no writer. Refusal is distinct from uncertainty. | `refused_start_pauses_without_a_writer` (both providers). |
 
 ## Liveness and stop
 
@@ -50,7 +52,7 @@ The suite parameterizes over two axes:
 | --- | --- | --- |
 | WC-LIVE-01 | Uninspectable liveness is not death: the recorded writer keeps ownership, no replacement Invocation or spawn is attempted, and recovered liveness re-asserts the same running writer. | `unknown_liveness_is_not_death` (`ScriptedProvider`; skipped on `PosixProvider` — `liveness_unknown` not declared). |
 | WC-STOP-01 | A cancel request is not terminal: while the recorded writer is provably alive the Execution sits in `stopping`, and it reaches `cancelled` only after every recorded writer is inspected stopped. | `cancel_waits_for_stop_proof` (both providers); descendant-snapshot coverage in the supervisor suite (`setsid_escapee_is_in_the_snapshot_and_signaled`, `setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit`). |
-| WC-STOP-02 | A delivered signal is not stop proof: while the writer's liveness read is unverifiable, settlement waits even though the signal landed; when verification recovers the signalled (dead) writer inspects stopped and the Execution settles. | `a_delivered_signal_is_not_stop_proof` (`ScriptedProvider`; skipped on `PosixProvider` — `liveness_unknown`/`signal_audit` not declared). |
+| WC-STOP-02 | A delivered signal is not stop proof: a writer that survived its signal keeps the Execution in `stopping`, a subsequent unverifiable liveness read still cannot settle, and the Execution reaches `cancelled` only after a signal the writer does not survive is inspected stopped. | `a_delivered_signal_is_not_stop_proof` (`ScriptedProvider`; skipped on `PosixProvider` — `signal_survived`/`liveness_unknown`/`signal_audit` not declared). |
 
 ## Artifacts
 

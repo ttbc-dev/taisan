@@ -55,6 +55,10 @@ struct Proc {
     /// When set, `inspect` reports `Unknown` — an uninspectable process,
     /// never silently dead.
     inspect_unknown: Option<String>,
+    /// When set, a delivered signal is recorded but the process keeps
+    /// writing — models the realizable gap between signal delivery and
+    /// the process actually dying.
+    survives_signal: bool,
 }
 
 #[derive(Debug, Default)]
@@ -148,6 +152,16 @@ impl ScriptedProcessControl {
         }
     }
 
+    /// Make the pid keep running after a delivered signal until
+    /// cleared — the signal is recorded (delivery is auditable) but
+    /// does not constitute stop proof.
+    pub fn set_survives_signal(&self, pid: i32, on: bool) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.survives_signal = on;
+        }
+    }
+
     /// Register a write-capable descendant of `leader` (e.g. a
     /// setsid-escaped writer) so `snapshot_descendants` reports it.
     pub fn adopt_child(&self, leader: i32) -> i32 {
@@ -162,6 +176,7 @@ impl ScriptedProcessControl {
                 alive: true,
                 exit_code: None,
                 inspect_unknown: None,
+                survives_signal: false,
             },
         );
         s.children.entry(leader).or_default().push(pid);
@@ -204,6 +219,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         alive: true,
                         exit_code: None,
                         inspect_unknown: None,
+                        survives_signal: false,
                     },
                 );
                 Err(SpawnError::Unknown { reason })
@@ -251,6 +267,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         alive,
                         exit_code,
                         inspect_unknown: None,
+                        survives_signal: false,
                     },
                 );
                 s.spawned.push(identity.clone());
@@ -343,13 +360,23 @@ impl ProcessControlPort for ScriptedProcessControl {
         let Some(p) = s.procs.get_mut(&identity.pid) else {
             return SignalOutcome::AlreadyGone;
         };
+        // Re-verification is impossible while the liveness read is
+        // unavailable — a conforming port fails the signal rather than
+        // signalling an unverified process.
+        if let Some(reason) = &p.inspect_unknown {
+            return SignalOutcome::Failed {
+                reason: reason.clone(),
+            };
+        }
         if p.started_at != identity.started_at {
             return SignalOutcome::SkippedStale;
         }
         if !p.alive {
             return SignalOutcome::AlreadyGone;
         }
-        p.alive = false;
+        if !p.survives_signal {
+            p.alive = false;
+        }
         s.signals.push(SignalRecord {
             pid: Some(identity.pid),
             pgid: None,
@@ -363,7 +390,9 @@ impl ProcessControlPort for ScriptedProcessControl {
         let mut hit = false;
         for p in s.procs.values_mut() {
             if p.pgid == Some(pgid) && p.alive {
-                p.alive = false;
+                if !p.survives_signal {
+                    p.alive = false;
+                }
                 hit = true;
             }
         }

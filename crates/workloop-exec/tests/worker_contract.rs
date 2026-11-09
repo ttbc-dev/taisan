@@ -13,9 +13,10 @@
 //!   outcomes no argv can produce (lost/unknown starts, uninspectable
 //!   liveness).
 //!
-//! Scenario assertions bind the durable store only: invocations,
-//! executions, and host-action intents. A completed scenario is a
-//! covered contract row.
+//! Scenario assertions bind the durable store plus facts observable at
+//! the port boundary — spawn count, delivered signals, recorded writer
+//! liveness — never provider internals beyond what the port itself
+//! exposes. A completed scenario is a covered contract row.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -272,6 +273,11 @@ trait WorkerHandle {
     /// Providers that cannot model this do not declare
     /// `liveness_unknown` and are skipped for the row.
     fn set_liveness_unknown(&mut self, on: bool);
+    /// Toggle whether the recorded writer survives a delivered signal —
+    /// the realizable gap between signal delivery and process death.
+    /// Providers that cannot model this do not declare
+    /// `signal_survived` and are skipped for the row.
+    fn set_survives_signal(&mut self, on: bool);
     /// The next start attempt reports the given failure class.
     fn fail_next_spawn(&mut self, f: SpawnFail);
     /// Spawn calls observed so far — the no-second-writer counter.
@@ -416,6 +422,9 @@ impl WorkerHandle for PosixProvider {
     fn set_liveness_unknown(&mut self, _on: bool) {
         unreachable!("PosixProvider does not declare liveness_unknown")
     }
+    fn set_survives_signal(&mut self, _on: bool) {
+        unreachable!("PosixProvider does not declare signal_survived")
+    }
     fn fail_next_spawn(&mut self, f: SpawnFail) {
         match f {
             // A spawn that can never produce a process: the binary does
@@ -478,6 +487,7 @@ impl WorkerProvider for ScriptedProvider {
             "stop_signal",
             "spawn_count",
             "signal_audit",
+            "signal_survived",
         ]
     }
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
@@ -543,6 +553,11 @@ impl WorkerHandle for ScriptedProvider {
         let leader = spawned.last().expect("a spawned writer").pid;
         self.port
             .set_inspect_unknown(leader, on.then(|| "process table read unavailable".into()));
+    }
+    fn set_survives_signal(&mut self, on: bool) {
+        let spawned = self.port.spawned();
+        let leader = spawned.last().expect("a spawned writer").pid;
+        self.port.set_survives_signal(leader, on);
     }
     fn fail_next_spawn(&mut self, f: SpawnFail) {
         self.port.push_plan(match f {
@@ -708,25 +723,40 @@ fn refused_start_pauses_without_a_writer(p: &mut dyn WorkerHandle, store: &Sqlit
 }
 
 /// WC-LIVE-01: uninspectable liveness is not death — the writer keeps
-/// ownership and no replacement is attempted.
+/// ownership, no replacement is attempted, and recovered liveness
+/// re-asserts the same recorded writer running.
 fn unknown_liveness_is_not_death(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (_w, eid) = submit_and_admit(store, &config(), "wc-live-1");
     p.consume(store);
     assert_eq!(p.spawns(), 1);
+    let recorded = invocations(store, &eid)[0]
+        .process_identity
+        .clone()
+        .expect("a recorded writer identity");
     p.set_liveness_unknown(true);
     p.poll(store);
-    let invocations = invocations(store, &eid);
-    assert_eq!(invocations.len(), 1, "no replacement Invocation");
+    let invs = invocations(store, &eid);
+    assert_eq!(invs.len(), 1, "no replacement Invocation");
     assert_ne!(
-        invocations[0].state,
+        invs[0].state,
         InvocationState::Done,
         "an uninspectable writer is never finished"
     );
     assert_eq!(p.spawns(), 1, "no replacement spawn while uncertain");
-    // Liveness recovers: the same recorded writer is reported running.
+    // Liveness recovers: the same recorded writer is re-asserted running.
     p.set_liveness_unknown(false);
     p.poll(store);
     assert_eq!(p.spawns(), 1);
+    assert_eq!(
+        invocations(store, &eid)[0].process_identity.as_ref(),
+        Some(&recorded),
+        "recovered liveness re-asserts the same writer identity"
+    );
+    assert_eq!(
+        execution(store, &eid).state,
+        ExecutionState::Running,
+        "the same writer is reported running again"
+    );
     p.exit_writers();
 }
 
@@ -755,30 +785,42 @@ fn cancel_waits_for_stop_proof(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     );
 }
 
-/// WC-STOP-02: a delivered signal is not stop proof — while the
-/// writer's state cannot be verified, settlement waits even though the
-/// signal landed.
+/// WC-STOP-02: a delivered signal is not stop proof — a writer that
+/// survived its signal keeps the Execution in `stopping`, and a stop
+/// that then becomes unverifiable still cannot settle, even though the
+/// signal audit shows delivery.
 fn a_delivered_signal_is_not_stop_proof(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (work_id, eid) = submit_and_admit(store, &config(), "wc-stop-2");
     p.consume(store);
     cancel(store, &work_id, "wc-stop-2-cancel");
-    // The signal is delivered behind the durable intent, but the
-    // writer's liveness read is unverifiable: the proof set can never
-    // confirm the stop.
-    p.set_liveness_unknown(true);
+    // The signal lands behind the durable intent, but the writer is
+    // still alive: proof is withheld, not settled.
+    p.set_survives_signal(true);
     p.drive_stops(store);
     assert!(
         p.signals_sent() > 0,
         "the stop signal was actually delivered"
     );
+    assert!(p.writer_alive(), "the writer survived the delivered signal");
+    assert_eq!(
+        execution(store, &eid).state,
+        ExecutionState::Stopping,
+        "a delivered signal on a live writer is not proof"
+    );
+    // The liveness read then becomes unverifiable: still no settlement —
+    // delivered signals plus an Unknown read are not proof either.
+    p.set_liveness_unknown(true);
+    p.drive_stops(store);
     assert_ne!(
         execution(store, &eid).state,
         ExecutionState::Cancelled,
-        "an unverifiable stop never settles — a delivered signal is not proof"
+        "an unverifiable stop never settles — delivered signals are not proof"
     );
-    // Verification recovers: the signalled (now dead) writer inspects
-    // stopped and the Execution settles.
+    // Verification and the kill path recover: the writer inspects
+    // stopped only after a signal it does not survive, and the
+    // Execution settles.
     p.set_liveness_unknown(false);
+    p.set_survives_signal(false);
     drive_until(p, store, "cancelled", || {
         execution(store, &eid).state == ExecutionState::Cancelled
     });
@@ -1054,6 +1096,7 @@ fn scenarios() -> Vec<WcScenario> {
             requires: &[
                 "resident_writer",
                 "stop_signal",
+                "signal_survived",
                 "liveness_unknown",
                 "signal_audit",
             ],
