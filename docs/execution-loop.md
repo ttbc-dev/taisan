@@ -86,6 +86,10 @@ Queries use the same envelope with `status` ∈ `accepted | error` (`unknown` ca
 | 5 | unavailable | declared source unreachable where the operation requires it |
 | 6 | unknown | mutation fate undetermined; `reason` names the unresolved identity |
 
+Two combinations sit across the table's boundaries deliberately: a `source_unavailable` **rejection** keeps `status: "rejected"` (the refusal is recorded) but exits `5` — the failure class wins over the rejection class so a caller can distinguish an unavailable declared source from a domain refusal without scraping prose. A Query refused by policy (`Forbidden`) is `status: "error"` with `reason.code: forbidden` at exit `1` — a refusal, distinct from an unreadable store.
+
+The `run` driver's envelope is its terminal result: a bounded run (`--ticks N`) emits exactly one envelope when it finishes — kind `run`, carrying the final work-list. Per-pass progress is a stderr diagnostic line. An unbounded run produces no result until it ends, so stdout carries nothing until then; a consumer must not read it as a stream of per-tick envelopes.
+
 Process exit zero alone never proves a Command was accepted or Work completed — the structured `status` and command identity are authoritative. Diagnostics never corrupt stdout: stderr carries human prose only.
 
 ### Identities and preconditions for mutation
