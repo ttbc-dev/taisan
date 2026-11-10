@@ -1,6 +1,6 @@
 //! Fixture host adapter: records `HostActionIntent` outbox rows and emits
-//! synthetic `change_head`/`host_action_result` Observations under test
-//! control.
+//! synthetic `issue`/`change_head`/`host_action_result` Observations
+//! under test control.
 //!
 //! The adapter never mutates Execution state itself — every fact goes
 //! through `work::handle_observation` so the outbox row, the head
@@ -9,10 +9,12 @@
 
 use std::collections::BTreeMap;
 
-use workloop_core::domain::WorkId;
-use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
+use workloop_core::domain::{ExecutionId, WorkId};
+use workloop_core::identity::{
+    ChangeRequestId, ChangeRequestRef, CommitRevision, IssueRef, SourceSnapshot,
+};
 use workloop_core::observation::{
-    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -27,9 +29,21 @@ pub struct FixtureGithub {
     changes: BTreeMap<String, String>,
     /// `branch` → current head object id.
     branches: BTreeMap<String, String>,
+    /// `issue` (display form `repo/issue`) → the synthetic remote's
+    /// current authoritative read. A declared source with no row is an
+    /// unavailable read — the host cannot answer it.
+    issues: BTreeMap<String, IssueRead>,
     next_number: u64,
     /// The write history, for test assertions.
     applied: Vec<String>,
+}
+
+/// What the synthetic remote reports for one source issue read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRead {
+    pub source_revision: String,
+    pub content_digest: String,
+    pub state: IssueState,
 }
 
 /// What one source-refresh pass read: head movements ingested, heads
@@ -63,6 +77,27 @@ impl FixtureGithub {
     pub fn set_head(&mut self, change_id: &str, head_object: &str) {
         self.changes
             .insert(change_id.to_string(), head_object.to_string());
+    }
+
+    /// Test control: the authoritative read the synthetic remote returns
+    /// for one source issue. `IssueState::Unavailable` models a read the
+    /// host cannot complete; removing the row models the same thing, so
+    /// an unplanted declared source reads as unavailable.
+    pub fn set_issue(
+        &mut self,
+        issue: &IssueRef,
+        source_revision: &str,
+        content_digest: &str,
+        state: IssueState,
+    ) {
+        self.issues.insert(
+            issue.to_string(),
+            IssueRead {
+                source_revision: source_revision.to_string(),
+                content_digest: content_digest.to_string(),
+                state,
+            },
+        );
     }
 
     pub fn applied(&self) -> &[String] {
@@ -194,13 +229,14 @@ impl FixtureGithub {
         Ok(report)
     }
 
-    /// Phase 1 (read-only source refresh): re-read every change head
-    /// this fixture knows for in-scope Works and ingest a `change_head`
-    /// Observation only when the synthetic remote head differs from the
-    /// store's latest recorded head for that change. The read-compare
-    /// makes the pass idempotent — a restart re-entering phase order
-    /// observes no movement and ingests nothing — and a deadline stops
-    /// the read before it starts the next source.
+    /// Phase 1 (read-only source refresh): re-read every declared issue
+    /// source for in-scope Works and every change head this fixture
+    /// knows, ingesting an Observation only when the fresh read differs
+    /// from the store's latest recorded fact. The read-compare makes the
+    /// pass idempotent — a restart re-entering phase order observes no
+    /// movement and ingests nothing — and a deadline stops the read
+    /// before it starts the next source. Reads never mutate the
+    /// synthetic remote and never touch a source no Work declared.
     pub fn refresh_sources(
         &self,
         store: &impl Store,
@@ -211,6 +247,52 @@ impl FixtureGithub {
     ) -> Result<SourceRefreshReport, StoreError> {
         let now = clock();
         let mut report = SourceRefreshReport::default();
+        // Authoritative reads of the declared issue sources feed the
+        // source gate: a matching read unblocks admission, a changed or
+        // closed source and an unreadable one both hold dispatch. Only
+        // declared sources are ever read — broader remote activity is
+        // never ingested as a substitute.
+        for (work_id, execution_id, source) in declared_sources(store, scope)? {
+            let key = source.issue.to_string();
+            if let Some(d) = deadline {
+                let tick_now = clock();
+                if tick_now >= d {
+                    report.deferred.push(key);
+                    continue;
+                }
+            }
+            let (revision, digest, state) = match self.issues.get(&key) {
+                Some(read) => (
+                    read.source_revision.clone(),
+                    read.content_digest.clone(),
+                    read.state.clone(),
+                ),
+                None => (String::new(), String::new(), IssueState::Unavailable),
+            };
+            let latest = latest_recorded_issue(store, &work_id, &source.issue)?;
+            if latest.as_ref() == Some(&(revision.clone(), digest.clone(), state.clone())) {
+                report.unchanged += 1;
+                continue;
+            }
+            self.emit(
+                store,
+                config,
+                Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id),
+                    subject_execution_id: Some(execution_id),
+                    fact: ObservationFact::Issue {
+                        issue: source.issue,
+                        source_revision: revision,
+                        content_digest: digest,
+                        state,
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
+            report.ingested += 1;
+        }
         // Attribute each known change to the Work that recorded an
         // intent carrying it; an unattributable change is never read
         // into this installation's facts.
@@ -499,6 +581,73 @@ impl FixtureGithub {
         }
         Ok(true)
     }
+}
+
+/// The spec-declared issue sources of in-scope Works that still have an
+/// active Execution — the exact set phase 1 owes an authoritative read,
+/// paired with the Execution the read's Observation binds to.
+fn declared_sources(
+    store: &impl Store,
+    scope: Option<&WorkId>,
+) -> Result<Vec<(WorkId, ExecutionId, SourceSnapshot)>, StoreError> {
+    store.transact(|tx| {
+        let mut out = Vec::new();
+        for work in tx.works()? {
+            if let Some(w) = scope
+                && work.id != *w
+            {
+                continue;
+            }
+            let Some(execution) = tx.active_execution(&work.id)? else {
+                continue;
+            };
+            let Some(spec) = tx.spec(&work.id, Some(work.approved_spec))? else {
+                continue;
+            };
+            for source in &spec.payload.sources {
+                out.push((work.id.clone(), execution.id.clone(), source.clone()));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// The latest recorded `issue` read for one declared source, ordered by
+/// observed time then row order — the same "latest wins" rule the
+/// source gate uses.
+fn latest_recorded_issue(
+    store: &impl Store,
+    work_id: &WorkId,
+    issue: &IssueRef,
+) -> Result<Option<(String, String, IssueState)>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::Issue {
+                issue: i,
+                source_revision,
+                content_digest,
+                state,
+            } = &o.fact
+                && i == issue
+            {
+                Some((
+                    o.observed_unix_seconds,
+                    index,
+                    (
+                        source_revision.clone(),
+                        content_digest.clone(),
+                        state.clone(),
+                    ),
+                ))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(t, i, _)| (*t, *i))
+        .map(|(_, _, v)| v))
 }
 
 /// The latest recorded `change_head` for one change, ordered by

@@ -10,7 +10,9 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
-use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
+use workloop_core::work::{
+    HostTemplate, WorkloopConfig, admit_queued, dispatch_once, handle_command,
+};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
@@ -101,6 +103,94 @@ fn admit(store: &SqliteStore, execution_id: &ExecutionId) {
         .unwrap();
 }
 
+fn issue(number: u64) -> IssueRef {
+    IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted(format!("issue-{number}")),
+        display_number: Some(number),
+    }
+}
+
+fn source(number: u64, revision: &str, digest: &str) -> SourceSnapshot {
+    SourceSnapshot {
+        issue: issue(number),
+        source_revision: revision.into(),
+        content_digest: digest.into(),
+    }
+}
+
+fn config_with_issue_read() -> WorkloopConfig {
+    let mut c = config();
+    c.declared_capabilities.insert(HostCapability::IssueRead);
+    c
+}
+
+fn submit_with_sources(
+    store: &SqliteStore,
+    key: &str,
+    sources: Vec<SourceSnapshot>,
+) -> (WorkId, ExecutionId) {
+    let d = handle_command(
+        store,
+        &config_with_issue_read(),
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: key.into(),
+            body: CommandBody::Submit {
+                intent: format!("intent-{key}"),
+                sources,
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let CommandDecision::Accepted {
+        work_id,
+        effect: CommandEffect::WorkCreated { execution_id },
+        ..
+    } = d
+    else {
+        panic!("submit {key}: {d:?}")
+    };
+    (work_id.unwrap(), execution_id)
+}
+
+fn gate_of(store: &SqliteStore, work_id: &WorkId) -> SourceGate {
+    store
+        .transact(|tx| Ok(tx.work(work_id)?.unwrap().source_gate))
+        .unwrap()
+}
+
+fn execution_of(store: &SqliteStore, execution_id: &ExecutionId) -> Execution {
+    store
+        .transact(|tx| tx.execution(execution_id))
+        .unwrap()
+        .unwrap()
+}
+
+fn issue_observations(store: &SqliteStore, work_id: &WorkId) -> Vec<(String, String, IssueState)> {
+    store
+        .transact(|tx| tx.observations_for_work(work_id))
+        .unwrap()
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::Issue {
+                source_revision,
+                content_digest,
+                state,
+                ..
+            } => Some((source_revision, content_digest, state)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
     store
         .transact(|tx| {
@@ -184,6 +274,181 @@ fn refresh_ingests_a_moved_head_once_and_a_matching_head_is_a_noop() {
     assert_eq!(again.ingested, 0);
     assert_eq!(again.unchanged, 2, "both known changes match their records");
     assert_eq!(change_head_observations(&store, &w1).len(), 2);
+}
+
+/// A declared source with no authoritative read yet defers admission;
+/// the first matching read flips the gate and dispatch proceeds — the
+/// whole "submit → refresh → admit" wiring in one pass.
+#[test]
+fn a_matching_source_read_unblocks_dispatch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = submit_with_sources(&store, "k-src", vec![source(9, "rev-1", "d-1")]);
+    assert_eq!(gate_of(&store, &w), SourceGate::NeedsCheck);
+    // NeedsCheck: dispatch owes a source read and records the deferral.
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    assert_eq!(execution_of(&store, &e).state, ExecutionState::Queued);
+
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+    let report = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    assert_eq!(gate_of(&store, &w), SourceGate::Matches);
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    assert_eq!(
+        execution_of(&store, &e).state,
+        ExecutionState::Ready,
+        "the matched source read unblocks admission"
+    );
+}
+
+/// A changed read holds dispatch: the queued Execution pauses for
+/// reapproval instead of being admitted on a stale spec.
+#[test]
+fn a_changed_source_read_holds_dispatch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = submit_with_sources(&store, "k-changed", vec![source(9, "rev-1", "d-1")]);
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-2", "d-2", IssueState::Open);
+    let report = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    assert_eq!(gate_of(&store, &w), SourceGate::Changed);
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    let execution = execution_of(&store, &e);
+    assert_eq!(
+        execution.state,
+        ExecutionState::Paused,
+        "a changed source holds the queued Execution for repair, never admits it"
+    );
+    assert_eq!(
+        execution.repair_prerequisites,
+        vec![RepairPrerequisite::SpecReapproval]
+    );
+}
+
+/// A read the host cannot complete is `unavailable`, never "unchanged":
+/// the queued Execution holds for a fresh matching read.
+#[test]
+fn an_unavailable_source_read_holds_dispatch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = submit_with_sources(&store, "k-unavail", vec![source(9, "rev-1", "d-1")]);
+    // No fixture row for the declared issue: the remote cannot answer.
+    let gh = FixtureGithub::new();
+    let report = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.ingested, 1, "the failed read is recorded");
+    assert_eq!(
+        issue_observations(&store, &w).last(),
+        Some(&("".to_string(), "".to_string(), IssueState::Unavailable)),
+        "unavailable is a recorded read, not an absence"
+    );
+    assert_eq!(gate_of(&store, &w), SourceGate::Unavailable);
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    let execution = execution_of(&store, &e);
+    assert_eq!(execution.state, ExecutionState::Paused);
+    assert_eq!(
+        execution.repair_prerequisites,
+        vec![RepairPrerequisite::SourceRead]
+    );
+}
+
+/// A closed source is a changed source: the snapshot it was approved
+/// under no longer describes the remote.
+#[test]
+fn a_closed_source_counts_as_changed() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = submit_with_sources(&store, "k-closed", vec![source(9, "rev-1", "d-1")]);
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-1", "d-1", IssueState::Closed);
+    gh.refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(gate_of(&store, &w), SourceGate::Changed);
+    assert_eq!(execution_of(&store, &e).state, ExecutionState::Paused);
+}
+
+/// The read-compare makes refresh idempotent: a re-read that matches the
+/// recorded fact ingests nothing, so a restart re-entering phase order
+/// is a no-op.
+#[test]
+fn an_identical_source_reread_is_a_noop() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) = submit_with_sources(&store, "k-idem", vec![source(9, "rev-1", "d-1")]);
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+    gh.refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    let again = gh
+        .refresh_sources(&store, &config(), &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(again.ingested, 0);
+    assert_eq!(again.unchanged, 1);
+    assert_eq!(
+        issue_observations(&store, &w).len(),
+        1,
+        "one recorded read, not one per pass"
+    );
+}
+
+/// Reads are scoped and deadline-bounded exactly like head reads.
+#[test]
+fn source_reads_are_scoped_and_deadline_bounded() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let (w1, _e1) = submit_with_sources(&store, "k-s1", vec![source(9, "rev-1", "d-1")]);
+    let (w2, _e2) = submit_with_sources(&store, "k-s2", vec![source(10, "rev-a", "d-a")]);
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+    gh.set_issue(&issue(10), "rev-a", "d-a", IssueState::Open);
+
+    let scoped = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, Some(&w1))
+        .unwrap();
+    assert_eq!(scoped.ingested, 1);
+    assert_eq!(gate_of(&store, &w1), SourceGate::Matches);
+    assert_eq!(
+        gate_of(&store, &w2),
+        SourceGate::NeedsCheck,
+        "the out-of-scope Work's source was never read"
+    );
+
+    let late = gh
+        .refresh_sources(&store, &config(), &mut || NOW, Some(NOW), None)
+        .unwrap();
+    assert_eq!(late.ingested, 0);
+    assert_eq!(
+        late.deferred,
+        vec![issue(9).to_string(), issue(10).to_string()],
+        "both unread sources wait for the next pass, in order"
+    );
+}
+
+/// Only declared sources are read — remote activity nothing declared
+/// is never ingested (R234).
+#[test]
+fn undeclared_remote_activity_is_never_ingested() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) = submit_with_sources(&store, "k-decl", vec![source(9, "rev-1", "d-1")]);
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+    // A source no Work declares: it must not be read into this
+    // installation's facts.
+    gh.set_issue(&issue(99), "rev-x", "d-x", IssueState::Open);
+    let report = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.ingested, 1, "only the declared source was read");
+    assert_eq!(issue_observations(&store, &w).len(), 1);
 }
 
 #[test]

@@ -27,7 +27,10 @@ use workloop_core::store::{Effect, Store, StoreError};
 pub struct PosixProcessControl;
 
 fn ps_output(args: &[&str]) -> std::io::Result<String> {
-    let out = Command::new("ps").args(args).output()?;
+    // The row/lstart parsers below are written for the C locale's ctime
+    // format; a localized `ps` renders different field text (e.g. a CJK
+    // weekday), which must not read back as an incomplete table row.
+    let out = Command::new("ps").args(args).env("LC_ALL", "C").output()?;
     checked_ps_output(out, args.contains(&"-p"))
 }
 

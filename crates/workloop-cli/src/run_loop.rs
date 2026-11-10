@@ -606,7 +606,7 @@ mod tests {
     use workloop_core::command::*;
     use workloop_core::domain::*;
     use workloop_core::identity::*;
-    use workloop_core::observation::HostActionStatus;
+    use workloop_core::observation::{HostActionStatus, IssueState};
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
 
@@ -696,6 +696,113 @@ mod tests {
 
     fn execution(store: &SqliteStore, id: &ExecutionId) -> Execution {
         store.transact(|tx| tx.execution(id)).unwrap().unwrap()
+    }
+
+    fn issue(number: u64) -> IssueRef {
+        IssueRef {
+            repository: config().host.repository.clone(),
+            issue: IssueId::trusted(format!("issue-{number}")),
+            display_number: Some(number),
+        }
+    }
+
+    fn source(number: u64, revision: &str, digest: &str) -> SourceSnapshot {
+        SourceSnapshot {
+            issue: issue(number),
+            source_revision: revision.into(),
+            content_digest: digest.into(),
+        }
+    }
+
+    fn config_with_issue_read() -> WorkloopConfig {
+        let mut c = config();
+        c.declared_capabilities.insert(HostCapability::IssueRead);
+        c
+    }
+
+    fn submit_with_sources(
+        store: &SqliteStore,
+        key: &str,
+        sources: Vec<SourceSnapshot>,
+    ) -> (WorkId, ExecutionId) {
+        let d = handle_command(
+            store,
+            &config_with_issue_read(),
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Submit {
+                    intent: format!("intent-{key}"),
+                    sources,
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        let CommandDecision::Accepted {
+            work_id,
+            effect: CommandEffect::WorkCreated { execution_id },
+            ..
+        } = d
+        else {
+            panic!("submit {key}: {d:?}")
+        };
+        (work_id.unwrap(), execution_id)
+    }
+
+    fn fixture_bin() -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/workloop-fixture-worker")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("workloop-run-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn supervisor(mode: &str, root: std::path::PathBuf) -> Supervisor<PosixProcessControl> {
+        Supervisor::new(
+            PosixProcessControl,
+            root,
+            vec![fixture_bin(), mode.to_string()],
+            config(),
+        )
+    }
+
+    /// One pass whose host adapter and (optional) supervisor are the
+    /// caller's, so a test can steer source reads and inject crash
+    /// boundaries between passes.
+    fn run_supervised(
+        store: &SqliteStore,
+        settings: &PassSettings,
+        host: &mut FixtureGithub,
+        supervisor: Option<&Supervisor<PosixProcessControl>>,
+        clock: &mut dyn FnMut() -> i64,
+    ) -> TickReport {
+        run_pass(
+            &mut Pass {
+                store,
+                config: &config(),
+                settings,
+                supervisor,
+                host,
+                state_root: std::path::Path::new("."),
+            },
+            None,
+            clock,
+            &|| false,
+        )
     }
 
     fn run(
@@ -1023,6 +1130,191 @@ mod tests {
         assert!(!report.deadline_exceeded);
         assert_eq!(report.abort_reason(), None);
         assert_eq!(report.schema_version, "1");
+    }
+
+    /// A source read that moved between the ready commit and the launch
+    /// holds the durable request: refresh reports the change, the
+    /// Execution holds for reapproval, and the recorded request's
+    /// Invocation is abandoned without ever spawning a writer.
+    #[test]
+    fn a_source_change_between_ready_and_spawn_never_launches_a_writer() {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (w, e) = submit_with_sources(&store, "k-hold", vec![source(9, "rev-1", "d-1")]);
+        let settings = settings();
+        let root = tmp_root("hold");
+        let mut host = FixtureGithub::new();
+        host.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+
+        // Pass 1 — matching read admits: queued→ready, capacity and the
+        // durable request committed. No supervisor this pass: the driver
+        // ends here, as a crash between the ready commit and the launch
+        // would leave it.
+        let sup = supervisor("hang", root.clone());
+        run_supervised(&store, &settings, &mut host, None, &mut || NOW);
+        assert_eq!(execution(&store, &e).state, ExecutionState::Ready);
+
+        // The source moved under the approved spec; the next pass reads it.
+        host.set_issue(&issue(9), "rev-2", "d-2", IssueState::Open);
+        run_supervised(&store, &settings, &mut host, Some(&sup), &mut || NOW);
+
+        let execution = execution(&store, &e);
+        assert_eq!(
+            execution.state,
+            ExecutionState::Paused,
+            "the hold settles after the unlaunched request is abandoned"
+        );
+        assert_eq!(
+            execution.repair_prerequisites,
+            vec![RepairPrerequisite::SpecReapproval]
+        );
+        let work = store.transact(|tx| tx.work(&w)).unwrap().unwrap();
+        assert_eq!(work.source_gate, SourceGate::Changed);
+        let invocations = store
+            .transact(|tx| tx.invocations_for_execution(&e))
+            .unwrap();
+        assert_eq!(invocations.len(), 1, "one recorded Invocation, never two");
+        assert_eq!(invocations[0].state, InvocationState::Abandoned);
+        assert!(
+            invocations[0].process_identity.is_none(),
+            "no writer ever existed for the held request"
+        );
+        assert_eq!(
+            execution.invocations_used, 1,
+            "the charged admission survives — no budget reset"
+        );
+        assert!(
+            store.transact(|tx| tx.slot_holders()).unwrap().is_empty(),
+            "the slot is released once no writer can exist"
+        );
+    }
+
+    /// A crash after the queued→ready commit replays the durable request
+    /// exactly once on the next pass: the supervisor reconciles the
+    /// recorded request and launches a single writer.
+    #[test]
+    fn a_request_persisted_before_a_crash_launches_once_on_restart() {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (w, e) = submit_with_sources(&store, "k-replay", vec![source(9, "rev-1", "d-1")]);
+        let settings = settings();
+        let root = tmp_root("replay");
+        let mut host = FixtureGithub::new();
+        host.set_issue(&issue(9), "rev-1", "d-1", IssueState::Open);
+
+        // Pass 1 without supervision commits ready + request.
+        run_supervised(&store, &settings, &mut host, None, &mut || NOW);
+        assert_eq!(execution(&store, &e).state, ExecutionState::Ready);
+        assert_eq!(
+            store.transact(|tx| tx.pending_requests()).unwrap().len(),
+            1,
+            "the durable request survives the crash"
+        );
+
+        // Restart: a new supervisor replays the request log and launches
+        // exactly one writer for it.
+        let sup = supervisor("clean-exit", root.clone());
+        run_supervised(&store, &settings, &mut host, Some(&sup), &mut || NOW + 1);
+        let invocations = store
+            .transact(|tx| tx.invocations_for_execution(&e))
+            .unwrap();
+        assert_eq!(invocations.len(), 1, "one Invocation per request");
+        assert!(
+            invocations[0].process_identity.is_some(),
+            "the replayed request produced exactly one writer"
+        );
+        let execution = execution(&store, &e);
+        assert_eq!(execution.invocations_used, 1);
+        assert!(execution.started_seq.is_some());
+        let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+        assert_eq!(
+            usage.first_dispatch_unix_seconds,
+            Some(NOW),
+            "the budget anchor is the first dispatch, never re-armed by restart"
+        );
+        assert!(
+            store
+                .transact(|tx| tx.pending_requests())
+                .unwrap()
+                .is_empty(),
+            "the consumed request never launches twice"
+        );
+    }
+
+    /// A crash between Invocation persist and spawn leaves the start
+    /// unprovable: the next pass reports the process state unknown, the
+    /// Execution stays owned and uncertain, and no second writer is
+    /// launched — restart after restart.
+    #[test]
+    fn a_spawn_with_no_recorded_identity_recovers_uncertain_without_a_second_writer() {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (_w, e) = submit(&store, "k-nearspawn");
+        let settings = settings();
+        let root = tmp_root("nearspawn");
+        let mut host = FixtureGithub::new();
+
+        // Pass 1 commits ready + request; the "crash" then consumes the
+        // request and persists a prepared Invocation without ever
+        // reaching the spawn.
+        run_supervised(&store, &settings, &mut host, None, &mut || NOW);
+        let request = store
+            .transact(|tx| {
+                Ok(tx
+                    .pending_requests()?
+                    .into_iter()
+                    .next()
+                    .expect("one request"))
+            })
+            .unwrap();
+        store
+            .transact(|tx| {
+                let inv_id = tx.alloc_id("inv")?;
+                tx.apply(&Effect::InsertInvocation {
+                    invocation: Invocation {
+                        id: InvocationId(inv_id),
+                        request_id: request.request_id.clone(),
+                        execution_id: e.clone(),
+                        role: InvocationRole::Coding,
+                        state: InvocationState::Prepared,
+                        process_identity: None,
+                        required_artifacts: vec![],
+                        evidence_refs: vec![],
+                    },
+                })?;
+                tx.apply(&Effect::MarkRequestConsumed {
+                    request_id: request.request_id.clone(),
+                })?;
+                Ok(())
+            })
+            .unwrap();
+
+        let sup = supervisor("hang", root.clone());
+        run_supervised(&store, &settings, &mut host, Some(&sup), &mut || NOW + 1);
+        let after = execution(&store, &e);
+        assert_eq!(
+            after.state,
+            ExecutionState::Uncertain,
+            "an unprovable start is uncertainty, never assumed death or success"
+        );
+        let invocations = store
+            .transact(|tx| tx.invocations_for_execution(&e))
+            .unwrap();
+        assert_eq!(
+            invocations.len(),
+            1,
+            "no second writer while the start is unproven"
+        );
+        assert!(invocations[0].process_identity.is_none());
+        assert_eq!(after.invocations_used, 1);
+
+        // Another restart cannot resurrect or duplicate the writer.
+        run_supervised(&store, &settings, &mut host, Some(&sup), &mut || NOW + 2);
+        assert_eq!(execution(&store, &e).state, ExecutionState::Uncertain);
+        assert_eq!(
+            store
+                .transact(|tx| tx.invocations_for_execution(&e))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
