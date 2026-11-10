@@ -12,7 +12,8 @@ use workloop_core::identity::{
     AdapterId, HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef,
 };
 use workloop_selector::{
-    IssueFact, IssueState, Proposal, SelectionPolicy, SelectorSnapshot, SkipReason, propose,
+    IssueFact, IssueState, Proposal, SelectionPolicy, SelectorSnapshot, SkipReason, SkippedIssue,
+    propose,
 };
 
 fn host() -> HostInstanceId {
@@ -286,7 +287,9 @@ fn a_later_matching_fact_never_re_admits_a_conflicted_issue() {
 }
 
 /// The proposal bound truncates deterministically: the lowest-sorted
-/// eligible issues win, and input order cannot change the cut.
+/// eligible issues win, input order cannot change the cut, and every
+/// eligible issue past the bound is reported as skipped — distinguishable
+/// by typed reason from an issue absent from the snapshot.
 #[test]
 fn the_bound_truncates_deterministically() {
     let snapshot = SelectorSnapshot {
@@ -294,6 +297,7 @@ fn the_bound_truncates_deterministically() {
             fact(issue("repo-a", "i3"), "r", "d", "c"),
             fact(issue("repo-a", "i1"), "r", "d", "a"),
             fact(issue("repo-a", "i2"), "r", "d", "b"),
+            fact(issue("repo-x", "i7"), "r", "d", "out of scope"),
         ],
         ..SelectorSnapshot::default()
     };
@@ -305,6 +309,26 @@ fn the_bound_truncates_deterministically() {
         proposed,
         vec![&issue("repo-a", "i1"), &issue("repo-a", "i2")],
         "the bound keeps the sorted head, not the input head"
+    );
+    assert_eq!(
+        out.skipped,
+        vec![
+            SkippedIssue {
+                issue: issue("repo-a", "i3"),
+                reason: SkipReason::TruncatedByBound,
+            },
+            SkippedIssue {
+                issue: issue("repo-x", "i7"),
+                reason: SkipReason::NotAllowlisted,
+            },
+        ],
+        "a bound-dropped eligible issue is typed data, not silence, and \
+         keeps its reason distinct from a policy refusal"
+    );
+    assert_eq!(
+        out.proposals.len() + out.skipped.len(),
+        4,
+        "every distinct snapshot issue accounts for exactly one outcome"
     );
 }
 

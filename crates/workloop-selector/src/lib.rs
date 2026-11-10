@@ -156,6 +156,10 @@ pub enum SkipReason {
     /// Two snapshot facts claim the same Issue identity with different
     /// content — an inconsistent read, never silently picked between.
     ConflictingFacts,
+    /// The Issue was eligible, but the run's `max_proposals` bound cut
+    /// it from this run's output — truncation is explicit data, never
+    /// indistinguishable from absence from the snapshot.
+    TruncatedByBound,
 }
 
 /// One snapshot fact that produced no proposal, with its reason.
@@ -175,6 +179,9 @@ pub struct ProposalSet {
 
 /// Run the reference selector: one proposal per eligible Issue, in
 /// deterministic `IssueRef` order, bounded by `policy.max_proposals`.
+/// Eligible Issues past the bound are reported in `skipped` with
+/// `SkipReason::TruncatedByBound` — a truncated run never passes
+/// silently for "the snapshot held nothing more".
 ///
 /// Pure and total — no store, clock, or I/O; an empty or all-refused
 /// snapshot yields an empty `proposals`, never an error.
@@ -232,15 +239,23 @@ pub fn propose(
             None => eligible.push(fact),
         }
     }
-    skipped.sort_by(|a, b| a.issue.cmp(&b.issue));
 
     // Deterministic order (facts are BTreeMap-ordered by IssueRef) and
-    // a deterministic bound: truncation never reshuffles.
-    let proposals = eligible
-        .into_iter()
-        .take(policy.max_proposals)
-        .map(|fact| proposal(selector, fact, snapshot, policy))
-        .collect();
+    // a deterministic bound: truncation never reshuffles, and every
+    // eligible Issue past the bound is reported in `skipped` — a
+    // consumer can always tell a bound-dropped Issue from an absent one.
+    let mut proposals = Vec::with_capacity(eligible.len().min(policy.max_proposals));
+    for (index, fact) in eligible.into_iter().enumerate() {
+        if index < policy.max_proposals {
+            proposals.push(proposal(selector, fact, snapshot, policy));
+        } else {
+            skipped.push(SkippedIssue {
+                issue: fact.issue.clone(),
+                reason: SkipReason::TruncatedByBound,
+            });
+        }
+    }
+    skipped.sort_by(|a, b| a.issue.cmp(&b.issue));
     ProposalSet { proposals, skipped }
 }
 
