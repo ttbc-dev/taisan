@@ -250,16 +250,21 @@ fn resubmitting_the_same_proposal_replays_the_saved_decision() {
 
 /// A selector-driven submission claiming a source Issue already owned
 /// by live Work gets Core's existing overlap rejection — the proposal
-/// path cannot bypass admission.
+/// path cannot bypass admission. There is no dedicated overlap code:
+/// Core answers with `RejectionCode::Ineligible` and an evidence
+/// string that names the owning Work.
 #[test]
 fn a_proposal_for_a_claimed_issue_is_rejected_as_overlap() {
     let store = SqliteStore::in_memory(1).unwrap();
     let claimed = issue("9");
     let manual = manual_submit("m-1", &claimed, "rev-1", "digest-1");
-    match handle_command(&store, &config(), &manual, NOW).unwrap() {
-        CommandDecision::Accepted { .. } => {}
+    let owner = match handle_command(&store, &config(), &manual, NOW).unwrap() {
+        CommandDecision::Accepted {
+            work_id: Some(work_id),
+            ..
+        } => work_id,
         other => panic!("manual submit should accept: {other:?}"),
-    }
+    };
 
     let proposal = one_proposal(
         fact(claimed, "rev-1", "digest-1", "second owner"),
@@ -273,8 +278,22 @@ fn a_proposal_for_a_claimed_issue_is_rejected_as_overlap() {
     )
     .unwrap();
     match decision {
-        CommandDecision::Rejected { reason, .. } => {
+        CommandDecision::Rejected {
+            reason,
+            current_work_id,
+            evidence,
+            ..
+        } => {
             assert_eq!(reason, RejectionCode::Ineligible);
+            assert_eq!(
+                current_work_id.as_ref(),
+                Some(&owner),
+                "the rejection points at the owning Work"
+            );
+            assert!(
+                evidence.iter().any(|e| e.contains(&owner.0)),
+                "the evidence names the owning Work: {evidence:?}"
+            );
         }
         other => panic!("overlap must be rejected, not accepted: {other:?}"),
     }

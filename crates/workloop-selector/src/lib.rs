@@ -86,7 +86,12 @@ pub struct SelectionPolicy {
     /// Repositories the selector may propose from. Facts outside the
     /// allowlist are refused — never quietly absorbed.
     pub allowlist: BTreeSet<RepositoryRef>,
-    /// Issues excluded from selection regardless of eligibility.
+    /// Issues excluded from selection regardless of eligibility. An
+    /// entry matches a fact by issue identity or — for `repo:number`
+    /// entries whose number the adapter does not use as its opaque
+    /// IssueId — by the repository-scoped display number. Display
+    /// numbers still take no part in identity comparison; this is a
+    /// policy filter over identity, not a change to identity.
     pub excluded: BTreeSet<IssueRef>,
     /// Bound on emitted proposals per run.
     pub max_proposals: usize,
@@ -225,7 +230,7 @@ pub fn propose(
     for (issue, fact) in &facts {
         let reason = if !policy.allowlist.contains(&issue.repository) {
             Some(SkipReason::NotAllowlisted)
-        } else if policy.excluded.contains(*issue) {
+        } else if excluded(&policy.excluded, issue) {
             Some(SkipReason::Excluded)
         } else if fact.state != IssueState::Open {
             Some(SkipReason::NotOpen)
@@ -256,6 +261,24 @@ pub fn propose(
         skipped,
         truncated,
     }
+}
+
+/// Whether policy excludes this fact's issue. An entry matches by
+/// issue identity, or — when both sides carry a display number in the
+/// same repository — by that display number: a `repo:number` policy
+/// entry names the number an operator sees, which an adapter may not
+/// use as its opaque IssueId. Display numbers never enter identity
+/// comparison; this is a policy filter, and it never matches two
+/// facts to one entry across repositories or on absent metadata.
+fn excluded(excluded: &BTreeSet<IssueRef>, issue: &IssueRef) -> bool {
+    excluded.contains(issue)
+        || excluded.iter().any(|entry| {
+            entry.repository == issue.repository
+                && matches!(
+                    (entry.display_number, issue.display_number),
+                    (Some(a), Some(b)) if a == b
+                )
+        })
 }
 
 fn proposal(

@@ -235,6 +235,53 @@ fn proposals_are_admitted_through_the_normal_submit_path() {
     assert_eq!(recovered["result"]["command_id"], command_id);
 }
 
+/// A configured `repo:number` exclusion holds even when the adapter's
+/// opaque IssueId is not that number: the fact is skipped as
+/// `excluded`, never proposed, while other eligible work still
+/// admits through the normal path.
+#[test]
+fn excluded_entries_match_by_display_number_for_opaque_issue_ids() {
+    let root = root("propose-excluded-display");
+    configure(
+        &root,
+        serde_json::json!({
+            "adapter": "issue-scan",
+            "allowlist": ["ops"],
+            "excluded": ["ops:9"],
+        }),
+    );
+    let opaque = serde_json::json!({
+        "issue": {
+            "repository": {"host": "host-local", "repository": "ops"},
+            "issue": "I_kwDOPaqeNumber",
+            "display_number": 9,
+        },
+        "state": "open",
+        "revision": "r9",
+        "content_digest": "d9",
+        "title": "Excluded by display number",
+    });
+    let snapshot = write_snapshot(
+        &root,
+        "snapshot.json",
+        serde_json::json!([opaque, issue("ops", 10, "open", "Kept")]),
+    );
+    let result = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = result["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1, "{result}");
+    assert_eq!(proposals[0]["status"], "accepted", "{result}");
+    let skipped = result["result"]["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{result}");
+    assert_eq!(skipped[0]["reason"], "excluded", "{result}");
+    assert_eq!(
+        skipped[0]["issue"], "host-local/ops/I_kwDOPaqeNumber",
+        "{result}"
+    );
+}
+
 #[test]
 fn a_missing_selector_section_blocks_nothing_else() {
     let root = root("propose-none");
@@ -306,6 +353,16 @@ fn an_unparseable_selector_section_is_refused_at_the_propose_boundary() {
         serde_json::json!({"adapter": "issue-scan", "allowlist": "ops"}),
         serde_json::json!({"adapter": "issue-scan", "policy_revision": -1}),
         serde_json::json!("not an object"),
+        // Unknown keys are refused, never defaulted past: a misspelled
+        // `allowlist` must surface as the bounded config error instead
+        // of silently degrading to an accepted zero-proposal run, and
+        // a typo beside valid fields must not be ignored either.
+        serde_json::json!({"adapter": "issue-scan", "alowlist": ["ops"]}),
+        serde_json::json!({
+            "adapter": "issue-scan",
+            "allowlist": ["ops"],
+            "max_proposalsx": 5
+        }),
     ] {
         configure(&root, selector);
         // Loading the installation never fails on the selector
@@ -576,6 +633,30 @@ fn switching_admission_configuration_preserves_existing_work() {
         .map(|i| (i["work_id"].as_str().unwrap(), i["phase"].as_str().unwrap()))
         .collect();
     assert!(phases.contains(&(existing.as_str(), "queued")));
+
+    // Outcome semantics survive the switch too: cancelling the
+    // pre-existing Work stores its terminal Outcome, and the later
+    // switch back to manual-only neither rewrites nor drops it.
+    let version = items
+        .iter()
+        .find(|i| i["work_id"].as_str() == Some(existing.as_str()))
+        .and_then(|i| i["version"].as_u64())
+        .expect("the pre-existing Work is listed");
+    run_at(
+        &root,
+        &[
+            "cancel",
+            "--work",
+            &existing,
+            "--expected-version",
+            &version.to_string(),
+        ],
+    );
+    let after_cancel = run_at(&root, &["work-list"]);
+    let cancelled = work_item(&after_cancel, &existing);
+    assert_eq!(cancelled["phase"], "stopped");
+    assert_eq!(cancelled["outcome"]["state"], "cancelled");
+
     // Switching back to manual-only admission is equally inert.
     configure(&root, serde_json::Value::Null);
     run_at(
@@ -588,11 +669,27 @@ fn switching_admission_configuration_preserves_existing_work() {
             "k-e2",
         ],
     );
+    let list = run_at(&root, &["work-list"]);
+    let items = list["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    let cancelled = work_item(&list, &existing);
     assert_eq!(
-        run_at(&root, &["work-list"])["result"]["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
+        cancelled["outcome"]["state"], "cancelled",
+        "the Outcome recorded under one admission path survives the switch"
     );
+    let queued = items.iter().filter(|i| i["phase"] == "queued").count();
+    assert_eq!(
+        queued, 2,
+        "the selector Work and the new manual Work share the queue"
+    );
+}
+
+/// One `work-list` item by Work id.
+fn work_item<'a>(list: &'a serde_json::Value, work_id: &str) -> &'a serde_json::Value {
+    list["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["work_id"].as_str() == Some(work_id))
+        .unwrap_or_else(|| panic!("Work {work_id} is listed: {list}"))
 }

@@ -219,6 +219,62 @@ fn excluded_issue_is_refused() {
     assert_eq!(out.skipped[0].reason, SkipReason::Excluded);
 }
 
+/// A `repo:number` exclusion entry also matches by the
+/// repository-scoped display number, so a configured exclusion holds
+/// when the adapter's opaque IssueId is not that number — and only
+/// that fact: a different number in the same repository, and the same
+/// number in another repository, are never swept in.
+#[test]
+fn excluded_entry_matches_a_fact_by_display_number() {
+    let mut entry = issue("repo-a", "137");
+    entry.display_number = Some(137);
+    let mut policy = policy(&["repo-a", "repo-b"]);
+    policy.excluded.insert(entry);
+
+    let opaque = IssueRef {
+        repository: repo("repo-a"),
+        issue: IssueId::trusted("I_kwDOOpaqueId"),
+        display_number: Some(137),
+    };
+    let other_number = IssueRef {
+        repository: repo("repo-a"),
+        issue: IssueId::trusted("I_kwDOOtherId"),
+        display_number: Some(138),
+    };
+    // Same display number, different repository: the exclusion is
+    // repository-scoped, so this fact stays eligible.
+    let other_repo = IssueRef {
+        repository: repo("repo-b"),
+        issue: IssueId::trusted("I_kwDOOpaqueId"),
+        display_number: Some(137),
+    };
+    let snapshot = SelectorSnapshot {
+        issues: vec![
+            fact(opaque.clone(), "r1", "d1", "skip me"),
+            fact(other_number, "r2", "d2", "keep"),
+            fact(other_repo, "r3", "d3", "keep — other repository"),
+        ],
+        ..SelectorSnapshot::default()
+    };
+    let out = propose(&selector(), &snapshot, &policy);
+    assert_eq!(
+        out.skipped,
+        vec![workloop_selector::SkippedIssue {
+            issue: opaque,
+            reason: SkipReason::Excluded,
+        }],
+        "only the display-number match in repo-a is excluded"
+    );
+    assert_eq!(
+        out.proposals
+            .iter()
+            .map(|p| p.sources[0].issue.issue.as_str())
+            .collect::<Vec<_>>(),
+        ["I_kwDOOtherId", "I_kwDOOpaqueId"],
+        "the same display number in repo-b is still proposed"
+    );
+}
+
 /// A closed issue is not proposed.
 #[test]
 fn closed_issue_is_not_proposed() {

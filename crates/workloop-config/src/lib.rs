@@ -79,11 +79,16 @@ pub struct Installation {
 /// The selector binding for alternate admission. Presence selects the
 /// alternate path. The section is deserialized from the installation
 /// file's raw JSON inside `selection_policy` — a structurally malformed
-/// block (missing or mistyped field, non-array list, out-of-range
-/// number) is a bounded config error for a selector run only, never a
-/// load failure that could block manual submission. Identity values are
-/// validated at the same boundary.
+/// block (missing or mistyped field, unknown key, non-array list,
+/// out-of-range number) is a bounded config error for a selector run
+/// only, never a load failure that could block manual submission.
+/// Identity values are validated at the same boundary. Unknown keys are
+/// refused rather than defaulted: a misspelled key must surface as the
+/// bounded error, never silently degrade the policy (an ignored
+/// `allowlist` typo would otherwise yield an accepted zero-proposal
+/// run).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectorSection {
     /// Selector adapter identity stamped on every proposal.
     pub adapter: String,
@@ -95,7 +100,10 @@ pub struct SelectorSection {
     #[serde(default)]
     pub allowlist: Vec<String>,
     /// Issues excluded from selection regardless of eligibility, in
-    /// `repo:number` form like `submit --issue`.
+    /// `repo:number` form like `submit --issue`. The number matches a
+    /// fact's opaque IssueId or its repository-scoped display number,
+    /// so an exclusion holds even when the adapter's IssueId is not
+    /// the decimal number.
     #[serde(default)]
     pub excluded: Vec<String>,
     /// Bound on emitted proposals per selector run.
@@ -510,6 +518,10 @@ impl Installation {
             let display_number: u64 = number
                 .parse()
                 .map_err(|_| format!("installation selector.excluded[{entry}]: bad number"))?;
+            // The entry carries the configured number as both the
+            // opaque id and the display number: the selector matches
+            // either, so an exclusion holds for adapters whose
+            // IssueId is not the decimal number.
             excluded.insert(IssueRef {
                 repository: RepositoryRef::new(
                     host.clone(),
