@@ -27,7 +27,10 @@ use workloop_core::store::{Effect, Store, StoreError};
 pub struct PosixProcessControl;
 
 fn ps_output(args: &[&str]) -> std::io::Result<String> {
-    let out = Command::new("ps").args(args).output()?;
+    // The row/lstart parsers below are written for the C locale's ctime
+    // format; a localized `ps` renders different field text (e.g. a CJK
+    // weekday), which must not read back as an incomplete table row.
+    let out = Command::new("ps").args(args).env("LC_ALL", "C").output()?;
     checked_ps_output(out, args.contains(&"-p"))
 }
 
@@ -94,6 +97,27 @@ fn stat_of(pid: i32) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+impl PosixProcessControl {
+    /// Capture a reuse-resistant identity for an existing process —
+    /// the caller's own pid when claiming the run lease. Returns an
+    /// error when the identity cannot be verified; a lease is never
+    /// claimed under an unverifiable owner record.
+    pub fn identity_of(pid: i32) -> Result<ProcessIdentity, String> {
+        match lstart_of(pid) {
+            LstartLookup::Present(started_at) => {
+                let pgid = unsafe { libc::getpgid(pid) };
+                Ok(ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: if pgid > 0 { Some(pgid) } else { None },
+                })
+            }
+            LstartLookup::Absent => Err(format!("pid {pid} is not in the process table")),
+            LstartLookup::Failed(reason) => Err(reason),
+        }
     }
 }
 
@@ -356,6 +380,14 @@ pub enum StopRecord {
     Unknown { reason: String },
 }
 
+/// The tick deadline, as every supervision item loop sees it: read the
+/// clock only when a deadline is actually set, and stop before starting
+/// the next item once it has been reached. `None` means unbounded — the
+/// clock is never consulted.
+fn deadline_reached(clock: &mut dyn FnMut() -> i64, deadline: Option<i64>) -> bool {
+    deadline.is_some_and(|d| clock() >= d)
+}
+
 /// Result of proving an exited writer's whole recorded tree is stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum TreeProof {
@@ -431,16 +463,57 @@ impl<P: ProcessControlPort> Supervisor<P> {
     }
 
     /// One supervisor pass: consume approved requests, inspect live
-    /// invocations, drive stop intents, and run one recovery attempt for
-    /// each Execution waiting on artifact recovery. Reconciles by scanning
+    /// invocations, drive stop intents and artifact handoffs, and run
+    /// one recovery attempt for each Execution waiting on artifact
+    /// recovery. Reconciles by scanning
     /// the store — a wakeup is an at-least-once signal, not evidence.
     pub fn run_once(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
-        self.consume_requests(store, now_unix_seconds)?;
-        self.poll_invocations(store, now_unix_seconds)?;
-        self.drive_stops(store, now_unix_seconds)?;
-        self.drive_handoffs(store)?;
-        self.run_recovery(store, now_unix_seconds)?;
-        Ok(())
+        self.run_once_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// One supervisor pass restricted to one Work for a diagnostic
+    /// `--work` pass: nothing outside the scope is launched, polled,
+    /// stopped, handed off or recovered.
+    ///
+    /// Every item loop inside checks `deadline` before starting a new
+    /// item, and the pass checks it between the loops — a pass that runs
+    /// out of tick budget stops instead of launching, polling or
+    /// signalling past the deadline; the untouched items are durable and
+    /// wait for the next pass. `Ok(true)` means the deadline stopped the
+    /// pass before it exhausted its work.
+    pub fn run_once_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<bool, ExecError> {
+        self.consume_requests_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.poll_invocations_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.drive_stops_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.drive_handoffs_scoped(store, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
+        self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        Ok(deadline_reached(clock, deadline))
     }
 
     /// Durable artifact handoff: resume every incomplete row (the
@@ -450,6 +523,21 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// after confirmed exit and stop proof — the point at which a
     /// finished Invocation becomes `Done`.
     pub fn drive_handoffs(&self, store: &impl Store) -> Result<(), ExecError> {
+        // The clock is never consulted: no deadline is set.
+        self.drive_handoffs_scoped(store, None, &mut || 0, None)
+    }
+
+    /// `drive_handoffs` restricted to one Work for a diagnostic `--work`
+    /// pass: rows and Executions outside the scope are left alone, and
+    /// the deadline is checked before each item so a pass out of tick
+    /// budget drives nothing further — the remaining rows stay durable.
+    pub fn drive_handoffs_scoped(
+        &self,
+        store: &impl Store,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
         let Some(layout) = &self.handoff else {
             return Ok(());
         };
@@ -457,11 +545,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // Rows already in flight resume first: a crash mid-export leaves
         // the row to advance from its last committed stage.
         for row in store.transact(|tx| tx.incomplete_handoffs())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             let Some(invocation) =
                 store.transact(|tx| tx.invocation_for_request(&row.request_id))?
             else {
                 continue;
             };
+            if let Some(work_id) = scope {
+                let in_scope = store
+                    .transact(|tx| tx.execution(&invocation.execution_id))?
+                    .is_some_and(|e| e.work_id == *work_id);
+                if !in_scope {
+                    continue;
+                }
+            }
             if let Some((seed, bound)) = self.handoff_seed(store, &invocation)? {
                 seeds.push((row.artifact_id.clone(), seed, bound));
             }
@@ -469,6 +568,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // Done invocations on nonterminal executions may need a row.
         // A non-git workspace keeps the file-artifact path untouched.
         for execution in store.transact(|tx| tx.nonterminal_executions())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
             if !self.workspace_of(&execution.work_id).join(".git").exists() {
                 continue;
             }
@@ -502,6 +609,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
         for (artifact_id, seed, bound) in seeds {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
@@ -572,7 +682,36 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        self.consume_requests_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+    }
+
+    /// Replay the durable request log for one scope only: a scoped pass
+    /// never launches another Work's Invocation. The deadline is checked
+    /// before each request starts, so a pass that runs out of tick budget
+    /// launches nothing further — the remaining requests stay durable.
+    pub fn consume_requests_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
         for request in store.transact(|tx| tx.pending_requests())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && request.work_id != *work_id
+            {
+                continue;
+            }
             self.reconcile_or_start(store, &request, now_unix_seconds)?;
         }
         Ok(())
@@ -774,8 +913,42 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        self.poll_invocations_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+    }
+
+    /// Inspect live invocations for one scope only. The deadline is
+    /// checked before each invocation is inspected: a poll that runs out
+    /// of tick budget stops with the rest untouched for the next pass.
+    pub fn poll_invocations_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
         let unresolved = store.transact(|tx| tx.unresolved_invocations())?;
         for invocation in unresolved {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope {
+                let belongs = store.transact(|tx| {
+                    Ok::<_, StoreError>(
+                        tx.execution(&invocation.execution_id)?
+                            .is_some_and(|e| &e.work_id == work_id),
+                    )
+                })?;
+                if !belongs {
+                    continue;
+                }
+            }
             let Some(identity) = invocation.process_identity.clone() else {
                 // Prepared but never identified: a crash near spawn left no
                 // provable answer — report unknown; `work` keeps the
@@ -1122,8 +1295,37 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// durable-intent → signal → inspect loop. A `requested` stop is never
     /// proof; only inspecting every recorded identity settles the state.
     pub fn drive_stops(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
+        self.drive_stops_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+    }
+
+    /// Drive stop intents for one scope only. The deadline is checked
+    /// before each Execution's stop is driven: signalling is new work,
+    /// so a pass out of tick budget leaves the remaining Executions for
+    /// the next pass.
+    pub fn drive_stops_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
             let wants_stop = match execution.state {
                 ExecutionState::Stopping => true,
                 ExecutionState::Uncertain => matches!(
@@ -1420,13 +1622,37 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// One bounded recovery attempt per waiting Execution per pass. Each
     /// attempt is durable; exhaustion is decided by `work`'s sweep against
     /// the stored bound, not by this loop.
-    pub fn run_recovery(
+    pub fn run_recovery(&self, store: &impl Store, now_unix_seconds: i64) -> Result<(), ExecError> {
+        self.run_recovery_scoped(
+            store,
+            now_unix_seconds,
+            None,
+            &mut || now_unix_seconds,
+            None,
+        )
+    }
+
+    /// Run one artifact-recovery attempt for one scope only. The
+    /// deadline is checked before each recovery attempt starts — an
+    /// attempt is new work, so a pass out of tick budget starts none.
+    pub fn run_recovery_scoped(
         &self,
         store: &impl Store,
         _now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
     ) -> Result<(), ExecError> {
         let executions = store.transact(|tx| tx.nonterminal_executions())?;
         for execution in executions {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
             if execution.state != ExecutionState::Waiting
                 || execution.waiting_reason != Some(WaitingReason::ArtifactRecovery)
             {

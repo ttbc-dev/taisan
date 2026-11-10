@@ -120,6 +120,17 @@ pub enum Effect {
     InsertRecoveryDecision {
         decision: RecoveryDecision,
     },
+    /// Schedules a durable recovery intent in the deciding transaction.
+    InsertRecoveryIntent {
+        intent: RecoveryIntent,
+    },
+    /// Moves one recovery intent through its closed lifecycle. The store
+    /// enforces the row exists; Core decides the transition.
+    UpdateRecoveryIntent {
+        intent_id: String,
+        state: RecoveryIntentState,
+        retirement_reason: Option<String>,
+    },
     /// Why a queued Execution was deferred at dispatch; surfaced by the
     /// `capacity` Query.
     RecordDeferral {
@@ -234,6 +245,34 @@ pub struct Deferral {
     pub reason: String,
     pub diagnostic: String,
     pub since_seq: EventSequence,
+}
+
+/// Closed lifecycle of a durable recovery intent. A restart cannot
+/// resurrect a `retired` intent or re-fire a `consumed` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryIntentState {
+    Pending,
+    Consumed,
+    Retired,
+}
+
+/// A durable recovery intent persisted in the deciding transaction:
+/// `(kind, due_at, generation, evidence_basis)` under one Work, fired at
+/// most once by the recovery-scheduling phase, retired with a reason
+/// when terminal evidence invalidates it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryIntent {
+    pub intent_id: String,
+    pub work_id: WorkId,
+    pub execution_id: Option<ExecutionId>,
+    pub kind: String,
+    pub due_at_unix_seconds: i64,
+    pub generation: u64,
+    pub evidence_basis: String,
+    pub state: RecoveryIntentState,
+    pub retirement_reason: Option<String>,
+    pub scheduled_seq: EventSequence,
 }
 
 /// Why the store refused an effect; `work` maps it to a rejection or
@@ -412,6 +451,9 @@ pub trait ReadView {
 
     /// Failure/recovery decision records for a Work.
     fn recovery_decisions(&self, work_id: &WorkId) -> Result<Vec<RecoveryDecision>, StoreError>;
+
+    /// All recorded recovery intents; Core filters by state/due time.
+    fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError>;
 
     fn last_seq(&self) -> Result<EventSequence, StoreError>;
 }

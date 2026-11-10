@@ -101,8 +101,9 @@ fn command_and_query_surface_round_trip() {
     assert!(list["as_of"].is_number());
     assert!(list["sources"].is_array());
 
-    // run-once admits the queued execution (capacity 1).
-    run_at(&root, &["run-once"]);
+    // `run --once` admits the queued execution (capacity 1) through
+    // the single run verb.
+    run_at(&root, &["run", "--once"]);
     let detail = run_at(&root, &["work-detail", "--work", &work_id]);
     assert_eq!(detail["status"], "accepted");
     assert_eq!(detail["work_id"], work_id);
@@ -333,7 +334,7 @@ fn run_emits_one_envelope_across_ticks() {
     // A bounded run is one command result: exactly one envelope on
     // stdout no matter how many ticks it drove; per-tick progress is
     // a stderr diagnostic.
-    let output = output_at(&root, &["run", "--ticks", "2", "--interval-ms", "0"]);
+    let output = output_at(&root, &["run", "--ticks", "2", "--interval", "1"]);
     assert!(
         output.status.success(),
         "{}",
