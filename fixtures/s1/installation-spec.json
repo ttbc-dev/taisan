@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "kind": "s1-installation-spec",
+  "status": "prepared",
+  "live_execution_authorized": false,
+  "recorded_decisions": {
+    "owner_date": "2026-11-09",
+    "repository": "shimpeiws/coding-worker-smoke",
+    "reason": "Dedicated isolated S1 target removed from the worker automation lane repository allowlist on 2026-11-09."
+  },
+  "repository": {
+    "host": "github.com",
+    "full_name": "shimpeiws/coding-worker-smoke",
+    "stable_id": "recorded-from-host-read-at-preflight",
+    "stable_id_source": "Host adapter repository read; the display path is never the binding identity."
+  },
+  "installation_allowlist": [
+    "shimpeiws/coding-worker-smoke"
+  ],
+  "credential_reference": {
+    "role": "publication",
+    "kind": "fine-grained-personal-access-token",
+    "provider": "env",
+    "name": "S1_PUBLICATION_CREDENTIAL",
+    "scope": [
+      "shimpeiws/coding-worker-smoke"
+    ],
+    "permissions": {
+      "contents": "write",
+      "pull_requests": "write",
+      "issues": "write",
+      "checks": "read"
+    },
+    "value_policy": "The reference resolves at the adapter boundary; no credential value is stored in this fixture, committed config, argv, logs, or evidence exports."
+  },
+  "reviewer_identity": {
+    "kind": "github-app",
+    "app_slug": "s1-reviewer",
+    "app_id": "recorded-from-owner-app-listing-at-preflight",
+    "actor": "s1-reviewer[bot]",
+    "installation_scope": [
+      "shimpeiws/coding-worker-smoke"
+    ],
+    "distinct_from_publication_actor": true
+  },
+  "worker_runtime_identity": {
+    "adapter": "reference-worker",
+    "identity": "reference-worker-adapter",
+    "runtime": "configured reference Worker adapter process",
+    "allowed_effects": {
+      "workspace_write": true,
+      "local_git_write": true,
+      "repository_host_write": false
+    },
+    "host_write_policy": "All repository-host mutations use persisted HostActionIntent records applied by the GitHub adapter; Workers hold no repository-host mutation credential."
+  },
+  "revisions": {
+    "materials": "s1-fixtures-v1",
+    "materials_base_commit": "fb70d123fec2e011914af2c121c341f340965923",
+    "taisan_core": "fb70d123fec2e011914af2c121c341f340965923",
+    "taisan_cli": "fb70d123fec2e011914af2c121c341f340965923",
+    "github_adapter": "fb70d123fec2e011914af2c121c341f340965923",
+    "worker_adapter": "fb70d123fec2e011914af2c121c341f340965923",
+    "runtime_revision_policy": "Replace each code revision with the exact commit SHA of the built CLI/Core/adapters at execution; this fixture pins the preparation base revision."
+  },
+  "configuration_identity": {
+    "store_id": "recorded-at-preflight",
+    "host_instance": "github.com",
+    "repository": "shimpeiws/coding-worker-smoke",
+    "adapter": "github",
+    "contract_version": 1,
+    "capabilities": [
+      "repository_read",
+      "branch_read",
+      "change_request_read",
+      "push_ref",
+      "change_request_create",
+      "change_request_update",
+      "comment_write",
+      "issue_read",
+      "checks_read",
+      "review_findings_read"
+    ],
+    "required_checks": [
+      "verify"
+    ],
+    "budget": {
+      "max_invocations": 4,
+      "max_review_rounds": 3,
+      "runtime_limit_seconds": 14400
+    }
+  },
+  "required_identities": [
+    "work_id",
+    "execution_id",
+    "invocation_id",
+    "action_id"
+  ]
+}

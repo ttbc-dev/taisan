@@ -18,6 +18,22 @@ authorization under the [implementation start gate](../design-closure.md#impleme
 | [seeded-issue.md](seeded-issue.md) | The deterministic seeded-issue definition and the fixture procedure that produces it, including the label rule that keeps seeded inputs out of every automation lane |
 | [evidence-checklist.md](evidence-checklist.md) | The criterion-to-evidence checklist: every S1 step and abnormal-input row mapped to the recorded identities and receipts a run must retain, split into success / Attention / recovery variants |
 
+## Machine-readable fixtures and preflight
+
+The prose above is paired with three fixture files that carry the
+checkable fields:
+
+| Fixture | Contents |
+| --- | --- |
+| [`fixtures/s1/installation-spec.json`](../../fixtures/s1/installation-spec.json) | Sole-repository allowlist, credential reference (never a value), reviewer and Worker runtime identities, pinned material revision and configuration identity |
+| [`fixtures/s1/seeded-issue.json`](../../fixtures/s1/seeded-issue.json) | Deterministic title/body templates, the empty label set and label policy, verification argv, and the expected outcome for each `success`, `Attention`, and `recovery` variant |
+| [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json) | Every S1 criterion row with its variant assignment, revision/config reference, Work/Execution/Invocation/action identities, and required evidence |
+
+`python3 scripts/s1/check-prerequisites.py` validates the install-spec
+fields and all three materials, fails closed on any missing entry, and
+never executes the live scenario. It is a pre-live preflight only: a
+pass is not execution permission and is not live evidence.
+
 ## Recorded decisions (owner, 2026-11-09)
 
 - **Isolated test repository**: `shimpeiws/coding-worker-smoke`
