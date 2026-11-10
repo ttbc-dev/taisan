@@ -25,8 +25,10 @@ use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
 use workloop_core::identity::{HostInstanceId, StoreId};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
+use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
-    Deferral, Effect, HostActionIntent, ReadView, Store, StoreError, TxView,
+    Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent, RecoveryIntentState, Store,
+    StoreError, TxView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -38,10 +40,14 @@ const FORMAT_VERSION: i64 = 2;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
-/// alone is not proof the file is this store's format.
+/// alone is not proof the file is this store's format — unless it is the
+/// previous release's v1 store, which holds every table except
+/// [`ADDITIVE_TABLES`] and is upgraded in place.
 const EXPECTED_TABLES: &[&str] = &[
     "artifact_handoffs",
     "attention_acks",
+    "body_catalog",
+    "body_pins",
     "capacity_slots",
     "commands",
     "deferrals",
@@ -55,9 +61,11 @@ const EXPECTED_TABLES: &[&str] = &[
     "issue_claims",
     "observations",
     "recovery_decisions",
+    "recovery_intents",
     "resource_reservations",
     "review_rounds",
     "round_judgments",
+    "run_lease",
     "specs",
     "stop_intents",
     "store_meta",
@@ -66,6 +74,13 @@ const EXPECTED_TABLES: &[&str] = &[
     "work_usage",
     "works",
 ];
+
+/// The tables the run-lease slice added on top of the previous
+/// release's v1 store while it was still stamped `1`. Together with
+/// [`V2_ADDED_TABLES`] they are the set a stamped v1 file may
+/// legitimately lack and still be upgraded in place by the additive
+/// migration.
+const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
 
 /// Tables the v1 → v2 migration adds. Everything else in
 /// `EXPECTED_TABLES` must already be present for a `user_version=1`
@@ -79,7 +94,62 @@ const V2_ADDED_TABLES: &[&str] = &["artifact_handoffs", "verification_results"];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
+}
+
+/// The process claiming the run lease: pid plus the opaque start-time
+/// verifier captured for it, and a per-acquisition nonce so two
+/// acquisitions by one process (or one test process standing in for two
+/// drivers) never read as the same holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLeaseOwner {
+    pub pid: i32,
+    pub started_at: String,
+    pub nonce: String,
+}
+
+/// Why the run lease could not be granted. Every variant fails closed:
+/// the caller starts no pass.
+#[derive(Debug)]
+pub enum RunLeaseError {
+    /// The recorded owner is provably alive — a second driver is
+    /// refused with `lock.held`.
+    Held {
+        owner_pid: i32,
+    },
+    /// The recorded owner's liveness could not be inspected — never
+    /// treated as stop proof, never granted.
+    Unavailable {
+        reason: String,
+    },
+    Store(StoreError),
+}
+
+impl std::fmt::Display for RunLeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held { owner_pid } => write!(f, "lock.held: run lease held by pid {owner_pid}"),
+            Self::Unavailable { reason } => {
+                write!(
+                    f,
+                    "lock.unavailable: run lease owner uninspectable: {reason}"
+                )
+            }
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunLeaseError {}
+
+/// A granted run lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunLeaseGrant {
+    /// No prior owner (or the same holder re-entering).
+    Acquired,
+    /// A previous owner's lease was reclaimed after inspection proved
+    /// it gone.
+    Reclaimed { previous_pid: i32 },
 }
 
 impl SqliteStore {
@@ -146,14 +216,20 @@ impl SqliteStore {
             }
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
-            // v1 → v2 migration is legitimate only for a file that holds
-            // the complete v1 schema: every expected table except the
-            // two v2 additions must already be present. A foreign file
-            // stamped 1 fails this check untouched.
+            // A v1 → v2 migration is legitimate only for a file that
+            // holds the complete v1 schema: every expected table except
+            // the ones added since v1 — the run-lease slice's additive
+            // set plus the two v2 additions — must already be present.
+            // A foreign file stamped 1 fails this check untouched, and
+            // the one accepted difference is the previous release's
+            // store: it holds every base table and none of the
+            // additions, so it is upgraded in place instead of being
+            // locked out with a misleading "not the recognized schema"
+            // refusal.
             let present = table_set(&conn)?;
             let v1_complete = EXPECTED_TABLES
                 .iter()
-                .filter(|t| !V2_ADDED_TABLES.contains(t))
+                .filter(|t| !V2_ADDED_TABLES.contains(t) && !ADDITIVE_TABLES.contains(t))
                 .all(|t| present.contains(*t));
             if !v1_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -163,9 +239,11 @@ impl SqliteStore {
                 });
             }
             // Additive migration inside one transaction: the new tables
-            // plus invocations.descendants. A crash leaves the file
-            // stamped 1 and the migration reruns idempotently (CREATE IF
-            // NOT EXISTS; the column check guards a partial ALTER).
+            // plus invocations.descendants and the pin-ledger
+            // reconstruction. A crash leaves the file stamped 1 and the
+            // migration reruns idempotently (CREATE IF NOT EXISTS; the
+            // column check guards a partial ALTER; the ledger insert is
+            // guarded by NOT EXISTS).
             let tx = conn.unchecked_transaction().map_err(internal)?;
             tx.execute_batch(SCHEMA).map_err(internal)?;
             let has_descendants: bool = tx
@@ -182,6 +260,20 @@ impl SqliteStore {
                 )
                 .map_err(internal)?;
             }
+            // A pre-ledger store recorded protection as the bare
+            // `pinned` boolean. Reconstruct the ledger row under the
+            // unnamed `registered` dependency so the materialized flag
+            // and the row set agree, and so clearing an unrelated
+            // dependency can never silently un-protect the body.
+            tx.execute(
+                "INSERT INTO body_pins (body_id, dependency) \
+                 SELECT body_id, 'registered' FROM body_catalog AS c \
+                 WHERE c.pinned = 1 \
+                   AND NOT EXISTS (SELECT 1 FROM body_pins AS p \
+                                   WHERE p.body_id = c.body_id)",
+                [],
+            )
+            .map_err(internal)?;
             tx.pragma_update(None, "user_version", FORMAT_VERSION)
                 .map_err(internal)?;
             tx.commit().map_err(internal)?;
@@ -230,16 +322,182 @@ impl SqliteStore {
             conn: Mutex::new(conn),
         })
     }
+
+    /// Claim the installation's single-flight run lease. Acquisition is
+    /// one immediate transaction, so contenders serialize on the writer
+    /// lock and at most one driver can hold the row. A recorded owner is
+    /// displaced only when the supplied inspection proves it gone; a
+    /// live owner is refused and an uninspectable owner fails closed —
+    /// lock contention and restart can never create two drivers.
+    pub fn acquire_run_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
+        let mut guard = self.conn.lock().map_err(|_| {
+            RunLeaseError::Store(StoreError::Internal {
+                detail: "store lock poisoned".into(),
+            })
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| RunLeaseError::Store(internal(e)))?;
+        let existing: Option<(i32, String, String)> = tx
+            .query_row(
+                "SELECT owner_pid, owner_started_at, owner_nonce \
+                 FROM run_lease WHERE lease_key='default'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+        let grant = match existing {
+            None => {
+                insert_lease(&tx, owner, now_unix_seconds).map_err(RunLeaseError::Store)?;
+                RunLeaseGrant::Acquired
+            }
+            Some((pid, _started_at, nonce)) if nonce == owner.nonce && pid == owner.pid => {
+                // The same holder re-entering (a repeated pass of one
+                // driver): refresh the acquisition stamp, keep ownership.
+                tx.execute(
+                    "UPDATE run_lease SET acquired_unix_seconds=?1 \
+                     WHERE lease_key='default'",
+                    params![now_unix_seconds],
+                )
+                .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+                RunLeaseGrant::Acquired
+            }
+            Some((pid, started_at, _)) => {
+                let evidence = inspect(&ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: None,
+                });
+                match evidence {
+                    ProcessEvidence::Alive { .. } => {
+                        return Err(RunLeaseError::Held { owner_pid: pid });
+                    }
+                    ProcessEvidence::Stopped { .. } => {
+                        // The recorded driver is provably gone (or its
+                        // pid was reused under a different start time):
+                        // its lease is reclaimable, never concurrent.
+                        tx.execute(
+                            "UPDATE run_lease SET owner_pid=?1, \
+                             owner_started_at=?2, owner_nonce=?3, \
+                             acquired_unix_seconds=?4 \
+                             WHERE lease_key='default'",
+                            params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+                        )
+                        .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+                        RunLeaseGrant::Reclaimed { previous_pid: pid }
+                    }
+                    ProcessEvidence::Unknown { reason } => {
+                        return Err(RunLeaseError::Unavailable { reason });
+                    }
+                }
+            }
+        };
+        tx.commit().map_err(|e| RunLeaseError::Store(internal(e)))?;
+        Ok(grant)
+    }
+
+    /// Release only this owner's lease. A stale holder's release can
+    /// never clear a lease that was reclaimed by another driver.
+    pub fn release_run_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        tx.execute(
+            "DELETE FROM run_lease WHERE lease_key='default' \
+             AND owner_nonce=?1 AND owner_pid=?2",
+            params![owner.nonce, owner.pid],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    /// How many events of one kind the audit log holds — used to verify
+    /// durable per-pass records (e.g. `tick_report`) after a run.
+    pub fn count_events(&self, kind: &str) -> Result<usize, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let n: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE kind=?1",
+                params![kind],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n as usize)
+    }
+
+    /// The audit-log payloads for one kind, in sequence order — used to
+    /// inspect durable per-pass records (e.g. `tick_report`) after a run.
+    pub fn events(&self, kind: &str) -> Result<Vec<String>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let mut stmt = guard
+            .prepare("SELECT payload FROM event_log WHERE kind=?1 ORDER BY seq")
+            .map_err(map_err)?;
+        stmt.query_map(params![kind], |r| r.get(0))
+            .map_err(map_err)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(map_err)
+    }
+
+    /// Append one non-effect event to the audit log (e.g. a durable tick
+    /// report). Returns the assigned sequence.
+    pub fn append_event(
+        &self,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<EventSequence, StoreError> {
+        let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO event_log (kind, payload) VALUES (?1, ?2)",
+            params![kind, payload_json],
+        )
+        .map_err(map_err)?;
+        let seq = tx.last_insert_rowid();
+        tx.commit().map_err(internal)?;
+        Ok(seq)
+    }
 }
 
-fn internal(e: impl std::fmt::Display) -> StoreError {
+fn insert_lease(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &RunLeaseOwner,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO run_lease (lease_key, owner_pid, owner_started_at, \
+         owner_nonce, acquired_unix_seconds) VALUES ('default', ?1, ?2, ?3, ?4)",
+        params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+    )
+    .map_err(map_err)?;
+    Ok(())
+}
+
+pub(crate) fn internal(e: impl std::fmt::Display) -> StoreError {
     StoreError::Internal {
         detail: e.to_string(),
     }
 }
 
 /// Map a rusqlite failure to the store's conflict vocabulary.
-fn map_err(e: rusqlite::Error) -> StoreError {
+pub(crate) fn map_err(e: rusqlite::Error) -> StoreError {
     match e {
         rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error {
@@ -1245,6 +1503,30 @@ impl ReadView for Tx<'_> {
             .map_err(map_err)?;
         Ok(s.unwrap_or(0))
     }
+
+    fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError> {
+        self.query_all(
+            "SELECT intent_id, work_id, execution_id, kind, \
+             due_at_unix_seconds, generation, evidence_basis, state, \
+             retirement_reason, scheduled_seq FROM recovery_intents \
+             ORDER BY due_at_unix_seconds, intent_id",
+            [],
+            |row| {
+                Ok(RecoveryIntent {
+                    intent_id: row.get(0)?,
+                    work_id: WorkId(row.get::<_, String>(1)?),
+                    execution_id: row.get::<_, Option<String>>(2)?.map(ExecutionId),
+                    kind: row.get(3)?,
+                    due_at_unix_seconds: row.get(4)?,
+                    generation: row.get::<_, i64>(5)? as u64,
+                    evidence_basis: row.get(6)?,
+                    state: untag(&row.get::<_, String>(7)?)?,
+                    retirement_reason: row.get(8)?,
+                    scheduled_seq: row.get(9)?,
+                })
+            },
+        )
+    }
 }
 
 impl TxView for Tx<'_> {
@@ -1668,6 +1950,63 @@ impl TxView for Tx<'_> {
                         json(&decision.usage_after)?,
                         decision.seq,
                     ],
+                )?;
+            }
+            Effect::InsertRecoveryIntent { intent } => {
+                self.exec(
+                    "INSERT INTO recovery_intents (intent_id, work_id, \
+                     execution_id, kind, due_at_unix_seconds, generation, \
+                     evidence_basis, state, retirement_reason, scheduled_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        intent.intent_id,
+                        intent.work_id.0,
+                        intent.execution_id.as_ref().map(|e| e.0.clone()),
+                        intent.kind,
+                        intent.due_at_unix_seconds,
+                        intent.generation as i64,
+                        intent.evidence_basis,
+                        tag(&intent.state),
+                        intent.retirement_reason,
+                        intent.scheduled_seq,
+                    ],
+                )?;
+            }
+            Effect::UpdateRecoveryIntent {
+                intent_id,
+                state,
+                retirement_reason,
+            } => {
+                // Closed lifecycle with idempotent retirement: a repeat
+                // of the recorded transition is a no-op, any other
+                // transition is refused.
+                let current: Option<String> = self
+                    .tx
+                    .query_row(
+                        "SELECT state FROM recovery_intents WHERE intent_id=?1",
+                        params![intent_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                let Some(current) = current else {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("recovery intent {intent_id} is absent"),
+                    });
+                };
+                let target = tag(state);
+                if current == target {
+                    return Ok(());
+                }
+                if current != tag(&RecoveryIntentState::Pending) {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("recovery intent {intent_id} is {current}, not pending"),
+                    });
+                }
+                self.exec(
+                    "UPDATE recovery_intents SET state=?2, retirement_reason=?3 \
+                     WHERE intent_id=?1 AND state='pending'",
+                    params![intent_id, target, retirement_reason],
                 )?;
             }
             Effect::RecordDeferral {

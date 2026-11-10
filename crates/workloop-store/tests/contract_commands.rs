@@ -4421,3 +4421,58 @@ fn a_versioned_file_without_the_recognized_schema_is_refused() {
         "a refused open must not leave WAL sidecars"
     );
 }
+
+/// Regression: a store created by the previous release — stamped v1,
+/// full base schema, none of this slice's additive tables — opens and
+/// is upgraded in place. Refusing it as "not the recognized schema"
+/// would lock every existing installation out of its own store.
+#[test]
+fn a_previous_release_v1_store_is_upgraded_in_place() {
+    let root = temp_root("cutover-previous-v1");
+    let db = root.join("store.db");
+    let (work_id, execution_id) = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let request = submit("k-prev");
+        let (work_id, execution_id) =
+            accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap());
+        (work_id, execution_id)
+    };
+    // Roll the file back to the previous release's table set and its
+    // v1 stamp: every base table intact, the additive tables this
+    // slice added dropped.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE run_lease; DROP TABLE recovery_intents; DROP TABLE body_catalog; \
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+    }
+    // Open upgrades in place instead of refusing the file.
+    let store = SqliteStore::open(&db, 1).expect("a previous-release v1 store opens");
+    // Base rows survived the upgrade.
+    let work = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .expect("base rows survive the upgrade");
+    assert_eq!(work.id, work_id);
+    let execution = store
+        .transact(|tx| tx.execution(&execution_id))
+        .unwrap()
+        .expect("execution row survives the upgrade");
+    assert_eq!(execution.state, ExecutionState::Queued);
+    // The additive tables are installed and usable again (`open` itself
+    // re-verifies the full expected table set before returning).
+    assert!(store.body_state("no-such-body").unwrap().is_none());
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the upgrade lands on the current format");
+    }
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    drop(store);
+    let again = SqliteStore::open(&db, 1).expect("reopen after upgrade");
+    assert!(again.body_state("no-such-body").unwrap().is_none());
+}

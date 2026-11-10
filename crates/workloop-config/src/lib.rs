@@ -4,6 +4,8 @@
 //! TUI can never drift on the file they must agree on — whichever
 //! adapter creates it, the other adopts it.
 
+pub mod profile;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,82 @@ use workloop_core::identity::{
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig};
 use workloop_selector::SelectionPolicy;
+
+/// Loop-driver settings (owner-approved defaults from the execution
+/// loop design). `None` in the file means "use these defaults".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopConfig {
+    #[serde(default = "default_loop_interval")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_tick_deadline")]
+    pub tick_deadline_seconds: u64,
+    #[serde(default = "default_source_refresh_timeout")]
+    pub source_refresh_timeout_seconds: u64,
+}
+
+fn default_loop_interval() -> u64 {
+    30
+}
+fn default_tick_deadline() -> u64 {
+    120
+}
+fn default_source_refresh_timeout() -> u64 {
+    30
+}
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: default_loop_interval(),
+            tick_deadline_seconds: default_tick_deadline(),
+            source_refresh_timeout_seconds: default_source_refresh_timeout(),
+        }
+    }
+}
+
+/// Retention sweep settings (owner-approved defaults from the retention
+/// policy). `None` in the file means "use these defaults".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_retention_interval")]
+    pub interval_seconds: i64,
+    #[serde(default = "default_max_bodies")]
+    pub max_bodies: usize,
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_delete_error_limit")]
+    pub delete_error_limit: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_retention_interval() -> i64 {
+    3600
+}
+fn default_max_bodies() -> usize {
+    256
+}
+fn default_max_bytes() -> u64 {
+    1 << 30
+}
+fn default_delete_error_limit() -> usize {
+    3
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: default_retention_interval(),
+            max_bodies: default_max_bodies(),
+            max_bytes: default_max_bytes(),
+            delete_error_limit: default_delete_error_limit(),
+        }
+    }
+}
 
 /// The on-disk installation record. Fields an adapter does not use
 /// pass through untouched, so a file either adapter wrote stays valid
@@ -64,6 +142,12 @@ pub struct Installation {
     pub lanes: Option<LanePolicy>,
     #[serde(default)]
     pub policy: Option<WorkPolicy>,
+    /// Loop-driver bounds; absent means the approved defaults.
+    #[serde(default, rename = "loop")]
+    pub loop_config: Option<LoopConfig>,
+    /// Retention sweep policy; absent means the approved defaults.
+    #[serde(default)]
+    pub retention: Option<RetentionConfig>,
     /// Alternate admission: the selector policy the `propose` path is
     /// bound to, held as the raw JSON it was written as. The shape is
     /// parsed at the selector boundary (`selection_policy`), never
@@ -347,7 +431,7 @@ fn load_or_create_with(
             "change_request_create".into(),
             "change_request_read".into(),
             "change_request_update".into(),
-            "comment_create".into(),
+            "comment_write".into(),
             "checks_read".into(),
             "review_findings_read".into(),
             "issue_read".into(),
@@ -365,6 +449,8 @@ fn load_or_create_with(
         budget: None,
         lanes: None,
         policy: None,
+        loop_config: None,
+        retention: None,
         selector: None,
     };
     if let Some(parent) = path.parent() {
@@ -390,6 +476,18 @@ fn load_or_create_with(
 }
 
 impl Installation {
+    /// The loop-driver settings, falling back to the approved defaults
+    /// when the file carries no `loop` section.
+    pub fn loop_settings(&self) -> LoopConfig {
+        self.loop_config.clone().unwrap_or_default()
+    }
+
+    /// The retention sweep settings, falling back to the approved
+    /// defaults when the file carries no `retention` section.
+    pub fn retention_settings(&self) -> RetentionConfig {
+        self.retention.clone().unwrap_or_default()
+    }
+
     /// The stable actor identity every adapter's requests carry.
     pub fn actor(&self) -> Actor {
         Actor {

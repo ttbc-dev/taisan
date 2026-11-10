@@ -232,12 +232,26 @@ pub enum HostCapability {
     ChangeRequestList,
     ReviewRead,
     ReviewFindingsRead,
-    CommentCreate,
+    /// Ordinary change-request comment write. The owner documents name
+    /// this `comment_write` (repository/host contract baseline); the
+    /// legacy `comment_create` spelling stays accepted on input.
+    #[serde(alias = "comment_create")]
+    CommentWrite,
+    CommentRead,
     ThreadResolve,
     IssueRead,
     IssueList,
     ChecksRead,
     ChecksWrite,
+    InlineComment,
+    ReviewFeedback,
+    Approve,
+    RequestChanges,
+    ThreadReply,
+    /// Non-draft/ready state change. The owner documents spell this
+    /// both `mark_ready` and `ready`; both stay accepted on input.
+    #[serde(alias = "ready")]
+    MarkReady,
 }
 
 impl HostCapability {
@@ -254,12 +268,19 @@ impl HostCapability {
             Self::ChangeRequestList => "change_request_list",
             Self::ReviewRead => "review_read",
             Self::ReviewFindingsRead => "review_findings_read",
-            Self::CommentCreate => "comment_create",
+            Self::CommentWrite => "comment_write",
+            Self::CommentRead => "comment_read",
             Self::ThreadResolve => "thread_resolve",
             Self::IssueRead => "issue_read",
             Self::IssueList => "issue_list",
             Self::ChecksRead => "checks_read",
             Self::ChecksWrite => "checks_write",
+            Self::InlineComment => "inline_comment",
+            Self::ReviewFeedback => "review_feedback",
+            Self::Approve => "approve",
+            Self::RequestChanges => "request_changes",
+            Self::ThreadReply => "thread_reply",
+            Self::MarkReady => "mark_ready",
         }
     }
 
@@ -276,12 +297,19 @@ impl HostCapability {
             "change_request_list" => Some(Self::ChangeRequestList),
             "review_read" => Some(Self::ReviewRead),
             "review_findings_read" => Some(Self::ReviewFindingsRead),
-            "comment_create" => Some(Self::CommentCreate),
+            "comment_write" | "comment_create" => Some(Self::CommentWrite),
+            "comment_read" => Some(Self::CommentRead),
             "thread_resolve" => Some(Self::ThreadResolve),
             "issue_read" => Some(Self::IssueRead),
             "issue_list" => Some(Self::IssueList),
             "checks_read" => Some(Self::ChecksRead),
             "checks_write" => Some(Self::ChecksWrite),
+            "inline_comment" => Some(Self::InlineComment),
+            "review_feedback" => Some(Self::ReviewFeedback),
+            "approve" => Some(Self::Approve),
+            "request_changes" => Some(Self::RequestChanges),
+            "thread_reply" => Some(Self::ThreadReply),
+            "mark_ready" | "ready" => Some(Self::MarkReady),
             _ => None,
         }
     }
