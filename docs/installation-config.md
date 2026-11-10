@@ -88,18 +88,29 @@ discussion  = ["comment_read", "comment_write"]
 
 [recovery]  # keys defined by recovery-policy.md; defaults apply when omitted
 [retention]  # keys defined by retention-policy.md
+
+[selector]                             # optional: its presence selects alternate admission
+adapter = "issue-scan"                 # selector adapter identity stamped on proposals
+policy_revision = 3                    # revision of the policy document, part of proposal identity
+allowlist = ["0123456789"]             # repository ids the selector may propose from
+excluded = ["0123456789:137"]          # repo:number issues never selected (matched by opaque IssueId or display number)
+max_proposals = 10                     # bound on proposals per selector run
+task_constraints = []                  # carried into every proposal's task input
+verification_argv = []                 # carried into every proposal's task input
+required_permissions = []              # declared on proposals, never expanded
 ```
 
 Validation rules:
 
 - `schema_version` is required and must equal a version this runtime understands; unknown/newer/corrupt content is refused without mutation, never auto-migrated.
-- Unknown keys at any level fail loading with the offending key named. `0` is never silently "unlimited" — each limit key's zero/disable semantics follow its defining document ([recovery policy](recovery-policy.md#configurable-policy-and-defaults), [retention policy](retention-policy.md#configuration)).
+- Unknown keys at any level fail loading with the offending key named — except inside the optional `[selector]` section, whose shape (including unknown keys) is validated when a selector run resolves the policy, exactly as the `[selector]` rule below specifies, so a malformed section can never block manual submission. `0` is never silently "unlimited" — each limit key's zero/disable semantics follow its defining document ([recovery policy](recovery-policy.md#configurable-policy-and-defaults), [retention policy](retention-policy.md#configuration)).
 - Every `credential_ref` must parse as a known provider (`env:`, `file:`, `command:`); file providers require an absolute path. Validation checks the reference's shape, never its value.
 - Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
 - `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
 - Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op. Capability names come from the contract's capability set (`ready`, `thread_resolve`, ...), which deliberately differs from operation names (`mark_ready`, `resolve_thread`) — a capability selects an effect class, an operation names a concrete host action.
 - `recovery.transport.backoff_seconds` is the per-attempt wait schedule between transient-failure retries. `recovery.transport.backoff_jitter_ratio` (default `0.0`, range `0.0`–`1.0`) applies symmetric jitter: each scheduled wait is scaled by a per-attempt random factor in `1 ± ratio`. A `recovery.transport.max_retries` beyond the schedule length repeats the final element; a shorter retry count truncates the schedule. A `0` schedule entry is a valid immediate retry; `0` is still never silently "unlimited" for limit keys.
-- Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects.
+- The `[selector]` section selects the alternate admission path. Its absence means manual submission only — the selector holds no default authority — and its unavailability must not block manual submission or existing Work. Every identity string inside it (adapter id, repository ids, issue references) is validated when the policy is resolved for a selector run, and unknown keys are refused rather than defaulted past, so a misspelled key surfaces as the bounded error instead of a silently degraded policy. An unparseable or unknown-keyed section is a bounded config error for that path only — validation deliberately does not gate config loading, so a malformed section cannot take manual submission down with it. An `excluded` `repo:number` entry matches a fact's opaque IssueId or its repository-scoped display number.
+- Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects. Switching the `[selector]` section in or out changes only which admission path new submissions take — it never rebinds existing Work.
 
 ## Credential references and secret hygiene
 

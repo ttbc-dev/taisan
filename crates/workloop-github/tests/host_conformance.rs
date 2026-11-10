@@ -70,24 +70,12 @@ trait OutboxHost {
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation);
 }
 
-/// The full baseline vocabulary the current fixture covers, as declared
-/// capability names (the `HostCapability` enum names).
-const FULL_BASELINE: &[&str] = &[
-    "repository_read",
-    "branch_read",
-    "push_ref",
-    "change_request_create",
-    "change_request_read",
-    "change_request_update",
-    "comment_create",
-    "checks_read",
-    "review_findings_read",
-    "issue_read",
-];
-
 impl OutboxHost for FixtureGithub {
     fn declared_names(&self) -> BTreeSet<&'static str> {
-        FULL_BASELINE.iter().copied().collect()
+        FixtureGithub::declared_capabilities()
+            .iter()
+            .copied()
+            .collect()
     }
     fn apply(&mut self, store: &SqliteStore, config: &WorkloopConfig) {
         self.apply_outbox(store, config, NOW).unwrap();

@@ -669,12 +669,14 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "workloop-config",
  "workloop-core",
  "workloop-exec",
  "workloop-github",
+ "workloop-selector",
  "workloop-store",
 ]
 
@@ -686,6 +688,7 @@ dependencies = [
  "serde_json",
  "toml",
  "workloop-core",
+ "workloop-selector",
 ]
 
 [[package]]
@@ -713,6 +716,7 @@ dependencies = [
  "libc",
  "serde_json",
  "workloop-core",
+ "workloop-github",
  "workloop-store",
 ]
 
@@ -728,6 +732,16 @@ name = "workloop-github"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "serde_json",
+ "workloop-core",
+ "workloop-store",
+]
+
+[[package]]
+name = "workloop-selector"
+version = "0.0.0"
+dependencies = [
+ "serde",
  "serde_json",
  "workloop-core",
  "workloop-store",

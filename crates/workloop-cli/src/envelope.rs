@@ -8,7 +8,7 @@
 use workloop_core::command::{
     CommandBody, CommandDecision, CommandEffect, CommandRequest, RejectionCode,
 };
-use workloop_core::domain::{Actor, EventSequence};
+use workloop_core::domain::{Actor, EventSequence, Origin};
 use workloop_core::projection::{QueryResult, SourceStatus};
 use workloop_core::store::StoreError;
 
@@ -37,6 +37,19 @@ fn bounded(s: &str, limit: usize) -> String {
     let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Apply the envelope's evidence bounds to any caller-built reference
+/// list — a rejection's evidence or a batch's replay keys — so no
+/// caller can exceed the bounded contract surface the envelope
+/// documents: at most [`EVIDENCE_BOUND`] items, each truncated to
+/// [`EVIDENCE_ITEM_BOUND`] characters.
+pub fn bounded_evidence(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .take(EVIDENCE_BOUND)
+        .map(|s| bounded(&s, EVIDENCE_ITEM_BOUND))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,11 +200,7 @@ fn decision_envelope(req: &CommandRequest, decision: &CommandDecision) -> (Envel
                     .unwrap_or_else(|| code.clone()),
                 code,
             });
-            e.evidence_refs = evidence
-                .iter()
-                .take(EVIDENCE_BOUND)
-                .map(|s| bounded(s, EVIDENCE_ITEM_BOUND))
-                .collect();
+            e.evidence_refs = bounded_evidence(evidence.iter().cloned());
             (e, rejection_exit(reason))
         }
     }
@@ -306,14 +315,51 @@ pub fn unknown_envelope(identity: CommandIdentity, detail: &str) -> (Envelope, i
     (e, EXIT_UNKNOWN)
 }
 
+/// A handler error resolved through the caller's replay identity — the
+/// one lost-response rule every mutation follows, shared by the
+/// single-mutation envelope and the `propose` batch.
+pub enum LostResponse {
+    /// The decision is durable: replaying it *is* the recovery.
+    Recorded(CommandDecision),
+    /// The attempt definitely did not commit: a local fault.
+    Absent(String),
+    /// The fate could not be determined — the lookup itself failed, so
+    /// nothing may be concluded either way.
+    Undetermined(String),
+}
+
+/// Resolve a `handle_command` error by looking the recorded decision up
+/// under the caller's replay key. A recorded decision comes back as the
+/// durable result, a definitively absent decision as a plain store
+/// error, and an unreadable lookup as `unknown` — never a definite
+/// conclusion about an undecidable fate.
+pub fn resolve_lost_response(
+    origin: &Origin,
+    idempotency_key: &str,
+    store_error: &StoreError,
+    lookup: impl FnOnce() -> Result<QueryResult<CommandDecision>, StoreError>,
+) -> LostResponse {
+    match lookup() {
+        Ok(QueryResult::Found { value, .. }) => LostResponse::Recorded(value),
+        // The attempt definitely did not commit: a local fault.
+        Ok(QueryResult::NotFound) => LostResponse::Absent(store_error.to_string()),
+        _ => LostResponse::Undetermined(format!(
+            "mutation fate undetermined ({store_error}); recover with \
+             command-result --origin {} --replay-key {idempotency_key}",
+            origin.0
+        )),
+    }
+}
+
 /// A mutation decision with the lost-response path applied: a handler
 /// error is followed by a `command_result` lookup under the caller's
-/// replay key. A recorded decision is emitted as the original result —
-/// replaying the durable decision *is* the recovery here; a
-/// definitively absent decision is a plain store-class error; and an
-/// unreadable lookup result stays `unknown`. The TUI session differs
-/// deliberately: it stages a found-but-unread decision as `unknown`
-/// until the user runs `recover`, where the CLI emits it directly.
+/// replay key (see [`resolve_lost_response`]). A recorded decision is
+/// emitted as the original result — replaying the durable decision *is*
+/// the recovery here; a definitively absent decision is a plain
+/// store-class error; and an unreadable lookup result stays `unknown`.
+/// The TUI session differs deliberately: it stages a found-but-unread
+/// decision as `unknown` until the user runs `recover`, where the CLI
+/// emits it directly.
 pub fn mutation_envelope(
     req: &CommandRequest,
     outcome: &Result<CommandDecision, StoreError>,
@@ -321,23 +367,17 @@ pub fn mutation_envelope(
 ) -> (Envelope, i32) {
     match outcome {
         Ok(decision) => decision_envelope(req, decision),
-        Err(store_error) => match lookup() {
-            Ok(QueryResult::Found { value, .. }) => decision_envelope(req, &value),
-            // The attempt definitely did not commit: a local fault.
-            Ok(QueryResult::NotFound) => error_envelope(
-                Some(request_identity(req)),
-                ErrorClass::Store,
-                &store_error.to_string(),
-            ),
-            _ => unknown_envelope(
-                request_identity(req),
-                &format!(
-                    "mutation fate undetermined ({store_error}); recover with \
-                     command-result --origin <origin> --replay-key {}",
-                    req.idempotency_key
-                ),
-            ),
-        },
+        Err(store_error) => {
+            match resolve_lost_response(&req.origin, &req.idempotency_key, store_error, lookup) {
+                LostResponse::Recorded(decision) => decision_envelope(req, &decision),
+                LostResponse::Absent(message) => {
+                    error_envelope(Some(request_identity(req)), ErrorClass::Store, &message)
+                }
+                LostResponse::Undetermined(detail) => {
+                    unknown_envelope(request_identity(req), &detail)
+                }
+            }
+        }
     }
 }
 
@@ -436,6 +476,26 @@ mod tests {
         let message = &env.reason.as_ref().unwrap().message;
         assert!(message.chars().count() <= MESSAGE_BOUND);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn evidence_refs_are_bounded_for_any_caller_list() {
+        // A caller-built list — a batch's replay keys, an adapter id
+        // long enough to blow the item bound — can never exceed the
+        // bounded surface the envelope documents.
+        let wide: Vec<String> = (0..EVIDENCE_BOUND * 3)
+            .map(|i| format!("key-{i}-{}", "x".repeat(EVIDENCE_ITEM_BOUND)))
+            .collect();
+        let refs = bounded_evidence(wide);
+        assert_eq!(refs.len(), EVIDENCE_BOUND);
+        for r in &refs {
+            assert!(r.chars().count() <= EVIDENCE_ITEM_BOUND, "{r:?}");
+            assert!(r.ends_with('…'));
+        }
+        assert_eq!(
+            bounded_evidence(vec!["short".into()]),
+            vec!["short".to_string()]
+        );
     }
 
     #[test]

@@ -4,4 +4,5 @@
 //! that stays in `work`.
 
 pub mod handoff;
+pub mod scripted;
 pub mod supervisor;

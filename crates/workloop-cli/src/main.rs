@@ -151,6 +151,15 @@ enum Commands {
         ticks: u32,
     },
     WorkList,
+    /// Run the configured selector over a snapshot file and admit each
+    /// proposal through the normal submit path. Requires the
+    /// `selector` section in the installation config.
+    Propose {
+        /// A JSON snapshot of available source facts, in the adapter's
+        /// output shape.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
     WorkDetail {
         #[arg(long)]
         work: String,
@@ -694,6 +703,206 @@ fn run(cli: Cli) -> i32 {
                     &e.to_string(),
                 )),
             }
+        }
+        Commands::Propose { snapshot } => {
+            let identity =
+                || envelope::query_identity("propose", &actor, cli.idempotency_key.as_deref());
+            // Alternate admission is configuration-selected: no
+            // selector section is a bounded refusal, never a guess.
+            let Some((selector, policy)) = (match installation.selection_policy() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            }) else {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Config,
+                    "selector admission is not configured",
+                ));
+            };
+            let text = match std::fs::read_to_string(&snapshot) {
+                Ok(t) => t,
+                Err(e) => {
+                    return usage("propose", &format!("snapshot {}: {e}", snapshot.display()));
+                }
+            };
+            let facts: workloop_selector::SelectorSnapshot = match serde_json::from_str(&text) {
+                Ok(s) => s,
+                Err(e) => {
+                    return usage("propose", &format!("snapshot {}: {e}", snapshot.display()));
+                }
+            };
+            let set = workloop_selector::propose(&selector, &facts, &policy);
+            // Every proposal is admitted through the same
+            // `handle_command` path a manual `submit` uses — the
+            // selector holds no authority of its own. Per-proposal
+            // outcomes are data inside one batch envelope.
+            let mut items = Vec::new();
+            // Replay keys of the proposals decided so far, in batch
+            // order — what a faulted or truncated run must still
+            // surface so every recorded decision stays recoverable.
+            let recorded_keys = |decided: &[serde_json::Value]| -> Vec<String> {
+                decided
+                    .iter()
+                    .filter_map(|i| i["replay_key"].as_str().map(str::to_string))
+                    .collect()
+            };
+            for proposal in &set.proposals {
+                let req = workloop_selector::admission::submit_command(proposal, actor.clone());
+                let decision = match handle_command(&store, &config, &req, now()) {
+                    Ok(d) => d,
+                    Err(store_error) => {
+                        // The batch shares the single-mutation
+                        // lost-response path: a handler error is
+                        // resolved under this proposal's replay
+                        // identity before the CLI concludes anything.
+                        let lookup = CommandResultLookup::ReplayKey {
+                            origin: req.origin.clone(),
+                            actor: req.actor.clone(),
+                            idempotency_key: req.idempotency_key.clone(),
+                        };
+                        let found =
+                            store.transact_deferred(|tx| projection::command_result(tx, &lookup));
+                        // The interrupted proposal's own key rides the
+                        // envelope alongside the committed ones: its
+                        // fate must be recoverable by `command-result`
+                        // exactly like a settled decision. The list is
+                        // bounded like every other evidence list.
+                        let mut recoverable = recorded_keys(&items);
+                        recoverable.push(req.idempotency_key.clone());
+                        match envelope::resolve_lost_response(
+                            &req.origin,
+                            &req.idempotency_key,
+                            &store_error,
+                            || found,
+                        ) {
+                            // The decision is durable — replaying it is
+                            // the recovery; the batch continues with it
+                            // as this proposal's outcome.
+                            envelope::LostResponse::Recorded(d) => d,
+                            // A batch is not atomic: earlier proposals
+                            // may already hold recorded decisions. Their
+                            // replay keys — and this proposal's — ride
+                            // the error envelope so the operator can
+                            // recover each via `command-result` — or
+                            // simply re-run `propose`, which replays
+                            // them. (Per the CLI contract's batch note,
+                            // `error` here means the *batch* stopped:
+                            // nothing was recorded for the interrupted
+                            // proposal, while `evidence_refs` names
+                            // what was recorded.)
+                            envelope::LostResponse::Absent(message) => {
+                                let (mut env, code) = envelope::error_envelope(
+                                    Some(identity()),
+                                    envelope::ErrorClass::Store,
+                                    &format!(
+                                        "batch interrupted at proposal {} ({message}); replay \
+                                         keys for committed and interrupted decisions are listed",
+                                        proposal.key
+                                    ),
+                                );
+                                env.evidence_refs = envelope::bounded_evidence(recoverable);
+                                return emit((env, code));
+                            }
+                            // The fate is undetermined — never a
+                            // definite store error about a mutation
+                            // that may have committed. Recovery keys on
+                            // the interrupted proposal's own mutation
+                            // identity, exactly like a single-mutation
+                            // `unknown`, never on the propose run's
+                            // query identity.
+                            envelope::LostResponse::Undetermined(detail) => {
+                                let (mut env, code) = envelope::unknown_envelope(
+                                    envelope::request_identity(&req),
+                                    &detail,
+                                );
+                                env.evidence_refs = envelope::bounded_evidence(recoverable);
+                                return emit((env, code));
+                            }
+                        }
+                    }
+                };
+                // The replay key rides the envelope so an operator can
+                // recover the decision — `command-result --origin
+                // selector --replay-key <key>` — without re-running
+                // selection.
+                let item = match &decision {
+                    CommandDecision::Accepted {
+                        work_id,
+                        command_id,
+                        ..
+                    } => serde_json::json!({
+                        "key": proposal.key,
+                        "replay_key": req.idempotency_key,
+                        "command_id": command_id.0,
+                        "status": "accepted",
+                        "work_id": work_id.as_ref().map(|w| w.0.clone()),
+                    }),
+                    CommandDecision::Rejected {
+                        command_id,
+                        reason,
+                        evidence,
+                        ..
+                    } => serde_json::json!({
+                        "key": proposal.key,
+                        "replay_key": req.idempotency_key,
+                        "command_id": command_id.0,
+                        "status": "rejected",
+                        "reason_code": serde_json::to_value(reason).ok(),
+                        "evidence": evidence,
+                    }),
+                };
+                items.push(item);
+            }
+            let as_of = match store.transact_deferred(|tx| tx.last_seq()) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Every proposal in this batch is already
+                    // recorded; only the bookkeeping read failed. The
+                    // envelope names the recorded decisions' replay
+                    // keys so a consumer never reads this store error
+                    // as "nothing was recorded".
+                    let recorded = recorded_keys(&items);
+                    let (mut env, code) = envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &format!(
+                            "batch admissions are recorded but the final sequence read failed \
+                             ({e}); replay keys for the recorded decisions are listed"
+                        ),
+                    );
+                    env.evidence_refs = envelope::bounded_evidence(recorded);
+                    return emit((env, code));
+                }
+            };
+            let value = serde_json::json!({
+                "selector": selector.as_str(),
+                "policy_revision": policy.revision,
+                "proposals": items,
+                "truncated": set.truncated,
+                "skipped": set
+                    .skipped
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "issue": s.issue.to_string(),
+                        "reason": serde_json::to_value(s.reason).ok(),
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            emit(envelope::query_envelope(
+                &workloop_core::projection::QueryResult::Found {
+                    value,
+                    as_of,
+                    sources: vec![],
+                },
+                identity(),
+                None,
+            ))
         }
         Commands::WorkDetail { work } => {
             let identity =
