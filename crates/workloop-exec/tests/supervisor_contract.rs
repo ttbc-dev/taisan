@@ -408,6 +408,7 @@ fn persist_failure_sends_no_signal() {
         process_identity: Some(leader.clone()),
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     };
     let receipt = sup
         .stop_unless_persisted(&invocation, &leader, |_| {
@@ -599,6 +600,7 @@ fn crash_near_spawn_leaves_uncertain_with_no_second_writer() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -654,6 +656,7 @@ fn live_process_is_rereported_running_after_a_lost_running_observation() {
                     process_identity: Some(identity.clone()),
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -725,6 +728,7 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
                     process_identity: Some(identity.clone()),
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
@@ -840,6 +844,355 @@ fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
     );
 }
 
+/// A reparented escapee stays a recorded identity: refreshing the live
+/// ppid snapshot must union with the durable descendant set, never
+/// replace it — leaving the tree is not proof of stopping.
+#[test]
+fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
+    use std::path::Path;
+    use workloop_core::ports::SpawnError;
+
+    struct LiveTree(Vec<ProcessIdentity>);
+    impl ProcessControlPort for LiveTree {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the poll path")
+        }
+        // The escapee is absent: it reparented out of the leader's ppid
+        // tree, so the live snapshot can no longer see it.
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(self.0.clone())
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            ProcessEvidence::Alive {
+                identity: id.clone(),
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("refreshunion");
+    let (_w, eid) = submit_and_admit(&store, "k-ru1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_800_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_800_001),
+    };
+    let live_child = ProcessIdentity {
+        pid: 9_800_002,
+        started_at: "child start".into(),
+        pgid: Some(9_800_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_800_003,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-ru1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![escapee.clone()],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(LiveTree(vec![live_child.clone()]), root, vec![], config());
+    sup.run_once(&store, NOW).unwrap();
+    let descendants = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("invocation")
+        .descendants;
+    let pids: BTreeSet<i32> = descendants.iter().map(|i| i.pid).collect();
+    assert_eq!(
+        pids,
+        BTreeSet::from([live_child.pid, escapee.pid]),
+        "refresh unions the live tree with recorded escapees, never replacing them"
+    );
+}
+
+/// The snapshot persisted by `request_stop` in the same pass must be part
+/// of the stop proof. The escapee here is visible only to that fresh
+/// snapshot — it `setsid`'d out of the group and the recorded descendant
+/// list predates its spawn — so settling on the pre-stop identity set
+/// would release capacity under a live writer.
+#[test]
+fn fresh_stop_snapshot_is_proven_before_settling() {
+    use std::path::Path;
+    use std::sync::Mutex;
+    use workloop_core::ports::SpawnError;
+
+    struct FreshSnapshotEscapee {
+        escapee: ProcessIdentity,
+        inspected: Mutex<BTreeSet<i32>>,
+    }
+    impl ProcessControlPort for FreshSnapshotEscapee {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the stop path")
+        }
+        // The escapee is still a live child at stop time: the stop
+        // intent's snapshot records it.
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![self.escapee.clone()])
+        }
+        // …but it left the process group, so enumeration cannot cover it.
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            self.inspected.lock().unwrap().insert(id.pid);
+            if id.pid == self.escapee.pid {
+                ProcessEvidence::Alive {
+                    identity: self.escapee.clone(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: id.clone(),
+                    exit_code: Some(0),
+                }
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("freshsnap");
+    let (_w, eid) = submit_and_admit(&store, "k-fs1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_900_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_900_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_900_002,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    // The writer is recorded Running; its durable descendant snapshot
+    // predates the escapee's spawn, and the Execution is already Stopping.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-fs1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Stopping;
+            e.desired_action = Some(DesiredAction::Cancel);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(
+        FreshSnapshotEscapee {
+            escapee: escapee.clone(),
+            inspected: Mutex::new(BTreeSet::new()),
+        },
+        root,
+        vec![],
+        config(),
+    );
+    sup.drive_stops(&store, NOW).unwrap();
+    assert!(
+        sup.port.inspected.lock().unwrap().contains(&escapee.pid),
+        "the just-persisted snapshot must be inspected before settling"
+    );
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Stopping,
+        "a live writer the stale identity set missed must withhold the exit fact"
+    );
+}
+
+/// The poll path owns the proof once an Execution leaves `Stopping`
+/// (e.g. an Uncertain pass on a deferred Cancel): a `setsid` escapee
+/// that only the durable intent still names must be inspected — and
+/// re-signalled — before the exit fact can settle and release
+/// capacity.
+#[test]
+fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
+    use std::path::Path;
+    use std::sync::Mutex;
+    use workloop_core::ports::SpawnError;
+
+    struct IntentEscapee {
+        escapee: ProcessIdentity,
+        signaled: Mutex<Vec<i32>>,
+    }
+    impl ProcessControlPort for IntentEscapee {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            panic!("no spawn in the poll path")
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        // The escapee `setsid`'d out of the group: enumeration cannot
+        // cover it — only the durable intent does.
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, id: &ProcessIdentity) -> ProcessEvidence {
+            if id.pid == self.escapee.pid {
+                ProcessEvidence::Alive {
+                    identity: self.escapee.clone(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: id.clone(),
+                    exit_code: Some(0),
+                }
+            }
+        }
+        fn signal_verified(&self, id: &ProcessIdentity, _: i32) -> SignalOutcome {
+            self.signaled.lock().unwrap().push(id.pid);
+            SignalOutcome::Sent
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::Sent
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("pollintent");
+    let (_w, eid) = submit_and_admit(&store, "k-pi1");
+    let request_id = store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one durable request")
+        .request_id;
+    let leader = ProcessIdentity {
+        pid: 9_800_001,
+        started_at: "leader start".into(),
+        pgid: Some(9_800_001),
+    };
+    let escapee = ProcessIdentity {
+        pid: 9_800_002,
+        started_at: "escapee start".into(),
+        pgid: None,
+    };
+    // The writer is recorded Running and the Execution left Stopping
+    // for a live state — the poll path owns its exit fact now.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-pi1".into()),
+                    request_id: request_id.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Running,
+                    process_identity: Some(leader.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.clone(),
+            })?;
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Running;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Ready,
+            })?;
+            // The durable intent from the earlier stop drive names the
+            // escapee — the only record that still covers it.
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertStopIntent {
+                intent: StopIntent {
+                    invocation_id: InvocationId("inv-pi1".into()),
+                    identities: vec![leader.clone(), escapee.clone()],
+                    recorded_seq: seq,
+                },
+            })
+        })
+        .unwrap();
+    let sup = Supervisor::new(
+        IntentEscapee {
+            escapee: escapee.clone(),
+            signaled: Mutex::new(vec![]),
+        },
+        root,
+        vec![],
+        config(),
+    );
+    sup.poll_invocations(&store, NOW).unwrap();
+    assert!(
+        sup.port.signaled.lock().unwrap().contains(&escapee.pid),
+        "the intent-recorded escapee must be re-signalled, not ignored"
+    );
+    let invocation = store
+        .transact(|tx| tx.invocation_for_request(&request_id))
+        .unwrap()
+        .expect("invocation");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Running,
+        "a live intent-recorded writer withholds the exit fact"
+    );
+}
+
 // ---- Artifact recovery (#10) ----
 
 #[test]
@@ -938,6 +1291,7 @@ fn recovery_artifact_in_the_workspace_root_is_not_truncated() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -1005,6 +1359,7 @@ fn failed_artifact_promotion_is_not_reported_present() {
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -1365,6 +1720,9 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             }
             Ok(vec![identity])
         }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
         fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
             if self.condition == "unknown" {
                 ProcessEvidence::Unknown {
@@ -1414,6 +1772,7 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             process_identity: Some(identity.clone()),
             required_artifacts: vec![],
             evidence_refs: vec![],
+            descendants: vec![],
         };
         let persisted = Cell::new(false);
         let receipt = sup
@@ -1445,6 +1804,9 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             unreachable!()
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
             Ok(vec![])
         }
         fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
@@ -1490,6 +1852,7 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             process_identity: Some(identity.clone()),
             required_artifacts: vec![],
             evidence_refs: vec![],
+            descendants: vec![],
         };
         let sup = Supervisor::new(
             SignalPort(signal),
@@ -1631,6 +1994,7 @@ fn stop_intent_is_durable_before_the_first_signal() {
         process_identity: Some(leader.clone()),
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     };
     let receipt = sup
         .stop_unless_persisted(&invocation, &leader, |mut intent| {
@@ -2140,6 +2504,7 @@ fn a_missing_pid_keeps_the_execution_uncertain_and_releases_nothing() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             tx.apply(&Effect::MarkRequestConsumed {

@@ -154,6 +154,7 @@ fn setup(state: InvocationState) -> (SqliteStore, WorkId, ExecutionId, Invocatio
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             })?;
             let mut execution = tx.execution(&execution_id)?.unwrap();

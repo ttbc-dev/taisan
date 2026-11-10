@@ -672,11 +672,13 @@ fn a_pre_ledger_pin_survives_the_upgrade_and_beats_an_unrelated_clear() {
     let path = register(&store, &dir, "legacy", NOW - 100, Some(NOW - 10), true, 8);
     drop(store);
 
-    // Roll the file back to the previous release's shape: protection
-    // was the bare `pinned` boolean, with no dependency ledger.
+    // Roll the file back to the previous release's shape and its v1
+    // stamp: protection was the bare `pinned` boolean, with no
+    // dependency ledger.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("DROP TABLE body_pins;").unwrap();
+        conn.execute_batch("DROP TABLE body_pins; PRAGMA user_version=1;")
+            .unwrap();
     }
     let store = SqliteStore::open(&db, 1).expect("the previous-release shape upgrades");
 

@@ -1,6 +1,7 @@
 //! `run` driver integration: the single-flight lease refuses a second
-//! driver, reclaims after a crash, `--once` emits one eight-phase tick
-//! report that is also persisted durably, and `--work` scopes a pass.
+//! driver, reclaims after a crash, `--once` emits the terminal envelope
+//! while the eight-phase tick report is persisted durably, and `--work`
+//! scopes a pass.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,7 +71,16 @@ fn run_once_emits_one_eight_phase_tick_report_and_persists_it() {
         "run --once failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    // The run's stdout is its terminal envelope; the tick report
+    // itself is durable in the audit log.
+    let env: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(env["status"], "accepted");
+    assert_eq!(env["command"]["kind"], "run");
+
+    let store = store(&dir);
+    assert_eq!(store.count_events("tick_report").unwrap(), 1);
+    let report: serde_json::Value =
+        serde_json::from_str(&store.events("tick_report").unwrap()[0]).unwrap();
     assert_eq!(report["schema_version"], "1");
     assert_eq!(report["kind"], "tick_report");
     assert_eq!(report["aborted"], false);
@@ -98,10 +108,6 @@ fn run_once_emits_one_eight_phase_tick_report_and_persists_it() {
         phases.iter().all(|p| p["status"] == "completed"),
         "{report}"
     );
-
-    // The same pass is durable in the audit log.
-    let store = store(&dir);
-    assert_eq!(store.count_events("tick_report").unwrap(), 1);
 }
 
 #[test]
@@ -156,7 +162,8 @@ fn the_retention_boundary_is_the_state_root_not_the_callers_cwd() {
         foreign_body.exists(),
         "a body under the caller's cwd is outside the installation state root"
     );
-    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&store.events("tick_report").unwrap()[0]).unwrap();
     let retention = &report["phases"][6];
     assert_eq!(retention["phase"], "retention_sweep");
     assert_eq!(retention["held"][0], "foreign-body:outside_root");
@@ -265,7 +272,8 @@ fn a_scoped_run_admits_only_the_named_work() {
         "scoped run failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&store(&dir).events("tick_report").unwrap()[0]).unwrap();
     assert_eq!(report["scope"], w2.as_str());
 
     assert_eq!(state_of(&dir, &w2), "ready", "the named Work was admitted");
@@ -323,7 +331,7 @@ fn state_of(dir: &Path, work_id: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    v["value"]["executions"][0]["state"]
+    v["result"]["executions"][0]["state"]
         .as_str()
         .unwrap()
         .to_string()
@@ -341,18 +349,20 @@ fn a_bounded_multi_pass_run_reports_each_pass_and_stays_single_flight() {
         "bounded run failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut reports = 0;
-    let stream = serde_json::Deserializer::from_str(&stdout).into_iter::<serde_json::Value>();
-    for item in stream {
-        let value = item.unwrap_or_else(|e| panic!("pass report {reports} is not JSON: {e}"));
+    // stdout carries the run's one terminal envelope; each pass's
+    // report is durable in the audit log instead.
+    let env: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one envelope");
+    assert_eq!(env["status"], "accepted");
+    assert_eq!(env["command"]["kind"], "run");
+    let store = store(&dir);
+    let reports = store.events("tick_report").unwrap();
+    assert_eq!(reports.len(), 2, "one durable report per pass");
+    for payload in &reports {
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
         assert_eq!(value["kind"], "tick_report");
         assert_eq!(value["phases"].as_array().unwrap().len(), 8);
         assert_eq!(value["aborted"], false);
-        reports += 1;
     }
-    assert_eq!(reports, 2, "one report per pass: {stdout}");
-    let store = store(&dir);
     assert_eq!(store.count_events("tick_report").unwrap(), 2);
 }
 
@@ -371,11 +381,9 @@ fn the_inter_pass_gap_is_the_interval_in_seconds() {
         "bounded run failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let reports = serde_json::Deserializer::from_str(&stdout)
-        .into_iter::<serde_json::Value>()
-        .count();
-    assert_eq!(reports, 2, "one report per pass: {stdout}");
+    let env: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one envelope");
+    assert_eq!(env["status"], "accepted");
+    assert_eq!(env["command"]["kind"], "run");
     assert!(
         elapsed >= std::time::Duration::from_secs(1),
         "--interval 1 must space the two passes one second apart, \
@@ -435,7 +443,8 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
         "run --once failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&store.events("tick_report").unwrap()[0]).unwrap();
     let retention = &report["phases"][6];
     assert_eq!(retention["phase"], "retention_sweep");
     let held: Vec<&str> = retention["held"]
@@ -478,7 +487,7 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
 
 #[test]
 fn a_sigint_finishes_the_phase_boundary_and_exits_gracefully() {
-    use std::io::BufReader;
+    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
     let dir = root("sigint");
@@ -502,31 +511,36 @@ fn a_sigint_finishes_the_phase_boundary_and_exits_gracefully() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("taisan run starts");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
 
-    // Consume the first tick report as soon as the pass that produced
-    // it has completed — the signal then arrives while the driver is
-    // between passes.
-    let mut reports = serde_json::Deserializer::from_reader(BufReader::new(stdout))
-        .into_iter::<serde_json::Value>();
-    let first = reports
-        .next()
-        .expect("the first pass reports")
-        .expect("one JSON object");
-    assert_eq!(first["kind"], "tick_report");
-    assert_eq!(first["phases"].as_array().unwrap().len(), 8);
+    // Consume the first pass's stderr diagnostic — stdout stays silent
+    // until the run ends, so per-pass progress is the only live signal.
+    // The signal then arrives while the driver is between passes.
+    let mut stderr_lines = BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = stderr_lines.read_line(&mut line).expect("stderr readable");
+        assert!(n > 0, "driver exited before its first pass: {line}");
+        if line.contains("pass 1") {
+            break;
+        }
+    }
 
     // Without the handler the default disposition kills the driver
     // mid-run; with it the process exits at the phase boundary with 0.
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    for item in reports {
-        item.expect("later reports stay JSON");
-    }
     let status = child.wait().expect("the driver exits");
     assert!(
         status.success(),
         "SIGINT finishes the phase boundary and exits 0: {status}"
     );
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut stdout)
+        .unwrap();
+    let env: serde_json::Value = serde_json::from_str(&stdout).expect("one terminal envelope");
+    assert_eq!(env["status"], "accepted");
+    assert_eq!(env["command"]["kind"], "run");
 
     // The graceful exit released the run lease: the next driver runs.
     let out = run_cli(&dir, &["run", "--once"]);
