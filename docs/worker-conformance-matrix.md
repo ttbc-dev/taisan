@@ -61,7 +61,7 @@ The suite parameterizes over two axes:
 | Row | Required semantics | Scenario / coverage |
 | --- | --- | --- |
 | WC-ART-01 | A confirmed exit without a required artifact runs bounded recovery and then fails `artifact_recovery_exhausted` — never success. | `missing_artifact_runs_bounded_recovery_then_fails` (both providers); `missing_artifact_runs_bounded_recovery_then_fails`, `recovery_artifact_in_the_workspace_root_is_not_truncated` (supervisor suite). |
-| WC-ART-02 | An artifact that cannot count — an empty file (no digest → absent, never `Present`) or content whose digest differs from the required one (`Present` but unsatisfying) — never completes the required set. | `invalid_artifact_never_counts` (both providers). |
+| WC-ART-02 | An artifact that cannot count never completes the required set: an empty file carries no digest and is never recorded `Present`, and content whose digest differs from the required one is never recorded `Present` either — recovery refuses to promote a mismatched payload instead of reporting it. | `invalid_artifact_never_counts` (both providers; after each form the scenario asserts no `Present` observation exists, then that bounded recovery exhausts to `Failed`). |
 
 ## Producer identity and effect authorization
 

@@ -892,25 +892,30 @@ fn invalid_artifact_never_counts(p: &mut dyn WorkerHandle, store: &SqliteStore) 
         e.state == ExecutionState::Waiting
             && e.waiting_reason == Some(WaitingReason::ArtifactRecovery)
     });
+    let any_present = || {
+        store
+            .transact(|tx| tx.observations_for_execution(&eid))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: ArtifactFact::Present { .. },
+                        ..
+                    }
+                )
+            })
+    };
     // An empty artifact carries no digest: it is absent, not Present.
     p.write_workspace_file(&work_id, "artifact.json", "");
     p.recover(store);
-    let present = store
-        .transact(|tx| tx.observations_for_execution(&eid))
-        .unwrap()
-        .iter()
-        .any(|o| {
-            matches!(
-                &o.fact,
-                ObservationFact::Artifact {
-                    state: ArtifactFact::Present { .. },
-                    ..
-                }
-            )
-        });
-    assert!(!present, "an empty artifact is never reported Present");
-    // Real content whose digest cannot match the required one: recorded
-    // Present but never satisfying.
+    assert!(
+        !any_present(),
+        "an empty artifact is never reported Present"
+    );
+    // Real content whose digest cannot match the required one: recovery
+    // never records it Present, so it never satisfies.
     let required_digest = sha256_hex("artifact-v1", b"not-the-artifact");
     store
         .transact(|tx| {
@@ -930,6 +935,10 @@ fn invalid_artifact_never_counts(p: &mut dyn WorkerHandle, store: &SqliteStore) 
         .unwrap();
     p.write_workspace_file(&work_id, "artifact.json", "real-but-wrong-bytes");
     p.recover(store);
+    assert!(
+        !any_present(),
+        "digest-mismatched content is never reported Present"
+    );
     assert_eq!(
         execution(store, &eid).waiting_reason,
         Some(WaitingReason::ArtifactRecovery),
