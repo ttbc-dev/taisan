@@ -567,7 +567,16 @@ fn run(cli: Cli) -> i32 {
             // survive between ticks, or publishes in different ticks
             // restart at PR 1 and a head recheck can never match a PR
             // published in an earlier tick.
-            let supervisor = build_supervisor(&config, &installation, &state_root);
+            let supervisor = match build_supervisor(&config, &installation, &state_root) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             let mut github = FixtureGithub::new();
             // Single-flight: one lease covers the whole run, taken
             // before the first pass and released when this process ends.
@@ -761,19 +770,53 @@ fn run(cli: Cli) -> i32 {
     }
 }
 
+/// `Ok(None)` only when no worker is configured. Handoff
+/// initialization failure is an error, not an absent worker — a `run`
+/// that keeps going without a supervisor admits work no worker ever
+/// consumes.
 fn build_supervisor(
     config: &WorkloopConfig,
     installation: &Installation,
     state_root: &std::path::Path,
-) -> Option<Supervisor<PosixProcessControl>> {
+) -> Result<Option<Supervisor<PosixProcessControl>>, String> {
     if installation.worker_argv.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(Supervisor::new(
-        PosixProcessControl,
-        installation_path(state_root, &installation.workspace_root),
-        installation.worker_argv.clone(),
-        config.clone(),
+    let workspace_root = installation_path(state_root, &installation.workspace_root);
+    // The durable artifact handoff needs an installation-owned bare
+    // repository: bundles export to it, verification worktrees check
+    // out from it. It lives under the workspace root's `.handoff`
+    // directory — never inside a `ws-*` workspace.
+    let handoff_root = workspace_root.join(".handoff");
+    let repository = handoff_root.join("repo.git");
+    if !repository.exists() {
+        std::fs::create_dir_all(&handoff_root)
+            .map_err(|e| format!("handoff dir {}: {e}", handoff_root.display()))?;
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repository)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!(
+                "handoff repository init failed at {}",
+                repository.display()
+            ));
+        }
+    }
+    Ok(Some(
+        Supervisor::new(
+            PosixProcessControl,
+            workspace_root.clone(),
+            installation.worker_argv.clone(),
+            config.clone(),
+        )
+        .with_handoff(workloop_exec::handoff::HandoffLayout {
+            repository,
+            workspace_root,
+            out_root: handoff_root.join("out"),
+        }),
     ))
 }
 

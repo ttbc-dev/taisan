@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
 use workloop_core::domain::WorkId;
+use workloop_core::identity::AdapterId;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
 use workloop_core::store::Store;
@@ -276,25 +277,37 @@ pub fn run_pass(
         }};
     }
 
+    // The in-process fixture owns the host legs only when the
+    // installation binds it; any other adapter identity names an
+    // out-of-process adapter (e.g. the S1 bridge) that performs host
+    // reads and effects against the same store. Running the fixture
+    // then would fabricate `unavailable` source reads and applied
+    // receipts for real pending intents.
+    let in_process_fixture = pass.config.host.adapter == AdapterId::trusted("fixture");
+
     // Phase 1 — source refresh (host adapter, read only).
     if gated!(0) {
-        let refresh_deadline = source_deadline.min(deadline);
-        let result = pass.host.refresh_sources(
-            pass.store,
-            pass.config,
-            clock,
-            Some(refresh_deadline),
-            scope,
-        );
-        push!(match result {
-            Ok(r) => {
-                let mut p = PhaseReport::completed(PHASES[0]);
-                p.processed = r.unchanged + r.ingested;
-                p.deferred = r.deferred;
-                p
-            }
-            Err(e) => PhaseReport::failed(PHASES[0], e),
-        });
+        if !in_process_fixture {
+            push!(PhaseReport::skipped(PHASES[0], "external_adapter"));
+        } else {
+            let refresh_deadline = source_deadline.min(deadline);
+            let result = pass.host.refresh_sources(
+                pass.store,
+                pass.config,
+                clock,
+                Some(refresh_deadline),
+                scope,
+            );
+            push!(match result {
+                Ok(r) => {
+                    let mut p = PhaseReport::completed(PHASES[0]);
+                    p.processed = r.unchanged + r.ingested;
+                    p.deferred = r.deferred;
+                    p
+                }
+                Err(e) => PhaseReport::failed(PHASES[0], e),
+            });
+        }
     }
 
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
@@ -364,27 +377,31 @@ pub fn run_pass(
     // new item, so a late pass defers the drain instead of writing
     // past the deadline).
     if gated!(3) {
-        let result = pass.host.apply_outbox_bounded(
-            pass.store,
-            pass.config,
-            clock,
-            Some(deadline),
-            scope,
-            OUTBOX_ITEMS_PER_TICK,
-        );
-        push!(match result {
-            Ok(r) => {
-                let mut p = PhaseReport::completed(PHASES[3]);
-                p.processed = r.attempted;
-                p.deferred = r.deferred;
-                p.reason = Some(format!(
-                    "applied={} failed={} unknown={}",
-                    r.applied, r.failed, r.unknown
-                ));
-                p
-            }
-            Err(e) => PhaseReport::failed(PHASES[3], e),
-        });
+        if !in_process_fixture {
+            push!(PhaseReport::skipped(PHASES[3], "external_adapter"));
+        } else {
+            let result = pass.host.apply_outbox_bounded(
+                pass.store,
+                pass.config,
+                clock,
+                Some(deadline),
+                scope,
+                OUTBOX_ITEMS_PER_TICK,
+            );
+            push!(match result {
+                Ok(r) => {
+                    let mut p = PhaseReport::completed(PHASES[3]);
+                    p.processed = r.attempted;
+                    p.deferred = r.deferred;
+                    p.reason = Some(format!(
+                        "applied={} failed={} unknown={}",
+                        r.applied, r.failed, r.unknown
+                    ));
+                    p
+                }
+                Err(e) => PhaseReport::failed(PHASES[3], e),
+            });
+        }
     }
 
     // Phase 5 — timed sweep (clock-derived Core decisions; always runs —
