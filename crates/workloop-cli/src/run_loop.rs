@@ -20,7 +20,7 @@
 //! the remaining phases report `shutdown` and the next run re-enters
 //! through phase order; workers are never touched by the signal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
@@ -168,10 +168,19 @@ impl TickReport {
 pub struct PassSettings {
     pub loop_config: LoopConfig,
     pub retention: RetentionConfig,
+    /// The installation's own files — the live store, its SQLite
+    /// sidecars and the config — that the retention sweep must never
+    /// reclaim even though they live under the state root. Supplied by
+    /// the composition root, which is the only place that knows the
+    /// store and config paths.
+    pub protected_paths: Vec<PathBuf>,
 }
 
 impl PassSettings {
-    pub fn from_installation(installation: &Installation) -> Result<Self, String> {
+    pub fn from_installation(
+        installation: &Installation,
+        protected_paths: Vec<PathBuf>,
+    ) -> Result<Self, String> {
         let loop_config = installation.loop_settings();
         if loop_config.interval_seconds == 0 {
             return Err("loop.interval_seconds must be > 0".into());
@@ -197,6 +206,7 @@ impl PassSettings {
         Ok(Self {
             loop_config,
             retention,
+            protected_paths,
         })
     }
 }
@@ -464,6 +474,7 @@ pub fn run_pass(
                     max_bodies: r.max_bodies,
                     max_bytes: r.max_bytes,
                     delete_error_limit: r.delete_error_limit,
+                    protected: pass.settings.protected_paths.clone(),
                 };
                 let result = pass.store.retention_sweep(&params, pass.state_root, now);
                 push!(match result {
@@ -659,6 +670,7 @@ mod tests {
                 source_refresh_timeout_seconds: 30,
             },
             retention: RetentionConfig::default(),
+            protected_paths: Vec::new(),
         }
     }
 
@@ -1275,6 +1287,7 @@ mod tests {
                         role: InvocationRole::Coding,
                         state: InvocationState::Prepared,
                         process_identity: None,
+                        descendants: vec![],
                         required_artifacts: vec![],
                         evidence_refs: vec![],
                     },

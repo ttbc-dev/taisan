@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use workloop_core::domain::{ExecutionId, WorkId};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, IssueRef, SourceSnapshot,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, IssueRef, RepositoryRef, SourceSnapshot,
 };
 use workloop_core::observation::{
     HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
@@ -25,15 +25,22 @@ use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 /// exactly where a real adapter would detect it.
 #[derive(Debug, Default)]
 pub struct FixtureGithub {
-    /// `change_request_id` → current head object id.
+    /// `change_request_id` → current head object id. Change-request ids
+    /// are globally unique (the provider's stable identity), while
+    /// display numbers are per-repository below.
     changes: BTreeMap<String, String>,
-    /// `branch` → current head object id.
-    branches: BTreeMap<String, String>,
+    /// `(repository, branch)` → current head object id — a real host's
+    /// branch namespace is scoped to the repository, so identical branch
+    /// names on two repositories never collide.
+    branches: BTreeMap<(String, String), String>,
     /// `issue` (display form `repo/issue`) → the synthetic remote's
     /// current authoritative read. A declared source with no row is an
     /// unavailable read — the host cannot answer it.
     issues: BTreeMap<String, IssueRead>,
-    next_number: u64,
+    next_id: u64,
+    /// `repository` → next display number: numbering is a per-repository
+    /// namespace, as on a real host.
+    next_number: BTreeMap<String, u64>,
     /// The write history, for test assertions.
     applied: Vec<String>,
 }
@@ -102,6 +109,15 @@ impl FixtureGithub {
 
     pub fn applied(&self) -> &[String] {
         &self.applied
+    }
+
+    /// The head the synthetic remote currently records for
+    /// `(repository, branch)` — a typed read for scoped-identity
+    /// assertions, independent of the write-history encoding.
+    pub fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+        self.branches
+            .get(&(repository.to_string(), branch.to_string()))
+            .cloned()
     }
 
     /// Feed a synthetic Observation (change_head, check, review, an
@@ -405,8 +421,10 @@ impl FixtureGithub {
 
         match &intent.action {
             HostAction::PushRef { branch, produced } => {
-                self.branches
-                    .insert(branch.clone(), produced.object.clone());
+                self.branches.insert(
+                    (intent.repository.to_string(), branch.clone()),
+                    produced.object.clone(),
+                );
                 self.applied.push(format!(
                     "push_ref:{}:{}",
                     intent.repository, produced.object
@@ -433,15 +451,23 @@ impl FixtureGithub {
                 target_branch,
                 ..
             } => {
-                self.next_number += 1;
+                self.next_id += 1;
+                let display = {
+                    let n = self
+                        .next_number
+                        .entry(intent.repository.to_string())
+                        .or_insert(0);
+                    *n += 1;
+                    *n
+                };
                 let change = ChangeRequestRef {
                     repository: intent.repository.clone(),
-                    change_request: ChangeRequestId::trusted(format!("cr-{}", self.next_number)),
-                    display_number: Some(self.next_number),
+                    change_request: ChangeRequestId::trusted(format!("cr-{}", self.next_id)),
+                    display_number: Some(display),
                 };
                 let head_object = self
                     .branches
-                    .get(source_branch)
+                    .get(&(intent.repository.to_string(), source_branch.clone()))
                     .cloned()
                     .unwrap_or_else(|| format!("{source_branch}-head"));
                 self.changes.insert(

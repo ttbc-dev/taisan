@@ -179,6 +179,24 @@ impl ReadView for FailingTx<'_> {
     fn stop_intent(&self, _invocation_id: &InvocationId) -> Result<Option<StopIntent>, StoreError> {
         unimplemented!()
     }
+    fn artifact_handoff(&self, _artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {
+        unimplemented!()
+    }
+    fn handoff_for_invocation(
+        &self,
+        _invocation_id: &InvocationId,
+    ) -> Result<Option<ArtifactHandoff>, StoreError> {
+        unimplemented!()
+    }
+    fn incomplete_handoffs(&self) -> Result<Vec<ArtifactHandoff>, StoreError> {
+        unimplemented!()
+    }
+    fn verification_results(
+        &self,
+        _artifact_id: &str,
+    ) -> Result<Vec<VerificationResult>, StoreError> {
+        unimplemented!()
+    }
     fn deferrals(&self) -> Result<Vec<Deferral>, StoreError> {
         unimplemented!()
     }

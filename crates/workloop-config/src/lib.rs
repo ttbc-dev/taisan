@@ -4,6 +4,8 @@
 //! TUI can never drift on the file they must agree on — whichever
 //! adapter creates it, the other adopts it.
 
+pub mod profile;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -368,7 +370,7 @@ fn load_or_create_with(
             "change_request_create".into(),
             "change_request_read".into(),
             "change_request_update".into(),
-            "comment_create".into(),
+            "comment_write".into(),
             "checks_read".into(),
             "review_findings_read".into(),
             "issue_read".into(),

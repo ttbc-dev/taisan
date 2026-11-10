@@ -3,7 +3,9 @@
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
 
-use std::path::PathBuf;
+mod envelope;
+
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use run_loop::{
@@ -266,33 +268,90 @@ fn print(value: &impl serde::Serialize) {
     );
 }
 
+/// Print the one JSON envelope for a result and hand back its exit code.
+/// Human diagnostics go to stderr only — stdout carries the object.
+fn emit(result: (envelope::Envelope, i32)) -> i32 {
+    let (env, code) = result;
+    if let Some(line) = envelope::diagnostic(&env) {
+        eprintln!("{line}");
+    }
+    print(&env);
+    code
+}
+
 pub(crate) fn main() {
-    let cli = Cli::parse();
-    if let Err(e) = run(cli) {
-        eprintln!("taisan: {e}");
-        std::process::exit(1);
+    let code = match Cli::try_parse() {
+        Ok(cli) => run(cli),
+        Err(e) => {
+            // --help/--version are display requests, not results.
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                0
+            } else {
+                emit(envelope::error_envelope(
+                    None,
+                    envelope::ErrorClass::Usage,
+                    &e.to_string(),
+                ))
+            }
+        }
+    };
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli) -> i32 {
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(|| cli.db.with_extension("config.json"));
-    let installation = load_or_create(&config_path)?;
+    let installation = match load_or_create(&config_path) {
+        Ok(i) => i,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
     let actor = installation.actor();
-    let config = installation.workloop_config()?;
+    let config = match installation.workloop_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
     // State lives beside the store file: CAS bodies, workspaces, out
     // directories and the handoff repository all resolve under this one
     // root. Resolve it once, at startup, so no pass depends on the
     // process working directory.
-    let db_abs = std::path::absolute(&cli.db).map_err(|e| format!("db path: {e}"))?;
+    let db_abs = match std::path::absolute(&cli.db) {
+        Ok(p) => p,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Usage,
+                &format!("db path: {e}"),
+            ));
+        }
+    };
     let state_root = db_abs
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let store =
-        SqliteStore::open(&db_abs, installation.capacity).map_err(|e| format!("store: {e}"))?;
+    let store = match SqliteStore::open(&db_abs, installation.capacity) {
+        Ok(s) => s,
+        Err(e) => return emit(envelope::store_error(&e)),
+    };
     let key = || {
         cli.idempotency_key
             .clone()
@@ -305,6 +364,33 @@ fn run(cli: Cli) -> Result<(), String> {
         body,
     };
 
+    // Input that cannot be shaped into a Command is a usage error: a
+    // bounded JSON envelope on stdout, exit 2, nothing recorded.
+    let usage = |kind: &str, message: &str| -> i32 {
+        emit(envelope::error_envelope(
+            Some(envelope::query_identity(
+                kind,
+                &actor,
+                cli.idempotency_key.as_deref(),
+            )),
+            envelope::ErrorClass::Usage,
+            message,
+        ))
+    };
+    // Every mutation runs through the same lost-response path: a handler
+    // error is resolved by `command-result` under the caller's replay
+    // identity before the CLI concludes anything.
+    let mutation = |req: CommandRequest| -> i32 {
+        let lookup = CommandResultLookup::ReplayKey {
+            origin: req.origin.clone(),
+            actor: req.actor.clone(),
+            idempotency_key: req.idempotency_key.clone(),
+        };
+        let outcome = handle_command(&store, &config, &req, now());
+        emit(envelope::mutation_envelope(&req, &outcome, || {
+            store.transact_deferred(|tx| projection::command_result(tx, &lookup))
+        }))
+    };
     match cli.command {
         Commands::Submit {
             intent,
@@ -315,16 +401,19 @@ fn run(cli: Cli) -> Result<(), String> {
             verification,
         } => {
             if issue.len() != issue_revision.len() || issue.len() != issue_digest.len() {
-                return Err(format!(
-                    "each --issue needs a paired --issue-revision and --issue-digest \
-                     ({} issues, {} revisions, {} digests)",
-                    issue.len(),
-                    issue_revision.len(),
-                    issue_digest.len()
-                ));
+                return usage(
+                    "submit",
+                    &format!(
+                        "each --issue needs a paired --issue-revision and --issue-digest \
+                         ({} issues, {} revisions, {} digests)",
+                        issue.len(),
+                        issue_revision.len(),
+                        issue_digest.len()
+                    ),
+                );
             }
             let host = &config.host.repository.host;
-            let sources = issue
+            let sources = match issue
                 .iter()
                 .zip(&issue_revision)
                 .zip(&issue_digest)
@@ -335,122 +424,105 @@ fn run(cli: Cli) -> Result<(), String> {
                         content_digest: digest.clone(),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            let body = CommandBody::Submit {
+                .collect::<Result<Vec<_>, String>>()
+            {
+                Ok(s) => s,
+                Err(m) => return usage("submit", &m),
+            };
+            mutation(request(CommandBody::Submit {
                 intent,
                 sources,
                 constraints: constraint,
                 verification_argv: verification.iter().map(|s| shlex_split(s)).collect(),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            }))
         }
         Commands::Retry {
             target,
             expected_execution,
-        } => {
-            let body = CommandBody::Retry {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                expected_execution_id: ExecutionId(expected_execution),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        Commands::Resume { target, execution } => {
-            let body = CommandBody::Resume {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                execution_id: ExecutionId(execution),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-        Commands::Cancel { target, execution } => {
-            let body = CommandBody::Cancel {
-                work_id: WorkId(target.work),
-                expected_work_version: target.expected_version,
-                execution_id: execution.map(ExecutionId),
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
-        }
+        } => mutation(request(CommandBody::Retry {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            expected_execution_id: ExecutionId(expected_execution),
+        })),
+        Commands::Resume { target, execution } => mutation(request(CommandBody::Resume {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            execution_id: ExecutionId(execution),
+        })),
+        Commands::Cancel { target, execution } => mutation(request(CommandBody::Cancel {
+            work_id: WorkId(target.work),
+            expected_work_version: target.expected_version,
+            execution_id: execution.map(ExecutionId),
+        })),
         Commands::Acknowledge { target, attention } => {
-            let body = CommandBody::Acknowledge {
+            mutation(request(CommandBody::Acknowledge {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
                 attention_id: attention,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            }))
         }
         Commands::JudgeFindings {
             target,
             head,
             decision,
         } => {
-            let body = CommandBody::JudgeFindings {
+            let expected_head = match parse_head(&head, &config.host.repository) {
+                Ok(h) => h,
+                Err(m) => return usage("judge-findings", &m),
+            };
+            let decisions = match decision
+                .iter()
+                .map(|s| parse_decision(s))
+                .collect::<Result<_, _>>()
+            {
+                Ok(d) => d,
+                Err(m) => return usage("judge-findings", &m),
+            };
+            mutation(request(CommandBody::JudgeFindings {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_head: parse_head(&head, &config.host.repository)?,
-                decisions: decision
-                    .iter()
-                    .map(|s| parse_decision(s))
-                    .collect::<Result<_, _>>()?,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+                expected_head,
+                decisions,
+            }))
         }
         Commands::ReleaseJudgment { target, head } => {
-            let body = CommandBody::ReleaseJudgment {
+            let expected_head = match parse_head(&head, &config.host.repository) {
+                Ok(h) => h,
+                Err(m) => return usage("release-judgment", &m),
+            };
+            mutation(request(CommandBody::ReleaseJudgment {
                 work_id: WorkId(target.work),
                 expected_work_version: target.expected_version,
-                expected_head: parse_head(&head, &config.host.repository)?,
-            };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+                expected_head,
+            }))
         }
         Commands::ClaimResources {
             resource,
             ttl_seconds,
         } => {
-            let body = CommandBody::ClaimResources {
-                resources: resource
-                    .iter()
-                    .map(|s| parse_resource(s, &config.host.repository.host))
-                    .collect::<Result<_, _>>()?,
-                ttl_seconds,
+            let resources = match resource
+                .iter()
+                .map(|s| parse_resource(s, &config.host.repository.host))
+                .collect::<Result<_, _>>()
+            {
+                Ok(r) => r,
+                Err(m) => return usage("claim-resources", &m),
             };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            mutation(request(CommandBody::ClaimResources {
+                resources,
+                ttl_seconds,
+            }))
         }
         Commands::ReleaseResources { resource } => {
-            let body = CommandBody::ReleaseResources {
-                resources: resource
-                    .iter()
-                    .map(|s| parse_resource(s, &config.host.repository.host))
-                    .collect::<Result<_, _>>()?,
+            let resources = match resource
+                .iter()
+                .map(|s| parse_resource(s, &config.host.repository.host))
+                .collect::<Result<_, _>>()
+            {
+                Ok(r) => r,
+                Err(m) => return usage("release-resources", &m),
             };
-            print(
-                &handle_command(&store, &config, &request(body), now())
-                    .map_err(|e| e.to_string())?,
-            );
+            mutation(request(CommandBody::ReleaseResources { resources }))
         }
         Commands::Run {
             once,
@@ -458,14 +530,34 @@ fn run(cli: Cli) -> Result<(), String> {
             interval,
             ticks,
         } => {
+            let identity =
+                || envelope::query_identity("run", &actor, cli.idempotency_key.as_deref());
             // SIGINT/SIGTERM finish the current phase boundary and
             // exit; without the handler the default disposition would
             // kill this process mid-phase.
-            install_shutdown_handler()?;
-            let settings = PassSettings::from_installation(&installation)?;
+            if let Err(e) = install_shutdown_handler() {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Store,
+                    &e,
+                ));
+            }
+            let settings = match PassSettings::from_installation(
+                &installation,
+                installation_files(&db_abs, &config_path),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             let interval = interval.unwrap_or(settings.loop_config.interval_seconds);
             if interval == 0 {
-                return Err("run --interval must be > 0".into());
+                return usage("run", "run --interval must be > 0");
             }
             let scope = work.map(WorkId);
             // One Supervisor across ticks: the per-request start/stop
@@ -482,7 +574,16 @@ fn run(cli: Cli) -> Result<(), String> {
             // A second `run` fails closed with `lock.held`; a crashed
             // run's lease is reclaimed only after its recorded process
             // identity is inspected as gone.
-            let _lease = RunLeaseGuard::acquire(&store, now()).map_err(|e| e.to_string())?;
+            let _lease = match RunLeaseGuard::acquire(&store, now()) {
+                Ok(l) => l,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &e.to_string(),
+                    ));
+                }
+            };
             let mut passes_done = 0u32;
             loop {
                 if shutdown_requested() {
@@ -502,55 +603,128 @@ fn run(cli: Cli) -> Result<(), String> {
                     &mut clock,
                     &shutdown_requested,
                 );
-                // The pass leaves a durable tick report first, then the
-                // same report on stdout — one JSON object per pass.
-                let payload =
-                    serde_json::to_string(&report).map_err(|e| format!("tick report: {e}"))?;
-                store
-                    .append_event("tick_report", &payload)
-                    .map_err(|e| format!("tick report: {e}"))?;
-                print(&report);
+                // The pass leaves a durable tick report first; stdout
+                // stays single-object — per-pass progress is a stderr
+                // diagnostic and the run's one envelope is emitted once
+                // when the bounded run finishes.
+                let payload = match serde_json::to_string(&report) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return emit(envelope::error_envelope(
+                            Some(identity()),
+                            envelope::ErrorClass::Store,
+                            &format!("tick report: {e}"),
+                        ));
+                    }
+                };
+                if let Err(e) = store.append_event("tick_report", &payload) {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &format!("tick report: {e}"),
+                    ));
+                }
                 passes_done += 1;
+                eprintln!(
+                    "taisan: pass {passes_done}: {} phase(s)",
+                    report.phases.len()
+                );
                 if let Some(reason) = report.abort_reason() {
-                    return Err(reason);
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &reason,
+                    ));
                 }
                 if once || (ticks != 0 && passes_done >= ticks) {
                     break;
                 }
                 // Sleep to the next pass in short slices so a signal
                 // during the idle gap exits promptly instead of after
-                // the full interval.
-                let mut remaining = interval;
-                while remaining > 0 && !shutdown_requested() {
-                    let slice = remaining.min(100);
+                // the full interval. The interval is seconds — the
+                // `--interval` help and `loop.interval_seconds` both
+                // say so — so the countdown runs in milliseconds and
+                // the gap lasts the documented cadence, not a
+                // millisecond-scale fraction of it.
+                let mut remaining_ms = interval.saturating_mul(1000);
+                while remaining_ms > 0 && !shutdown_requested() {
+                    let slice = remaining_ms.min(100);
                     std::thread::sleep(std::time::Duration::from_millis(slice));
-                    remaining -= slice;
+                    remaining_ms -= slice;
                 }
             }
+            // The run's terminal result is exactly one envelope — kind
+            // `run`, carrying the final work-list — no matter how many
+            // passes it drove.
+            let list = match store.transact_deferred(|tx| projection::work_list(tx, now())) {
+                Ok(list) => list,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &e.to_string(),
+                    ));
+                }
+            };
+            emit(envelope::query_envelope(&list, identity(), None))
         }
         Commands::WorkList => {
-            let r = store
-                .transact_deferred(|tx| projection::work_list(tx, now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            match store.transact_deferred(|tx| projection::work_list(tx, now())) {
+                Ok(r) => emit(envelope::query_envelope(
+                    &r,
+                    envelope::query_identity("work_list", &actor, cli.idempotency_key.as_deref()),
+                    None,
+                )),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(envelope::query_identity(
+                        "work_list",
+                        &actor,
+                        cli.idempotency_key.as_deref(),
+                    )),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::WorkDetail { work } => {
-            let r = store
-                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work), now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("work_detail", &actor, cli.idempotency_key.as_deref());
+            match store
+                .transact_deferred(|tx| projection::work_detail(tx, &WorkId(work.clone()), now()))
+            {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, Some(work))),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::Attention { work } => {
-            let r = store
-                .transact_deferred(|tx| projection::attention(tx, work.map(WorkId).as_ref(), now()))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("attention", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| {
+                projection::attention(tx, work.clone().map(WorkId).as_ref(), now())
+            }) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, work)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::Capacity => {
-            let r = store
-                .transact_deferred(|tx| projection::capacity(tx))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("capacity", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| projection::capacity(tx)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::CommandResult {
             command_id,
@@ -567,18 +741,24 @@ fn run(cli: Cli) -> Result<(), String> {
                     idempotency_key: replay_key,
                 },
                 _ => {
-                    return Err(
-                        "command-result needs --command-id or --origin + --replay-key".into(),
+                    return usage(
+                        "command-result",
+                        "command-result needs --command-id or --origin + --replay-key",
                     );
                 }
             };
-            let r = store
-                .transact_deferred(|tx| projection::command_result(tx, &lookup))
-                .map_err(|e| e.to_string())?;
-            print(&r);
+            let identity =
+                envelope::query_identity("command_result", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| projection::command_result(tx, &lookup)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
     }
-    Ok(())
 }
 
 fn build_supervisor(
@@ -607,6 +787,22 @@ fn installation_path(state_root: &std::path::Path, configured: &str) -> PathBuf 
     } else {
         state_root.join(path)
     }
+}
+
+/// The installation's own files: the live store, its SQLite sidecars
+/// and the config. All three sit under the state root, so containment
+/// alone would let the retention sweep reclaim them if a catalog row
+/// ever pointed at them; they are declared here, at the composition
+/// root that knows these paths, and the sweep holds them instead.
+fn installation_files(db_abs: &Path, config_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![db_abs.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = db_abs.as_os_str().to_os_string();
+        name.push(suffix);
+        paths.push(PathBuf::from(name));
+    }
+    paths.push(std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf()));
+    paths
 }
 
 #[cfg(test)]
@@ -653,7 +849,7 @@ mod tests {
                 HostCapability::ChangeRequestCreate,
                 HostCapability::ChangeRequestRead,
                 HostCapability::ChangeRequestUpdate,
-                HostCapability::CommentCreate,
+                HostCapability::CommentWrite,
                 HostCapability::ChecksRead,
                 HostCapability::ReviewFindingsRead,
                 HostCapability::IssueRead,
@@ -778,6 +974,7 @@ mod tests {
         let settings = PassSettings {
             loop_config: Default::default(),
             retention: Default::default(),
+            protected_paths: Vec::new(),
         };
         run_pass(
             &mut Pass {

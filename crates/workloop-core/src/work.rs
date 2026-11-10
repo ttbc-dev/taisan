@@ -78,7 +78,7 @@ fn action_capability(action: &HostAction) -> HostCapability {
         HostAction::PushRef { .. } => HostCapability::PushRef,
         HostAction::OpenChangeRequest { .. } => HostCapability::ChangeRequestCreate,
         HostAction::UpdateChangeRequest { .. } => HostCapability::ChangeRequestUpdate,
-        HostAction::PostComment { .. } => HostCapability::CommentCreate,
+        HostAction::PostComment { .. } => HostCapability::CommentWrite,
     }
 }
 

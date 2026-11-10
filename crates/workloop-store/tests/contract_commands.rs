@@ -2103,6 +2103,7 @@ fn recording_an_invocation_consumes_only_its_request() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             },
             Effect::MarkRequestConsumed {
@@ -2172,6 +2173,7 @@ fn recording_an_invocation_without_a_request_row_leaves_pending_alone() {
                     process_identity: None,
                     required_artifacts: vec![],
                     evidence_refs: vec![],
+                    descendants: vec![],
                 },
             },
             Effect::MarkRequestConsumed {
@@ -2733,6 +2735,7 @@ fn recorded_invocation(eid: &ExecutionId, id: &str) -> Invocation {
         process_identity: None,
         required_artifacts: vec![],
         evidence_refs: vec![],
+        descendants: vec![],
     }
 }
 
@@ -3421,6 +3424,43 @@ fn a_newer_store_format_is_refused() {
         Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
         Ok(_) => panic!("expected UnsupportedFormat, got an open store"),
     }
+}
+
+/// Regression: a genuine v1 file upgrades to v2 in place — the new
+/// tables and the invocations.descendants column appear and stamped
+/// rows survive; a second open is a no-op because the migration is
+/// idempotent.
+#[test]
+fn a_v1_store_upgrades_to_v2_preserving_rows() {
+    let root = temp_root("upgrade-v1");
+    let db = root.join("store.db");
+    let request = submit("k-upgrade");
+    let (work_id, _) = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
+    };
+    // Reshape the file into a real v1 store: drop the v2 additions and
+    // the descendants column, then stamp user_version=1.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE artifact_handoffs;
+             DROP TABLE verification_results;
+             ALTER TABLE invocations DROP COLUMN descendants;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    let store = SqliteStore::open(&db, 1).unwrap();
+    store
+        .transact(|tx| {
+            let work = tx.work(&work_id)?.expect("work row survives the upgrade");
+            assert_eq!(work.version, 1);
+            Ok(())
+        })
+        .unwrap();
+    // A second open must not re-migrate — the schema is already v2.
+    let _ = SqliteStore::open(&db, 1).unwrap();
 }
 
 /// Regression (acceptance): new-format records survive a reopen — the
@@ -4397,12 +4437,14 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
             accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap());
         (work_id, execution_id)
     };
-    // Roll the file back to the previous release's table set: every
-    // base table intact, none of the additive tables this slice added.
+    // Roll the file back to the previous release's table set and its
+    // v1 stamp: every base table intact, the additive tables this
+    // slice added dropped.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP TABLE run_lease; DROP TABLE recovery_intents; DROP TABLE body_catalog;",
+            "DROP TABLE run_lease; DROP TABLE recovery_intents; DROP TABLE body_catalog; \
+             PRAGMA user_version=1;",
         )
         .unwrap();
     }
@@ -4427,7 +4469,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1, "the upgrade does not change the format");
+        assert_eq!(version, 2, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

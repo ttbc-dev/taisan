@@ -10,12 +10,12 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `1` is the only supported
-//! version. An unversioned database with user tables is a slice-0 file —
-//! archive-only, refused at open — and a newer version is refused. A v1
-//! file from the previous release (full base schema, none of this
-//! slice's additive tables) is upgraded in place; any other v1 file
-//! that is missing tables is foreign and refused.
+//! `PRAGMA user_version` is the format gate: `2` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` must carry the complete
+//! recognized v1 schema and upgrades additively at open; a stamped file
+//! whose schema is foreign or incomplete, an unversioned database with
+//! user tables (a slice-0 file — archive-only), and a newer version are
+//! all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -33,8 +33,10 @@ use workloop_core::store::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// The only store format this binary reads or writes.
-const FORMAT_VERSION: i64 = 1;
+/// The only store format this binary reads or writes. `2` adds the
+/// `invocations.descendants` column and the artifact-handoff and
+/// verification tables; v1 files upgrade additively at open.
+const FORMAT_VERSION: i64 = 2;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -42,6 +44,7 @@ const FORMAT_VERSION: i64 = 1;
 /// previous release's v1 store, which holds every table except
 /// [`ADDITIVE_TABLES`] and is upgraded in place.
 const EXPECTED_TABLES: &[&str] = &[
+    "artifact_handoffs",
     "attention_acks",
     "body_catalog",
     "body_pins",
@@ -66,17 +69,24 @@ const EXPECTED_TABLES: &[&str] = &[
     "specs",
     "stop_intents",
     "store_meta",
+    "verification_results",
     "work_issue_refs",
     "work_usage",
     "works",
 ];
 
-/// The tables this slice added on top of the previous release's v1
-/// store. A v1 file missing only these is that earlier store — every
-/// other expected table is present — and is upgraded in place by
-/// installing them. A v1 file missing anything else is foreign and is
-/// refused exactly as before.
+/// The tables the run-lease slice added on top of the previous
+/// release's v1 store while it was still stamped `1`. Together with
+/// [`V2_ADDED_TABLES`] they are the set a stamped v1 file may
+/// legitimately lack and still be upgraded in place by the additive
+/// migration.
 const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
+
+/// Tables the v1 → v2 migration adds. Everything else in
+/// `EXPECTED_TABLES` must already be present for a `user_version=1`
+/// file to migrate — that check is what keeps a foreign stamped file
+/// refused instead of silently reshaped.
+const V2_ADDED_TABLES: &[&str] = &["artifact_handoffs", "verification_results"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -172,23 +182,32 @@ impl SqliteStore {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(internal)?;
-        if version != 0 && version != FORMAT_VERSION {
+        if version != 0 && !(1..=FORMAT_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedFormat {
                 detail: format!("store format {version} is newer than supported {FORMAT_VERSION}"),
             });
         }
+        // A version stamp alone is not proof this is our store: verify
+        // the schema shape before any mutating pragma. A foreign or
+        // truncated file carrying the stamp is refused as unsupported —
+        // never WAL-flipped, migrated, or seeded first.
+        let table_set =
+            |conn: &Connection| -> Result<std::collections::HashSet<String>, StoreError> {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master \
+                     WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .map_err(internal)?;
+                stmt.query_map([], |r| r.get(0))
+                    .map_err(internal)?
+                    .collect::<Result<_, _>>()
+                    .map_err(internal)
+            };
+
         let mut bootstrapping = false;
-        let mut upgrading = false;
         if version == 0 {
-            let has_tables: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                     WHERE type='table' AND name NOT LIKE 'sqlite_%')",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(internal)?;
-            if has_tables {
+            if !table_set(&conn)?.is_empty() {
                 return Err(StoreError::UnsupportedFormat {
                     detail: "unversioned store file (pre-v1 format); \
                              archive it and start a new store"
@@ -196,71 +215,51 @@ impl SqliteStore {
                 });
             }
             bootstrapping = true;
-        } else {
-            // A v1 stamp alone is not proof this is our store: verify the
-            // schema shape before any mutating pragma. A foreign or
-            // truncated file carrying version 1 is refused as unsupported
-            // — never WAL-flipped and seeded first. The one accepted
-            // difference is the previous release's store: it holds every
-            // expected table except the additive ones this slice installs,
-            // so it is upgraded in place instead of being locked out with
-            // a misleading "not the recognized schema" refusal.
-            let mut stmt = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master \
-                     WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        } else if version < FORMAT_VERSION {
+            // A v1 → v2 migration is legitimate only for a file that
+            // holds the complete v1 schema: every expected table except
+            // the ones added since v1 — the run-lease slice's additive
+            // set plus the two v2 additions — must already be present.
+            // A foreign file stamped 1 fails this check untouched, and
+            // the one accepted difference is the previous release's
+            // store: it holds every base table and none of the
+            // additions, so it is upgraded in place instead of being
+            // locked out with a misleading "not the recognized schema"
+            // refusal.
+            let present = table_set(&conn)?;
+            let v1_complete = EXPECTED_TABLES
+                .iter()
+                .filter(|t| !V2_ADDED_TABLES.contains(t) && !ADDITIVE_TABLES.contains(t))
+                .all(|t| present.contains(*t));
+            if !v1_complete {
+                return Err(StoreError::UnsupportedFormat {
+                    detail: "store file claims the v1 format but does \
+                             not hold the recognized schema"
+                        .into(),
+                });
+            }
+            // Additive migration inside one transaction: the new tables
+            // plus invocations.descendants and the pin-ledger
+            // reconstruction. A crash leaves the file stamped 1 and the
+            // migration reruns idempotently (CREATE IF NOT EXISTS; the
+            // column check guards a partial ALTER; the ledger insert is
+            // guarded by NOT EXISTS).
+            let tx = conn.unchecked_transaction().map_err(internal)?;
+            tx.execute_batch(SCHEMA).map_err(internal)?;
+            let has_descendants: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocations') \
+                     WHERE name='descendants')",
+                    [],
+                    |r| r.get(0),
                 )
                 .map_err(internal)?;
-            let present: std::collections::HashSet<String> = stmt
-                .query_map([], |r| r.get(0))
-                .map_err(internal)?
-                .collect::<Result<_, _>>()
+            if !has_descendants {
+                tx.execute_batch(
+                    "ALTER TABLE invocations ADD COLUMN descendants TEXT NOT NULL DEFAULT '[]'",
+                )
                 .map_err(internal)?;
-            let missing: Vec<&str> = EXPECTED_TABLES
-                .iter()
-                .copied()
-                .filter(|t| !present.contains(*t))
-                .collect();
-            if !missing.is_empty() {
-                if missing.iter().all(|t| ADDITIVE_TABLES.contains(t)) {
-                    upgrading = true;
-                } else {
-                    return Err(StoreError::UnsupportedFormat {
-                        detail: "store file claims the current format but does \
-                                 not hold the recognized schema"
-                            .into(),
-                    });
-                }
             }
-        }
-        // journal_mode cannot change inside a transaction, so it is set
-        // here — only for a file the gate accepted.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(internal)?;
-        if bootstrapping {
-            // Bootstrap is one transaction: schema, format version, and
-            // the store_meta row land together or not at all, so a crash
-            // can never leave a table-bearing version-0 file (refused as
-            // a legacy archive on next open) or a v1 store without a
-            // store_id.
-            let tx = conn.unchecked_transaction().map_err(internal)?;
-            tx.execute_batch(SCHEMA).map_err(internal)?;
-            tx.pragma_update(None, "user_version", FORMAT_VERSION)
-                .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO store_meta (key, value) VALUES ('store_id', ?1)",
-                params![new_id("store")],
-            )
-            .map_err(internal)?;
-            tx.commit().map_err(internal)?;
-        } else if upgrading {
-            // Previous-release v1 store: install only the missing
-            // additive tables. `SCHEMA` is entirely `CREATE TABLE IF
-            // NOT EXISTS`, so a re-run is a no-op and a crash mid-way
-            // resumes on the next open. `user_version` stays 1 — the
-            // format did not change, the recognized table set grew.
-            let tx = conn.unchecked_transaction().map_err(internal)?;
-            tx.execute_batch(SCHEMA).map_err(internal)?;
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
             // unnamed `registered` dependency so the materialized flag
@@ -273,6 +272,39 @@ impl SqliteStore {
                    AND NOT EXISTS (SELECT 1 FROM body_pins AS p \
                                    WHERE p.body_id = c.body_id)",
                 [],
+            )
+            .map_err(internal)?;
+            tx.pragma_update(None, "user_version", FORMAT_VERSION)
+                .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
+        if !bootstrapping {
+            let present = table_set(&conn)?;
+            if !EXPECTED_TABLES.iter().all(|t| present.contains(*t)) {
+                return Err(StoreError::UnsupportedFormat {
+                    detail: "store file claims the current format but does \
+                             not hold the recognized schema"
+                        .into(),
+                });
+            }
+        }
+        // journal_mode cannot change inside a transaction, so it is set
+        // here — only for a file the gate accepted.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(internal)?;
+        if bootstrapping {
+            // Bootstrap is one transaction: schema, format version, and
+            // the store_meta row land together or not at all, so a crash
+            // can never leave a table-bearing version-0 file (refused as
+            // a legacy archive on next open) or a stamped store without a
+            // store_id.
+            let tx = conn.unchecked_transaction().map_err(internal)?;
+            tx.execute_batch(SCHEMA).map_err(internal)?;
+            tx.pragma_update(None, "user_version", FORMAT_VERSION)
+                .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('store_id', ?1)",
+                params![new_id("store")],
             )
             .map_err(internal)?;
             tx.commit().map_err(internal)?;
@@ -403,6 +435,21 @@ impl SqliteStore {
             )
             .map_err(map_err)?;
         Ok(n as usize)
+    }
+
+    /// The audit-log payloads for one kind, in sequence order — used to
+    /// inspect durable per-pass records (e.g. `tick_report`) after a run.
+    pub fn events(&self, kind: &str) -> Result<Vec<String>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let mut stmt = guard
+            .prepare("SELECT payload FROM event_log WHERE kind=?1 ORDER BY seq")
+            .map_err(map_err)?;
+        stmt.query_map(params![kind], |r| r.get(0))
+            .map_err(map_err)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(map_err)
     }
 
     /// Append one non-effect event to the audit log (e.g. a durable tick
@@ -627,7 +674,7 @@ const EXECUTION_COLS: &str = "id, work_id, ordinal, state, waiting_reason, \
     uncertain_since_unix_seconds, paused_since_unix_seconds, next_role";
 
 const INVOCATION_COLS: &str = "id, request_id, execution_id, role, state, \
-    process_identity, required_artifacts, evidence_refs";
+    process_identity, descendants, required_artifacts, evidence_refs";
 
 fn invocation_from_row(row: &rusqlite::Row<'_>) -> Result<Invocation, rusqlite::Error> {
     Ok(Invocation {
@@ -637,8 +684,47 @@ fn invocation_from_row(row: &rusqlite::Row<'_>) -> Result<Invocation, rusqlite::
         role: untag(&row.get::<_, String>(3)?)?,
         state: untag(&row.get::<_, String>(4)?)?,
         process_identity: opt_de_row(row.get::<_, Option<String>>(5)?)?,
-        required_artifacts: de_row(&row.get::<_, String>(6)?)?,
-        evidence_refs: de_row(&row.get::<_, String>(7)?)?,
+        descendants: de_row(&row.get::<_, String>(6)?)?,
+        required_artifacts: de_row(&row.get::<_, String>(7)?)?,
+        evidence_refs: de_row(&row.get::<_, String>(8)?)?,
+    })
+}
+
+const HANDOFF_COLS: &str = "artifact_id, invocation_id, request_id, work_id, \
+    execution_id, base, produced, manifest_digest, state, invalid_reason, \
+    attempt, recorded_seq";
+
+fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite::Error> {
+    Ok(ArtifactHandoff {
+        artifact_id: row.get(0)?,
+        invocation_id: InvocationId(row.get::<_, String>(1)?),
+        request_id: row.get(2)?,
+        work_id: WorkId(row.get::<_, String>(3)?),
+        execution_id: ExecutionId(row.get::<_, String>(4)?),
+        base: row.get(5)?,
+        produced: row.get(6)?,
+        manifest_digest: row.get(7)?,
+        state: untag(&row.get::<_, String>(8)?)?,
+        invalid_reason: row.get(9)?,
+        attempt: row.get::<_, u32>(10)?,
+        recorded_seq: row.get(11)?,
+    })
+}
+
+const VERIFICATION_COLS: &str = "id, artifact_id, requirement, argv, produced, \
+    environment_digest, result, output, recorded_seq";
+
+fn verification_from_row(row: &rusqlite::Row<'_>) -> Result<VerificationResult, rusqlite::Error> {
+    Ok(VerificationResult {
+        id: row.get(0)?,
+        artifact_id: row.get(1)?,
+        requirement: row.get(2)?,
+        argv: de_row(&row.get::<_, String>(3)?)?,
+        produced: row.get(4)?,
+        environment_digest: row.get(5)?,
+        result: untag(&row.get::<_, String>(6)?)?,
+        output: row.get(7)?,
+        recorded_seq: row.get(8)?,
     })
 }
 
@@ -1215,6 +1301,53 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {
+        self.query_opt(
+            &format!("SELECT {HANDOFF_COLS} FROM artifact_handoffs WHERE artifact_id=?1"),
+            params![artifact_id],
+            handoff_from_row,
+        )
+    }
+
+    fn handoff_for_invocation(
+        &self,
+        invocation_id: &InvocationId,
+    ) -> Result<Option<ArtifactHandoff>, StoreError> {
+        self.query_opt(
+            &format!(
+                "SELECT {HANDOFF_COLS} FROM artifact_handoffs \
+                 WHERE invocation_id=?1 ORDER BY artifact_id"
+            ),
+            params![invocation_id.0],
+            handoff_from_row,
+        )
+    }
+
+    fn incomplete_handoffs(&self) -> Result<Vec<ArtifactHandoff>, StoreError> {
+        self.query_all(
+            &format!(
+                "SELECT {HANDOFF_COLS} FROM artifact_handoffs \
+                 WHERE state NOT IN ('acknowledged','invalid') ORDER BY recorded_seq"
+            ),
+            [],
+            handoff_from_row,
+        )
+    }
+
+    fn verification_results(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Vec<VerificationResult>, StoreError> {
+        self.query_all(
+            &format!(
+                "SELECT {VERIFICATION_COLS} FROM verification_results \
+                 WHERE artifact_id=?1 ORDER BY recorded_seq"
+            ),
+            params![artifact_id],
+            verification_from_row,
+        )
+    }
+
     fn deferrals(&self) -> Result<Vec<Deferral>, StoreError> {
         self.query_all(
             "SELECT execution_id, reason, diagnostic, since_seq FROM deferrals",
@@ -1582,8 +1715,8 @@ impl TxView for Tx<'_> {
             Effect::InsertInvocation { invocation } => {
                 self.exec(
                     "INSERT INTO invocations (id, request_id, execution_id, role, \
-                     state, process_identity, required_artifacts, evidence_refs) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                     state, process_identity, descendants, required_artifacts, \
+                     evidence_refs) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![
                         invocation.id.0,
                         invocation.request_id,
@@ -1591,6 +1724,7 @@ impl TxView for Tx<'_> {
                         tag(&invocation.role),
                         tag(&invocation.state),
                         invocation.process_identity.as_ref().map(json).transpose()?,
+                        json(&invocation.descendants)?,
                         json(&invocation.required_artifacts)?,
                         json(&invocation.evidence_refs)?,
                     ],
@@ -1602,12 +1736,13 @@ impl TxView for Tx<'_> {
             } => {
                 let n = self.exec(
                     "UPDATE invocations SET state=?2, process_identity=?3, \
-                     required_artifacts=?4, evidence_refs=?5 \
-                     WHERE id=?1 AND state=?6",
+                     descendants=?4, required_artifacts=?5, evidence_refs=?6 \
+                     WHERE id=?1 AND state=?7",
                     params![
                         invocation.id.0,
                         tag(&invocation.state),
                         invocation.process_identity.as_ref().map(json).transpose()?,
+                        json(&invocation.descendants)?,
                         json(&invocation.required_artifacts)?,
                         json(&invocation.evidence_refs)?,
                         tag(expected_state),
@@ -1911,6 +2046,74 @@ impl TxView for Tx<'_> {
                 self.exec(
                     "UPDATE invocation_requests SET consumed=1 WHERE request_id=?1",
                     params![request_id],
+                )?;
+            }
+            Effect::UpsertHandoff {
+                handoff,
+                expected_seq,
+            } => {
+                // Compare-and-set on recorded_seq: a concurrent
+                // supervisor's write first lands here, and the loser's
+                // write becomes a conflict instead of regressing the
+                // row it read before doing its git work.
+                let n = self.exec(
+                    "INSERT INTO artifact_handoffs (artifact_id, invocation_id, \
+                     request_id, work_id, execution_id, base, produced, \
+                     manifest_digest, state, invalid_reason, attempt, \
+                     recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+                     ON CONFLICT(artifact_id) DO UPDATE SET base=?6, produced=?7, \
+                     manifest_digest=?8, state=?9, invalid_reason=?10, \
+                     attempt=?11, recorded_seq=?12 \
+                     WHERE artifact_handoffs.recorded_seq=?13",
+                    params![
+                        handoff.artifact_id,
+                        handoff.invocation_id.0,
+                        handoff.request_id,
+                        handoff.work_id.0,
+                        handoff.execution_id.0,
+                        handoff.base,
+                        handoff.produced,
+                        handoff.manifest_digest,
+                        tag(&handoff.state),
+                        handoff.invalid_reason,
+                        handoff.attempt,
+                        handoff.recorded_seq,
+                        expected_seq,
+                    ],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "artifact_handoffs {} advanced concurrently",
+                            handoff.artifact_id
+                        ),
+                    });
+                }
+            }
+            Effect::InsertVerificationResult { result } => {
+                // One row per (artifact, requirement): a retried
+                // inconclusive run replaces its previous record so the
+                // latest result is the evidence of record.
+                self.exec(
+                    "INSERT INTO verification_results (id, artifact_id, \
+                     requirement, argv, produced, environment_digest, result, \
+                     output, recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                     ON CONFLICT (artifact_id, requirement) DO UPDATE SET \
+                     id=excluded.id, argv=excluded.argv, produced=excluded.produced, \
+                     environment_digest=excluded.environment_digest, \
+                     result=excluded.result, output=excluded.output, \
+                     recorded_seq=excluded.recorded_seq",
+                    params![
+                        result.id,
+                        result.artifact_id,
+                        result.requirement,
+                        json(&result.argv)?,
+                        result.produced,
+                        result.environment_digest,
+                        tag(&result.result),
+                        result.output,
+                        result.recorded_seq,
+                    ],
                 )?;
             }
         }
