@@ -401,11 +401,10 @@ fn expected_head_mismatch_aborts_write(
         })
         .expect("opened change request");
 
-    // Move the remote head under the recorded intent. The guard is
-    // exercised only because the expected head really was the opened
-    // head — the mismatch must be caused by the move.
-    let writes_before = fixture.applied().len();
-    fixture.set_change_head(&repo(), change.change_request.as_str(), "moved-head");
+    // The same write lands while the recorded head still matches: an
+    // applied receipt carrying the metadata-update fact — the success
+    // branch every head-bound-capable fixture implements, not only the
+    // abort.
     insert_intent(
         store,
         &work_id,
@@ -422,6 +421,41 @@ fn expected_head_mismatch_aborts_write(
     let update = intents
         .iter()
         .find(|i| matches!(i.action, HostAction::UpdateChangeRequest { .. }))
+        .unwrap();
+    assert_eq!(update.status, HostActionStatus::Applied);
+    match &update.effects[..] {
+        [
+            NormalizedEffectFact::MetadataUpdated {
+                change: c, head, ..
+            },
+        ] => {
+            assert_eq!(*c, change);
+            assert_eq!(*head, opened_head);
+        }
+        other => panic!("update receipt missing MetadataUpdated fact: {other:?}"),
+    }
+
+    // Move the remote head under the recorded intent. The guard is
+    // exercised only because the expected head really was the opened
+    // head — the mismatch must be caused by the move.
+    let writes_before = fixture.applied().len();
+    fixture.set_change_head(&repo(), change.change_request.as_str(), "moved-head");
+    let aborted_update_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::UpdateChangeRequest {
+            change: change.clone(),
+            expected_head: opened_head.clone(),
+            title: Some("edited".into()),
+            body: None,
+        },
+    );
+    fixture.apply(store, config);
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    let update = intents
+        .iter()
+        .find(|i| i.action_id == aborted_update_id)
         .unwrap();
     assert!(
         matches!(update.status, HostActionStatus::Failed { .. }),
@@ -762,8 +796,17 @@ fn scoped_identities_do_not_collide(
 ) {
     let (work_a, _ea) = submit(store, config, "hc-scope-a");
     let (work_b, _eb) = submit(store, config, "hc-scope-b");
+    // A repository namespace only this scenario opens against: its
+    // first change request is display #1 no matter what the suite ran
+    // before — the per-repository-numbering assertion stays true for
+    // any scenario order or fixture state, not just the current one.
+    let repo_scoped = RepositoryRef::new(host(), RepositoryId::trusted("hc-scoped-repo"));
     let mut push_ids = Vec::new();
-    for (work, repository, object) in [(&work_a, repo(), "head-a"), (&work_b, repo_b(), "head-b")] {
+    for (work, repository, object) in [
+        (&work_a, repo(), "head-a"),
+        (&work_b, repo_b(), "head-b"),
+        (&work_a, repo_scoped.clone(), "head-scoped"),
+    ] {
         push_ids.push(insert_intent(
             store,
             work,
@@ -775,7 +818,11 @@ fn scoped_identities_do_not_collide(
         ));
     }
     let mut open_ids = Vec::new();
-    for (work, repository) in [(&work_a, repo()), (&work_b, repo_b())] {
+    for (work, repository) in [
+        (&work_a, repo()),
+        (&work_b, repo_b()),
+        (&work_a, repo_scoped.clone()),
+    ] {
         open_ids.push(insert_intent(
             store,
             work,
@@ -796,7 +843,7 @@ fn scoped_identities_do_not_collide(
         .iter()
         .filter(|i| push_ids.contains(&i.action_id) || open_ids.contains(&i.action_id))
         .collect();
-    assert_eq!(mine.len(), 4, "two pushes and two opens");
+    assert_eq!(mine.len(), 6, "three pushes and three opens");
     for i in mine {
         assert_eq!(i.status, HostActionStatus::Applied);
         match &i.effects[..] {
@@ -812,11 +859,11 @@ fn scoped_identities_do_not_collide(
     }
     assert_eq!(
         bound,
-        BTreeSet::from([repo(), repo_b()]),
+        BTreeSet::from([repo(), repo_b(), repo_scoped.clone()]),
         "each receipt keeps its own repository binding"
     );
     // The remote itself kept the writes separate: identical branch
-    // names on two repositories each retain their own head object.
+    // names on three repositories each retain their own head object.
     assert_eq!(
         fixture.remote_head(&repo(), "work/shared-name"),
         Some("head-a".to_string()),
@@ -827,15 +874,17 @@ fn scoped_identities_do_not_collide(
         Some("head-b".to_string()),
         "repo B's remote branch keeps its own head"
     );
-    // Display numbers are a per-repository namespace: repo B's first
-    // change request is #1 even though repo A has already numbered
-    // several — under a global counter it could not be 1.
-    assert_eq!(display.get(&repo_b()), Some(&Some(1)));
-    assert_ne!(
-        display.get(&repo()),
-        Some(&Some(1)),
-        "repo A's counter advanced independently"
+    assert_eq!(
+        fixture.remote_head(&repo_scoped, "work/shared-name"),
+        Some("head-scoped".to_string()),
+        "the scoped repository's branch keeps its own head"
     );
+    // Display numbers are a per-repository namespace: `hc-scoped-repo`
+    // is opened only by this scenario, so its first change request is
+    // #1 even though this scenario already numbered repositories A and
+    // B — under a global counter it could not be 1, whatever earlier
+    // scenarios left behind.
+    assert_eq!(display.get(&repo_scoped), Some(&Some(1)));
 }
 
 /// HC-SWAP-01: a configuration change after an intent was recorded does
@@ -1080,28 +1129,14 @@ fn gitlab_fixture_undeclared_issue_read_rejects_source_bound_work() {
     }
 }
 
-/// Approval and readiness are not in this contract version's
-/// vocabulary: neither a capability declaration nor an applied receipt
-/// for them is constructible, so an unsupported approval/ready can
-/// never be counted as applied — the unsupported state stays explicit
-/// at the type level on every conforming fixture.
+/// Approval and readiness stay outside the *write* vocabulary: their
+/// capability names exist (a fixture may declare them for read-side
+/// use), but no `HostAction` variant carries an approval, readiness, or
+/// thread write, so an applied receipt for one is not constructible —
+/// the unsupported state stays explicit at the type level on every
+/// conforming fixture.
 #[test]
 fn approval_and_ready_stay_explicitly_unsupported() {
-    for name in [
-        "approve",
-        "ready",
-        "mark_ready",
-        "review_feedback",
-        "request_changes",
-        "inline_comment",
-        "thread_reply",
-    ] {
-        assert_eq!(
-            HostCapability::from_name(name),
-            None,
-            "capability {name} cannot be declared in this contract version"
-        );
-    }
     for action in [
         serde_json::json!({ "action": "approve_change" }),
         serde_json::json!({ "action": "mark_ready" }),

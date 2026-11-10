@@ -34,7 +34,7 @@ skipped for that row, never substituted. Suite runner:
 | Matrix row | FixtureGithub | GitlabFixture | SparseHost | Live GitLab spike |
 | --- | --- | --- | --- | --- |
 | HC-BASE-01/02 baseline effects | covered | covered | covered | incomplete — spike not run |
-| HC-BASE-03/04 head-bound writes | covered | covered | skipped (no `change_request_update`/`comment_create`) | incomplete — spike not run |
+| HC-BASE-03/04 head-bound writes | covered — update applies against the recorded head, then aborts on a moved head | covered — same applied-then-aborted update | skipped (no `change_request_update`/`comment_create`) | incomplete — spike not run |
 | HC-PART-01 partial receipts | covered | covered | covered | incomplete — spike not run |
 | HC-SNAP-01 stale-head evidence | covered | covered | covered | incomplete — spike not run |
 | HC-PERM-01 denied vs unsupported | covered | covered | covered | incomplete — spike not run |
@@ -43,17 +43,18 @@ skipped for that row, never substituted. Suite runner:
 | HC-CAP-01 admission gate | covered | covered — plus `gitlab_fixture_undeclared_issue_read_rejects_source_bound_work` | covered | incomplete — spike not run |
 | HC-CAP-02 explicit unsupported | not exercised — implements every declared operation | not exercised — implements every declared operation | covered (`failed` receipts) | incomplete — spike not run |
 | HC-CAP-03 approval/ready explicit | covered — `approval_and_ready_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
-| HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | covered (fixture adapter suite) | incomplete — spike not run |
-| HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | covered (fixture adapter suite) | incomplete — spike not run |
+| HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
+| HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-READ-01 typed reads | incomplete — read-model ops not in vocabulary | incomplete — same | incomplete — same | incomplete |
 | HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete |
 
 HC-CAP-02 measures a fixture's own explicit-unsupported behavior; a
 fixture implementing every declared operation has nothing to exercise
 there, so only `SparseHost` covers the row. HC-CAP-03 is a single
-fixture-independent, type-level check — `approve`/`mark_ready` exist in
-no capability name, `HostAction` variant, or deserialization path — so
-one test covers all fixtures and any future host implementation.
+fixture-independent, type-level check — `approve`/`mark_ready` exist as
+capability names but in no `HostAction` variant or deserialization
+path, so no applied receipt is constructible — one test covers all
+fixtures and any future host implementation.
 
 Cross-fixture selection and non-migration under a configuration swap
 are exercised separately by
