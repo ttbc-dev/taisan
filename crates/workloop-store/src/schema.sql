@@ -301,3 +301,64 @@ CREATE TABLE IF NOT EXISTS recovery_decisions (
     usage_after TEXT NOT NULL,
     seq INTEGER NOT NULL
 );
+
+-- Single-flight run lease: at most one loop driver per installation.
+-- The recorded owner identity (pid + opaque start-time verifier) lets a
+-- contender re-inspect the holder: a live owner is never displaced, a
+-- provably gone owner's lease is reclaimed, and an unreadable inspection
+-- fails closed. Ordinary Commands and Queries never touch this row.
+CREATE TABLE IF NOT EXISTS run_lease (
+    lease_key TEXT PRIMARY KEY,
+    owner_pid INTEGER NOT NULL,
+    owner_started_at TEXT NOT NULL,
+    owner_nonce TEXT NOT NULL,
+    acquired_unix_seconds INTEGER NOT NULL
+);
+
+-- Durable recovery intents: (pending | consumed | retired), scheduled
+-- in the deciding transaction and fired exactly once by the loop's
+-- recovery-scheduling phase. `generation` pins retirement to the
+-- evidence generation that invalidated the intent.
+CREATE TABLE IF NOT EXISTS recovery_intents (
+    intent_id TEXT PRIMARY KEY,
+    work_id TEXT NOT NULL,
+    execution_id TEXT,
+    kind TEXT NOT NULL,
+    due_at_unix_seconds INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    evidence_basis TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'consumed', 'retired')),
+    retirement_reason TEXT,
+    scheduled_seq INTEGER NOT NULL
+);
+
+-- Managed body catalog: durable metadata rows only; the body itself is
+-- the file at `path`. `reclaiming` -> `reclaimed` is the two-phase
+-- deletion protocol; `eligible_after_unix_seconds` is NULL while a body
+-- is unattributed and is never sweep-eligible.
+CREATE TABLE IF NOT EXISTS body_catalog (
+    body_id TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    path TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    registered_unix_seconds INTEGER NOT NULL,
+    eligible_after_unix_seconds INTEGER,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'present'
+        CHECK (state IN ('present', 'reclaiming', 'reclaimed')),
+    reclaim_reason TEXT,
+    delete_failures INTEGER NOT NULL DEFAULT 0,
+    reclaimed_unix_seconds INTEGER
+);
+
+-- Protective-dependency pin rows: one row per live dependency, so a
+-- body stays pinned while ANY row exists and discharging one
+-- dependency deletes only its own row. `body_catalog.pinned` is the
+-- materialized EXISTS of this table, updated in the same transaction
+-- as every ledger write.
+CREATE TABLE IF NOT EXISTS body_pins (
+    body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
+    dependency TEXT NOT NULL,
+    PRIMARY KEY (body_id, dependency)
+);

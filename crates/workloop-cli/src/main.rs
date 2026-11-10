@@ -5,9 +5,12 @@
 
 mod envelope;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use run_loop::{
+    Pass, PassSettings, RunLeaseGuard, install_shutdown_handler, run_pass, shutdown_requested,
+};
 use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
@@ -16,10 +19,12 @@ use workloop_core::identity::{
 };
 use workloop_core::projection::{self, CommandResultLookup};
 use workloop_core::store::Store;
-use workloop_core::work::{WorkloopConfig, dispatch_once, handle_command, sweep};
+use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
+
+mod run_loop;
 
 #[derive(Parser)]
 #[command(
@@ -129,14 +134,21 @@ enum Commands {
         #[arg(long)]
         resource: Vec<String>,
     },
-    /// Drive one pass: dispatch, execution consumer, outbox, sweep.
-    RunOnce,
-    /// Drive the loop until interrupted (or --ticks passes).
+    /// Drive the eight-phase loop: one bounded pass with --once, one
+    /// Work with --work, repeated until interrupted (or --ticks).
     Run {
+        /// Run exactly one pass and exit.
+        #[arg(long)]
+        once: bool,
+        /// Scope the pass to one Work id (diagnosis).
+        #[arg(long)]
+        work: Option<String>,
+        /// Seconds between passes (overrides loop.interval_seconds).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Stop after this many passes; 0 runs until interrupted.
         #[arg(long, default_value_t = 0)]
         ticks: u32,
-        #[arg(long, default_value_t = 1000)]
-        interval_ms: u64,
     },
     WorkList,
     WorkDetail {
@@ -318,7 +330,25 @@ fn run(cli: Cli) -> i32 {
             ));
         }
     };
-    let store = match SqliteStore::open(&cli.db, installation.capacity) {
+    // State lives beside the store file: CAS bodies, workspaces, out
+    // directories and the handoff repository all resolve under this one
+    // root. Resolve it once, at startup, so no pass depends on the
+    // process working directory.
+    let db_abs = match std::path::absolute(&cli.db) {
+        Ok(p) => p,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Usage,
+                &format!("db path: {e}"),
+            ));
+        }
+    };
+    let state_root = db_abs
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let store = match SqliteStore::open(&db_abs, installation.capacity) {
         Ok(s) => s,
         Err(e) => return emit(envelope::store_error(&e)),
     };
@@ -494,76 +524,149 @@ fn run(cli: Cli) -> i32 {
             };
             mutation(request(CommandBody::ReleaseResources { resources }))
         }
-        Commands::RunOnce => {
-            let supervisor = build_supervisor(&config, &installation);
-            let mut github = FixtureGithub::new();
-            match run_tick(
-                &store,
-                &config,
-                &installation,
-                supervisor.as_ref(),
-                &mut github,
-            ) {
-                Ok(list) => emit(envelope::query_envelope(
-                    &list,
-                    envelope::query_identity("run", &actor, cli.idempotency_key.as_deref()),
-                    None,
-                )),
-                Err(e) => emit(envelope::error_envelope(
-                    Some(envelope::query_identity(
-                        "run",
-                        &actor,
-                        cli.idempotency_key.as_deref(),
-                    )),
-                    envelope::ErrorClass::Store,
-                    &e,
-                )),
-            }
-        }
-        Commands::Run { ticks, interval_ms } => {
-            // One Supervisor across ticks: the per-request start/stop locks
-            // live on it, so recreating it would drop serialization. The
-            // FixtureGithub lives for the whole loop for the same reason:
-            // its PR numbering and head state must survive between ticks,
-            // or publishes in different ticks restart at PR 1 and an
-            // UpdatePr/PostPrComment head recheck can never match a PR
-            // published in an earlier tick.
-            let supervisor = build_supervisor(&config, &installation);
-            let mut github = FixtureGithub::new();
+        Commands::Run {
+            once,
+            work,
+            interval,
+            ticks,
+        } => {
             let identity =
                 || envelope::query_identity("run", &actor, cli.idempotency_key.as_deref());
-            let mut remaining = ticks;
-            let mut tick = 0u32;
+            // SIGINT/SIGTERM finish the current phase boundary and
+            // exit; without the handler the default disposition would
+            // kill this process mid-phase.
+            if let Err(e) = install_shutdown_handler() {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Store,
+                    &e,
+                ));
+            }
+            let settings = match PassSettings::from_installation(
+                &installation,
+                installation_files(&db_abs, &config_path),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
+            let interval = interval.unwrap_or(settings.loop_config.interval_seconds);
+            if interval == 0 {
+                return usage("run", "run --interval must be > 0");
+            }
+            let scope = work.map(WorkId);
+            // One Supervisor across ticks: the per-request start/stop
+            // locks live on it, so recreating it would drop
+            // serialization. The FixtureGithub lives for the whole run
+            // for the same reason: its PR numbering and head state must
+            // survive between ticks, or publishes in different ticks
+            // restart at PR 1 and a head recheck can never match a PR
+            // published in an earlier tick.
+            let supervisor = build_supervisor(&config, &installation, &state_root);
+            let mut github = FixtureGithub::new();
+            // Single-flight: one lease covers the whole run, taken
+            // before the first pass and released when this process ends.
+            // A second `run` fails closed with `lock.held`; a crashed
+            // run's lease is reclaimed only after its recorded process
+            // identity is inspected as gone.
+            let _lease = match RunLeaseGuard::acquire(&store, now()) {
+                Ok(l) => l,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &e.to_string(),
+                    ));
+                }
+            };
+            let mut passes_done = 0u32;
             loop {
-                // stdout stays single-object: per-pass progress is a
-                // stderr diagnostic, and the envelope is emitted once
+                if shutdown_requested() {
+                    break;
+                }
+                let mut clock = now;
+                let report = run_pass(
+                    &mut Pass {
+                        store: &store,
+                        config: &config,
+                        settings: &settings,
+                        supervisor: supervisor.as_ref(),
+                        host: &mut github,
+                        state_root: &state_root,
+                    },
+                    scope.as_ref(),
+                    &mut clock,
+                    &shutdown_requested,
+                );
+                // The pass leaves a durable tick report first; stdout
+                // stays single-object — per-pass progress is a stderr
+                // diagnostic and the run's one envelope is emitted once
                 // when the bounded run finishes.
-                let list = match run_tick(
-                    &store,
-                    &config,
-                    &installation,
-                    supervisor.as_ref(),
-                    &mut github,
-                ) {
-                    Ok(list) => list,
+                let payload = match serde_json::to_string(&report) {
+                    Ok(p) => p,
                     Err(e) => {
                         return emit(envelope::error_envelope(
                             Some(identity()),
                             envelope::ErrorClass::Store,
-                            &e,
+                            &format!("tick report: {e}"),
                         ));
                     }
                 };
-                tick += 1;
-                if let projection::QueryResult::Found { value, .. } = &list {
-                    eprintln!("taisan: tick {tick}: {} work item(s)", value.items.len());
+                if let Err(e) = store.append_event("tick_report", &payload) {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &format!("tick report: {e}"),
+                    ));
                 }
-                if remaining == 1 {
-                    return emit(envelope::query_envelope(&list, identity(), None));
+                passes_done += 1;
+                eprintln!(
+                    "taisan: pass {passes_done}: {} phase(s)",
+                    report.phases.len()
+                );
+                if let Some(reason) = report.abort_reason() {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &reason,
+                    ));
                 }
-                remaining = remaining.saturating_sub(1);
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                if once || (ticks != 0 && passes_done >= ticks) {
+                    break;
+                }
+                // Sleep to the next pass in short slices so a signal
+                // during the idle gap exits promptly instead of after
+                // the full interval. The interval is seconds — the
+                // `--interval` help and `loop.interval_seconds` both
+                // say so — so the countdown runs in milliseconds and
+                // the gap lasts the documented cadence, not a
+                // millisecond-scale fraction of it.
+                let mut remaining_ms = interval.saturating_mul(1000);
+                while remaining_ms > 0 && !shutdown_requested() {
+                    let slice = remaining_ms.min(100);
+                    std::thread::sleep(std::time::Duration::from_millis(slice));
+                    remaining_ms -= slice;
+                }
             }
+            // The run's terminal result is exactly one envelope — kind
+            // `run`, carrying the final work-list — no matter how many
+            // passes it drove.
+            let list = match store.transact_deferred(|tx| projection::work_list(tx, now())) {
+                Ok(list) => list,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &e.to_string(),
+                    ));
+                }
+            };
+            emit(envelope::query_envelope(&list, identity(), None))
         }
         Commands::WorkList => {
             match store.transact_deferred(|tx| projection::work_list(tx, now())) {
@@ -661,45 +764,45 @@ fn run(cli: Cli) -> i32 {
 fn build_supervisor(
     config: &WorkloopConfig,
     installation: &Installation,
+    state_root: &std::path::Path,
 ) -> Option<Supervisor<PosixProcessControl>> {
     if installation.worker_argv.is_empty() {
         return None;
     }
     Some(Supervisor::new(
         PosixProcessControl,
-        PathBuf::from(&installation.workspace_root),
+        installation_path(state_root, &installation.workspace_root),
         installation.worker_argv.clone(),
         config.clone(),
     ))
 }
 
-/// One pass of the run loop: dispatch scan, execution consumer, GitHub
-/// outbox, timed sweep — every decision committed through the same ports.
-/// The GitHub adapter is owned by the caller so its remote state (PR
-/// numbering, heads, applied writes) persists across ticks of one `run`.
-fn run_tick(
-    store: &SqliteStore,
-    config: &WorkloopConfig,
-    _installation: &Installation,
-    supervisor: Option<&Supervisor<PosixProcessControl>>,
-    github: &mut FixtureGithub,
-) -> Result<projection::QueryResult<projection::WorkListView>, String> {
-    let now = now();
-    store
-        .transact(|tx| dispatch_once(tx, config, now).map(|_| ()))
-        .map_err(|e| e.to_string())?;
-    if let Some(supervisor) = supervisor {
-        supervisor.run_once(store, now).map_err(|e| e.to_string())?;
+/// Resolve an installation-relative path against the one state root.
+/// An absolute configured path is used as-is; a relative one never
+/// resolves against the ambient working directory.
+fn installation_path(state_root: &std::path::Path, configured: &str) -> PathBuf {
+    let path = PathBuf::from(configured);
+    if path.is_absolute() {
+        path
+    } else {
+        state_root.join(path)
     }
-    github
-        .apply_outbox(store, config, now)
-        .map_err(|e| e.to_string())?;
-    sweep(store, config, now).map_err(|e| e.to_string())?;
-    // Status output goes through the same read-only projection as the
-    // query subcommands — never a raw store read.
-    store
-        .transact_deferred(|tx| projection::work_list(tx, now))
-        .map_err(|e| e.to_string())
+}
+
+/// The installation's own files: the live store, its SQLite sidecars
+/// and the config. All three sit under the state root, so containment
+/// alone would let the retention sweep reclaim them if a catalog row
+/// ever pointed at them; they are declared here, at the composition
+/// root that knows these paths, and the sweep holds them instead.
+fn installation_files(db_abs: &Path, config_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![db_abs.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = db_abs.as_os_str().to_os_string();
+        name.push(suffix);
+        paths.push(PathBuf::from(name));
+    }
+    paths.push(std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf()));
+    paths
 }
 
 #[cfg(test)]
@@ -746,7 +849,7 @@ mod tests {
                 HostCapability::ChangeRequestCreate,
                 HostCapability::ChangeRequestRead,
                 HostCapability::ChangeRequestUpdate,
-                HostCapability::CommentCreate,
+                HostCapability::CommentWrite,
                 HostCapability::ChecksRead,
                 HostCapability::ReviewFindingsRead,
                 HostCapability::IssueRead,
@@ -762,27 +865,6 @@ mod tests {
             },
             budget: ExecutionBudget::default(),
             policy: WorkPolicy::default(),
-        }
-    }
-
-    fn installation() -> Installation {
-        Installation {
-            actor_id: "actor-test".into(),
-            actor_kind: "human".into(),
-            host_instance: "host-local".into(),
-            repository: "local-repo".into(),
-            adapter: "fixture".into(),
-            contract_version: 1,
-            capabilities: vec![],
-            host_actors: Default::default(),
-            required_checks: vec![],
-            capacity: 2,
-            worker_argv: vec![],
-            workspace_root: "workspaces".into(),
-            allowed_effects: None,
-            budget: None,
-            lanes: None,
-            policy: None,
         }
     }
 
@@ -881,11 +963,38 @@ mod tests {
         }
     }
 
+    /// One driver pass with default settings — the same entry point the
+    /// `run` command uses, minus the lease (the test process is the
+    /// only driver here).
+    fn tick(
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        host: &mut FixtureGithub,
+    ) -> run_loop::TickReport {
+        let settings = PassSettings {
+            loop_config: Default::default(),
+            retention: Default::default(),
+            protected_paths: Vec::new(),
+        };
+        run_pass(
+            &mut Pass {
+                store,
+                config,
+                settings: &settings,
+                supervisor: None,
+                host,
+                state_root: std::path::Path::new("."),
+            },
+            None,
+            &mut now,
+            &|| false,
+        )
+    }
+
     #[test]
     fn host_state_persists_across_ticks_of_one_run() {
         let store = SqliteStore::in_memory(2).unwrap();
         let config = config();
-        let installation = installation();
         let (w1, e1) = submit(&store, "tick-1");
         let (w2, e2) = submit(&store, "tick-2");
         for eid in [&e1, &e2] {
@@ -900,7 +1009,7 @@ mod tests {
 
         // Tick 1: work 1 opens its change request.
         queue_open_change(&store, &w1);
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        tick(&store, &config, &mut github);
         assert_eq!(
             github.applied(),
             &["open_change:host-local/local-repo:cr-1"]
@@ -909,7 +1018,7 @@ mod tests {
         // Tick 2: work 2 opens later — its change number must continue,
         // not restart at 1 and collide with work 1's.
         queue_open_change(&store, &w2);
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        tick(&store, &config, &mut github);
         assert_eq!(
             github.applied(),
             &[
@@ -932,7 +1041,7 @@ mod tests {
                 body: Some("edited".into()),
             },
         );
-        run_tick(&store, &config, &installation, None, &mut github).unwrap();
+        tick(&store, &config, &mut github);
         assert_eq!(
             github.applied(),
             &[
