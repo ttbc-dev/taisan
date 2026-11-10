@@ -5,4 +5,5 @@
 pub mod credential;
 pub mod fixture;
 pub mod gitlab_fixture;
+pub mod gitlab_spike;
 pub mod sparse_fixture;
