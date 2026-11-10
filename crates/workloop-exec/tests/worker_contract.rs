@@ -6,8 +6,11 @@
 //! contract, `docs/worker-protocol.md`).
 //!
 //! Providers under test:
-//! - `PosixProvider`: `Supervisor<PosixProcessControl>` spawning the
-//!   real `workloop-fixture-worker` binary — real spawn, real signals.
+//! - `PosixProvider`: `Supervisor<CountingPosix>` — an observational
+//!   decorator that delegates spawn/inspect/signal to
+//!   `PosixProcessControl` and records every spawn call and spawned
+//!   identity — spawning the real `workloop-fixture-worker` binary —
+//!   real spawn, real signals.
 //! - `ScriptedProvider`: `Supervisor<ScriptedProcessControl>`, an
 //!   independently implemented in-memory port that models spawn
 //!   outcomes no argv can produce (lost/unknown starts, uninspectable
@@ -18,7 +21,7 @@
 //! liveness — never provider internals beyond what the port itself
 //! exposes. A completed scenario is a covered contract row.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -281,6 +284,9 @@ trait WorkerHandle {
     /// The next start attempt reports the given failure class.
     fn fail_next_spawn(&mut self, f: SpawnFail);
     /// Spawn calls observed so far — the no-second-writer counter.
+    /// Every `spawn` attempt counts, refused and unknown outcomes
+    /// included, so a scenario can prove no second start attempt even
+    /// when the first attempt produced no writer.
     fn spawns(&self) -> usize;
     /// Signals the port verifiably delivered — the signal audit used to
     /// prove a signal landed while settlement still waits. Providers
@@ -308,16 +314,21 @@ trait WorkerProvider {
 
 // ---- Posix provider: real spawn of the fixture worker --------------
 
-/// Observational decorator: counts and records spawned identities so a
-/// scenario can assert no second writer. It delegates every call to
-/// `PosixProcessControl` — spawn, inspect, and signal semantics are the
-/// real port's.
+/// Observational decorator: counts every spawn call — refused and
+/// unknown attempts included — and records the identities the real port
+/// produced, so a scenario can assert both no second attempt and no
+/// second writer. It delegates every call to `PosixProcessControl` —
+/// spawn, inspect, and signal semantics are the real port's.
 struct CountingPosix {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
+    calls: Rc<Cell<usize>>,
 }
 
 impl ProcessControlPort for CountingPosix {
     fn spawn(&self, argv: &[String], cwd: &std::path::Path) -> Result<ProcessIdentity, SpawnError> {
+        // Count the attempt before delegating: the counter observes
+        // start calls, not only the ones that produced a writer.
+        self.calls.set(self.calls.get() + 1);
         let out = PosixProcessControl.spawn(argv, cwd);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
@@ -347,6 +358,7 @@ impl ProcessControlPort for CountingPosix {
 struct PosixProvider {
     sup: Supervisor<CountingPosix>,
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
+    calls: Rc<Cell<usize>>,
 }
 
 impl WorkerProvider for PosixProvider {
@@ -365,6 +377,7 @@ impl WorkerProvider for PosixProvider {
     }
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
         let spawned = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
         let mode = match shape {
             WorkerShape::CleanExit => vec![fixture_bin(), "clean-exit".into()],
             WorkerShape::NoArtifact => vec![fixture_bin(), "exit-no-artifact".into()],
@@ -374,12 +387,14 @@ impl WorkerProvider for PosixProvider {
             sup: Supervisor::new(
                 CountingPosix {
                     spawned: spawned.clone(),
+                    calls: calls.clone(),
                 },
                 tmp_root(tag),
                 mode,
                 config.clone(),
             ),
             spawned,
+            calls,
         }
     }
     fn handle(&mut self) -> &mut dyn WorkerHandle {
@@ -438,7 +453,7 @@ impl WorkerHandle for PosixProvider {
         }
     }
     fn spawns(&self) -> usize {
-        self.spawned.borrow().len()
+        self.calls.get()
     }
     fn signals_sent(&self) -> usize {
         unreachable!("PosixProvider does not declare signal_audit")
@@ -700,11 +715,19 @@ fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store:
 }
 
 /// WC-START-03: a definitely-refused start pauses without a writer and
-/// releases the slot — refusal is not uncertainty.
+/// releases the slot — refusal is not uncertainty. The spawn counter
+/// observes the refused attempt itself, so the scenario can prove the
+/// refusal was attempted exactly once and never retried.
 fn refused_start_pauses_without_a_writer(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (_w, eid) = submit_and_admit(store, &config(), "wc-start-3");
+    let spawns_before = p.spawns();
     p.fail_next_spawn(SpawnFail::Refused);
     p.consume(store);
+    assert_eq!(
+        p.spawns(),
+        spawns_before + 1,
+        "the refused start attempt is observed by the counter"
+    );
     let e = execution(store, &eid);
     assert_eq!(
         e.state,
@@ -719,6 +742,11 @@ fn refused_start_pauses_without_a_writer(p: &mut dyn WorkerHandle, store: &Sqlit
             .count(),
         0,
         "refusal never produced a writer"
+    );
+    assert_eq!(
+        p.spawns(),
+        spawns_before + 1,
+        "a refused start is not retried into a second attempt"
     );
 }
 
@@ -1072,7 +1100,7 @@ fn scenarios() -> Vec<WcScenario> {
         },
         WcScenario {
             id: "WC-START-03 refused start pauses without a writer",
-            requires: &["spawn_refused"],
+            requires: &["spawn_refused", "spawn_count"],
             shape: WorkerShape::Resident,
             config,
             run: refused_start_pauses_without_a_writer,
