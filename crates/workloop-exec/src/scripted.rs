@@ -277,11 +277,12 @@ impl ProcessControlPort for ScriptedProcessControl {
     }
 
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
-        let s = self.state.lock().unwrap();
-        if let Some(reason) = s.snapshot_errors.front() {
-            let reason = reason.clone();
-            drop(s);
-            self.state.lock().unwrap().snapshot_errors.pop_front();
+        // Check-and-pop is one critical section: a cloned handle racing
+        // this caller must not observe or consume the same queued error
+        // twice — "the next snapshot_descendants fails" is exactly one
+        // call.
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.snapshot_errors.pop_front() {
             return Err(reason);
         }
         let mut out = Vec::new();
@@ -410,5 +411,58 @@ impl ProcessControlPort for ScriptedProcessControl {
 
     fn reap(&self, pid: i32) {
         self.state.lock().unwrap().procs.remove(&pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "The next `snapshot_descendants` fails with this reason" is
+    /// exactly one call: two cloned handles racing on one queued error
+    /// must not both observe it, and the unconsumed caller gets a normal
+    /// snapshot.
+    #[test]
+    fn queued_snapshot_error_is_consumed_by_exactly_one_caller() {
+        let a = ScriptedProcessControl::new();
+        let b = a.clone();
+        a.fail_next_snapshot("incomplete process-table read");
+
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<Vec<ProcessIdentity>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [a, b]
+                .into_iter()
+                .map(|handle| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        handle.snapshot_descendants(0)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let errors: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+        assert_eq!(errors.len(), 1, "queued error consumed exactly once");
+        assert_eq!(
+            errors[0].as_ref().unwrap_err(),
+            "incomplete process-table read"
+        );
+        assert!(
+            results.iter().any(|r| r.is_ok()),
+            "the other caller gets a normal snapshot"
+        );
+    }
+
+    /// Sequentially: one queued error fails one call, the next succeeds.
+    #[test]
+    fn queued_snapshot_error_is_consumed_fifo() {
+        let port = ScriptedProcessControl::new();
+        port.fail_next_snapshot("first");
+        port.fail_next_snapshot("second");
+        assert_eq!(port.snapshot_descendants(0).unwrap_err(), "first");
+        assert_eq!(port.snapshot_descendants(0).unwrap_err(), "second");
+        assert!(port.snapshot_descendants(0).unwrap().is_empty());
     }
 }

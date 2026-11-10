@@ -71,23 +71,30 @@ leaves intents `pending`, never a fabricated failure.
 | `checks_read` | check-runs / statuses endpoints | Exact-revision evidence for readiness lanes |
 | `checks_write` | `POST …/check-runs`, commit statuses | Adapter-owned status emission; not required by the S1 profile |
 
-## Contract optional capabilities not in the executable vocabulary
+## Contract capabilities missing executable operations or capability names
 
-These exist in the contract's optional set and in GitHub's API, but have
-no `HostAction` variant today. They remain explicit-unsupported: an
-accepted Work requiring them cannot weaken them into a comment or a
-review submission.
+These contract capabilities have no executable counterpart today. The
+gap differs per row, so it is named explicitly: a missing `HostAction`
+operation variant (writes cannot be authorized), a missing
+`HostCapability` name (the installation cannot declare support), or a
+missing typed read-model row. A capability name already in
+`HostCapability` without a matching `HostAction` variant is declarable
+but unusable at the effect boundary, and an existing receipt fact alone
+does not supply the operation: `NormalizedEffectFact` already carries
+`ThreadResolved` and `ReadyObserved`. All rows remain
+explicit-unsupported: an accepted Work requiring them cannot weaken
+them into a comment or a review submission (HC-CAP-03).
 
-| Contract capability | GitHub surface | Status |
-| --- | --- | --- |
-| `inline_comment` | `POST …/pulls/{n}/comments` at a validated diff position | Not in vocabulary — position validation against an immutable diff snapshot belongs to the adapter that implements it |
-| `review_feedback` | `POST …/pulls/{n}/reviews` event `COMMENT` | Not in vocabulary — head-bound review record, not an approval |
-| `approve` | `POST …/pulls/{n}/reviews` event `APPROVE` | Not in vocabulary — requires independently observable evidence and actor-eligibility proof |
-| `request_changes` | `POST …/pulls/{n}/reviews` event `REQUEST_CHANGES` | Not in vocabulary — host-native decision, not ordinary criticism |
-| `thread_reply` | `POST …/pulls/{n}/comments/{id}/replies`, GraphQL thread reply | Not in vocabulary — marked reply preserving thread identity |
-| `thread_resolve` | GraphQL `resolveReviewThread` | Capability name exists; operation absent — see table above |
-| `ready` | GraphQL `markPullRequestReadyForReview` | Not in vocabulary — already-ready state may satisfy the postcondition only through a fresh observation |
-| `comment_read` | `GET …/issues/{n}/comments` | Baseline in the contract; the typed read-model rows are an uncovered matrix gap (HC-READ-01), tracked separately |
+| Contract capability | Contract set | GitHub surface | Missing executable element | Status |
+| --- | --- | --- | --- | --- |
+| `inline_comment` | optional extension | `POST …/pulls/{n}/comments` at a validated diff position | `HostAction` variant and `HostCapability` name | Not in vocabulary — position validation against an immutable diff snapshot belongs to the adapter that implements it |
+| `review_feedback` | optional extension | `POST …/pulls/{n}/reviews` event `COMMENT` | `HostAction` variant and `HostCapability` name | Not in vocabulary — head-bound review record, not an approval |
+| `approve` | optional extension | `POST …/pulls/{n}/reviews` event `APPROVE` | `HostAction` variant and `HostCapability` name | Not in vocabulary — requires independently observable evidence and actor-eligibility proof |
+| `request_changes` | optional extension | `POST …/pulls/{n}/reviews` event `REQUEST_CHANGES` | `HostAction` variant and `HostCapability` name | Not in vocabulary — host-native decision, not ordinary criticism |
+| `thread_reply` | optional extension | `POST …/pulls/{n}/comments/{id}/replies`, GraphQL thread reply | `HostAction` variant and `HostCapability` name | Not in vocabulary — marked reply preserving thread identity |
+| `thread_resolve` | optional extension | GraphQL `resolveReviewThread` | `HostAction` variant only — `HostCapability::ThreadResolve` and the `ThreadResolved` receipt fact already exist | Capability declarable; operation absent — see table above |
+| `ready` | optional extension | GraphQL `markPullRequestReadyForReview` | `HostAction` variant and `HostCapability` name — the `ReadyObserved` receipt fact already exists | Capability not declarable — already-ready state may satisfy the postcondition only through a fresh observation |
+| `comment_read` | mandatory baseline, not optional | `GET …/issues/{n}/comments` | `HostCapability` name and typed read-model rows — reads have no `HostAction` by design | Baseline capability outside the executable set; the typed read-model rows are an uncovered matrix gap (HC-READ-01), tracked separately |
 
 ## Identity scoping
 
