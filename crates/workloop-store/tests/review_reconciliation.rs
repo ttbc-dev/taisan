@@ -57,7 +57,7 @@ fn config() -> WorkloopConfig {
             actors: vec![RoleBinding {
                 role: ActorRole::Publication,
                 actor: publisher(),
-                credential_ref: "cred-publication".into(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
             }],
         },
         declared_capabilities: BTreeSet::from([

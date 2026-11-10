@@ -32,7 +32,7 @@ fn config() -> WorkloopConfig {
                     host: host(),
                     actor: HostActorId::trusted("pub-agent"),
                 },
-                credential_ref: "cred-publication".into(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
             }],
         },
         declared_capabilities: BTreeSet::from([

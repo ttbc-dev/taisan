@@ -11,9 +11,9 @@ use workloop_core::domain::{
     Actor, ActorKind, ExecutionBudget, LanePolicy, Origin, WorkId, WorkPolicy,
 };
 use workloop_core::identity::{
-    ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget,
-    HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
-    RoleBinding,
+    ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef,
+    DiffTarget, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
+    RepositoryRef, RoleBinding,
 };
 use workloop_core::observation::{
     Completeness, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
@@ -97,7 +97,7 @@ fn config() -> WorkloopConfig {
                         host: host_instance(),
                         actor: HostActorId::trusted("pub-agent"),
                     },
-                    credential_ref: "cred-publication".into(),
+                    credential_ref: CredentialRef::trusted("cred-publication"),
                 },
                 RoleBinding {
                     role: ActorRole::Review,
@@ -105,7 +105,7 @@ fn config() -> WorkloopConfig {
                         host: host_instance(),
                         actor: HostActorId::trusted("review-bot"),
                     },
-                    credential_ref: "cred-review".into(),
+                    credential_ref: CredentialRef::trusted("cred-review"),
                 },
             ],
         },

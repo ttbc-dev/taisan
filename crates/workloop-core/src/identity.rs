@@ -86,6 +86,11 @@ opaque_id!(IssueId, "issue_id");
 opaque_id!(ChangeRequestId, "change_request_id");
 opaque_id!(HostActorId, "host_actor_id");
 opaque_id!(AdapterId, "adapter_id");
+// The only credential shape Core holds: an opaque reference naming a
+// secret slot, never the secret value. The `kind:name` provider form
+// is adapter business — resolution happens at the adapter boundary
+// (`credential` module), so Core stores the reference unparsed.
+opaque_id!(CredentialRef, "credential_ref");
 
 /// Repository identity `(host_instance, repository_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -350,7 +355,7 @@ impl ActorRole {
 pub struct RoleBinding {
     pub role: ActorRole,
     pub actor: HostActorRef,
-    pub credential_ref: String,
+    pub credential_ref: CredentialRef,
 }
 
 /// The immutable host binding recorded on Work acceptance. Identities
@@ -389,7 +394,7 @@ impl HostBinding {
             return Err("host binding: no actor roles".into());
         }
         for a in &actors {
-            check_opaque("credential_ref", &a.credential_ref)?;
+            check_opaque("credential_ref", a.credential_ref.as_str())?;
             if a.actor.host != repository.host {
                 return Err(format!(
                     "host binding: actor {} is not on host {}",
@@ -563,7 +568,7 @@ mod tests {
                 host: HostInstanceId::trusted("h"),
                 actor: HostActorId::trusted("a"),
             },
-            credential_ref: "cred".into(),
+            credential_ref: CredentialRef::trusted("cred"),
         }];
         assert!(
             HostBinding::new(

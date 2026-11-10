@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use workloop_core::credential::CredentialProvider;
 use workloop_core::identity::{ActorRole, AdapterId, HostActorId, HostCapability, RepositoryId};
 
 /// The single schema version this runtime understands. A missing,
@@ -766,42 +767,9 @@ fn is_bare_host_name(entry: &str) -> bool {
 /// have pasted a live token here, and the load error must not carry
 /// it out of this module.
 fn check_credential_ref(role: &str, credential_ref: &str) -> Result<(), String> {
-    if let Some(name) = credential_ref.strip_prefix("env:") {
-        let valid = !name.is_empty()
-            && name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
-            return Err(format!(
-                "roles.{role}.credential_ref: invalid env: reference <redacted> — \
-                 environment identifier expected"
-            ));
-        }
-        return Ok(());
-    }
-    if let Some(path) = credential_ref.strip_prefix("file:") {
-        if path.starts_with('~') || !Path::new(path).is_absolute() {
-            return Err(format!(
-                "roles.{role}.credential_ref: file: requires an absolute path \
-                 (got <redacted>) — '~' is not expanded"
-            ));
-        }
-        return Ok(());
-    }
-    if let Some(argv) = credential_ref.strip_prefix("command:") {
-        if argv.trim().is_empty() {
-            return Err(format!(
-                "roles.{role}.credential_ref: command: requires a non-empty argv"
-            ));
-        }
-        return Ok(());
-    }
-    Err(format!(
-        "roles.{role}.credential_ref: unknown provider in <redacted> — expected \
-         env:, file:, or command:"
-    ))
+    CredentialProvider::parse_str(credential_ref)
+        .map(|_| ())
+        .map_err(|rule| format!("roles.{role}.credential_ref: {rule}"))
 }
 
 /// Describe a syntax failure by location and parser message only. The
