@@ -35,9 +35,11 @@ pub const SELECTOR_ORIGIN: &str = "selector";
 /// Source bindings land in `SourceSnapshot` verbatim — the recorded
 /// `source_revision`/`content_digest` stay the freshness evidence the
 /// source gate compares later authoritative reads against. Declared
-/// `required_permissions` are provenance for the acceptance record,
-/// not a command field; capability coverage is Core's check at
-/// admission, not a translation concern.
+/// `required_permissions` are proposal/policy provenance only — they
+/// shape the proposal key and record what the policy asked for, but
+/// they are not a command field and are not recorded on the admitted
+/// Work; capability coverage is Core's check at admission, not a
+/// translation concern.
 pub fn submit_command(proposal: &Proposal, actor: Actor) -> CommandRequest {
     CommandRequest {
         actor,

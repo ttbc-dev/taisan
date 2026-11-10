@@ -72,8 +72,10 @@ pub struct Installation {
 }
 
 /// The selector binding for alternate admission. Presence selects the
-/// alternate path; every value is validated at the config boundary —
-/// an unparseable identity refuses loading, never degrades to a guess.
+/// alternate path. Values are validated when the policy is resolved
+/// for a selector run — an unparseable identity is a bounded config
+/// error for that path only, never a load failure that could block
+/// manual submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectorSection {
     /// Selector adapter identity stamped on every proposal.
@@ -98,8 +100,9 @@ pub struct SelectorSection {
     /// The verification argv every proposal's task input carries.
     #[serde(default)]
     pub verification_argv: Vec<String>,
-    /// Permissions proposed Work will need — declared on the proposal,
-    /// never expanded.
+    /// Permissions proposed Work will need — declared on the proposal
+    /// (identity/policy provenance), never expanded, and not enforced
+    /// or recorded by admission; capability coverage is Core's check.
     #[serde(default)]
     pub required_permissions: Vec<String>,
 }
@@ -467,10 +470,12 @@ impl Installation {
 
     /// The selector adapter identity and policy for the alternate
     /// admission path, or `None` when the installation runs manual
-    /// submission only. The config file is external input: every
+    /// submission only. The selector section is external input: every
     /// identity string is validated here — an unparseable adapter,
-    /// repository, or issue reference refuses loading rather than
-    /// silently mis-binding the policy.
+    /// repository, or issue reference is an error rather than a
+    /// silently mis-bound policy. Validation deliberately happens at
+    /// this boundary (a selector run), not at config load: a malformed
+    /// section must never take manual submission down with it.
     pub fn selection_policy(&self) -> Result<Option<(AdapterId, SelectionPolicy)>, String> {
         let Some(section) = &self.selector else {
             return Ok(None);

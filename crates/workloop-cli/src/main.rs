@@ -636,11 +636,27 @@ fn run(cli: Cli) -> i32 {
                 let decision = match handle_command(&store, &config, &req, now()) {
                     Ok(d) => d,
                     Err(e) => {
-                        return emit(envelope::error_envelope(
+                        // A batch is not atomic: earlier proposals may
+                        // already hold recorded decisions. Their replay
+                        // keys ride the error envelope so the operator
+                        // can recover each via `command-result` — or
+                        // simply re-run `propose`, which replays them.
+                        let (mut env, code) = envelope::error_envelope(
                             Some(identity()),
                             envelope::ErrorClass::Store,
-                            &e.to_string(),
-                        ));
+                            &format!(
+                                "batch interrupted at proposal {} ({e}); committed \
+                                 decisions are recoverable by replay key",
+                                proposal.key
+                            ),
+                        );
+                        env.evidence_refs = items
+                            .iter()
+                            .filter_map(|i: &serde_json::Value| {
+                                i["replay_key"].as_str().map(str::to_string)
+                            })
+                            .collect();
+                        return emit((env, code));
                     }
                 };
                 // The replay key rides the envelope so an operator can
@@ -689,6 +705,7 @@ fn run(cli: Cli) -> i32 {
                 "selector": selector.as_str(),
                 "policy_revision": policy.revision,
                 "proposals": items,
+                "truncated": set.truncated,
                 "skipped": set
                     .skipped
                     .iter()

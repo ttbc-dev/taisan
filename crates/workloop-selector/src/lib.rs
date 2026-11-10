@@ -169,10 +169,16 @@ pub struct SkippedIssue {
 
 /// The deterministic output of one selector run: proposals in stable
 /// sorted order plus the typed reasons every other fact was refused.
+/// `truncated` counts eligible candidates dropped by the proposal
+/// bound — a bounded run must say so, never pass silently for "no
+/// more work".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposalSet {
     pub proposals: Vec<Proposal>,
     pub skipped: Vec<SkippedIssue>,
+    /// Eligible candidates cut by `policy.max_proposals`.
+    #[serde(default)]
+    pub truncated: usize,
 }
 
 /// Run the reference selector: one proposal per eligible Issue, in
@@ -237,13 +243,19 @@ pub fn propose(
     skipped.sort_by(|a, b| a.issue.cmp(&b.issue));
 
     // Deterministic order (facts are BTreeMap-ordered by IssueRef) and
-    // a deterministic bound: truncation never reshuffles.
+    // a deterministic bound: truncation never reshuffles, and the
+    // dropped count is reported rather than lost.
+    let truncated = eligible.len().saturating_sub(policy.max_proposals);
     let proposals = eligible
         .into_iter()
         .take(policy.max_proposals)
         .map(|fact| proposal(selector, fact, snapshot, policy))
         .collect();
-    ProposalSet { proposals, skipped }
+    ProposalSet {
+        proposals,
+        skipped,
+        truncated,
+    }
 }
 
 fn proposal(

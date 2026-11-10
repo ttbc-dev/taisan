@@ -289,6 +289,111 @@ fn a_malformed_snapshot_is_a_usage_error() {
 }
 
 #[test]
+fn an_unparseable_selector_section_is_refused_at_the_propose_boundary() {
+    let root = root("propose-invalid");
+    // A malformed selector section is a bounded config error for the
+    // selector path only — it can never take manual submission down.
+    for selector in [
+        serde_json::json!({"adapter": "", "allowlist": ["ops"]}),
+        serde_json::json!({"adapter": "issue-scan", "excluded": ["ops:notanumber"]}),
+    ] {
+        configure(&root, selector);
+        let snapshot = write_snapshot(&root, "snap.json", serde_json::json!([]));
+        let (code, env) = fail_at(
+            &root,
+            &["propose", "--snapshot", &snapshot.to_string_lossy()],
+        );
+        assert_eq!(code, 3, "{env}");
+        assert_eq!(env["status"], "error");
+        assert_eq!(env["reason"]["code"], "config");
+        run_at(
+            &root,
+            &[
+                "submit",
+                "--intent",
+                "manual still fine",
+                "--idempotency-key",
+                "k-i",
+            ],
+        );
+    }
+}
+
+#[test]
+fn a_rejected_proposal_does_not_abort_the_batch() {
+    let root = root("propose-partial");
+    // Manual submission claims ops:1 first.
+    run_at(
+        &root,
+        &[
+            "submit",
+            "--intent",
+            "claimed",
+            "--issue",
+            "ops:1",
+            "--issue-revision",
+            "r1",
+            "--issue-digest",
+            "d1",
+            "--idempotency-key",
+            "k-c1",
+        ],
+    );
+    configure(
+        &root,
+        serde_json::json!({"adapter": "issue-scan", "allowlist": ["ops"]}),
+    );
+    let snapshot = write_snapshot(
+        &root,
+        "snapshot.json",
+        serde_json::json!([
+            issue("ops", 1, "open", "Claimed issue"),
+            issue("ops", 2, "open", "Fresh issue"),
+        ]),
+    );
+    let result = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = result["result"]["proposals"].as_array().unwrap();
+    // One item's rejection is data; later proposals are still admitted.
+    assert_eq!(proposals.len(), 2, "{result}");
+    assert_eq!(proposals[0]["status"], "rejected");
+    assert_eq!(proposals[0]["reason_code"], "ineligible");
+    assert_eq!(proposals[1]["status"], "accepted");
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(list["result"]["items"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn truncation_at_the_proposal_bound_is_reported() {
+    let root = root("propose-bound");
+    configure(
+        &root,
+        serde_json::json!({
+            "adapter": "issue-scan",
+            "allowlist": ["ops"],
+            "max_proposals": 1,
+        }),
+    );
+    let snapshot = write_snapshot(
+        &root,
+        "snapshot.json",
+        serde_json::json!([
+            issue("ops", 1, "open", "First"),
+            issue("ops", 2, "open", "Second"),
+        ]),
+    );
+    let result = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    assert_eq!(result["result"]["proposals"].as_array().unwrap().len(), 1);
+    // "Hit the bound" is distinguishable from "no more eligible work".
+    assert_eq!(result["result"]["truncated"], 1, "{result}");
+}
+
+#[test]
 fn switching_admission_configuration_preserves_existing_work() {
     let root = root("propose-swap");
     // Work accepted under manual admission.

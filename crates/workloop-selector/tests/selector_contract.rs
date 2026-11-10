@@ -306,6 +306,12 @@ fn the_bound_truncates_deterministically() {
         vec![&issue("repo-a", "i1"), &issue("repo-a", "i2")],
         "the bound keeps the sorted head, not the input head"
     );
+    // The cut is reported, not silent: an operator can tell "hit the
+    // bound" from "no more eligible work".
+    assert_eq!(out.truncated, 1);
+    policy.max_proposals = 10;
+    let unbound = propose(&selector(), &snapshot, &policy);
+    assert_eq!(unbound.truncated, 0);
 }
 
 /// A proposal carries the exact source read it was built from — issue
