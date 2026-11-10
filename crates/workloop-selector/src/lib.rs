@@ -24,6 +24,8 @@
 //! yields the same proposal identity and new Issue content yields a
 //! new one.
 
+pub mod admission;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};

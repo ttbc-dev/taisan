@@ -593,6 +593,7 @@ dependencies = [
  "workloop-core",
  "workloop-exec",
  "workloop-github",
+ "workloop-selector",
  "workloop-store",
 ]
 
@@ -603,6 +604,7 @@ dependencies = [
  "serde",
  "serde_json",
  "workloop-core",
+ "workloop-selector",
 ]
 
 [[package]]
@@ -657,6 +659,7 @@ dependencies = [
  "serde",
  "serde_json",
  "workloop-core",
+ "workloop-store",
 ]
 
 [[package]]
