@@ -11,7 +11,8 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
-use workloop_core::store::{Effect, HostAction, Store};
+use workloop_core::projection::{self, WriterState};
+use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
 };
@@ -2578,4 +2579,269 @@ fn a_runtime_deadline_expiry_requests_stop_and_releases_nothing() {
     }
     assert_eq!(execution(&store, &eid).state, ExecutionState::Failed);
     assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// A crash at the stop boundary — durable intent written, supervisor
+/// killed before any signal — holds the reservation and the capacity
+/// slot through the restart until BOTH the writer's verified stop AND
+/// required-effect reconciliation complete. Neither condition alone
+/// releases.
+#[test]
+fn a_mid_stop_crash_holds_the_slot_until_stop_and_effects_reconcile() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("midstop-effect");
+    let (w, eid) = submit_and_admit(&store, "k-ms1");
+    let sup = supervisor("hang", root.clone());
+    sup.consume_requests(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let leader = invocation.process_identity.clone().unwrap();
+
+    // An outstanding required effect: the terminal release must wait
+    // for its reconciliation even after the writer is verified stopped.
+    let action_id = "act-midstop".to_string();
+    store
+        .transact(|tx| {
+            let cfg = config();
+            let created_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: action_id.clone(),
+                    work_id: w.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: cfg.host.actors[0].actor.clone(),
+                    action: HostAction::PushRef {
+                        branch: format!("work/{}", w.0),
+                        produced: CommitRevision::new(repo(), "0".repeat(40)).unwrap(),
+                    },
+                    payload_digest: "digest".into(),
+                    status: HostActionStatus::Pending,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq,
+                },
+            })
+        })
+        .unwrap();
+
+    cancel(&store, &w, "k-ms2");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    assert_eq!(held_claims(&store), (1, 2));
+
+    // The crash: the stop intent — with its descendant snapshot — is
+    // durable, then the supervisor dies before any signal is sent.
+    let _intent = persist_stop_intent(&store, &sup, &invocation, &leader);
+    drop(sup);
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "the mid-stop crash holds the slot and the reservations"
+    );
+
+    // The restarted supervisor resumes from the durable intent and
+    // drives the recorded identities to verified stop; the exit fact
+    // it reports is the recorded proof.
+    let restarted = supervisor("hang", root);
+    for _ in 0..40 {
+        restarted.drive_stops(&store, NOW).unwrap();
+        if store
+            .transact(|tx| projection::latest_process_fact(tx, &eid, &invocation.id))
+            .unwrap()
+            == Some(ProcessStateFact::Exited)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let record = store
+        .transact(|tx| projection::supervision(tx, &eid))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.writer_state,
+        Some(WriterState::Stopped),
+        "the verified stop is on record"
+    );
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Stopping,
+        "verified stop alone does not release while an effect is outstanding"
+    );
+    assert_eq!(
+        held_claims(&store),
+        (1, 2),
+        "the outstanding effect keeps the slot and reservations held"
+    );
+
+    // Reconciliation: the host reports a definite no-effect failure for
+    // the recorded intent — only now does the terminal settle release.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "test".into(),
+                event_id: "host:midstop-reconcile".into(),
+            }),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::HostActionResult {
+                action_id,
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "host reports no write was made".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    assert_eq!(
+        execution(&store, &eid).state,
+        ExecutionState::Cancelled,
+        "verified stop plus reconciled effects settles the cancel"
+    );
+    assert_eq!(held_claims(&store), (0, 0), "terminal release");
+}
+
+/// A failed liveness read never implies a stopped writer: the Execution
+/// turns `uncertain`, keeps slot and reservations, and no replacement
+/// trial is spawned until the recorded identity verifies stopped — only
+/// then may the slot release.
+#[test]
+fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
+    use std::cell::Cell;
+    use std::path::Path;
+    use workloop_core::ports::SpawnError;
+
+    // A port whose liveness read can be failed on demand: spawn records
+    // an identity, then `inspect` reports `unknown` until reconciled.
+    struct FlakyPort {
+        fail: Cell<bool>,
+        identity: ProcessIdentity,
+    }
+    impl ProcessControlPort for FlakyPort {
+        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+            Ok(self.identity.clone())
+        }
+        fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn group_members(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
+            Ok(vec![])
+        }
+        fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
+            if self.fail.get() {
+                ProcessEvidence::Unknown {
+                    reason: "liveness read failed".into(),
+                }
+            } else {
+                ProcessEvidence::Stopped {
+                    identity: identity.clone(),
+                    exit_code: None,
+                }
+            }
+        }
+        fn signal_verified(&self, _: &ProcessIdentity, _: i32) -> SignalOutcome {
+            SignalOutcome::AlreadyGone
+        }
+        fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
+            SignalOutcome::AlreadyGone
+        }
+        fn reap(&self, _: i32) {}
+    }
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, eid) = submit_and_admit(&store, "k-fl1");
+    let identity = ProcessIdentity {
+        pid: 4242,
+        started_at: "recorded".into(),
+        pgid: Some(4242),
+    };
+    let sup = Supervisor::new(
+        FlakyPort {
+            fail: Cell::new(false),
+            identity,
+        },
+        tmp_root("flaky"),
+        vec![fixture_bin(), "hang".into()],
+        config(),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Running);
+
+    // The liveness read now fails: the writer is unknown, never dead.
+    sup.port.fail.set(true);
+    for _ in 0..3 {
+        sup.poll_invocations(&store, NOW).unwrap();
+        assert_eq!(
+            execution(&store, &eid).state,
+            ExecutionState::Uncertain,
+            "a failed liveness read leaves writer ownership unproven"
+        );
+        assert_eq!(
+            held_claims(&store),
+            (1, 2),
+            "nothing releases on an unknown writer"
+        );
+        assert!(
+            store
+                .transact(|tx| tx.pending_requests())
+                .unwrap()
+                .is_empty(),
+            "no replacement trial while the writer is unverified"
+        );
+        assert_eq!(
+            store
+                .transact(|tx| tx.invocations_for_execution(&eid))
+                .unwrap()
+                .len(),
+            1,
+            "no second writer is spawned while the writer is unverified"
+        );
+        let record = store
+            .transact(|tx| projection::supervision(tx, &eid))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.writer_state, Some(WriterState::Unknown));
+        assert!(
+            record.capacity_slot.is_some() && record.reservation_ids.len() == 2,
+            "the supervision record shows the held slot and reservations"
+        );
+    }
+
+    // Reconciliation: the recorded identity verifies stopped — only now
+    // does the Execution settle (the recorded continue pauses it) and
+    // the slot release; reservations stay held for the preserved WIP.
+    sup.port.fail.set(false);
+    sup.poll_invocations(&store, NOW).unwrap();
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "the verified stop settles the recorded continue"
+    );
+    assert_eq!(
+        held_claims(&store),
+        (0, 2),
+        "the slot releases only after verification; reservations keep the WIP"
+    );
+    let record = store
+        .transact(|tx| projection::supervision(tx, &eid))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.writer_state, Some(WriterState::Stopped));
+    assert!(record.capacity_slot.is_none());
 }
