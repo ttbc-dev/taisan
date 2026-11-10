@@ -15,9 +15,11 @@ modeled behavior — they do not claim production-runtime support.
 The suite parameterizes over two axes:
 
 - **Provider implementation.** `PosixProvider` wraps
-  `Supervisor<PosixProcessControl>` spawning the real
-  `workloop-fixture-worker` binary — real process spawn, real signals,
-  real liveness reads. `ScriptedProvider` wraps
+  `Supervisor<CountingPosix>` — an observational decorator that
+  delegates spawn, inspect, and signal to `PosixProcessControl` and
+  records every spawn call and spawned identity — which in turn spawns
+  the real `workloop-fixture-worker` binary: real process spawn, real
+  signals, real liveness reads. `ScriptedProvider` wraps
   `Supervisor<ScriptedProcessControl>`, an independently implemented
   in-memory process table that can model start/liveness outcomes no
   argv can produce (a spawn whose identity capture was lost, an
@@ -44,7 +46,7 @@ The suite parameterizes over two axes:
 | --- | --- | --- |
 | WC-START-01 | A second delivery of the same durable request — the delivered-twice window where a consumer already recorded a writer identity for it — reconciles by request identity: the recorded writer is inspected and re-asserted running, one Invocation, no second spawn. | `duplicate_request_delivery_starts_no_second_writer` (both providers; the first leg spawns through the provider's own port so the recorded identity is real). |
 | WC-START-02 | A start whose outcome was lost (`SpawnError::Unknown`) leaves the writer uncertain — never a silent not-started that permits a replacement. The Invocation records no process identity and no second start is attempted. | `unknown_start_outcome_blocks_a_second_writer` (`ScriptedProvider`; skipped on `PosixProvider` — `spawn_unknown` not declared). |
-| WC-START-03 | A definitely-refused start (`SpawnError::Refused`) pauses the Execution and produces no writer. Refusal is distinct from uncertainty. | `refused_start_pauses_without_a_writer` (both providers). |
+| WC-START-03 | A definitely-refused start (`SpawnError::Refused`) pauses the Execution and produces no writer; the spawn counter observes the refused attempt exactly once and no second attempt follows. Refusal is distinct from uncertainty. | `refused_start_pauses_without_a_writer` (both providers). |
 
 ## Liveness and stop
 
@@ -59,7 +61,7 @@ The suite parameterizes over two axes:
 | Row | Required semantics | Scenario / coverage |
 | --- | --- | --- |
 | WC-ART-01 | A confirmed exit without a required artifact runs bounded recovery and then fails `artifact_recovery_exhausted` — never success. | `missing_artifact_runs_bounded_recovery_then_fails` (both providers); `missing_artifact_runs_bounded_recovery_then_fails`, `recovery_artifact_in_the_workspace_root_is_not_truncated` (supervisor suite). |
-| WC-ART-02 | An artifact that cannot count — an empty file (no digest → absent, never `Present`) or content whose digest differs from the required one (`Present` but unsatisfying) — never completes the required set. | `invalid_artifact_never_counts` (both providers). |
+| WC-ART-02 | An artifact that cannot count never completes the required set: an empty file carries no digest and is never recorded `Present`, and content whose digest differs from the required one is never recorded `Present` either — recovery refuses to promote a mismatched payload instead of reporting it. | `invalid_artifact_never_counts` (both providers; after each form the scenario asserts no `Present` observation exists, then that bounded recovery exhausts to `Failed`). |
 
 ## Producer identity and effect authorization
 
