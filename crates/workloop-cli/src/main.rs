@@ -665,12 +665,42 @@ fn build_supervisor(
     if installation.worker_argv.is_empty() {
         return None;
     }
-    Some(Supervisor::new(
-        PosixProcessControl,
-        PathBuf::from(&installation.workspace_root),
-        installation.worker_argv.clone(),
-        config.clone(),
-    ))
+    let workspace_root = PathBuf::from(&installation.workspace_root);
+    // The durable artifact handoff needs an installation-owned bare
+    // repository: bundles export to it, verification worktrees check
+    // out from it. It lives under the workspace root's `.handoff`
+    // directory — never inside a `ws-*` workspace.
+    let handoff_root = workspace_root.join(".handoff");
+    let repository = handoff_root.join("repo.git");
+    if !repository.exists() {
+        if let Err(e) = std::fs::create_dir_all(&handoff_root) {
+            eprintln!("taisan: handoff dir: {e}");
+            return None;
+        }
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repository)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("taisan: handoff repository init failed");
+            return None;
+        }
+    }
+    Some(
+        Supervisor::new(
+            PosixProcessControl,
+            workspace_root.clone(),
+            installation.worker_argv.clone(),
+            config.clone(),
+        )
+        .with_handoff(workloop_exec::handoff::HandoffLayout {
+            repository,
+            workspace_root,
+            out_root: handoff_root.join("out"),
+        }),
+    )
 }
 
 /// One pass of the run loop: dispatch scan, execution consumer, GitHub
@@ -691,9 +721,16 @@ fn run_tick(
     if let Some(supervisor) = supervisor {
         supervisor.run_once(store, now).map_err(|e| e.to_string())?;
     }
-    github
-        .apply_outbox(store, config, now)
-        .map_err(|e| e.to_string())?;
+    // The in-process fixture drains the outbox only when the
+    // installation declares it. Any other adapter identity names an
+    // out-of-process adapter (e.g. the S1 bridge) that performs host
+    // effects against the same store — running the fixture here would
+    // fabricate applied receipts for real pending intents.
+    if config.host.adapter == workloop_core::identity::AdapterId::trusted("fixture") {
+        github
+            .apply_outbox(store, config, now)
+            .map_err(|e| e.to_string())?;
+    }
     sweep(store, config, now).map_err(|e| e.to_string())?;
     // Status output goes through the same read-only projection as the
     // query subcommands — never a raw store read.

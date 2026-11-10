@@ -3296,30 +3296,33 @@ fn maybe_publish(
     // Stage 1: push_ref. Produced revision = the published artifact's
     // digest interpreted as an object id on the bound repository.
     let branch = format!("work/{}", work.id.0);
-    // Any applied push lands the ref — earlier failed retries must not
-    // keep the stage pinned open.
+    // The stage is satisfied only by an applied push that published the
+    // *current* produced revision — a fix Invocation's new artifact
+    // digest re-arms the stage so the branch republishes.
     let push_applied = work_intents.iter().any(|i| {
-        matches!(i.action, HostAction::PushRef { .. }) && i.status == HostActionStatus::Applied
+        matches!(
+            &i.action,
+            HostAction::PushRef { produced, .. }
+                if produced.object == artifact_digests[0]
+        ) && i.status == HostActionStatus::Applied
     });
     if !push_applied {
         // A definitely-failed latest attempt re-issues while the
         // transport account has retries left (the receipt handler pauses
         // when spent). Pending/unknown pushes are already caught by the
-        // outstanding check above.
+        // outstanding check above; an applied push for a stale produced
+        // revision is exactly the republish case — fall through and
+        // record a fresh intent.
         if let Some(latest_push) = work_intents
             .iter()
             .rfind(|i| matches!(i.action, HostAction::PushRef { .. }))
+            && let HostActionStatus::Failed { .. } = latest_push.status
         {
-            match latest_push.status {
-                HostActionStatus::Failed { .. } => {
-                    let usage = tx
-                        .work_usage(&work.id)?
-                        .unwrap_or_else(|| WorkUsage::new(&work.id));
-                    if usage.transport_retries_used > work.policy.transport_max_retries {
-                        return Ok(());
-                    }
-                }
-                _ => return Ok(()),
+            let usage = tx
+                .work_usage(&work.id)?
+                .unwrap_or_else(|| WorkUsage::new(&work.id));
+            if usage.transport_retries_used > work.policy.transport_max_retries {
+                return Ok(());
             }
         }
         let produced =
