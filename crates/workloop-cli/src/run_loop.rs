@@ -656,7 +656,7 @@ mod tests {
                         host: HostInstanceId::trusted("host-local"),
                         actor: HostActorId::trusted("bot-pub"),
                     },
-                    credential_ref: "default".into(),
+                    credential_ref: CredentialRef::trusted("default"),
                 }],
             },
             declared_capabilities: BTreeSet::from([

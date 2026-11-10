@@ -132,8 +132,8 @@ fn preview_fails_fast_under_held_write_lock() {
         Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, Origin, WorkPolicy,
     };
     use workloop_core::identity::{
-        ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId,
-        RepositoryId, RepositoryRef, RoleBinding,
+        ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability,
+        HostInstanceId, RepositoryId, RepositoryRef, RoleBinding,
     };
     use workloop_core::work::{HostTemplate, WorkloopConfig, preview};
 
@@ -172,7 +172,7 @@ fn preview_fails_fast_under_held_write_lock() {
                     host,
                     actor: HostActorId::trusted("pub-agent"),
                 },
-                credential_ref: "cred-publication".into(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
             }],
         },
         declared_capabilities: BTreeSet::from([

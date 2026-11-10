@@ -16,8 +16,8 @@ use workloop_core::domain::{
     Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy,
 };
 use workloop_core::identity::{
-    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
-    RepositoryRef, RoleBinding,
+    ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability, HostInstanceId,
+    RepositoryId, RepositoryRef, RoleBinding,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig};
 
@@ -464,7 +464,8 @@ impl Installation {
                 },
                 // The credential source is installation configuration;
                 // the record's value names it, never a secret value.
-                credential_ref: "default".to_string(),
+                credential_ref: CredentialRef::new("default")
+                    .map_err(|e| format!("installation credential_ref: {e}"))?,
             });
         }
         let mut declared_capabilities = BTreeSet::new();
