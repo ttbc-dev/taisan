@@ -1011,6 +1011,71 @@ fn one_works_conflict_is_recorded_and_the_sweep_continues() {
 }
 
 #[test]
+fn a_sweep_conflict_deferral_is_cleared_when_the_sweep_next_reads_cleanly() {
+    let (store, e1, _e2) = two_admitted_executions("sweep-clear");
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: false,
+    };
+    let report = sweep(&injected, &config(), NOW).expect("a per-Work conflict is not a tick error");
+    assert_eq!(report.conflicts, vec![e1.clone()]);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e1 && d.reason == "sweep_conflict"),
+        "the conflict is recorded first"
+    );
+
+    // The next pass reads the same Work cleanly: the transient conflict
+    // is resolved, not left on the capacity view forever.
+    sweep(&store, &config(), NOW).unwrap();
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e1),
+        "a clean sweep resolves the recorded conflict"
+    );
+}
+
+#[test]
+fn a_sweep_conflict_deferral_is_cleared_when_the_sweep_records_a_stop() {
+    let (store, e1, _e2) = two_admitted_executions("sweep-clear-stop");
+    let injected = Injected {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+        internal: false,
+    };
+    let over = NOW + (6 * 3600) + 1;
+    sweep(&injected, &config(), over).expect("a per-Work conflict is not a tick error");
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e1)
+    );
+
+    let report = sweep(&store, &config(), over).unwrap();
+    assert_eq!(report.stops_recorded, 1, "the later pass stops the Work");
+    assert_eq!(execution(&store, &e1).state, ExecutionState::Stopping);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e1),
+        "a recorded stop is no longer a deferred Execution"
+    );
+}
+
+#[test]
 fn an_infrastructure_failure_still_fails_the_sweep() {
     let (store, _e1, _e2) = two_admitted_executions("sweep-outage");
     let injected = Injected {

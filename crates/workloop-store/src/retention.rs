@@ -358,12 +358,16 @@ impl SqliteStore {
         }
 
         // Phase B: reclaim oldest-first until a pass bound stops it.
-        let mut reclaimed_count: usize = 0;
+        // The body bound counts deletion attempts, not successes: a
+        // failed delete has already paid the pass's cost, so it must
+        // advance the bound instead of letting a pass walk the whole
+        // candidate set when every attempt fails.
+        let mut attempted_bodies: usize = 0;
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
         for (index, candidate) in candidates.iter().enumerate() {
-            if reclaimed_count >= params.max_bodies {
+            if attempted_bodies >= params.max_bodies {
                 if candidate.state == "present" {
                     report.eligible_remaining += 1;
                 }
@@ -433,11 +437,11 @@ impl SqliteStore {
                 }
             }
 
+            attempted_bodies += 1;
             match delete_managed(&managed) {
                 Ok(reason) => {
                     self.finish_reclaim(&candidate.body_id, &reason, now_unix_seconds)?;
                     report.bytes_reclaimed += candidate.bytes;
-                    reclaimed_count += 1;
                     report.reclaimed.push(ReclaimedBody {
                         body_id: candidate.body_id.clone(),
                         bytes: candidate.bytes,

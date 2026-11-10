@@ -3922,6 +3922,28 @@ enum SweepOutcome {
     TerminalFailure,
 }
 
+/// Drop any stall explanation recorded against an Execution that the
+/// sweep has now resolved (a successful read, a stop, or settlement).
+fn clear_deferral(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Result<(), StoreError> {
+    tx.apply(&Effect::ClearDeferral {
+        execution_id: execution_id.clone(),
+    })
+}
+
+/// Clear only a previous `sweep_conflict`: a clean sweep read resolves
+/// that transient conflict, while a `dispatch_conflict` on a still-queued
+/// Execution is dispatch's explanation to keep until admission re-decides.
+fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Result<(), StoreError> {
+    let stale = tx
+        .deferrals()?
+        .iter()
+        .any(|d| d.execution_id == *execution_id && d.reason == "sweep_conflict");
+    if stale {
+        clear_deferral(tx, execution_id)?;
+    }
+    Ok(())
+}
+
 /// One execution's sweep decision inside its own transaction. The
 /// execution is re-read here so a change committed after the list was
 /// taken is observed fresh, never acted on from a stale snapshot.
@@ -3931,6 +3953,7 @@ fn sweep_one(
     now_unix_seconds: i64,
 ) -> Result<SweepOutcome, StoreError> {
     let Some(execution) = tx.execution(execution_id)? else {
+        clear_deferral(tx, execution_id)?;
         return Ok(SweepOutcome::Absent);
     };
     match execution.state {
@@ -3966,6 +3989,7 @@ fn sweep_one(
                     execution: next,
                     expected_state: execution.state.clone(),
                 })?;
+                clear_deferral(tx, execution_id)?;
                 return Ok(SweepOutcome::StopRecorded);
             }
         }
@@ -4010,11 +4034,13 @@ fn sweep_one(
                         execution: next,
                         expected_state: execution.state.clone(),
                     })?;
+                    clear_deferral(tx, execution_id)?;
                     return Ok(SweepOutcome::StopRecorded);
                 }
             }
         }
     }
+    clear_sweep_conflict(tx, execution_id)?;
     Ok(SweepOutcome::Unchanged)
 }
 
@@ -4050,6 +4076,12 @@ fn fail_terminal(
     })?;
     tx.apply(&Effect::ReleaseIssueClaims {
         work_id: execution.work_id.clone(),
+    })?;
+    // A terminal Execution is never a deferred one: any stale stall
+    // explanation recorded against it would otherwise keep surfacing on
+    // the `capacity` Query after settlement.
+    tx.apply(&Effect::ClearDeferral {
+        execution_id: execution.id.clone(),
     })?;
     let usage = tx
         .work_usage(&execution.work_id)?
@@ -4118,6 +4150,11 @@ pub fn consume_due_recovery_intents(
     let mut scan = RecoveryScan::default();
     let now = clock();
     let intents = store.transact(|tx| tx.recovery_intents())?;
+    // Every due intent evaluated this pass consumes the per-tick budget,
+    // including the ones held by a guard (`operator_hold`, unmet
+    // prerequisites, an active Execution, an unsupported kind). Only the
+    // deadline-deferred intents are exempt: they were never evaluated.
+    let mut evaluated: usize = 0;
     for listed in intents {
         if listed.state != crate::store::RecoveryIntentState::Pending {
             continue;
@@ -4137,11 +4174,12 @@ pub fn consume_due_recovery_intents(
                 continue;
             }
         }
-        if scan.consumed + scan.retired >= limit {
+        if evaluated >= limit {
             scan.held
                 .push((listed.intent_id.clone(), "recovery_limit".into()));
             continue;
         }
+        evaluated += 1;
         if listed.kind != "requeue" {
             // Only the documented kind fires automatically; anything
             // else waits for its owning slice rather than being guessed.
@@ -4232,6 +4270,9 @@ fn fire_due_intent(
         execution.state,
         ExecutionState::Succeeded | ExecutionState::Failed | ExecutionState::Cancelled
     ) {
+        // Terminal evidence invalidates the intent and any stall
+        // explanation a prior conflict recorded against the Execution.
+        clear_deferral(tx, &execution_id)?;
         retire_intent(tx, &intent.intent_id, "execution_terminal")?;
         return Ok(FireOutcome::Retired);
     }
@@ -4259,12 +4300,23 @@ fn fire_due_intent(
         return Ok(FireOutcome::Held("prerequisites_unmet".into()));
     }
     // Work-wide automatic-time ceiling: an exhausted budget can only
-    // hand off, never requeue (same rule as sweep and resume).
+    // hand off, never requeue (same rule as sweep and resume). The
+    // current pause has not been closed yet, so charge it as
+    // human-decision waiting here — exactly what `close_pause_effects`
+    // will persist on the transition. Otherwise a long human/repair
+    // pause would count as automatic time and terminally fail the
+    // Execution the design says must be excluded.
     let usage = tx.work_usage(&work.id)?;
-    if let Some(usage) = usage
-        && let Some(automatic) = automatic_seconds_used(&usage, now)
-        && automatic > work.policy.automatic_time_limit_seconds
-    {
+    let automatic_exhausted = usage.is_some_and(|mut usage| {
+        if let Some(paused_since) = execution.paused_since_unix_seconds {
+            usage.human_wait_seconds_total = usage
+                .human_wait_seconds_total
+                .saturating_add((now - paused_since).max(0) as u64);
+        }
+        automatic_seconds_used(&usage, now)
+            .is_some_and(|a| a > work.policy.automatic_time_limit_seconds)
+    });
+    if automatic_exhausted {
         fail_terminal(
             tx,
             &execution,

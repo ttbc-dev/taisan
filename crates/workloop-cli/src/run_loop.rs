@@ -287,8 +287,9 @@ pub fn run_pass(
         });
     }
 
-    // Phase 2 — dispatch admission (Core judges; one transaction per
-    // admission, deadline and scope supplied as facts).
+    // Phase 2 — dispatch admission (Core judges; the whole scan shares
+    // one store transaction and isolates each admission in its own
+    // attempt savepoint, with deadline and scope supplied as facts).
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;

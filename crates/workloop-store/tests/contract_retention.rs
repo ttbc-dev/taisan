@@ -221,6 +221,57 @@ fn the_body_bound_stops_the_pass_and_reports_the_remainder() {
 }
 
 #[test]
+fn the_body_bound_counts_failed_delete_attempts() {
+    let dir = root("bound-failures");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // A parent that is a regular file makes every delete fail.
+    let blocker = dir.join("not-a-dir");
+    std::fs::write(&blocker, "block").unwrap();
+    for (i, id) in ["f0", "f1", "f2"].iter().enumerate() {
+        store
+            .register_body(&CatalogBody {
+                body_id: (*id).into(),
+                category: "cas".into(),
+                path: blocker
+                    .join(format!("child-{i}.blob"))
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes: 8,
+                registered_unix_seconds: NOW - 300 + i as i64,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+    }
+
+    let mut p = params();
+    p.max_bodies = 2;
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+    assert_eq!(
+        report.failed.len(),
+        2,
+        "the bound counts deletion attempts, not only successes"
+    );
+    assert_eq!(report.eligible_remaining, 1);
+    assert_eq!(
+        store.body_state("f0").unwrap().unwrap().2,
+        1,
+        "the oldest body was attempted"
+    );
+    assert_eq!(
+        store.body_state("f1").unwrap().unwrap().2,
+        1,
+        "the second body was attempted"
+    );
+    assert_eq!(
+        store.body_state("f2").unwrap().unwrap().2,
+        0,
+        "the body past the bound was not attempted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_byte_bound_stops_before_paying_for_the_next_body() {
     let dir = root("bound-bytes");
     let store = SqliteStore::in_memory(1).unwrap();

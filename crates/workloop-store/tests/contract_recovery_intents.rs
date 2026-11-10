@@ -416,6 +416,51 @@ fn the_tick_bound_leaves_the_remainder_pending() {
 }
 
 #[test]
+fn held_intents_count_against_the_tick_bound() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let mut scheduled = Vec::new();
+    for i in 0..3 {
+        let (work_id, execution_id) = submit(&store, &format!("k-held-{i}"));
+        pause(&store, &execution_id, vec![]);
+        // An unknown kind is never guessed: each due intent is held
+        // after evaluation, and evaluation itself consumes the bound.
+        scheduled.push(schedule(
+            &store,
+            &work_id,
+            Some(&execution_id),
+            "unknown",
+            NOW,
+        ));
+    }
+
+    let scan = consume(&store, NOW, None, None, 2);
+    assert_eq!(scan.consumed, 0);
+    assert_eq!(
+        scan.held
+            .iter()
+            .filter(|(_, reason)| reason == "unsupported_kind")
+            .count(),
+        2,
+        "only the tick bound's worth of intents is evaluated: {scan:?}"
+    );
+    assert_eq!(
+        scan.held
+            .iter()
+            .filter(|(_, reason)| reason == "recovery_limit")
+            .count(),
+        1,
+        "the intent past the bound is reported, not evaluated: {scan:?}"
+    );
+    for id in &scheduled {
+        assert_eq!(
+            intent(&store, id).state,
+            RecoveryIntentState::Pending,
+            "held intents stay pending"
+        );
+    }
+}
+
+#[test]
 fn the_tick_deadline_defers_due_intents_to_the_next_pass() {
     let store = SqliteStore::in_memory(2).unwrap();
     let (work_id, execution_id) = submit(&store, "k-deadline");
@@ -509,6 +554,46 @@ fn the_work_wide_time_ceiling_blocks_a_requeue() {
     let e = execution(&store, &execution_id);
     assert_eq!(e.state, ExecutionState::Failed);
     assert_eq!(e.terminal_code.as_deref(), Some("automatic_time_exhausted"));
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Consumed
+    );
+}
+
+#[test]
+fn a_long_human_pause_does_not_count_against_the_automatic_time_ceiling() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-time-pause");
+    pause(&store, &execution_id, vec![]);
+    let work = store.transact(|tx| tx.work(&work_id)).unwrap().unwrap();
+    let limit = work.policy.automatic_time_limit_seconds as i64;
+    // The Work dispatched long ago, but almost all of the elapsed wall
+    // time has been the current human/repair pause.
+    store
+        .transact(|tx| {
+            let mut usage = tx.work_usage(&work_id)?.unwrap();
+            usage.first_dispatch_unix_seconds = Some(NOW - limit - 200);
+            tx.apply(&Effect::UpdateWorkUsage { usage })?;
+            let mut execution = tx.execution(&execution_id)?.unwrap();
+            execution.paused_since_unix_seconds = Some(NOW - limit - 150);
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Paused,
+            })
+        })
+        .unwrap();
+    let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(
+        scan.failed_terminal, 0,
+        "human waiting is excluded from automatic time: {scan:?}"
+    );
+    assert_eq!(scan.requeued, 1);
+    assert_eq!(
+        execution(&store, &execution_id).state,
+        ExecutionState::Queued
+    );
     assert_eq!(
         intent(&store, &intent_id).state,
         RecoveryIntentState::Consumed

@@ -258,6 +258,35 @@ fn the_outbox_stops_at_the_tick_bound_and_reports_the_remainder() {
 }
 
 #[test]
+fn permanently_pending_intents_do_not_starve_later_ready_intents() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let mut gh = FixtureGithub::new();
+    let (w, e) = submit(&store, "k-stuck");
+    admit(&store, &e);
+    // These Works have no Execution, so their intents can never leave
+    // Pending. Eight of them are exactly one tick's worth of attempts:
+    // they must not consume the budget and starve the ready intent.
+    for i in 0..8 {
+        queue_open_change(&store, &WorkId(format!("missing-{i}")));
+    }
+    queue_open_change(&store, &w);
+
+    let report = gh
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 8)
+        .unwrap();
+    assert_eq!(
+        report.attempted, 1,
+        "only the intent that can run is a host attempt"
+    );
+    assert_eq!(report.applied, 1);
+    assert_eq!(
+        gh.applied().len(),
+        1,
+        "the later ready intent is reached within the same tick"
+    );
+}
+
+#[test]
 fn a_tick_deadline_stops_the_outbox_drain_and_defers_the_remainder() {
     let store = SqliteStore::in_memory(4).unwrap();
     let mut gh = FixtureGithub::new();

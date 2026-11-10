@@ -141,6 +141,11 @@ impl FixtureGithub {
             // Both bounds stop the drain before the next item starts:
             // the per-tick item budget and the tick deadline. Whichever
             // trips, the untouched remainder is reported, never dropped.
+            // Only a real host attempt consumes the item budget — an
+            // intent that cannot run yet (its Execution is missing or
+            // denies `host_write`) is skipped without charging the
+            // budget, so a permanently pending intent never starves the
+            // ready intents behind it.
             if report.attempted >= max_items || deadline.is_some_and(|d| clock() >= d) {
                 let pending: Vec<String> = store.transact(|tx| {
                     Ok(tx
@@ -167,8 +172,10 @@ impl FixtureGithub {
             let Some(intent) = next else { break };
             let action_id = intent.action_id.clone();
             attempted.insert(action_id.clone());
-            report.attempted += 1;
-            self.attempt(store, config, intent, now)?;
+            let host_attempt = self.attempt(store, config, intent, now)?;
+            if host_attempt {
+                report.attempted += 1;
+            }
             let status = store.transact(|tx| {
                 Ok(tx
                     .action_intents()?
@@ -282,7 +289,7 @@ impl FixtureGithub {
         config: &WorkloopConfig,
         intent: HostActionIntent,
         now: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
             Ok(tx
@@ -291,10 +298,10 @@ impl FixtureGithub {
                 .max_by_key(|execution| execution.ordinal))
         })?;
         let Some(execution) = execution else {
-            return Ok(());
+            return Ok(false);
         };
         if !execution.allowed_effects.host_write {
-            return Ok(());
+            return Ok(false);
         }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
@@ -490,7 +497,7 @@ impl FixtureGithub {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
