@@ -73,7 +73,7 @@ fn config(adapter: &str, repository: RepositoryRef, actor: HostActorRef) -> Work
             actors: vec![RoleBinding {
                 role: ActorRole::Publication,
                 actor,
-                credential_ref: "cred-publication".into(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
             }],
         },
         declared_capabilities: declared(),

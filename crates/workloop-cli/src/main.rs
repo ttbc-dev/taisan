@@ -1061,8 +1061,8 @@ fn installation_files(db_abs: &Path, config_path: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use workloop_core::identity::{
-        ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, HostActorId, HostActorRef,
-        HostCapability, HostInstanceId, RoleBinding,
+        ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CredentialRef, HostActorId,
+        HostActorRef, HostCapability, HostInstanceId, RoleBinding,
     };
     use workloop_core::observation::HostActionStatus;
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
@@ -1092,7 +1092,7 @@ mod tests {
                 actors: vec![RoleBinding {
                     role: ActorRole::Publication,
                     actor: publisher(),
-                    credential_ref: "default".into(),
+                    credential_ref: CredentialRef::trusted("default"),
                 }],
             },
             declared_capabilities: [

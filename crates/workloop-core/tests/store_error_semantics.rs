@@ -8,8 +8,8 @@ use std::cell::Cell;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::{
-    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, IssueRef,
-    RepositoryId, RepositoryRef, RoleBinding, StoreId,
+    ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability, HostInstanceId,
+    IssueRef, RepositoryId, RepositoryRef, RoleBinding, StoreId,
 };
 use workloop_core::observation::Observation;
 use workloop_core::store::{
@@ -35,7 +35,7 @@ fn config() -> WorkloopConfig {
                     host: host_instance(),
                     actor: HostActorId::trusted("bot-pub"),
                 },
-                credential_ref: "default".into(),
+                credential_ref: CredentialRef::trusted("default"),
             }],
         },
         declared_capabilities: [
