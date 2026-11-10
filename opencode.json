@@ -17,6 +17,19 @@
           "limit": { "context": 1048576, "output": 131072 }
         }
       }
+    },
+    "ollama-cloud": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama Cloud",
+      "options": {
+        "baseURL": "https://ollama.com/v1"
+      },
+      "models": {
+        "deepseek-v4.1-flash": {
+          "name": "deepseek-v4.1-flash",
+          "limit": { "context": 1048576, "output": 131072 }
+        }
+      }
     }
   }
 }
