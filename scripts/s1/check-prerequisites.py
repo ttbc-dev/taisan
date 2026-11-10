@@ -28,6 +28,31 @@ DOC_FILES = {
     "materials-readme": "docs/s1/README.md",
 }
 CREDENTIAL_VALUE_KEYS = {"value", "secret", "token", "password", "pat"}
+REQUIRED_CAPABILITIES = (
+    "repository_read",
+    "branch_read",
+    "change_request_read",
+    "push_ref",
+    "change_request_create",
+    "change_request_update",
+    "comment_write",
+    "issue_read",
+    "checks_read",
+    "review_findings_read",
+)
+REQUIRED_CHECKS = ("verify",)
+BUDGET_KEYS = ("max_invocations", "max_review_rounds", "runtime_limit_seconds")
+PLACEHOLDER_MARKERS = (
+    "recorded-from",
+    "recorded-at",
+    "recorded from",
+    "recorded at",
+    "to-be-recorded",
+    "placeholder",
+    "changeme",
+    "tbd",
+    "todo",
+)
 REVISION_KEYS = (
     "materials_revision",
     "taisan_core_revision",
@@ -70,8 +95,138 @@ def _check_identity_scope(prefix: str, value, errors: list[str]) -> None:
         errors.append(f"{prefix}: must scope to exactly [{S1_REPOSITORY!r}], got {value!r}")
 
 
+def _is_placeholder(value: str) -> bool:
+    lowered = value.strip().lower()
+    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
+
+
+def _identity_state(value) -> tuple[str, str]:
+    """Classify a binding identity as resolved, unresolved, or invalid.
+
+    An unresolved identity is a declared reference with an explicit
+    resolution step, not a binding value. It keeps the preflight honest:
+    preparation can carry it, but the installation is never certified
+    complete until the live preflight records the real value.
+    """
+    if isinstance(value, dict):
+        if (
+            value.get("status") == "unresolved"
+            and _nonempty(value.get("resolution"))
+            and _nonempty(value.get("resolved_by"))
+        ):
+            return "unresolved", f"{value['resolution']} ({value['resolved_by']})"
+        return (
+            "invalid",
+            "unresolved identities require status 'unresolved', resolution, and resolved_by",
+        )
+    if not isinstance(value, str) or not value.strip():
+        return "invalid", "required"
+    if _is_placeholder(value):
+        return (
+            "invalid",
+            "must be a resolved identity or an explicit unresolved reference; "
+            "placeholder text is not an identity",
+        )
+    return "resolved", value
+
+
+def install_spec_unresolved(spec: dict) -> list[str]:
+    """Return the binding items the live preflight must still resolve."""
+    unresolved: list[str] = []
+    repository = spec.get("repository")
+    reviewer = spec.get("reviewer_identity")
+    config = spec.get("configuration_identity")
+    for prefix, value in (
+        ("repository.stable_id", repository.get("stable_id") if isinstance(repository, dict) else None),
+        ("reviewer_identity.app_id", reviewer.get("app_id") if isinstance(reviewer, dict) else None),
+        ("configuration_identity.store_id", config.get("store_id") if isinstance(config, dict) else None),
+    ):
+        state, detail = _identity_state(value)
+        if state == "unresolved":
+            unresolved.append(f"{prefix}: {detail}")
+
+    status = spec.get("implementation_status")
+    target = status.get("target_profile") if isinstance(status, dict) else None
+    if not isinstance(target, dict):
+        unresolved.append(
+            "implementation_status.target_profile: missing; target availability is unverified"
+        )
+        return unresolved
+    if target.get("adapter_available") is not True:
+        unresolved.append(
+            "implementation_status.target_profile.adapter: target adapter is not available in this tree"
+        )
+    if target.get("reviewer_app_available") is not True:
+        unresolved.append(
+            "implementation_status.target_profile.reviewer_app: target reviewer App does not exist yet"
+        )
+    return unresolved
+
+
+def validate_rehearsals(root: Path, spec: dict) -> list[str]:
+    """Cross-check the recorded rehearsal profile against its evidence files."""
+    errors: list[str] = []
+    status = spec.get("implementation_status")
+    if not isinstance(status, dict):
+        return ["implementation_status: missing object"]
+    target = status.get("target_profile")
+    if not isinstance(target, dict):
+        errors.append("implementation_status.target_profile: missing object")
+    rehearsals = status.get("retained_rehearsals")
+    if not isinstance(rehearsals, list) or not rehearsals:
+        errors.append(
+            "implementation_status.retained_rehearsals: required non-empty array"
+        )
+        return errors
+    for index, rehearsal in enumerate(rehearsals):
+        prefix = f"implementation_status.retained_rehearsals[{index}]"
+        if not isinstance(rehearsal, dict):
+            errors.append(f"{prefix}: expected object")
+            continue
+        for key in (
+            "evidence",
+            "run_tag",
+            "adapter",
+            "reviewer_actor",
+            "credential_reference",
+            "classification",
+        ):
+            if not _nonempty(rehearsal.get(key)):
+                errors.append(f"{prefix}.{key}: required")
+        if rehearsal.get("repository_host_write") is not True:
+            errors.append(f"{prefix}.repository_host_write: expected true")
+        evidence = rehearsal.get("evidence")
+        if not isinstance(evidence, str) or not evidence:
+            continue
+        document = root / evidence
+        if not document.is_file():
+            errors.append(f"{prefix}.evidence: missing {evidence}")
+            continue
+        text = document.read_text()
+        for key in ("run_tag", "adapter", "reviewer_actor", "credential_reference"):
+            value = rehearsal.get(key)
+            if isinstance(value, str) and value and value not in text:
+                errors.append(
+                    f"{prefix}.{key}: {value!r} is not recorded in {evidence}"
+                )
+        if (
+            rehearsal.get("repository_host_write") is True
+            and "host_write: true" not in text
+        ):
+            errors.append(
+                f"{prefix}.repository_host_write: true is not recorded in {evidence}"
+            )
+    return errors
+
+
 def validate_install_spec(spec: dict) -> list[str]:
-    """Return every install-spec failure; an empty list means complete."""
+    """Return every hard install-spec failure.
+
+    An empty list means the declared fields are structurally and
+    semantically valid; unresolved binding identities are reported
+    separately by :func:`install_spec_unresolved` and never certify the
+    installation as complete.
+    """
     errors: list[str] = []
     if spec.get("schema_version") != 1:
         errors.append("schema_version: expected 1")
@@ -95,8 +250,9 @@ def validate_install_spec(spec: dict) -> list[str]:
             errors.append("repository.host: expected github.com")
         if repository.get("full_name") != S1_REPOSITORY:
             errors.append(f"repository.full_name: expected {S1_REPOSITORY!r}")
-        if not _nonempty(repository.get("stable_id")):
-            errors.append("repository.stable_id: required")
+        state, detail = _identity_state(repository.get("stable_id"))
+        if state == "invalid":
+            errors.append(f"repository.stable_id: {detail}")
 
     credential = spec.get("credential_reference")
     if not isinstance(credential, dict) or not credential:
@@ -141,8 +297,9 @@ def validate_install_spec(spec: dict) -> list[str]:
             errors.append("reviewer_identity.kind: expected github-app")
         if not _nonempty(reviewer.get("app_slug")):
             errors.append("reviewer_identity.app_slug: required")
-        if not _nonempty(reviewer.get("app_id")):
-            errors.append("reviewer_identity.app_id: required")
+        state, detail = _identity_state(reviewer.get("app_id"))
+        if state == "invalid":
+            errors.append(f"reviewer_identity.app_id: {detail}")
         if not _nonempty(reviewer.get("actor")):
             errors.append("reviewer_identity.actor: required")
         _check_identity_scope(
@@ -191,16 +348,7 @@ def validate_install_spec(spec: dict) -> list[str]:
     if not isinstance(config, dict):
         errors.append("configuration_identity: missing")
     else:
-        for key in (
-            "store_id",
-            "host_instance",
-            "repository",
-            "adapter",
-            "contract_version",
-            "capabilities",
-            "required_checks",
-            "budget",
-        ):
+        for key in ("host_instance", "repository", "adapter", "contract_version"):
             if not _nonempty(config.get(key)):
                 errors.append(f"configuration_identity.{key}: required")
         if config.get("repository") != S1_REPOSITORY:
@@ -209,6 +357,47 @@ def validate_install_spec(spec: dict) -> list[str]:
             )
         if config.get("host_instance") != "github.com":
             errors.append("configuration_identity.host_instance: expected github.com")
+        state, detail = _identity_state(config.get("store_id"))
+        if state == "invalid":
+            errors.append(f"configuration_identity.store_id: {detail}")
+
+        capabilities = config.get("capabilities")
+        if not isinstance(capabilities, list) or not capabilities:
+            errors.append(
+                "configuration_identity.capabilities: required non-empty array"
+            )
+        else:
+            if any(not isinstance(item, str) or not item.strip() for item in capabilities):
+                errors.append(
+                    "configuration_identity.capabilities: entries must be non-empty strings"
+                )
+            missing = sorted(set(REQUIRED_CAPABILITIES) - set(capabilities))
+            if missing:
+                errors.append(
+                    "configuration_identity.capabilities: missing required S1 "
+                    f"capabilities {', '.join(missing)}"
+                )
+
+        required_checks = config.get("required_checks")
+        if not isinstance(required_checks, list) or required_checks != list(
+            REQUIRED_CHECKS
+        ):
+            errors.append(
+                "configuration_identity.required_checks: expected exactly "
+                f"{list(REQUIRED_CHECKS)!r}, got {required_checks!r}"
+            )
+
+        budget = config.get("budget")
+        if not isinstance(budget, dict):
+            errors.append("configuration_identity.budget: required object")
+        else:
+            for key in BUDGET_KEYS:
+                value = budget.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    errors.append(
+                        f"configuration_identity.budget.{key}: expected a positive "
+                        f"integer, got {value!r}"
+                    )
 
     identities = spec.get("required_identities")
     if not isinstance(identities, list):
@@ -400,6 +589,8 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
     root = root.resolve()
     errors: list[str] = []
     checked: list[str] = []
+    spec: dict = {}
+    resolved_spec = False
 
     paths = {name: root / relative for name, relative in FIXTURE_FILES.items()}
     for name, path in paths.items():
@@ -416,12 +607,16 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         spec_path = install_spec if install_spec is not None else paths["installation-spec"]
         if not spec_path.is_file():
             errors.append(f"installation-spec: missing at {spec_path}")
-            spec = {}
         else:
             spec = _load_json(spec_path)
             spec_errors = validate_install_spec(spec)
             errors.extend(f"installation-spec: {item}" for item in spec_errors)
+            errors.extend(
+                f"installation-spec: {item}"
+                for item in validate_rehearsals(root, spec)
+            )
             checked.append(str(spec_path))
+            resolved_spec = True
 
         seed = _load_json(paths["seeded-issue"]) if paths["seeded-issue"].is_file() else {}
         errors.extend(f"seeded-issue: {item}" for item in validate_seeded_issue(seed))
@@ -439,8 +634,12 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
     except CheckFailure as exc:
         errors.extend(exc.errors)
 
+    unresolved = install_spec_unresolved(spec) if resolved_spec else []
+    status = "failed" if errors else ("prepared" if unresolved else "ok")
     return {
-        "status": "ok" if not errors else "failed",
+        "status": status,
+        "installation_ready": status == "ok",
+        "unresolved_identities": unresolved,
         "live_execution": "not-run (materials preflight only)",
         "checked_files": checked,
         "errors": errors,
@@ -466,12 +665,14 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         report = {
             "status": "failed",
+            "installation_ready": False,
+            "unresolved_identities": [],
             "live_execution": "not-run (materials preflight only)",
             "checked_files": [],
             "errors": [str(exc)],
         }
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["status"] == "ok" else 1
+    return 1 if report["status"] == "failed" else 0
 
 
 if __name__ == "__main__":

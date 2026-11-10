@@ -30,9 +30,18 @@ checkable fields:
 | [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json) | Every S1 criterion row with its variant assignment, revision/config reference, Work/Execution/Invocation/action identities, and required evidence |
 
 `python3 scripts/s1/check-prerequisites.py` validates the install-spec
-fields and all three materials, fails closed on any missing entry, and
-never executes the live scenario. It is a pre-live preflight only: a
-pass is not execution permission and is not live evidence.
+fields (allowlist, credential reference, reviewer identity, revision,
+configuration, **capability/required-check/budget content**) and all
+three materials, fails closed on any missing or invalid entry, and
+never executes the live scenario. Binding identities that only a
+read-only host/store interaction can resolve are carried as explicit
+unresolved references: the shipped preparation fixture reports
+`status: prepared` with `installation_ready: false`, while a fully
+resolved install spec reports `status: ok`. Neither result is execution
+permission, and neither is live evidence. The retained scenario-bridge
+rehearsals (`docs/evidence/u8.2.md`, `u8.3.md`) are recorded separately
+from the S1 target profile; their adapter, reviewer, credential-reference
+and `host_write` values are cross-checked against those documents.
 
 ## Recorded decisions (owner, 2026-11-09)
 

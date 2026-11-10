@@ -25,7 +25,7 @@ allowlist is evaluated against that identity, not the display name.
 | Kind | Fine-grained personal access token, scoped to `shimpeiws/coding-worker-smoke` only |
 | Permissions | contents RW, pull requests RW, issues RW, checks R |
 | Storage | Installation config holds a **credential reference** (a name resolving to the secret store entry) — never a value |
-| Reference name | `s1-publication-credential` (installation-local; the resolved value never appears in the repository, committed config, or evidence exports) |
+| Reference name | `S1_PUBLICATION_CREDENTIAL` (provider `env`; installation-local; the resolved value never appears in the repository, committed config, or evidence exports) |
 
 The reference mechanism permits swapping to a scoped GitHub App later
 without changing this spec or the recorded Work bindings. Credential
@@ -38,6 +38,8 @@ not a rotation.
 | Field | Value |
 | --- | --- |
 | Kind | Dedicated S1 reviewer GitHub App (owner-created) |
+| App slug / actor | `s1-reviewer` / `s1-reviewer[bot]` |
+| App id | Recorded as an **unresolved reference** until the owner creates the App; the live installation preflight records the real id (never invented here) |
 | Installation scope | Installed on `shimpeiws/coding-worker-smoke` only |
 | Relationship to worker credential | A separate identity: review evidence is produced by an actor distinct from the publication actor, so author and reviewer can never collapse into one identity |
 
@@ -56,10 +58,46 @@ credential.
 | Field | Value |
 | --- | --- |
 | Host instance ID | `github.com` (the production GitHub instance) |
-| Repository | The stable repository ID of `shimpeiws/coding-worker-smoke`, not its display path |
-| Adapter | `github` |
-| Contract version | The adapter contract version negotiated at installation |
+| Repository | The stable repository ID of `shimpeiws/coding-worker-smoke`, not its display path. Recorded as an **unresolved reference** until the live installation preflight reads it from the host |
+| Adapter | `github` — the target production adapter. It is **not shipped in this tree** (U3); the only real-host adapter today is the scenario bridge `s1-bridge` |
+| Contract version | The adapter contract version negotiated at installation (`1` in the prepared profile) |
 | Actor bindings | `publication` → the scoped-PAT identity; review observations bound to the reviewer App identity |
+
+## Installation completeness and retained rehearsals
+
+The prepared fixture distinguishes **target profile** from **completed
+installation**. Three binding identities cannot be known without a
+read-only host/store interaction, so the fixture records them as
+explicit unresolved references rather than placeholder text:
+
+| Identity | Resolution step |
+| --- | --- |
+| `repository.stable_id` | Read-only host repository read during the live installation preflight (#113) |
+| `reviewer_identity.app_id` | Owner app listing after the owner creates the S1 reviewer App |
+| `configuration_identity.store_id` | Fresh store opened for the S1 installation before #113 |
+
+`scripts/s1/check-prerequisites.py` therefore reports
+`status: prepared` and `installation_ready: false` for the shipped
+fixture. It reports `status: ok` only for a spec whose binding
+identities are resolved and whose target adapter and reviewer App are
+declared available. A `prepared` result is **not** execution
+permission; it means the materials are complete enough to hand to the
+live preflight.
+
+The retained live runs in this tree are **scenario-bridge
+rehearsals**, not S1 acceptance. They used a different installation
+profile, and the fixture records that profile explicitly so the two
+accounts cannot be confused:
+
+| Run | Adapter | Reviewer actor | Credential ref | `host_write` |
+| --- | --- | --- | --- | --- |
+| [U8.2](../evidence/u8.2.md) | `s1-bridge` | `github-actions[bot]` | `default` | `true` |
+| [U8.3](../evidence/u8.3.md) | `s1-bridge` | `github-actions[bot]` | `default` | `true` |
+| S1 target (this spec) | `github` (not yet shipped) | `s1-reviewer[bot]` (App to be created) | `S1_PUBLICATION_CREDENTIAL` | `false` |
+
+The test `test_retained_rehearsal_profile_matches_live_evidence`
+cross-checks those rehearsal fields against the retained evidence
+documents. Live execution and live-evidence approval remain #113.
 
 ## Required capabilities
 

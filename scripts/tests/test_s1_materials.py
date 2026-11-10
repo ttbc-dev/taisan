@@ -28,28 +28,150 @@ class S1MaterialsTest(unittest.TestCase):
         mutate(spec)
         return prerequisites.validate_install_spec(spec)
 
+    def complete_install_spec(self):
+        spec = copy.deepcopy(self.install_spec)
+        spec['repository']['stable_id'] = 'R_fixture_s1_repository'
+        spec['reviewer_identity']['app_id'] = '1234567'
+        spec['configuration_identity']['store_id'] = 'store-s1-fixture'
+        target = spec['implementation_status']['target_profile']
+        target['adapter_available'] = True
+        target['reviewer_app_available'] = True
+        return spec
+
     def test_all_three_material_fixtures_are_present(self):
         for relative in prerequisites.FIXTURE_FILES.values():
             self.assertTrue((ROOT / relative).is_file(), relative)
         report = prerequisites.verify(ROOT)
-        self.assertEqual(report['status'], 'ok', report['errors'])
         self.assertEqual(report['errors'], [])
+        self.assertEqual(report['status'], 'prepared', report['errors'])
+
+    def test_shipped_spec_is_prepared_not_certified_as_installed(self):
+        report = prerequisites.verify(ROOT)
+        self.assertEqual(report['status'], 'prepared', report['errors'])
+        self.assertFalse(report['installation_ready'])
+        unresolved = report['unresolved_identities']
+        self.assertTrue(unresolved)
+        for field in (
+            'repository.stable_id',
+            'reviewer_identity.app_id',
+            'configuration_identity.store_id',
+        ):
+            self.assertTrue(
+                any(field in item for item in unresolved), (field, unresolved)
+            )
+        self.assertTrue(any('adapter' in item for item in unresolved), unresolved)
+        self.assertTrue(
+            any('reviewer app' in item.lower() for item in unresolved), unresolved
+        )
 
     def test_complete_install_spec_reports_success_without_live_execution(self):
-        report = prerequisites.verify(ROOT)
-        self.assertEqual(report['status'], 'ok', report['errors'])
-        self.assertEqual(report['errors'], [])
-        self.assertIn('not-run', report['live_execution'])
-        result = subprocess.run(
-            [sys.executable, str(MODULE_PATH), '--root', str(ROOT)],
-            capture_output=True,
-            text=True,
-            check=False,
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'install.json'
+            path.write_text(json.dumps(self.complete_install_spec()))
+            report = prerequisites.verify(ROOT, path)
+            self.assertEqual(report['status'], 'ok', report['errors'])
+            self.assertEqual(report['errors'], [])
+            self.assertTrue(report['installation_ready'])
+            self.assertEqual(report['unresolved_identities'], [])
+            self.assertIn('not-run', report['live_execution'])
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    '--root',
+                    str(ROOT),
+                    '--install-spec',
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['status'], 'ok')
+            self.assertTrue(output['installation_ready'])
+            self.assertEqual(output['unresolved_identities'], [])
+            self.assertIn('not-run', output['live_execution'])
+
+    def test_placeholder_binding_identities_fail_closed(self):
+        spec = copy.deepcopy(self.install_spec)
+        spec['repository']['stable_id'] = 'recorded-from-host-read-at-preflight'
+        spec['reviewer_identity']['app_id'] = (
+            'recorded-from-owner-app-listing-at-preflight'
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        output = json.loads(result.stdout)
-        self.assertEqual(output['status'], 'ok')
-        self.assertIn('not-run', output['live_execution'])
+        spec['configuration_identity']['store_id'] = 'recorded-at-preflight'
+        errors = prerequisites.validate_install_spec(spec)
+        for field in (
+            'repository.stable_id',
+            'reviewer_identity.app_id',
+            'configuration_identity.store_id',
+        ):
+            self.assertTrue(any(field in error for error in errors), (field, errors))
+
+    def test_missing_required_capability_fails_closed(self):
+        for capability in (
+            'push_ref',
+            'change_request_create',
+            'change_request_update',
+            'comment_write',
+        ):
+            spec = copy.deepcopy(self.install_spec)
+            spec['configuration_identity']['capabilities'].remove(capability)
+            errors = prerequisites.validate_install_spec(spec)
+            self.assertTrue(
+                any('capabilities' in error and capability in error for error in errors),
+                (capability, errors),
+            )
+
+    def test_missing_required_check_fails_closed(self):
+        for required_checks in ([], ['not-verify'], ['verify', 'extra']):
+            spec = copy.deepcopy(self.install_spec)
+            spec['configuration_identity']['required_checks'] = required_checks
+            errors = prerequisites.validate_install_spec(spec)
+            self.assertTrue(any('required_checks' in error for error in errors), errors)
+
+    def test_non_positive_budget_fails_closed(self):
+        for key in ('max_invocations', 'max_review_rounds', 'runtime_limit_seconds'):
+            for value in (0, -1, '4', None):
+                spec = copy.deepcopy(self.install_spec)
+                spec['configuration_identity']['budget'][key] = value
+                errors = prerequisites.validate_install_spec(spec)
+                self.assertTrue(
+                    any('budget' in error and key in error for error in errors),
+                    (key, value, errors),
+                )
+
+    def test_missing_budget_field_fails_closed(self):
+        spec = copy.deepcopy(self.install_spec)
+        spec['configuration_identity']['budget'].pop('max_review_rounds')
+        errors = prerequisites.validate_install_spec(spec)
+        self.assertTrue(any('budget' in error for error in errors), errors)
+
+    def test_retained_rehearsal_profile_matches_live_evidence(self):
+        status = self.install_spec['implementation_status']
+        target = status['target_profile']
+        self.assertFalse(target['adapter_available'])
+        self.assertFalse(target['reviewer_app_available'])
+        rehearsals = status['retained_rehearsals']
+        self.assertEqual(len(rehearsals), 2)
+        for rehearsal in rehearsals:
+            document = (ROOT / rehearsal['evidence']).read_text()
+            self.assertIn(rehearsal['run_tag'], document)
+            self.assertIn(rehearsal['adapter'], document)
+            self.assertIn(rehearsal['reviewer_actor'], document)
+            self.assertIn(rehearsal['credential_reference'], document)
+            self.assertIn('host_write: true', document)
+            self.assertTrue(rehearsal['repository_host_write'])
+        self.assertEqual(
+            prerequisites.validate_rehearsals(ROOT, self.install_spec), []
+        )
+        broken = copy.deepcopy(self.install_spec)
+        broken['implementation_status']['retained_rehearsals'][0]['adapter'] = (
+            'not-the-recorded-adapter'
+        )
+        errors = prerequisites.validate_rehearsals(ROOT, broken)
+        self.assertTrue(any('adapter' in error for error in errors), errors)
 
     def test_all_three_variants_are_defined(self):
         variants = set(prerequisites.VARIANTS)
@@ -196,6 +318,24 @@ class S1MaterialsTest(unittest.TestCase):
         broken['labels'] = ['automation-lane-selected']
         errors = prerequisites.validate_seeded_issue(broken)
         self.assertTrue(any('labels' in error for error in errors), errors)
+
+    def test_evidence_and_revisions_cite_the_slice_commit_not_the_base(self):
+        base = 'fb70d123fec2e011914af2c121c341f340965923'
+        revisions = self.install_spec['revisions']
+        slice_sha = revisions['materials_base_commit']
+        self.assertNotEqual(slice_sha, base)
+        self.assertRegex(slice_sha, r'^[0-9a-f]{40}$')
+        for key in (
+            'taisan_core',
+            'taisan_cli',
+            'github_adapter',
+            'worker_adapter',
+        ):
+            self.assertEqual(revisions[key], slice_sha, key)
+        evidence = (ROOT / 'docs' / 'evidence' / 'u8.1.md').read_text()
+        self.assertIn('Slice revision', evidence)
+        self.assertIn(slice_sha, evidence)
+        self.assertNotIn('Slice revision | The tested tree is the uncommitted', evidence)
 
     def test_cli_fails_closed_on_incomplete_install_spec(self):
         with tempfile.TemporaryDirectory() as temp:
