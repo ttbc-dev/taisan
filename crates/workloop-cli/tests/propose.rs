@@ -592,6 +592,161 @@ fn clear_mid_batch_fault(root: &Path) {
     .expect("fault trigger clears");
 }
 
+/// Overwrite a recorded decision's payload so every later read of that
+/// replay key fails to deserialize: both `handle_command`'s idempotency
+/// read and the recovery lookup then error, which is an *undetermined*
+/// batch fate — distinct from the mid-batch fault's definitely-absent
+/// one.
+fn corrupt_recorded_decision(root: &Path, replay_key: &str) {
+    let conn = rusqlite::Connection::open(root.join("workloop.db")).expect("store opens");
+    let updated = conn
+        .execute(
+            "UPDATE commands SET decision = 'not-json' \
+             WHERE origin = 'selector' AND idempotency_key = ?1",
+            [replay_key],
+        )
+        .expect("recorded decision corrupts");
+    assert_eq!(updated, 1, "one recorded decision matches {replay_key}");
+}
+
+/// An undetermined batch fate emits `unknown` carrying the interrupted
+/// proposal's own mutation identity — kind `submit`, origin `selector`,
+/// its replay key — exactly like a single mutation's lost response, so
+/// `command-result` recovery keys on the right `(origin, actor, key)`
+/// instead of the propose run's query identity.
+#[test]
+fn an_undetermined_batch_fate_reports_the_interrupted_proposal_identity() {
+    let root = root("propose-unknown");
+    configure(
+        &root,
+        serde_json::json!({"adapter": "issue-scan", "allowlist": ["ops"]}),
+    );
+    let snapshot = write_snapshot(
+        &root,
+        "snapshot.json",
+        serde_json::json!([
+            issue("ops", 1, "open", "First"),
+            issue("ops", 2, "open", "Second"),
+        ]),
+    );
+    let first = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = first["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 2, "{first}");
+    let committed_key = proposals[0]["replay_key"].as_str().unwrap().to_string();
+    let interrupted_key = proposals[1]["replay_key"].as_str().unwrap().to_string();
+    // The actor label is the installation's, identical to a manual
+    // submit's — the interrupted identity is not a fresh one.
+    let manual = run_at(
+        &root,
+        &[
+            "submit",
+            "--intent",
+            "actor probe",
+            "--idempotency-key",
+            "k-actor",
+        ],
+    );
+    let actor = manual["command"]["actor"].as_str().unwrap().to_string();
+
+    corrupt_recorded_decision(&root, &interrupted_key);
+    let (code, env) = fail_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    assert_eq!(code, 6, "{env}");
+    assert_eq!(env["status"], "unknown", "{env}");
+    assert_eq!(env["reason"]["code"], "unknown", "{env}");
+    let cmd = &env["command"];
+    assert_eq!(cmd["kind"], "submit", "{env}");
+    assert_eq!(cmd["idempotency_key"], interrupted_key.as_str(), "{env}");
+    assert_eq!(cmd["actor"], actor.as_str(), "{env}");
+
+    // Both replay keys ride the envelope: the committed decision still
+    // recovers, the interrupted one is named by the mutation identity
+    // above.
+    let refs = env["evidence_refs"].as_array().unwrap();
+    let refs: Vec<&str> = refs.iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(
+        refs,
+        vec![committed_key.as_str(), interrupted_key.as_str()],
+        "{env}"
+    );
+    let recovered = run_at(
+        &root,
+        &[
+            "command-result",
+            "--origin",
+            "selector",
+            "--replay-key",
+            &committed_key,
+        ],
+    );
+    assert_eq!(
+        recovered["result"]["command_id"], proposals[0]["command_id"],
+        "{recovered}"
+    );
+    // Nothing new was admitted: the interrupted proposal recorded
+    // nothing, the committed one replayed.
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(list["result"]["items"].as_array().unwrap().len(), 3);
+}
+
+/// The batch's terminal `unknown` envelope lists replay keys under the
+/// envelope's own evidence bounds: with far more recoverable keys than
+/// the item bound, the list is capped and every surviving entry stays
+/// within the per-item limit — the bounded contract surface holds even
+/// for an unbounded `max_proposals`.
+#[test]
+fn batch_evidence_refs_stay_within_the_envelope_bounds() {
+    let root = root("propose-evibound");
+    configure(
+        &root,
+        serde_json::json!({
+            "adapter": "issue-scan",
+            "allowlist": ["ops"],
+            "max_proposals": 32,
+        }),
+    );
+    let issues: Vec<serde_json::Value> = (1u64..=20)
+        .map(|n| issue("ops", n, "open", "Issue"))
+        .collect();
+    let snapshot = write_snapshot(&root, "snapshot.json", serde_json::json!(issues));
+    let first = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = first["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 20, "{first}");
+    let last_key = proposals[19]["replay_key"].as_str().unwrap().to_string();
+    corrupt_recorded_decision(&root, &last_key);
+
+    let (code, env) = fail_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    assert_eq!(code, 6, "{env}");
+    assert_eq!(env["status"], "unknown", "{env}");
+    // 19 replayed + 1 interrupted = 20 recoverable keys, capped at the
+    // envelope's evidence bound; each surviving entry is within the
+    // per-item bound.
+    let refs = env["evidence_refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 16, "{env}");
+    for r in refs {
+        assert!(r.as_str().unwrap().chars().count() <= 240, "{env}");
+    }
+    // The interrupted proposal's identity — the key recovery needs —
+    // survives in the structured command field even when the list
+    // bound trimmed it.
+    assert_eq!(
+        env["command"]["idempotency_key"],
+        last_key.as_str(),
+        "{env}"
+    );
+}
+
 #[test]
 fn switching_admission_configuration_preserves_existing_work() {
     let root = root("propose-swap");

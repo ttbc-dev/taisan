@@ -631,6 +631,15 @@ fn run(cli: Cli) -> i32 {
             // selector holds no authority of its own. Per-proposal
             // outcomes are data inside one batch envelope.
             let mut items = Vec::new();
+            // Replay keys of the proposals decided so far, in batch
+            // order — what a faulted or truncated run must still
+            // surface so every recorded decision stays recoverable.
+            let recorded_keys = |decided: &[serde_json::Value]| -> Vec<String> {
+                decided
+                    .iter()
+                    .filter_map(|i| i["replay_key"].as_str().map(str::to_string))
+                    .collect()
+            };
             for proposal in &set.proposals {
                 let req = workloop_selector::admission::submit_command(proposal, actor.clone());
                 let decision = match handle_command(&store, &config, &req, now()) {
@@ -650,13 +659,9 @@ fn run(cli: Cli) -> i32 {
                         // The interrupted proposal's own key rides the
                         // envelope alongside the committed ones: its
                         // fate must be recoverable by `command-result`
-                        // exactly like a settled decision.
-                        let mut recoverable: Vec<String> = items
-                            .iter()
-                            .filter_map(|i: &serde_json::Value| {
-                                i["replay_key"].as_str().map(str::to_string)
-                            })
-                            .collect();
+                        // exactly like a settled decision. The list is
+                        // bounded like every other evidence list.
+                        let mut recoverable = recorded_keys(&items);
                         recoverable.push(req.idempotency_key.clone());
                         match envelope::resolve_lost_response(
                             &req.origin,
@@ -674,7 +679,11 @@ fn run(cli: Cli) -> i32 {
                             // the error envelope so the operator can
                             // recover each via `command-result` — or
                             // simply re-run `propose`, which replays
-                            // them.
+                            // them. (Per the CLI contract's batch note,
+                            // `error` here means the *batch* stopped:
+                            // nothing was recorded for the interrupted
+                            // proposal, while `evidence_refs` names
+                            // what was recorded.)
                             envelope::LostResponse::Absent(message) => {
                                 let (mut env, code) = envelope::error_envelope(
                                     Some(identity()),
@@ -685,16 +694,22 @@ fn run(cli: Cli) -> i32 {
                                         proposal.key
                                     ),
                                 );
-                                env.evidence_refs = recoverable;
+                                env.evidence_refs = envelope::bounded_evidence(recoverable);
                                 return emit((env, code));
                             }
                             // The fate is undetermined — never a
                             // definite store error about a mutation
-                            // that may have committed.
+                            // that may have committed. Recovery keys on
+                            // the interrupted proposal's own mutation
+                            // identity, exactly like a single-mutation
+                            // `unknown`, never on the propose run's
+                            // query identity.
                             envelope::LostResponse::Undetermined(detail) => {
-                                let (mut env, code) =
-                                    envelope::unknown_envelope(identity(), &detail);
-                                env.evidence_refs = recoverable;
+                                let (mut env, code) = envelope::unknown_envelope(
+                                    envelope::request_identity(&req),
+                                    &detail,
+                                );
+                                env.evidence_refs = envelope::bounded_evidence(recoverable);
                                 return emit((env, code));
                             }
                         }
@@ -735,11 +750,22 @@ fn run(cli: Cli) -> i32 {
             let as_of = match store.transact_deferred(|tx| tx.last_seq()) {
                 Ok(s) => s,
                 Err(e) => {
-                    return emit(envelope::error_envelope(
+                    // Every proposal in this batch is already
+                    // recorded; only the bookkeeping read failed. The
+                    // envelope names the recorded decisions' replay
+                    // keys so a consumer never reads this store error
+                    // as "nothing was recorded".
+                    let recorded = recorded_keys(&items);
+                    let (mut env, code) = envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
-                        &e.to_string(),
-                    ));
+                        &format!(
+                            "batch admissions are recorded but the final sequence read failed \
+                             ({e}); replay keys for the recorded decisions are listed"
+                        ),
+                    );
+                    env.evidence_refs = envelope::bounded_evidence(recorded);
+                    return emit((env, code));
                 }
             };
             let value = serde_json::json!({

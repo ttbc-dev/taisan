@@ -39,6 +39,19 @@ fn bounded(s: &str, limit: usize) -> String {
     out
 }
 
+/// Apply the envelope's evidence bounds to any caller-built reference
+/// list — a rejection's evidence or a batch's replay keys — so no
+/// caller can exceed the bounded contract surface the envelope
+/// documents: at most [`EVIDENCE_BOUND`] items, each truncated to
+/// [`EVIDENCE_ITEM_BOUND`] characters.
+pub fn bounded_evidence(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .take(EVIDENCE_BOUND)
+        .map(|s| bounded(&s, EVIDENCE_ITEM_BOUND))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandIdentity {
     pub id: Option<String>,
@@ -187,11 +200,7 @@ fn decision_envelope(req: &CommandRequest, decision: &CommandDecision) -> (Envel
                     .unwrap_or_else(|| code.clone()),
                 code,
             });
-            e.evidence_refs = evidence
-                .iter()
-                .take(EVIDENCE_BOUND)
-                .map(|s| bounded(s, EVIDENCE_ITEM_BOUND))
-                .collect();
+            e.evidence_refs = bounded_evidence(evidence.iter().cloned());
             (e, rejection_exit(reason))
         }
     }
@@ -467,6 +476,26 @@ mod tests {
         let message = &env.reason.as_ref().unwrap().message;
         assert!(message.chars().count() <= MESSAGE_BOUND);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn evidence_refs_are_bounded_for_any_caller_list() {
+        // A caller-built list — a batch's replay keys, an adapter id
+        // long enough to blow the item bound — can never exceed the
+        // bounded surface the envelope documents.
+        let wide: Vec<String> = (0..EVIDENCE_BOUND * 3)
+            .map(|i| format!("key-{i}-{}", "x".repeat(EVIDENCE_ITEM_BOUND)))
+            .collect();
+        let refs = bounded_evidence(wide);
+        assert_eq!(refs.len(), EVIDENCE_BOUND);
+        for r in &refs {
+            assert!(r.chars().count() <= EVIDENCE_ITEM_BOUND, "{r:?}");
+            assert!(r.ends_with('…'));
+        }
+        assert_eq!(
+            bounded_evidence(vec!["short".into()]),
+            vec!["short".to_string()]
+        );
     }
 
     #[test]
