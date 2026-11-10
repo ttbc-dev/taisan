@@ -495,7 +495,20 @@ fn run(cli: Cli) -> i32 {
             mutation(request(CommandBody::ReleaseResources { resources }))
         }
         Commands::RunOnce => {
-            let supervisor = build_supervisor(&config, &installation);
+            let supervisor = match build_supervisor(&config, &installation) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(envelope::query_identity(
+                            "run",
+                            &actor,
+                            cli.idempotency_key.as_deref(),
+                        )),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             let mut github = FixtureGithub::new();
             match run_tick(
                 &store,
@@ -528,7 +541,20 @@ fn run(cli: Cli) -> i32 {
             // or publishes in different ticks restart at PR 1 and an
             // UpdatePr/PostPrComment head recheck can never match a PR
             // published in an earlier tick.
-            let supervisor = build_supervisor(&config, &installation);
+            let supervisor = match build_supervisor(&config, &installation) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(envelope::query_identity(
+                            "run",
+                            &actor,
+                            cli.idempotency_key.as_deref(),
+                        )),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             let mut github = FixtureGithub::new();
             let identity =
                 || envelope::query_identity("run", &actor, cli.idempotency_key.as_deref());
@@ -658,12 +684,16 @@ fn run(cli: Cli) -> i32 {
     }
 }
 
+/// `Ok(None)` only when no worker is configured. Handoff
+/// initialization failure is an error, not an absent worker — a `run`
+/// that keeps going without a supervisor admits work no worker ever
+/// consumes.
 fn build_supervisor(
     config: &WorkloopConfig,
     installation: &Installation,
-) -> Option<Supervisor<PosixProcessControl>> {
+) -> Result<Option<Supervisor<PosixProcessControl>>, String> {
     if installation.worker_argv.is_empty() {
-        return None;
+        return Ok(None);
     }
     let workspace_root = PathBuf::from(&installation.workspace_root);
     // The durable artifact handoff needs an installation-owned bare
@@ -673,10 +703,8 @@ fn build_supervisor(
     let handoff_root = workspace_root.join(".handoff");
     let repository = handoff_root.join("repo.git");
     if !repository.exists() {
-        if let Err(e) = std::fs::create_dir_all(&handoff_root) {
-            eprintln!("taisan: handoff dir: {e}");
-            return None;
-        }
+        std::fs::create_dir_all(&handoff_root)
+            .map_err(|e| format!("handoff dir {}: {e}", handoff_root.display()))?;
         let ok = std::process::Command::new("git")
             .args(["init", "--bare"])
             .arg(&repository)
@@ -684,11 +712,13 @@ fn build_supervisor(
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("taisan: handoff repository init failed");
-            return None;
+            return Err(format!(
+                "handoff repository init failed at {}",
+                repository.display()
+            ));
         }
     }
-    Some(
+    Ok(Some(
         Supervisor::new(
             PosixProcessControl,
             workspace_root.clone(),
@@ -700,7 +730,7 @@ fn build_supervisor(
             workspace_root,
             out_root: handoff_root.join("out"),
         }),
-    )
+    ))
 }
 
 /// One pass of the run loop: dispatch scan, execution consumer, GitHub

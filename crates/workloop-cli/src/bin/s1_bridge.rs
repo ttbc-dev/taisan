@@ -343,6 +343,28 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
         let Ok(observed) = CommitRevision::new(intent.repository.clone(), sha.clone()) else {
             continue;
         };
+        // `produced` is the artifact payload digest — a content
+        // identity, never a git object — so the relation is checked
+        // against the last head this receipt chain recorded as remotely
+        // verified: the concrete commit the push landed.
+        let base = intent.effects.iter().rev().find_map(|e| match e {
+            NormalizedEffectFact::RefPublished { observed, .. } => Some(observed.object.clone()),
+            _ => None,
+        });
+        let relation = match base.as_deref() {
+            Some(base) if base == sha => RefRelation::Equal,
+            Some(base) => match gh(&[
+                "api",
+                &format!("repos/{}/compare/{base}...{sha}", ctx.repo_display),
+                "--jq",
+                ".status",
+            ]) {
+                Ok(status) if status == "ahead" => RefRelation::Ancestor,
+                Ok(_) => RefRelation::Diverged,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
         let execution = ctx
             .store
             .transact_deferred(|tx| {
@@ -352,19 +374,34 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
                     .max_by_key(|e| e.ordinal))
             })
             .map_err(|e| e.to_string())?;
+        // A ref that no longer contains the pushed revision is drift,
+        // not a fresh applied claim — recording it unknown lets the
+        // publish chain re-arm instead of trusting a stale receipt.
+        let status = if relation == RefRelation::Diverged {
+            HostActionStatus::Unknown {
+                reason: format!("remote {branch} no longer contains the pushed revision"),
+            }
+        } else {
+            HostActionStatus::Applied
+        };
+        let relation_key = match relation {
+            RefRelation::Equal => "equal",
+            RefRelation::Ancestor => "ancestor",
+            RefRelation::Diverged => "diverged",
+        };
         let _ = ctx.emit(
             Some((&intent.work_id, execution.as_ref().map(|e| &e.id))),
-            format!("act:{}:verify:{sha}", intent.action_id),
+            format!("act:{}:verify:{sha}:{relation_key}", intent.action_id),
             ObservationFact::HostActionResult {
                 action_id: intent.action_id.clone(),
                 authenticated_actor: Some(ctx.authenticated.clone()),
-                status: HostActionStatus::Applied,
+                status,
                 effects: vec![NormalizedEffectFact::RefPublished {
                     repository: intent.repository.clone(),
                     branch: branch.clone(),
                     produced: produced.clone(),
                     observed,
-                    relation: RefRelation::Ancestor,
+                    relation,
                 }],
             },
         );
@@ -432,9 +469,66 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                 return Ok(());
             }
             let local_head = git(&repo_dir, &["rev-parse", "HEAD"])?;
+            // Expected-prior-ref guard: read the remote ref, then push
+            // under a lease on that exact value. A remote that moved
+            // since the read rejects the push instead of being
+            // fast-forwarded silently.
+            let prior_sha = match git(
+                &repo_dir,
+                &["ls-remote", &ctx.remote, &format!("refs/heads/{branch}")],
+            ) {
+                Ok(out) => out
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                Err(e) => {
+                    emit_result(
+                        ctx,
+                        intent,
+                        HostActionStatus::Failed {
+                            reason: format!("prior-ref read failed: {e}"),
+                        },
+                        vec![],
+                    );
+                    return Ok(());
+                }
+            };
+            // The read-back records the prior ref the lease guards on;
+            // with the applied receipt's `observed` it shows the prior →
+            // new head pair the republish evidence requires.
+            let prior_state = if prior_sha.is_empty() {
+                BranchState::Absent
+            } else {
+                BranchState::At {
+                    revision: CommitRevision::new(intent.repository.clone(), prior_sha.clone())?,
+                }
+            };
+            let _ = ctx.emit(
+                Some((&intent.work_id, Some(&execution.id))),
+                format!(
+                    "branch:{branch}:{}",
+                    if prior_sha.is_empty() {
+                        "absent"
+                    } else {
+                        prior_sha.as_str()
+                    }
+                ),
+                ObservationFact::BranchState {
+                    repository: intent.repository.clone(),
+                    branch: branch.clone(),
+                    state: prior_state,
+                },
+            );
+            let lease = format!("--force-with-lease=refs/heads/{branch}:{prior_sha}");
             let push = git(
                 &repo_dir,
-                &["push", &ctx.remote, &format!("HEAD:refs/heads/{branch}")],
+                &[
+                    "push",
+                    &lease,
+                    &ctx.remote,
+                    &format!("HEAD:refs/heads/{branch}"),
+                ],
             );
             let observed = gh(&[
                 "api",
@@ -501,10 +595,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                 body,
             ]) {
                 Ok(url) => {
+                    let owner = ctx.repo_display.split('/').next().unwrap_or_default();
                     let pr = gh_json(&[
                         "api",
                         &format!(
-                            "repos/{}/pulls?head=shimpeiws:{source_branch}&state=open",
+                            "repos/{}/pulls?head={owner}:{source_branch}&state=open",
                             ctx.repo_display
                         ),
                     ])?;
@@ -689,18 +784,20 @@ fn assess_invariants(
 }
 
 /// Parse the machine-readable finding set a posted review body carries.
-fn parse_findings(body: &str) -> Vec<OccurrenceInput> {
+/// A missing block is a clean review; a present-but-malformed block is
+/// an error, so the review can never be recorded as complete-clean by
+/// failing open.
+fn parse_findings(body: &str) -> Result<Vec<OccurrenceInput>, String> {
     let Some(start) = body.find("```s1-findings") else {
-        return vec![];
+        return Ok(vec![]);
     };
     let rest = &body[start + "```s1-findings".len()..];
     let Some(end) = rest.find("```") else {
-        return vec![];
+        return Err("s1-findings block has no closing fence".into());
     };
-    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(rest[..end].trim()) else {
-        return vec![];
-    };
-    items
+    let items = serde_json::from_str::<Vec<serde_json::Value>>(rest[..end].trim())
+        .map_err(|e| format!("s1-findings block is not valid json: {e}"))?;
+    Ok(items
         .iter()
         .map(|it| {
             let summary = it["summary"].as_str().unwrap_or_default();
@@ -712,7 +809,7 @@ fn parse_findings(body: &str) -> Vec<OccurrenceInput> {
                 thread_id: None,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Poll the real remote facts for every Work that has an opened change:
@@ -831,8 +928,13 @@ fn poll_remote(ctx: &Ctx) -> Result<(), String> {
                         ) else {
                             continue;
                         };
-                        let occurrences =
-                            parse_findings(review["body"].as_str().unwrap_or_default());
+                        // A malformed findings block makes the review
+                        // partial — never a clean complete round.
+                        let (completeness, occurrences) =
+                            match parse_findings(review["body"].as_str().unwrap_or_default()) {
+                                Ok(occurrences) => (Completeness::Complete, occurrences),
+                                Err(reason) => (Completeness::Partial { reason }, vec![]),
+                            };
                         let _ = ctx.emit(
                             Some((&work.id, execution.as_ref().map(|e| &e.id))),
                             format!("review:{}:{id}", change.change_request.as_str()),
@@ -845,7 +947,7 @@ fn poll_remote(ctx: &Ctx) -> Result<(), String> {
                                 },
                                 source: reviewer,
                                 source_revision: Some(id.to_string()),
-                                completeness: Completeness::Complete,
+                                completeness,
                                 occurrences,
                             },
                         );
@@ -872,13 +974,19 @@ fn poll_remote(ctx: &Ctx) -> Result<(), String> {
                         target_revision: main_revision.clone(),
                     };
                     if let Ok(fact) = assess_invariants(ctx, &work, &target, &repo_dir) {
-                        let digest = match &fact {
-                            ObservationFact::Assessment { set_digest, .. } => set_digest.clone(),
-                            _ => String::new(),
-                        };
+                        // The delivery id keys on the full fact content,
+                        // not just the item-id set: a re-assessment with
+                        // a changed verdict or a moved target revision is
+                        // a new fact to record, never a delivery-id reuse
+                        // the store must reject.
+                        let key = sha256_hex(
+                            "s1-assess-event-v1",
+                            canonical_json(&serde_json::to_value(&fact).unwrap_or_default())
+                                .as_slice(),
+                        );
                         let _ = ctx.emit(
                             Some((&work.id, execution.as_ref().map(|e| &e.id))),
-                            format!("assess:{head_sha}:{digest}"),
+                            format!("assess:{head_sha}:{key}"),
                             fact,
                         );
                     }
