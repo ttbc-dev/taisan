@@ -139,6 +139,15 @@ enum Commands {
         interval_ms: u64,
     },
     WorkList,
+    /// Run the configured selector over a snapshot file and admit each
+    /// proposal through the normal submit path. Requires the
+    /// `selector` section in the installation config.
+    Propose {
+        /// A JSON snapshot of available source facts, in the adapter's
+        /// output shape.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
     WorkDetail {
         #[arg(long)]
         work: String,
@@ -583,6 +592,122 @@ fn run(cli: Cli) -> i32 {
                 )),
             }
         }
+        Commands::Propose { snapshot } => {
+            let identity =
+                || envelope::query_identity("propose", &actor, cli.idempotency_key.as_deref());
+            // Alternate admission is configuration-selected: no
+            // selector section is a bounded refusal, never a guess.
+            let Some((selector, policy)) = (match installation.selection_policy() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            }) else {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Config,
+                    "selector admission is not configured",
+                ));
+            };
+            let text = match std::fs::read_to_string(&snapshot) {
+                Ok(t) => t,
+                Err(e) => {
+                    return usage("propose", &format!("snapshot {}: {e}", snapshot.display()));
+                }
+            };
+            let facts: workloop_selector::SelectorSnapshot = match serde_json::from_str(&text) {
+                Ok(s) => s,
+                Err(e) => {
+                    return usage("propose", &format!("snapshot {}: {e}", snapshot.display()));
+                }
+            };
+            let set = workloop_selector::propose(&selector, &facts, &policy);
+            // Every proposal is admitted through the same
+            // `handle_command` path a manual `submit` uses — the
+            // selector holds no authority of its own. Per-proposal
+            // outcomes are data inside one batch envelope.
+            let mut items = Vec::new();
+            for proposal in &set.proposals {
+                let req = workloop_selector::admission::submit_command(proposal, actor.clone());
+                let decision = match handle_command(&store, &config, &req, now()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return emit(envelope::error_envelope(
+                            Some(identity()),
+                            envelope::ErrorClass::Store,
+                            &e.to_string(),
+                        ));
+                    }
+                };
+                // The replay key rides the envelope so an operator can
+                // recover the decision — `command-result --origin
+                // selector --replay-key <key>` — without re-running
+                // selection.
+                let item = match &decision {
+                    CommandDecision::Accepted {
+                        work_id,
+                        command_id,
+                        ..
+                    } => serde_json::json!({
+                        "key": proposal.key,
+                        "replay_key": req.idempotency_key,
+                        "command_id": command_id.0,
+                        "status": "accepted",
+                        "work_id": work_id.as_ref().map(|w| w.0.clone()),
+                    }),
+                    CommandDecision::Rejected {
+                        command_id,
+                        reason,
+                        evidence,
+                        ..
+                    } => serde_json::json!({
+                        "key": proposal.key,
+                        "replay_key": req.idempotency_key,
+                        "command_id": command_id.0,
+                        "status": "rejected",
+                        "reason_code": serde_json::to_value(reason).ok(),
+                        "evidence": evidence,
+                    }),
+                };
+                items.push(item);
+            }
+            let as_of = match store.transact_deferred(|tx| tx.last_seq()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &e.to_string(),
+                    ));
+                }
+            };
+            let value = serde_json::json!({
+                "selector": selector.as_str(),
+                "policy_revision": policy.revision,
+                "proposals": items,
+                "skipped": set
+                    .skipped
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "issue": s.issue.to_string(),
+                        "reason": serde_json::to_value(s.reason).ok(),
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            emit(envelope::query_envelope(
+                &workloop_core::projection::QueryResult::Found {
+                    value,
+                    as_of,
+                    sources: vec![],
+                },
+                identity(),
+                None,
+            ))
+        }
         Commands::WorkDetail { work } => {
             let identity =
                 envelope::query_identity("work_detail", &actor, cli.idempotency_key.as_deref());
@@ -783,6 +908,7 @@ mod tests {
             budget: None,
             lanes: None,
             policy: None,
+            selector: None,
         }
     }
 

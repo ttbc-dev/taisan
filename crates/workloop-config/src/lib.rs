@@ -14,10 +14,11 @@ use workloop_core::domain::{
     Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy,
 };
 use workloop_core::identity::{
-    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
-    RepositoryRef, RoleBinding,
+    ActorRole, AdapterId, HostActorId, HostActorRef, HostCapability, HostInstanceId, IssueId,
+    IssueRef, RepositoryId, RepositoryRef, RoleBinding,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig};
+use workloop_selector::SelectionPolicy;
 
 /// The on-disk installation record. Fields an adapter does not use
 /// pass through untouched, so a file either adapter wrote stays valid
@@ -63,6 +64,48 @@ pub struct Installation {
     pub lanes: Option<LanePolicy>,
     #[serde(default)]
     pub policy: Option<WorkPolicy>,
+    /// Alternate admission: the selector policy the `propose` path is
+    /// bound to. Absent means manual submission only — the selector
+    /// holds no default authority and its absence blocks nothing.
+    #[serde(default)]
+    pub selector: Option<SelectorSection>,
+}
+
+/// The selector binding for alternate admission. Presence selects the
+/// alternate path; every value is validated at the config boundary —
+/// an unparseable identity refuses loading, never degrades to a guess.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorSection {
+    /// Selector adapter identity stamped on every proposal.
+    pub adapter: String,
+    /// Revision of the policy document — part of proposal identity.
+    #[serde(default)]
+    pub policy_revision: u64,
+    /// Repository ids (on this installation's host) the selector may
+    /// propose from.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// Issues excluded from selection regardless of eligibility, in
+    /// `repo:number` form like `submit --issue`.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+    /// Bound on emitted proposals per selector run.
+    #[serde(default = "default_max_proposals")]
+    pub max_proposals: usize,
+    /// Constraints every proposal's task input carries.
+    #[serde(default)]
+    pub task_constraints: Vec<String>,
+    /// The verification argv every proposal's task input carries.
+    #[serde(default)]
+    pub verification_argv: Vec<String>,
+    /// Permissions proposed Work will need — declared on the proposal,
+    /// never expanded.
+    #[serde(default)]
+    pub required_permissions: Vec<String>,
+}
+
+fn default_max_proposals() -> usize {
+    10
 }
 
 fn default_host_instance() -> String {
@@ -304,6 +347,7 @@ fn load_or_create_with(
         budget: None,
         lanes: None,
         policy: None,
+        selector: None,
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
@@ -419,6 +463,60 @@ impl Installation {
             budget: self.budget.clone().unwrap_or_default(),
             policy: self.policy.clone().unwrap_or_default(),
         })
+    }
+
+    /// The selector adapter identity and policy for the alternate
+    /// admission path, or `None` when the installation runs manual
+    /// submission only. The config file is external input: every
+    /// identity string is validated here — an unparseable adapter,
+    /// repository, or issue reference refuses loading rather than
+    /// silently mis-binding the policy.
+    pub fn selection_policy(&self) -> Result<Option<(AdapterId, SelectionPolicy)>, String> {
+        let Some(section) = &self.selector else {
+            return Ok(None);
+        };
+        let host = HostInstanceId::new(self.host_instance.clone())
+            .map_err(|e| format!("installation host_instance: {e}"))?;
+        let adapter = AdapterId::new(section.adapter.clone())
+            .map_err(|e| format!("installation selector.adapter: {e}"))?;
+        let mut allowlist = BTreeSet::new();
+        for repo_id in &section.allowlist {
+            allowlist.insert(RepositoryRef::new(
+                host.clone(),
+                RepositoryId::new(repo_id.clone())
+                    .map_err(|e| format!("installation selector.allowlist[{repo_id}]: {e}"))?,
+            ));
+        }
+        let mut excluded = BTreeSet::new();
+        for entry in &section.excluded {
+            let (repo, number) = entry.rsplit_once(':').ok_or_else(|| {
+                format!("installation selector.excluded[{entry}]: expected repo:number")
+            })?;
+            let display_number: u64 = number
+                .parse()
+                .map_err(|_| format!("installation selector.excluded[{entry}]: bad number"))?;
+            excluded.insert(IssueRef {
+                repository: RepositoryRef::new(
+                    host.clone(),
+                    RepositoryId::new(repo)
+                        .map_err(|e| format!("installation selector.excluded[{entry}]: {e}"))?,
+                ),
+                issue: IssueId::trusted(number),
+                display_number: Some(display_number),
+            });
+        }
+        Ok(Some((
+            adapter,
+            SelectionPolicy {
+                revision: section.policy_revision,
+                allowlist,
+                excluded,
+                max_proposals: section.max_proposals,
+                task_constraints: section.task_constraints.iter().cloned().collect(),
+                verification_argv: section.verification_argv.clone(),
+                required_permissions: section.required_permissions.iter().cloned().collect(),
+            },
+        )))
     }
 }
 
