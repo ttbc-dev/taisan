@@ -459,6 +459,10 @@ fn protected_installation_paths_are_held_not_reclaimed() {
 
     let mut p = params();
     p.protected = vec![db.clone(), config.clone()];
+    // The body bound counts deletion attempts: a held protected
+    // candidate costs no attempt, so the one allowed attempt is still
+    // spent on the ordinary body.
+    p.max_bodies = 1;
     let report = store.retention_sweep(&p, &dir, NOW).unwrap();
 
     assert_eq!(report.reclaimed.len(), 1, "the ordinary body is reclaimed");
