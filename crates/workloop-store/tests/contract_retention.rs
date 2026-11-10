@@ -23,6 +23,7 @@ fn params() -> SweepParams {
         max_bodies: 256,
         max_bytes: 1 << 30,
         delete_error_limit: 3,
+        protected: Vec::new(),
     }
 }
 
@@ -402,6 +403,81 @@ fn foreign_and_traversing_paths_are_refused_untouched() {
     assert!(foreign_file.exists(), "a foreign body is never touched");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn protected_installation_paths_are_held_not_reclaimed() {
+    let dir = root("protected");
+    let store = SqliteStore::in_memory(1).unwrap();
+
+    // The installation's own files, catalogued like any body: the
+    // store and the config both live under the state root, so only
+    // the explicit exclusion keeps the sweep from deleting them.
+    let db = dir.join("workloop.db");
+    std::fs::write(&db, b"store").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "store".into(),
+            category: "cas".into(),
+            path: db.to_string_lossy().into_owned(),
+            bytes: 5,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+    let config = dir.join("config.json");
+    std::fs::write(&config, b"{}").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "config".into(),
+            category: "cas".into(),
+            path: config.to_string_lossy().into_owned(),
+            bytes: 2,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+    // An ordinary managed body beside them.
+    let path = register(&store, &dir, "b1", NOW - 90, Some(NOW - 10), false, 8);
+    // The same store reached through a symlinked directory spelling:
+    // lexical equality misses it, the canonical path must not.
+    let link = dir.join("root-link");
+    std::os::unix::fs::symlink(dir.as_path(), &link).unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "store-via-link".into(),
+            category: "cas".into(),
+            path: link.join("workloop.db").to_string_lossy().into_owned(),
+            bytes: 5,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+
+    let mut p = params();
+    p.protected = vec![db.clone(), config.clone()];
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+
+    assert_eq!(report.reclaimed.len(), 1, "the ordinary body is reclaimed");
+    assert_eq!(report.reclaimed[0].body_id, "b1");
+    assert!(!path.exists());
+    for id in ["store", "config", "store-via-link"] {
+        assert!(
+            report
+                .held
+                .iter()
+                .any(|h| h.body_id == id && h.reason == "protected_path"),
+            "{id} is held, not reclaimed: {:?}",
+            report.held
+        );
+        assert_eq!(store.body_state(id).unwrap().unwrap().0, "present");
+    }
+    assert!(db.exists(), "the store survives the pass");
+    assert!(config.exists(), "the config survives the pass");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

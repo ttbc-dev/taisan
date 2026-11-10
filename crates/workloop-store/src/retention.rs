@@ -15,8 +15,9 @@ use workloop_core::store::StoreError;
 
 use crate::sqlite::{SqliteStore, internal, map_err};
 
-/// Bounds for one sweep pass. `0` on any axis is invalid configuration,
-/// never "no limit" and never "reclaim everything".
+/// Bounds and exclusions for one sweep pass. `0` on any bound axis is
+/// invalid configuration, never "no limit" and never "reclaim
+/// everything".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepParams {
     /// Minimum seconds between completed passes.
@@ -28,6 +29,11 @@ pub struct SweepParams {
     /// Consecutive failed delete attempts on one body before it is no
     /// longer attempted by the automatic sweep.
     pub delete_error_limit: usize,
+    /// The installation's own files — the live store, its SQLite
+    /// sidecars and the config. Containment under the state root does
+    /// not authorize deleting them: a catalog row pointing at one of
+    /// these is held, never reclaimed.
+    pub protected: Vec<PathBuf>,
 }
 
 impl Default for SweepParams {
@@ -37,6 +43,7 @@ impl Default for SweepParams {
             max_bodies: 256,
             max_bytes: 1 << 30,
             delete_error_limit: 3,
+            protected: Vec::new(),
         }
     }
 }
@@ -413,6 +420,20 @@ impl SqliteStore {
                 }
             };
 
+            // The installation's own files are never reclaimable, even
+            // when a catalog row points at them: deleting the live
+            // store or the config would destroy the very catalog this
+            // sweep reads. Held before the `reclaiming` mark, so the
+            // row keeps its durable `present` state and the pass moves
+            // on to the next candidate.
+            if is_protected(&managed, &params.protected) {
+                report.held.push(HeldBody {
+                    body_id: candidate.body_id.clone(),
+                    reason: "protected_path".into(),
+                });
+                continue;
+            }
+
             // Two-phase: mark `reclaiming` (re-checking the pin inside
             // the same transaction) before touching the filesystem.
             if candidate.state == "present" {
@@ -592,6 +613,24 @@ fn managed_path(root_abs: &Path, recorded: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(candidate)
+}
+
+/// Whether a managed path names one of the installation's protected
+/// files. Lexical equality first, then canonical paths, so a recorded
+/// spelling (or a symlinked directory) cannot reach one of them by a
+/// different string. A protected file that does not exist still
+/// matches lexically: it must never be committed as `reclaimed`
+/// either.
+fn is_protected(managed: &Path, protected: &[PathBuf]) -> bool {
+    protected.iter().any(|p| {
+        if p == managed {
+            return true;
+        }
+        match (std::fs::canonicalize(p), std::fs::canonicalize(managed)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    })
 }
 
 /// Delete one managed body. Symlinks and special files are refused —

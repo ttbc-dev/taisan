@@ -357,6 +357,126 @@ fn a_bounded_multi_pass_run_reports_each_pass_and_stays_single_flight() {
 }
 
 #[test]
+fn the_inter_pass_gap_is_the_interval_in_seconds() {
+    let dir = root("interval");
+    // `--interval` documents seconds (`loop.interval_seconds` is the
+    // same unit): with `--ticks 2` the one gap between the two passes
+    // must sleep the whole second — sleeping it as milliseconds would
+    // finish the run in a few milliseconds instead.
+    let started = std::time::Instant::now();
+    let out = run_cli(&dir, &["run", "--ticks", "2", "--interval", "1"]);
+    let elapsed = started.elapsed();
+    assert!(
+        out.status.success(),
+        "bounded run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reports = serde_json::Deserializer::from_str(&stdout)
+        .into_iter::<serde_json::Value>()
+        .count();
+    assert_eq!(reports, 2, "one report per pass: {stdout}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(1),
+        "--interval 1 must space the two passes one second apart, \
+         the run took {elapsed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_sweep_never_reclaims_the_store_or_the_config() {
+    let dir = root("protected");
+    let out = run_cli(&dir, &["work-list"]);
+    assert!(out.status.success());
+
+    let store = store(&dir);
+    // A catalog row pointing at each of the installation's own files:
+    // the live store, its WAL sidecar and the config. The state root
+    // contains all of them, so containment alone must not authorize
+    // the sweep to delete them.
+    for (body_id, path) in [
+        ("store-file", dir.join("workloop.db")),
+        ("store-wal", dir.join("workloop.db-wal")),
+        ("config-file", dir.join("config.json")),
+    ] {
+        store
+            .register_body(&CatalogBody {
+                body_id: body_id.into(),
+                category: "cas".into(),
+                path: path.to_string_lossy().into_owned(),
+                bytes: 4,
+                registered_unix_seconds: NOW - 100,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+    }
+    // A managed body beside them is still reclaimed: the exclusion is
+    // the installation's own files, not the whole state root.
+    let body = dir.join("workspaces").join("case-1.blob");
+    std::fs::create_dir_all(body.parent().unwrap()).unwrap();
+    std::fs::write(&body, b"body").unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "reclaimable".into(),
+            category: "cas".into(),
+            path: body.to_string_lossy().into_owned(),
+            bytes: 4,
+            registered_unix_seconds: NOW - 90,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+
+    let out = run_cli(&dir, &["run", "--once"]);
+    assert!(
+        out.status.success(),
+        "run --once failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let retention = &report["phases"][6];
+    assert_eq!(retention["phase"], "retention_sweep");
+    let held: Vec<&str> = retention["held"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for id in ["store-file", "store-wal", "config-file"] {
+        let entry = format!("{id}:protected_path");
+        assert!(
+            held.contains(&entry.as_str()),
+            "expected {entry} held, got {held:?}"
+        );
+    }
+
+    assert!(
+        dir.join("workloop.db").exists(),
+        "the live store survives the sweep"
+    );
+    assert!(
+        dir.join("config.json").exists(),
+        "the config survives the sweep"
+    );
+    for id in ["store-file", "store-wal", "config-file"] {
+        assert_eq!(
+            store.body_state(id).unwrap().unwrap().0,
+            "present",
+            "{id} is held, not reclaimed"
+        );
+    }
+    assert_eq!(
+        store.body_state("reclaimable").unwrap().unwrap().0,
+        "reclaimed",
+        "an ordinary body beside them is still reclaimed"
+    );
+    assert!(!body.exists(), "the ordinary body is gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_sigint_finishes_the_phase_boundary_and_exits_gracefully() {
     use std::io::BufReader;
     use std::process::Stdio;

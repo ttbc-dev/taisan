@@ -3,7 +3,7 @@
 //! `work::handle_command`, and every read goes through the projection
 //! Queries — the CLI is a replaceable interface, not an authority.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use run_loop::{
@@ -462,7 +462,10 @@ fn run(cli: Cli) -> Result<(), String> {
             // exit; without the handler the default disposition would
             // kill this process mid-phase.
             install_shutdown_handler()?;
-            let settings = PassSettings::from_installation(&installation)?;
+            let settings = PassSettings::from_installation(
+                &installation,
+                installation_files(&db_abs, &config_path),
+            )?;
             let interval = interval.unwrap_or(settings.loop_config.interval_seconds);
             if interval == 0 {
                 return Err("run --interval must be > 0".into());
@@ -519,12 +522,16 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 // Sleep to the next pass in short slices so a signal
                 // during the idle gap exits promptly instead of after
-                // the full interval.
-                let mut remaining = interval;
-                while remaining > 0 && !shutdown_requested() {
-                    let slice = remaining.min(100);
+                // the full interval. The interval is seconds — the
+                // `--interval` help and `loop.interval_seconds` both
+                // say so — so the countdown runs in milliseconds and
+                // the gap lasts the documented cadence, not a
+                // millisecond-scale fraction of it.
+                let mut remaining_ms = interval.saturating_mul(1000);
+                while remaining_ms > 0 && !shutdown_requested() {
+                    let slice = remaining_ms.min(100);
                     std::thread::sleep(std::time::Duration::from_millis(slice));
-                    remaining -= slice;
+                    remaining_ms -= slice;
                 }
             }
         }
@@ -607,6 +614,22 @@ fn installation_path(state_root: &std::path::Path, configured: &str) -> PathBuf 
     } else {
         state_root.join(path)
     }
+}
+
+/// The installation's own files: the live store, its SQLite sidecars
+/// and the config. All three sit under the state root, so containment
+/// alone would let the retention sweep reclaim them if a catalog row
+/// ever pointed at them; they are declared here, at the composition
+/// root that knows these paths, and the sweep holds them instead.
+fn installation_files(db_abs: &Path, config_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![db_abs.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = db_abs.as_os_str().to_os_string();
+        name.push(suffix);
+        paths.push(PathBuf::from(name));
+    }
+    paths.push(std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf()));
+    paths
 }
 
 #[cfg(test)]
@@ -778,6 +801,7 @@ mod tests {
         let settings = PassSettings {
             loop_config: Default::default(),
             retention: Default::default(),
+            protected_paths: Vec::new(),
         };
         run_pass(
             &mut Pass {
