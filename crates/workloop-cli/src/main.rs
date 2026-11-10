@@ -746,7 +746,7 @@ mod tests {
                 HostCapability::ChangeRequestCreate,
                 HostCapability::ChangeRequestRead,
                 HostCapability::ChangeRequestUpdate,
-                HostCapability::CommentCreate,
+                HostCapability::CommentWrite,
                 HostCapability::ChecksRead,
                 HostCapability::ReviewFindingsRead,
                 HostCapability::IssueRead,
