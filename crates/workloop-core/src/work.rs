@@ -1972,15 +1972,8 @@ pub fn admit_queued_role(
             // outcome is recorded (lifecycle.md): intents are
             // delivery-bound and the outbox drain would still apply a
             // pending write under a recorded failure.
-            if !crate::projection::outstanding_actions(tx, &work.id)?.is_empty() {
-                tx.apply(&Effect::RecordDeferral {
-                    execution_id: execution.id.clone(),
-                    reason: "outbox_reconciliation".into(),
-                    diagnostic: format!(
-                        "terminal {} defers until outstanding host writes reconcile",
-                        limit.terminal_code()
-                    ),
-                })?;
+            if defer_terminal_while_outstanding(tx, &work.id, &execution.id, limit.terminal_code())?
+            {
                 return Ok(None);
             }
             fail_terminal(tx, &execution, limit.terminal_code(), &limit.detail())?;
@@ -1989,6 +1982,37 @@ pub fn admit_queued_role(
             })?;
         }
         return Ok(None);
+    }
+
+    // The Work-wide automatic-time deadline gates at this seam too: past
+    // it, no new trial is dispatched. The timed sweep records the same
+    // terminal decision, but admission runs phases before the sweep —
+    // without the gate a pass would admit-and-launch inside one tick.
+    // Queue time counts toward the deadline; human-decision waiting does
+    // not (already charged into the usage row).
+    {
+        let usage = tx
+            .work_usage(&work.id)?
+            .unwrap_or_else(|| WorkUsage::new(&work.id));
+        if automatic_seconds_used(&usage, now_unix_seconds)
+            .is_some_and(|automatic| automatic > work.policy.automatic_time_limit_seconds)
+        {
+            if defer_terminal_while_outstanding(
+                tx,
+                &work.id,
+                &execution.id,
+                "automatic_time_exhausted",
+            )? {
+                return Ok(None);
+            }
+            fail_terminal(
+                tx,
+                &execution,
+                "automatic_time_exhausted",
+                "Work-wide automatic time limit reached",
+            )?;
+            return Ok(None);
+        }
     }
 
     // Source gate: dispatch runs only on approved, matched sources. A
@@ -3947,6 +3971,30 @@ fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Resu
     Ok(())
 }
 
+/// A terminal decision (spent budget or a passed deadline) must wait
+/// for outstanding host writes to reconcile (lifecycle.md): intents are
+/// delivery-bound and would still apply under a recorded failure, so the
+/// stall is recorded as `outbox_reconciliation` instead of the terminal
+/// outcome. Returns true while the deferral stands.
+fn defer_terminal_while_outstanding(
+    tx: &mut dyn TxView,
+    work_id: &WorkId,
+    execution_id: &ExecutionId,
+    terminal_code: &str,
+) -> Result<bool, StoreError> {
+    if crate::projection::outstanding_actions(tx, work_id)?.is_empty() {
+        return Ok(false);
+    }
+    tx.apply(&Effect::RecordDeferral {
+        execution_id: execution_id.clone(),
+        reason: "outbox_reconciliation".into(),
+        diagnostic: format!(
+            "terminal {terminal_code} defers until outstanding host writes reconcile"
+        ),
+    })?;
+    Ok(true)
+}
+
 /// One execution's sweep decision inside its own transaction. The
 /// execution is re-read here so a change committed after the list was
 /// taken is observed fresh, never acted on from a stale snapshot.
@@ -4021,6 +4069,17 @@ fn sweep_one(
         {
             match execution.state {
                 ExecutionState::Queued => {
+                    // The same rule admission applies at the
+                    // request-creation seam: the terminal outcome waits
+                    // for outstanding host writes to reconcile.
+                    if defer_terminal_while_outstanding(
+                        tx,
+                        &work.id,
+                        &execution.id,
+                        "automatic_time_exhausted",
+                    )? {
+                        return Ok(SweepOutcome::Unchanged);
+                    }
                     fail_terminal(
                         tx,
                         &execution,

@@ -970,6 +970,65 @@ mod tests {
         );
     }
 
+    /// Past the Work-wide deadline the next dispatch pass emits no new
+    /// trial: admission decides the same terminal outcome the timed
+    /// sweep records — at the request-creation seam, before a writer
+    /// could ever launch inside the same tick.
+    #[test]
+    fn past_the_deadline_the_dispatch_pass_emits_no_new_execution() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-past-deadline");
+        let cfg = config();
+        // The deadline anchor is durable usage: the chain's first
+        // dispatch was long enough ago that automatic-time accounting
+        // (elapsed minus recorded human waiting) is over the ceiling.
+        store
+            .transact(|tx| {
+                let mut usage = tx.work_usage(&w)?.unwrap_or_else(|| WorkUsage::new(&w));
+                usage.first_dispatch_unix_seconds =
+                    Some(NOW - cfg.policy.automatic_time_limit_seconds as i64 - 1);
+                tx.apply(&Effect::UpdateWorkUsage { usage })
+            })
+            .unwrap();
+        let settings = settings();
+        let report = run(&store, &settings, None, &mut || NOW);
+        assert!(!report.aborted);
+        let dispatch = &report.phases[1];
+        assert_eq!(dispatch.phase, "dispatch_admission");
+        assert_eq!(dispatch.status, "completed");
+        assert_eq!(
+            dispatch.processed, 0,
+            "past the deadline no new trial is dispatched"
+        );
+        assert!(
+            dispatch.deferred.is_empty(),
+            "the item is decided, not deferred past the deadline"
+        );
+        assert_eq!(execution(&store, &e).state, ExecutionState::Failed);
+        assert_eq!(
+            execution(&store, &e).terminal_code.as_deref(),
+            Some("automatic_time_exhausted")
+        );
+        assert!(
+            store
+                .transact(|tx| tx.pending_requests())
+                .unwrap()
+                .is_empty(),
+            "no Invocation request exists for a trial that never dispatched"
+        );
+        // The supervision record exposes the deadline that fired.
+        let record = store
+            .transact(|tx| projection::supervision(tx, &e))
+            .unwrap()
+            .unwrap();
+        assert!(
+            record.deadline_unix_seconds.is_some_and(|d| d < NOW),
+            "the supervision record's deadline is what admission enforced"
+        );
+        assert!(record.capacity_slot.is_none());
+        assert!(record.reservation_ids.is_empty());
+    }
+
     #[test]
     fn the_outbox_item_loop_stops_at_the_tick_deadline() {
         let store = SqliteStore::in_memory(2).unwrap();

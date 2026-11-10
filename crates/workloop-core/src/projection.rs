@@ -658,3 +658,138 @@ pub fn latest_process_fact(
             _ => None,
         }))
 }
+
+/// The recorded writer's liveness, per the supervision contract:
+/// `running` (observed live), `stopped` (a supervisor-observed exit is
+/// on record — the verified stop), `unknown` (the liveness read failed
+/// or the record is inconsistent). An unknown writer never reads as
+/// stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterState {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+/// The supervision record Core derives for one Execution: the earliest
+/// deadline supervision must act on, the write-resource reservations it
+/// holds, the capacity slot it occupies, and the recorded writer's
+/// liveness. Derived from saved facts only — nothing here inspects a
+/// live process, and an unknown or inconsistent record never reports a
+/// `stopped` writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisionRecord {
+    pub execution_id: ExecutionId,
+    /// The earliest bound supervision must act on, as a wall-clock
+    /// instant: the Execution's runtime deadline once dispatched, and
+    /// the Work-wide automatic-time deadline once the chain has a first
+    /// dispatch (shifted by recorded human-decision waiting, which the
+    /// ceiling excludes). `None` while neither bound is anchored.
+    pub deadline_unix_seconds: Option<i64>,
+    /// Resource keys of the reservations this Execution holds.
+    pub reservation_ids: Vec<String>,
+    /// The claimed capacity slot's sequence while the Execution holds it.
+    pub capacity_slot: Option<EventSequence>,
+    /// The recorded writer's liveness; `None` while no writer exists.
+    pub writer_state: Option<WriterState>,
+}
+
+/// The supervision record for one Execution, derived from saved facts.
+/// `reservation_ids` and `capacity_slot` stay set for as long as the
+/// record says they must: stop-path and uncertain Executions keep both
+/// until verified stop and required-effect reconciliation release them.
+pub fn supervision(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+) -> Result<Option<SupervisionRecord>, StoreError> {
+    let Some(execution) = tx.execution(execution_id)? else {
+        return Ok(None);
+    };
+    let mut deadline = execution
+        .started_unix_seconds
+        .map(|s| s + execution.budget.runtime_limit_seconds as i64);
+    if let (Some(work), Some(usage)) = (
+        tx.work(&execution.work_id)?,
+        tx.work_usage(&execution.work_id)?,
+    ) && let Some(first) = usage.first_dispatch_unix_seconds
+    {
+        // First dispatch + the limit + excluded human waiting = the
+        // wall-clock instant the automatic-time ceiling fires.
+        let work_deadline = first
+            + work.policy.automatic_time_limit_seconds as i64
+            + usage.human_wait_seconds_total as i64;
+        deadline = Some(deadline.map_or(work_deadline, |d| d.min(work_deadline)));
+    }
+    let holder = ReservationHolder::Execution {
+        execution_id: execution.id.clone(),
+    };
+    let mut reservation_ids: Vec<String> = tx
+        .reservations()?
+        .into_iter()
+        .filter(|r| r.holder == holder)
+        .map(|r| r.resource_key)
+        .collect();
+    reservation_ids.sort();
+    let capacity_slot = tx
+        .slot_holders()?
+        .into_iter()
+        .find(|(holder, _)| holder == &execution.id)
+        .map(|(_, since)| since);
+    Ok(Some(SupervisionRecord {
+        execution_id: execution.id.clone(),
+        deadline_unix_seconds: deadline,
+        reservation_ids,
+        capacity_slot,
+        writer_state: writer_state_of(tx, &execution)?,
+    }))
+}
+
+/// The writer liveness the record reports. An unresolved writer reads
+/// `running` only on a live observation; a failed or missing read and an
+/// inconsistent record (an exit recorded while the writer is unresolved,
+/// or a resolution with no verified exit on record) read `unknown` —
+/// never a stronger state. `Abandoned` is proven unable to write, hence
+/// `stopped`.
+fn writer_state_of(
+    tx: &dyn ReadView,
+    execution: &Execution,
+) -> Result<Option<WriterState>, StoreError> {
+    let invocations = tx.invocations_for_execution(&execution.id)?;
+    if invocations.is_empty() {
+        return Ok(None);
+    }
+    let mut saw_unknown = false;
+    let mut saw_running = false;
+    for invocation in &invocations {
+        let latest = latest_process_fact(tx, &execution.id, &invocation.id)?;
+        let state = match invocation.state {
+            InvocationState::Done => match latest {
+                Some(ProcessStateFact::Exited) => WriterState::Stopped,
+                // Resolved without a verified exit on record.
+                _ => WriterState::Unknown,
+            },
+            // Never launched or prevented before writing: proven unable
+            // to write.
+            InvocationState::Abandoned => WriterState::Stopped,
+            // Prepared, Running, and Unknown are unresolved writers: only
+            // a live observation reads running.
+            _ => match latest {
+                Some(ProcessStateFact::Running) => WriterState::Running,
+                _ => WriterState::Unknown,
+            },
+        };
+        match state {
+            WriterState::Unknown => saw_unknown = true,
+            WriterState::Running => saw_running = true,
+            WriterState::Stopped => {}
+        }
+    }
+    Ok(Some(if saw_unknown {
+        WriterState::Unknown
+    } else if saw_running {
+        WriterState::Running
+    } else {
+        WriterState::Stopped
+    }))
+}
