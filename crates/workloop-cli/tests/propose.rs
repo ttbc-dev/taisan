@@ -293,11 +293,24 @@ fn an_unparseable_selector_section_is_refused_at_the_propose_boundary() {
     let root = root("propose-invalid");
     // A malformed selector section is a bounded config error for the
     // selector path only — it can never take manual submission down.
+    // Both semantic identity errors (validated at the boundary) and
+    // structural shape errors (parsed at the boundary, never at config
+    // load) are refused the same way.
     for selector in [
         serde_json::json!({"adapter": "", "allowlist": ["ops"]}),
         serde_json::json!({"adapter": "issue-scan", "excluded": ["ops:notanumber"]}),
+        // Structurally malformed: missing field, wrong field type,
+        // non-array list, out-of-range number, section not an object.
+        serde_json::json!({"allowlist": ["ops"]}),
+        serde_json::json!({"adapter": 7}),
+        serde_json::json!({"adapter": "issue-scan", "allowlist": "ops"}),
+        serde_json::json!({"adapter": "issue-scan", "policy_revision": -1}),
+        serde_json::json!("not an object"),
     ] {
         configure(&root, selector);
+        // Loading the installation never fails on the selector
+        // section: every command reaches its own path.
+        run_at(&root, &["work-list"]);
         let snapshot = write_snapshot(&root, "snap.json", serde_json::json!([]));
         let (code, env) = fail_at(
             &root,
@@ -391,6 +404,135 @@ fn truncation_at_the_proposal_bound_is_reported() {
     assert_eq!(result["result"]["proposals"].as_array().unwrap().len(), 1);
     // "Hit the bound" is distinguishable from "no more eligible work".
     assert_eq!(result["result"]["truncated"], 1, "{result}");
+}
+
+#[test]
+fn a_mid_batch_store_fault_lists_replay_keys_for_recovery() {
+    let root = root("propose-fault");
+    configure(
+        &root,
+        serde_json::json!({"adapter": "issue-scan", "allowlist": ["ops"]}),
+    );
+    let snapshot = write_snapshot(
+        &root,
+        "snapshot.json",
+        serde_json::json!([
+            issue("ops", 1, "open", "First"),
+            issue("ops", 2, "open", "Second"),
+        ]),
+    );
+    inject_mid_batch_fault(&root);
+
+    let (code, env) = fail_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    // The interrupted proposal's transaction rolled back, so its fate
+    // is definitely absent — a store-class error (exit 4), never a
+    // guess — and the envelope lists the committed proposal's replay
+    // key next to the interrupted one's.
+    assert_eq!(code, 4, "{env}");
+    assert_eq!(env["status"], "error", "{env}");
+    assert_eq!(env["reason"]["code"], "store", "{env}");
+    let refs = env["evidence_refs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("evidence_refs is an array: {env}"));
+    assert_eq!(refs.len(), 2, "{env}");
+    assert!(
+        refs.iter()
+            .all(|r| r.as_str().unwrap().starts_with("proposal/issue-scan:")),
+        "{env}"
+    );
+
+    // Each listed key is operator-visible through the documented
+    // recovery query: the committed one yields its recorded decision,
+    // the interrupted one a durable not-found — before any re-run.
+    let committed_key = refs[0].as_str().unwrap().to_string();
+    let interrupted_key = refs[1].as_str().unwrap().to_string();
+    let recovered = run_at(
+        &root,
+        &[
+            "command-result",
+            "--origin",
+            "selector",
+            "--replay-key",
+            &committed_key,
+        ],
+    );
+    let committed_command_id = recovered["result"]["command_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("committed decision recovered: {recovered}"))
+        .to_string();
+    let interrupted = run_at(
+        &root,
+        &[
+            "command-result",
+            "--origin",
+            "selector",
+            "--replay-key",
+            &interrupted_key,
+        ],
+    );
+    assert!(
+        interrupted["result"].is_null(),
+        "interrupted decision is durably absent: {interrupted}"
+    );
+
+    // Only the committed proposal became Work.
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(list["result"]["items"].as_array().unwrap().len(), 1);
+
+    // Recovery: clear the fault and re-run — the committed proposal
+    // replays its recorded decision (same command id), the interrupted
+    // one admits normally. Nothing is duplicated.
+    clear_mid_batch_fault(&root);
+    let result = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = result["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 2, "{result}");
+    assert!(
+        proposals.iter().all(|p| p["status"] == "accepted"),
+        "{result}"
+    );
+    let replayed = proposals
+        .iter()
+        .find(|p| p["replay_key"] == committed_key)
+        .unwrap_or_else(|| panic!("committed proposal is in the re-run: {result}"));
+    assert_eq!(replayed["command_id"], committed_command_id, "{result}");
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(list["result"]["items"].as_array().unwrap().len(), 2);
+}
+
+/// Install a deterministic mid-batch store fault on the live store: the
+/// first selector decision save commits, the second is aborted by a
+/// trigger, so its transaction rolls back. The counter row is seeded —
+/// an `UPDATE` of an empty table changes nothing and would never trip
+/// the abort.
+fn inject_mid_batch_fault(root: &Path) {
+    let conn = rusqlite::Connection::open(root.join("workloop.db")).expect("store opens");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fault_counter (n INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO fault_counter (n) VALUES (0);
+         CREATE TRIGGER mid_batch_fault BEFORE INSERT ON commands
+         WHEN NEW.origin = 'selector'
+         BEGIN
+           UPDATE fault_counter SET n = n + 1;
+           SELECT RAISE(ABORT, 'injected mid-batch fault')
+             WHERE (SELECT n FROM fault_counter) >= 2;
+         END;",
+    )
+    .expect("fault trigger installs");
+}
+
+fn clear_mid_batch_fault(root: &Path) {
+    let conn = rusqlite::Connection::open(root.join("workloop.db")).expect("store opens");
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS mid_batch_fault;
+         DROP TABLE IF EXISTS fault_counter;",
+    )
+    .expect("fault trigger clears");
 }
 
 #[test]

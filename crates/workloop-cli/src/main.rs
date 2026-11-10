@@ -635,28 +635,69 @@ fn run(cli: Cli) -> i32 {
                 let req = workloop_selector::admission::submit_command(proposal, actor.clone());
                 let decision = match handle_command(&store, &config, &req, now()) {
                     Ok(d) => d,
-                    Err(e) => {
-                        // A batch is not atomic: earlier proposals may
-                        // already hold recorded decisions. Their replay
-                        // keys ride the error envelope so the operator
-                        // can recover each via `command-result` — or
-                        // simply re-run `propose`, which replays them.
-                        let (mut env, code) = envelope::error_envelope(
-                            Some(identity()),
-                            envelope::ErrorClass::Store,
-                            &format!(
-                                "batch interrupted at proposal {} ({e}); committed \
-                                 decisions are recoverable by replay key",
-                                proposal.key
-                            ),
-                        );
-                        env.evidence_refs = items
+                    Err(store_error) => {
+                        // The batch shares the single-mutation
+                        // lost-response path: a handler error is
+                        // resolved under this proposal's replay
+                        // identity before the CLI concludes anything.
+                        let lookup = CommandResultLookup::ReplayKey {
+                            origin: req.origin.clone(),
+                            actor: req.actor.clone(),
+                            idempotency_key: req.idempotency_key.clone(),
+                        };
+                        let found =
+                            store.transact_deferred(|tx| projection::command_result(tx, &lookup));
+                        // The interrupted proposal's own key rides the
+                        // envelope alongside the committed ones: its
+                        // fate must be recoverable by `command-result`
+                        // exactly like a settled decision.
+                        let mut recoverable: Vec<String> = items
                             .iter()
                             .filter_map(|i: &serde_json::Value| {
                                 i["replay_key"].as_str().map(str::to_string)
                             })
                             .collect();
-                        return emit((env, code));
+                        recoverable.push(req.idempotency_key.clone());
+                        match envelope::resolve_lost_response(
+                            &req.origin,
+                            &req.idempotency_key,
+                            &store_error,
+                            || found,
+                        ) {
+                            // The decision is durable — replaying it is
+                            // the recovery; the batch continues with it
+                            // as this proposal's outcome.
+                            envelope::LostResponse::Recorded(d) => d,
+                            // A batch is not atomic: earlier proposals
+                            // may already hold recorded decisions. Their
+                            // replay keys — and this proposal's — ride
+                            // the error envelope so the operator can
+                            // recover each via `command-result` — or
+                            // simply re-run `propose`, which replays
+                            // them.
+                            envelope::LostResponse::Absent(message) => {
+                                let (mut env, code) = envelope::error_envelope(
+                                    Some(identity()),
+                                    envelope::ErrorClass::Store,
+                                    &format!(
+                                        "batch interrupted at proposal {} ({message}); replay \
+                                         keys for committed and interrupted decisions are listed",
+                                        proposal.key
+                                    ),
+                                );
+                                env.evidence_refs = recoverable;
+                                return emit((env, code));
+                            }
+                            // The fate is undetermined — never a
+                            // definite store error about a mutation
+                            // that may have committed.
+                            envelope::LostResponse::Undetermined(detail) => {
+                                let (mut env, code) =
+                                    envelope::unknown_envelope(identity(), &detail);
+                                env.evidence_refs = recoverable;
+                                return emit((env, code));
+                            }
+                        }
                     }
                 };
                 // The replay key rides the envelope so an operator can

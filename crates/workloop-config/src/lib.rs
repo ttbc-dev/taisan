@@ -65,17 +65,24 @@ pub struct Installation {
     #[serde(default)]
     pub policy: Option<WorkPolicy>,
     /// Alternate admission: the selector policy the `propose` path is
-    /// bound to. Absent means manual submission only — the selector
-    /// holds no default authority and its absence blocks nothing.
+    /// bound to, held as the raw JSON it was written as. The shape is
+    /// parsed at the selector boundary (`selection_policy`), never
+    /// during load: a structurally malformed section must fail that
+    /// path with a bounded config error, not fail every command —
+    /// including manual `submit` — at deserialization. Absent means
+    /// manual submission only — the selector holds no default
+    /// authority and its absence blocks nothing.
     #[serde(default)]
-    pub selector: Option<SelectorSection>,
+    pub selector: Option<serde_json::Value>,
 }
 
 /// The selector binding for alternate admission. Presence selects the
-/// alternate path. Values are validated when the policy is resolved
-/// for a selector run — an unparseable identity is a bounded config
-/// error for that path only, never a load failure that could block
-/// manual submission.
+/// alternate path. The section is deserialized from the installation
+/// file's raw JSON inside `selection_policy` — a structurally malformed
+/// block (missing or mistyped field, non-array list, out-of-range
+/// number) is a bounded config error for a selector run only, never a
+/// load failure that could block manual submission. Identity values are
+/// validated at the same boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectorSection {
     /// Selector adapter identity stamped on every proposal.
@@ -470,16 +477,19 @@ impl Installation {
 
     /// The selector adapter identity and policy for the alternate
     /// admission path, or `None` when the installation runs manual
-    /// submission only. The selector section is external input: every
-    /// identity string is validated here — an unparseable adapter,
+    /// submission only. The selector section is external input: its
+    /// structure and every identity string are validated here — a
+    /// structurally malformed block, an unparseable adapter,
     /// repository, or issue reference is an error rather than a
     /// silently mis-bound policy. Validation deliberately happens at
     /// this boundary (a selector run), not at config load: a malformed
     /// section must never take manual submission down with it.
     pub fn selection_policy(&self) -> Result<Option<(AdapterId, SelectionPolicy)>, String> {
-        let Some(section) = &self.selector else {
+        let Some(raw) = &self.selector else {
             return Ok(None);
         };
+        let section: SelectorSection = serde_json::from_value(raw.clone())
+            .map_err(|e| format!("installation selector: {e}"))?;
         let host = HostInstanceId::new(self.host_instance.clone())
             .map_err(|e| format!("installation host_instance: {e}"))?;
         let adapter = AdapterId::new(section.adapter.clone())
