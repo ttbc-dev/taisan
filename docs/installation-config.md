@@ -103,7 +103,7 @@ required_permissions = []              # declared on proposals, never expanded
 Validation rules:
 
 - `schema_version` is required and must equal a version this runtime understands; unknown/newer/corrupt content is refused without mutation, never auto-migrated.
-- Unknown keys at any level fail loading with the offending key named. `0` is never silently "unlimited" — each limit key's zero/disable semantics follow its defining document ([recovery policy](recovery-policy.md#configurable-policy-and-defaults), [retention policy](retention-policy.md#configuration)).
+- Unknown keys at any level fail loading with the offending key named — except inside the optional `[selector]` section, whose shape (including unknown keys) is validated when a selector run resolves the policy, exactly as the `[selector]` rule below specifies, so a malformed section can never block manual submission. `0` is never silently "unlimited" — each limit key's zero/disable semantics follow its defining document ([recovery policy](recovery-policy.md#configurable-policy-and-defaults), [retention policy](retention-policy.md#configuration)).
 - Every `credential_ref` must parse as a known provider (`env:`, `file:`, `command:`); file providers require an absolute path. Validation checks the reference's shape, never its value.
 - Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
 - `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
