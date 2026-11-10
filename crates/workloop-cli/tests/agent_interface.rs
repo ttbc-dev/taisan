@@ -7,8 +7,11 @@
 //! change request, a sealed review round, a paused or failed
 //! Execution) are seeded through the same store the binary opens — the
 //! fixture equivalent of prior history, matching the contract-test
-//! pattern. Every assertion reads the binary's stdout envelope; the
-//! store is a setup tool, never the assertion surface.
+//! pattern. Assertions read the binary's stdout envelope; the store
+//! is a setup tool, never the assertion surface — with one
+//! exception: `submit`'s recorded spec payload reaches no CLI
+//! surface, so the submit test asserts its verbatim preservation on
+//! the store record itself.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
