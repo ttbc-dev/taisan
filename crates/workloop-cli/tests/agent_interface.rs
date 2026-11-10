@@ -406,10 +406,10 @@ fn queries_read_recorded_state_with_unavailable_sources_visible() {
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
 
-    // `run-once` is the loop driver: dispatch admits the queued
-    // Execution — the canonical identities stay consistent across
-    // every query surface.
-    run_at(&root, &["run-once"]);
+    // A single bounded tick is the loop driver: dispatch admits the
+    // queued Execution — the canonical identities stay consistent
+    // across every query surface.
+    run_at(&root, &["run", "--once"]);
 
     let list = run_at(&root, &["work-list"]);
     assert_eq!(list["status"], "accepted");
@@ -906,7 +906,7 @@ fn conversation_closure_leaves_the_recorded_execution_queryable() {
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
     let command_id = env["command"]["id"].as_str().unwrap().to_string();
-    run_at(&root, &["run-once"]);
+    run_at(&root, &["run", "--once"]);
     assert_eq!(
         work_detail(&root, &work_id)["result"]["executions"][0]["state"],
         "ready"
@@ -933,7 +933,7 @@ fn conversation_closure_leaves_the_recorded_execution_queryable() {
 
     // The loop itself reads the same recorded state: a bounded run
     // neither duplicates the writer nor infers a cancellation.
-    let env = run_at(&root, &["run", "--ticks", "1", "--interval-ms", "0"]);
+    let env = run_at(&root, &["run", "--once"]);
     assert_eq!(env["status"], "accepted");
     assert_eq!(env["command"]["kind"], "run");
     let det = work_detail(&root, &work_id);
