@@ -162,7 +162,7 @@ fn config_with(declared: BTreeSet<HostCapability>, host_write: bool) -> Workloop
             actors: vec![RoleBinding {
                 role: ActorRole::Publication,
                 actor: publisher(),
-                credential_ref: "cred-publication".into(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
             }],
         },
         declared_capabilities: declared,

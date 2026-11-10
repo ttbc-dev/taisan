@@ -1,4 +1,5 @@
 pub mod command;
+pub mod credential;
 pub mod domain;
 pub mod identity;
 pub mod observation;

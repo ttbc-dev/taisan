@@ -8,16 +8,113 @@
 //! pipeline a real adapter would use.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use workloop_core::domain::{ExecutionId, WorkId};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, IssueRef, RepositoryRef, SourceSnapshot,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, IssueRef, RepositoryRef,
+    SourceSnapshot,
 };
 use workloop_core::observation::{
     HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
+
+use crate::credential::{
+    CredentialError, CredentialProviders, ResolvedCredential, bind_credential,
+    read_credential_file, run_credential_command,
+};
+
+/// What the fixture's synthetic host reports when a resolved credential
+/// authenticates — test control for the "who does this credential act
+/// as" step a real adapter performs.
+#[derive(Debug, Clone)]
+pub enum CredentialSeat {
+    /// The host recognizes the value and reports this actor identity.
+    Actor(HostActorRef),
+    /// The host reports the credential as expired.
+    Expired,
+    /// The host denies the credential outright.
+    Denied,
+}
+
+/// The fixture's credential environment: the slots `credential_ref`s
+/// resolve through, plus the authentication outcome each resolved value
+/// maps to. Seated `env:` values live in memory only — the process
+/// environment is never mutated, and no seat value is ever logged,
+/// persisted, or placed on argv.
+#[derive(Debug, Default)]
+pub struct CredentialBook {
+    env: BTreeMap<String, String>,
+    seats: BTreeMap<String, CredentialSeat>,
+}
+
+impl CredentialBook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seat or rotate one `env:` slot's value.
+    pub fn seat_env(&mut self, name: &str, value: &str) {
+        self.env.insert(name.to_string(), value.to_string());
+    }
+
+    /// The host recognizes `value` and reports `actor` for it.
+    pub fn seat_actor(&mut self, value: &str, actor: HostActorRef) {
+        self.seats
+            .insert(value.to_string(), CredentialSeat::Actor(actor));
+    }
+
+    /// The host reports `value` as an expired credential.
+    pub fn seat_expired(&mut self, value: &str) {
+        self.seats
+            .insert(value.to_string(), CredentialSeat::Expired);
+    }
+
+    /// The host denies `value` outright.
+    pub fn seat_denied(&mut self, value: &str) {
+        self.seats.insert(value.to_string(), CredentialSeat::Denied);
+    }
+
+    /// The adapter's authentication step: which actor this credential
+    /// acts as. An unrecognized value is unresolvable — never an
+    /// anonymous fallback.
+    pub fn authenticate(
+        &self,
+        credential: &ResolvedCredential,
+    ) -> Result<HostActorRef, CredentialError> {
+        match self.seats.get(credential.expose()) {
+            Some(CredentialSeat::Actor(actor)) => Ok(actor.clone()),
+            Some(CredentialSeat::Expired) => Err(CredentialError::expired(
+                "the host reports the credential as expired",
+            )),
+            Some(CredentialSeat::Denied) => Err(CredentialError::unresolvable(
+                "the host denies the credential",
+            )),
+            None => Err(CredentialError::unresolvable(
+                "the host does not recognize the credential",
+            )),
+        }
+    }
+}
+
+impl CredentialProviders for CredentialBook {
+    fn env(&self, name: &str) -> Result<String, CredentialError> {
+        self.env
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CredentialError::unresolvable(format!("env: variable {name} is unset")))
+    }
+
+    fn file(&self, path: &Path) -> Result<Vec<u8>, CredentialError> {
+        read_credential_file(path)
+    }
+
+    fn command(&self, argv: &[String]) -> Result<String, CredentialError> {
+        run_credential_command(argv)
+    }
+}
 
 /// An in-memory host the tests steer. `apply_outbox` drains recorded
 /// intents in outbox order; each write re-reads the synthetic remote head
@@ -48,6 +145,23 @@ pub struct FixtureGithub {
     next_number: BTreeMap<String, u64>,
     /// The write history, for test assertions.
     applied: Vec<String>,
+    /// When installed, every pending intent's recorded credential
+    /// binding is resolved and authenticated before its write — the
+    /// adapter-boundary credential gate. Absent a book the fixture is
+    /// permissive, preserving the pre-credential contract tests.
+    credentials: Option<CredentialBook>,
+}
+
+/// What one pending intent's pass did.
+enum AttemptOutcome {
+    /// No host attempt ran: the intent names another host instance, the
+    /// Execution is missing, or its `host_write` grant is denied.
+    Skipped,
+    /// A credential failure blocked the write before any host call;
+    /// the intent stays `pending` and the pass reports the class.
+    CredentialBlocked(&'static str),
+    /// The adapter attempted the write at the host.
+    Attempted,
 }
 
 /// What the synthetic remote reports for one source issue read.
@@ -78,6 +192,20 @@ pub struct OutboxReport {
     /// Pending in-scope intents not attempted because the per-tick
     /// bound stopped the drain; they stay pending for the next pass.
     pub deferred: Vec<String>,
+    /// Intents whose credential binding failed resolution or actor
+    /// verification during the pass; each stays `pending` with its
+    /// `credential.*` class recorded for the repair path.
+    pub credential_blocked: Vec<CredentialBlock>,
+}
+
+/// One intent a credential failure blocked before any host write. The
+/// block names the failure class only — never the ref and never a
+/// secret value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialBlock {
+    pub action_id: String,
+    /// The `credential.*` failure class.
+    pub code: &'static str,
 }
 
 impl FixtureGithub {
@@ -111,6 +239,19 @@ impl FixtureGithub {
             "review_findings_read",
             "issue_read",
         ]
+    }
+
+    /// Install the credential environment this adapter resolves and
+    /// authenticates against before every write.
+    pub fn with_credentials(mut self, credentials: CredentialBook) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// Test control: mutate the seated credential environment between
+    /// passes — e.g. rotating a slot's value mid-Work.
+    pub fn credentials_mut(&mut self) -> Option<&mut CredentialBook> {
+        self.credentials.as_mut()
     }
 
     /// Test control: what the synthetic remote believes the change head is.
@@ -256,9 +397,15 @@ impl FixtureGithub {
             let Some(intent) = next else { break };
             let action_id = intent.action_id.clone();
             attempted.insert(action_id.clone());
-            let host_attempt = self.attempt(store, config, intent, now)?;
-            if host_attempt {
-                report.attempted += 1;
+            match self.attempt(store, config, intent, now)? {
+                AttemptOutcome::Attempted => report.attempted += 1,
+                AttemptOutcome::CredentialBlocked(code) => {
+                    report.credential_blocked.push(CredentialBlock {
+                        action_id: action_id.clone(),
+                        code,
+                    });
+                }
+                AttemptOutcome::Skipped => {}
             }
             let status = store.transact(|tx| {
                 Ok(tx
@@ -420,7 +567,7 @@ impl FixtureGithub {
         config: &WorkloopConfig,
         intent: HostActionIntent,
         now: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<AttemptOutcome, StoreError> {
         // Not this instance's intent: leave it pending for the adapter
         // bound to the recorded host — an effect never migrates across
         // host instances. It is not a real attempt, so it does not
@@ -430,7 +577,7 @@ impl FixtureGithub {
             .as_ref()
             .is_some_and(|bound| *bound != intent.host)
         {
-            return Ok(false);
+            return Ok(AttemptOutcome::Skipped);
         }
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
@@ -440,10 +587,37 @@ impl FixtureGithub {
                 .max_by_key(|execution| execution.ordinal))
         })?;
         let Some(execution) = execution else {
-            return Ok(false);
+            return Ok(AttemptOutcome::Skipped);
         };
         if !execution.allowed_effects.host_write {
-            return Ok(false);
+            return Ok(AttemptOutcome::Skipped);
+        }
+        // The adapter-boundary credential gate: with a book installed,
+        // the intent's recorded role binding resolves its credential
+        // slot and the resolved value is authenticated against the
+        // intent's authorized actor before any write. A failure leaves
+        // the intent pending — an actor mismatch never rebinds an
+        // outstanding action, and a same-actor renewal resolves the new
+        // secret under the original binding.
+        let mut verified_actor: Option<HostActorRef> = None;
+        if let Some(book) = &self.credentials {
+            let reference = store.transact(|tx| {
+                Ok(tx.work(&work_id)?.and_then(|work| {
+                    work.binding
+                        .actors
+                        .iter()
+                        .find(|binding| binding.role == intent.role)
+                        .map(|binding| binding.credential_ref.clone())
+                }))
+            })?;
+            match bind_credential(reference.as_ref(), &intent.actor, book, &|credential| {
+                book.authenticate(credential)
+            }) {
+                Ok(actor) => verified_actor = Some(actor),
+                Err(error) => {
+                    return Ok(AttemptOutcome::CredentialBlocked(error.code()));
+                }
+            }
         }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
@@ -453,11 +627,12 @@ impl FixtureGithub {
             fact,
             observed_unix_seconds: now,
         };
+        let authenticated = verified_actor.unwrap_or_else(|| intent.actor.clone());
         let result =
             |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
                 ObservationFact::HostActionResult {
                     action_id,
-                    authenticated_actor: Some(intent.actor.clone()),
+                    authenticated_actor: Some(authenticated.clone()),
                     status,
                     effects,
                 }
@@ -649,7 +824,7 @@ impl FixtureGithub {
                 }
             }
         }
-        Ok(true)
+        Ok(AttemptOutcome::Attempted)
     }
 }
 
