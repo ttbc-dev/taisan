@@ -37,8 +37,14 @@ never executes the live scenario. Binding identities that only a
 read-only host/store interaction can resolve are carried as explicit
 unresolved references: the shipped preparation fixture reports
 `status: prepared` with `installation_ready: false`, while a fully
-resolved install spec reports `status: ok`. Neither result is execution
-permission, and neither is live evidence. The preflight also recomputes
+resolved install spec reports `status: ok`. Resolving those late-bound
+identities does not stale the prepared checklist, because its exact
+configuration identity pins the declared configuration (host, repository,
+adapter, contract, capabilities, required checks, allowed effects, and
+budget) and leaves the store identity to the execution evidence. A
+change to the declared configuration still fails closed until the
+checklist is regenerated. Neither result is execution permission, and
+neither is live evidence. The preflight also recomputes
 the sha256 fixture content digest and fails closed when the record in
 `docs/evidence/u8.1.md` is missing or no longer matches, so neither
 deleting the record nor editing a fixture can leave the evidence digest

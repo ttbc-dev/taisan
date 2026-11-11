@@ -75,18 +75,6 @@ class S1MaterialsTest(unittest.TestCase):
             complete = self.complete_install_spec()
             path = root / 'install.json'
             path.write_text(json.dumps(complete))
-            checklist_path = root / 'fixtures' / 's1' / 'evidence-checklist.json'
-            checklist = json.loads(checklist_path.read_text())
-            expected = prerequisites.expected_revision_config(complete)
-            checklist['revision_config'] = copy.deepcopy(expected)
-            for row in checklist['rows']:
-                row['revision_config'] = copy.deepcopy(expected)
-            checklist_path.write_text(json.dumps(checklist, indent=2) + '\n')
-            evidence_path = root / 'docs' / 'evidence' / 'u8.1.md'
-            evidence = evidence_path.read_text()
-            old_digest = prerequisites.fixture_content_digest(ROOT)
-            new_digest = prerequisites.fixture_content_digest(root)
-            evidence_path.write_text(evidence.replace(old_digest, new_digest))
             report = prerequisites.verify(root, path)
             self.assertEqual(report['status'], 'ok', report['errors'])
             self.assertEqual(report['errors'], [])
@@ -113,10 +101,24 @@ class S1MaterialsTest(unittest.TestCase):
             self.assertEqual(output['unresolved_identities'], [])
             self.assertIn('not-run', output['live_execution'])
 
-    def test_explicit_install_spec_must_match_checklist_revision_config(self):
+    def test_resolving_late_bound_identities_does_not_stale_the_checklist(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'install.json'
             path.write_text(json.dumps(self.complete_install_spec()))
+            report = prerequisites.verify(ROOT, path)
+            self.assertEqual(report['status'], 'ok', report['errors'])
+            self.assertEqual(report['errors'], [])
+            self.assertTrue(report['installation_ready'])
+            self.assertEqual(report['unresolved_identities'], [])
+
+    def test_explicit_spec_with_changed_declared_config_must_match_checklist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            changed = copy.deepcopy(self.complete_install_spec())
+            changed['worker_runtime_identity']['allowed_effects'][
+                'workspace_write'
+            ] = False
+            path = Path(temp) / 'install.json'
+            path.write_text(json.dumps(changed))
             report = prerequisites.verify(ROOT, path)
             self.assertEqual(report['status'], 'failed', report['errors'])
             self.assertTrue(
@@ -519,6 +521,15 @@ class S1MaterialsTest(unittest.TestCase):
                 for error in errors
             ),
             errors,
+        )
+        broken = copy.deepcopy(self.checklist)
+        broken['revision_config']['configuration_identity'] = (
+            'github.com/shimpeiws/coding-worker-smoke adapter=github '
+            'contract=1 store=unresolved:store-open-read'
+        )
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(
+            any('late-bound unresolved' in error for error in errors), errors
         )
         broken = copy.deepcopy(self.checklist)
         broken['revision_config']['taisan_core_revision'] = 'a' * 40

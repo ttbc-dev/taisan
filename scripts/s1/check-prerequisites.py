@@ -187,20 +187,20 @@ def fixture_content_digest(root: Path) -> str:
 
 
 def configuration_identity_label(spec: dict) -> str:
-    """Return the exact configuration identity recorded by the checklist.
+    """Return the exact pre-execution configuration identity.
 
-    The label binds the concrete installation fields plus a canonical
-    digest of the full configuration object, so a capability, check, or
-    budget change cannot leave a checklist row pointing at stale config.
+    The label binds the concrete declared installation fields plus a
+    canonical digest, so a capability, check, effect, or budget change
+    cannot leave a checklist row pointing at stale config. The store
+    identity is deliberately not pinned: it is a late-bound binding
+    resolved by the live preflight and recorded in execution evidence,
+    and embedding its unresolved reference here would make every
+    prepared checklist row stale as soon as the store is resolved.
     """
     config = spec.get("configuration_identity")
     if not isinstance(config, dict):
         return ""
-    store = config.get("store_id")
-    if isinstance(store, dict):
-        store_label = f"unresolved:{store.get('resolution', '')}"
-    else:
-        store_label = str(store)
+    declared = {key: value for key, value in config.items() if key != "store_id"}
     worker = spec.get("worker_runtime_identity")
     effects = worker.get("allowed_effects") if isinstance(worker, dict) else None
     if isinstance(effects, dict):
@@ -210,7 +210,7 @@ def configuration_identity_label(spec: dict) -> str:
     else:
         effects_label = "missing"
     canonical = json.dumps(
-        {"configuration_identity": config, "allowed_effects": effects},
+        {"configuration_identity": declared, "allowed_effects": effects},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -219,7 +219,7 @@ def configuration_identity_label(spec: dict) -> str:
         f"{config.get('host_instance')}/{config.get('repository')} "
         f"adapter={config.get('adapter')} "
         f"contract={config.get('contract_version')} "
-        f"store={store_label} effects={effects_label} "
+        f"store=late-bound effects={effects_label} "
         f"config_sha256={config_digest}"
     )
 
@@ -683,6 +683,11 @@ def _validate_revision_config(
                 errors.append(
                     f"{prefix}.{key}: expected the exact "
                     f"configuration identity, not a reference ({value!r})"
+                )
+            elif "unresolved:" in lowered:
+                errors.append(
+                    f"{prefix}.{key}: must not pin a late-bound unresolved "
+                    f"identity ({value!r})"
                 )
         elif key == "contract_version":
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

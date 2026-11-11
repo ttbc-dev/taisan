@@ -19,7 +19,14 @@ carries the same rows with an explicit `variant`, `revision_config`, and
 `identities` object for each entry, plus a top-level `revision_config`.
 Both the top-level object and every row hold the exact commit SHAs and
 configuration identity derived from `installation-spec.json`, not
-reference text. `python3 scripts/s1/check-prerequisites.py` asserts
+reference text. The configuration identity pins the declared
+configuration (host, repository, adapter, contract, capabilities,
+required checks, allowed effects, and budget); it does **not** pin the
+late-bound store identity, which the live preflight resolves and the
+execution evidence records. Resolving `configuration_identity.store_id`
+therefore does not stale these rows, while a change to any declared
+configuration field still fails closed until the checklist is
+regenerated. `python3 scripts/s1/check-prerequisites.py` asserts
 that the top-level object and every row carry exact revision/config
 values (40-hex SHAs and a concrete config identity), that every row has
 one of `success`, `Attention`, or `recovery`, and that each row retains

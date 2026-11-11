@@ -80,7 +80,11 @@ explicit unresolved references rather than placeholder text:
 `status: prepared` and `installation_ready: false` for the shipped
 fixture. It reports `status: ok` only for a spec whose binding
 identities are resolved and whose target adapter and reviewer App are
-declared available. A `prepared` result is **not** execution
+declared available. Resolving those late-bound identities does not
+change the checklist's exact configuration identity, which pins the
+declared configuration and leaves the store identity to the execution
+evidence; changing the declared configuration still fails closed until
+the checklist is regenerated. A `prepared` result is **not** execution
 permission; it means the materials are complete enough to hand to the
 live preflight.
 
