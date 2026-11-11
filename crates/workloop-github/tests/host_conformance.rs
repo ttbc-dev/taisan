@@ -1585,6 +1585,96 @@ fn evidence_defers_exchangeability_to_114() {
     }
 }
 
+/// Doc check: the tested revision named by the U9.1 evidence record must
+/// resolve to a repository commit that actually contains the exercised
+/// suite. A patch digest may supplement that revision but cannot replace
+/// a commit another checkout can reproduce.
+#[test]
+fn evidence_tested_revision_contains_the_exercised_suite() {
+    let evidence = include_str!("../../../docs/evidence/u9.1.md");
+    let row = evidence
+        .lines()
+        .find(|line| line.contains("Tested revision (slice commit"))
+        .expect("evidence names a tested revision");
+    let sha = row
+        .split('`')
+        .nth(1)
+        .expect("Tested revision is a backticked commit id");
+    assert_eq!(sha.len(), 40, "tested revision is a full commit id: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "tested revision is a hex commit id: {sha}"
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+        .output()
+        .expect("git is available");
+    assert!(
+        commit.status.success(),
+        "tested revision {sha} must resolve to a commit in this repository: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let spec = format!("{sha}:crates/workloop-github/tests/host_conformance.rs");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["cat-file", "-e", &spec])
+        .output()
+        .expect("git is available");
+    assert!(
+        out.status.success(),
+        "tested revision {sha} must contain the exercised suite: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Doc check: the exchangeability report's runner semantics and coverage
+/// cells must agree with the matrix runner. A covered row runs unchanged;
+/// an undeclared capability is an explicit unsupported outcome, never a
+/// per-row skip.
+#[test]
+fn exchangeability_report_matches_the_matrix_runner() {
+    let report = include_str!("../../../docs/host-exchangeability.md");
+    let lower = report.to_ascii_lowercase();
+    assert!(
+        !lower.contains("is skipped for that row"),
+        "report still describes a per-row skip path"
+    );
+    assert!(
+        !lower.contains("declared-set skip path"),
+        "report still calls undeclared coverage a skip path"
+    );
+    let base = report
+        .lines()
+        .find(|line| line.contains("HC-BASE-03/04"))
+        .expect("report records the head-bound write row");
+    let base_lower = base.to_ascii_lowercase();
+    assert!(
+        !base_lower.contains("skipped"),
+        "head-bound write row is an explicit unsupported outcome, not a skip: {base}"
+    );
+    assert!(
+        base_lower.contains("unsupported"),
+        "head-bound write row records the undeclared capability: {base}"
+    );
+    let read = report
+        .lines()
+        .find(|line| line.contains("HC-READ-01"))
+        .expect("report records the typed-read row");
+    let read_lower = read.to_ascii_lowercase();
+    assert!(
+        read_lower.contains("covered") && read_lower.contains("issue_read"),
+        "typed-read row records covered fixtures and the undeclared capability: {read}"
+    );
+    assert!(
+        !read_lower.contains("read-model ops not in vocabulary"),
+        "typed-read row is stale: {read}"
+    );
+}
+
 /// The capability difference is part of the contract surface: this
 /// fixture does not declare `issue_read`, so a source-bound Work is
 /// rejected `unsupported_capability` at admission — the declared set

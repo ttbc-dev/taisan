@@ -26,15 +26,17 @@ against the real GitHub adapter, not these fixtures.
 
 ## Coverage matrix
 
-Rows run wherever the fixture's declared capability set covers the
-scenario's requirement list; a fixture that cannot cover a row is
-skipped for that row, never substituted. Suite runner:
-`run_suite` in `host_conformance.rs`.
+Every row yields exactly one outcome per fixture. A fixture whose
+declared capability set covers the scenario's requirement list runs the
+unchanged scenario; a fixture that does not declare a required
+capability records an explicit `unsupported` outcome for every missing
+capability. There is no per-row skip path, and no fixture is
+substituted. Suite runner: `run_suite` in `host_conformance.rs`.
 
 | Matrix row | FixtureGithub | GitlabFixture | SparseHost | Live GitLab spike |
 | --- | --- | --- | --- | --- |
 | HC-BASE-01/02 baseline effects | covered | covered | covered | incomplete — spike not run |
-| HC-BASE-03/04 head-bound writes | covered — update applies against the recorded head, then aborts on a moved head | covered — same applied-then-aborted update | skipped (no `change_request_update`/`comment_create`) | incomplete — spike not run |
+| HC-BASE-03/04 head-bound writes | covered — update applies against the recorded head, then aborts on a moved head | covered — same applied-then-aborted update | explicit unsupported (no `change_request_update`/`comment_create`) | incomplete — spike not run |
 | HC-PART-01 partial receipts | covered | covered | covered | incomplete — spike not run |
 | HC-SNAP-01 stale-head evidence | covered | covered | covered | incomplete — spike not run |
 | HC-PERM-01 denied vs unsupported | covered | covered | covered | incomplete — spike not run |
@@ -45,7 +47,7 @@ skipped for that row, never substituted. Suite runner:
 | HC-CAP-03 approval/ready explicit | covered — `approval_and_ready_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
 | HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
-| HC-READ-01 typed reads | incomplete — read-model ops not in vocabulary | incomplete — same | incomplete — same | incomplete |
+| HC-READ-01 typed reads | covered — issue read is repository-scoped and revision-bound | explicit unsupported (`issue_read` undeclared) | explicit unsupported (`issue_read` undeclared) | incomplete — spike not run |
 | HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete |
 
 HC-CAP-02 measures a fixture's own explicit-unsupported behavior; a
@@ -72,7 +74,8 @@ read/check/review observations the suite drives), the unchanged shared
 suite passes on `FixtureGithub` and `GitlabFixture` with no
 Core/Command change — fixture-level exchangeability for those
 operations only, with valid scenario evidence cited above. `SparseHost`
-proves the runner's declared-set skip path rather than full coverage.
+proves the runner's explicit-unsupported path for undeclared
+capabilities rather than full coverage.
 
 ## Remaining limitations
 
@@ -82,8 +85,10 @@ proves the runner's declared-set skip path rather than full coverage.
 - `approve_change` / `mark_ready` / thread operations are absent from
   the `HostAction` vocabulary — structurally unsupported, not yet
   implementable (HC-CAP-03).
-- Typed read-model operations for issue content, comments, and threads
-  are not in the contract vocabulary (HC-READ-01).
+- Issue content reads are typed and covered by fixtures declaring
+  `issue_read` (HC-READ-01); comment and thread read-model operations
+  are not in the contract vocabulary, so that part of the row remains
+  uncovered.
 - Rename, mid-Work actor change, and cross-instance delivery-ID
   deduplication are unexercised (HC-LIFE-03).
 - `GitlabFixture` models IID scoping and branch-following heads; a real
