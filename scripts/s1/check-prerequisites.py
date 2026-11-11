@@ -830,10 +830,17 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         errors.extend(
             f"evidence-checklist: {item}" for item in validate_checklist(checklist)
         )
-        if resolved_spec and install_spec is None:
+        checklist_spec = spec if install_spec is None else {}
+        if install_spec is not None and paths["installation-spec"].is_file():
+            try:
+                checklist_spec = _load_json(paths["installation-spec"])
+            except CheckFailure as exc:
+                errors.extend(exc.errors)
+                checklist_spec = {}
+        if checklist_spec:
             errors.extend(
                 f"evidence-checklist: {item}"
-                for item in validate_checklist_revision_config(checklist, spec)
+                for item in validate_checklist_revision_config(checklist, checklist_spec)
             )
         if all((root / relative).is_file() for relative in DOC_FILES.values()):
             errors.extend(validate_markdown(root, checklist))

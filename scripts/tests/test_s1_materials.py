@@ -465,6 +465,45 @@ class S1MaterialsTest(unittest.TestCase):
                 report['errors'],
             )
 
+    def test_explicit_install_spec_still_validates_checklist_revisions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(FIXTURE_DIR, root / 'fixtures' / 's1')
+            shutil.copytree(ROOT / 'docs' / 's1', root / 'docs' / 's1')
+            shutil.copytree(
+                ROOT / 'docs' / 'evidence', root / 'docs' / 'evidence'
+            )
+            checklist_path = root / 'fixtures' / 's1' / 'evidence-checklist.json'
+            checklist = json.loads(checklist_path.read_text())
+            checklist['rows'][0]['revision_config']['taisan_core_revision'] = 'a' * 40
+            checklist_path.write_text(json.dumps(checklist, indent=2) + '\n')
+            shipped = root / 'fixtures' / 's1' / 'installation-spec.json'
+            report = prerequisites.verify(root, shipped)
+            self.assertEqual(report['status'], 'failed')
+            self.assertTrue(
+                any('revision_config' in error for error in report['errors']),
+                report['errors'],
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    '--root',
+                    str(root),
+                    '--install-spec',
+                    str(shipped),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertTrue(
+                any('revision_config' in error for error in output['errors']),
+                output['errors'],
+            )
+
     def test_malformed_but_json_valid_types_fail_closed(self):
         seed = copy.deepcopy(self.seeded_issue)
         seed['title_template'] = 123
