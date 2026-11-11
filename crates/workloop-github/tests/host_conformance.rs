@@ -1733,11 +1733,12 @@ fn absent_tested_revision_is_explained(evidence: &str, suite: &str) -> Result<()
 
 /// Doc check: the tested revision named by the U9.1 evidence record must
 /// be a branch commit on the history leading to HEAD that contains the
-/// exercised suite. CI checks out full history so the branch commit is
-/// available there; a checkout without it (such as a patch applied to the
-/// pre-PR base) still checks that the record explains the pending branch
-/// commit and that the matrix suite is present in this tree. The check
-/// deliberately does not pin the living suite to a hardcoded blob digest.
+/// exercised suite. When the checkout keeps that branch commit, the check
+/// verifies its ancestry and that the suite exists at that revision; a
+/// checkout without it (such as a patch applied to the pre-PR base) still
+/// checks that the record explains the pending branch commit and that the
+/// matrix suite is present in this tree. The check deliberately does not
+/// pin the living suite to a hardcoded blob digest.
 #[test]
 fn evidence_tested_revision_contains_the_exercised_suite() {
     let evidence = include_str!("../../../docs/evidence/u9.1.md");
