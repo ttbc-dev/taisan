@@ -54,6 +54,11 @@ PLACEHOLDER_MARKERS = (
     "changeme",
     "tbd",
     "todo",
+    "unresolved",
+    "pending",
+    "unknown",
+    "unset",
+    "not-set",
 )
 REVISION_KEYS = (
     "materials_revision",
@@ -112,6 +117,10 @@ def _check_identity_scope(prefix: str, value, errors: list[str]) -> None:
 
 def _is_placeholder(value: str) -> bool:
     lowered = value.strip().lower()
+    if not lowered:
+        return True
+    if "<" in lowered or ">" in lowered:
+        return True
     return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
 
 
@@ -477,11 +486,17 @@ def validate_install_spec(spec: dict) -> list[str]:
         effects = worker.get("allowed_effects")
         if not isinstance(effects, dict):
             errors.append("worker_runtime_identity.allowed_effects: missing")
-        elif effects.get("repository_host_write") is not False:
-            errors.append(
-                "worker_runtime_identity.allowed_effects.repository_host_write: "
-                "must be false"
-            )
+        else:
+            for key, expected in (
+                ("workspace_write", True),
+                ("local_git_write", True),
+                ("repository_host_write", False),
+            ):
+                if effects.get(key) is not expected:
+                    errors.append(
+                        "worker_runtime_identity.allowed_effects."
+                        f"{key}: must be {str(expected).lower()}"
+                    )
 
     revisions = spec.get("revisions")
     if not isinstance(revisions, dict):

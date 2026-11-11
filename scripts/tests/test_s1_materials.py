@@ -141,6 +141,47 @@ class S1MaterialsTest(unittest.TestCase):
         ):
             self.assertTrue(any(field in error for error in errors), (field, errors))
 
+    def test_untagged_placeholder_binding_identities_fail_closed(self):
+        fields = (
+            ('repository', 'stable_id'),
+            ('reviewer_identity', 'app_id'),
+            ('configuration_identity', 'store_id'),
+        )
+        for section, key in fields:
+            for placeholder in ('unresolved', 'pending', 'unknown', '<app-id>'):
+                with self.subTest(section=section, key=key, placeholder=placeholder):
+                    spec = copy.deepcopy(self.install_spec)
+                    spec[section][key] = placeholder
+                    errors = prerequisites.validate_install_spec(spec)
+                    self.assertTrue(
+                        any(f'{section}.{key}' in error for error in errors),
+                        (section, key, placeholder, errors),
+                    )
+
+    def test_required_allowed_effects_fail_closed(self):
+        for key, value in (
+            ('workspace_write', False),
+            ('local_git_write', False),
+            ('workspace_write', None),
+            ('local_git_write', None),
+            ('repository_host_write', True),
+        ):
+            with self.subTest(key=key, value=value):
+                spec = copy.deepcopy(self.install_spec)
+                effects = spec['worker_runtime_identity']['allowed_effects']
+                if value is None:
+                    effects.pop(key)
+                else:
+                    effects[key] = value
+                errors = prerequisites.validate_install_spec(spec)
+                self.assertTrue(
+                    any(
+                        'allowed_effects' in error and key in error
+                        for error in errors
+                    ),
+                    (key, value, errors),
+                )
+
     def test_missing_required_capability_fails_closed(self):
         for capability in (
             'push_ref',
