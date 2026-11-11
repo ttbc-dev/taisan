@@ -118,10 +118,12 @@ taisan acknowledge --work <WORK_ID> --expected-version <N> --attention <ATTENTIO
 
 Use the observed version and target identities from the Queries above.
 `retry` creates a new Execution after confirmed failure; `resume`
-continues a paused one; `cancel` records a stop intent and is never stop
-proof — the Execution settles through the uncertain-stop path;
-`acknowledge` applies only to the currently derivable Attention version
-and releases nothing. `cancel` optionally takes `--execution <EXECUTION_ID>`.
+continues a paused one; `cancel` is an intervention, not writer-safety
+proof: a queued or paused Execution is cancelled immediately, while a
+live one settles through the uncertain-stop path until writer safety is
+established — cancellation is never stop proof. `acknowledge` applies
+only to the currently derivable Attention version and releases nothing.
+`cancel` optionally takes `--execution <EXECUTION_ID>`.
 Ineligible or stale preconditions are `rejected` at exit 1 (`reason.code`
 such as `ineligible` / `stale_work_version`), never silently retargeted.
 
