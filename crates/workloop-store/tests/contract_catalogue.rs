@@ -309,6 +309,72 @@ fn pin_state_changes_protect_and_release_the_same_body() {
     );
 }
 
+/// Clearing the catalogue marker releases only the marker: a boolean
+/// pin recorded by the registration path keeps its own ledger
+/// dependency, so release semantics do not depend on the creation path.
+#[test]
+fn clearing_the_catalogue_marker_keeps_pins_from_other_creation_paths() {
+    use workloop_store::retention::CatalogBody;
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "runtime".into(),
+            category: "cas".into(),
+            path: "/managed/runtime.blob".into(),
+            bytes: 10,
+            registered_unix_seconds: NOW - 10,
+            eligible_after_unix_seconds: Some(NOW - 5),
+            pinned: true,
+        })
+        .unwrap();
+    register_all(&store, &[body("catalogue", NOW - 10, 10, PinState::Active)]);
+    let over = settings(Some(1000), Some(1));
+
+    store.set_pin_state("runtime", PinState::None).unwrap();
+    assert_eq!(
+        store
+            .catalogue_record("runtime")
+            .unwrap()
+            .unwrap()
+            .pin_state,
+        PinState::Active,
+        "the runtime pin's ledger dependency survives clearing the marker"
+    );
+    assert!(
+        !store
+            .catalogue_eligibility(&over, NOW)
+            .unwrap()
+            .is_eligible("runtime")
+    );
+
+    store.set_pin_state("catalogue", PinState::None).unwrap();
+    assert_eq!(
+        store
+            .catalogue_record("catalogue")
+            .unwrap()
+            .unwrap()
+            .pin_state,
+        PinState::None,
+        "the catalogue marker was the only dependency"
+    );
+    assert!(
+        store
+            .catalogue_eligibility(&over, NOW)
+            .unwrap()
+            .is_eligible("catalogue")
+    );
+
+    // The runtime dependency discharges through its own ledger id.
+    store.set_body_pin("runtime", "registered", false).unwrap();
+    assert!(
+        store
+            .catalogue_eligibility(&over, NOW)
+            .unwrap()
+            .is_eligible("runtime")
+    );
+}
+
 /// Reclamation failure paths keep the catalogue readable: an absent
 /// body is recorded `missing`, an unsafe path is held before deletion,
 /// and a delete error leaves the row retryable without losing metadata.
@@ -437,6 +503,20 @@ fn a_v2_catalogue_without_pin_state_upgrades_and_materializes_existing_pins() {
         .unwrap();
     assert!(!report.is_eligible("pinned"));
     assert!(report.is_eligible("free"));
+
+    // The reconstructed ledger dependency is the migrated row's own
+    // protection, so clearing the catalogue marker leaves it pinned.
+    store.set_pin_state("pinned", PinState::None).unwrap();
+    assert_eq!(
+        store.catalogue_record("pinned").unwrap().unwrap().pin_state,
+        PinState::Active
+    );
+    assert!(
+        !store
+            .catalogue_eligibility(&settings(Some(1000), Some(1)), NOW)
+            .unwrap()
+            .is_eligible("pinned")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1157,20 +1157,24 @@ impl SqliteStore {
                 params![body_id],
             )
             .map_err(map_err)?;
-        tx.commit().map_err(internal)?;
-        if updated == 1 {
-            Ok(MarkOutcome::Marked {
-                reason: if age_expired {
-                    "age_expired"
-                } else {
-                    "size_pressure"
-                },
-            })
-        } else {
-            // A pin landed between the read and the mark; the
-            // transaction refuses to claim the body.
-            Ok(MarkOutcome::Pinned)
+        if updated != 1 {
+            // The read above established `present` and unpinned inside
+            // this same immediate transaction on the single locked
+            // connection, so no other writer can interleave. A miss is
+            // an internal inconsistency, never a legitimate pin, and
+            // must not be reported as one.
+            return Err(StoreError::Internal {
+                detail: format!("body {body_id} changed while being marked for reclamation"),
+            });
         }
+        tx.commit().map_err(internal)?;
+        Ok(MarkOutcome::Marked {
+            reason: if age_expired {
+                "age_expired"
+            } else {
+                "size_pressure"
+            },
+        })
     }
 
     fn mark_reclaiming(&self, body_id: &str) -> Result<bool, StoreError> {
