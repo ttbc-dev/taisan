@@ -4357,6 +4357,18 @@ fn fire_due_intent(
         && let Some(work) = tx.work(&intent.work_id)?
         && usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit
     {
+        // Durably record the suppression — the intent stays Pending and
+        // the deferral on the Execution carries the recorded reason
+        // (visible through the capacity Query), the same mechanism the
+        // dispatch recovery_conflict path uses.
+        tx.apply(&Effect::RecordDeferral {
+            execution_id: execution.id.clone(),
+            reason: "equivalent_failure_suppressed".into(),
+            diagnostic: format!(
+                "automatic requeue refused: equivalent-failure streak {} reached the policy limit {}",
+                usage.equivalent_failure_streak, work.policy.equivalent_failure_limit
+            ),
+        })?;
         return Ok(FireOutcome::Suppressed(
             "equivalent_failure_suppressed".into(),
         ));

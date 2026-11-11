@@ -158,9 +158,9 @@ byte-identical command. If recovery is unavailable, preserve the
 | `status` | meaning | what you do |
 | --- | --- | --- |
 | `accepted` | Command/Query completed and its durable result is recorded | continue; acceptance ≠ completion |
-| `rejected` | domain refusal; exit 1 (or 5 for a source_unavailable rejection) | read `reason.code`; surface it; never rewrite preconditions |
-| `unknown` | fate undetermined | recover via `command-result` / identical replay only |
-| `error` | usage/config/store/source failure; nothing recorded as accepted | fix the environment or input; exit class 2/3/4/5/6 |
+| `rejected` | domain refusal; exit 1 (or 5 when `reason.code` is `source_unavailable` — the failure class wins over the rejection class) | read `reason.code`; surface it; never rewrite preconditions |
+| `unknown` | fate undetermined (exit 6) | recover via `command-result` / identical replay only |
+| `error` | usage/config/store/query-refusal failure; nothing recorded as accepted | fix the environment or input; exit 2 (usage), 3 (config), 4 (store), or 1 (`forbidden`) |
 
 ## Scope
 

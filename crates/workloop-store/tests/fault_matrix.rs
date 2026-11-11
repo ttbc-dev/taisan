@@ -713,6 +713,17 @@ fn lp_26_a_suppressed_intent_is_recorded_not_consumed() {
     let recorded = intent(&store, &intent_id);
     assert_eq!(recorded.state, RecoveryIntentState::Pending);
     assert_eq!(execution(&store, &e1).state, ExecutionState::Paused);
+    let deferrals = store.transact(|tx| tx.deferrals()).unwrap();
+    let deferral = deferrals
+        .iter()
+        .find(|d| d.execution_id == e1)
+        .expect("the suppression is durably recorded against the Execution");
+    assert_eq!(deferral.reason, "equivalent_failure_suppressed");
+    assert!(
+        deferral.diagnostic.contains("policy limit"),
+        "{}",
+        deferral.diagnostic
+    );
 }
 
 // ---- LP-27: timeout recovery sequence ordering ----

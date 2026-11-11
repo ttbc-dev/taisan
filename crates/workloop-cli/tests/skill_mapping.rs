@@ -1,9 +1,10 @@
 //! Agent-skill coverage for the shipped `skills/taisan/SKILL.md`
 //! (U7.3): the skill's documented operations are enumerated from the
 //! file itself, exercised through the same `taisan` binary an operator
-//! invokes directly, and asserted byte-for-byte on the
-//! status/diagnostic surface (envelope status, schema_version, command
-//! kind, rejection reason code, exit code). The skill-path arguments
+//! invokes directly, and asserted equal on the
+//! status/diagnostic surface (exit code, schema_version, status,
+//! command kind, rejection reason code — field-level comparison).
+//! The skill-path arguments
 //! are parsed out of SKILL.md's fenced blocks with placeholder
 //! substitution; the direct-path arguments are built literally by the
 //! test — two independent constructions of the same invocation.
@@ -420,11 +421,12 @@ fn as_refs(args: &[String]) -> Vec<&str> {
 /// The status/diagnostic surface of an envelope: what both paths must
 /// agree on. Volatile identities (command id, work/execution ids,
 /// timestamps) are intentionally excluded.
-fn status_surface(output: &Output) -> (i32, String, String, String) {
+fn status_surface(output: &Output) -> (i32, String, String, String, String) {
     let code = output.status.code().unwrap_or(-1);
     let env = envelope(output);
     (
         code,
+        env["schema_version"].as_str().unwrap_or("").to_string(),
         env["status"].as_str().unwrap_or("").to_string(),
         env["command"]["kind"].as_str().unwrap_or("").to_string(),
         env["reason"]["code"].as_str().unwrap_or("").to_string(),
@@ -457,7 +459,7 @@ fn assert_paths_agree(tag: &str, scenario: fn(&Path, Path_) -> Output) {
         skill_surface
     );
     assert_eq!(
-        skill_surface.1, "accepted",
+        skill_surface.2, "accepted",
         "{tag}: these scenarios are seeded to be accepted; skill-path envelope: {:?}",
         skill_surface
     );
