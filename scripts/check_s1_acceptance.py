@@ -174,10 +174,9 @@ def main():
                 for i, check in enumerate(checks):
                     if not isinstance(check, dict):
                         fail(f'{cid}: remote_receipts.checks[{i}] must be an object')
-                    if not isinstance(check.get('name'), str) or not check['name'].strip():
-                        fail(f'{cid}: remote_receipts.checks[{i}].name missing or empty')
-                    if check.get('id') is None and not isinstance(check.get('conclusion'), str):
-                        fail(f'{cid}: remote_receipts.checks[{i}] carries neither id nor conclusion — unverifiable')
+                    for key in ('name', 'id', 'conclusion'):
+                        if not isinstance(check.get(key), str) or not check[key].strip():
+                            fail(f'{cid}: remote_receipts.checks[{i}].{key} missing or empty')
         resolve(claim, 'stop_proof', 'stop_proof')
 
     prose_and_table = '\n'.join(re.findall(r'^\|.*$', text, re.MULTILINE))

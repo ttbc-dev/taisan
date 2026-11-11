@@ -45,7 +45,7 @@ skipped for that row, never substituted. Suite runner:
 | HC-CAP-03 approval/ready explicit | covered — `approval_and_ready_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
 | HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
-| HC-READ-01 typed reads | incomplete — read-model ops not in vocabulary; fixture side (spike not run) | incomplete — same | incomplete — same | incomplete — spike not run |
+| HC-READ-01 typed reads | incomplete — typed read-model operations absent from the contract vocabulary | incomplete — same | incomplete — same | incomplete — spike not run |
 | HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete — spike not run |
 
 HC-CAP-02 measures a fixture's own explicit-unsupported behavior; a
