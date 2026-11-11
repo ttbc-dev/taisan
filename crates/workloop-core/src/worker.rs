@@ -81,6 +81,24 @@ pub struct WorkerRequest {
 }
 
 impl WorkerRequest {
+    /// Build the export for a `start` request. Infallible: the only
+    /// failure mode of [`WorkerRequest::build`] is a `resume` kind,
+    /// which this constructor cannot produce.
+    pub fn start(
+        invocation_id: InvocationId,
+        profile_id: impl Into<String>,
+        workspace_root: impl Into<String>,
+    ) -> Self {
+        Self {
+            format_version: WORKER_REQUEST_FORMAT_VERSION.into(),
+            kind: WorkerRequestKind::Start,
+            request_id: export_request_id(&invocation_id),
+            invocation_id,
+            profile_id: profile_id.into(),
+            workspace_root: workspace_root.into(),
+        }
+    }
+
     /// Build the export for one Invocation. A `resume` kind is refused
     /// with [`Unsupported`]; nothing is built and nothing may launch.
     pub fn build(
@@ -90,14 +108,7 @@ impl WorkerRequest {
         workspace_root: impl Into<String>,
     ) -> Result<Self, Unsupported> {
         match kind {
-            WorkerRequestKind::Start => Ok(Self {
-                format_version: WORKER_REQUEST_FORMAT_VERSION.into(),
-                kind,
-                request_id: export_request_id(&invocation_id),
-                invocation_id,
-                profile_id: profile_id.into(),
-                workspace_root: workspace_root.into(),
-            }),
+            WorkerRequestKind::Start => Ok(Self::start(invocation_id, profile_id, workspace_root)),
             WorkerRequestKind::Resume => Err(Unsupported {
                 reason: "resume is not supported in v0.1; a continuation is a new Invocation"
                     .into(),
@@ -184,6 +195,14 @@ mod tests {
             request.digest(),
             request.canonical_bytes().len().to_string()
         );
+    }
+
+    #[test]
+    fn start_is_infallible_and_matches_build_start() {
+        let a = WorkerRequest::start(invocation_id("9"), "p", "/ws");
+        let b = WorkerRequest::build(invocation_id("9"), WorkerRequestKind::Start, "p", "/ws")
+            .expect("build start");
+        assert_eq!(a, b);
     }
 
     #[test]

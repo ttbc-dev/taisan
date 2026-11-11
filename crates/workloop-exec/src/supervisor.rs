@@ -22,7 +22,6 @@ use workloop_core::ports::{
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::{
     DEFAULT_ISOLATION_PROFILE_ID, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
-    WorkerRequestKind,
 };
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
@@ -792,17 +791,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
             evidence_refs: vec![],
         };
         let export_workspace = self.workspace_of(&request.work_id);
-        let export = WorkerRequest::build(
+        let export = WorkerRequest::start(
             invocation.id.clone(),
-            WorkerRequestKind::Start,
             self.isolation_profile_id.clone(),
             export_workspace.to_string_lossy().into_owned(),
-        )
-        .map_err(|e| {
-            ExecError::Store(StoreError::Internal {
-                detail: format!("worker request refused: {e}"),
-            })
-        })?;
+        );
         let export_record = WorkerRequestExport {
             invocation_id: invocation.id.clone(),
             request_id: export.request_id.clone(),

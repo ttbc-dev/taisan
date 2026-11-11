@@ -205,8 +205,11 @@ fn a_duplicate_start_for_one_invocation_spawns_exactly_one_writer() {
     let sup = supervisor(port.clone(), root, None);
     let (_w, eid) = submit_and_admit(&store, "k-shim-2");
     sup.consume_requests(&store, NOW).unwrap();
+    // Replay: a duplicated delivery of the same start plus full
+    // supervision passes never spawn a second writer.
     sup.consume_requests(&store, NOW).unwrap();
-    sup.consume_requests(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
     assert_eq!(
         port.spawn_calls(),
         1,
@@ -264,12 +267,20 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     let sup = supervisor(port.clone(), root, None);
     let (_w, eid) = submit_and_admit(&store, "k-shim-4");
     sup.consume_requests(&store, NOW).unwrap();
-    sup.consume_requests(&store, NOW).unwrap();
-    sup.consume_requests(&store, NOW).unwrap();
+    // The supervision pass that owns the lost-start window: it must
+    // reconcile through the recorded export/invocation, never spawn.
+    sup.poll_invocations(&store, NOW).unwrap();
+    sup.run_once(&store, NOW + 1).unwrap();
     assert_eq!(
         port.spawn_calls(),
         1,
         "the lost start response never produces a second writer"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Uncertain,
+        "a lost start response keeps the Execution uncertain, not restarted"
     );
     let invocation = only_invocation(&store, &eid);
     assert!(invocation.process_identity.is_none());
