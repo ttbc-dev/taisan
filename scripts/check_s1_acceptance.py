@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Check docs/s1/acceptance-report.md against the S1 checklist.
+
+Fail-closed assertions for the U8.5 acceptance report:
+
+1. Every S1 criterion × variant row of the checklist appears exactly
+   once, with a status cell that is `valid`, `absent` or `invalid`;
+   absent/invalid cells carry a reason; valid cells reference a claim.
+2. Every referenced claim exists, is complete (revision SHA, config
+   digest, Work/Execution/Invocation/action identities, remote receipts
+   PR/head/check/review, stop proof), and any null field is paired with
+   an explicit reason — never silently absent.
+3. The report contains no U6 (alternate admission) or U9 (host
+   exchangeability) evidence rows or claims; references to them appear
+   only in the prose boundary notes, never in the table or the claims.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+REPORT = ROOT / 'docs/s1/acceptance-report.md'
+
+EXPECTED_ROWS = (
+    [f'S-{i}' for i in range(1, 9)]
+    + ['S-3a']
+    + [f'A-{i}' for i in range(1, 5)]
+    + [f'R-{i}' for i in range(1, 10)]
+)
+
+ROW = re.compile(r'^\|\s*(S-\d+a?|A-\d+|R-\d+)\s*\|([^|]+)\|([^|]+)\|([^|]+)\|\s*$', re.MULTILINE)
+CLAIM_HEADING = re.compile(r'^###\s*(C-\d+)\s*\(([^,]+),\s*([a-z]+)\)\s*$', re.MULTILINE)
+VALID = re.compile(r'^valid\s*[—-]\s*(C-\d+)\s*$')
+MARKER = re.compile(r'^(absent|invalid)\s*[—-]\s*(.{10,})$', re.DOTALL)
+
+
+def fail(msg):
+    print(f'check_s1_acceptance: FAIL: {msg}', file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    text = REPORT.read_text()
+
+    rows = {}
+    for match in ROW.finditer(text):
+        row_id, criterion, variant, result = (g.strip() for g in match.groups())
+        rows[row_id] = (criterion, variant, result)
+    for row_id in EXPECTED_ROWS:
+        if row_id not in rows:
+            fail(f'missing S1 row {row_id}')
+    extra = sorted(set(rows) - set(EXPECTED_ROWS))
+    if extra:
+        fail(f'unexpected rows in the report table: {extra}')
+
+    for row_id, (criterion, variant, result) in rows.items():
+        if row_id.startswith('S') and variant != 'success':
+            fail(f'{row_id}: variant {variant!r} != success')
+        if row_id.startswith('A') and variant != 'attention':
+            fail(f'{row_id}: variant {variant!r} != attention')
+        if row_id.startswith('R') and variant != 'recovery':
+            fail(f'{row_id}: variant {variant!r} != recovery')
+        valid = VALID.match(result)
+        if valid:
+            continue
+        marker = MARKER.match(result)
+        if not marker:
+            fail(f'{row_id}: result cell must be `valid — C-nn` or `absent|invalid — <reason ≥ 10 chars>`, got {result!r}')
+
+    headings = {}
+    for match in CLAIM_HEADING.finditer(text):
+        claim_id, _criterion, variant = match.groups()
+        headings[claim_id] = variant
+
+    referenced = set()
+    for row_id, (_c, _v, result) in rows.items():
+        valid = VALID.match(result)
+        if valid:
+            referenced.add(valid.group(1))
+    for claim_id in sorted(referenced):
+        if claim_id not in headings:
+            fail(f'{row_id}: referenced claim {claim_id} has no claim block')
+    for claim_id in sorted(set(headings) - referenced):
+        fail(f'claim {claim_id} is never referenced by a valid cell')
+
+    fences = re.findall(r'###\s*C-\d+[^\n]*\n```json\n(.*?)```', text, re.DOTALL)
+    if len(fences) != len(headings):
+        fail(f'expected {len(headings)} claim json fences, found {len(fences)}')
+    claims = [json.loads(f) for f in fences]
+
+    for claim in claims:
+        cid = claim.get('id', '?')
+        for key in ('id', 'criterion', 'variant', 'status', 'source', 'revision', 'config_digest'):
+            if not isinstance(claim.get(key), str) or not claim[key].strip():
+                fail(f'{cid}: missing or empty required key {key!r}')
+        row = rows.get(claim['criterion'])
+        if not row:
+            fail(f'{cid}: criterion {claim["criterion"]!r} not in the report table')
+        if row[1] != claim['variant']:
+            fail(f'{cid}: variant {claim["variant"]!r} does not match the row variant {row[1]!r}')
+        if claim['status'] != 'valid':
+            fail(f'{cid}: claims exist only for valid cells, status {claim["status"]!r}')
+        if not re.fullmatch(r'[0-9a-f]{7,40}', claim['revision']):
+            fail(f'{cid}: revision {claim["revision"]!r} is not a commit SHA')
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', claim['config_digest']):
+            fail(f'{cid}: config_digest {claim["config_digest"]!r} is not sha256:<64 hex>')
+        src = ROOT / claim['source'].split('#')[0]
+        if not src.exists():
+            fail(f'{cid}: source {claim["source"]!r} does not exist in the repo')
+
+        ids = claim.get('identities') or {}
+        if not isinstance(ids.get('work'), str) or not ids['work'].strip():
+            fail(f'{cid}: identities.work must be non-empty')
+        for key in ('executions', 'invocations', 'actions', 'commands'):
+            if not isinstance(ids.get(key), list):
+                fail(f'{cid}: identities.{key} must be an array')
+        if not ids['executions']:
+            fail(f'{cid}: identities.executions must be non-empty')
+
+        receipts = claim.get('remote_receipts') or {}
+        for key in ('pr', 'head', 'checks', 'review'):
+            if key not in receipts:
+                fail(f'{cid}: remote_receipts.{key} missing entirely (absence must be explicit null + reason)')
+        if isinstance(receipts.get('pr'), str) and '#' not in receipts['pr']:
+            fail(f'{cid}: remote_receipts.pr {receipts["pr"]!r} is not a PR reference')
+        elif receipts.get('pr') is None:
+            fail(f'{cid}: remote_receipts.pr may not be null (every valid claim has a PR)')
+
+        def resolve(container, key, label):
+            value = container.get(key)
+            if value is not None:
+                return value
+            reason = container.get(f'{key}_reason')
+            if not isinstance(reason, str) or len(reason.strip()) < 20:
+                fail(f'{cid}: {label} is null without a reason of ≥ 20 chars')
+            return None
+
+        resolve(receipts, 'head', 'remote_receipts.head')
+        resolve(receipts, 'review', 'remote_receipts.review')
+        checks = resolve(receipts, 'checks', 'remote_receipts.checks')
+        if checks is not None:
+            if not isinstance(checks, list):
+                fail(f'{cid}: remote_receipts.checks must be an array or null with checks_reason')
+            if not checks:
+                reason = receipts.get('checks_reason')
+                if not isinstance(reason, str) or len(reason.strip()) < 20:
+                    fail(f'{cid}: empty remote_receipts.checks without a checks_reason of ≥ 20 chars')
+        resolve(claim, 'stop_proof', 'stop_proof')
+
+    prose_and_table = '\n'.join(re.findall(r'^\|.*$', text, re.MULTILINE))
+    claims_text = '\n'.join(fences)
+    for match in re.finditer(r'\bU[69]\b', prose_and_table):
+        fail('the boundary table contains a U6/U9 reference')
+    for match in re.finditer(r'\bU[69]\b', claims_text):
+        fail('a claim contains a U6/U9 reference (alternate admission / host proof are out of scope)')
+
+    valid = sum(1 for _r in referenced)
+    print(f'check_s1_acceptance: all assertions passed '
+          f'({len(rows)} S1 rows, {len(claims)} valid claims, {len(rows) - valid} explicitly absent/invalid)')
+
+
+if __name__ == '__main__':
+    main()
