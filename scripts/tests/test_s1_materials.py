@@ -166,12 +166,49 @@ class S1MaterialsTest(unittest.TestCase):
         self.assertEqual(
             prerequisites.validate_rehearsals(ROOT, self.install_spec), []
         )
-        broken = copy.deepcopy(self.install_spec)
-        broken['implementation_status']['retained_rehearsals'][0]['adapter'] = (
-            'not-the-recorded-adapter'
-        )
-        errors = prerequisites.validate_rehearsals(ROOT, broken)
-        self.assertTrue(any('adapter' in error for error in errors), errors)
+        for key, value in (
+            ('adapter', 'not-the-recorded-adapter'),
+            ('credential_reference', 'defaults'),
+            ('credential_reference', 'not-the-recorded-credential'),
+            ('reviewer_actor', 'not-the-recorded-reviewer'),
+        ):
+            with self.subTest(key=key, value=value):
+                broken = copy.deepcopy(self.install_spec)
+                broken['implementation_status']['retained_rehearsals'][0][key] = value
+                errors = prerequisites.validate_rehearsals(ROOT, broken)
+                self.assertTrue(
+                    any(key in error for error in errors), (key, value, errors)
+                )
+
+    def test_fixture_content_digest_is_computed_and_recorded(self):
+        report = prerequisites.verify(ROOT)
+        computed = prerequisites.fixture_content_digest(ROOT)
+        self.assertEqual(report['fixture_content_digest'], computed)
+        evidence = (ROOT / 'docs' / 'evidence' / 'u8.1.md').read_text()
+        self.assertEqual(evidence.count(computed), 2, evidence[:200])
+        self.assertEqual(report['errors'], [])
+
+    def test_stale_fixture_content_digest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(FIXTURE_DIR, root / 'fixtures' / 's1')
+            shutil.copytree(ROOT / 'docs' / 's1', root / 'docs' / 's1')
+            shutil.copytree(
+                ROOT / 'docs' / 'evidence', root / 'docs' / 'evidence'
+            )
+            seed_path = root / 'fixtures' / 's1' / 'seeded-issue.json'
+            seed = json.loads(seed_path.read_text())
+            seed['body_template'] += ' '
+            seed_path.write_text(json.dumps(seed, indent=2) + '\n')
+            report = prerequisites.verify(root)
+            self.assertEqual(report['status'], 'failed')
+            self.assertTrue(
+                any(
+                    'fixture content digest' in error and 'does not match' in error
+                    for error in report['errors']
+                ),
+                report['errors'],
+            )
 
     def test_all_three_variants_are_defined(self):
         variants = set(prerequisites.VARIANTS)
@@ -257,14 +294,53 @@ class S1MaterialsTest(unittest.TestCase):
         self.assertTrue(any('configuration_identity' in error for error in missing_config))
 
     def test_every_checklist_entry_has_revision_config_and_identity_fields(self):
+        expected = prerequisites.expected_revision_config(self.install_spec)
+        revisions = self.install_spec['revisions']
+        self.assertEqual(expected['taisan_core_revision'], revisions['taisan_core'])
+        self.assertEqual(expected['taisan_cli_revision'], revisions['taisan_cli'])
+        self.assertEqual(
+            expected['github_adapter_revision'], revisions['github_adapter']
+        )
+        self.assertEqual(
+            expected['worker_adapter_revision'], revisions['worker_adapter']
+        )
+        self.assertIn('config_sha256=', expected['configuration_identity'])
         for row in self.checklist['rows']:
             self.assertIsInstance(row['revision_config'], dict, row['id'])
-            for key in prerequisites.REVISION_KEYS:
-                self.assertTrue(row['revision_config'].get(key), f"{row['id']} {key}")
+            self.assertEqual(row['revision_config'], expected, row['id'])
+            for key in prerequisites.SHA_REVISION_KEYS:
+                self.assertRegex(
+                    row['revision_config'][key], r'^[0-9a-f]{40}$', row['id']
+                )
             for key in prerequisites.IDENTITY_KEYS:
                 self.assertIn(key, row['identities'], row['id'])
                 self.assertIsInstance(row['identities'][key], list, row['id'])
+        self.assertEqual(prerequisites.validate_checklist(self.checklist), [])
 
+        broken = copy.deepcopy(self.checklist)
+        broken['rows'][0]['revision_config']['taisan_core_revision'] = (
+            'exact SHA from installation-spec.revisions.taisan_core'
+        )
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(
+            any('taisan_core_revision' in error for error in errors), errors
+        )
+        broken = copy.deepcopy(self.checklist)
+        broken['rows'][0]['revision_config']['configuration_identity'] = (
+            'installation-spec.configuration_identity'
+        )
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(
+            any('configuration_identity' in error for error in errors), errors
+        )
+        broken = copy.deepcopy(self.checklist)
+        broken['rows'][0]['revision_config']['taisan_core_revision'] = 'a' * 40
+        errors = prerequisites.validate_checklist_revision_config(
+            broken, self.install_spec
+        )
+        self.assertTrue(
+            any('revision_config' in error for error in errors), errors
+        )
         broken = copy.deepcopy(self.checklist)
         broken['rows'][0]['identities'].pop('action')
         errors = prerequisites.validate_checklist(broken)

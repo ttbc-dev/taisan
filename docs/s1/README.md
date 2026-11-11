@@ -27,7 +27,7 @@ checkable fields:
 | --- | --- |
 | [`fixtures/s1/installation-spec.json`](../../fixtures/s1/installation-spec.json) | Sole-repository allowlist, credential reference (never a value), reviewer and Worker runtime identities, pinned material revision and configuration identity |
 | [`fixtures/s1/seeded-issue.json`](../../fixtures/s1/seeded-issue.json) | Deterministic title/body templates, the empty label set and label policy, verification argv, and the expected outcome for each `success`, `Attention`, and `recovery` variant |
-| [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json) | Every S1 criterion row with its variant assignment, revision/config reference, Work/Execution/Invocation/action identities, and required evidence |
+| [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json) | Every S1 criterion row with its variant assignment, exact revision/config values, Work/Execution/Invocation/action identities, and required evidence |
 
 `python3 scripts/s1/check-prerequisites.py` validates the install-spec
 fields (allowlist, credential reference, reviewer identity, revision,
@@ -38,10 +38,14 @@ read-only host/store interaction can resolve are carried as explicit
 unresolved references: the shipped preparation fixture reports
 `status: prepared` with `installation_ready: false`, while a fully
 resolved install spec reports `status: ok`. Neither result is execution
-permission, and neither is live evidence. The retained scenario-bridge
-rehearsals (`docs/evidence/u8.2.md`, `u8.3.md`) are recorded separately
-from the S1 target profile; their adapter, reviewer, credential-reference
-and `host_write` values are cross-checked against those documents.
+permission, and neither is live evidence. The preflight also recomputes
+the sha256 fixture content digest and fails closed when it no longer
+matches the digest recorded in `docs/evidence/u8.1.md`, so editing a
+fixture cannot leave the evidence digest silently stale. The retained
+scenario-bridge rehearsals (`docs/evidence/u8.2.md`, `u8.3.md`) are
+recorded separately from the S1 target profile; their adapter, reviewer,
+credential-reference and `host_write` values are cross-checked in their
+exact recorded forms against those documents.
 
 ## Recorded decisions (owner, 2026-11-09)
 

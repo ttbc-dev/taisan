@@ -10,7 +10,9 @@ runs the live scenario.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 from pathlib import Path
 
 S1_REPOSITORY = "shimpeiws/coding-worker-smoke"
@@ -61,6 +63,16 @@ REVISION_KEYS = (
     "worker_adapter_revision",
     "configuration_identity",
     "contract_version",
+)
+SHA_REVISION_KEYS = (
+    "taisan_core_revision",
+    "taisan_cli_revision",
+    "github_adapter_revision",
+    "worker_adapter_revision",
+)
+EVIDENCE_DOCUMENT = "docs/evidence/u8.1.md"
+DIGEST_PATTERN = re.compile(
+    r"fixture content digest\s+`?([0-9a-f]{64})`?", re.IGNORECASE
 )
 
 
@@ -163,6 +175,111 @@ def install_spec_unresolved(spec: dict) -> list[str]:
     return unresolved
 
 
+def fixture_content_digest(root: Path) -> str:
+    """Return the sha256 over the fixture files in lexical path order."""
+    digest = hashlib.sha256()
+    for relative in sorted(FIXTURE_FILES.values()):
+        digest.update((root / relative).read_bytes())
+    return digest.hexdigest()
+
+
+def configuration_identity_label(spec: dict) -> str:
+    """Return the exact configuration identity recorded by the checklist.
+
+    The label binds the concrete installation fields plus a canonical
+    digest of the full configuration object, so a capability, check, or
+    budget change cannot leave a checklist row pointing at stale config.
+    """
+    config = spec.get("configuration_identity")
+    if not isinstance(config, dict):
+        return ""
+    store = config.get("store_id")
+    if isinstance(store, dict):
+        store_label = f"unresolved:{store.get('resolution', '')}"
+    else:
+        store_label = str(store)
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    config_digest = hashlib.sha256(canonical.encode()).hexdigest()
+    return (
+        f"{config.get('host_instance')}/{config.get('repository')} "
+        f"adapter={config.get('adapter')} "
+        f"contract={config.get('contract_version')} "
+        f"store={store_label} config_sha256={config_digest}"
+    )
+
+
+def expected_revision_config(spec: dict) -> dict:
+    """Return the exact revision/config values every checklist row must carry."""
+    revisions = spec.get("revisions")
+    revisions = revisions if isinstance(revisions, dict) else {}
+    config = spec.get("configuration_identity")
+    config = config if isinstance(config, dict) else {}
+    return {
+        "materials_revision": revisions.get("materials"),
+        "taisan_core_revision": revisions.get("taisan_core"),
+        "taisan_cli_revision": revisions.get("taisan_cli"),
+        "github_adapter_revision": revisions.get("github_adapter"),
+        "worker_adapter_revision": revisions.get("worker_adapter"),
+        "configuration_identity": configuration_identity_label(spec),
+        "contract_version": config.get("contract_version"),
+    }
+
+
+def validate_checklist_revision_config(checklist: dict, spec: dict) -> list[str]:
+    """Check every checklist row against the install-spec revision/config."""
+    errors: list[str] = []
+    expected = expected_revision_config(spec)
+    rows = checklist.get("rows") if isinstance(checklist, dict) else None
+    if not isinstance(rows, list):
+        return errors
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        if row.get("revision_config") != expected:
+            errors.append(
+                f"rows[{index}].revision_config: does not match the exact "
+                "installation-spec revision/config"
+            )
+    return errors
+
+
+def _records_rehearsal_value(text: str, key: str, value: str) -> bool:
+    """Return true only when the evidence records the exact value for *key*.
+
+    Plain substring matching is not sufficient: ``default`` occurs inside
+    unrelated prose such as ``defaults``. Each key therefore requires its
+    recorded form (a keyed assignment or backticked token) rather than an
+    arbitrary occurrence anywhere in the document.
+    """
+    token = re.escape(value)
+    if key == "run_tag":
+        pattern = rf"`{token}`"
+    elif key == "credential_reference":
+        pattern = rf"credential[ _]ref(?:erence)?\s*[:=]?\s*`{token}`"
+    elif key == "adapter":
+        pattern = rf"adapter\s*[:=]?\s*`?{token}`?(?![A-Za-z0-9_.-])"
+    else:
+        pattern = rf"(?<![A-Za-z0-9_.-]){token}(?![A-Za-z0-9_.-])"
+    return re.search(pattern, text) is not None
+
+
+def validate_fixture_digest(root: Path) -> tuple[str, list[str]]:
+    """Compute the fixture digest and check it against the evidence record."""
+    digest = fixture_content_digest(root)
+    document = root / EVIDENCE_DOCUMENT
+    if not document.is_file():
+        return digest, []
+    recorded = set(DIGEST_PATTERN.findall(document.read_text()))
+    if not recorded:
+        return digest, [f"{EVIDENCE_DOCUMENT}: missing fixture content digest"]
+    if recorded != {digest}:
+        return digest, [
+            f"{EVIDENCE_DOCUMENT}: recorded fixture content digest "
+            f"{', '.join(sorted(recorded))} does not match computed {digest}"
+        ]
+    return digest, []
+
+
 def validate_rehearsals(root: Path, spec: dict) -> list[str]:
     """Cross-check the recorded rehearsal profile against its evidence files."""
     errors: list[str] = []
@@ -205,9 +322,13 @@ def validate_rehearsals(root: Path, spec: dict) -> list[str]:
         text = document.read_text()
         for key in ("run_tag", "adapter", "reviewer_actor", "credential_reference"):
             value = rehearsal.get(key)
-            if isinstance(value, str) and value and value not in text:
+            if (
+                isinstance(value, str)
+                and value
+                and not _records_rehearsal_value(text, key, value)
+            ):
                 errors.append(
-                    f"{prefix}.{key}: {value!r} is not recorded in {evidence}"
+                    f"{prefix}.{key}: {value!r} is not recorded exactly in {evidence}"
                 )
         if (
             rehearsal.get("repository_host_write") is True
@@ -528,8 +649,40 @@ def validate_checklist(checklist: dict) -> list[str]:
             errors.append(f"{prefix}.revision_config: required")
         else:
             for key in REVISION_KEYS:
-                if not _nonempty(revision_config.get(key)):
+                value = revision_config.get(key)
+                if not _nonempty(value):
                     errors.append(f"{prefix}.revision_config.{key}: required")
+                    continue
+                if key in SHA_REVISION_KEYS:
+                    if not isinstance(value, str) or not re.fullmatch(
+                        r"[0-9a-f]{40}", value
+                    ):
+                        errors.append(
+                            f"{prefix}.revision_config.{key}: expected an exact "
+                            f"40-hex commit SHA, got {value!r}"
+                        )
+                elif key == "configuration_identity":
+                    lowered = str(value).lower()
+                    if "installation-spec" in lowered or "exact sha" in lowered:
+                        errors.append(
+                            f"{prefix}.revision_config.{key}: expected the exact "
+                            f"configuration identity, not a reference ({value!r})"
+                        )
+                elif key == "contract_version":
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                    ):
+                        errors.append(
+                            f"{prefix}.revision_config.{key}: expected a positive "
+                            f"integer, got {value!r}"
+                        )
+                elif not isinstance(value, str):
+                    errors.append(
+                        f"{prefix}.revision_config.{key}: expected a string, "
+                        f"got {value!r}"
+                    )
         identities = row.get("identities")
         if not isinstance(identities, dict):
             errors.append(f"{prefix}.identities: required")
@@ -603,6 +756,14 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         if not path.is_file():
             errors.append(f"{name}: document missing at {relative}")
 
+    fixture_digest: str | None = None
+    if all(path.is_file() for path in paths.values()):
+        try:
+            fixture_digest, digest_errors = validate_fixture_digest(root)
+            errors.extend(digest_errors)
+        except OSError as exc:
+            errors.append(f"fixture-content-digest: unreadable ({exc})")
+
     try:
         spec_path = install_spec if install_spec is not None else paths["installation-spec"]
         if not spec_path.is_file():
@@ -629,6 +790,11 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         errors.extend(
             f"evidence-checklist: {item}" for item in validate_checklist(checklist)
         )
+        if resolved_spec and install_spec is None:
+            errors.extend(
+                f"evidence-checklist: {item}"
+                for item in validate_checklist_revision_config(checklist, spec)
+            )
         if all((root / relative).is_file() for relative in DOC_FILES.values()):
             errors.extend(validate_markdown(root, checklist))
     except CheckFailure as exc:
@@ -641,6 +807,7 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         "installation_ready": status == "ok",
         "unresolved_identities": unresolved,
         "live_execution": "not-run (materials preflight only)",
+        "fixture_content_digest": fixture_digest,
         "checked_files": checked,
         "errors": errors,
     }
@@ -668,6 +835,7 @@ def main(argv: list[str] | None = None) -> int:
             "installation_ready": False,
             "unresolved_identities": [],
             "live_execution": "not-run (materials preflight only)",
+            "fixture_content_digest": None,
             "checked_files": [],
             "errors": [str(exc)],
         }
