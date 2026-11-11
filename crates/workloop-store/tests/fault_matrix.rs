@@ -1,13 +1,17 @@
-//! Fault-injection acceptance matrix for the execution loop's
-//! automatic recovery (U5.7): every case LP-19..LP-27 from
-//! `docs/execution-loop.md` "Planned verification suite" runs here
-//! against a real SqliteStore, asserts the exact resulting state and
-//! evidence records, and exercises the automatic recovery mechanism —
-//! recovery-intent firing (loop phase 6), the deadline gate, the
-//! observation-driven transition path, and Attention derivation. No
-//! case substitutes a manual `retry` Command for a required automatic
-//! branch; fixtures seed the crash-after-scheduling durable state
-//! through the store, matching the established contract-test pattern.
+//! Acceptance matrix for the execution loop's automatic recovery
+//! (U5.7): every case LP-19..LP-27 from `docs/execution-loop.md`
+//! "Planned verification suite" runs here against a real SqliteStore,
+//! asserts the exact resulting state and evidence records, and
+//! exercises the automatic recovery mechanism — recovery-intent firing
+//! (loop phase 6), the observation-driven transition path, and
+//! Attention derivation. No case substitutes a manual `retry` Command
+//! for a required automatic branch. Crash scenarios are exercised
+//! from their durable post-crash state (an intent persisted before the
+//! crash boundary, a stopping Execution, a pending host action),
+//! seeded through the store — the same prior-history pattern prior
+//! slices established; no case kills a process mid-phase. The dispatch
+//! deadline gate itself is covered by U5.3's
+//! `run_loop::tests::past_the_deadline_the_dispatch_pass_emits_no_new_execution`.
 //!
 //! Claims boundary: fixture/contract results only. No live host,
 //! Worker, or E2E scenario was run; live claims require separately
