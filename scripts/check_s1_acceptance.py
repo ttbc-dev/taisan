@@ -184,7 +184,10 @@ def main():
                     for key in ('name', 'id', 'conclusion'):
                         if not isinstance(check.get(key), str) or not check[key].strip():
                             fail(f'{cid}: remote_receipts.checks[{i}].{key} missing or empty')
-        resolve(claim, 'stop_proof', 'stop_proof')
+        stop_proof = resolve(claim, 'stop_proof', 'stop_proof')
+        if stop_proof is not None:
+            if not isinstance(stop_proof, str) or len(stop_proof.strip()) < 20:
+                fail(f'{cid}: stop_proof must be a non-empty string of ≥ 20 chars when present')
 
     prose_and_table = '\n'.join(re.findall(r'^\|.*$', text, re.MULTILINE))
     claims_text = '\n'.join(fences)

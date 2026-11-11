@@ -30,7 +30,7 @@ weaker there; this is recorded here rather than papered over.
 | S-5 | real checks and a real review (≥1 finding) on H1 | success | invalid — H1 evidence is real (checks success; review `5836107428`, 2 occurrences) but the reviewer identity was `github-actions[bot]`, not the dedicated S1 reviewer GitHub App the installation spec requires; claim identity fails linkage |
 | S-6 | judge(expected_head=H1) → fix → I2 → republish H2 | success | valid — C-05 |
 | S-7 | reassessment on H2 (verification + checks + clean fresh review) | success | valid — C-06 |
-| S-8 | `work` records `succeeded` | success | valid — C-07 |
+| S-8 | `work` records `succeeded` | success | invalid — u8.2's Outcome froze 8 evidence refs (spec, target, both artifacts, all three applied actions, clean round); no writer-stop record is among them, and the criterion requires writer-stop evidence in the Outcome. Invocation exits (inv-2/inv-3) are recorded as observations but are not frozen into the Outcome — linkage fails |
 | A-1 | finding → `paused(human_judgment)` + Attention | attention | valid — C-08 |
 | A-2 | Attention visible until acknowledged; ack is presentation-only | attention | valid — C-09 |
 | A-3 | judge → release → requeue; budgets unchanged | attention | valid — C-10 |
@@ -234,36 +234,6 @@ only with a reason.
     "review": {"id": "5836140631", "author": "github-actions[bot]", "state": "COMMENTED", "occurrences": 0}
   },
   "stop_proof": "inv-3 Exited with verified stop (H2 bound to the fixed artifact; reassessment on H2 recorded)"
-}
-```
-
-### C-07 (S-8, success)
-```json
-{
-  "id": "C-07",
-  "criterion": "S-8",
-  "variant": "success",
-  "status": "valid",
-  "source": "docs/evidence/u8.2.md#acceptance-checklist-mapping",
-  "revision": "8009e8b",
-  "config_digest": "sha256:10616c4cdb385b09dd1ea4d8c93b75ab9f9338abe4140136e2c539b4e0b52828",
-  "identities": {
-    "work": "w-1",
-    "executions": ["e-2"],
-    "invocations": ["inv-2", "inv-3"],
-    "actions": ["act-19f925f6", "act-57ebdebe", "act-f73dd542"],
-    "commands": ["cmd-1", "cmd-3", "cmd-4", "cmd-5"]
-  },
-  "remote_receipts": {
-    "pr": "shimpeiws/coding-worker-smoke#14",
-    "head": "f54c97bd01995e9606faf4d29c0536d9a7a5b4cd",
-    "checks": [
-      {"name": "verify", "id": "129599695802", "conclusion": "success"},
-      {"name": "review", "id": "129599695262", "conclusion": "success"}
-    ],
-    "review": {"id": "5836140631", "author": "github-actions[bot]", "state": "COMMENTED", "occurrences": 0}
-  },
-  "stop_proof": "inv-2 and inv-3 both Exited with verified stop; the terminal Outcome freezes the evidence refs including both writer-stop records"
 }
 ```
 

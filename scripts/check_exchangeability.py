@@ -128,8 +128,9 @@ def main():
                 raise AssertionError(f'binding row for `{op}` names {row_id}, absent from the coverage matrix')
             if all(c.lower().startswith('covered') for c in candidate[:2]):
                 backed.append(row_id)
-        if not backed:
-            raise AssertionError(f'claimed operation `{op}` has no fixture-`covered` backing row in {bound}')
+        if len(backed) != len(bound):
+            raise AssertionError(f'claimed operation `{op}` bound to {bound}, but not all are fixture-`covered` '
+                                 f'on both full-baseline fixtures: {backed}')
     for marker in ('fixture-level exchangeability', 'only'):
         if marker not in claim:
             raise AssertionError(f'exchangeability claim must stay fixture-scoped ({marker!r} missing)')
