@@ -1050,7 +1050,7 @@ fn run(cli: Cli) -> i32 {
             };
             match command {
                 RetentionCommands::Report => {
-                    match store.retention_report(&category_settings, now()) {
+                    match store.retention_report(&category_settings, &state_root, now()) {
                         Ok(report) => finish(
                             "retention_report",
                             serde_json::to_value(report).unwrap_or(serde_json::json!({})),
@@ -1088,26 +1088,33 @@ fn run(cli: Cli) -> i32 {
                     }
                     // Phase 1 (persist the bounded plan), then phase 2
                     // execute it; an interrupted run resumes the open
-                    // plan and skips already-recorded entries.
-                    if let Err(e) = store.reclaim_plan_create(
+                    // plan and skips already-recorded entries. Bodies
+                    // phase 1 held out of the plan (over-budget,
+                    // protected) are carried into the result so the
+                    // operator sees them on execution too.
+                    let plan = match store.reclaim_plan_create(
                         &category_settings,
                         &bounds,
                         &state_root,
                         &protected,
                         now(),
                     ) {
-                        return store_error("retention_cleanup", e);
-                    }
+                        Ok(plan) => plan,
+                        Err(e) => return store_error("retention_cleanup", e),
+                    };
                     match store.reclaim_plan_execute(
                         &state_root,
                         &protected,
                         retention.delete_error_limit,
                         now(),
                     ) {
-                        Ok(Some(execution)) => finish(
-                            "retention_cleanup",
-                            serde_json::to_value(execution).unwrap_or(serde_json::json!({})),
-                        ),
+                        Ok(Some(execution)) => {
+                            let mut value =
+                                serde_json::to_value(execution).unwrap_or(serde_json::json!({}));
+                            value["skipped"] = serde_json::to_value(&plan.skipped)
+                                .unwrap_or(serde_json::json!([]));
+                            finish("retention_cleanup", value)
+                        }
                         // Phase 1 just ensured an open plan exists.
                         Ok(None) => finish(
                             "retention_cleanup",

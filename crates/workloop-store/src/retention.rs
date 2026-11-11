@@ -1264,6 +1264,43 @@ impl SqliteStore {
             .map_err(map_err)
     }
 
+    /// Crash-safe reclaim record: the catalogue row's `reclaiming →
+    /// reclaimed` transition and the plan entry's outcome are written
+    /// in one transaction, so a crash between them can never strand a
+    /// pending entry for a body this run already reclaimed (the resume
+    /// path would otherwise misrecord the plan's own deletion as
+    /// `unavailable`).
+    fn finish_reclaim_and_record(
+        &self,
+        plan_id: &str,
+        body_id: &str,
+        reason: &str,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        tx.execute(
+            "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
+             delete_failures=0, reclaimed_unix_seconds=?3 WHERE body_id=?1 \
+             AND state='reclaiming'",
+            params![body_id, reason, now_unix_seconds],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE reclaim_plan_entries SET outcome='reclaimed', \
+             outcome_reason=?2, outcome_unix_seconds=?3 \
+             WHERE plan_id=?1 AND body_id=?4 AND outcome IS NULL",
+            params![plan_id, reason, now_unix_seconds, body_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
     fn finish_reclaim(
         &self,
         body_id: &str,
@@ -1472,6 +1509,11 @@ pub struct CategoryReport {
     /// Age of the oldest `present` body in the category, against
     /// `max_age_seconds`. `None` when the category holds nothing.
     pub oldest_present_age_seconds: Option<i64>,
+    /// Bodies whose backing path could not be `stat`ed (missing,
+    /// permission denied, unreadable). Reported as `unknown`, never
+    /// counted as present usage or fed into the pressure computation.
+    pub unknown_count: u64,
+    pub unknown_bytes: u64,
     pub over_max_bytes: bool,
     pub protected_over_limit: bool,
     /// `none`, `over_limit` (reclaimable excess exists) or
@@ -1499,6 +1541,9 @@ pub struct RetentionReport {
     pub unavailable: Vec<UnavailableBody>,
     /// The unavailable list is bounded; this flags truncation.
     pub unavailable_truncated: bool,
+    /// The filesystem scan underpinning `unknown_*` is bounded; this
+    /// flags that not every present body was stat'ed.
+    pub unknown_scan_truncated: bool,
 }
 
 /// The selected, bounded set both phase-1 entry points compute.
@@ -1509,6 +1554,7 @@ struct PlannedSet {
 }
 
 const UNAVAILABLE_REPORT_BOUND: usize = 100;
+const UNKNOWN_SCAN_BOUND: usize = 1000;
 
 fn reclaim_plan_id(now_unix_seconds: i64) -> String {
     let nanos = std::time::SystemTime::now()
@@ -1836,6 +1882,11 @@ impl SqliteStore {
         delete_error_limit: usize,
         now_unix_seconds: i64,
     ) -> Result<ReclaimExecution, StoreError> {
+        if delete_error_limit == 0 {
+            return Err(StoreError::Internal {
+                detail: "delete_error_limit must be positive".into(),
+            });
+        }
         let mut execution = ReclaimExecution {
             plan_id: plan_id.to_string(),
             ..ReclaimExecution::default()
@@ -2111,14 +2162,7 @@ impl SqliteStore {
                 } else {
                     entry_reason.as_deref().unwrap_or("age_expired")
                 };
-                self.finish_reclaim(body_id, recorded, now_unix_seconds)?;
-                self.record_entry_outcome(
-                    plan_id,
-                    body_id,
-                    "reclaimed",
-                    recorded,
-                    now_unix_seconds,
-                )?;
+                self.finish_reclaim_and_record(plan_id, body_id, recorded, now_unix_seconds)?;
                 execution.bytes_reclaimed += bytes;
                 execution.reclaimed.push(ReclaimedBody {
                     body_id: body_id.into(),
@@ -2216,10 +2260,15 @@ impl SqliteStore {
 
     /// Read-only storage-pressure report: per-category usage against
     /// the configured limits, reclaim status, and the bounded
-    /// unavailable body list. Mutates nothing.
+    /// unavailable body list. Mutates nothing. Body paths are resolved
+    /// against `root` exactly as the reclaim path resolves them —
+    /// relative paths under the installation state root, absolute paths
+    /// contained in it; anything that cannot be stat'ed is reported as
+    /// `unknown`, never as present usage.
     pub fn retention_report(
         &self,
         settings: &CategorySettings,
+        root: &Path,
         now_unix_seconds: i64,
     ) -> Result<RetentionReport, StoreError> {
         let eligibility = self.catalogue_eligibility(settings, now_unix_seconds)?;
@@ -2272,6 +2321,63 @@ impl SqliteStore {
                 acc.entry(category).or_default().insert(reason, count);
                 acc
             })
+        };
+        // Filesystem scan behind the `unknown` accounting: at most
+        // UNKNOWN_SCAN_BOUND present bodies are stat'ed; a row whose
+        // path cannot be read contributes `unknown`, never present
+        // bytes. One over the bound flips the truncated flag.
+        let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
+            detail: format!("retention root {}: {e}", root.display()),
+        })?;
+        let (unknown, unknown_scan_truncated): (BTreeMap<String, (u64, u64, u64)>, bool) = {
+            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                detail: "store lock poisoned".into(),
+            })?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT body_id, category, path, bytes, pin_state, pinned \
+                     FROM body_catalog WHERE state='present' \
+                     ORDER BY registered_unix_seconds, body_id LIMIT ?1",
+                )
+                .map_err(map_err)?;
+            let rows: Vec<(String, String, String, i64, String, i64)> = stmt
+                .query_map(params![(UNKNOWN_SCAN_BOUND + 1) as i64], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })
+                .map_err(map_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_err)?;
+            let truncated = rows.len() > UNKNOWN_SCAN_BOUND;
+            let mut acc: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+            for (_, category, path, bytes, pin_state, pinned) in
+                rows.into_iter().take(UNKNOWN_SCAN_BOUND)
+            {
+                let stat_ok = match managed_path(&root_abs, &path) {
+                    Ok(managed) => std::fs::symlink_metadata(&managed).is_ok(),
+                    Err(_) => false,
+                };
+                if stat_ok {
+                    continue;
+                }
+                let entry = acc.entry(category).or_default();
+                entry.0 += 1;
+                entry.1 += bytes.max(0) as u64;
+                let is_pin = PinState::parse(&pin_state)
+                    .map(|p| p.is_pin())
+                    .unwrap_or(false)
+                    || pinned != 0;
+                if is_pin {
+                    entry.2 += bytes.max(0) as u64;
+                }
+            }
+            (acc, truncated)
         };
         let oldest: BTreeMap<String, i64> = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
@@ -2333,8 +2439,19 @@ impl SqliteStore {
                 .iter()
                 .filter(|e| e.category == category && e.pin_state.is_pin())
                 .count() as u64;
-            let protected_over_limit = reported.is_some_and(|r| r.protected_over_limit);
-            let over_max_bytes = reported.is_some_and(|r| r.over_max_bytes);
+            let (unknown_count, unknown_bytes, unknown_pinned_bytes) =
+                unknown.get(&category).copied().unwrap_or((0, 0, 0));
+            // Pressure is computed on the verifiable remainder only:
+            // bodies whose path cannot be stat'ed never count toward
+            // present usage or pinned-byte caps.
+            let verified_present_bytes = present_bytes.saturating_sub(unknown_bytes);
+            let verified_protected_bytes = reported
+                .map(|r| r.protected_bytes)
+                .unwrap_or(0)
+                .saturating_sub(unknown_pinned_bytes);
+            let max_bytes = limits.and_then(|l| l.1);
+            let over_max_bytes = max_bytes.is_some_and(|max| verified_present_bytes > max);
+            let protected_over_limit = max_bytes.is_some_and(|max| verified_protected_bytes > max);
             let pressure = if protected_over_limit {
                 "protected_over_limit"
             } else if eligible_count > 0 {
@@ -2346,11 +2463,11 @@ impl SqliteStore {
             categories.push(CategoryReport {
                 category: category.clone(),
                 max_age_seconds: limits.map_or(default_limits.max_age, |l| l.0),
-                max_bytes: limits.map_or(default_limits.max_bytes, |l| l.1),
-                present_count,
-                present_bytes,
+                max_bytes,
+                present_count: present_count.saturating_sub(unknown_count),
+                present_bytes: verified_present_bytes,
                 pinned_count,
-                pinned_bytes: reported.map_or(0, |r| r.protected_bytes),
+                pinned_bytes: verified_protected_bytes,
                 eligible_count,
                 eligible_bytes,
                 reclaiming_count,
@@ -2361,6 +2478,8 @@ impl SqliteStore {
                 oldest_present_age_seconds: oldest
                     .get(&category)
                     .map(|created| now_unix_seconds.saturating_sub(*created)),
+                unknown_count,
+                unknown_bytes,
                 over_max_bytes,
                 protected_over_limit,
                 pressure: pressure.into(),
@@ -2406,6 +2525,7 @@ impl SqliteStore {
             categories,
             unavailable,
             unavailable_truncated,
+            unknown_scan_truncated,
         })
     }
 }

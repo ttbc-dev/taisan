@@ -412,7 +412,7 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
     register(&store, "pinned", NOW - 10_000, 20, PinState::Active, &rel);
 
     let report = store
-        .retention_report(&settings(Some(100), Some(15)), NOW)
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
         .unwrap();
     let cas = report
         .categories
@@ -502,6 +502,43 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Accounting fixture bodies whose path does not exist on disk must
+/// not be counted as present usage: the report lists them under
+/// `unknown` and excludes them from the pressure computation.
+#[test]
+fn report_counts_unstatable_bodies_as_unknown_not_present() {
+    let fixture = Fixture::new("unknown");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let rel_real = fixture.write_body("real", 10);
+    register(&store, "real", NOW - 10, 10, PinState::None, &rel_real);
+    register(
+        &store,
+        "ghost",
+        NOW - 20,
+        20,
+        PinState::None,
+        "bodies/ghost-never-written.blob",
+    );
+
+    let report = store
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
+        .unwrap();
+    let cas = report
+        .categories
+        .iter()
+        .find(|c| c.category == "cas")
+        .unwrap();
+    assert_eq!(cas.unknown_count, 1);
+    assert_eq!(cas.unknown_bytes, 20);
+    assert_eq!(cas.present_bytes, 10, "ghost bytes are not present usage");
+    assert_eq!(cas.present_count, 1);
+    assert!(
+        !cas.over_max_bytes,
+        "verified usage (10 B) is under the 15 B cap even though the catalogue holds 30 B"
+    );
+    assert!(!report.unknown_scan_truncated);
+}
+
 #[test]
 fn report_exposes_pressure_metrics_and_unavailable_list() {
     let fixture = Fixture::new("report");
@@ -523,7 +560,7 @@ fn report_exposes_pressure_metrics_and_unavailable_list() {
         .unwrap();
 
     let report = store
-        .retention_report(&settings(Some(100), Some(15)), NOW)
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
         .unwrap();
     let cas = report
         .categories
