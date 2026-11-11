@@ -564,7 +564,6 @@ fn scenario_rejected_stale_version(root: &Path, path: Path_) -> Output {
     output_at(root, &as_refs(&args))
 }
 
-
 fn skill_submit(root: &Path, path: Path_, key: &str) -> Output {
     let md = skill_md();
     let args = match path {
@@ -903,7 +902,11 @@ fn every_documented_operation_maps_one_to_one_through_both_paths() {
     assert_paths_agree("cancel", scenario_cancel, Expect::Accepted);
     assert_paths_agree("acknowledge", scenario_acknowledge, Expect::Accepted);
     assert_paths_agree("judge-findings", scenario_judge_findings, Expect::Accepted);
-    assert_paths_agree("release-judgment", scenario_release_judgment, Expect::Accepted);
+    assert_paths_agree(
+        "release-judgment",
+        scenario_release_judgment,
+        Expect::Accepted,
+    );
     assert_paths_agree("command-result", scenario_command_result, Expect::Accepted);
     // A rejection through both paths: identical envelope, exit 1,
     // reason.code stale_work_version — never retargeted.
