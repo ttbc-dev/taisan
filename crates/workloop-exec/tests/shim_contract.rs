@@ -215,6 +215,10 @@ fn a_duplicate_start_for_one_invocation_spawns_exactly_one_writer() {
     assert_eq!(port.spawned().len(), 1);
     let invocation = only_invocation(&store, &eid);
     assert!(invocation.process_identity.is_some());
+    // The export identity is the deterministic binding for this launch.
+    let export = export_for(&store, &invocation);
+    assert_eq!(export.request_id, export_request_id(&invocation.id));
+    assert_eq!(export.state, WorkerRequestExportState::Bound);
 }
 
 #[test]

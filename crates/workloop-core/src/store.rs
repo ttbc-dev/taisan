@@ -419,8 +419,11 @@ pub trait ReadView {
     /// The durable handoff record for one artifact id; `None` = absent.
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError>;
     /// The durable WorkerRequest export recorded for a deterministic
-    /// request identity; `None` = absent. Reconciliation resolves the
-    /// writer through this binding.
+    /// request identity; `None` = absent. The supervisor writes this
+    /// binding at launch; callers (tests today, lost-start reconciliation
+    /// later) read it back to resolve the spawned writer. The running
+    /// Invocation row remains the primary reconciliation key; this binding
+    /// is the durable audit record of the launch.
     fn worker_request_export(
         &self,
         request_id: &str,

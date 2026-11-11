@@ -4466,6 +4466,39 @@ fn a_versioned_file_without_the_recognized_schema_is_refused() {
     );
 }
 
+/// Regression: a file stamped v2 but missing v2-era tables is refused —
+/// the additive migration may recreate only the v3 addition on an honest
+/// v2 file, never a damaged one.
+#[test]
+fn a_versioned_file_missing_the_v2_schema_is_refused() {
+    let root = temp_root("cutover-foreign-v2");
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE artifact_handoffs; PRAGMA user_version=2;")
+            .unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("v2"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("a stamped v2 file missing v2 tables must be refused"),
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='artifact_handoffs')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!exists, "a refused open must not recreate dropped tables");
+}
+
 /// Regression: a store created by the previous release — stamped v1,
 /// full base schema, none of this slice's additive tables — opens and
 /// is upgraded in place. Refusing it as "not the recognized schema"

@@ -226,7 +226,9 @@ impl SqliteStore {
             // holds the complete v1 schema: every expected table except
             // the ones added since v1 — the run-lease slice's additive
             // set, the two v2 additions, and the v3 addition — must
-            // already be present.
+            // already be present. A v2 file must hold the complete v2
+            // schema (everything except the v3 addition); a stamped-2
+            // file missing the v2 tables passes neither gate.
             // A foreign file stamped 1 fails this check untouched, and
             // the one accepted difference is the previous release's
             // store: it holds every base table and none of the
@@ -234,19 +236,27 @@ impl SqliteStore {
             // locked out with a misleading "not the recognized schema"
             // refusal.
             let present = table_set(&conn)?;
-            let v1_complete = EXPECTED_TABLES
-                .iter()
-                .filter(|t| {
-                    !V2_ADDED_TABLES.contains(t)
-                        && !ADDITIVE_TABLES.contains(t)
-                        && !V3_ADDED_TABLES.contains(t)
-                })
-                .all(|t| present.contains(*t));
-            if !v1_complete {
+            let required_complete = if version == 1 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| {
+                        !V2_ADDED_TABLES.contains(t)
+                            && !ADDITIVE_TABLES.contains(t)
+                            && !V3_ADDED_TABLES.contains(t)
+                    })
+                    .all(|t| present.contains(*t))
+            } else {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V3_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            };
+            if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
-                    detail: "store file claims the v1 format but does \
-                             not hold the recognized schema"
-                        .into(),
+                    detail: format!(
+                        "store file claims the v{version} format but does \\
+                         not hold the recognized schema"
+                    ),
                 });
             }
             // Additive migration inside one transaction: the new tables
