@@ -1461,6 +1461,9 @@ pub struct ReclaimPlan {
     /// Bodies that are eligible but can never fit a pass bound
     /// (larger than `max_bytes`); reported, never planned.
     pub skipped: Vec<HeldBody>,
+    /// Pinned bodies that would otherwise be eligible; reported,
+    /// never planned — "what pins prevented", per the retention policy.
+    pub held: Vec<HeldBody>,
 }
 
 /// The result of executing (or resuming) an open plan.
@@ -1551,6 +1554,7 @@ struct PlannedSet {
     entries: Vec<BodyEligibility>,
     skipped: Vec<HeldBody>,
     total_bytes: u64,
+    held: Vec<HeldBody>,
 }
 
 const UNAVAILABLE_REPORT_BOUND: usize = 100;
@@ -1627,6 +1631,7 @@ impl SqliteStore {
             entries: rows,
             total_bytes: total_bytes.max(0) as u64,
             skipped: Vec::new(),
+            held: Vec::new(),
         })
     }
 
@@ -1659,8 +1664,20 @@ impl SqliteStore {
         let mut planned: Vec<BodyEligibility> = Vec::new();
         let mut skipped: Vec<HeldBody> = Vec::new();
         let mut total_bytes: u64 = 0;
-        // `entries` from catalogue_eligibility are ordered by
-        // registered_unix_seconds, body_id — oldest first, deterministic.
+        // Pinned bodies that would otherwise be eligible: what pins
+        // prevented. `entries` from catalogue_eligibility are ordered
+        // by registered_unix_seconds, body_id — oldest first.
+        let held: Vec<HeldBody> = eligibility
+            .entries
+            .iter()
+            .filter(|e| {
+                !e.eligible && e.pin_state.is_pin() && (e.age_expired || e.category_over_max_bytes)
+            })
+            .map(|e| HeldBody {
+                body_id: e.body_id.clone(),
+                reason: "pinned".into(),
+            })
+            .collect();
         for entry in eligibility.entries.into_iter().filter(|e| e.eligible) {
             if planned.len() >= bounds.max_bodies {
                 break;
@@ -1702,6 +1719,7 @@ impl SqliteStore {
             entries: planned,
             skipped,
             total_bytes,
+            held,
         })
     }
 
@@ -1729,6 +1747,7 @@ impl SqliteStore {
             entries: planned,
             skipped,
             total_bytes,
+            held,
         } = self.collect_plan(settings, bounds, root, protected, now_unix_seconds)?;
         Ok(ReclaimPlan {
             plan_id: "preview".into(),
@@ -1747,6 +1766,7 @@ impl SqliteStore {
                 .collect(),
             total_bytes,
             skipped,
+            held,
         })
     }
 
@@ -1801,6 +1821,7 @@ impl SqliteStore {
             entries: planned,
             skipped,
             total_bytes,
+            held,
         } = self.collect_plan(settings, bounds, root, protected, now_unix_seconds)?;
         let plan_id = reclaim_plan_id(now_unix_seconds);
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
@@ -1867,16 +1888,19 @@ impl SqliteStore {
                 .collect(),
             total_bytes,
             skipped,
+            held,
         })
     }
 
     /// Phase 2 for one planned entry: re-verify, reclaim, record. Used
     /// by [`Self::reclaim_plan_execute`] and directly by tests to drive
     /// an interrupted run one body at a time.
+    #[allow(clippy::too_many_arguments)]
     pub fn reclaim_plan_entry(
         &self,
         plan_id: &str,
         body_id: &str,
+        settings: &CategorySettings,
         root: &Path,
         protected: &[PathBuf],
         delete_error_limit: usize,
@@ -1922,6 +1946,7 @@ impl SqliteStore {
         self.execute_entry(
             plan_id,
             body_id,
+            settings,
             root,
             protected,
             delete_error_limit,
@@ -1941,6 +1966,7 @@ impl SqliteStore {
     /// open plan exists.
     pub fn reclaim_plan_execute(
         &self,
+        settings: &CategorySettings,
         root: &Path,
         protected: &[PathBuf],
         delete_error_limit: usize,
@@ -1966,6 +1992,7 @@ impl SqliteStore {
             self.execute_entry(
                 &plan.plan_id,
                 &entry.body_id,
+                settings,
                 root,
                 protected,
                 delete_error_limit,
@@ -1982,6 +2009,7 @@ impl SqliteStore {
         &self,
         plan_id: &str,
         body_id: &str,
+        settings: &CategorySettings,
         root: &Path,
         protected: &[PathBuf],
         delete_error_limit: usize,
@@ -2076,91 +2104,173 @@ impl SqliteStore {
             });
             return Ok(());
         }
-        let mut marked = false;
+        let bytes = bytes.max(0) as u64;
         if state == "present" {
-            // Pin re-checked inside the same immediate transaction the
-            // sweep uses; a pin that appeared after planning holds the
-            // body here. A false return means the row moved out of
-            // `present` first (a concurrent pass won): re-read instead
-            // of reporting a false `held`/`pinned`. A row that is now
-            // `reclaiming` goes through the same resume path as an
-            // interrupted run — the concurrent pass may have marked it
-            // without deleting yet, and the delete is idempotent.
-            if self.mark_reclaiming(body_id)? {
-                marked = true;
-            } else {
-                match self.row_state(body_id)? {
-                    Some(current) if current == "present" => {
-                        self.record_entry_outcome(
-                            plan_id,
-                            body_id,
-                            "held",
-                            "pinned",
-                            now_unix_seconds,
-                        )?;
-                        execution.held.push(HeldBody {
-                            body_id: body_id.into(),
-                            reason: "pinned".into(),
-                        });
-                        return Ok(());
-                    }
-                    Some(current) if current == "reclaiming" => {
-                        // fall through to the resume pin re-check below
-                    }
-                    Some(_) => {
-                        self.record_entry_outcome(
-                            plan_id,
-                            body_id,
-                            "unavailable",
-                            "already_reclaimed",
-                            now_unix_seconds,
-                        )?;
-                        execution.unavailable.push(HeldBody {
-                            body_id: body_id.into(),
-                            reason: "already_reclaimed".into(),
-                        });
-                        return Ok(());
-                    }
-                    None => {
-                        self.record_entry_outcome(
-                            plan_id,
-                            body_id,
-                            "unavailable",
-                            "not_registered",
-                            now_unix_seconds,
-                        )?;
-                        execution.unavailable.push(HeldBody {
-                            body_id: body_id.into(),
-                            reason: "not_registered".into(),
-                        });
-                        return Ok(());
+            // Pin AND age/byte eligibility are recomputed inside the
+            // marking transaction — a `size_pressure` entry whose
+            // category fell back under the cap while this plan ran is
+            // no longer eligible and stays `present`. A pin that
+            // appeared after planning holds the body here.
+            match self.mark_reclaiming_if_eligible(body_id, settings, now_unix_seconds)? {
+                MarkOutcome::Marked { reason } => {
+                    let _ = reason;
+                    self.delete_and_record(
+                        plan_id,
+                        body_id,
+                        bytes,
+                        &managed,
+                        entry_reason.as_deref(),
+                        delete_error_limit,
+                        now_unix_seconds,
+                        execution,
+                    )?;
+                }
+                MarkOutcome::Pinned => {
+                    // A pinned-or-refused mark is indistinguishable from
+                    // "the row left `present` first" without re-reading.
+                    match self.row_state(body_id)? {
+                        Some(current) if current == "present" => {
+                            self.record_entry_outcome(
+                                plan_id,
+                                body_id,
+                                "held",
+                                "pinned",
+                                now_unix_seconds,
+                            )?;
+                            execution.held.push(HeldBody {
+                                body_id: body_id.into(),
+                                reason: "pinned".into(),
+                            });
+                        }
+                        Some(current) if current == "reclaiming" => {
+                            // a concurrent pass marked it without
+                            // deleting yet — finish through the resume
+                            // path (the delete is idempotent)
+                            self.delete_and_record_with_pin_recheck(
+                                plan_id,
+                                body_id,
+                                bytes,
+                                &managed,
+                                entry_reason.as_deref(),
+                                delete_error_limit,
+                                now_unix_seconds,
+                                execution,
+                            )?;
+                        }
+                        Some(_) => {
+                            self.record_entry_outcome(
+                                plan_id,
+                                body_id,
+                                "unavailable",
+                                "already_reclaimed",
+                                now_unix_seconds,
+                            )?;
+                            execution.unavailable.push(HeldBody {
+                                body_id: body_id.into(),
+                                reason: "already_reclaimed".into(),
+                            });
+                        }
+                        None => {
+                            self.record_entry_outcome(
+                                plan_id,
+                                body_id,
+                                "unavailable",
+                                "not_registered",
+                                now_unix_seconds,
+                            )?;
+                            execution.unavailable.push(HeldBody {
+                                body_id: body_id.into(),
+                                reason: "not_registered".into(),
+                            });
+                        }
                     }
                 }
+                MarkOutcome::WithinLimits => {
+                    self.record_entry_outcome(
+                        plan_id,
+                        body_id,
+                        "held",
+                        "within_limits",
+                        now_unix_seconds,
+                    )?;
+                    execution.held.push(HeldBody {
+                        body_id: body_id.into(),
+                        reason: "within_limits".into(),
+                    });
+                }
             }
+            return Ok(());
         }
-        if !marked {
-            // `reclaiming` row — either this run just lost the race to
-            // a concurrent pass, or an interrupted run left it for us:
-            // re-check the pin before retrying the delete, exactly as
-            // the sweep's resume path does.
-            if self.row_pinned(body_id)? {
-                self.record_entry_outcome(plan_id, body_id, "held", "pinned", now_unix_seconds)?;
-                execution.held.push(HeldBody {
-                    body_id: body_id.into(),
-                    reason: "pinned".into(),
-                });
-                return Ok(());
-            }
+        // `reclaiming` row — an interrupted run left it for us, or
+        // a concurrent pass marked it without deleting yet:
+        // re-check the pin before retrying the delete, exactly as
+        // the sweep's resume path does.
+        self.delete_and_record_with_pin_recheck(
+            plan_id,
+            body_id,
+            bytes,
+            &managed,
+            entry_reason.as_deref(),
+            delete_error_limit,
+            now_unix_seconds,
+            execution,
+        )
+    }
+
+    /// Pin re-check shared by the interrupted-run and lost-race resume
+    /// paths, then the delete-and-record step.
+    #[allow(clippy::too_many_arguments)]
+    fn delete_and_record_with_pin_recheck(
+        &self,
+        plan_id: &str,
+        body_id: &str,
+        bytes: u64,
+        managed: &Path,
+        entry_reason: Option<&str>,
+        delete_error_limit: usize,
+        now_unix_seconds: i64,
+        execution: &mut ReclaimExecution,
+    ) -> Result<(), StoreError> {
+        if self.row_pinned(body_id)? {
+            self.record_entry_outcome(plan_id, body_id, "held", "pinned", now_unix_seconds)?;
+            execution.held.push(HeldBody {
+                body_id: body_id.into(),
+                reason: "pinned".into(),
+            });
+            return Ok(());
         }
-        let bytes = bytes.max(0) as u64;
-        match delete_managed(&managed) {
+        self.delete_and_record(
+            plan_id,
+            body_id,
+            bytes,
+            managed,
+            entry_reason,
+            delete_error_limit,
+            now_unix_seconds,
+            execution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delete_and_record(
+        &self,
+        plan_id: &str,
+        body_id: &str,
+        bytes: u64,
+        managed: &Path,
+        entry_reason: Option<&str>,
+        delete_error_limit: usize,
+        now_unix_seconds: i64,
+        execution: &mut ReclaimExecution,
+    ) -> Result<(), StoreError> {
+        match delete_managed(managed) {
             Ok(reason) => {
                 // Keep `missing` when the body was already gone;
                 // otherwise record the planning reason.
                 let recorded = if reason == "missing" {
-                    reason.as_str()
+                    "missing"
                 } else {
-                    entry_reason.as_deref().unwrap_or("age_expired")
+                    entry_reason.unwrap_or("age_expired")
                 };
                 self.finish_reclaim_and_record(plan_id, body_id, recorded, now_unix_seconds)?;
                 execution.bytes_reclaimed += bytes;
@@ -2326,10 +2436,11 @@ impl SqliteStore {
         // UNKNOWN_SCAN_BOUND present bodies are stat'ed; a row whose
         // path cannot be read contributes `unknown`, never present
         // bytes. One over the bound flips the truncated flag.
+        type UnknownTotals = BTreeMap<String, (u64, u64, u64, Vec<String>)>;
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
-        let (unknown, unknown_scan_truncated): (BTreeMap<String, (u64, u64, u64)>, bool) = {
+        let (unknown, unknown_scan_truncated): (UnknownTotals, bool) = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
             })?;
@@ -2355,8 +2466,8 @@ impl SqliteStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(map_err)?;
             let truncated = rows.len() > UNKNOWN_SCAN_BOUND;
-            let mut acc: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
-            for (_, category, path, bytes, pin_state, pinned) in
+            let mut acc: UnknownTotals = BTreeMap::new();
+            for (entry_body_id, category, path, bytes, pin_state, pinned) in
                 rows.into_iter().take(UNKNOWN_SCAN_BOUND)
             {
                 let stat_ok = match managed_path(&root_abs, &path) {
@@ -2369,6 +2480,7 @@ impl SqliteStore {
                 let entry = acc.entry(category).or_default();
                 entry.0 += 1;
                 entry.1 += bytes.max(0) as u64;
+                entry.3.push(entry_body_id);
                 let is_pin = PinState::parse(&pin_state)
                     .map(|p| p.is_pin())
                     .unwrap_or(false)
@@ -2427,10 +2539,19 @@ impl SqliteStore {
                 .get(&(category.clone(), "reclaimed".to_string()))
                 .copied()
                 .unwrap_or((0, 0));
+            let (unknown_count, unknown_bytes, unknown_pinned_bytes, unknown_ids) =
+                match unknown.get(&category) {
+                    Some((c, b, p, ids)) => (*c, *b, *p, ids.as_slice()),
+                    None => (0, 0, 0, &[][..]),
+                };
             let eligible: Vec<&BodyEligibility> = eligibility
                 .entries
                 .iter()
-                .filter(|e| e.category == category && e.eligible)
+                .filter(|e| {
+                    e.category == category
+                        && e.eligible
+                        && !unknown_ids.iter().any(|id| id == &e.body_id)
+                })
                 .collect();
             let eligible_count = eligible.len() as u64;
             let eligible_bytes = eligible.iter().map(|e| e.size_bytes).sum();
@@ -2439,8 +2560,6 @@ impl SqliteStore {
                 .iter()
                 .filter(|e| e.category == category && e.pin_state.is_pin())
                 .count() as u64;
-            let (unknown_count, unknown_bytes, unknown_pinned_bytes) =
-                unknown.get(&category).copied().unwrap_or((0, 0, 0));
             // Pressure is computed on the verifiable remainder only:
             // bodies whose path cannot be stat'ed never count toward
             // present usage or pinned-byte caps.

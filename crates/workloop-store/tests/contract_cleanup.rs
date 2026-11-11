@@ -256,7 +256,7 @@ fn execute_reclaims_planned_bodies_and_records_plan_and_execution() {
         .unwrap();
     let plan_id = plan.plan_id.clone();
     let execution = store
-        .reclaim_plan_execute(&fixture.root, &[], 3, NOW)
+        .reclaim_plan_execute(&settings(Some(100), None), &fixture.root, &[], 3, NOW)
         .unwrap()
         .expect("an open plan exists");
 
@@ -309,7 +309,15 @@ fn interrupted_phase_two_resumes_and_skips_reclaimed_bodies() {
     // Simulate a process that dies after reclaiming exactly one body:
     // phase 2 for `body-a` completes, the process stops before the rest.
     let first = store
-        .reclaim_plan_entry(&plan_id, "body-a", &fixture.root, &[], 3, NOW)
+        .reclaim_plan_entry(
+            &plan_id,
+            "body-a",
+            &settings(Some(100), None),
+            &fixture.root,
+            &[],
+            3,
+            NOW,
+        )
         .unwrap();
     assert_eq!(first.reclaimed.len(), 1);
     assert_eq!(store.body_state("body-a").unwrap().unwrap().0, "reclaimed");
@@ -325,7 +333,7 @@ fn interrupted_phase_two_resumes_and_skips_reclaimed_bodies() {
 
     // The rerun skips the already-reclaimed body and completes the plan.
     let execution = store
-        .reclaim_plan_execute(&fixture.root, &[], 3, NOW)
+        .reclaim_plan_execute(&settings(Some(100), None), &fixture.root, &[], 3, NOW)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -376,7 +384,7 @@ fn missing_and_already_reclaimed_bodies_are_unavailable_not_errors() {
     std::fs::remove_file(fixture.root.join("bodies/body-b")).unwrap();
 
     let execution = store
-        .reclaim_plan_execute(&fixture.root, &[], 3, NOW)
+        .reclaim_plan_execute(&settings(Some(100), None), &fixture.root, &[], 3, NOW)
         .unwrap()
         .unwrap();
 
@@ -438,7 +446,7 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
         .unwrap();
     assert!(plan.entries.is_empty(), "pinned bodies are never planned");
     let execution = store
-        .reclaim_plan_execute(&fixture.root, &[], 3, NOW)
+        .reclaim_plan_execute(&settings(Some(100), None), &fixture.root, &[], 3, NOW)
         .unwrap()
         .unwrap();
     assert!(execution.reclaimed.is_empty());

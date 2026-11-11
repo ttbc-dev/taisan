@@ -1103,6 +1103,7 @@ fn run(cli: Cli) -> i32 {
                         Err(e) => return store_error("retention_cleanup", e),
                     };
                     match store.reclaim_plan_execute(
+                        &category_settings,
                         &state_root,
                         &protected,
                         retention.delete_error_limit,
@@ -1112,6 +1113,8 @@ fn run(cli: Cli) -> i32 {
                             let mut value =
                                 serde_json::to_value(execution).unwrap_or(serde_json::json!({}));
                             value["skipped"] = serde_json::to_value(&plan.skipped)
+                                .unwrap_or(serde_json::json!([]));
+                            value["held"] = serde_json::to_value(&plan.held)
                                 .unwrap_or(serde_json::json!([]));
                             finish("retention_cleanup", value)
                         }
