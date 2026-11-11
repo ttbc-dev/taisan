@@ -441,10 +441,16 @@ enum Path_ {
     Direct,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Expect {
+    Accepted,
+    Rejected,
+}
+
 /// Run `scenario` twice — once with skill-path args parsed out of
 /// SKILL.md, once with hand-built direct-CLI args — against identical
 /// seeded state, and assert the status/diagnostic surfaces agree.
-fn assert_paths_agree(tag: &str, scenario: fn(&Path, Path_) -> Output) {
+fn assert_paths_agree(tag: &str, scenario: fn(&Path, Path_) -> Output, expect: Expect) {
     let skill_root = root(&format!("{tag}-skill"));
     let direct_root = root(&format!("{tag}-direct"));
     let skill = scenario(&skill_root, Path_::Skill);
@@ -455,16 +461,32 @@ fn assert_paths_agree(tag: &str, scenario: fn(&Path, Path_) -> Output) {
         skill_surface, direct_surface,
         "{tag}: skill-path and direct-CLI envelopes differ"
     );
-    assert_eq!(
-        skill_surface.0, 0,
-        "{tag}: both paths must exit 0; skill-path envelope: {:?}",
-        skill_surface
-    );
-    assert_eq!(
-        skill_surface.2, "accepted",
-        "{tag}: these scenarios are seeded to be accepted; skill-path envelope: {:?}",
-        skill_surface
-    );
+    match expect {
+        Expect::Accepted => {
+            assert_eq!(
+                skill_surface.0, 0,
+                "{tag}: both paths must exit 0; skill-path envelope: {:?}",
+                skill_surface
+            );
+            assert_eq!(
+                skill_surface.2, "accepted",
+                "{tag}: these scenarios are seeded to be accepted; skill-path envelope: {:?}",
+                skill_surface
+            );
+        }
+        Expect::Rejected => {
+            assert_eq!(
+                skill_surface.0, 1,
+                "{tag}: both paths must exit 1 rejected; skill-path envelope: {:?}",
+                skill_surface
+            );
+            assert_eq!(
+                skill_surface.2, "rejected",
+                "{tag}: skill-path envelope: {:?}",
+                skill_surface
+            );
+        }
+    }
 }
 
 // ---- INV-001 / INV-005: static check of the shipped skill ----
@@ -507,6 +529,41 @@ fn skill_references_only_documented_operations() {
     }
 }
 // ---- The twelve documented operations, both paths ----
+
+/// A rejected Command through both paths: the stale precondition
+/// rejection is identical through the skill and the direct CLI.
+fn scenario_rejected_stale_version(root: &Path, path: Path_) -> Output {
+    let env = submit_at(root, "skill-eq-rej-setup", "rejected work");
+    let work_id = env["work_id"].as_str().unwrap().to_string();
+    let execution_id = env["execution_id"].as_str().unwrap().to_string();
+    let md = skill_md();
+    let args = match path {
+        Path_::Skill => skill_args(
+            md,
+            "retry",
+            |_| true,
+            &[
+                ("<WORK_ID>", &work_id),
+                ("<N>", "99"),
+                ("<EXECUTION_ID>", &execution_id),
+                ("<KEY>", "skill-eq-rej"),
+            ],
+        ),
+        Path_::Direct => vec![
+            "retry".into(),
+            "--work".into(),
+            work_id,
+            "--expected-version".into(),
+            "99".into(),
+            "--expected-execution".into(),
+            execution_id,
+            "--idempotency-key".into(),
+            "skill-eq-rej".into(),
+        ],
+    };
+    output_at(root, &as_refs(&args))
+}
+
 
 fn skill_submit(root: &Path, path: Path_, key: &str) -> Output {
     let md = skill_md();
@@ -836,18 +893,25 @@ fn scenario_command_result(root: &Path, path: Path_) -> Output {
 
 #[test]
 fn every_documented_operation_maps_one_to_one_through_both_paths() {
-    assert_paths_agree("submit", scenario_submit);
-    assert_paths_agree("work-list", scenario_work_list);
-    assert_paths_agree("work-detail", scenario_work_detail);
-    assert_paths_agree("attention", scenario_attention);
-    assert_paths_agree("capacity", scenario_capacity);
-    assert_paths_agree("retry", scenario_retry);
-    assert_paths_agree("resume", scenario_resume);
-    assert_paths_agree("cancel", scenario_cancel);
-    assert_paths_agree("acknowledge", scenario_acknowledge);
-    assert_paths_agree("judge-findings", scenario_judge_findings);
-    assert_paths_agree("release-judgment", scenario_release_judgment);
-    assert_paths_agree("command-result", scenario_command_result);
+    assert_paths_agree("submit", scenario_submit, Expect::Accepted);
+    assert_paths_agree("work-list", scenario_work_list, Expect::Accepted);
+    assert_paths_agree("work-detail", scenario_work_detail, Expect::Accepted);
+    assert_paths_agree("attention", scenario_attention, Expect::Accepted);
+    assert_paths_agree("capacity", scenario_capacity, Expect::Accepted);
+    assert_paths_agree("retry", scenario_retry, Expect::Accepted);
+    assert_paths_agree("resume", scenario_resume, Expect::Accepted);
+    assert_paths_agree("cancel", scenario_cancel, Expect::Accepted);
+    assert_paths_agree("acknowledge", scenario_acknowledge, Expect::Accepted);
+    assert_paths_agree("judge-findings", scenario_judge_findings, Expect::Accepted);
+    assert_paths_agree("release-judgment", scenario_release_judgment, Expect::Accepted);
+    assert_paths_agree("command-result", scenario_command_result, Expect::Accepted);
+    // A rejection through both paths: identical envelope, exit 1,
+    // reason.code stale_work_version — never retargeted.
+    assert_paths_agree(
+        "retry-rejected",
+        scenario_rejected_stale_version,
+        Expect::Rejected,
+    );
 }
 
 // ---- INV-003: replay identity through the skill ----

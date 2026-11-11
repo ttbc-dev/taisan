@@ -474,6 +474,7 @@ fn lp_19_fake_liveness_does_not_reset_the_progress_clock() {
         u.first_dispatch_unix_seconds = Some(NOW - 3700);
         u.last_progress_unix_seconds = Some(NOW - 3600);
     });
+    seed_change(&store, &w, "sha-1", NOW);
 
     // The warning derivs from durable records only; nothing stops.
     let items = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
@@ -520,6 +521,14 @@ fn lp_19_fake_liveness_does_not_reset_the_progress_clock() {
         usage.last_progress_unix_seconds,
         Some(NOW - 3600),
         "fake liveness never rearms the progress clock"
+    );
+    let items = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
+        QueryResult::Found { value, .. } => value,
+        other => panic!("expected found, got {other:?}"),
+    };
+    assert!(
+        items.iter().any(|a| a.reason == "no_progress"),
+        "a failing check on a current head is still not progress; the Attention persists"
     );
 
     // Material progress (a passing required check) rearms and clears.
