@@ -3426,12 +3426,12 @@ fn a_newer_store_format_is_refused() {
     }
 }
 
-/// Regression: a genuine v1 file upgrades to v2 in place — the new
-/// tables and the invocations.descendants column appear and stamped
-/// rows survive; a second open is a no-op because the migration is
-/// idempotent.
+/// Regression: a genuine v1 file upgrades to the current format in
+/// place — the new tables, the invocations.descendants column and the
+/// body catalogue's pin_state appear and stamped rows survive; a
+/// second open is a no-op because the migration is idempotent.
 #[test]
-fn a_v1_store_upgrades_to_v2_preserving_rows() {
+fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
     let root = temp_root("upgrade-v1");
     let db = root.join("store.db");
     let request = submit("k-upgrade");
@@ -3459,7 +3459,7 @@ fn a_v1_store_upgrades_to_v2_preserving_rows() {
             Ok(())
         })
         .unwrap();
-    // A second open must not re-migrate — the schema is already v2.
+    // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
 }
 
@@ -4469,7 +4469,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "the upgrade lands on the current format");
+        assert_eq!(version, 3, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);
