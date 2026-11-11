@@ -84,3 +84,26 @@ The suite parameterizes over two axes:
   retention rule.
 - Skipped rows are reported per provider by the runner, not silently
   absorbed inside a scenario.
+
+## Adapter selection and swap
+
+| Row | Required semantics | Scenario / coverage |
+| --- | --- | --- |
+| WS-20 | A `worker_argv` swap between the reference adapter and the independent contract Worker changes the selection only for requests created after the swap. Requests and running Invocations created before the swap keep their recorded adapter ID, version, capability digest, and argv; no running Invocation is migrated. Command admission, queue order, budget and terminal cancel Outcome are identical under either adapter. | `adapter_swap.rs::ws_20_worker_argv_swap_binds_only_new_requests_in_each_direction` (both swap directions, fixture → contract → fixture). |
+| WS-21 | A runtime version that differs from the declaration stored on the request's own binding — the bound argv is probed again at launch — is a configuration repair: no worker start is attempted, the retained evidence records `runtime.version_mismatch`, and the request is terminal for its binding (abandon and re-issue under a new request, which binds the upgraded declaration). It is never a silent runtime upgrade and the stored declaration is never updated in place. | `adapter_swap.rs::ws_21_runtime_version_mismatch_is_configuration_repair_with_no_start` — drifted declaration refuses with no start, then a new request binds `fixture-2.0.0` and starts; unit cases `adapter::tests::a_same_adapter_runtime_change_is_a_configuration_repair`, `mismatch_reasons_name_the_differing_field`, `a_failed_describe_is_not_selectable`, and `a_wedged_describe_is_bounded_and_not_selectable`. |
+
+The durable binding is the request's `adapter_binding`: adapter ID,
+adapter version, runtime version, capability digest, and the exact argv
+selected. The first binding wins (`Effect::BindRequestAdapter` updates
+only an unbound request), so a later configuration edit cannot retarget
+it — and a refused request is terminal for it: the work is re-issued
+under a new request rather than resumed into the same repair.
+`describe` is effect-free but runs through the supervisor's
+process-control port (own process group, bounded wait, group signalled
+on timeout). It is fail-closed: an executable that does not implement
+it, or a probe that is refused, bounded, non-zero, unparseable, or
+missing the adapter identity, makes the adapter not selectable as
+`adapter.declaration_unavailable` — no synthetic declaration is ever
+compared or dispatched on. The capability digest sorts the declared
+protocol, role, and capability lists before hashing, so set-order
+changes do not masquerade as a capability change.

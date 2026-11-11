@@ -10,12 +10,12 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `2` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` must carry the complete
-//! recognized v1 schema and upgrades additively at open; a stamped file
-//! whose schema is foreign or incomplete, an unversioned database with
-//! user tables (a slice-0 file — archive-only), and a newer version are
-//! all refused at open.
+//! `PRAGMA user_version` is the format gate: `3` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` or `2` must carry the
+//! complete recognized earlier schema and upgrades additively at open; a
+//! stamped file whose schema is foreign or incomplete, an unversioned
+//! database with user tables (a slice-0 file — archive-only), and a
+//! newer version are all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -33,10 +33,11 @@ use workloop_core::store::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// The only store format this binary reads or writes. `2` adds the
+/// The only store format this binary reads or writes. `2` added the
 /// `invocations.descendants` column and the artifact-handoff and
-/// verification tables; v1 files upgrade additively at open.
-const FORMAT_VERSION: i64 = 2;
+/// verification tables; `3` adds the request's durable Worker adapter
+/// binding. Earlier files upgrade additively at open.
+const FORMAT_VERSION: i64 = 3;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -216,16 +217,16 @@ impl SqliteStore {
             }
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
-            // A v1 → v2 migration is legitimate only for a file that
-            // holds the complete v1 schema: every expected table except
-            // the ones added since v1 — the run-lease slice's additive
-            // set plus the two v2 additions — must already be present.
-            // A foreign file stamped 1 fails this check untouched, and
-            // the one accepted difference is the previous release's
-            // store: it holds every base table and none of the
-            // additions, so it is upgraded in place instead of being
-            // locked out with a misleading "not the recognized schema"
-            // refusal.
+            // An earlier-format migration is legitimate only for a
+            // file that holds the complete v1 schema: every expected
+            // table except the ones added since v1 — the run-lease
+            // slice's additive set plus the two v2 additions — must
+            // already be present. A foreign file stamped 1 fails this
+            // check untouched, and the one accepted difference is the
+            // previous release's store: it holds every base table and
+            // none of the additions, so it is upgraded in place instead
+            // of being locked out with a misleading "not the recognized
+            // schema" refusal.
             let present = table_set(&conn)?;
             let v1_complete = EXPECTED_TABLES
                 .iter()
@@ -238,12 +239,13 @@ impl SqliteStore {
                         .into(),
                 });
             }
-            // Additive migration inside one transaction: the new tables
-            // plus invocations.descendants and the pin-ledger
-            // reconstruction. A crash leaves the file stamped 1 and the
-            // migration reruns idempotently (CREATE IF NOT EXISTS; the
-            // column check guards a partial ALTER; the ledger insert is
-            // guarded by NOT EXISTS).
+            // Additive migration inside one transaction: the new tables,
+            // the invocations.descendants and invocation_requests
+            // adapter_binding columns, and the pin-ledger reconstruction.
+            // A crash leaves the old stamp and the migration reruns
+            // idempotently (CREATE IF NOT EXISTS; the column checks guard
+            // a partial ALTER; the ledger insert is guarded by NOT
+            // EXISTS).
             let tx = conn.unchecked_transaction().map_err(internal)?;
             tx.execute_batch(SCHEMA).map_err(internal)?;
             let has_descendants: bool = tx
@@ -259,6 +261,18 @@ impl SqliteStore {
                     "ALTER TABLE invocations ADD COLUMN descendants TEXT NOT NULL DEFAULT '[]'",
                 )
                 .map_err(internal)?;
+            }
+            let has_adapter_binding: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                     WHERE name='adapter_binding')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_adapter_binding {
+                tx.execute_batch("ALTER TABLE invocation_requests ADD COLUMN adapter_binding TEXT")
+                    .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
@@ -736,6 +750,7 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqli
         role: untag(&row.get::<_, String>(3)?)?,
         spec_revision: row.get(4)?,
         payload: de_row(&row.get::<_, String>(5)?)?,
+        adapter_binding: opt_de_row(row.get::<_, Option<String>>(6)?)?,
     })
 }
 
@@ -1218,7 +1233,8 @@ impl ReadView for Tx<'_> {
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError> {
         self.query_all(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload FROM invocation_requests WHERE consumed=0 ORDER BY rowid",
+             payload, adapter_binding FROM invocation_requests \
+             WHERE consumed=0 ORDER BY rowid",
             [],
             request_from_row,
         )
@@ -1227,7 +1243,7 @@ impl ReadView for Tx<'_> {
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
         self.query_opt(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload FROM invocation_requests WHERE request_id=?1",
+             payload, adapter_binding FROM invocation_requests WHERE request_id=?1",
             params![request_id],
             request_from_row,
         )
@@ -1700,8 +1716,8 @@ impl TxView for Tx<'_> {
             Effect::InsertRequest { request } => {
                 self.exec(
                     "INSERT INTO invocation_requests (request_id, work_id, \
-                     execution_id, role, spec_revision, payload) \
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                     execution_id, role, spec_revision, payload, adapter_binding) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         request.request_id,
                         request.work_id.0,
@@ -1709,7 +1725,20 @@ impl TxView for Tx<'_> {
                         tag(&request.role),
                         request.spec_revision,
                         json(&request.payload)?,
+                        request.adapter_binding.as_ref().map(json).transpose()?,
                     ],
+                )?;
+            }
+            Effect::BindRequestAdapter {
+                request_id,
+                binding,
+            } => {
+                // First binding wins: a request already dispatched under
+                // one adapter is never migrated to another.
+                self.exec(
+                    "UPDATE invocation_requests SET adapter_binding=?2 \
+                     WHERE request_id=?1 AND adapter_binding IS NULL",
+                    params![request_id, json(&binding)?],
                 )?;
             }
             Effect::InsertInvocation { invocation } => {

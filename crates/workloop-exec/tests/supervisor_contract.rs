@@ -10,7 +10,9 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt};
+use workloop_core::ports::{
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt,
+};
 use workloop_core::projection::{self, WriterState};
 use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{
@@ -878,6 +880,14 @@ fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     let store = SqliteStore::in_memory(1).unwrap();
@@ -990,6 +1000,14 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     let store = SqliteStore::in_memory(1).unwrap();
@@ -1109,6 +1127,14 @@ fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     let store = SqliteStore::in_memory(1).unwrap();
@@ -1747,6 +1773,14 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             panic!("unverified group must not be signaled")
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     for condition in ["reused", "stopped", "unknown"] {
@@ -1822,6 +1856,14 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             self.0.clone()
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     for (signal, expected) in [
@@ -2761,6 +2803,19 @@ fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
             SignalOutcome::AlreadyGone
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            Ok(ProbeOutcome::Exited {
+                stdout: br#"{"adapter":"workloop-fixture-worker",
+                    "adapter_version":"1.0.0","runtime_version":"fixture-1.0.0"}"#
+                    .to_vec(),
+                success: true,
+            })
+        }
     }
 
     let store = SqliteStore::in_memory(1).unwrap();

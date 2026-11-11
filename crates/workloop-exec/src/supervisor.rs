@@ -9,17 +9,20 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use workloop_core::domain::*;
 use workloop_core::observation::{
     ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
 };
 use workloop_core::ports::{
-    ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
 };
 use workloop_core::store::{Effect, Store, StoreError};
+
+use crate::adapter;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -334,6 +337,58 @@ impl ProcessControlPort for PosixProcessControl {
         let mut status = 0;
         unsafe {
             libc::waitpid(pid, &mut status, libc::WNOHANG);
+        }
+    }
+
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        let Some(program) = argv.first() else {
+            return Err(SpawnError::Refused {
+                reason: "empty argv".into(),
+            });
+        };
+        // Same containment as `spawn`: own process group so a bound can
+        // reach the whole tree the leader did not let escape. stderr is
+        // dropped — only the declared stdout payload is evidence.
+        let mut cmd = Command::new(program);
+        cmd.args(&argv[1..])
+            .current_dir(cwd)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = cmd.spawn().map_err(|e| SpawnError::Refused {
+            reason: format!("spawn {program}: {e}"),
+        })?;
+        let pid = child.id() as i32;
+        let pgid = unsafe { libc::getpgid(pid) };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        });
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok(output)) => Ok(ProbeOutcome::Exited {
+                stdout: output.stdout,
+                success: output.status.success(),
+            }),
+            Ok(Err(e)) => Err(SpawnError::Unknown {
+                reason: format!("wait {program}: {e}"),
+            }),
+            Err(_) => {
+                // The bound elapsed: signal the whole recorded group and
+                // the leader itself (covers a pgid read that raced the
+                // group setup), then give the waiter a short drain so the
+                // direct child is reaped rather than left a zombie.
+                if pgid > 0 {
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                }
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let _ = receiver.recv_timeout(Duration::from_secs(2));
+                Ok(ProbeOutcome::Bounded)
+            }
         }
     }
 }
@@ -759,10 +814,62 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         }
 
+        // The Execution state gates the describe probe too: a request
+        // that can never launch never starts the worker binary, not even
+        // the effect-free declaration probe.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+
+        // Resolve the request's adapter before any Invocation is
+        // recorded. A request that already carries a binding keeps it
+        // verbatim — a later `worker_argv` swap can only affect requests
+        // created after the change — but the bound argv is probed again
+        // and must still declare the stored binding; a mismatch is a
+        // configuration repair that authorizes no start. An unbound
+        // request selects now and records the binding in the consume
+        // commit. A failed `describe` is fail-closed: the adapter is not
+        // selectable and the request does not dispatch.
+        let (binding, repair_reason) = if exec_state != Some(ExecutionState::Ready) {
+            (None, None)
+        } else {
+            let workspace = self.workspace_of(&request.work_id);
+            std::fs::create_dir_all(&workspace)?;
+            match &request.adapter_binding {
+                Some(stored) => {
+                    match adapter::observe_worker_declaration(&self.port, &stored.argv, &workspace)
+                    {
+                        Ok(observed) => match adapter::select_adapter(&observed, stored) {
+                            adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
+                            adapter::AdapterSelection::ConfigurationRepair { reason } => {
+                                (None, Some(reason))
+                            }
+                        },
+                        Err(why) => (
+                            None,
+                            Some(format!("adapter.declaration_unavailable: {why}")),
+                        ),
+                    }
+                }
+                None => match adapter::observe_worker_declaration(
+                    &self.port,
+                    &self.worker_argv,
+                    &workspace,
+                ) {
+                    Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
+                    Err(why) => (
+                        None,
+                        Some(format!("adapter.declaration_unavailable: {why}")),
+                    ),
+                },
+            }
+        };
+
         // First consumption: persist the Invocation inside the same commit
         // that consumes the request — crash order is identity before launch.
         // Recording the Invocation flips `consumed` itself; the explicit
-        // mark records the supervisor's handoff and is idempotent.
+        // mark records the supervisor's handoff and is idempotent. The
+        // request's first adapter binding lands in the same commit.
         let invocation = Invocation {
             id: InvocationId(store.transact(|tx| tx.alloc_id("inv"))?),
             request_id: request.request_id.clone(),
@@ -775,6 +882,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             evidence_refs: vec![],
         };
         store.transact(|tx| {
+            if request.adapter_binding.is_none()
+                && let Some(binding) = &binding
+            {
+                tx.apply(&Effect::BindRequestAdapter {
+                    request_id: request.request_id.clone(),
+                    binding: binding.clone(),
+                })?;
+            }
             tx.apply(&Effect::InsertInvocation {
                 invocation: invocation.clone(),
             })?;
@@ -784,14 +899,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(())
         })?;
 
-        // Launch only for a freshly admitted Execution. A request consumed
-        // while the Execution wants stop (or is uncertain, waiting, or
-        // terminal) must not produce a writer — the invocation is
-        // abandoned so `drive_stops` can settle the Execution instead of
-        // leaving it blocked on a writer that never existed.
-        let exec_state = store
-            .transact(|tx| tx.execution(&request.execution_id))?
-            .map(|e| e.state);
+        if let Some(reason) = repair_reason {
+            // A declaration mismatch or an unanswered `describe` is a
+            // configuration repair: the attempt is recorded and abandoned,
+            // but no worker starts. The consumed request is terminal for
+            // its binding — a re-issued request binds a fresh declaration.
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchRefused {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+
         if exec_state != Some(ExecutionState::Ready) {
             store.transact(|tx| {
                 let mut next = invocation.clone();
@@ -808,7 +941,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let work_id = request.work_id.clone();
         let workspace = self.workspace_of(&work_id);
         std::fs::create_dir_all(&workspace)?;
-        let argv = self.worker_argv.clone();
+        // The bound argv is the recorded selection — a `worker_argv`
+        // change after binding never retargets this request.
+        let argv = binding
+            .as_ref()
+            .map(|binding| binding.argv.clone())
+            .unwrap_or_else(|| self.worker_argv.clone());
         match self.port.spawn(&argv, &workspace) {
             Ok(identity) => {
                 // Descendant coverage starts at launch: a writer that
@@ -2024,6 +2162,14 @@ mod tests {
             panic!("incomplete snapshot must not authorize signaling")
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     #[test]
@@ -2127,6 +2273,14 @@ mod tests {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     fn scripted_config() -> workloop_core::work::WorkloopConfig {

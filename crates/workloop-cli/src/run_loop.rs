@@ -29,10 +29,11 @@ use workloop_core::domain::WorkId;
 use workloop_core::identity::AdapterId;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
+use workloop_exec::adapter;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::{SweepParams, SweepReport};
@@ -313,11 +314,37 @@ pub fn run_pass(
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
     // one store transaction and isolates each admission in its own
     // attempt savepoint, with deadline and scope supplied as facts).
+    // The worker declaration is probed once before the transaction so
+    // each admitted request is created carrying its adapter binding —
+    // the stored declaration recorded at request creation. A probe that
+    // does not answer leaves the requests unbound; the supervisor's
+    // fail-closed selection handles them at consume.
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;
-        let result =
-            store.transact(|tx| dispatch_scan(tx, config, &mut *clock, Some(deadline), scope));
+        let binding = pass.supervisor.and_then(|supervisor| {
+            adapter::observe_worker_declaration(
+                &supervisor.port,
+                &supervisor.worker_argv,
+                &supervisor.workspace_root,
+            )
+            .ok()
+            .map(|declaration| declaration.binding(&supervisor.worker_argv))
+        });
+        let result = store.transact(|tx| {
+            let scan = dispatch_scan(tx, config, &mut *clock, Some(deadline), scope)?;
+            if let Some(binding) = &binding {
+                for request in tx.pending_requests()? {
+                    if request.adapter_binding.is_none() {
+                        tx.apply(&Effect::BindRequestAdapter {
+                            request_id: request.request_id.clone(),
+                            binding: binding.clone(),
+                        })?;
+                    }
+                }
+            }
+            Ok(scan)
+        });
         push!(match result {
             Ok(scan) => {
                 let mut p = PhaseReport::completed(PHASES[1]);

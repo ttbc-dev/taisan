@@ -68,6 +68,13 @@ pub enum Effect {
     InsertRequest {
         request: InvocationRequest,
     },
+    /// Bind a request to the exact Worker adapter selected before its
+    /// first launch. First binding is authoritative; a bound request is
+    /// never migrated to another adapter.
+    BindRequestAdapter {
+        request_id: String,
+        binding: WorkerAdapterBinding,
+    },
     InsertInvocation {
         invocation: Invocation,
     },

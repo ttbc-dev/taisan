@@ -2153,6 +2153,9 @@ pub fn admit_queued_role(
         role: role.clone(),
         spec_revision: work.spec,
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
+        // Adapter selection is captured by `execution` immediately
+        // before the first launch, never inferred at admission time.
+        adapter_binding: None,
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;

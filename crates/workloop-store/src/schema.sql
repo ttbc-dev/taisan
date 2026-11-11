@@ -1,8 +1,8 @@
--- workloop v2 store: current-state tables enforcing structural
+-- workloop v3 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 2` marks the format; a stamped v1 file with
--- the complete recognized schema upgrades additively at open, while an
--- unversioned slice-0 database and a newer version are refused.
+-- `PRAGMA user_version = 3` marks the format; a stamped v1 or v2 file
+-- with the complete recognized schema upgrades additively at open,
+-- while an unversioned slice-0 database and a newer version are refused.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -133,6 +133,9 @@ CREATE TABLE IF NOT EXISTS invocation_requests (
     role TEXT NOT NULL,
     spec_revision INTEGER NOT NULL,
     payload TEXT NOT NULL,
+    -- The Worker adapter binding captured before the first launch;
+    -- null until the supervisor selects the adapter for this request.
+    adapter_binding TEXT,
     consumed INTEGER NOT NULL DEFAULT 0
 );
 

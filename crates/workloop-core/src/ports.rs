@@ -3,6 +3,7 @@
 //! GitHub-integration port (fixture in `workloop-github`).
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::domain::ProcessIdentity;
 
@@ -61,6 +62,22 @@ pub enum StopReceipt {
     Unknown { reason: String },
 }
 
+/// Result of one bounded effect-free probe (`<worker_argv...> describe`).
+/// The probe is a real supervised process start: it runs in its own
+/// process group like a writer, so the bound covers the whole tree —
+/// a probe that forks a same-group child does not leave an orphan the
+/// stop path cannot reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The probe exited inside the bound; `success` is the exit status
+    /// and `stdout` its captured output.
+    Exited { stdout: Vec<u8>, success: bool },
+    /// The bound elapsed: the probe's process group and leader were
+    /// signalled to stop and the leader was reaped. No partial output
+    /// is trusted.
+    Bounded,
+}
+
 /// How `execution` supervises real worker processes. Implementations must
 /// satisfy the crash rules in `docs/lifecycle.md`: record `pid + start
 /// time`, snapshot write-capable descendants with the stop intent, signal
@@ -100,4 +117,19 @@ pub trait ProcessControlPort {
     /// Reap a child this supervisor spawned so inspection is not polluted
     /// by zombies. No-op for pids that are not our children.
     fn reap(&self, pid: i32);
+
+    /// Run a bounded effect-free probe (`<worker_argv...> describe`) under
+    /// the same containment contract as a writer: the child starts in its
+    /// own process group, and when `timeout` elapses the whole group plus
+    /// the leader is signalled to stop and the leader reaped — a wedged
+    /// probe can never hold a dispatch pass open or leak a same-group
+    /// child past the bound. `SpawnError` means no probe ran (`Refused`)
+    /// or its fate is unknown (`Unknown`); a caller must treat either as
+    /// "the adapter did not answer".
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError>;
 }

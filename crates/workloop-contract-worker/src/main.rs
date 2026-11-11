@@ -17,8 +17,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 const USAGE: &str = "usage: workloop-contract-worker <mode> \
-    [--interval-ms <n>] [--file <name>]\nmodes: clean-exit | \
-    exit-no-artifact | hang | path-reopen";
+    [--interval-ms <n>] [--file <name>] [--runtime-version <v>]\nmodes: \
+    clean-exit | exit-no-artifact | hang | path-reopen | describe";
 
 fn usage_exit() -> ! {
     eprintln!("{USAGE}");
@@ -128,6 +128,7 @@ fn main() {
     let mut mode = String::new();
     let mut interval = Duration::from_millis(100);
     let mut file_arg: Option<String> = None;
+    let mut runtime_version = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -136,6 +137,7 @@ fn main() {
                     Duration::from_millis(it.next().and_then(|v| v.parse().ok()).unwrap_or(100));
             }
             "--file" => file_arg = it.next(),
+            "--runtime-version" => runtime_version = it.next(),
             other => mode = other.to_string(),
         }
     }
@@ -200,6 +202,17 @@ fn main() {
         }
         // Periodic heartbeat, fixed name — workspace-local only.
         "reopen" => heartbeat_forever(&ws, interval),
+        // Effect-free declaration; no workspace writes.
+        "describe" => {
+            report(serde_json::json!({
+                "adapter": "workloop-contract-worker",
+                "adapter_version": "1.0.0",
+                "runtime_version": runtime_version.as_deref().unwrap_or("contract-1.0.0"),
+                "protocol_versions": ["taisan.worker/1"],
+                "roles": ["coding", "fix", "review"],
+                "capabilities": ["workspace_write", "artifact_json", "process_control"],
+            }));
+        }
         _ => usage_exit(),
     }
 }

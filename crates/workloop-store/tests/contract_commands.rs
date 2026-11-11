@@ -755,6 +755,7 @@ fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
         role: InvocationRole::Coding,
         spec_revision: 1,
         payload: serde_json::json!({}),
+        adapter_binding: None,
     };
     apply_effects(&store, &[Effect::InsertRequest { request: seeded }]);
 
@@ -1786,6 +1787,7 @@ fn admission_rolls_back_on_request_persistence_failure() {
                 role: InvocationRole::Coding,
                 spec_revision: 1,
                 payload: serde_json::json!({}),
+                adapter_binding: None,
             },
         }],
     );
@@ -3439,14 +3441,16 @@ fn a_v1_store_upgrades_to_v2_preserving_rows() {
         let store = SqliteStore::open(&db, 1).unwrap();
         accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
     };
-    // Reshape the file into a real v1 store: drop the v2 additions and
-    // the descendants column, then stamp user_version=1.
+    // Reshape the file into a real v1 store: drop every post-v1
+    // addition — the v2 tables, the descendants column, and the request
+    // adapter binding — then stamp user_version=1.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "DROP TABLE artifact_handoffs;
              DROP TABLE verification_results;
-             ALTER TABLE invocations DROP COLUMN descendants;",
+             ALTER TABLE invocations DROP COLUMN descendants;
+             ALTER TABLE invocation_requests DROP COLUMN adapter_binding;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -4469,7 +4473,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "the upgrade lands on the current format");
+        assert_eq!(version, 3, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

@@ -20,12 +20,16 @@ struct Args {
     mode: String,
     interval: Duration,
     file: String,
+    runtime_version: Option<String>,
+    adapter_version: Option<String>,
 }
 
 fn parse() -> Args {
     let mut mode = String::new();
     let mut interval = Duration::from_millis(100);
     let mut file = "artifact.json".to_string();
+    let mut runtime_version = None;
+    let mut adapter_version = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -38,6 +42,10 @@ fn parse() -> Args {
                     file = v;
                 }
             }
+            // Declaration-only values used by the effect-free `describe`
+            // operation. They never change the writing mode.
+            "--runtime-version" => runtime_version = it.next(),
+            "--adapter-version" => adapter_version = it.next(),
             other => mode = other.to_string(),
         }
     }
@@ -49,6 +57,8 @@ fn parse() -> Args {
         mode,
         interval,
         file,
+        runtime_version,
+        adapter_version,
     }
 }
 
@@ -172,6 +182,22 @@ fn main() {
             }
         }
         "exit-now" => std::process::exit(0),
+        // Effect-free capability declaration. One adapter identity may be
+        // probed with different runtime versions to prove that a version
+        // change is a configuration repair rather than a silent upgrade.
+        "describe" => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "adapter": "workloop-fixture-worker",
+                    "adapter_version": args.adapter_version.as_deref().unwrap_or("1.0.0"),
+                    "runtime_version": args.runtime_version.as_deref().unwrap_or("fixture-1.0.0"),
+                    "protocol_versions": ["taisan.worker/1"],
+                    "roles": ["coding", "fix", "review"],
+                    "capabilities": ["workspace_write", "artifact_json", "process_control"],
+                })
+            );
+        }
         other => {
             eprintln!("unknown mode {other}\n{USAGE}");
             std::process::exit(2);

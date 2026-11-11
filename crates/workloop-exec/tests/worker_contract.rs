@@ -31,7 +31,9 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError};
+use workloop_core::ports::{
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError,
+};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
@@ -318,10 +320,14 @@ trait WorkerProvider {
 /// unknown attempts included — and records the identities the real port
 /// produced, so a scenario can assert both no second attempt and no
 /// second writer. It delegates every call to `PosixProcessControl` —
-/// spawn, inspect, and signal semantics are the real port's.
+/// spawn, inspect, and signal semantics are the real port's. The
+/// `fail_next` toggle injects a refusal at the spawn call itself: the
+/// describe probe still answers, so the scenario models a start attempt
+/// that fails after admission, not an adapter that cannot declare.
 struct CountingPosix {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
+    fail_next: Rc<Cell<bool>>,
 }
 
 impl ProcessControlPort for CountingPosix {
@@ -329,6 +335,11 @@ impl ProcessControlPort for CountingPosix {
         // Count the attempt before delegating: the counter observes
         // start calls, not only the ones that produced a writer.
         self.calls.set(self.calls.get() + 1);
+        if self.fail_next.replace(false) {
+            return Err(SpawnError::Refused {
+                reason: "adapter declined the request".into(),
+            });
+        }
         let out = PosixProcessControl.spawn(argv, cwd);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
@@ -353,12 +364,21 @@ impl ProcessControlPort for CountingPosix {
     fn reap(&self, pid: i32) {
         PosixProcessControl.reap(pid)
     }
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        PosixProcessControl.run_probe(argv, cwd, timeout)
+    }
 }
 
 struct PosixProvider {
     sup: Supervisor<CountingPosix>,
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
+    fail_next: Rc<Cell<bool>>,
 }
 
 impl WorkerProvider for PosixProvider {
@@ -378,6 +398,7 @@ impl WorkerProvider for PosixProvider {
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
         let spawned = Rc::new(RefCell::new(Vec::new()));
         let calls = Rc::new(Cell::new(0));
+        let fail_next = Rc::new(Cell::new(false));
         let mode = match shape {
             WorkerShape::CleanExit => vec![fixture_bin(), "clean-exit".into()],
             WorkerShape::NoArtifact => vec![fixture_bin(), "exit-no-artifact".into()],
@@ -388,6 +409,7 @@ impl WorkerProvider for PosixProvider {
                 CountingPosix {
                     spawned: spawned.clone(),
                     calls: calls.clone(),
+                    fail_next: fail_next.clone(),
                 },
                 tmp_root(tag),
                 mode,
@@ -395,6 +417,7 @@ impl WorkerProvider for PosixProvider {
             ),
             spawned,
             calls,
+            fail_next,
         }
     }
     fn handle(&mut self) -> &mut dyn WorkerHandle {
@@ -442,10 +465,11 @@ impl WorkerHandle for PosixProvider {
     }
     fn fail_next_spawn(&mut self, f: SpawnFail) {
         match f {
-            // A spawn that can never produce a process: the binary does
-            // not exist, so `spawn` returns Refused before any child.
+            // The describe probe still answers; the start attempt after
+            // admission is refused — the same refusal class Scripted
+            // injects on its spawn plan.
             SpawnFail::Refused => {
-                self.sup.worker_argv = vec!["/nonexistent/workloop-worker".into()];
+                self.fail_next.set(true);
             }
             SpawnFail::Unknown => {
                 unreachable!("PosixProvider does not declare spawn_unknown")
