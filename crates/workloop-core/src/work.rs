@@ -4253,6 +4253,7 @@ pub fn consume_due_recovery_intents(
         match store.transact(|tx| fire_due_intent(tx, &intent_id, now)) {
             Ok(FireOutcome::Ignored) => {}
             Ok(FireOutcome::Retired) => scan.retired += 1,
+            Ok(FireOutcome::Suppressed(reason)) => scan.held.push((intent_id, reason)),
             Ok(FireOutcome::Held(reason)) => scan.held.push((intent_id, reason)),
             Ok(FireOutcome::Consumed {
                 requeued,
@@ -4293,6 +4294,10 @@ enum FireOutcome {
     Ignored,
     Retired,
     Held(String),
+    /// The Work's equivalent-failure budget is spent: the automatic
+    /// requeue is refused and recorded as suppressed. The intent stays
+    /// `pending`; it is never silently consumed.
+    Suppressed(String),
     Consumed {
         requeued: bool,
         failed_terminal: bool,
@@ -4343,6 +4348,17 @@ fn fire_due_intent(
         // uncertain): a manual resume or another path owns the next
         // move. The intent stays visible and pending, never forced.
         return Ok(FireOutcome::Held("execution_active".into()));
+    }
+    // Equivalent-failure suppression: the Work's failure budget is
+    // spent, so the automatic requeue is refused and recorded as
+    // suppressed — never consumed, never silently held.
+    if let Some(usage) = tx.work_usage(&intent.work_id)?
+        && let Some(work) = tx.work(&intent.work_id)?
+        && usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit
+    {
+        return Ok(FireOutcome::Suppressed(
+            "equivalent_failure_suppressed".into(),
+        ));
     }
     if execution
         .repair_prerequisites
