@@ -1669,31 +1669,93 @@ fn evidence_defers_exchangeability_to_114() {
     }
 }
 
-/// A commit cited by the evidence need not exist in a shallow CI
-/// checkout or an exported tree. In that case the record must explain
-/// the detached review commit as pending the publishing branch, and the
-/// current checkout must still contain the exercised suite.
-fn absent_tested_revision_is_explained(evidence: &str, suite_exists: bool) -> Result<(), String> {
+/// The blob hash `git hash-object` assigns to the suite file in the
+/// working tree.
+fn suite_blob_hash(root: &std::path::Path, suite: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object"])
+        .arg(suite)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The suite blob a cited revision records, if that revision is in this
+/// checkout.
+fn suite_blob_at(root: &std::path::Path, revision: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "rev-parse",
+            &format!("{revision}:crates/workloop-github/tests/host_conformance.rs"),
+        ])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_commit_available(root: &std::path::Path, revision: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn git_is_ancestor(root: &std::path::Path, revision: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", revision, "HEAD"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// A commit cited by the evidence need not exist in this checkout: a CI
+/// pull-request checkout fetches only the merge commit, not every branch
+/// commit. In that case the record must name the tested revision as a
+/// branch commit and carry the exercised suite's blob digest, and the
+/// current suite must match that digest — presence of the suite alone
+/// would make the check wording-only.
+fn absent_tested_revision_is_explained(
+    evidence: &str,
+    suite_exists: bool,
+    suite_matches_digest: bool,
+) -> Result<(), String> {
     let lower = evidence.to_ascii_lowercase();
-    if !(lower.contains("detached local review commit") && lower.contains("pending")) {
+    if !(lower.contains("branch commit") && lower.contains("shallow") && lower.contains("digest")) {
         return Err(
-            "cited revision is absent here, so the record must state it is a detached review \
-             commit pending the branch commit"
+            "cited revision is absent here, so the record must name it as a branch commit that a \
+             shallow checkout may omit and record the exercised suite digest"
                 .into(),
         );
     }
     if !suite_exists {
         return Err("this checkout must contain the exercised suite".into());
     }
+    if !suite_matches_digest {
+        return Err("the current suite must match the recorded exercised-suite digest".into());
+    }
     Ok(())
 }
 
 /// Doc check: the tested revision named by the U9.1 evidence record must
-/// resolve to a repository commit that actually contains the exercised
-/// suite. A patch digest may supplement that revision but cannot replace
-/// a commit another checkout can reproduce. When the cited commit is not
-/// in this checkout's history, the record's detached/pending statement
-/// and the current suite stand in rather than a false red.
+/// be a branch commit that contains the exercised suite, and the record's
+/// suite blob digest must identify exactly the suite in this tree. A
+/// patch digest may supplement that revision but cannot replace a commit
+/// another checkout can reproduce. When the cited commit is absent (a
+/// shallow CI checkout), the digest keeps the check substantive instead
+/// of degrading to a wording-only assertion.
 #[test]
 fn evidence_tested_revision_contains_the_exercised_suite() {
     let evidence = include_str!("../../../docs/evidence/u9.1.md");
@@ -1710,43 +1772,50 @@ fn evidence_tested_revision_contains_the_exercised_suite() {
         sha.chars().all(|c| c.is_ascii_hexdigit()),
         "tested revision is a hex commit id: {sha}"
     );
+    let digest_row = evidence
+        .lines()
+        .find(|line| line.contains("Exercised suite blob digest"))
+        .expect("evidence records the exercised suite blob digest");
+    let digest = digest_row
+        .split('`')
+        .nth(1)
+        .expect("Exercised suite blob digest is a backticked blob id");
+    assert_eq!(digest.len(), 40, "suite digest is a full blob id: {digest}");
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "suite digest is a hex blob id: {digest}"
+    );
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let commit_probe = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-        .output();
-    let commit_available = commit_probe
-        .as_ref()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-    if !commit_available {
-        let suite =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/host_conformance.rs");
-        absent_tested_revision_is_explained(evidence, suite.is_file())
+    let suite = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/host_conformance.rs");
+    let current = suite_blob_hash(&root, &suite).expect("git can hash the exercised suite");
+    assert_eq!(
+        current, digest,
+        "the suite in this tree must be the exercised suite recorded in evidence"
+    );
+    if !git_commit_available(&root, sha) {
+        absent_tested_revision_is_explained(evidence, suite.is_file(), current == digest)
             .unwrap_or_else(|reason| panic!("{reason}"));
         return;
     }
-    let spec = format!("{sha}:crates/workloop-github/tests/host_conformance.rs");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["cat-file", "-e", &spec])
-        .output()
-        .expect("git is available");
+    let at_revision = suite_blob_at(&root, sha)
+        .unwrap_or_else(|| panic!("tested revision {sha} must contain the exercised suite"));
+    assert_eq!(
+        at_revision, digest,
+        "tested revision {sha} must contain the exercised suite blob"
+    );
     assert!(
-        out.status.success(),
-        "tested revision {sha} must contain the exercised suite: {}",
-        String::from_utf8_lossy(&out.stderr)
+        git_is_ancestor(&root, sha),
+        "tested revision {sha} must be on the branch history leading to HEAD"
     );
 }
 
 #[test]
 fn absent_tested_revision_requires_pending_note_and_suite() {
     let evidence = include_str!("../../../docs/evidence/u9.1.md");
-    assert!(absent_tested_revision_is_explained(evidence, true).is_ok());
-    assert!(absent_tested_revision_is_explained("no note", true).is_err());
-    assert!(absent_tested_revision_is_explained(evidence, false).is_err());
+    assert!(absent_tested_revision_is_explained(evidence, true, true).is_ok());
+    assert!(absent_tested_revision_is_explained("no note", true, true).is_err());
+    assert!(absent_tested_revision_is_explained(evidence, false, true).is_err());
+    assert!(absent_tested_revision_is_explained(evidence, true, false).is_err());
 }
 
 /// Doc check: the exchangeability report's runner semantics and coverage
