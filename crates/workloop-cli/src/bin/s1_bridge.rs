@@ -530,6 +530,15 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                     &format!("HEAD:refs/heads/{branch}"),
                 ],
             );
+            // U8.4 fault hook: S1_BRIDGE_KILL_AFTER_APPLY=push_ref dies
+            // between the landed push and the receipt write (lost response).
+            if std::env::var("S1_BRIDGE_KILL_AFTER_APPLY").as_deref() == Ok("push_ref") {
+                eprintln!(
+                    "s1-bridge: injected fault kill_after_apply push_ref {}",
+                    intent.action_id
+                );
+                std::process::exit(137);
+            }
             let observed = gh(&[
                 "api",
                 &format!("repos/{}/branches/{branch}", ctx.repo_display),
@@ -580,6 +589,20 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
             title,
             body,
         } => {
+            // U8.4 fault hook: S1_BRIDGE_INJECT_FAIL_OPEN_PR=1 records a
+            // definite no-effect failure for the create leg (partial effect:
+            // push landed, create refused).
+            if std::env::var("S1_BRIDGE_INJECT_FAIL_OPEN_PR").as_deref() == Ok("1") {
+                emit_result(
+                    ctx,
+                    intent,
+                    HostActionStatus::Failed {
+                        reason: "injected fault: partial effect (landed push, change_request_create refused)".into(),
+                    },
+                    vec![],
+                );
+                return Ok(());
+            }
             match gh(&[
                 "pr",
                 "create",
