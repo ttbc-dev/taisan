@@ -179,6 +179,13 @@ fn observe_worker_declaration_within(
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "describe omitted the adapter identity".to_string())?;
+    // The reported identity is untrusted worker output and gets bound
+    // verbatim: it must pass the same `check_opaque` rules that gate
+    // `AdapterId::new` and deserialization — an oversized or
+    // control-character id stored now would fail every pending-request
+    // read back (#152).
+    let adapter = AdapterId::new(adapter)
+        .map_err(|why| format!("describe declared an invalid adapter identity: {why}"))?;
     let strings = |key: &str| -> Vec<String> {
         value
             .get(key)
@@ -192,7 +199,7 @@ fn observe_worker_declaration_within(
             .unwrap_or_default()
     };
     Ok(WorkerDeclaration {
-        adapter: AdapterId::trusted(adapter),
+        adapter,
         adapter_version: value
             .get("adapter_version")
             .and_then(|v| v.as_str())
@@ -361,6 +368,26 @@ mod tests {
             assert!(
                 observe_worker_declaration(&port, &["worker".into()], Path::new("/tmp")).is_err()
             );
+        }
+    }
+
+    /// A malformed adapter identity is refused at the describe
+    /// boundary, never bound: the same `check_opaque` rules that gate
+    /// `AdapterId::new` and deserialization apply to worker output —
+    /// storing one would break every pending-request read back (#152).
+    #[test]
+    fn a_malformed_adapter_identity_is_refused() {
+        for body in [
+            format!(r#"{{"adapter":"{}"}}"#, "a".repeat(600)),
+            r#"{"adapter":"has\ncontrol"}"#.to_string(),
+        ] {
+            let why = observe_worker_declaration(
+                &declaring(&body),
+                &["worker".into()],
+                Path::new("/tmp"),
+            )
+            .expect_err("a malformed adapter identity must be refused");
+            assert!(why.contains("invalid adapter identity"), "{why}");
         }
     }
 

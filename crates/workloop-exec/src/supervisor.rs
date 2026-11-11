@@ -103,6 +103,39 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
+/// What a timed-out probe may signal once the bound has elapsed. The
+/// waiter thread can already have reaped the leader between the bound
+/// expiring and the kill, freeing the pid for reuse, so the recorded
+/// `pid + lstart` is re-verified first — the same owner check
+/// `proof_identities` applies to a recorded group: pgid == the leader's
+/// pid (`process_group(0)`), a live process at that pid under a
+/// different start is a recycled owner and its group is foreign, while
+/// an absent owner leaves only this probe's own stragglers holding the
+/// group.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeSignalPlan {
+    /// The leader re-verified: it and the group this probe created are
+    /// still ours to signal.
+    LeaderAndGroup,
+    /// The pid is unallocated: a surviving group can only be held by
+    /// this probe's own stragglers — a group id is only minted by a
+    /// live process of that pid — so the group is still ours to signal.
+    GroupOnly,
+    /// A live process at the pid carries a different start (recycled,
+    /// foreign) or the lookup itself failed: nothing is signalled. A
+    /// possibly-leaked straggler beats a signal to an unrelated
+    /// process.
+    Nothing,
+}
+
+fn probe_signal_plan(recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
+    match lookup {
+        LstartLookup::Present(now) if now == recorded_lstart => ProbeSignalPlan::LeaderAndGroup,
+        LstartLookup::Absent => ProbeSignalPlan::GroupOnly,
+        _ => ProbeSignalPlan::Nothing,
+    }
+}
+
 impl PosixProcessControl {
     /// Capture a reuse-resistant identity for an existing process —
     /// the caller's own pid when claiming the run lease. Returns an
@@ -360,11 +393,26 @@ impl ProcessControlPort for PosixProcessControl {
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let child = cmd.spawn().map_err(|e| SpawnError::Refused {
+        let mut child = cmd.spawn().map_err(|e| SpawnError::Refused {
             reason: format!("spawn {program}: {e}"),
         })?;
         let pid = child.id() as i32;
-        let pgid = unsafe { libc::getpgid(pid) };
+        // Record the leader's `pid + lstart` while the pid is provably
+        // still ours — the handle is held, so it cannot have been
+        // recycled. The waiter below can reap the leader before the
+        // bound path signals, and only this identity separates our
+        // process from a reused pid there. When the identity cannot be
+        // captured no later signal is verifiable: the still-unreaped
+        // child is stopped now (signalling it is safe while the handle
+        // is held) and the probe's fate is reported unknown.
+        let started_at = match Self::identity_of(pid) {
+            Ok(identity) => identity.started_at,
+            Err(reason) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SpawnError::Unknown { reason });
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = sender.send(child.wait_with_output());
@@ -378,14 +426,24 @@ impl ProcessControlPort for PosixProcessControl {
                 reason: format!("wait {program}: {e}"),
             }),
             Err(_) => {
-                // The bound elapsed: signal the whole recorded group and
-                // the leader itself (covers a pgid read that raced the
-                // group setup), then give the waiter a short drain so the
-                // direct child is reaped rather than left a zombie.
-                if pgid > 0 {
-                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                // The bound elapsed: re-verify the recorded identity
+                // before signalling — the waiter may already have reaped
+                // the leader, freeing the pid for reuse (#152). The
+                // group id is the leader's pid by construction, so the
+                // plan decides exactly which of the leader and its
+                // group are still ours. A short drain then lets the
+                // waiter reap the direct child rather than leaving a
+                // zombie.
+                match probe_signal_plan(&started_at, &lstart_of(pid)) {
+                    ProbeSignalPlan::LeaderAndGroup => unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    },
+                    ProbeSignalPlan::GroupOnly => unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    },
+                    ProbeSignalPlan::Nothing => {}
                 }
-                unsafe { libc::kill(pid, libc::SIGKILL) };
                 let _ = receiver.recv_timeout(Duration::from_secs(2));
                 Ok(ProbeOutcome::Bounded)
             }
@@ -2432,5 +2490,61 @@ mod tests {
             LstartLookup::Present(s) => assert_eq!(s, "Sat Oct 4 06:14:00 2026"),
             other => panic!("expected Present, got {other:?}"),
         }
+    }
+
+    /// The bounded-probe signal plan applies the recorded-group owner
+    /// check: a leader that re-verifies is ours to signal, an absent
+    /// owner pid leaves only our own stragglers holding the group, and
+    /// a pid that lives under a different start is recycled — signalling
+    /// it would hit an unrelated process (#152).
+    #[test]
+    fn a_probe_timeout_signals_only_verified_identities() {
+        let recorded = "Sat Oct 4 06:14:00 2026";
+        assert_eq!(
+            probe_signal_plan(recorded, &LstartLookup::Present(recorded.into())),
+            ProbeSignalPlan::LeaderAndGroup
+        );
+        assert_eq!(
+            probe_signal_plan(recorded, &LstartLookup::Absent),
+            ProbeSignalPlan::GroupOnly
+        );
+        assert_eq!(
+            probe_signal_plan(
+                recorded,
+                &LstartLookup::Present("Sun Nov 1 00:00:00 2026".into())
+            ),
+            ProbeSignalPlan::Nothing
+        );
+        assert_eq!(
+            probe_signal_plan(recorded, &LstartLookup::Failed("ps unavailable".into())),
+            ProbeSignalPlan::Nothing
+        );
+    }
+
+    /// A probe that leaves a same-group straggler past the bound loses
+    /// the whole group: the leader's pid is the group id by
+    /// construction, so the straggler writes nothing after the bound.
+    #[test]
+    fn a_timed_out_probe_group_is_killed_with_its_leader() {
+        let marker =
+            std::env::temp_dir().join(format!("workloop-probe-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // The straggler writes the marker at ~1s if the group survives;
+        // the leader keeps the bound wedged well past that point.
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("(sleep 1; touch \"{}\") & sleep 30", marker.display()),
+        ];
+        let outcome = PosixProcessControl
+            .run_probe(&argv, Path::new("/tmp"), Duration::from_millis(50))
+            .expect("a spawned probe reports its outcome");
+        assert_eq!(outcome, ProbeOutcome::Bounded);
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(
+            !marker.exists(),
+            "a same-group straggler must be killed with the probe leader"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }
