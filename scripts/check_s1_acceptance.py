@@ -153,12 +153,13 @@ def main():
         for key in ('pr', 'head', 'checks', 'review'):
             if key not in receipts:
                 fail(f'{cid}: remote_receipts.{key} missing entirely (absence must be explicit null + reason)')
-        if isinstance(receipts.get('pr'), str) and '#' not in receipts['pr']:
-            fail(f'{cid}: remote_receipts.pr {receipts["pr"]!r} is not a PR reference')
-        elif receipts.get('pr') is None:
+        pr = receipts.get('pr')
+        if pr is None:
             reason = receipts.get('pr_reason')
             if not isinstance(reason, str) or len(reason.strip()) < 20:
                 fail(f'{cid}: remote_receipts.pr is null without a pr_reason of ≥ 20 chars')
+        elif not isinstance(pr, str) or '#' not in pr:
+            fail(f'{cid}: remote_receipts.pr {pr!r} is not a PR reference')
 
         def resolve(container, key, label):
             value = container.get(key)
