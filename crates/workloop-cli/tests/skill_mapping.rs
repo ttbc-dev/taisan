@@ -915,11 +915,9 @@ fn a_mid_operation_crash_recovers_identically_through_the_skill() {
 
     // The operation runs but the response is lost (the unknown-result
     // case): the agent crashed or the connection dropped after the
-    // store committed and before the envelope arrived.
+    // store committed and before the envelope arrived. Nothing in the
+    // recovery path below may depend on having read it.
     let output = output_at(&root, &as_refs(&args));
-    let original = envelope(&output);
-    assert_eq!(original["status"], "accepted");
-    let command_id = original["command"]["id"].as_str().unwrap().to_string();
 
     // Recovery via the skill's documented reconciliation — the original
     // (origin, actor, idempotency_key), byte-identical payload.
@@ -931,7 +929,10 @@ fn a_mid_operation_crash_recovers_identically_through_the_skill() {
     );
     let recovered = run_at(&root, &as_refs(&by_key));
     assert_eq!(recovered["status"], "accepted");
-    assert_eq!(recovered["result"]["command_id"], command_id);
+    let command_id = recovered["result"]["command_id"]
+        .as_str()
+        .expect("recovery returns the recorded command id")
+        .to_string();
 
     // The direct-CLI recovery of the same identity agrees.
     let direct = run_at(
@@ -956,6 +957,13 @@ fn a_mid_operation_crash_recovers_identically_through_the_skill() {
     assert_eq!(replay["command"]["id"], command_id);
     let list = run_at(&root, &["work-list"]);
     assert_eq!(list["result"]["items"].as_array().unwrap().len(), 1);
+
+    // Post-hoc ground truth from the lost bytes, decoded only after
+    // recovery completed: the recovered identity is the identity that
+    // was committed.
+    let original = envelope(&output);
+    assert_eq!(original["status"], "accepted");
+    assert_eq!(original["command"]["id"], command_id);
 
     // An unknown result never justifies a fresh key.
     let (code, env) = fail_at(
