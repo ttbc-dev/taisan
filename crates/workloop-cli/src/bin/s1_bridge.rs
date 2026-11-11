@@ -178,6 +178,33 @@ impl Ctx {
     }
 }
 
+/// U8.4 fault hooks are scenario-only and must never be armed by a
+/// stray inherited variable. They are inert unless the process
+/// explicitly opts in with `S1_BRIDGE_SCENARIO_FAULTS` naming the exact
+/// repository this bridge is configured for, and the build is a debug
+/// build (the scenario bridge is never a release artifact). Only then
+/// is the hook's own value consulted. The predicate is split out so the
+/// arming rules are unit-tested without mutating process-global env.
+fn fault_hook_armed(ctx: &Ctx, hook: &str, expected: &str) -> bool {
+    fault_hook_armed_with(
+        &ctx.repo_display,
+        std::env::var("S1_BRIDGE_SCENARIO_FAULTS").ok().as_deref(),
+        std::env::var(hook).ok().as_deref(),
+        expected,
+        cfg!(debug_assertions),
+    )
+}
+
+fn fault_hook_armed_with(
+    repo_display: &str,
+    opted_in_repo: Option<&str>,
+    hook_value: Option<&str>,
+    expected: &str,
+    debug_build: bool,
+) -> bool {
+    debug_build && opted_in_repo == Some(repo_display) && hook_value == Some(expected)
+}
+
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
 /// authorization is the credential's real `permissions` answer.
@@ -533,10 +560,9 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
             // U8.4 fault hook: S1_BRIDGE_KILL_AFTER_APPLY=push_ref dies
             // only after the push actually succeeded — a lease-rejected or
             // otherwise failed push is recorded through the ordinary
-            // Failed path, never fault-injected.
-            if push.is_ok()
-                && std::env::var("S1_BRIDGE_KILL_AFTER_APPLY").as_deref() == Ok("push_ref")
-            {
+            // Failed path, never fault-injected. Arming additionally
+            // requires the scenario opt-in; see `fault_hook_armed`.
+            if push.is_ok() && fault_hook_armed(ctx, "S1_BRIDGE_KILL_AFTER_APPLY", "push_ref") {
                 eprintln!(
                     "s1-bridge: injected fault kill_after_apply push_ref {}",
                     intent.action_id
@@ -595,8 +621,9 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
         } => {
             // U8.4 fault hook: S1_BRIDGE_INJECT_FAIL_OPEN_PR=1 records a
             // definite no-effect failure for the create leg (partial effect:
-            // push landed, create refused).
-            if std::env::var("S1_BRIDGE_INJECT_FAIL_OPEN_PR").as_deref() == Ok("1") {
+            // push landed, create refused). Arming additionally requires
+            // the scenario opt-in; see `fault_hook_armed`.
+            if fault_hook_armed(ctx, "S1_BRIDGE_INJECT_FAIL_OPEN_PR", "1") {
                 emit_result(
                     ctx,
                     intent,
@@ -1101,5 +1128,58 @@ fn main() {
             }
             std::thread::sleep(Duration::from_millis(interval_ms));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fault_hook_armed_with;
+
+    const SCENARIO_REPO: &str = "shimpeiws/coding-worker-smoke";
+
+    #[test]
+    fn fault_hooks_require_scenario_opt_in_for_this_repo() {
+        assert!(fault_hook_armed_with(
+            SCENARIO_REPO,
+            Some(SCENARIO_REPO),
+            Some("push_ref"),
+            "push_ref",
+            true,
+        ));
+        assert!(!fault_hook_armed_with(
+            SCENARIO_REPO,
+            None,
+            Some("push_ref"),
+            "push_ref",
+            true,
+        ));
+        assert!(!fault_hook_armed_with(
+            SCENARIO_REPO,
+            Some("someone/else"),
+            Some("push_ref"),
+            "push_ref",
+            true,
+        ));
+        assert!(!fault_hook_armed_with(
+            SCENARIO_REPO,
+            Some(SCENARIO_REPO),
+            Some("open_pr"),
+            "push_ref",
+            true,
+        ));
+        assert!(!fault_hook_armed_with(
+            SCENARIO_REPO,
+            Some(SCENARIO_REPO),
+            None,
+            "push_ref",
+            true,
+        ));
+        assert!(!fault_hook_armed_with(
+            SCENARIO_REPO,
+            Some(SCENARIO_REPO),
+            Some("push_ref"),
+            "push_ref",
+            false,
+        ));
     }
 }
