@@ -538,6 +538,153 @@ fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
     assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
 }
 
+/// An `applied` intent whose remote fact later diverges re-arms — but
+/// only on an `unknown` receipt authenticated by the intent's bound
+/// actor. Unauthenticated and unbound receipts are invalid evidence and
+/// never re-open a reconciled intent.
+#[test]
+fn applied_intent_rearms_only_on_bound_actor_unknown_receipt() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-drift");
+    let action_id = insert_intent_with(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "b".into(),
+            produced: rev("head-x"),
+        },
+        HostActionStatus::Applied,
+    );
+    let drift = |authenticated_actor: Option<HostActorRef>, event: &str| {
+        handle_observation(
+            &store,
+            &config(),
+            &obs(
+                &work_id,
+                &eid,
+                Some(event),
+                NOW,
+                ObservationFact::HostActionResult {
+                    action_id: action_id.clone(),
+                    authenticated_actor,
+                    status: HostActionStatus::Unknown {
+                        reason: "remote no longer contains the pushed revision".into(),
+                    },
+                    effects: vec![NormalizedEffectFact::RefPublished {
+                        repository: repo(),
+                        branch: "b".into(),
+                        produced: rev("head-x"),
+                        observed: rev("head-y"),
+                        relation: RefRelation::Diverged,
+                    }],
+                },
+            ),
+            NOW,
+        )
+        .unwrap();
+    };
+
+    // An unauthenticated drift receipt cannot resurrect the intent.
+    drift(None, "drift-unauthenticated");
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+
+    // A receipt authenticated as a different actor cannot either.
+    drift(
+        Some(HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("other-agent"),
+        }),
+        "drift-wrong-actor",
+    );
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+
+    // The bound actor's drift receipt re-opens reconciliation: the
+    // intent is outstanding again, not stuck behind the applied
+    // terminal.
+    drift(Some(publisher()), "drift-bound-actor");
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown {
+            reason: "remote no longer contains the pushed revision".into()
+        }
+    );
+    let outstanding = store
+        .transact(|tx| workloop_core::projection::outstanding_actions(tx, &work_id))
+        .unwrap();
+    assert_eq!(outstanding, vec![action_id.clone()]);
+
+    // Re-armed means reconcilable again: a later receipt authenticated
+    // by the bound actor settles it.
+    handle_observation(
+        &store,
+        &config(),
+        &obs(
+            &work_id,
+            &eid,
+            Some("resettle"),
+            NOW,
+            ObservationFact::HostActionResult {
+                action_id: action_id.clone(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Applied,
+                effects: vec![NormalizedEffectFact::RefPublished {
+                    repository: repo(),
+                    branch: "b".into(),
+                    produced: rev("head-x"),
+                    observed: rev("head-z"),
+                    relation: RefRelation::Ancestor,
+                }],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+}
+
+#[test]
+fn failed_intent_stays_terminal_under_unknown_receipts() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "k-drift-failed");
+    let action_id = insert_intent_with(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "b".into(),
+            produced: rev("head-x"),
+        },
+        HostActionStatus::Failed {
+            reason: "push rejected".into(),
+        },
+    );
+    handle_observation(
+        &store,
+        &config(),
+        &obs(
+            &work_id,
+            &eid,
+            Some("drift-on-failed"),
+            NOW,
+            ObservationFact::HostActionResult {
+                action_id: action_id.clone(),
+                authenticated_actor: Some(publisher()),
+                status: HostActionStatus::Unknown {
+                    reason: "remote fact moved".into(),
+                },
+                effects: vec![],
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Failed {
+            reason: "push rejected".into()
+        }
+    );
+}
+
 #[test]
 fn head_bound_evidence_drives_success_only_for_the_current_head() {
     let store = SqliteStore::in_memory(1).unwrap();

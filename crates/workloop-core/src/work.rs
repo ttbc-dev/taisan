@@ -2648,13 +2648,27 @@ fn reconcile_intent(
         return Ok(());
     };
     // Terminal reconciliation sticks: a late receipt cannot resurrect a
-    // failed intent or downgrade an applied one. `unknown` stays
-    // reconcilable — a later receipt for the same action_id is what
-    // resolves it.
-    if matches!(
-        intent.status,
-        HostActionStatus::Applied | HostActionStatus::Failed { .. }
-    ) {
+    // failed intent or downgrade an applied one — with one drift
+    // exception. An `applied` intent whose remote fact later diverges
+    // is re-armable: an `unknown` receipt re-opens reconciliation, but
+    // only when authenticated by the intent's bound actor. An
+    // unauthenticated or unbound receipt is invalid evidence and can
+    // never re-open a reconciled intent. `unknown` stays reconcilable —
+    // a later receipt for the same action_id is what resolves it.
+    if intent.status == HostActionStatus::Applied {
+        let drift_rearm = matches!(status, HostActionStatus::Unknown { .. })
+            && authenticated_actor.as_ref() == Some(&intent.actor);
+        if !drift_rearm {
+            return Ok(());
+        }
+        return tx.apply(&Effect::UpdateHostActionIntent {
+            action_id: action_id.to_string(),
+            status,
+            authenticated_actor,
+            effects,
+        });
+    }
+    if matches!(intent.status, HostActionStatus::Failed { .. }) {
         return Ok(());
     }
     let recorded = match status {
