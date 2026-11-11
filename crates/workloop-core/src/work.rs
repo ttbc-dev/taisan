@@ -4309,7 +4309,35 @@ enum FireOutcome {
 /// documented revalidation guards before any transition, so a stale
 /// list snapshot can never fire an intent twice or against a state
 /// that changed since the list was taken.
+/// Fire one intent, keeping the recorded suppression state honest:
+/// any outcome other than `Suppressed` (and other than `Ignored`,
+/// which means nothing was learned) drops a stale
+/// `equivalent_failure_suppressed` deferral for this intent's
+/// Execution, so the capacity Query never shows a stall explanation
+/// for a condition that no longer holds.
 fn fire_due_intent(
+    tx: &mut dyn TxView,
+    intent_id: &str,
+    now: i64,
+) -> Result<FireOutcome, StoreError> {
+    let outcome = fire_due_intent_inner(tx, intent_id, now)?;
+    if !matches!(outcome, FireOutcome::Suppressed(_) | FireOutcome::Ignored)
+        && let Some(execution_id) = tx
+            .recovery_intents()?
+            .into_iter()
+            .find(|i| i.intent_id == intent_id)
+            .and_then(|i| i.execution_id)
+        && tx
+            .deferrals()?
+            .iter()
+            .any(|d| d.execution_id == execution_id && d.reason == "equivalent_failure_suppressed")
+    {
+        tx.apply(&Effect::ClearDeferral { execution_id })?;
+    }
+    Ok(outcome)
+}
+
+fn fire_due_intent_inner(
     tx: &mut dyn TxView,
     intent_id: &str,
     now: i64,

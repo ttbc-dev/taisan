@@ -724,6 +724,31 @@ fn lp_26_a_suppressed_intent_is_recorded_not_consumed() {
         "{}",
         deferral.diagnostic
     );
+
+    // A later outcome clears the stale suppression explanation: the
+    // failure budget resets and the Execution holds for a human
+    // decision instead — the capacity Query must not keep showing the
+    // old stall reason.
+    set_state(
+        &store,
+        &e1,
+        ExecutionState::Paused,
+        ExecutionState::Paused,
+        Some(vec![RepairPrerequisite::OperatorDecision]),
+    );
+    seed_usage(&store, &w, &|u| {
+        u.equivalent_failure_streak = 0;
+        u.equivalent_signature = None;
+    });
+    let scan = consume(&store, NOW + 1);
+    assert_eq!(scan.held, vec![(intent_id.clone(), "operator_hold".into())]);
+    let deferrals = store.transact(|tx| tx.deferrals()).unwrap();
+    assert!(
+        deferrals
+            .iter()
+            .all(|d| !(d.execution_id == e1 && d.reason == "equivalent_failure_suppressed")),
+        "the stale suppression explanation is cleared once the outcome changes: {deferrals:?}"
+    );
 }
 
 // ---- LP-27: timeout recovery sequence ordering ----

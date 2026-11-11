@@ -91,10 +91,12 @@ taisan capacity
 
 `attention` without `--work` spans every Work. Show canonical identities,
 recorded state, unavailable sources, and blockers. Agent inference is not
-recorded evidence; an unavailable source is surfaced, never translated
+recorded evidence; an unavailable source is surfaced in
+`sources[].availability` inside an `accepted` envelope, never translated
 into an empty workload. A not-found item is `accepted` with
-`result: null` — distinct from an unreadable store (`error`, exit 4) or
-unavailable source (`error`, exit 5).
+`result: null`; an unreadable store is `error` at exit 4. (Exit 5 is not
+produced by Queries — it belongs to a `rejected` Command whose
+`reason.code` is `source_unavailable`.)
 
 ### Intervene on eligible Executions
 
