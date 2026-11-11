@@ -368,3 +368,36 @@ CREATE TABLE IF NOT EXISTS body_pins (
     dependency TEXT NOT NULL,
     PRIMARY KEY (body_id, dependency)
 );
+
+-- Two-phase bounded reclaim plans for explicit `retention cleanup`.
+-- Phase 1 computes the eligible set and persists it here (bounded by
+-- max_bodies/max_bytes); phase 2 executes it. An interrupted phase 2
+-- resumes from the pending entries; already-reclaimed bodies are
+-- skipped. The plan and every entry's outcome are durable metadata
+-- that survives the bodies they name.
+CREATE TABLE IF NOT EXISTS reclaim_plans (
+    plan_id TEXT PRIMARY KEY,
+    created_unix_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'completed')),
+    body_count INTEGER NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    completed_unix_seconds INTEGER
+);
+
+-- One row per planned body. `reason` is the eligibility reason that
+-- authorized planning; `outcome` is NULL while pending, then one of
+-- 'reclaimed' | 'unavailable' | 'held' | 'delete_failed'.
+CREATE TABLE IF NOT EXISTS reclaim_plan_entries (
+    plan_id TEXT NOT NULL REFERENCES reclaim_plans(plan_id),
+    body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
+    category TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    outcome TEXT
+        CHECK (outcome IS NULL OR outcome IN
+               ('reclaimed', 'unavailable', 'held', 'delete_failed')),
+    outcome_reason TEXT,
+    outcome_unix_seconds INTEGER,
+    PRIMARY KEY (plan_id, body_id)
+);

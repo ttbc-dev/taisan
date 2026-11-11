@@ -17,11 +17,12 @@ use workloop_core::domain::*;
 use workloop_core::identity::{
     CommitRevision, IssueId, IssueRef, RepositoryId, RepositoryRef, SourceSnapshot,
 };
-use workloop_core::projection::{self, CommandResultLookup};
+use workloop_core::projection::{self, Availability, CommandResultLookup, SourceStatus};
 use workloop_core::store::Store;
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
+use workloop_store::retention::PlanBounds;
 use workloop_store::sqlite::SqliteStore;
 
 mod run_loop;
@@ -176,6 +177,34 @@ enum Commands {
         origin: Option<String>,
         #[arg(long)]
         replay_key: Option<String>,
+    },
+    /// Storage-pressure accounting and two-phase bounded cleanup.
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum RetentionCommands {
+    /// Read-only report: per-category usage against max_bytes/max_age,
+    /// reclaim status and the bounded unavailable body list.
+    Report,
+    /// Two-phase bounded cleanup. Dry-run by default: computes and
+    /// shows the bounded plan, deletes nothing, persists nothing.
+    /// `--execute` persists the plan and performs the reclaim; an
+    /// interrupted run resumes the open plan, skipping entries whose
+    /// outcome is already recorded.
+    Cleanup {
+        /// Perform the phase-2 reclaim plan. Without it, changes nothing.
+        #[arg(long)]
+        execute: bool,
+        /// Override the configured per-pass body bound.
+        #[arg(long)]
+        max_bodies: Option<usize>,
+        /// Override the configured per-pass byte bound.
+        #[arg(long)]
+        max_bytes: Option<u64>,
     },
 }
 
@@ -974,6 +1003,117 @@ fn run(cli: Cli) -> i32 {
                     envelope::ErrorClass::Store,
                     &e.to_string(),
                 )),
+            }
+        }
+        Commands::Retention { command } => {
+            // Per-category limits are not configurable yet: the closed
+            // documented defaults apply (retention-policy.md). The
+            // installation config owns the sweep bounds only.
+            let category_settings = workloop_store::retention::CategorySettings::new();
+            let finish = |kind: &str, value: serde_json::Value| -> i32 {
+                emit((
+                    envelope::Envelope {
+                        schema_version: "1",
+                        status: "accepted",
+                        command: Some(envelope::query_identity(
+                            kind,
+                            &actor,
+                            cli.idempotency_key.as_deref(),
+                        )),
+                        work_id: None,
+                        execution_id: None,
+                        result: Some(value),
+                        reason: None,
+                        evidence_refs: vec![],
+                        sources: Some(vec![SourceStatus {
+                            source: "store".into(),
+                            availability: Availability::Known,
+                            observed_unix_seconds: None,
+                        }]),
+                        as_of: None,
+                    },
+                    envelope::EXIT_OK,
+                ))
+            };
+            let store_error = |kind: &str, e: workloop_core::store::StoreError| -> i32 {
+                emit(envelope::error_envelope(
+                    Some(envelope::query_identity(
+                        kind,
+                        &actor,
+                        cli.idempotency_key.as_deref(),
+                    )),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                ))
+            };
+            match command {
+                RetentionCommands::Report => {
+                    match store.retention_report(&category_settings, now()) {
+                        Ok(report) => finish(
+                            "retention_report",
+                            serde_json::to_value(report).unwrap_or(serde_json::json!({})),
+                        ),
+                        Err(e) => store_error("retention_report", e),
+                    }
+                }
+                RetentionCommands::Cleanup {
+                    execute,
+                    max_bodies,
+                    max_bytes,
+                } => {
+                    let retention = installation.retention_settings();
+                    let bounds = PlanBounds {
+                        max_bodies: max_bodies.unwrap_or(retention.max_bodies),
+                        max_bytes: max_bytes.unwrap_or(retention.max_bytes),
+                    };
+                    let protected = installation_files(&db_abs, &config_path);
+                    if !execute {
+                        // Dry-run: nothing is persisted, nothing is
+                        // marked, nothing is deleted.
+                        return match store.reclaim_plan_candidates(
+                            &category_settings,
+                            &bounds,
+                            &state_root,
+                            &protected,
+                            now(),
+                        ) {
+                            Ok(plan) => finish(
+                                "retention_cleanup",
+                                serde_json::to_value(plan).unwrap_or(serde_json::json!({})),
+                            ),
+                            Err(e) => store_error("retention_cleanup", e),
+                        };
+                    }
+                    // Phase 1 (persist the bounded plan), then phase 2
+                    // execute it; an interrupted run resumes the open
+                    // plan and skips already-recorded entries.
+                    if let Err(e) = store.reclaim_plan_create(
+                        &category_settings,
+                        &bounds,
+                        &state_root,
+                        &protected,
+                        now(),
+                    ) {
+                        return store_error("retention_cleanup", e);
+                    }
+                    match store.reclaim_plan_execute(
+                        &state_root,
+                        &protected,
+                        retention.delete_error_limit,
+                        now(),
+                    ) {
+                        Ok(Some(execution)) => finish(
+                            "retention_cleanup",
+                            serde_json::to_value(execution).unwrap_or(serde_json::json!({})),
+                        ),
+                        // Phase 1 just ensured an open plan exists.
+                        Ok(None) => finish(
+                            "retention_cleanup",
+                            serde_json::json!({ "completed": true, "no_open_plan": true }),
+                        ),
+                        Err(e) => store_error("retention_cleanup", e),
+                    }
+                }
             }
         }
     }
