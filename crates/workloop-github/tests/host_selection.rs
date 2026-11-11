@@ -206,6 +206,7 @@ fn config_swap_selects_host_for_new_work_and_keeps_existing_bindings() {
         HostAction::PushRef {
             branch: branch_a.clone(),
             produced: rev_on(&repo_a, "head-a-1"),
+            expected_prior: None,
         },
     );
     let open_a = insert_intent(
@@ -282,6 +283,7 @@ fn config_swap_selects_host_for_new_work_and_keeps_existing_bindings() {
         HostAction::PushRef {
             branch: branch_b.clone(),
             produced: rev_on(&repo_b, "head-b-1"),
+            expected_prior: None,
         },
     );
     insert_intent(
@@ -325,6 +327,7 @@ fn config_swap_selects_host_for_new_work_and_keeps_existing_bindings() {
         HostAction::PushRef {
             branch: "work/follow-up".into(),
             produced: rev_on(&repo_a, "head-a-2"),
+            expected_prior: None,
         },
     );
 

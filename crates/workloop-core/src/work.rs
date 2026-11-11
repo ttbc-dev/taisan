@@ -3389,6 +3389,43 @@ fn maybe_publish(
         let produced =
             CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
+        // The guard's expected prior is the freshest remote position
+        // this installation observed for the branch: the last recorded
+        // branch-state read (e.g. the fresh position a refusal surfaced)
+        // wins over the last applied push's read-back revision, and a
+        // first publish expects an absent ref.
+        let observed_position = tx
+            .observations_for_work(&work.id)?
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::BranchState {
+                    repository,
+                    branch: state_branch,
+                    state: BranchState::At { revision },
+                } if state_branch == &branch && repository == &work.binding.repository => {
+                    Some(revision.clone())
+                }
+                _ => None,
+            })
+            .next_back();
+        let expected_prior = observed_position.or_else(|| {
+            work_intents
+                .iter()
+                .filter(|i| i.status == HostActionStatus::Applied)
+                .flat_map(|i| i.effects.iter())
+                .filter_map(|e| match e {
+                    NormalizedEffectFact::RefPublished {
+                        repository,
+                        branch: ref_branch,
+                        observed,
+                        ..
+                    } if ref_branch == &branch && repository == &work.binding.repository => {
+                        Some(observed.clone())
+                    }
+                    _ => None,
+                })
+                .next_back()
+        });
         return record_intent(
             tx,
             &work,
@@ -3396,6 +3433,7 @@ fn maybe_publish(
             HostAction::PushRef {
                 branch: branch.clone(),
                 produced,
+                expected_prior,
             },
             execution,
         );

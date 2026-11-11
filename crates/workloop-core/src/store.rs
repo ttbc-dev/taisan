@@ -207,10 +207,17 @@ fn pending_status() -> HostActionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HostAction {
-    /// Publish `produced` on `branch`.
+    /// Publish `produced` on `branch` guarded by `expected_prior` —
+    /// the remote ref position recorded at intent time; `None` requires
+    /// the ref to be absent. The write is refused when the remote no
+    /// longer matches it.
     PushRef {
         branch: String,
         produced: CommitRevision,
+        /// The remote ref position the intent was recorded against;
+        /// `None` requires an absent ref (create).
+        #[serde(default)]
+        expected_prior: Option<CommitRevision>,
     },
     /// Open a change request from `source_branch` into `target_branch`.
     OpenChangeRequest {
@@ -236,6 +243,19 @@ pub enum HostAction {
         marker: String,
         body: String,
     },
+}
+
+impl HostAction {
+    /// The operation name used for capability/eligibility bookkeeping
+    /// and failure receipts — stable across payload changes.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PushRef { .. } => "push_ref",
+            Self::OpenChangeRequest { .. } => "open_change_request",
+            Self::UpdateChangeRequest { .. } => "update_change_request",
+            Self::PostComment { .. } => "post_comment",
+        }
+    }
 }
 
 /// A dispatch deferral: why a queued Execution was not admitted.

@@ -329,7 +329,10 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     for intent in intents {
-        let HostAction::PushRef { branch, produced } = &intent.action else {
+        let HostAction::PushRef {
+            branch, produced, ..
+        } = &intent.action
+        else {
             continue;
         };
         let Ok(sha) = gh(&[
@@ -455,7 +458,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
         return Ok(());
     }
     match &intent.action {
-        HostAction::PushRef { branch, produced } => {
+        HostAction::PushRef {
+            branch,
+            produced,
+            expected_prior,
+        } => {
             let repo_dir = ctx.workspace_of(&intent.work_id);
             if !repo_dir.join(".git").exists() {
                 emit_result(
@@ -520,6 +527,25 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                     state: prior_state,
                 },
             );
+            // The guard binds the write to the position recorded at
+            // intent time, not to whatever a fresh read happens to
+            // return: a remote ref that moved since the intent was
+            // persisted refuses the write before it is attempted.
+            let expected = expected_prior
+                .as_ref()
+                .map(|p| p.object.as_str())
+                .unwrap_or_default();
+            if prior_sha != expected {
+                emit_result(
+                    ctx,
+                    intent,
+                    HostActionStatus::Failed {
+                        reason: "stale_head".into(),
+                    },
+                    vec![],
+                );
+                return Ok(());
+            }
             let lease = format!("--force-with-lease=refs/heads/{branch}:{prior_sha}");
             let push = git(
                 &repo_dir,

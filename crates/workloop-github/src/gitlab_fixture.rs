@@ -244,7 +244,22 @@ impl GitlabFixture {
         };
 
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The same fast-forward guard the GitHub fixture
+                // models: a moved remote ref refuses the write.
+                let actual = self
+                    .projects
+                    .get(&intent.repository.to_string())
+                    .and_then(|p| p.branches.get(branch))
+                    .cloned();
+                if actual != expected_prior.as_ref().map(|p| p.object.clone()) {
+                    failed(self, intent.action_id.clone(), "stale_head")?;
+                    return Ok(());
+                }
                 let project = self
                     .projects
                     .entry(intent.repository.to_string())

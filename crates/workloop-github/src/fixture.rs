@@ -16,8 +16,8 @@ use workloop_core::identity::{
     SourceSnapshot,
 };
 use workloop_core::observation::{
-    Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact,
-    Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
+    BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
+    NormalizedEffectFact, Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -163,6 +163,20 @@ pub struct FixtureGithub {
     /// Object ids the remote knows. A read naming an unknown object is
     /// partial — the host never invents a revision.
     objects: std::collections::BTreeSet<String>,
+    /// `object` → parent object: the remote's commit ancestry, used to
+    /// classify the observed ref against the produced revision on a
+    /// read-back (`Equal`/`Ancestor`/`Diverged`).
+    parents: BTreeMap<String, String>,
+    /// `change_request_id` → the remote's stored title/body: what a
+    /// metadata update wrote and a fresh read returns.
+    change_meta: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// `action name` → failure reason: test-injected execution faults.
+    /// A matching attempt consumes the entry — one-shot per arming.
+    forced_failures: BTreeMap<String, String>,
+    /// Remote mutations a racing actor lands after each successful
+    /// adapter write, before the read-back — the write/read gap a real
+    /// adapter cannot close.
+    queued_mutations: std::collections::VecDeque<RemoteMutation>,
     /// `ReadSubject::key()` → the remote's version of that subject.
     /// Every mutation bumps the version of each subject it touched;
     /// reads carry the version they observed, so a delayed delivery of
@@ -234,6 +248,33 @@ pub struct RemoteRead {
     pub subject_version: u64,
     pub actor: HostActorRef,
     pub completeness: Completeness,
+}
+
+/// A remote mutation queued by test control to model a racing actor:
+/// applied after each successful adapter write, before the read-back —
+/// the write/read gap a real adapter cannot close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteMutation {
+    /// A racing actor moved a branch ref to `head` (descends from its
+    /// previous position).
+    MoveBranch {
+        repository: RepositoryRef,
+        branch: String,
+        head: String,
+        actor: HostActorRef,
+    },
+    /// A racing actor moved a change request's head.
+    MoveChange {
+        change: ChangeRequestRef,
+        head: String,
+        actor: HostActorRef,
+    },
+    /// A racing actor changed a change request's stored fields.
+    SetChangeMeta {
+        change: ChangeRequestRef,
+        title: Option<String>,
+        body: Option<String>,
+    },
 }
 
 /// What one source-refresh pass read: head movements ingested, heads
@@ -395,6 +436,103 @@ impl FixtureGithub {
         for object in objects {
             self.note_object(object);
         }
+    }
+
+    /// Test control: record `child`'s parent in the remote's commit
+    /// ancestry — the fact a fast-forward push implies.
+    pub fn set_parent(&mut self, child: &str, parent: &str) {
+        self.note_object(child);
+        self.parents.insert(child.to_string(), parent.to_string());
+    }
+
+    /// Whether `ancestor` is on `object`'s recorded parent chain.
+    fn descends(&self, object: &str, ancestor: &str) -> bool {
+        let mut current = object;
+        for _ in 0..=self.parents.len() {
+            if current == ancestor {
+                return true;
+            }
+            let Some(parent) = self.parents.get(current) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
+    /// Test control: the next attempt of `action_name` faults at
+    /// execution and reports `Failed{reason}` — the write never reaches
+    /// the remote. One-shot; re-arm to repeat.
+    pub fn force_failure(&mut self, action_name: &str, reason: &str) {
+        self.forced_failures
+            .insert(action_name.to_string(), reason.to_string());
+    }
+
+    /// Test control: queue a remote mutation a racing actor lands after
+    /// the next successful adapter write, before its read-back.
+    pub fn queue_remote_mutation(&mut self, mutation: RemoteMutation) {
+        self.queued_mutations.push_back(mutation);
+    }
+
+    /// Apply every queued racing-actor mutation — the remote state the
+    /// read-back will observe.
+    fn apply_queued_mutations(&mut self) {
+        while let Some(mutation) = self.queued_mutations.pop_front() {
+            match mutation {
+                RemoteMutation::MoveBranch {
+                    repository,
+                    branch,
+                    head,
+                    actor,
+                } => {
+                    let key = (repository.to_string(), branch.clone());
+                    if let Some(old) = self.branches.get(&key).cloned() {
+                        self.parents.insert(head.clone(), old);
+                    }
+                    self.note_object(&head);
+                    self.branches.insert(key.clone(), head);
+                    self.branch_actors.insert(key, actor);
+                    self.bump(&ReadSubject::Head { repository, branch });
+                }
+                RemoteMutation::MoveChange {
+                    change,
+                    head,
+                    actor,
+                } => {
+                    let id = change.change_request.as_str().to_string();
+                    if let Some(old) = self.changes.get(&id).cloned() {
+                        self.parents.insert(head.clone(), old);
+                    }
+                    self.note_object(&head);
+                    self.changes.insert(id.clone(), head);
+                    self.change_actors.insert(id.clone(), actor);
+                    self.bump(&ReadSubject::Pr { change });
+                }
+                RemoteMutation::SetChangeMeta {
+                    change,
+                    title,
+                    body,
+                } => {
+                    let meta = self
+                        .change_meta
+                        .entry(change.change_request.as_str().to_string())
+                        .or_default();
+                    if title.is_some() {
+                        meta.0 = title;
+                    }
+                    if body.is_some() {
+                        meta.1 = body;
+                    }
+                    self.bump(&ReadSubject::Pr { change });
+                }
+            }
+        }
+    }
+
+    /// The remote's stored fields for a change — the fresh read a
+    /// metadata receipt reports.
+    fn change_fields(&self, change_id: &str) -> (Option<String>, Option<String>) {
+        self.change_meta.get(change_id).cloned().unwrap_or_default()
     }
 
     /// Test control: the remote's record of a repository's
@@ -1027,17 +1165,76 @@ impl FixtureGithub {
                 }
             };
 
+        // A test-armed execution fault: the write never reaches the
+        // remote; the failed receipt is explicit and the intent keeps
+        // its own record — a fault in one effect never rewrites the
+        // receipts of the others.
+        if let Some(reason) = self.forced_failures.remove(intent.action.name()) {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Failed { reason },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
-                self.branches.insert(
-                    (intent.repository.to_string(), branch.clone()),
-                    produced.object.clone(),
-                );
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The guarded fast-forward: the remote ref must still
+                // hold the position recorded at intent time (`None` =
+                // absent). A moved ref refuses the write — no ref
+                // update occurs, and the fresh position surfaces so
+                // the caller can re-issue against it.
+                let key = (intent.repository.to_string(), branch.clone());
+                let actual = self.branches.get(&key).cloned();
+                let expected = expected_prior.as_ref().map(|p| p.object.clone());
+                if actual != expected {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "stale_head".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    let state = match &actual {
+                        Some(head) => BranchState::At {
+                            revision: CommitRevision::new(intent.repository.clone(), head)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                        },
+                        None => BranchState::Absent,
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::BranchState {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            state,
+                        }),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.branches.insert(key.clone(), produced.object.clone());
+                if let Some(prior) = &actual {
+                    self.parents.insert(produced.object.clone(), prior.clone());
+                }
                 self.note_object(&produced.object);
-                self.branch_actors.insert(
-                    (intent.repository.to_string(), branch.clone()),
-                    authenticated.clone(),
-                );
+                self.branch_actors.insert(key, authenticated.clone());
                 self.bump(&ReadSubject::Head {
                     repository: intent.repository.clone(),
                     branch: branch.clone(),
@@ -1046,6 +1243,34 @@ impl FixtureGithub {
                     "push_ref:{}:{}",
                     intent.repository, produced.object
                 ));
+                // Read-back: the remote may have raced between write and
+                // fresh read — the receipt reports what the read
+                // observes, never the attempted value.
+                self.apply_queued_mutations();
+                let observed_object = self.remote_head(&intent.repository, branch);
+                let (observed, relation) = match &observed_object {
+                    Some(object) if object == &produced.object => {
+                        (produced.clone(), RefRelation::Equal)
+                    }
+                    Some(object) => {
+                        let relation = if self.descends(object, &produced.object) {
+                            RefRelation::Ancestor
+                        } else {
+                            RefRelation::Diverged
+                        };
+                        (
+                            CommitRevision::new(intent.repository.clone(), object)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                            relation,
+                        )
+                    }
+                    None => {
+                        // The ref is gone after our write: the outcome
+                        // cannot be established as applied — report the
+                        // produced revision as diverged evidence.
+                        (produced.clone(), RefRelation::Diverged)
+                    }
+                };
                 self.emit(
                     store,
                     config,
@@ -1056,8 +1281,8 @@ impl FixtureGithub {
                             repository: intent.repository.clone(),
                             branch: branch.clone(),
                             produced: produced.clone(),
-                            observed: produced.clone(),
-                            relation: RefRelation::Equal,
+                            observed,
+                            relation,
                         }],
                     )),
                     now,
@@ -1066,7 +1291,8 @@ impl FixtureGithub {
             HostAction::OpenChangeRequest {
                 source_branch,
                 target_branch,
-                ..
+                title,
+                body,
             } => {
                 self.next_id += 1;
                 let display = {
@@ -1091,6 +1317,10 @@ impl FixtureGithub {
                     change.change_request.as_str().to_string(),
                     head_object.clone(),
                 );
+                self.change_meta.insert(
+                    change.change_request.as_str().to_string(),
+                    (Some(title.clone()), Some(body.clone())),
+                );
                 self.note_object(&head_object);
                 self.change_refs
                     .insert(change.change_request.as_str().to_string(), change.clone());
@@ -1105,7 +1335,16 @@ impl FixtureGithub {
                     "open_change:{}:{}",
                     intent.repository, change.change_request
                 ));
-                let head = CommitRevision::new(intent.repository.clone(), head_object)
+                // Read-back: the receipt reports the head a fresh
+                // change-request lookup observes, not the value the
+                // write attempted.
+                self.apply_queued_mutations();
+                let observed_head = self
+                    .changes
+                    .get(change.change_request.as_str())
+                    .cloned()
+                    .unwrap_or(head_object);
+                let head = CommitRevision::new(intent.repository.clone(), observed_head)
                     .map_err(|detail| StoreError::Internal { detail })?;
                 self.emit(
                     store,
@@ -1135,15 +1374,43 @@ impl FixtureGithub {
             HostAction::UpdateChangeRequest {
                 change,
                 expected_head,
-                ..
+                title,
+                body,
             } => {
                 let actual = self.changes.get(change.change_request.as_str()).cloned();
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    // The remote stores only the fields the request
+                    // carried — a PATCH never rewrites omitted fields.
+                    {
+                        let meta = self
+                            .change_meta
+                            .entry(change.change_request.as_str().to_string())
+                            .or_default();
+                        if title.is_some() {
+                            meta.0 = title.clone();
+                        }
+                        if body.is_some() {
+                            meta.1 = body.clone();
+                        }
+                    }
                     self.bump_change(change.change_request.as_str());
                     self.applied.push(format!(
                         "update_change:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    // Read-back: the digest covers the remote's stored
+                    // fields after any racing update — never the
+                    // attempted payload.
+                    self.apply_queued_mutations();
+                    let (stored_title, stored_body) =
+                        self.change_fields(change.change_request.as_str());
+                    let fields_digest = workloop_core::domain::sha256_hex(
+                        "change-meta-v1",
+                        &workloop_core::domain::canonical_json(&serde_json::json!({
+                            "title": stored_title,
+                            "body": stored_body,
+                        })),
+                    );
                     self.emit(
                         store,
                         config,
@@ -1153,7 +1420,7 @@ impl FixtureGithub {
                             vec![NormalizedEffectFact::MetadataUpdated {
                                 change: change.clone(),
                                 head: expected_head.clone(),
-                                fields_digest: "fixture".into(),
+                                fields_digest,
                             }],
                         )),
                         now,

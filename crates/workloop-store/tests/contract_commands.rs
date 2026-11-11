@@ -2917,6 +2917,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             HostAction::PushRef {
                 branch: format!("work/{}", w.0),
                 produced: rev("artifact-digest"),
+                expected_prior: None,
             },
         ),
         (
@@ -3103,6 +3104,7 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                         HostAction::PushRef {
                             branch: format!("work/{}", w.0),
                             produced: rev("artifact-digest"),
+                            expected_prior: None,
                         },
                         HostActionStatus::Applied,
                     ),
@@ -4319,6 +4321,7 @@ fn a_smuggled_open_effect_in_a_push_receipt_creates_no_diff_target() {
                 action: HostAction::PushRef {
                     branch: format!("work/{}", w.0),
                     produced: rev("artifact-digest"),
+                    expected_prior: None,
                 },
                 payload_digest: "test".into(),
                 status: HostActionStatus::Pending,

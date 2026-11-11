@@ -173,7 +173,30 @@ impl SparseHost {
         };
 
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The same fast-forward guard the main fixture models:
+                // a moved remote ref refuses the write.
+                let key = (intent.repository.to_string(), branch.clone());
+                let actual = self.branches.get(&key).cloned();
+                if actual != expected_prior.as_ref().map(|p| p.object.clone()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "stale_head".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(());
+                }
                 self.branches.insert(
                     (intent.repository.to_string(), branch.clone()),
                     produced.object.clone(),

@@ -253,6 +253,26 @@ fn intent(store: &SqliteStore, action_id: &str) -> HostActionIntent {
         .unwrap()
 }
 
+/// A `push_ref` intent bound to the remote's *current* position for the
+/// branch — the suite's fixture remote persists across scenarios while
+/// each store restarts work ids, so the recorded expected prior must be
+/// read back from the remote, not assumed absent.
+fn push_ref(
+    fixture: &mut dyn OutboxHost,
+    repository: &RepositoryRef,
+    branch: &str,
+    object: &str,
+) -> HostAction {
+    let expected_prior = fixture
+        .remote_head(repository, branch)
+        .map(|head| rev_on(repository, &head));
+    HostAction::PushRef {
+        branch: branch.into(),
+        produced: rev_on(repository, object),
+        expected_prior,
+    }
+}
+
 /// One host-neutral scenario: the capabilities it requires plus the
 /// assertions every conforming fixture must satisfy. `run` panics on a
 /// contract violation, so a completed scenario is a covered matrix row.
@@ -279,10 +299,7 @@ fn baseline_effects_apply(
         store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: format!("work/{}", work_id.0),
-            produced: rev("head-1"),
-        },
+        push_ref(fixture, &repo(), &format!("work/{}", work_id.0), "head-1"),
     );
     fixture.apply(store, config);
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
@@ -359,10 +376,7 @@ fn expected_head_mismatch_aborts_write(
         store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: format!("work/{}", work_id.0),
-            produced: rev("head-1"),
-        },
+        push_ref(fixture, &repo(), &format!("work/{}", work_id.0), "head-1"),
     );
     insert_intent(
         store,
@@ -500,10 +514,7 @@ fn partial_receipts_stay_separate(
         store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: format!("work/{}", work_id.0),
-            produced: rev("head-1"),
-        },
+        push_ref(fixture, &repo(), &format!("work/{}", work_id.0), "head-1"),
     );
     let open_id = insert_intent(
         store,
@@ -629,6 +640,7 @@ fn stale_head_evidence_cannot_complete(
                     HostAction::PushRef {
                         branch: format!("work/{}", work_id.0),
                         produced: rev("artifact-digest"),
+                        expected_prior: None,
                     },
                 ),
                 (
@@ -755,10 +767,7 @@ fn denied_permission_is_not_unsupported(
         store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: format!("work/{}", work_id.0),
-            produced: rev("head-1"),
-        },
+        push_ref(fixture, &repo(), &format!("work/{}", work_id.0), "head-1"),
     );
     let writes_before = fixture.applied().len();
     fixture.apply(store, &denied);
@@ -799,10 +808,7 @@ fn scoped_identities_do_not_collide(
             store,
             work,
             &repository,
-            HostAction::PushRef {
-                branch: "work/shared-name".into(),
-                produced: rev_on(&repository, object),
-            },
+            push_ref(fixture, &repository, "work/shared-name", object),
         ));
     }
     let mut open_ids = Vec::new();
@@ -887,10 +893,7 @@ fn config_swap_keeps_recorded_binding(
         store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: format!("work/{}", work_id.0),
-            produced: rev("head-1"),
-        },
+        push_ref(fixture, &repo(), &format!("work/{}", work_id.0), "head-1"),
     );
     // The installation's default repository moved, but the recorded
     // intent carries its original binding.
@@ -1158,10 +1161,7 @@ fn gitlab_fixture_reuses_iid_across_projects_without_aliasing() {
             &store,
             work,
             &repository,
-            HostAction::PushRef {
-                branch: format!("work/{object}"),
-                produced: rev_on(&repository, object),
-            },
+            push_ref(&mut fixture, &repository, &format!("work/{object}"), object),
         );
         let open_id = insert_intent(
             &store,
@@ -1297,10 +1297,7 @@ fn push_to_an_open_merge_requests_source_branch_surfaces_the_new_head() {
         &store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: "work/tracked".into(),
-            produced: rev("head-1"),
-        },
+        push_ref(&mut fixture, &repo(), "work/tracked", "head-1"),
     );
     let open_id = insert_intent(
         &store,
@@ -1325,10 +1322,7 @@ fn push_to_an_open_merge_requests_source_branch_surfaces_the_new_head() {
         &store,
         &work_id,
         &repo(),
-        HostAction::PushRef {
-            branch: "work/tracked".into(),
-            produced: rev("head-2"),
-        },
+        push_ref(&mut fixture, &repo(), "work/tracked", "head-2"),
     );
     fixture.apply(&store, &config);
     let heads: Vec<CommitRevision> = store
