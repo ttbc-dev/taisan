@@ -7,7 +7,7 @@
 //! support contract claims only — no live host is contacted.
 
 use workloop_core::identity::{
-    HostActorId, HostActorRef, HostInstanceId, RepositoryId, RepositoryRef,
+    ChangeRequestId, HostActorId, HostActorRef, HostInstanceId, RepositoryId, RepositoryRef,
 };
 use workloop_github::gitlab_spike::*;
 
@@ -25,6 +25,10 @@ fn scope() -> SpikeScope {
 
 fn repo() -> RepositoryRef {
     scope().repository()
+}
+
+fn change(id: &str) -> ChangeRequestId {
+    ChangeRequestId::trusted(id)
 }
 
 fn row(id: &str, op: SpikeOp) -> SpikeRow {
@@ -67,6 +71,7 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r3-comment",
             SpikeOp::CommentPost {
+                change_request: change("!1"),
                 source_branch: "spike/u94/w".into(),
                 expected_head: "head-1".into(),
                 body: "spike note".into(),
@@ -84,6 +89,7 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r5-stale-comment",
             SpikeOp::CommentPost {
+                change_request: change("!1"),
                 source_branch: "spike/u94/w".into(),
                 expected_head: "head-1".into(),
                 body: "stale note".into(),
@@ -92,8 +98,8 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r6-head-read",
             SpikeOp::HeadRead {
-                target: HeadTarget::ChangeFromBranch {
-                    source_branch: "spike/u94/w".into(),
+                target: HeadTarget::Change {
+                    change_request: change("!1"),
                 },
             },
         ),
@@ -113,6 +119,31 @@ fn applied_revision(record: &RowRecord) -> &workloop_core::identity::CommitRevis
         RowOutcome::Receipt(WriteReceipt::Applied { revision, .. }) => revision,
         other => panic!("{}: expected applied receipt: {other:?}", record.row_id),
     }
+}
+
+/// Every `self.remote.<method>(` call site in `source`, independent of
+/// rustfmt's line breaks: whitespace is normalized away before the call
+/// markers are parsed, and only a method followed by `(` counts.
+fn remote_call_sites(source: &str) -> Vec<String> {
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let marker = "self.remote.";
+    let mut sites = Vec::new();
+    let mut rest = compact.as_str();
+    while let Some(index) = rest.find(marker) {
+        let after = &rest[index + marker.len()..];
+        if after.is_empty() {
+            break;
+        }
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let method = &after[..end];
+        if after[end..].starts_with('(') {
+            sites.push(method.to_string());
+        }
+        rest = &after[end.max(1)..];
+    }
+    sites
 }
 
 /// Persist a scenario's journal under the test tmpdir — the retained
@@ -235,31 +266,45 @@ fn denial_lost_response_and_restart_retain_evidence() {
     let mut moved_default = scope();
     moved_default.repository = RepositoryId::trusted("installation-default-repo");
     let mut resumed = SpikeHarness::resume(&mut remote, None, journal, &moved_default);
+    assert_eq!(
+        resumed.journal().scope.repository,
+        scope().repository,
+        "the recorded scope wins over the moved default"
+    );
     resumed.reconcile();
-    let change = {
+    {
         let r2 = record(resumed.journal(), "r2-create");
         let reconciliation = r2.reconciliation.as_ref().expect("create reconciled");
-        assert_eq!(reconciliation.effect, ReconciledEffect::Present);
-        let change = reconciliation
-            .change
-            .clone()
-            .expect("the created MR is established");
+        // A lost create response leaves no IID: a head read of its source
+        // branch cannot establish which MR (if any) it made.
         assert_eq!(
-            change.repository,
+            reconciliation.effect,
+            ReconciledEffect::Indeterminate,
+            "a lost create is not reported present by branch coincidence"
+        );
+        assert!(reconciliation.change.is_none());
+        assert_eq!(
+            reconciliation
+                .observed
+                .as_ref()
+                .expect("the branch read is retained")
+                .repository,
             repo(),
             "reconciled under the recorded binding"
         );
-        change
-    };
+    }
     // The run continues under the recorded scope: remaining rows drive
-    // against the reconciled state; already-recorded rows are not
-    // re-driven.
+    // against the identity the fixture assigned; already-recorded rows
+    // are not re-driven.
     resumed.run(&plan()[2..]);
     let journal = resumed.into_journal();
     assert_eq!(journal.records.len(), plan().len());
     match &record(&journal, "r3-comment").outcome {
         RowOutcome::Receipt(WriteReceipt::Applied { fact, .. }) => match fact.as_ref() {
-            EffectFact::CommentPosted { change: c, .. } => assert_eq!(c, &change),
+            EffectFact::CommentPosted { change: c, .. } => {
+                assert_eq!(c.change_request, change("!1"));
+                assert_eq!(c.repository, repo());
+            }
             other => panic!("comment fact expected: {other:?}"),
         },
         other => panic!("the resumed comment applies: {other:?}"),
@@ -413,6 +458,285 @@ fn live_rows_require_the_recorded_authorization() {
     );
 }
 
+/// Scope identity is injective: the binding escapes its separator, and
+/// the actor's host instance participates in it. Two scopes that would
+/// collide under a naive `/` join — or that differ only in the actor's
+/// host — never cover each other's live authorization.
+#[test]
+fn scope_binding_separates_escaped_fields_and_the_actor_host() {
+    let actor = HostActorRef {
+        host: HostInstanceId::trusted("actor-host"),
+        actor: HostActorId::trusted("actor"),
+    };
+    let split_repo = SpikeScope {
+        host: HostInstanceId::trusted("h"),
+        repository: RepositoryId::trusted("r/x"),
+        branch_prefix: "p".into(),
+        actor: actor.clone(),
+    };
+    let split_prefix = SpikeScope {
+        host: HostInstanceId::trusted("h"),
+        repository: RepositoryId::trusted("r"),
+        branch_prefix: "x/p".into(),
+        actor: actor.clone(),
+    };
+    assert_ne!(
+        split_repo.binding(),
+        split_prefix.binding(),
+        "an opaque id containing `/` cannot merge two scopes"
+    );
+
+    let authorization = LiveAuthorization {
+        record: "owner approval — split-scope guard".into(),
+        binding: split_repo.binding(),
+    };
+    assert!(authorization.covers(&split_repo));
+    assert!(!authorization.covers(&split_prefix));
+
+    let mut other_actor_host = split_repo.clone();
+    other_actor_host.actor.host = HostInstanceId::trusted("other-actor-host");
+    assert_ne!(
+        split_repo.binding(),
+        other_actor_host.binding(),
+        "the actor's host instance is part of the bound identity"
+    );
+    assert!(!authorization.covers(&other_actor_host));
+
+    let mut backslash = split_repo.clone();
+    backslash.repository = RepositoryId::trusted("r\\x");
+    backslash.branch_prefix = "p".into();
+    let mut escaped_slash = split_repo.clone();
+    escaped_slash.repository = RepositoryId::trusted("r");
+    escaped_slash.branch_prefix = "\\x/p".into();
+    assert_ne!(
+        backslash.binding(),
+        escaped_slash.binding(),
+        "escaped backslashes and escaped slashes stay distinct"
+    );
+}
+
+/// Two change requests can share one source branch. Comments and head
+/// reads name the IID they mean; the remote never picks an arbitrary
+/// MR from the branch.
+#[test]
+fn change_request_identity_is_the_iid_not_the_source_branch() {
+    let mut remote = GitlabSpikeRemote::new();
+    let rows = vec![
+        row(
+            "push",
+            SpikeOp::GuardedPush {
+                branch: "spike/u94/w".into(),
+                expected_prior: None,
+                produced: "head-1".into(),
+            },
+        ),
+        row(
+            "create-a",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "create-b",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "comment-b",
+            SpikeOp::CommentPost {
+                change_request: change("!2"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "to the second MR".into(),
+            },
+        ),
+        row(
+            "comment-a",
+            SpikeOp::CommentPost {
+                change_request: change("!1"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "to the first MR".into(),
+            },
+        ),
+        row(
+            "read-a",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!1"),
+                },
+            },
+        ),
+        row(
+            "read-b",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!2"),
+                },
+            },
+        ),
+        row(
+            "read-unknown",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!404"),
+                },
+            },
+        ),
+        row(
+            "comment-unknown",
+            SpikeOp::CommentPost {
+                change_request: change("!99"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "no such MR".into(),
+            },
+        ),
+        row(
+            "comment-wrong-branch",
+            SpikeOp::CommentPost {
+                change_request: change("!1"),
+                source_branch: "spike/u94/other".into(),
+                expected_head: "head-1".into(),
+                body: "wrong branch".into(),
+            },
+        ),
+    ];
+    let mut harness = SpikeHarness::new(scope(), &mut remote, None);
+    harness.run(&rows);
+    assert_eq!(
+        harness.remote_mut().applied().len(),
+        5,
+        "push, two creates, and the two identity-addressed comments wrote"
+    );
+    let journal = harness.into_journal();
+
+    let commented_change = |id: &str| -> ChangeRequestId {
+        match &record(&journal, id).outcome {
+            RowOutcome::Receipt(WriteReceipt::Applied { fact, .. }) => match fact.as_ref() {
+                EffectFact::CommentPosted { change, .. } => change.change_request.clone(),
+                other => panic!("{id}: comment fact expected: {other:?}"),
+            },
+            other => panic!("{id}: applied comment expected: {other:?}"),
+        }
+    };
+    assert_eq!(commented_change("comment-b"), change("!2"));
+    assert_eq!(commented_change("comment-a"), change("!1"));
+
+    for (id, expected) in [("read-a", "!1"), ("read-b", "!2")] {
+        match &record(&journal, id).outcome {
+            RowOutcome::Observed(observed) => assert_eq!(
+                observed
+                    .change
+                    .as_ref()
+                    .map(|change| change.change_request.as_str()),
+                Some(expected),
+                "{id} resolves the IID it named"
+            ),
+            other => panic!("{id}: head read expected: {other:?}"),
+        }
+    }
+    match &record(&journal, "read-unknown").outcome {
+        RowOutcome::Observed(observed) => {
+            assert!(observed.change.is_none());
+            assert!(observed.head.is_none());
+        }
+        other => panic!("read-unknown: head read expected: {other:?}"),
+    }
+    for id in ["comment-unknown", "comment-wrong-branch"] {
+        assert!(
+            matches!(
+                record(&journal, id).outcome,
+                RowOutcome::Receipt(WriteReceipt::Failed { .. })
+            ),
+            "{id}: an unaddressable or mismatched IID is refused"
+        );
+    }
+}
+
+/// A lost create response leaves no IID. Even when other MRs share its
+/// source branch, reconciliation reports `indeterminate` rather than
+/// borrowing one of their identities as `present`.
+#[test]
+fn lost_create_does_not_borrow_another_change_requests_identity() {
+    let mut remote = GitlabSpikeRemote::new();
+    let mut harness = SpikeHarness::new(scope(), &mut remote, None);
+    harness.run(&[
+        row(
+            "push",
+            SpikeOp::GuardedPush {
+                branch: "spike/u94/w".into(),
+                expected_prior: None,
+                produced: "head-1".into(),
+            },
+        ),
+        row(
+            "create-a",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "create-b",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+    ]);
+    harness.remote_mut().lose_next_response();
+    harness.run(&[row(
+        "create-c",
+        SpikeOp::MrCreate {
+            source_branch: "spike/u94/w".into(),
+            target_branch: "main".into(),
+        },
+    )]);
+    assert!(matches!(
+        record(harness.journal(), "create-c").outcome,
+        RowOutcome::Receipt(WriteReceipt::Unknown { .. })
+    ));
+    assert_eq!(
+        harness.remote_mut().applied().len(),
+        4,
+        "the lost-response create landed as !3"
+    );
+    harness.reconcile();
+    {
+        let create_c = record(harness.journal(), "create-c");
+        let reconciliation = create_c.reconciliation.as_ref().expect("reconciled");
+        assert_eq!(reconciliation.effect, ReconciledEffect::Indeterminate);
+        assert!(
+            reconciliation.change.is_none(),
+            "no other MR's identity is attributed to the lost create"
+        );
+    }
+    // The effect did land as !3; it is addressable by IID, but the lost
+    // receipt itself still cannot claim that identity.
+    harness.run(&[row(
+        "read-c",
+        SpikeOp::HeadRead {
+            target: HeadTarget::Change {
+                change_request: change("!3"),
+            },
+        },
+    )]);
+    match &record(harness.journal(), "read-c").outcome {
+        RowOutcome::Observed(observed) => assert_eq!(
+            observed
+                .change
+                .as_ref()
+                .map(|change| change.change_request.as_str()),
+            Some("!3")
+        ),
+        other => panic!("read-c: head read expected: {other:?}"),
+    }
+}
+
 /// The narrow surface is closed: the harness reaches only the four
 /// operations — every remote call site in the module is one of the four
 /// `SpikeRemote` methods, the operation kind set holds exactly four,
@@ -422,19 +746,31 @@ fn live_rows_require_the_recorded_authorization() {
 #[test]
 fn no_operation_beyond_the_four_is_reachable() {
     const SOURCE: &str = include_str!("../src/gitlab_spike.rs");
-    let remote_calls = SOURCE.matches("self.remote.").count();
-    let allowed: usize = [
-        "self.remote.guarded_push(",
-        "self.remote.mr_create(",
-        "self.remote.comment_post(",
-        "self.remote.head_read(",
-    ]
-    .iter()
-    .map(|call| SOURCE.matches(call).count())
-    .sum();
+    const ALLOWED: [&str; 4] = ["guarded_push", "mr_create", "comment_post", "head_read"];
+    let calls = remote_call_sites(SOURCE);
+    assert!(
+        !calls.is_empty(),
+        "the static check must find the harness's remote call sites"
+    );
+    for call in &calls {
+        assert!(
+            ALLOWED.contains(&call.as_str()),
+            "remote call `{call}` is outside the four-operation surface"
+        );
+    }
+    // The check normalizes whitespace: a multi-line formatted call is
+    // still a call site, and an unknown method is still counted.
+    let formatted = "fn f() { self\n    .remote\n    .head_read(t); self.remote.mr_create(a, b); }";
     assert_eq!(
-        remote_calls, allowed,
-        "every remote call the harness makes is one of the four operations"
+        remote_call_sites(formatted),
+        vec!["head_read", "mr_create"],
+        "multi-line formatted calls are counted"
+    );
+    let outside = "fn f() { self . remote . approve_change(x); }";
+    assert_eq!(
+        remote_call_sites(outside),
+        vec!["approve_change"],
+        "an operation outside the four is counted rather than skipped"
     );
     assert_eq!(
         SpikeOpKind::ALL.len(),
