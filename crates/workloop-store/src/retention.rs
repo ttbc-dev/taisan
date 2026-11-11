@@ -707,6 +707,43 @@ impl SqliteStore {
         })
     }
 
+    /// Stat a category's present bodies under `root` and return the
+    /// verified byte total — bodies whose paths cannot be stat'ed are
+    /// excluded. The stat snapshot is taken before any transaction;
+    /// concurrent reclamation only shrinks the verified total
+    /// (conservative direction for a deletion decision).
+    fn verified_present_bytes(&self, category: &str, root: &Path) -> Result<u64, StoreError> {
+        let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
+            detail: format!("retention root {}: {e}", root.display()),
+        })?;
+        let rows: Vec<(String, i64)> = {
+            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                detail: "store lock poisoned".into(),
+            })?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT path, bytes FROM body_catalog \
+                     WHERE state='present' AND category=?1",
+                )
+                .map_err(map_err)?;
+            stmt.query_map(params![category], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(map_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_err)?
+        };
+        let mut total: u64 = 0;
+        for (path, bytes) in rows {
+            let stat_ok = match managed_path(&root_abs, &path) {
+                Ok(managed) => std::fs::symlink_metadata(&managed).is_ok(),
+                Err(_) => false,
+            };
+            if stat_ok {
+                total = total.saturating_add(bytes.max(0) as u64);
+            }
+        }
+        Ok(total)
+    }
+
     /// Reclaim one eligible body through the same two-phase protocol as
     /// the bounded sweep. Eligibility is recomputed from authoritative
     /// catalogue state inside the marking transaction, so a caller can
@@ -765,7 +802,7 @@ impl SqliteStore {
                 reason: "protected_path".into(),
             });
         }
-        match self.mark_reclaiming_if_eligible(body_id, settings, now_unix_seconds)? {
+        match self.mark_reclaiming_if_eligible(body_id, settings, root, now_unix_seconds)? {
             MarkOutcome::Pinned => Ok(CatalogueReclaim {
                 body_id: body_id.into(),
                 reclaimed: false,
@@ -1131,8 +1168,58 @@ impl SqliteStore {
         &self,
         body_id: &str,
         settings: &CategorySettings,
+        root: &Path,
         now_unix_seconds: i64,
     ) -> Result<MarkOutcome, StoreError> {
+        // Capacity pressure is decided on verified bytes: a category
+        // whose catalog total exceeds the cap is stat'ed before the
+        // transaction, so ghost bytes can never authorize a deletion.
+        // The stat snapshot is taken outside the transaction;
+        // concurrent reclamation only shrinks the verified total.
+        // Age eligibility is decided per body and needs no snapshot.
+        let pre: Option<(String, i64)> = {
+            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                detail: "store lock poisoned".into(),
+            })?;
+            guard
+                .query_row(
+                    "SELECT category, registered_unix_seconds FROM body_catalog \
+                     WHERE body_id=?1",
+                    params![body_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(map_err)?
+        };
+        let verified_over: Option<bool> = match &pre {
+            Some((category, _)) => {
+                let limits = effective_limits(settings, category)?;
+                match limits.max_bytes {
+                    Some(max_bytes) => {
+                        let catalog_bytes: i64 = {
+                            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                                detail: "store lock poisoned".into(),
+                            })?;
+                            guard
+                                .query_row(
+                                    "SELECT COALESCE(SUM(bytes), 0) FROM body_catalog \
+                                     WHERE state='present' AND category=?1",
+                                    params![category],
+                                    |r| r.get(0),
+                                )
+                                .map_err(map_err)?
+                        };
+                        if catalog_bytes.max(0) as u64 > max_bytes {
+                            Some(self.verified_present_bytes(category, root)? > max_bytes)
+                        } else {
+                            Some(false)
+                        }
+                    }
+                    None => Some(false),
+                }
+            }
+            None => None,
+        };
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
@@ -1174,18 +1261,9 @@ impl SqliteStore {
         let limits = effective_limits(settings, &category)?;
         let age = now_unix_seconds.saturating_sub(created_at);
         let age_expired = limits.max_age.is_some_and(|max_age| age > max_age);
-        let present_bytes: i64 = tx
-            .query_row(
-                "SELECT COALESCE(SUM(bytes), 0) FROM body_catalog \
-                 WHERE state='present' AND category=?1",
-                params![category],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        let present_bytes = present_bytes.max(0) as u64;
-        let over_max_bytes = limits
-            .max_bytes
-            .is_some_and(|max_bytes| present_bytes > max_bytes);
+        // Ghost bytes never authorize a reclaim: over-cap must hold on
+        // the verified (stat'able) total as well as on the catalog.
+        let over_max_bytes = verified_over.unwrap_or(false);
         if !(age_expired || over_max_bytes) {
             return Ok(MarkOutcome::WithinLimits);
         }
@@ -1649,6 +1727,30 @@ impl SqliteStore {
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
+        // Veto size_pressure-only verdicts driven by ghost bytes: a
+        // category over its byte cap by the catalogue total but under
+        // it on the verified (stat'able) total has no pressure, and
+        // its young unpinned bodies must not be planned for deletion.
+        let mut entries = eligibility.entries;
+        for category in eligibility
+            .categories
+            .iter()
+            .filter(|c| c.over_max_bytes)
+            .map(|c| c.category.clone())
+        {
+            let Some(max_bytes) = effective_limits(settings, &category)?.max_bytes else {
+                continue;
+            };
+            if self.verified_present_bytes(&category, root)? <= max_bytes {
+                for entry in entries.iter_mut().filter(|e| {
+                    e.category == category && !e.age_expired && e.category_over_max_bytes
+                }) {
+                    entry.category_over_max_bytes = false;
+                    entry.eligible = false;
+                    entry.reason = "within_limits".into();
+                }
+            }
+        }
         let paths: BTreeMap<String, String> = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
@@ -1667,8 +1769,7 @@ impl SqliteStore {
         // Pinned bodies that would otherwise be eligible: what pins
         // prevented. `entries` from catalogue_eligibility are ordered
         // by registered_unix_seconds, body_id — oldest first.
-        let held: Vec<HeldBody> = eligibility
-            .entries
+        let held: Vec<HeldBody> = entries
             .iter()
             .filter(|e| {
                 !e.eligible && e.pin_state.is_pin() && (e.age_expired || e.category_over_max_bytes)
@@ -1678,7 +1779,7 @@ impl SqliteStore {
                 reason: "pinned".into(),
             })
             .collect();
-        for entry in eligibility.entries.into_iter().filter(|e| e.eligible) {
+        for entry in entries.into_iter().filter(|e| e.eligible) {
             if planned.len() >= bounds.max_bodies {
                 break;
             }
@@ -2111,8 +2212,8 @@ impl SqliteStore {
             // category fell back under the cap while this plan ran is
             // no longer eligible and stays `present`. A pin that
             // appeared after planning holds the body here.
-            match self.mark_reclaiming_if_eligible(body_id, settings, now_unix_seconds)? {
-                MarkOutcome::Marked { reason } => {
+            match self.mark_reclaiming_if_eligible(body_id, settings, root, now_unix_seconds) {
+                Ok(MarkOutcome::Marked { reason }) => {
                     let _ = reason;
                     self.delete_and_record(
                         plan_id,
@@ -2125,67 +2226,20 @@ impl SqliteStore {
                         execution,
                     )?;
                 }
-                MarkOutcome::Pinned => {
-                    // A pinned-or-refused mark is indistinguishable from
-                    // "the row left `present` first" without re-reading.
-                    match self.row_state(body_id)? {
-                        Some(current) if current == "present" => {
-                            self.record_entry_outcome(
-                                plan_id,
-                                body_id,
-                                "held",
-                                "pinned",
-                                now_unix_seconds,
-                            )?;
-                            execution.held.push(HeldBody {
-                                body_id: body_id.into(),
-                                reason: "pinned".into(),
-                            });
-                        }
-                        Some(current) if current == "reclaiming" => {
-                            // a concurrent pass marked it without
-                            // deleting yet — finish through the resume
-                            // path (the delete is idempotent)
-                            self.delete_and_record_with_pin_recheck(
-                                plan_id,
-                                body_id,
-                                bytes,
-                                &managed,
-                                entry_reason.as_deref(),
-                                delete_error_limit,
-                                now_unix_seconds,
-                                execution,
-                            )?;
-                        }
-                        Some(_) => {
-                            self.record_entry_outcome(
-                                plan_id,
-                                body_id,
-                                "unavailable",
-                                "already_reclaimed",
-                                now_unix_seconds,
-                            )?;
-                            execution.unavailable.push(HeldBody {
-                                body_id: body_id.into(),
-                                reason: "already_reclaimed".into(),
-                            });
-                        }
-                        None => {
-                            self.record_entry_outcome(
-                                plan_id,
-                                body_id,
-                                "unavailable",
-                                "not_registered",
-                                now_unix_seconds,
-                            )?;
-                            execution.unavailable.push(HeldBody {
-                                body_id: body_id.into(),
-                                reason: "not_registered".into(),
-                            });
-                        }
-                    }
+                Ok(MarkOutcome::Pinned) => {
+                    self.record_entry_outcome(
+                        plan_id,
+                        body_id,
+                        "held",
+                        "pinned",
+                        now_unix_seconds,
+                    )?;
+                    execution.held.push(HeldBody {
+                        body_id: body_id.into(),
+                        reason: "pinned".into(),
+                    });
                 }
-                MarkOutcome::WithinLimits => {
+                Ok(MarkOutcome::WithinLimits) => {
                     self.record_entry_outcome(
                         plan_id,
                         body_id,
@@ -2198,6 +2252,52 @@ impl SqliteStore {
                         reason: "within_limits".into(),
                     });
                 }
+                // The row left `present` between the earlier read and
+                // the marking transaction (a concurrent sweep, or the
+                // second of two concurrent cleanup invocations):
+                // re-read instead of aborting the pass or recording a
+                // false hold.
+                Err(StoreError::ConstraintConflict { .. }) => match self.row_state(body_id)? {
+                    Some(current) if current == "reclaiming" => {
+                        self.delete_and_record_with_pin_recheck(
+                            plan_id,
+                            body_id,
+                            bytes,
+                            &managed,
+                            entry_reason.as_deref(),
+                            delete_error_limit,
+                            now_unix_seconds,
+                            execution,
+                        )?;
+                    }
+                    Some(_) => {
+                        self.record_entry_outcome(
+                            plan_id,
+                            body_id,
+                            "unavailable",
+                            "already_reclaimed",
+                            now_unix_seconds,
+                        )?;
+                        execution.unavailable.push(HeldBody {
+                            body_id: body_id.into(),
+                            reason: "already_reclaimed".into(),
+                        });
+                    }
+                    None => {
+                        self.record_entry_outcome(
+                            plan_id,
+                            body_id,
+                            "unavailable",
+                            "not_registered",
+                            now_unix_seconds,
+                        )?;
+                        execution.unavailable.push(HeldBody {
+                            body_id: body_id.into(),
+                            reason: "not_registered".into(),
+                        });
+                    }
+                },
+                Err(e) => return Err(e),
             }
             return Ok(());
         }
@@ -2544,17 +2644,6 @@ impl SqliteStore {
                     Some((c, b, p, ids)) => (*c, *b, *p, ids.as_slice()),
                     None => (0, 0, 0, &[][..]),
                 };
-            let eligible: Vec<&BodyEligibility> = eligibility
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.category == category
-                        && e.eligible
-                        && !unknown_ids.iter().any(|id| id == &e.body_id)
-                })
-                .collect();
-            let eligible_count = eligible.len() as u64;
-            let eligible_bytes = eligible.iter().map(|e| e.size_bytes).sum();
             let pinned_count = eligibility
                 .entries
                 .iter()
@@ -2571,6 +2660,18 @@ impl SqliteStore {
             let max_bytes = limits.and_then(|l| l.1);
             let over_max_bytes = max_bytes.is_some_and(|max| verified_present_bytes > max);
             let protected_over_limit = max_bytes.is_some_and(|max| verified_protected_bytes > max);
+            let eligible: Vec<&BodyEligibility> = eligibility
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.category == category
+                        && e.eligible
+                        && !unknown_ids.iter().any(|id| id == &e.body_id)
+                        && (e.age_expired || (e.category_over_max_bytes && over_max_bytes))
+                })
+                .collect();
+            let eligible_count = eligible.len() as u64;
+            let eligible_bytes = eligible.iter().map(|e| e.size_bytes).sum();
             let pressure = if protected_over_limit {
                 "protected_over_limit"
             } else if eligible_count > 0 {

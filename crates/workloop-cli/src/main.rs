@@ -1112,9 +1112,14 @@ fn run(cli: Cli) -> i32 {
                         Ok(Some(execution)) => {
                             let mut value =
                                 serde_json::to_value(execution).unwrap_or(serde_json::json!({}));
-                            value["skipped"] = serde_json::to_value(&plan.skipped)
+                            // Phase-2 holds recorded by the execution
+                            // stay under `held`; the phase-1 plan's
+                            // skipped/held lists go under distinct keys
+                            // so they never clobber each other (nor
+                            // the phase-2 holds).
+                            value["planned_skipped"] = serde_json::to_value(&plan.skipped)
                                 .unwrap_or(serde_json::json!([]));
-                            value["held"] =
+                            value["planned_held"] =
                                 serde_json::to_value(&plan.held).unwrap_or(serde_json::json!([]));
                             finish("retention_cleanup", value)
                         }

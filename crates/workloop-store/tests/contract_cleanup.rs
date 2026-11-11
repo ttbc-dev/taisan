@@ -513,6 +513,44 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
 /// Accounting fixture bodies whose path does not exist on disk must
 /// not be counted as present usage: the report lists them under
 /// `unknown` and excludes them from the pressure computation.
+/// Ghost bytes (a catalogue row whose file does not exist) must not
+/// authorize a size_pressure reclaim of a young unpinned body: the
+/// verified category total is under the cap, so no plan is written
+/// and the body stays `present`.
+#[test]
+fn phantom_bytes_cannot_authorize_size_pressure() {
+    let fixture = Fixture::new("phantom");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let rel_real = fixture.write_body("real", 10);
+    register(&store, "real", NOW - 10, 10, PinState::None, &rel_real);
+    register(
+        &store,
+        "ghost",
+        NOW - 20,
+        20,
+        PinState::None,
+        "bodies/ghost-never-written.blob",
+    );
+
+    // The plan must not target "real": the verified total (10 B) is
+    // under the 15 B cap even though the catalogue holds 30 B.
+    let plan = store
+        .reclaim_plan_create(
+            &settings(Some(100), Some(15)),
+            &bounds(),
+            &fixture.root,
+            &[],
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        !plan.entries.iter().any(|e| e.body_id == "real"),
+        "phantom bytes must not make a young body size-pressure eligible"
+    );
+    assert!(fixture.root.join("bodies/real").exists());
+    assert_eq!(store.body_state("real").unwrap().unwrap().0, "present");
+}
+
 #[test]
 fn report_counts_unstatable_bodies_as_unknown_not_present() {
     let fixture = Fixture::new("unknown");
