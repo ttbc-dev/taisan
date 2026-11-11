@@ -531,8 +531,12 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                 ],
             );
             // U8.4 fault hook: S1_BRIDGE_KILL_AFTER_APPLY=push_ref dies
-            // between the landed push and the receipt write (lost response).
-            if std::env::var("S1_BRIDGE_KILL_AFTER_APPLY").as_deref() == Ok("push_ref") {
+            // only after the push actually succeeded — a lease-rejected or
+            // otherwise failed push is recorded through the ordinary
+            // Failed path, never fault-injected.
+            if matches!(&push, Ok(_))
+                && std::env::var("S1_BRIDGE_KILL_AFTER_APPLY").as_deref() == Ok("push_ref")
+            {
                 eprintln!(
                     "s1-bridge: injected fault kill_after_apply push_ref {}",
                     intent.action_id

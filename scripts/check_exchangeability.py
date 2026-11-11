@@ -77,14 +77,14 @@ def main():
     missing = matrix - compared
     assert not missing, f'matrix rows missing from the coverage matrix: {sorted(missing)}'
 
-    spike_ok = SPIKE_EVIDENCE.exists() and 'authorized' in SPIKE_EVIDENCE.read_text().lower()
+    spike_ok = SPIKE_EVIDENCE.exists() and re.search(r'u94-[0-9T]+Z?-r[0-9]+', SPIKE_EVIDENCE.read_text()) and 'authorized' in SPIKE_EVIDENCE.read_text().lower()
     for label, ids, cells in rows:
         live = cells[3].lower()
-        if live.startswith('incomplete'):
+        if re.match(r'^incomplete\s+(—|-)\s+spike not run', live):
             continue
         assert spike_ok, (
-            f'coverage row {label!r}: live spike cell is {cells[3]!r} but '
-            'docs/evidence/u9.4-live-spike.md (with the authorized spike run) does not exist')
+            f'coverage row {label!r}: live spike cell must be `incomplete — spike not run` '
+            f'(or carry an authorized U9.4 spike record with a run tag), got {cells[3]!r}')
 
     limitations = section(report, 'Remaining limitations')
     uncovered = []

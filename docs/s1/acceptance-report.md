@@ -42,7 +42,7 @@ weaker there; this is recorded here rather than papered over.
 | R-5 | installation restart while an Invocation may be live | recovery | absent — fault (a) and fault (c) of U8.4 exercised restart with an unverified *host-effect intent* and a pending *RetryIntent*, respectively; the possibly-live *worker process* leg (unverified Invocation, PID/start-time re-verification, descendant inspection) remains unexercised on this revision |
 | R-6 | stale review / stale head rejected (`stale_head`) | recovery | absent — never exercised; recorded `stale_work_version` rejections are not the stale-head criterion |
 | R-7 | GitHub adapter outage; `unavailable` Observations; sources distinguish "no findings" from "source unavailable" | recovery | absent — never exercised |
-| R-8 | budget exhaustion → stopping/uncertain → `failed` + limit code; `retry` creates E2 claiming the same workspace/branch | recovery | valid — C-12 |
+| R-8 | budget exhaustion → stopping/uncertain → `failed` + limit code; `retry` creates E2 claiming the same workspace/branch | recovery | invalid — u8.2's `e-1` failed with `artifact_recovery_exhausted` (a shim syntax fault), not with `max_invocations`/`max_review_rounds`/`runtime_limit_seconds` exhaustion; the `retry` leg (cmd-3 → e-2, same workspace) is real but was driven by artifact failure, not budget, so the R-8 claim fails the linkage its criterion demands |
 | R-9 | duplicate Observation delivery deduplicated | recovery | valid — C-13 |
 
 ## Claims
@@ -352,35 +352,6 @@ only with a reason.
     "review": {"id": "5836140631", "author": "github-actions[bot]", "state": "COMMENTED", "occurrences": 0}
   },
   "stop_proof": "inv-3 Exited with verified stop; fix_invocations_used was charged exactly once for inv-3 (the Fix invocation) and not reset by either pause (u8.3 records the same for its inv-2)"
-}
-```
-
-### C-12 (R-8, recovery)
-```json
-{
-  "id": "C-12",
-  "criterion": "R-8",
-  "variant": "recovery",
-  "status": "valid",
-  "source": "docs/evidence/u8.2.md#acceptance-checklist-mapping",
-  "revision": "8009e8b",
-  "config_digest": "sha256:10616c4cdb385b09dd1ea4d8c93b75ab9f9338abe4140136e2c539b4e0b52828",
-  "identities": {
-    "work": "w-1",
-    "executions": ["e-1", "e-2"],
-    "invocations": ["inv-1", "inv-2"],
-    "actions": ["act-19f925f6"],
-    "commands": ["cmd-1", "cmd-3"]
-  },
-  "remote_receipts": {
-    "pr": "shimpeiws/coding-worker-smoke#14",
-    "head": "e01bf9ad12d99967e42f4e00063d94476b944468",
-    "checks": [
-      {"name": "verify", "id": "129597981958", "conclusion": "success"}
-    ],
-    "review": {"id": "5836107428", "author": "github-actions[bot]", "state": "COMMENTED"}
-  },
-  "stop_proof": "e-1 recorded artifact_recovery_exhausted with no writer left running (inv-1 exit recorded); cmd-3 retry created e-2 claiming the same workspace (recorded in u8.2 incidents §2)"
 }
 ```
 

@@ -109,6 +109,16 @@ def main():
         src = ROOT / claim['source'].split('#')[0]
         if not src.exists():
             fail(f'{cid}: source {claim["source"]!r} does not exist in the repo')
+        fragment = claim['source'].split('#', 1)[1] if '#' in claim['source'] else ''
+        if fragment:
+            def slug(heading):
+                s = heading.strip().lower()
+                s = re.sub(r'[^\w\s-]', '', s, flags=re.UNICODE)
+                return re.sub(r'\s+', '-', s)
+            headings = [slug(l[3:]) for l in src.read_text().splitlines() if l.startswith('## ') or l.startswith('### ')]
+            if fragment not in headings:
+                fail(f'{cid}: source fragment #{fragment} matches no heading in {src.relative_to(ROOT)} '
+                     f'(headings: {headings})')
 
         ids = claim.get('identities') or {}
         if not isinstance(ids.get('work'), str) or not ids['work'].strip():
