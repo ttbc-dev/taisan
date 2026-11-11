@@ -178,11 +178,46 @@ impl CategoryLimits {
             max_bytes: None,
         }
     }
+
+    /// The documented default for one of the closed retention
+    /// categories. An omitted configuration key never means "no
+    /// limit": only `archive` is documented as unlimited. `None` means
+    /// the name is outside the closed category set.
+    pub fn documented_default(category: &str) -> Option<Self> {
+        let limits = match category {
+            "workspace" => Self::new(Some(2_592_000), Some(21_474_836_480)),
+            "worker_output" => Self::new(Some(2_592_000), Some(10_737_418_240)),
+            "cas" => Self::new(Some(7_776_000), Some(42_949_672_960)),
+            "handoff_objects" => Self::new(Some(7_776_000), Some(10_737_418_240)),
+            "archive" => Self::unlimited(),
+            _ => return None,
+        };
+        Some(limits)
+    }
 }
 
 /// Per-category limits keyed by the catalogue's `category`. A category
-/// absent from the map resolves to [`CategoryLimits::unlimited`].
+/// absent from the map resolves to its documented default; a category
+/// outside the closed set is a `StoreError` rather than silent
+/// `unlimited` retention.
 pub type CategorySettings = BTreeMap<String, CategoryLimits>;
+
+/// Resolve the authoritative limits for a catalogue category: an
+/// explicit setting wins, an omitted documented category applies its
+/// default, and an unknown name fails closed.
+fn effective_limits(
+    settings: &CategorySettings,
+    category: &str,
+) -> Result<CategoryLimits, StoreError> {
+    if let Some(limits) = settings.get(category) {
+        return Ok(*limits);
+    }
+    CategoryLimits::documented_default(category).ok_or_else(|| StoreError::ConstraintConflict {
+        detail: format!(
+            "unknown retention category {category:?}; supply its limits or register under a documented category"
+        ),
+    })
+}
 
 /// One body as its producer registers it. `created_at` is the age
 /// baseline; `path` is the body itself, while the catalogue row is the
@@ -276,6 +311,15 @@ pub struct CatalogueReclaim {
     pub body_id: String,
     pub reclaimed: bool,
     pub reason: String,
+}
+
+/// Outcome of the marking transaction: either the row moved to
+/// `reclaiming` under a recomputed eligibility decision, or it is held
+/// (pinned / within limits).
+enum MarkOutcome {
+    Marked { reason: &'static str },
+    Pinned,
+    WithinLimits,
 }
 
 /// Marker dependency used by [`SqliteStore::set_pin_state`] so the
@@ -594,7 +638,7 @@ impl SqliteStore {
 
         let mut entries = Vec::with_capacity(observed.len());
         for (body_id, category, size_bytes, created_at, pin_state) in observed {
-            let limits = settings.get(&category).copied().unwrap_or_default();
+            let limits = effective_limits(settings, &category)?;
             let age = now_unix_seconds.saturating_sub(created_at);
             let age_expired = limits.max_age.is_some_and(|max_age| age > max_age);
             let category_over_max_bytes = limits
@@ -628,7 +672,7 @@ impl SqliteStore {
 
         let mut categories = Vec::with_capacity(present_bytes.len());
         for (category, total_bytes) in &present_bytes {
-            let limits = settings.get(category).copied().unwrap_or_default();
+            let limits = effective_limits(settings, category)?;
             let protected = protected_bytes.get(category).copied().unwrap_or(0);
             let over_max_bytes = limits.max_bytes.is_some_and(|max| *total_bytes > max);
             let mut held = Vec::new();
@@ -660,30 +704,35 @@ impl SqliteStore {
         })
     }
 
-    /// Reclaim one unpinned body through the same two-phase protocol as
-    /// the bounded sweep. The catalogue row and its five fields are
-    /// never deleted: only the body's availability state changes.
+    /// Reclaim one eligible body through the same two-phase protocol as
+    /// the bounded sweep. Eligibility is recomputed from authoritative
+    /// catalogue state inside the marking transaction, so a caller can
+    /// never delete a body the policy retains. Installation files named
+    /// by `protected` are held before any marking. The catalogue row and
+    /// its five fields are never deleted: only the body's availability
+    /// state changes.
     pub fn reclaim_catalogue_body(
         &self,
         body_id: &str,
+        settings: &CategorySettings,
         root: &Path,
+        protected: &[PathBuf],
         now_unix_seconds: i64,
     ) -> Result<CatalogueReclaim, StoreError> {
-        let found: Option<(String, String, String, i64)> = {
+        let found: Option<(String, String)> = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
             })?;
             guard
                 .query_row(
-                    "SELECT state, path, pin_state, pinned FROM body_catalog \
-                     WHERE body_id=?1",
+                    "SELECT state, path FROM body_catalog WHERE body_id=?1",
                     params![body_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
                 .map_err(map_err)?
         };
-        let Some((state, path, pin_state, pinned)) = found else {
+        let Some((state, path)) = found else {
             return Err(StoreError::ConstraintConflict {
                 detail: format!("body {body_id} is not registered"),
             });
@@ -691,14 +740,6 @@ impl SqliteStore {
         if state != "present" {
             return Err(StoreError::ConstraintConflict {
                 detail: format!("body {body_id} is unavailable ({state})"),
-            });
-        }
-        let pin_state = PinState::parse(&pin_state)?;
-        if pin_state.is_pin() || pinned != 0 {
-            return Ok(CatalogueReclaim {
-                body_id: body_id.into(),
-                reclaimed: false,
-                reason: "pinned".into(),
             });
         }
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
@@ -714,30 +755,50 @@ impl SqliteStore {
                 });
             }
         };
-        if !self.mark_reclaiming(body_id)? {
+        if is_protected(&managed, protected) {
             return Ok(CatalogueReclaim {
                 body_id: body_id.into(),
                 reclaimed: false,
-                reason: "pinned".into(),
+                reason: "protected_path".into(),
             });
         }
-        match delete_managed(&managed) {
-            Ok(reason) => {
-                self.finish_reclaim(body_id, &reason, now_unix_seconds)?;
-                Ok(CatalogueReclaim {
-                    body_id: body_id.into(),
-                    reclaimed: true,
-                    reason,
-                })
-            }
-            Err(detail) => {
-                let failures = self.record_delete_failure(body_id)?;
-                Ok(CatalogueReclaim {
-                    body_id: body_id.into(),
-                    reclaimed: false,
-                    reason: format!("delete_failed({failures}): {detail}"),
-                })
-            }
+        match self.mark_reclaiming_if_eligible(body_id, settings, now_unix_seconds)? {
+            MarkOutcome::Pinned => Ok(CatalogueReclaim {
+                body_id: body_id.into(),
+                reclaimed: false,
+                reason: "pinned".into(),
+            }),
+            MarkOutcome::WithinLimits => Ok(CatalogueReclaim {
+                body_id: body_id.into(),
+                reclaimed: false,
+                reason: "within_limits".into(),
+            }),
+            MarkOutcome::Marked { reason } => match delete_managed(&managed) {
+                Ok(delete_reason) => {
+                    // Keep `missing` when the body was already gone;
+                    // otherwise record the eligibility reason that
+                    // authorized the deletion.
+                    let recorded = if delete_reason == "missing" {
+                        delete_reason.as_str()
+                    } else {
+                        reason
+                    };
+                    self.finish_reclaim(body_id, recorded, now_unix_seconds)?;
+                    Ok(CatalogueReclaim {
+                        body_id: body_id.into(),
+                        reclaimed: true,
+                        reason: recorded.into(),
+                    })
+                }
+                Err(detail) => {
+                    let failures = self.record_delete_failure(body_id)?;
+                    Ok(CatalogueReclaim {
+                        body_id: body_id.into(),
+                        reclaimed: false,
+                        reason: format!("delete_failed({failures}): {detail}"),
+                    })
+                }
+            },
         }
     }
 
@@ -1020,6 +1081,96 @@ impl SqliteStore {
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;
         Ok(())
+    }
+
+    /// Two-phase marker for explicit catalogue reclamation: inside one
+    /// immediate transaction it reads the authoritative row, refuses a
+    /// pin, recomputes age and category-byte eligibility from present
+    /// rows, and only then moves `present` to `reclaiming`. A policy
+    /// that retains the body leaves it `present`.
+    fn mark_reclaiming_if_eligible(
+        &self,
+        body_id: &str,
+        settings: &CategorySettings,
+        now_unix_seconds: i64,
+    ) -> Result<MarkOutcome, StoreError> {
+        let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let row: Option<(String, String, i64, i64, String, i64)> = tx
+            .query_row(
+                "SELECT state, category, bytes, registered_unix_seconds, \
+                 pin_state, pinned FROM body_catalog WHERE body_id=?1",
+                params![body_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some((state, category, _bytes, created_at, stored, pinned)) = row else {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!("body {body_id} is not registered"),
+            });
+        };
+        if state != "present" {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!("body {body_id} is unavailable ({state})"),
+            });
+        }
+        let stored = PinState::parse(&stored)?;
+        if stored.is_pin() || pinned != 0 {
+            return Ok(MarkOutcome::Pinned);
+        }
+        let limits = effective_limits(settings, &category)?;
+        let age = now_unix_seconds.saturating_sub(created_at);
+        let age_expired = limits.max_age.is_some_and(|max_age| age > max_age);
+        let present_bytes: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM body_catalog \
+                 WHERE state='present' AND category=?1",
+                params![category],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let present_bytes = present_bytes.max(0) as u64;
+        let over_max_bytes = limits
+            .max_bytes
+            .is_some_and(|max_bytes| present_bytes > max_bytes);
+        if !(age_expired || over_max_bytes) {
+            return Ok(MarkOutcome::WithinLimits);
+        }
+        let updated = tx
+            .execute(
+                "UPDATE body_catalog SET state='reclaiming' \
+                 WHERE body_id=?1 AND state='present' AND pinned=0",
+                params![body_id],
+            )
+            .map_err(map_err)?;
+        tx.commit().map_err(internal)?;
+        if updated == 1 {
+            Ok(MarkOutcome::Marked {
+                reason: if age_expired {
+                    "age_expired"
+                } else {
+                    "size_pressure"
+                },
+            })
+        } else {
+            // A pin landed between the read and the mark; the
+            // transaction refuses to claim the body.
+            Ok(MarkOutcome::Pinned)
+        }
     }
 
     fn mark_reclaiming(&self, body_id: &str) -> Result<bool, StoreError> {

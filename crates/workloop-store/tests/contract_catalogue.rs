@@ -215,7 +215,9 @@ fn over_budget_protected_bodies_are_retained_and_reported() {
     );
 
     // Reclamation refuses the protected body and it remains on disk.
-    let outcome = store.reclaim_catalogue_body("pinned", &dir, NOW).unwrap();
+    let outcome = store
+        .reclaim_catalogue_body("pinned", &settings(Some(1000), Some(5)), &dir, &[], NOW)
+        .unwrap();
     assert!(!outcome.reclaimed);
     assert_eq!(outcome.reason, "pinned");
     assert!(
@@ -250,7 +252,9 @@ fn reclaiming_a_body_preserves_its_catalogue_metadata() {
             .is_eligible("old")
     );
 
-    let outcome = store.reclaim_catalogue_body("old", &dir, NOW).unwrap();
+    let outcome = store
+        .reclaim_catalogue_body("old", &settings(Some(100), Some(1000)), &dir, &[], NOW)
+        .unwrap();
     assert!(outcome.reclaimed);
     assert_eq!(outcome.reason, "age_expired");
     assert!(!path.exists(), "the physical body is gone");
@@ -340,16 +344,23 @@ fn catalogue_reclaim_reports_missing_unsafe_and_failed_deletes() {
     };
     register_all(&store, &[missing, unsafe_path, failed]);
 
-    let absent = store.reclaim_catalogue_body("missing", &dir, NOW).unwrap();
+    let reclaim_settings = settings(Some(100), Some(1000));
+    let absent = store
+        .reclaim_catalogue_body("missing", &reclaim_settings, &dir, &[], NOW)
+        .unwrap();
     assert!(absent.reclaimed);
     assert_eq!(absent.reason, "missing");
 
-    let unsafe_result = store.reclaim_catalogue_body("unsafe", &dir, NOW).unwrap();
+    let unsafe_result = store
+        .reclaim_catalogue_body("unsafe", &reclaim_settings, &dir, &[], NOW)
+        .unwrap();
     assert!(!unsafe_result.reclaimed);
     assert_eq!(unsafe_result.reason, "unsafe_path");
     assert_eq!(store.body_state("unsafe").unwrap().unwrap().0, "present");
 
-    let failure = store.reclaim_catalogue_body("failed", &dir, NOW).unwrap();
+    let failure = store
+        .reclaim_catalogue_body("failed", &reclaim_settings, &dir, &[], NOW)
+        .unwrap();
     assert!(!failure.reclaimed);
     assert!(
         failure.reason.starts_with("delete_failed(1)"),
@@ -434,4 +445,192 @@ fn temp_root(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// A young unpinned body the policy retains must not be deletable
+/// through the catalogue reclamation API: eligibility is recomputed from
+/// the same authoritative state the report uses, inside the marking
+/// transaction.
+#[test]
+fn reclaim_refuses_a_body_the_policy_would_retain() {
+    let dir = temp_root("catalogue-ineligible-reclaim");
+    let path = dir.join("young.blob");
+    std::fs::write(&path, b"0123456789").unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    store
+        .register_retained_body(&RetainedBody {
+            body_id: "young".into(),
+            category: "cas".into(),
+            size_bytes: 10,
+            created_at: NOW - 10,
+            pin_state: PinState::None,
+            path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    let limits = settings(Some(2_592_000), Some(1_073_741_824));
+    assert!(
+        !store
+            .catalogue_eligibility(&limits, NOW)
+            .unwrap()
+            .is_eligible("young"),
+        "the policy retains a young body within its byte cap"
+    );
+
+    let outcome = store
+        .reclaim_catalogue_body("young", &limits, &dir, &[], NOW)
+        .unwrap();
+    assert!(!outcome.reclaimed);
+    assert_eq!(outcome.reason, "within_limits");
+    assert!(path.exists(), "an ineligible body's file remains");
+    assert_eq!(store.body_state("young").unwrap().unwrap().0, "present");
+
+    // Tightening the byte cap makes the same young body eligible by
+    // size pressure; the reclaim records that reason, not an age one.
+    let tight = settings(Some(2_592_000), Some(9));
+    assert!(
+        store
+            .catalogue_eligibility(&tight, NOW)
+            .unwrap()
+            .is_eligible("young")
+    );
+    let outcome = store
+        .reclaim_catalogue_body("young", &tight, &dir, &[], NOW)
+        .unwrap();
+    assert!(outcome.reclaimed);
+    assert_eq!(outcome.reason, "size_pressure");
+    assert!(!path.exists());
+    let after = store.catalogue_record("young").unwrap().unwrap();
+    assert_eq!(after.size_bytes, 10);
+    assert_eq!(after.category, "cas");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A catalogue row pointing at one of the installation's own files is
+/// held, never reclaimed: containment under the state root does not
+/// authorize deleting the live store or the config.
+#[test]
+fn reclaim_holds_a_catalogue_row_pointing_at_an_installation_file() {
+    let dir = temp_root("catalogue-protected-reclaim");
+    let live = dir.join("store.db");
+    let config = dir.join("config.toml");
+    std::fs::write(&live, b"live store").unwrap();
+    std::fs::write(&config, b"config").unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    for (body_id, path) in [("live", &live), ("config", &config)] {
+        store
+            .register_retained_body(&RetainedBody {
+                body_id: body_id.into(),
+                category: "cas".into(),
+                size_bytes: 8,
+                created_at: NOW - 200,
+                pin_state: PinState::None,
+                path: path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+    }
+    let limits = settings(Some(100), Some(1000));
+    let protected = vec![live.clone(), config.clone()];
+    for body_id in ["live", "config"] {
+        let outcome = store
+            .reclaim_catalogue_body(body_id, &limits, &dir, &protected, NOW)
+            .unwrap();
+        assert!(!outcome.reclaimed, "{body_id} is held");
+        assert_eq!(outcome.reason, "protected_path");
+        assert_eq!(store.body_state(body_id).unwrap().unwrap().0, "present");
+    }
+    assert!(live.exists(), "the live store survives");
+    assert!(config.exists(), "the config survives");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An omitted category key applies the documented bounded default, not
+/// unlimited: `cas` keeps 90 days / 40 GiB, so the same rows become
+/// eligible on age or byte pressure without an explicit settings entry.
+#[test]
+fn omitted_known_categories_use_the_documented_bounded_defaults() {
+    let age_store = SqliteStore::in_memory(1).unwrap();
+    register_all(
+        &age_store,
+        &[
+            body("old", NOW - 7_776_001, 1, PinState::None),
+            body("young", NOW - 7_775_999, 1, PinState::None),
+        ],
+    );
+    let empty = CategorySettings::new();
+    let aged = age_store.catalogue_eligibility(&empty, NOW).unwrap();
+    assert!(aged.entry("old").unwrap().age_expired);
+    assert!(aged.is_eligible("old"));
+    assert!(!aged.entry("young").unwrap().age_expired);
+    assert!(!aged.is_eligible("young"));
+
+    let byte_store = SqliteStore::in_memory(1).unwrap();
+    register_all(
+        &byte_store,
+        &[body("over", NOW - 10, 42_949_672_961, PinState::None)],
+    );
+    let pressured = byte_store.catalogue_eligibility(&empty, NOW).unwrap();
+    assert!(pressured.category("cas").unwrap().over_max_bytes);
+    assert!(pressured.is_eligible("over"));
+    assert_eq!(pressured.entry("over").unwrap().reason, "size_pressure");
+
+    assert_eq!(
+        CategoryLimits::documented_default("workspace"),
+        Some(CategoryLimits::new(Some(2_592_000), Some(21_474_836_480)))
+    );
+    assert_eq!(
+        CategoryLimits::documented_default("archive"),
+        Some(CategoryLimits::unlimited())
+    );
+}
+
+/// A category outside the closed set is a loud error, not a silent
+/// never-reclaim policy: when no explicit setting exists for it,
+/// eligibility fails closed instead of resolving to unlimited.
+#[test]
+fn unknown_catalogue_categories_are_rejected_instead_of_becoming_unlimited() {
+    use workloop_store::retention::CatalogBody;
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut typo = body("typo", NOW - 10, 10, PinState::None);
+    typo.category = "CAS".into();
+    store.register_retained_body(&typo).unwrap();
+    let err = store
+        .catalogue_eligibility(&CategorySettings::new(), NOW)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown retention category"),
+        "{err}"
+    );
+
+    // A row written through the legacy API also cannot resolve to an
+    // unbounded category during eligibility.
+    let legacy = SqliteStore::in_memory(1).unwrap();
+    legacy
+        .register_body(&CatalogBody {
+            body_id: "legacy".into(),
+            category: "checkpoint".into(),
+            path: "/managed/legacy.blob".into(),
+            bytes: 10,
+            registered_unix_seconds: NOW - 10,
+            eligible_after_unix_seconds: None,
+            pinned: false,
+        })
+        .unwrap();
+    let err = legacy
+        .catalogue_eligibility(&CategorySettings::new(), NOW)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown retention category"),
+        "{err}"
+    );
+
+    // An explicit setting for the same name is authoritative, so a
+    // producer can still manage a non-default category deliberately.
+    let explicit = BTreeMap::from([("CAS".to_string(), CategoryLimits::new(Some(100), Some(100)))]);
+    assert!(
+        !store
+            .catalogue_eligibility(&explicit, NOW)
+            .unwrap()
+            .is_eligible("typo")
+    );
 }
