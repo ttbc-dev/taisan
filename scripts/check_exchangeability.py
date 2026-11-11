@@ -12,8 +12,8 @@ Fail-closed assertions for the U9.5 exchangeability evidence report:
    `covered` has its rows listed (with reasons) in the remaining
    limitations section.
 4. The exchangeability claim names only operations with a binding in
-   the claim binding table, every bound row has at least one fixture
-   `covered` cell, and the claim stays fixture-scoped (no live claim
+   the claim binding table, every bound row has both full-baseline
+   fixtures `covered`, and the claim stays fixture-scoped (no live claim
    while the spike is unrun); structurally unsupported operations may
    never appear in the claim.
 """
@@ -78,7 +78,10 @@ def main():
     if missing:
         raise AssertionError(f'matrix rows missing from the coverage matrix: {sorted(missing)}')
 
-    spike_ok = SPIKE_EVIDENCE.exists() and re.search(r'u94-[0-9T]+Z?-r[0-9]+', SPIKE_EVIDENCE.read_text()) and 'authorized' in SPIKE_EVIDENCE.read_text().lower()
+    spike_text = SPIKE_EVIDENCE.read_text().lower() if SPIKE_EVIDENCE.exists() else ''
+    spike_ok = bool(spike_text) and bool(re.search(r'u94-[0-9t]+z?-r[0-9]+', spike_text)) \
+        and bool(re.search(r'\bauthorized\b', spike_text)) \
+        and not re.search(r'\b(unauthorized|un_authorized|not\s+authorized|never\s+authorized|no\s+authori[sz]ation)\b', spike_text)
     for label, ids, cells in rows:
         live = cells[3].lower()
         if re.match(r'^incomplete\s+(—|-)\s+spike not run', live):
@@ -123,7 +126,7 @@ def main():
             candidate = next((cells for label, ids, cells in rows if row_id in ids), None)
             if candidate is None:
                 raise AssertionError(f'binding row for `{op}` names {row_id}, absent from the coverage matrix')
-            if any(c.lower().startswith('covered') for c in candidate[:2]):
+            if all(c.lower().startswith('covered') for c in candidate[:2]):
                 backed.append(row_id)
         if not backed:
             raise AssertionError(f'claimed operation `{op}` has no fixture-`covered` backing row in {bound}')
