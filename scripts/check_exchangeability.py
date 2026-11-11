@@ -25,7 +25,6 @@ MATRIX = ROOT / 'docs/host-conformance-matrix.md'
 REPORT = ROOT / 'docs/host-exchangeability.md'
 
 MATRIX_ROW = re.compile(r'^\|\s*(HC-[A-Z]+-\d+)\s*\|', re.MULTILINE)
-COVERAGE_ROW = re.compile(r'^\|\s*((?:HC-[A-Z]+-\d+(?:/\d+)?(?:\s*/\s*HC-[A-Z]+-\d+)*)|HC-[A-Z]+-\d+)\b[^|]*\|((?:[^|]*\|){4})', re.MULTILINE)
 
 
 def matrix_rows():
@@ -47,7 +46,6 @@ def coverage_rows(text):
     rows = []
     for match in re.finditer(r'^\|\s*(HC-[^\|]+?)\s*\|((?:[^\n|]*\|){4})\s*$', text, re.MULTILINE):
         label, body = match.groups()
-        cells = [c.strip() for c in body.split('|') if c.strip() or body.count('|') >= 4]
         cells = [c.strip() for c in body.split('|')][:4]
         cells = [c.strip() for c in cells]
         if len(cells) != 4:
