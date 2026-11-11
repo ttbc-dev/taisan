@@ -60,6 +60,19 @@ PLACEHOLDER_MARKERS = (
     "unset",
     "not-set",
 )
+PLACEHOLDER_TOKENS = {
+    "a", "app", "available", "bar", "baz", "be", "bound", "change",
+    "changeme", "config", "configuration", "decide", "decided", "dummy",
+    "empty", "example", "fake", "fill", "fixture", "foo", "from", "host",
+    "id", "identifier", "identity", "installation", "later", "listing",
+    "me", "missing", "n", "na", "name", "nil", "none", "not", "null",
+    "omitted", "open", "owner", "pending", "placeholder", "preflight",
+    "provided", "r", "read", "recorded", "redacted", "repo", "replace",
+    "replacement", "repository", "required", "sample", "set", "spec",
+    "stable", "store", "tbd", "test", "to", "todo", "unassigned",
+    "undecided", "unknown", "unresolved", "unset", "uuid", "value", "x",
+    "xxx",
+}
 REVISION_KEYS = (
     "materials_revision",
     "taisan_core_revision",
@@ -116,12 +129,25 @@ def _check_identity_scope(prefix: str, value, errors: list[str]) -> None:
 
 
 def _is_placeholder(value: str) -> bool:
+    """Return true for any value that reads as placeholder text.
+
+    A resolved binding identity is an opaque machine value, not a prose
+    description of one. Besides the explicit marker phrases, a value made
+    up entirely of generic identity words and separators (``app-id``,
+    ``N/A``, ``replace_me``, ``not available``) is placeholder text even
+    when it carries no known marker.
+    """
     lowered = value.strip().lower()
     if not lowered:
         return True
     if "<" in lowered or ">" in lowered:
         return True
-    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
+    if any(marker in lowered for marker in PLACEHOLDER_MARKERS):
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
+    if not tokens:
+        return True
+    return all(token in PLACEHOLDER_TOKENS for token in tokens)
 
 
 def _identity_state(value) -> tuple[str, str]:
@@ -322,6 +348,24 @@ def validate_fixture_digest(root: Path) -> tuple[str, list[str]]:
     return digest, errors
 
 
+def _contained_document(root: Path, relative: str) -> Path | None:
+    """Resolve *relative* under *root*, rejecting paths that escape it.
+
+    The install spec is reviewable input, so its evidence path must never
+    make this read-only preflight stat or read a file outside the
+    checkout. Absolute paths, ``..`` segments, and symlinks that resolve
+    outside the root are all rejected.
+    """
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        return None
+    resolved_root = root.resolve()
+    resolved = (resolved_root / candidate).resolve()
+    if not resolved.is_relative_to(resolved_root):
+        return None
+    return resolved
+
+
 def validate_rehearsals(root: Path, spec: dict) -> list[str]:
     """Cross-check the recorded rehearsal profile against its evidence files."""
     errors: list[str] = []
@@ -357,7 +401,13 @@ def validate_rehearsals(root: Path, spec: dict) -> list[str]:
         evidence = rehearsal.get("evidence")
         if not isinstance(evidence, str) or not evidence:
             continue
-        document = root / evidence
+        document = _contained_document(root, evidence)
+        if document is None:
+            errors.append(
+                f"{prefix}.evidence: must stay within the repository, "
+                f"got {evidence!r}"
+            )
+            continue
         if not document.is_file():
             errors.append(f"{prefix}.evidence: missing {evidence}")
             continue

@@ -148,7 +148,17 @@ class S1MaterialsTest(unittest.TestCase):
             ('configuration_identity', 'store_id'),
         )
         for section, key in fields:
-            for placeholder in ('unresolved', 'pending', 'unknown', '<app-id>'):
+            for placeholder in (
+                'unresolved',
+                'pending',
+                'unknown',
+                '<app-id>',
+                'app-id',
+                'N/A',
+                'replace_me',
+                'not available',
+                'undecided',
+            ):
                 with self.subTest(section=section, key=key, placeholder=placeholder):
                     spec = copy.deepcopy(self.install_spec)
                     spec[section][key] = placeholder
@@ -272,6 +282,30 @@ class S1MaterialsTest(unittest.TestCase):
                 self.assertTrue(
                     any(key in error for error in errors), (key, value, errors)
                 )
+
+    def test_rehearsal_evidence_path_must_stay_within_repository(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'repo'
+            root.mkdir()
+            outside = Path(temp) / 'outside-evidence.md'
+            outside.write_text(
+                'run_tag `u82-20261110T025345Z-r2` adapter `s1-bridge` '
+                'host_write: true\n'
+            )
+            for evidence in ('../outside-evidence.md', str(outside)):
+                with self.subTest(evidence=evidence):
+                    broken = copy.deepcopy(self.install_spec)
+                    rehearsals = broken['implementation_status']['retained_rehearsals']
+                    rehearsals[0]['evidence'] = evidence
+                    errors = prerequisites.validate_rehearsals(root, broken)
+                    self.assertTrue(
+                        any(
+                            'retained_rehearsals[0].evidence' in error
+                            and 'within the repository' in error
+                            for error in errors
+                        ),
+                        (evidence, errors),
+                    )
 
     def test_fixture_content_digest_is_computed_and_recorded(self):
         report = prerequisites.verify(ROOT)
