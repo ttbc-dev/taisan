@@ -59,7 +59,9 @@ fn skill_md() -> &'static str {
 }
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_workloop-cli"))
+    // The skill documents the `taisan` binary; exercise that target,
+    // not the package-default binary.
+    PathBuf::from(env!("CARGO_BIN_EXE_taisan"))
 }
 
 fn root(tag: &str) -> PathBuf {
