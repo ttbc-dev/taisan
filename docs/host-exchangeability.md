@@ -87,7 +87,7 @@ constitutes, or may be read as, live evidence.
 | `open_change_request` | HC-BASE-02 (`baseline_effects_apply`), HC-PART-01 (`partial_receipts_stay_separate`) | not run — incomplete |
 | `update_change_request` | HC-BASE-03 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
 | `post_comment` | HC-BASE-04 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
-| read/check/review observations | HC-SNAP-01 (`stale_head_evidence_cannot_complete`), HC-CAP-01 (`unsupported_capability_stays_explicit`) | not run — incomplete |
+| read/check/review observations | HC-SNAP-01 (`stale_head_evidence_cannot_complete`) | not run — incomplete |
 
 ## Remaining limitations
 

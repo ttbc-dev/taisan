@@ -22,13 +22,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT = ROOT / 'docs/s1/acceptance-report.md'
-
-EXPECTED_ROWS = (
-    [f'S-{i}' for i in range(1, 9)]
-    + ['S-3a']
-    + [f'A-{i}' for i in range(1, 5)]
-    + [f'R-{i}' for i in range(1, 10)]
-)
+CHECKLIST = ROOT / 'docs/s1/evidence-checklist.md'
+CHECKLIST_ROW = re.compile(r'^\|\s*(S-\d+a?|A-\d+|R-\d+)\s*\|', re.MULTILINE)
 
 ROW = re.compile(r'^\|\s*(S-\d+a?|A-\d+|R-\d+)\s*\|([^|]+)\|([^|]+)\|([^|]+)\|\s*$', re.MULTILINE)
 CLAIM_HEADING = re.compile(r'^###\s*(C-\d+)\s*\(([^,]+),\s*([a-z]+)\)\s*$', re.MULTILINE)
@@ -41,8 +36,26 @@ def fail(msg):
     sys.exit(1)
 
 
+def expected_rows():
+    # The checklist is the source of truth: a criterion added to it must
+    # also appear in the report (and vice versa). Never hardcode the set,
+    # or both sides could omit a new row without failing.
+    try:
+        ids = CHECKLIST_ROW.findall(CHECKLIST.read_text())
+    except FileNotFoundError:
+        fail(f'checklist {CHECKLIST} not found')
+    seen = []
+    for row_id in ids:
+        if row_id not in seen:
+            seen.append(row_id)
+    if not seen:
+        fail(f'checklist {CHECKLIST} defines no S1 rows')
+    return seen
+
+
 def main():
     text = REPORT.read_text()
+    expected = expected_rows()
 
     rows = {}
     for match in ROW.finditer(text):
@@ -50,10 +63,10 @@ def main():
         if row_id in rows:
             fail(f'duplicate row {row_id} — each S1 criterion must appear exactly once')
         rows[row_id] = (criterion, variant, result)
-    for row_id in EXPECTED_ROWS:
+    for row_id in expected:
         if row_id not in rows:
             fail(f'missing S1 row {row_id}')
-    extra = sorted(set(rows) - set(EXPECTED_ROWS))
+    extra = sorted(set(rows) - set(expected))
     if extra:
         fail(f'unexpected rows in the report table: {extra}')
 

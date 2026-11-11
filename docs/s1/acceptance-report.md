@@ -13,19 +13,20 @@ admission) or U9 (host exchangeability) evidence rows** — those are
 separate acceptance tracks; see [evidence-checklist.md](evidence-checklist.md#boundaries).
 
 `config_digest` is `sha256:<hex>` of the sanitized installation config
-file (`installation.json`). For U8.4 (this slice) it is the digest of the retained
-installation config used by this run (path not committed), matching the config recorded at
-run time. For U8.2/U8.3 the digests were taken from the retained files
-**at the time this report was written**, not captured at run time —
-those records predate this slice's digest definition, so the binding is
-weaker there; this is recorded here rather than papered over.
+file (`installation.json`). The valid claims in this report cite U8.2/U8.3
+evidence; their digests were taken from the retained files **at the time
+this report was written**, not captured at run time, because those
+records predate this report's digest definition. That binding is weaker
+than a run-time digest and is recorded here rather than papered over.
+The U8.4 recovery slice supplies no claim block here — its outcomes
+appear only in the absent/invalid reasons of the table.
 
 | # | Criterion | Variant | Result |
 | --- | --- | --- | --- |
 | S-1 | submit accepted; W1/E1 queued; no Invocation | success | valid — C-01 |
 | S-2 | dispatch admission (slot + reservations + Invocation request atomically) | success | valid — C-02 |
 | S-3 | artifact produced; `verification_argv` passes | success | valid — C-03 |
-| S-3a | invariant-check Invocation on the approved set before publication | success | invalid — no separate invariant-check Invocation exists on this revision; the invariant leg ran as an Assessment fact (u8.2/u8.3/u8.4 all record `s1.writable-paths-bounded` + `s1.no-force-push` as Assessment facts only) |
+| S-3a | invariant-check Invocation on the approved set before publication | success | invalid — no separate invariant-check Invocation exists on this revision; only u8.2 records the invariant content as named Assessment facts (`s1.writable-paths-bounded` + `s1.no-force-push`), while u8.3 describes it generically (bounded writable paths, no-force-push ancestry) and u8.4 records only a generic invariant-check Assessment fact — no criteria row has a separate Invocation identity |
 | S-4 | stop proof → push receipt → open receipt → ChangeHead H1 | success | valid — C-04 |
 | S-5 | real checks and a real review (≥1 finding) on H1 | success | invalid — H1 evidence is real (checks success; review `5836107428`, 2 occurrences) but the reviewer identity was `github-actions[bot]`, not the dedicated S1 reviewer GitHub App the installation spec requires; claim identity fails linkage |
 | S-6 | judge(expected_head=H1) → fix → I2 → republish H2 | success | valid — C-05 |

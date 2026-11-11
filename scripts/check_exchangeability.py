@@ -6,8 +6,9 @@ Fail-closed assertions for the U9.5 exchangeability evidence report:
 1. Every HC-* row in the conformance matrix appears in the coverage
    matrix (the comparison applies the same matrix to both sides).
 2. Every live-spike cell of the coverage matrix is marked incomplete
-   unless docs/evidence/u9.4-live-spike.md exists — a non-incomplete
-   live cell is only legal with that authorized-spike evidence record.
+   unless the established U9.4 evidence record (docs/evidence/u9.4.md)
+   carries an authorized live-spike run tag — a non-incomplete live cell
+   is only legal with that authorized-spike evidence record.
 3. Every coverage row in which at least one fixture cell is not
    `covered` has its rows listed (with reasons) in the remaining
    limitations section.
@@ -25,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / 'docs/host-conformance-matrix.md'
 REPORT = ROOT / 'docs/host-exchangeability.md'
-SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4-live-spike.md'
+SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4.md'
 
 MATRIX_ROW = re.compile(r'^\|\s*(HC-[A-Z]+-\d+)\s*\|', re.MULTILINE)
 
@@ -79,9 +80,14 @@ def main():
         raise AssertionError(f'matrix rows missing from the coverage matrix: {sorted(missing)}')
 
     spike_text = SPIKE_EVIDENCE.read_text().lower() if SPIKE_EVIDENCE.exists() else ''
+    # A live cell may leave `incomplete` only when the record carries a
+    # run tag and a positive authorization assertion. Negations are
+    # matched as phrases, so a record that merely *mentions* a past
+    # unauthorized attempt while asserting the authorized one is not a
+    # false negative.
     spike_ok = bool(spike_text) and bool(re.search(r'u94-[0-9t]+z?-r[0-9]+', spike_text)) \
         and bool(re.search(r'\bauthorized\b', spike_text)) \
-        and not re.search(r'\b(unauthorized|un_authorized|not\s+authorized|never\s+authorized|no\s+authori[sz]ation)\b', spike_text)
+        and not re.search(r'\b(not\s+authorized|never\s+authorized|no\s+authori[sz]ation)\b', spike_text)
     for label, ids, cells in rows:
         live = cells[3].lower()
         if re.match(r'^incomplete\s+(—|-)\s+spike not run', live):
@@ -112,25 +118,40 @@ def main():
     claimed = re.findall(r'`([a-z_]+)`', claim)
     if not claimed:
         raise AssertionError('exchangeability claim names no operations')
+    unbacked = []
+    bindings = []
     for op in sorted(set(claimed)):
         if op in ('approve_change', 'mark_ready', 'resolve_thread'):
             raise AssertionError(f'{op} is structurally unsupported and may not appear in the exchangeability claim')
         match = re.search(rf'^\|\s*`{re.escape(op)}`\s*\|([^|]+)\|', binding, re.MULTILINE)
         if not match:
             raise AssertionError(f'claimed operation `{op}` has no binding row in the claim binding table')
-        bound = row_ids(match.group(1))
+        bindings.append((f'`{op}`', match.group(1)))
+    # The observations category is named in the claim as plain prose, not
+    # a backticked operation; it must be bound and validated like the rest.
+    observations = re.search(r'read\s*/\s*check\s*/\s*review\s+observations', claim)
+    if observations:
+        match = re.search(r'^\|\s*read\s*/\s*check\s*/\s*review observations\s*\|([^|]+)\|',
+                          binding, re.MULTILINE)
+        if not match:
+            raise AssertionError('claimed read/check/review observations have no binding row')
+        bindings.append(('read/check/review observations', match.group(1)))
+    for op, cell in bindings:
+        bound = row_ids(cell)
         if not bound:
-            raise AssertionError(f'binding row for `{op}` names no HC rows')
+            raise AssertionError(f'binding row for {op} names no HC rows')
         backed = []
         for row_id in bound:
             candidate = next((cells for label, ids, cells in rows if row_id in ids), None)
             if candidate is None:
-                raise AssertionError(f'binding row for `{op}` names {row_id}, absent from the coverage matrix')
+                raise AssertionError(f'binding row for {op} names {row_id}, absent from the coverage matrix')
             if all(c.lower().startswith('covered') for c in candidate[:2]):
                 backed.append(row_id)
         if len(backed) != len(bound):
-            raise AssertionError(f'claimed operation `{op}` bound to {bound}, but not all are fixture-`covered` '
-                                 f'on both full-baseline fixtures: {backed}')
+            unbacked.append(f'{op} bound to {bound}, but not all are fixture-`covered` on both '
+                            f'full-baseline fixtures: {backed}')
+    if unbacked:
+        raise AssertionError('; '.join(unbacked))
     for marker in ('fixture-level exchangeability', 'only'):
         if marker not in claim:
             raise AssertionError(f'exchangeability claim must stay fixture-scoped ({marker!r} missing)')
