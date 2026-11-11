@@ -6,9 +6,10 @@ Fail-closed assertions for the U9.5 exchangeability evidence report:
 1. Every HC-* row in the conformance matrix appears in the coverage
    matrix (the comparison applies the same matrix to both sides).
 2. Every live-spike cell of the coverage matrix is marked incomplete
-   unless the established U9.4 evidence record (docs/evidence/u9.4.md)
-   carries an authorized live-spike run tag — a non-incomplete live cell
-   is only legal with that authorized-spike evidence record.
+   unless a dedicated live-spike record
+   (docs/evidence/u9.4-live-spike.md) carries an authorized run tag — a
+   non-incomplete live cell is only legal with that authorized-spike
+   record. The fixture-only U9.4 record is never treated as live proof.
 3. Every coverage row in which at least one fixture cell is not
    `covered` has its rows listed (with reasons) in the remaining
    limitations section.
@@ -26,7 +27,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / 'docs/host-conformance-matrix.md'
 REPORT = ROOT / 'docs/host-exchangeability.md'
-SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4.md'
+SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4-live-spike.md'
+NEGATED_AUTH = re.compile(
+    r'\b(?:un[ _-]?authori[sz]ed|(?:not|never|no)[ _-]+(?:authori[sz]ed|authori[sz]ation))\b')
 
 MATRIX_ROW = re.compile(r'^\|\s*(HC-[A-Z]+-\d+)\s*\|', re.MULTILINE)
 
@@ -80,14 +83,15 @@ def main():
         raise AssertionError(f'matrix rows missing from the coverage matrix: {sorted(missing)}')
 
     spike_text = SPIKE_EVIDENCE.read_text().lower() if SPIKE_EVIDENCE.exists() else ''
-    # A live cell may leave `incomplete` only when the record carries a
-    # run tag and a positive authorization assertion. Negations are
-    # matched as phrases, so a record that merely *mentions* a past
-    # unauthorized attempt while asserting the authorized one is not a
-    # false negative.
+    # A live cell may leave `incomplete` only when a dedicated live-spike
+    # record (never the fixture-only U9.4 record) carries a run tag and a
+    # positive authorization assertion. Negations are matched as phrases
+    # with either separator, so `not_authorized` fails as closed as
+    # `not authorized`, while a record that merely mentions a past
+    # unauthorized attempt is not a false negative.
     spike_ok = bool(spike_text) and bool(re.search(r'u94-[0-9t]+z?-r[0-9]+', spike_text)) \
         and bool(re.search(r'\bauthorized\b', spike_text)) \
-        and not re.search(r'\b(not\s+authorized|never\s+authorized|no\s+authori[sz]ation)\b', spike_text)
+        and not NEGATED_AUTH.search(spike_text)
     for label, ids, cells in rows:
         live = cells[3].lower()
         if re.match(r'^incomplete\s+(—|-)\s+spike not run', live):
