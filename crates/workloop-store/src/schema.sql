@@ -362,3 +362,19 @@ CREATE TABLE IF NOT EXISTS body_pins (
     dependency TEXT NOT NULL,
     PRIMARY KEY (body_id, dependency)
 );
+
+-- The durable WorkerRequest export for one Invocation (U4.2): written
+-- before any process is launched; `state` flips to 'bound' in the same
+-- commit that records the running Invocation's identity. An 'exported'
+-- row whose Invocation never launched is the crash window
+-- reconciliation tolerates — never a stop proof, never a release.
+CREATE TABLE IF NOT EXISTS worker_request_exports (
+    invocation_id TEXT PRIMARY KEY REFERENCES invocations(id),
+    request_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    workspace_root TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'exported'
+        CHECK (state IN ('exported', 'bound')),
+    process_identity TEXT
+);

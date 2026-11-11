@@ -140,6 +140,12 @@ impl ReadView for FailingTx<'_> {
     fn work_usage(&self, _work_id: &WorkId) -> Result<Option<WorkUsage>, StoreError> {
         unimplemented!()
     }
+    fn worker_request_export(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<workloop_core::worker::WorkerRequestExport>, StoreError> {
+        Ok(None)
+    }
     fn reservation(&self, _resource_key: &str) -> Result<Option<ResourceReservation>, StoreError> {
         unimplemented!()
     }
