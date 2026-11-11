@@ -71,8 +71,11 @@ SHA_REVISION_KEYS = (
     "worker_adapter_revision",
 )
 EVIDENCE_DOCUMENT = "docs/evidence/u8.1.md"
-DIGEST_PATTERN = re.compile(
-    r"fixture content digest\s+`?([0-9a-f]{64})`?", re.IGNORECASE
+INLINE_DIGEST_PATTERN = re.compile(
+    r"fixture content digest[ \t]+`?([0-9a-f]{64})`?", re.IGNORECASE
+)
+TABLE_DIGEST_PATTERN = re.compile(
+    r"fixture content digest[ \t]*\|[ \t]*`?([0-9a-f]{64})`?", re.IGNORECASE
 )
 
 
@@ -198,13 +201,26 @@ def configuration_identity_label(spec: dict) -> str:
         store_label = f"unresolved:{store.get('resolution', '')}"
     else:
         store_label = str(store)
-    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    worker = spec.get("worker_runtime_identity")
+    effects = worker.get("allowed_effects") if isinstance(worker, dict) else None
+    if isinstance(effects, dict):
+        effects_label = ",".join(
+            f"{key}={str(value).lower()}" for key, value in sorted(effects.items())
+        )
+    else:
+        effects_label = "missing"
+    canonical = json.dumps(
+        {"configuration_identity": config, "allowed_effects": effects},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     config_digest = hashlib.sha256(canonical.encode()).hexdigest()
     return (
         f"{config.get('host_instance')}/{config.get('repository')} "
         f"adapter={config.get('adapter')} "
         f"contract={config.get('contract_version')} "
-        f"store={store_label} config_sha256={config_digest}"
+        f"store={store_label} effects={effects_label} "
+        f"config_sha256={config_digest}"
     )
 
 
@@ -278,15 +294,23 @@ def validate_fixture_digest(root: Path) -> tuple[str, list[str]]:
         return digest, [
             f"{EVIDENCE_DOCUMENT}: missing required fixture content digest record"
         ]
-    recorded = set(DIGEST_PATTERN.findall(document.read_text()))
-    if not recorded:
-        return digest, [f"{EVIDENCE_DOCUMENT}: missing fixture content digest"]
-    if recorded != {digest}:
-        return digest, [
-            f"{EVIDENCE_DOCUMENT}: recorded fixture content digest "
-            f"{', '.join(sorted(recorded))} does not match computed {digest}"
-        ]
-    return digest, []
+    text = document.read_text()
+    errors: list[str] = []
+    for label, pattern in (
+        ("inline", INLINE_DIGEST_PATTERN),
+        ("table-row", TABLE_DIGEST_PATTERN),
+    ):
+        recorded = set(pattern.findall(text))
+        if not recorded:
+            errors.append(
+                f"{EVIDENCE_DOCUMENT}: missing {label} fixture content digest"
+            )
+        elif recorded != {digest}:
+            errors.append(
+                f"{EVIDENCE_DOCUMENT}: recorded {label} fixture content digest "
+                f"{', '.join(sorted(recorded))} does not match computed {digest}"
+            )
+    return digest, errors
 
 
 def validate_rehearsals(root: Path, spec: dict) -> list[str]:
@@ -830,17 +854,10 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
         errors.extend(
             f"evidence-checklist: {item}" for item in validate_checklist(checklist)
         )
-        checklist_spec = spec if install_spec is None else {}
-        if install_spec is not None and paths["installation-spec"].is_file():
-            try:
-                checklist_spec = _load_json(paths["installation-spec"])
-            except CheckFailure as exc:
-                errors.extend(exc.errors)
-                checklist_spec = {}
-        if checklist_spec:
+        if resolved_spec:
             errors.extend(
                 f"evidence-checklist: {item}"
-                for item in validate_checklist_revision_config(checklist, checklist_spec)
+                for item in validate_checklist_revision_config(checklist, spec)
             )
         if all((root / relative).is_file() for relative in DOC_FILES.values()):
             errors.extend(validate_markdown(root, checklist))

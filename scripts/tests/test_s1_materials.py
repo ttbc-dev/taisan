@@ -66,9 +66,28 @@ class S1MaterialsTest(unittest.TestCase):
 
     def test_complete_install_spec_reports_success_without_live_execution(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / 'install.json'
-            path.write_text(json.dumps(self.complete_install_spec()))
-            report = prerequisites.verify(ROOT, path)
+            root = Path(temp)
+            shutil.copytree(FIXTURE_DIR, root / 'fixtures' / 's1')
+            shutil.copytree(ROOT / 'docs' / 's1', root / 'docs' / 's1')
+            shutil.copytree(
+                ROOT / 'docs' / 'evidence', root / 'docs' / 'evidence'
+            )
+            complete = self.complete_install_spec()
+            path = root / 'install.json'
+            path.write_text(json.dumps(complete))
+            checklist_path = root / 'fixtures' / 's1' / 'evidence-checklist.json'
+            checklist = json.loads(checklist_path.read_text())
+            expected = prerequisites.expected_revision_config(complete)
+            checklist['revision_config'] = copy.deepcopy(expected)
+            for row in checklist['rows']:
+                row['revision_config'] = copy.deepcopy(expected)
+            checklist_path.write_text(json.dumps(checklist, indent=2) + '\n')
+            evidence_path = root / 'docs' / 'evidence' / 'u8.1.md'
+            evidence = evidence_path.read_text()
+            old_digest = prerequisites.fixture_content_digest(ROOT)
+            new_digest = prerequisites.fixture_content_digest(root)
+            evidence_path.write_text(evidence.replace(old_digest, new_digest))
+            report = prerequisites.verify(root, path)
             self.assertEqual(report['status'], 'ok', report['errors'])
             self.assertEqual(report['errors'], [])
             self.assertTrue(report['installation_ready'])
@@ -79,7 +98,7 @@ class S1MaterialsTest(unittest.TestCase):
                     sys.executable,
                     str(MODULE_PATH),
                     '--root',
-                    str(ROOT),
+                    str(root),
                     '--install-spec',
                     str(path),
                 ],
@@ -93,6 +112,17 @@ class S1MaterialsTest(unittest.TestCase):
             self.assertTrue(output['installation_ready'])
             self.assertEqual(output['unresolved_identities'], [])
             self.assertIn('not-run', output['live_execution'])
+
+    def test_explicit_install_spec_must_match_checklist_revision_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'install.json'
+            path.write_text(json.dumps(self.complete_install_spec()))
+            report = prerequisites.verify(ROOT, path)
+            self.assertEqual(report['status'], 'failed', report['errors'])
+            self.assertTrue(
+                any('revision_config' in error for error in report['errors']),
+                report['errors'],
+            )
 
     def test_placeholder_binding_identities_fail_closed(self):
         spec = copy.deepcopy(self.install_spec)
@@ -147,6 +177,26 @@ class S1MaterialsTest(unittest.TestCase):
         spec['configuration_identity']['budget'].pop('max_review_rounds')
         errors = prerequisites.validate_install_spec(spec)
         self.assertTrue(any('budget' in error for error in errors), errors)
+
+    def test_configuration_identity_binds_allowed_effects(self):
+        baseline = prerequisites.expected_revision_config(
+            self.install_spec
+        )['configuration_identity']
+        for key in ('workspace_write', 'local_git_write'):
+            spec = copy.deepcopy(self.install_spec)
+            spec['worker_runtime_identity']['allowed_effects'][key] = False
+            changed = prerequisites.expected_revision_config(
+                spec
+            )['configuration_identity']
+            self.assertNotEqual(changed, baseline, key)
+            self.assertIn('effects=', changed)
+            errors = prerequisites.validate_checklist_revision_config(
+                self.checklist, spec
+            )
+            self.assertTrue(
+                any(error.startswith('revision_config:') for error in errors),
+                (key, errors),
+            )
 
     def test_retained_rehearsal_profile_matches_live_evidence(self):
         status = self.install_spec['implementation_status']
@@ -209,6 +259,39 @@ class S1MaterialsTest(unittest.TestCase):
                 ),
                 report['errors'],
             )
+
+    def test_table_digest_record_is_enforced(self):
+        for mutation in ('stale', 'missing'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                shutil.copytree(FIXTURE_DIR, root / 'fixtures' / 's1')
+                shutil.copytree(ROOT / 'docs' / 's1', root / 'docs' / 's1')
+                shutil.copytree(
+                    ROOT / 'docs' / 'evidence', root / 'docs' / 'evidence'
+                )
+                evidence_path = root / 'docs' / 'evidence' / 'u8.1.md'
+                lines = evidence_path.read_text().splitlines(keepends=True)
+                if mutation == 'stale':
+                    rewritten = []
+                    for line in lines:
+                        if line.startswith('| Fixture content digest |'):
+                            line = '| Fixture content digest | `' + 'a' * 64 + '` |\n'
+                        rewritten.append(line)
+                    evidence_path.write_text(''.join(rewritten))
+                else:
+                    evidence_path.write_text(
+                        ''.join(
+                            line
+                            for line in lines
+                            if not line.startswith('| Fixture content digest |')
+                        )
+                    )
+                report = prerequisites.verify(root)
+                self.assertEqual(report['status'], 'failed')
+                self.assertTrue(
+                    any('table-row' in error for error in report['errors']),
+                    report['errors'],
+                )
 
     def test_all_three_variants_are_defined(self):
         variants = set(prerequisites.VARIANTS)
