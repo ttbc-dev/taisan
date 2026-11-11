@@ -1404,7 +1404,7 @@ fn sparse_host_unsupported_operations_stay_explicit() {
         let action_id = insert_intent(&store, &work_id, &repo(), action);
         fixture.apply(&store, &config);
         match intent(&store, &action_id).status {
-            HostActionStatus::Failed { ref reason } => {
+            HostActionStatus::Unsupported { ref reason } => {
                 assert!(
                     reason.contains("unsupported") && reason.contains(name),
                     "unsupported stays explicit: {reason}"

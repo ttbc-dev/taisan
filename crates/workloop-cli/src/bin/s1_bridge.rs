@@ -676,21 +676,19 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                 ),
             }
         }
-        // Head-bound writes the bridge does not implement stay explicit
-        // failures — an unsupported effect is never an applied receipt.
-        HostAction::UpdateChangeRequest { .. } => emit_result(
+        // Head-bound and discussion writes the bridge does not
+        // implement stay explicit — an `unsupported` receipt is never
+        // an applied receipt or a permission verdict.
+        HostAction::UpdateChangeRequest { .. }
+        | HostAction::PostComment { .. }
+        | HostAction::PublishReviewFeedback { .. }
+        | HostAction::ReplyToThread { .. }
+        | HostAction::ResolveThread { .. }
+        | HostAction::MarkReady { .. } => emit_result(
             ctx,
             intent,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: update_change_request".into(),
-            },
-            vec![],
-        ),
-        HostAction::PostComment { .. } => emit_result(
-            ctx,
-            intent,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: post_comment".into(),
+            HostActionStatus::Unsupported {
+                reason: format!("unsupported operation: {}", intent.action.name()),
             },
             vec![],
         ),

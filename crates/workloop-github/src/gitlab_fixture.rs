@@ -479,6 +479,26 @@ impl GitlabFixture {
                     failed(self, intent.action_id.clone(), "expected head moved")?;
                 }
             }
+            // Discussion and ready writes are outside this fixture's
+            // capability map — an explicit `unsupported` receipt, never
+            // a permission verdict or an invented success.
+            HostAction::PublishReviewFeedback { .. }
+            | HostAction::ReplyToThread { .. }
+            | HostAction::ResolveThread { .. }
+            | HostAction::MarkReady { .. } => {
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Unsupported {
+                            reason: format!("unsupported operation: {}", intent.action.name()),
+                        },
+                        vec![],
+                    )),
+                    now,
+                )?;
+            }
         }
         Ok(())
     }

@@ -79,6 +79,10 @@ fn action_capability(action: &HostAction) -> HostCapability {
         HostAction::OpenChangeRequest { .. } => HostCapability::ChangeRequestCreate,
         HostAction::UpdateChangeRequest { .. } => HostCapability::ChangeRequestUpdate,
         HostAction::PostComment { .. } => HostCapability::CommentWrite,
+        HostAction::PublishReviewFeedback { .. } => HostCapability::ReviewFeedback,
+        HostAction::ReplyToThread { .. } => HostCapability::ThreadReply,
+        HostAction::ResolveThread { .. } => HostCapability::ThreadResolve,
+        HostAction::MarkReady { .. } => HostCapability::MarkReady,
     }
 }
 
@@ -2648,12 +2652,14 @@ fn reconcile_intent(
         return Ok(());
     };
     // Terminal reconciliation sticks: a late receipt cannot resurrect a
-    // failed intent or downgrade an applied one. `unknown` stays
-    // reconcilable — a later receipt for the same action_id is what
-    // resolves it.
+    // failed or unsupported intent or downgrade an applied one.
+    // `unknown` stays reconcilable — a later receipt for the same
+    // action_id is what resolves it.
     if matches!(
         intent.status,
-        HostActionStatus::Applied | HostActionStatus::Failed { .. }
+        HostActionStatus::Applied
+            | HostActionStatus::Failed { .. }
+            | HostActionStatus::Unsupported { .. }
     ) {
         return Ok(());
     }
@@ -2754,6 +2760,46 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
                 && comment_marker == marker
                 && target.as_ref().is_none_or(|t| &t.head == expected_head)
         }
+        (
+            HostAction::PublishReviewFeedback { change, head, .. },
+            NormalizedEffectFact::ReviewPublished {
+                change: reviewed,
+                head: reviewed_head,
+                ..
+            },
+        ) => reviewed == change && reviewed_head == head,
+        (
+            HostAction::ReplyToThread {
+                change, thread_id, ..
+            },
+            NormalizedEffectFact::ReplyPosted {
+                change: replied,
+                thread_id: replied_thread,
+                ..
+            },
+        ) => replied == change && replied_thread == thread_id,
+        (
+            HostAction::ResolveThread {
+                change,
+                thread_id,
+                head,
+            },
+            NormalizedEffectFact::ThreadResolved {
+                change: resolved,
+                thread_id: resolved_thread,
+                target,
+            },
+        ) => resolved == change && resolved_thread == thread_id && &target.head == head,
+        (
+            HostAction::MarkReady {
+                change,
+                expected_head,
+            },
+            NormalizedEffectFact::ReadyObserved {
+                change: readied,
+                head,
+            },
+        ) => readied == change && head == expected_head,
         _ => false,
     })
 }

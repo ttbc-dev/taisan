@@ -364,6 +364,12 @@ pub enum HostActionStatus {
     Failed {
         reason: String,
     },
+    /// The host's capability map does not contain the operation:
+    /// terminal and explicit, never a permission verdict, and never
+    /// retried as a transport failure.
+    Unsupported {
+        reason: String,
+    },
     /// The action's effect cannot be determined; never treated as
     /// success and never silently re-attempted.
     Unknown {
@@ -415,6 +421,18 @@ pub enum NormalizedEffectFact {
         marker: String,
         body_digest: String,
         target: Option<DiffTarget>,
+    },
+    ReviewPublished {
+        change: ChangeRequestRef,
+        review_id: String,
+        head: CommitRevision,
+        body_digest: String,
+    },
+    ReplyPosted {
+        change: ChangeRequestRef,
+        thread_id: String,
+        reply_id: String,
+        body_digest: String,
     },
     ThreadResolved {
         change: ChangeRequestRef,

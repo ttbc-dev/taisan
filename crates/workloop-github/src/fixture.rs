@@ -12,8 +12,8 @@ use std::path::Path;
 
 use workloop_core::domain::{ExecutionId, WorkId};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, IssueRef, RepositoryRef,
-    SourceSnapshot,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorRef, IssueRef,
+    RepositoryRef, SourceSnapshot,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
@@ -160,6 +160,26 @@ pub struct FixtureGithub {
     checks: BTreeMap<(String, String), CheckRun>,
     /// `change_request_id` → the review stream, oldest first.
     reviews: BTreeMap<String, Vec<ReviewRecord>>,
+    /// The remote's stored comments, in post order: what a fresh read
+    /// of the discussion returns — the receipt's read-back source.
+    comments: Vec<PostedComment>,
+    /// `thread_id` → the remote's thread record: resolved state and
+    /// the posted reply stream.
+    threads: BTreeMap<String, RemoteThread>,
+    /// `change_request_id`s the remote currently reports ready
+    /// (non-draft).
+    ready_changes: std::collections::BTreeSet<String>,
+    /// Operation names the host's capability map does not contain:
+    /// attempts report `unsupported`, distinctly from any permission
+    /// verdict.
+    unsupported_ops: std::collections::BTreeSet<String>,
+    /// `(operation, actor)` pairs the remote denies — the bound actor
+    /// lacks the grant on this subject.
+    denied_ops: std::collections::BTreeSet<(String, String)>,
+    /// `(operation, actor)` pairs the remote marks ineligible — the
+    /// actor class cannot perform the operation on this subject
+    /// (e.g. the author reviewing their own change).
+    ineligible_ops: std::collections::BTreeSet<(String, String)>,
     /// Object ids the remote knows. A read naming an unknown object is
     /// partial — the host never invents a revision.
     objects: std::collections::BTreeSet<String>,
@@ -235,6 +255,30 @@ pub struct CheckRun {
 pub struct ReviewRecord {
     pub review_id: String,
     pub actor: HostActorRef,
+    /// The body the remote stored — what a fresh read of the review
+    /// returns for the receipt's digest.
+    pub body: String,
+}
+
+/// One comment the remote stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedComment {
+    /// The change the comment hangs on.
+    pub change_id: String,
+    /// The remote-issued comment identity — the read-back object id.
+    pub comment_id: String,
+    pub actor: HostActorRef,
+    pub body: String,
+}
+
+/// The remote's record of one review thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteThread {
+    /// The change the thread hangs on.
+    pub change_id: String,
+    pub resolved: bool,
+    /// Posted replies, in order: `(reply_id, actor, body)`.
+    pub replies: Vec<(String, HostActorRef, String)>,
 }
 
 /// What one typed `read` resolved against the synthetic remote: the
@@ -331,6 +375,10 @@ impl FixtureGithub {
             "change_request_read",
             "change_request_update",
             "comment_create",
+            "review_feedback",
+            "thread_reply",
+            "thread_resolve",
+            "mark_ready",
             "checks_read",
             "review_findings_read",
             "issue_read",
@@ -632,10 +680,54 @@ impl FixtureGithub {
             .push(ReviewRecord {
                 review_id: review_id.to_string(),
                 actor: actor.clone(),
+                body: String::new(),
             });
         self.bump(&ReadSubject::Review {
             change: change.clone(),
         });
+    }
+
+    /// Test control: register an open thread on a change — the remote
+    /// thread a reply or resolve effect targets.
+    pub fn add_thread(&mut self, change: &ChangeRequestRef, thread_id: &str) {
+        self.threads.insert(
+            thread_id.to_string(),
+            RemoteThread {
+                change_id: change.change_request.as_str().to_string(),
+                ..RemoteThread::default()
+            },
+        );
+    }
+
+    /// The remote's thread record, for assertions on the post-effect
+    /// state.
+    pub fn thread(&self, thread_id: &str) -> Option<&RemoteThread> {
+        self.threads.get(thread_id)
+    }
+
+    /// Whether the remote reports the change as ready (non-draft).
+    pub fn is_ready(&self, change_id: &str) -> bool {
+        self.ready_changes.contains(change_id)
+    }
+
+    /// Test control: drop `operation` from the host's capability map —
+    /// attempts report `unsupported`, distinctly from a denied grant.
+    pub fn remove_support(&mut self, operation: &str) {
+        self.unsupported_ops.insert(operation.to_string());
+    }
+
+    /// Test control: `actor` lacks the grant for `operation` on the
+    /// subject — attempts record `Failed{reason: denied}`.
+    pub fn deny(&mut self, operation: &str, actor: &HostActorRef) {
+        self.denied_ops
+            .insert((operation.to_string(), actor.actor.as_str().to_string()));
+    }
+
+    /// Test control: `actor`'s class cannot perform `operation` on the
+    /// subject — attempts record `Failed{reason: ineligible}`.
+    pub fn mark_ineligible(&mut self, operation: &str, actor: &HostActorRef) {
+        self.ineligible_ops
+            .insert((operation.to_string(), actor.actor.as_str().to_string()));
     }
 
     /// Resolve one typed read target against the remote: the observed
@@ -1165,6 +1257,54 @@ impl FixtureGithub {
                 }
             };
 
+        // Support is validated distinctly from eligibility: an
+        // operation absent from the host's capability map is an
+        // explicit `unsupported` receipt — the write is never
+        // attempted and it is never a permission verdict.
+        if self.unsupported_ops.contains(intent.action.name()) {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Unsupported {
+                        reason: format!("unsupported operation: {}", intent.action.name()),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+        // Actor eligibility on the subject is checked before the
+        // write: `ineligible` (the actor's class cannot perform the
+        // operation here) and `denied` (the actor lacks the grant) are
+        // distinct explicit failure classes — both terminal, never
+        // conflated with `unsupported`.
+        let eligibility_key = || {
+            (
+                intent.action.name().to_string(),
+                authenticated.actor.as_str().to_string(),
+            )
+        };
+        let ineligible = self.ineligible_ops.contains(&eligibility_key());
+        let denied = self.denied_ops.contains(&eligibility_key());
+        if ineligible || denied {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Failed {
+                        reason: if ineligible { "ineligible" } else { "denied" }.into(),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+
         // A test-armed execution fault: the write never reaches the
         // remote; the failed receipt is explicit and the intent keeps
         // its own record — a fault in one effect never rewrites the
@@ -1459,14 +1599,39 @@ impl FixtureGithub {
                 change,
                 expected_head,
                 marker,
-                ..
+                body,
             } => {
                 let actual = self.changes.get(change.change_request.as_str()).cloned();
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    let comment_id = format!("c-{}", intent.action_id);
+                    self.comments.push(PostedComment {
+                        change_id: change.change_request.as_str().to_string(),
+                        comment_id: comment_id.clone(),
+                        actor: authenticated.clone(),
+                        body: body.clone(),
+                    });
+                    self.bump(&ReadSubject::Pr {
+                        change: change.clone(),
+                    });
                     self.applied.push(format!(
                         "post_comment:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    // Read-back: the receipt cites the remote-issued
+                    // comment identity, read from the remote's stored
+                    // discussion — not the attempted payload.
+                    self.apply_queued_mutations();
+                    let posted = self
+                        .comments
+                        .iter()
+                        .find(|c| c.comment_id == comment_id)
+                        .expect("the just-written comment");
+                    let body_digest = workloop_core::domain::sha256_hex(
+                        "comment-v1",
+                        &workloop_core::domain::canonical_json(&serde_json::json!({
+                            "body": posted.body,
+                        })),
+                    );
                     self.emit(
                         store,
                         config,
@@ -1475,10 +1640,10 @@ impl FixtureGithub {
                             HostActionStatus::Applied,
                             vec![NormalizedEffectFact::CommentPosted {
                                 change: change.clone(),
-                                comment_id: format!("c-{}", intent.action_id),
-                                actor: intent.actor.clone(),
+                                comment_id: posted.comment_id.clone(),
+                                actor: posted.actor.clone(),
                                 marker: marker.clone(),
-                                body_digest: "fixture".into(),
+                                body_digest,
                                 target: None,
                             }],
                         )),
@@ -1497,6 +1662,296 @@ impl FixtureGithub {
                         )),
                         now,
                     )?;
+                }
+            }
+            HostAction::PublishReviewFeedback { change, head, body } => {
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let review_id = format!("rv-{}", intent.action_id);
+                self.reviews
+                    .entry(change.change_request.as_str().to_string())
+                    .or_default()
+                    .push(ReviewRecord {
+                        review_id: review_id.clone(),
+                        actor: authenticated.clone(),
+                        body: body.clone(),
+                    });
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.bump(&ReadSubject::Review {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "publish_review_feedback:{}:{}",
+                    intent.repository, change.change_request
+                ));
+                // Read-back: the receipt cites the remote-issued review
+                // id and the stored body digest.
+                self.apply_queued_mutations();
+                let posted = self
+                    .reviews
+                    .get(change.change_request.as_str())
+                    .and_then(|rs| rs.iter().find(|r| r.review_id == review_id))
+                    .expect("the just-written review");
+                let body_digest = workloop_core::domain::sha256_hex(
+                    "review-v1",
+                    &workloop_core::domain::canonical_json(&serde_json::json!({
+                        "body": posted.body,
+                    })),
+                );
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::ReviewPublished {
+                            change: change.clone(),
+                            review_id: posted.review_id.clone(),
+                            head: head.clone(),
+                            body_digest,
+                        }],
+                    )),
+                    now,
+                )?;
+            }
+            HostAction::ReplyToThread {
+                change,
+                thread_id,
+                body,
+            } => {
+                let belongs = self
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|t| t.change_id == change.change_request.as_str());
+                if !belongs {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "unknown thread".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let reply_id = format!("rp-{}", intent.action_id);
+                self.threads
+                    .get_mut(thread_id)
+                    .expect("checked")
+                    .replies
+                    .push((reply_id.clone(), authenticated.clone(), body.clone()));
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied
+                    .push(format!("thread_reply:{}:{}", intent.repository, thread_id));
+                // Read-back: the receipt cites the remote-issued reply
+                // identity on the exact thread.
+                self.apply_queued_mutations();
+                let posted = self
+                    .threads
+                    .get(thread_id)
+                    .and_then(|t| t.replies.iter().find(|(id, _, _)| id == &reply_id))
+                    .expect("the just-written reply");
+                let body_digest = workloop_core::domain::sha256_hex(
+                    "reply-v1",
+                    &workloop_core::domain::canonical_json(&serde_json::json!({
+                        "body": posted.2,
+                    })),
+                );
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::ReplyPosted {
+                            change: change.clone(),
+                            thread_id: thread_id.clone(),
+                            reply_id: posted.0.clone(),
+                            body_digest,
+                        }],
+                    )),
+                    now,
+                )?;
+            }
+            HostAction::ResolveThread {
+                change,
+                thread_id,
+                head,
+            } => {
+                let belongs = self
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|t| t.change_id == change.change_request.as_str());
+                if !belongs {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "unknown thread".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.threads.get_mut(thread_id).expect("checked").resolved = true;
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "resolve_thread:{}:{}",
+                    intent.repository, thread_id
+                ));
+                // Read-back: the receipt reports the thread state a
+                // fresh read observes.
+                self.apply_queued_mutations();
+                let resolved = self.threads.get(thread_id).is_some_and(|t| t.resolved);
+                let observed_head = self.changes.get(change.change_request.as_str()).cloned();
+                if resolved && let Some(object) = observed_head {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Applied,
+                            vec![NormalizedEffectFact::ThreadResolved {
+                                change: change.clone(),
+                                thread_id: thread_id.clone(),
+                                target: DiffTarget {
+                                    change: change.clone(),
+                                    head: CommitRevision::new(intent.repository.clone(), object)
+                                        .map_err(|detail| StoreError::Internal { detail })?,
+                                    base: None,
+                                    target_revision: None,
+                                },
+                            }],
+                        )),
+                        now,
+                    )?;
+                } else {
+                    // The write may have been undone by a racing actor:
+                    // the outcome cannot be established — report
+                    // unknown, never a fabricated resolve.
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Unknown {
+                                reason: "thread not resolved at read-back".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                }
+            }
+            HostAction::MarkReady {
+                change,
+                expected_head,
+            } => {
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(expected_head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.ready_changes
+                    .insert(change.change_request.as_str().to_string());
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "mark_ready:{}:{}",
+                    intent.repository, change.change_request
+                ));
+                // Read-back: the ready state and head a fresh read
+                // observes — not the attempted values.
+                self.apply_queued_mutations();
+                let ready = self.is_ready(change.change_request.as_str());
+                let observed_head = self.changes.get(change.change_request.as_str()).cloned();
+                match (ready, observed_head) {
+                    (true, Some(object)) => {
+                        self.emit(
+                            store,
+                            config,
+                            obs(result(
+                                intent.action_id.clone(),
+                                HostActionStatus::Applied,
+                                vec![NormalizedEffectFact::ReadyObserved {
+                                    change: change.clone(),
+                                    head: CommitRevision::new(intent.repository.clone(), object)
+                                        .map_err(|detail| StoreError::Internal { detail })?,
+                                }],
+                            )),
+                            now,
+                        )?;
+                    }
+                    _ => {
+                        self.emit(
+                            store,
+                            config,
+                            obs(result(
+                                intent.action_id.clone(),
+                                HostActionStatus::Unknown {
+                                    reason: "ready state not observed at read-back".into(),
+                                },
+                                vec![],
+                            )),
+                            now,
+                        )?;
+                    }
                 }
             }
         }

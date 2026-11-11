@@ -162,7 +162,7 @@ impl SparseHost {
                 config,
                 obs(result(
                     intent.action_id.clone(),
-                    HostActionStatus::Failed {
+                    HostActionStatus::Unsupported {
                         reason: format!("unsupported operation: {name}"),
                     },
                     vec![],
@@ -284,14 +284,27 @@ impl SparseHost {
                     now,
                 )?;
             }
-            // This fixture implements no head-bound writes. Reporting
-            // `failed(unsupported)` keeps the intent's fate explicit —
-            // an unsupported capability is never an applied receipt.
+            // This fixture implements no head-bound or discussion
+            // writes. An explicit `unsupported` receipt keeps the
+            // intent's fate honest — an unsupported capability is
+            // never an applied receipt and never a permission verdict.
             HostAction::UpdateChangeRequest { .. } => {
                 unsupported(self, "update_change_request")?;
             }
             HostAction::PostComment { .. } => {
                 unsupported(self, "post_comment")?;
+            }
+            HostAction::PublishReviewFeedback { .. } => {
+                unsupported(self, "publish_review_feedback")?;
+            }
+            HostAction::ReplyToThread { .. } => {
+                unsupported(self, "thread_reply")?;
+            }
+            HostAction::ResolveThread { .. } => {
+                unsupported(self, "resolve_thread")?;
+            }
+            HostAction::MarkReady { .. } => {
+                unsupported(self, "mark_ready")?;
             }
         }
         Ok(())

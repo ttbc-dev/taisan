@@ -243,17 +243,48 @@ pub enum HostAction {
         marker: String,
         body: String,
     },
+    /// Publish review feedback bound to the head it examined.
+    PublishReviewFeedback {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+        body: String,
+    },
+    /// Post one reply on the identified thread, preserving its exact
+    /// thread identity.
+    ReplyToThread {
+        change: ChangeRequestRef,
+        thread_id: String,
+        body: String,
+    },
+    /// Resolve the identified thread, bound to the head its findings
+    /// were examined at. A reply is not a resolution.
+    ResolveThread {
+        change: ChangeRequestRef,
+        thread_id: String,
+        head: CommitRevision,
+    },
+    /// Mark the change request ready (non-draft), bound to an exact
+    /// head.
+    MarkReady {
+        change: ChangeRequestRef,
+        expected_head: CommitRevision,
+    },
 }
 
 impl HostAction {
     /// The operation name used for capability/eligibility bookkeeping
-    /// and failure receipts — stable across payload changes.
+    /// and failure receipts — the contract operation names, stable
+    /// across payload changes.
     pub fn name(&self) -> &'static str {
         match self {
             Self::PushRef { .. } => "push_ref",
             Self::OpenChangeRequest { .. } => "open_change_request",
             Self::UpdateChangeRequest { .. } => "update_change_request",
             Self::PostComment { .. } => "post_comment",
+            Self::PublishReviewFeedback { .. } => "publish_review_feedback",
+            Self::ReplyToThread { .. } => "thread_reply",
+            Self::ResolveThread { .. } => "resolve_thread",
+            Self::MarkReady { .. } => "mark_ready",
         }
     }
 }
