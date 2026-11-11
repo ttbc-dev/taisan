@@ -4305,16 +4305,13 @@ enum FireOutcome {
     },
 }
 
-/// Re-read one intent inside the firing transaction and apply the
-/// documented revalidation guards before any transition, so a stale
-/// list snapshot can never fire an intent twice or against a state
-/// that changed since the list was taken.
 /// Fire one intent, keeping the recorded suppression state honest:
 /// any outcome other than `Suppressed` (and other than `Ignored`,
 /// which means nothing was learned) drops a stale
 /// `equivalent_failure_suppressed` deferral for this intent's
 /// Execution, so the capacity Query never shows a stall explanation
-/// for a condition that no longer holds.
+/// for a condition that no longer holds. The re-read and revalidation
+/// happens in `fire_due_intent_inner`.
 fn fire_due_intent(
     tx: &mut dyn TxView,
     intent_id: &str,
@@ -4337,6 +4334,10 @@ fn fire_due_intent(
     Ok(outcome)
 }
 
+/// Re-read one intent inside the firing transaction and apply the
+/// documented revalidation guards before any transition, so a stale
+/// list snapshot can never fire an intent twice or against a state
+/// that changed since the list was taken.
 fn fire_due_intent_inner(
     tx: &mut dyn TxView,
     intent_id: &str,

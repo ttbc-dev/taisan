@@ -166,10 +166,12 @@ byte-identical command. If recovery is unavailable, preserve the
 
 ## Scope
 
-Setup (`init`, `check`), retention tooling, the `propose` selector
-batch, and the `run` driver are operator-facing surfaces invoked directly
-against an installation; this skill covers the workflow Operations listed
-above and adds nothing else. TUI and MCP are not part of this skill.
+Installation is implicit (`load_or_create` on first use) and the
+`run` driver, the `propose` selector batch, and resource
+claim/release are operator-facing surfaces invoked directly against an
+installation; this skill covers the workflow Operations listed above and
+adds nothing else, and it names no surface that does not ship in the CLI.
+TUI and MCP are not part of this skill.
 
 ## What this skill never does
 
