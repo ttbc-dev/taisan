@@ -76,12 +76,27 @@ proves the runner's declared-set skip path rather than full coverage.
 
 ## Remaining limitations
 
+- `HC-CAP-02` is exercised only by `SparseHost` — both
+  full-baseline fixtures implement every declared operation, so there is
+  nothing for them to refuse (by design, not an omission), but that
+  means the row carries no `FixtureGithub`/`GitlabFixture` evidence.
+- `HC-DELIV-01`, `HC-LIFE-01` and `HC-LIFE-02` are exercised only by
+  `FixtureGithub` (the fixture adapter suite instantiates it only);
+  `GitlabFixture` and `SparseHost` have no delivery-idempotency or
+  deferred-settlement evidence.
+- `HC-READ-01` — no fixture evidence at all (read-model ops are not in
+  the vocabulary).
+- `HC-LIFE-03` is partial on every side — restart durability is
+  exercised via durable-store tests; rename and mid-Work actor change
+  are uncovered.
 - No live claim: U9.4 (#80) has not run; approval/readiness semantics,
   actor eligibility, denied-permission injection, and restart
-  reconciliation on a real host remain unproven.
+  reconciliation on a real host remain unproven — every live cell in
+  the coverage matrix is `incomplete — spike not run`, with this reason.
 - `approve_change` / `mark_ready` / thread operations are absent from
   the `HostAction` vocabulary — structurally unsupported, not yet
-  implementable (HC-CAP-03).
+  implementable (HC-CAP-03, covered by a fixture-independent type-level
+  check on all fixtures).
 - Typed read-model operations for issue content, comments, and threads
   are not in the contract vocabulary (HC-READ-01).
 - Rename, mid-Work actor change, and cross-instance delivery-ID
