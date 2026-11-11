@@ -205,6 +205,30 @@ fn fault_hook_armed_with(
     debug_build && opted_in_repo == Some(repo_display) && hook_value == Some(expected)
 }
 
+/// A partial-effect injection is only honest when a push for this Work's
+/// source branch already landed and was recorded `Applied` with a
+/// `RefPublished` effect. A stray armed variable with no such receipt
+/// must fall through to the real create path instead of fabricating a
+/// "landed push" claim.
+fn push_landed_in(intents: &[HostActionIntent], work_id: &WorkId, branch: &str) -> bool {
+    intents.iter().any(|intent| {
+        intent.work_id == *work_id
+            && intent.status == HostActionStatus::Applied
+            && matches!(&intent.action, HostAction::PushRef { branch: b, .. } if b.as_str() == branch)
+            && intent
+                .effects
+                .iter()
+                .any(|e| matches!(e, NormalizedEffectFact::RefPublished { .. }))
+    })
+}
+
+fn push_landed_for(ctx: &Ctx, work_id: &WorkId, branch: &str) -> bool {
+    ctx.store
+        .transact_deferred(|tx| tx.action_intents())
+        .map(|intents| push_landed_in(&intents, work_id, branch))
+        .unwrap_or(false)
+}
+
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
 /// authorization is the credential's real `permissions` answer.
@@ -622,8 +646,13 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
             // U8.4 fault hook: S1_BRIDGE_INJECT_FAIL_OPEN_PR=1 records a
             // definite no-effect failure for the create leg (partial effect:
             // push landed, create refused). Arming additionally requires
-            // the scenario opt-in; see `fault_hook_armed`.
-            if fault_hook_armed(ctx, "S1_BRIDGE_INJECT_FAIL_OPEN_PR", "1") {
+            // the scenario opt-in; see `fault_hook_armed`. It also requires
+            // a recorded `Applied` push for this Work and source branch, so
+            // an armed variable left set across ticks/stores cannot fabricate
+            // a "landed push" receipt where no push happened.
+            if fault_hook_armed(ctx, "S1_BRIDGE_INJECT_FAIL_OPEN_PR", "1")
+                && push_landed_for(ctx, &intent.work_id, source_branch)
+            {
                 emit_result(
                     ctx,
                     intent,
@@ -1133,9 +1162,78 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::fault_hook_armed_with;
+    use super::*;
+    use workloop_core::identity::{ActorRole, HostInstanceId, RepositoryId, RepositoryRef};
 
     const SCENARIO_REPO: &str = "shimpeiws/coding-worker-smoke";
+
+    fn push_intent(
+        work: &str,
+        status: HostActionStatus,
+        branch: &str,
+        with_effect: bool,
+    ) -> HostActionIntent {
+        let host = HostInstanceId::trusted("test-host");
+        let repository = RepositoryRef::new(host.clone(), RepositoryId::trusted("test-repo"));
+        let produced = CommitRevision::new(repository.clone(), "produced").unwrap();
+        let effects = if with_effect {
+            vec![NormalizedEffectFact::RefPublished {
+                repository: repository.clone(),
+                branch: branch.into(),
+                produced: produced.clone(),
+                observed: CommitRevision::new(repository.clone(), "observed").unwrap(),
+                relation: RefRelation::Equal,
+            }]
+        } else {
+            vec![]
+        };
+        HostActionIntent {
+            action_id: "act-test".into(),
+            work_id: WorkId(work.into()),
+            host: host.clone(),
+            repository,
+            role: ActorRole::Publication,
+            actor: HostActorRef {
+                host: host.clone(),
+                actor: HostActorId::trusted("publisher"),
+            },
+            action: HostAction::PushRef {
+                branch: branch.into(),
+                produced,
+            },
+            payload_digest: "digest".into(),
+            status,
+            authenticated_actor: None,
+            effects,
+            created_seq: 1,
+        }
+    }
+
+    #[test]
+    fn partial_effect_injection_requires_a_recorded_landed_push() {
+        let work = WorkId("work-test".into());
+        let applied = push_intent("work-test", HostActionStatus::Applied, "work/test", true);
+        assert!(push_landed_in(
+            std::slice::from_ref(&applied),
+            &work,
+            "work/test"
+        ));
+
+        let pending = push_intent("work-test", HostActionStatus::Pending, "work/test", true);
+        assert!(!push_landed_in(&[pending], &work, "work/test"));
+        assert!(!push_landed_in(
+            std::slice::from_ref(&applied),
+            &work,
+            "work/other"
+        ));
+        assert!(!push_landed_in(
+            std::slice::from_ref(&applied),
+            &WorkId("work-other".into()),
+            "work/test"
+        ));
+        let no_effect = push_intent("work-test", HostActionStatus::Applied, "work/test", false);
+        assert!(!push_landed_in(&[no_effect], &work, "work/test"));
+    }
 
     #[test]
     fn fault_hooks_require_scenario_opt_in_for_this_repo() {

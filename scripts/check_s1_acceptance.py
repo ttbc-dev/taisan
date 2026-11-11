@@ -106,6 +106,7 @@ def main():
     if len(fences) != len(headings):
         fail(f'expected {len(headings)} claim json fences, found {len(fences)}')
     claims = [json.loads(f) for f in fences]
+    source_digests = {}
 
     for claim in claims:
         cid = claim.get('id', '?')
@@ -126,16 +127,22 @@ def main():
             fail(f'{cid}: revision {claim["revision"]!r} is not a commit SHA')
         if not re.fullmatch(r'sha256:[0-9a-f]{64}', claim['config_digest']):
             fail(f'{cid}: config_digest {claim["config_digest"]!r} is not sha256:<64 hex>')
-        src = ROOT / claim['source'].split('#')[0]
+        source_path = claim['source'].split('#')[0]
+        source_digests.setdefault(source_path, set()).add(claim['config_digest'])
+        src = ROOT / source_path
         if not src.exists():
             fail(f'{cid}: source {claim["source"]!r} does not exist in the repo')
+        src_text = src.read_text()
+        if claim['revision'] not in src_text:
+            fail(f'{cid}: revision {claim["revision"]!r} does not appear in the linked source '
+                 f'{source_path}')
         fragment = claim['source'].split('#', 1)[1] if '#' in claim['source'] else ''
         if fragment:
             def slug(heading):
                 s = heading.strip().lower()
                 s = re.sub(r'[^\w\s-]', '', s, flags=re.UNICODE)
                 return re.sub(r'\s+', '-', s)
-            headings = [slug(l[3:]) for l in src.read_text().splitlines() if l.startswith('## ') or l.startswith('### ')]
+            headings = [slug(l[3:]) for l in src_text.splitlines() if l.startswith('## ') or l.startswith('### ')]
             if fragment not in headings:
                 fail(f'{cid}: source fragment #{fragment} matches no heading in {src.relative_to(ROOT)} '
                      f'(headings: {headings})')
@@ -202,6 +209,11 @@ def main():
         if stop_proof is not None:
             if not isinstance(stop_proof, str) or len(stop_proof.strip()) < 20:
                 fail(f'{cid}: stop_proof must be a non-empty string of ≥ 20 chars when present')
+
+    for source_path, digests in sorted(source_digests.items()):
+        if len(digests) > 1:
+            fail(f'claims linked to {source_path} declare conflicting config_digest values: '
+                 f'{sorted(digests)}')
 
     prose_and_table = '\n'.join(re.findall(r'^\|.*$', text, re.MULTILINE))
     claims_text = '\n'.join(fences)

@@ -18,6 +18,10 @@ evidence; their digests were taken from the retained files **at the time
 this report was written**, not captured at run time, because those
 records predate this report's digest definition. That binding is weaker
 than a run-time digest and is recorded here rather than papered over.
+`scripts/check_s1_acceptance.py` cross-checks each revision SHA against
+the linked evidence file and requires a consistent digest per source,
+but it cannot recompute the digest: no retained `installation.json` is
+in this repo.
 The U8.4 recovery slice supplies no claim block here — its outcomes
 appear only in the absent/invalid reasons of the table.
 

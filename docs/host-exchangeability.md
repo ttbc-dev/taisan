@@ -95,6 +95,11 @@ constitutes, or may be read as, live evidence.
   full-baseline fixtures implement every declared operation, so there is
   nothing for them to refuse (by design, not an omission), but that
   means the row carries no `FixtureGithub`/`GitlabFixture` evidence.
+- `HC-BASE-03` and `HC-BASE-04` are `skipped` on `SparseHost` because
+  that fixture does not declare `change_request_update` or
+  `comment_create`; the declared-set skip is by design, but it means the
+  row carries no `SparseHost` evidence (both full-baseline fixtures
+  cover it).
 - `HC-DELIV-01`, `HC-LIFE-01` and `HC-LIFE-02` are exercised only by
   `FixtureGithub` (the fixture adapter suite instantiates it only);
   `GitlabFixture` and `SparseHost` have no delivery-idempotency or

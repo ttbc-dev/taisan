@@ -29,7 +29,7 @@ MATRIX = ROOT / 'docs/host-conformance-matrix.md'
 REPORT = ROOT / 'docs/host-exchangeability.md'
 SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4-live-spike.md'
 NEGATED_AUTH = re.compile(
-    r'\b(?:un[ _-]?authori[sz]ed|(?:not|never|no)[ _-]+(?:authori[sz]ed|authori[sz]ation))\b')
+    r'\b(?:(?:not|never|no|un)[ _-]+(?:authori[sz]ed|authori[sz]ation))\b')
 
 MATRIX_ROW = re.compile(r'^\|\s*(HC-[A-Z]+-\d+)\s*\|', re.MULTILINE)
 
@@ -105,7 +105,7 @@ def main():
     uncovered = []
     for label, ids, cells in rows:
         fixture_cells = cells[:3]
-        if any(not c.lower().startswith(('covered', 'skipped')) for c in fixture_cells):
+        if any(not c.lower().startswith('covered') for c in fixture_cells):
             uncovered.extend(ids)
     live_limitation = re.search(r'spike.*(not run|unproven)|live claim', limitations, re.IGNORECASE | re.DOTALL)
     if not live_limitation:
