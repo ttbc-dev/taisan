@@ -454,6 +454,54 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
     }
 }
 
+/// Regression (shadow review): a store stamped with the format this
+/// slice bumps from (3), created before this slice — full base schema,
+/// no reclaim-plan tables — must open and upgrade in place. Refusing
+/// it as "not the recognized schema" would lock existing installations
+/// out of their own stores.
+#[test]
+fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
+    let unique = format!(
+        "taisan-cleanup-upgrade-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let d = handle_command(&store, &config(), &submit("upgrade-prev"), NOW).unwrap();
+        assert!(matches!(d, CommandDecision::Accepted { .. }));
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE reclaim_plan_entries; DROP TABLE reclaim_plans; PRAGMA user_version=3;",
+        )
+        .unwrap();
+    }
+    let store = SqliteStore::open(&db, 1).expect("a previous-format store opens");
+    assert!(
+        store.reclaim_plan_open().unwrap().is_none(),
+        "the reclaim tables are installed and usable"
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "the upgrade lands on the current format");
+    }
+    drop(store);
+    let again = SqliteStore::open(&db, 1).expect("reopen after upgrade is a no-op");
+    assert!(again.reclaim_plan_open().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn report_exposes_pressure_metrics_and_unavailable_list() {
     let fixture = Fixture::new("report");

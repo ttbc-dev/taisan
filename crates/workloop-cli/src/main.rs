@@ -197,7 +197,9 @@ enum RetentionCommands {
     /// outcome is already recorded.
     Cleanup {
         /// Perform the phase-2 reclaim plan. Without it, changes nothing.
-        #[arg(long)]
+        /// `--apply` is accepted as a synonym (the retention policy's
+        /// documented spelling for the same flag).
+        #[arg(long, alias = "apply")]
         execute: bool,
         /// Override the configured per-pass body bound.
         #[arg(long)]

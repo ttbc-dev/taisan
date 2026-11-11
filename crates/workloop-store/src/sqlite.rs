@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `3` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` or `2` must carry the
+//! `PRAGMA user_version` is the format gate: `4` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` or `2` or `3` must carry the
 //! complete recognized earlier schema and upgrades additively at open;
 //! a stamped file whose schema is foreign or incomplete, an unversioned
 //! database with user tables (a slice-0 file — archive-only), and a
@@ -36,8 +36,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// The only store format this binary reads or writes. `2` adds the
 /// `invocations.descendants` column and the artifact-handoff and
 /// verification tables; `3` adds the body catalogue's explicit
-/// `pin_state`. Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 3;
+/// `pin_state`; `4` adds the `reclaim_plans` / `reclaim_plan_entries`
+/// tables. Older files upgrade additively at open.
+const FORMAT_VERSION: i64 = 4;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -80,23 +81,21 @@ const EXPECTED_TABLES: &[&str] = &[
 
 /// The tables the run-lease slice added on top of the previous
 /// release's v1 store while it was still stamped `1`. Together with
-/// [`V2_ADDED_TABLES`] they are the set a stamped v1 file may
-/// legitimately lack and still be upgraded in place by the additive
-/// migration.
-const ADDITIVE_TABLES: &[&str] = &[
-    "body_catalog",
-    "body_pins",
-    "reclaim_plan_entries",
-    "reclaim_plans",
-    "recovery_intents",
-    "run_lease",
-];
+/// [`V2_ADDED_TABLES`] and [`V3_ADDED_TABLES`] they are the set a
+/// stamped file may legitimately lack and still be upgraded in place
+/// by the additive migration.
+const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
 
 /// Tables the v1 → v2 migration adds. Everything else in
 /// `EXPECTED_TABLES` must already be present for a `user_version=1`
 /// file to migrate — that check is what keeps a foreign stamped file
 /// refused instead of silently reshaped.
 const V2_ADDED_TABLES: &[&str] = &["artifact_handoffs", "verification_results"];
+
+/// The tables the U2.6 two-phase cleanup slice adds on top of the
+/// format-3 store while it is still stamped `3`. Like the additive set
+/// they are installed by the same `SCHEMA` batch on upgrade.
+const V3_ADDED_TABLES: &[&str] = &["reclaim_plan_entries", "reclaim_plans"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -238,7 +237,11 @@ impl SqliteStore {
             let present = table_set(&conn)?;
             let v1_complete = EXPECTED_TABLES
                 .iter()
-                .filter(|t| !V2_ADDED_TABLES.contains(t) && !ADDITIVE_TABLES.contains(t))
+                .filter(|t| {
+                    !V2_ADDED_TABLES.contains(t)
+                        && !V3_ADDED_TABLES.contains(t)
+                        && !ADDITIVE_TABLES.contains(t)
+                })
                 .all(|t| present.contains(*t));
             if !v1_complete {
                 return Err(StoreError::UnsupportedFormat {

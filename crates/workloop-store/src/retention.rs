@@ -1214,6 +1214,20 @@ impl SqliteStore {
         Ok(pinned != 0)
     }
 
+    fn row_state(&self, body_id: &str) -> Result<Option<String>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        guard
+            .query_row(
+                "SELECT state FROM body_catalog WHERE body_id=?1",
+                params![body_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
     fn finish_reclaim(
         &self,
         body_id: &str,
@@ -1790,6 +1804,34 @@ impl SqliteStore {
             plan_id: plan_id.to_string(),
             ..ReclaimExecution::default()
         };
+        // The entry must belong to this plan and still be pending —
+        // the public entry point is not a general delete primitive.
+        let pending: Option<Option<String>> = {
+            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                detail: "store lock poisoned".into(),
+            })?;
+            guard
+                .query_row(
+                    "SELECT outcome FROM reclaim_plan_entries \
+                     WHERE plan_id=?1 AND body_id=?2",
+                    params![plan_id, body_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_err)?
+        };
+        match pending {
+            None => {
+                return Err(StoreError::ConstraintConflict {
+                    detail: format!("body {body_id} is not an entry of plan {plan_id}"),
+                });
+            }
+            Some(Some(_)) => {
+                execution.already_recorded = 1;
+                return Ok(execution);
+            }
+            Some(None) => {}
+        }
         self.execute_entry(
             plan_id,
             body_id,
@@ -1950,13 +1992,51 @@ impl SqliteStore {
         if state == "present" {
             // Pin re-checked inside the same immediate transaction the
             // sweep uses; a pin that appeared after planning holds the
-            // body here.
+            // body here. A false return means the row moved out of
+            // `present` first (a concurrent pass won): re-read instead
+            // of reporting a false `held`/`pinned`.
             if !self.mark_reclaiming(body_id)? {
-                self.record_entry_outcome(plan_id, body_id, "held", "pinned", now_unix_seconds)?;
-                execution.held.push(HeldBody {
-                    body_id: body_id.into(),
-                    reason: "pinned".into(),
-                });
+                match self.row_state(body_id)? {
+                    Some(current) if current == "present" => {
+                        self.record_entry_outcome(
+                            plan_id,
+                            body_id,
+                            "held",
+                            "pinned",
+                            now_unix_seconds,
+                        )?;
+                        execution.held.push(HeldBody {
+                            body_id: body_id.into(),
+                            reason: "pinned".into(),
+                        });
+                    }
+                    Some(_) => {
+                        self.record_entry_outcome(
+                            plan_id,
+                            body_id,
+                            "unavailable",
+                            "reclaimed_by_concurrent_pass",
+                            now_unix_seconds,
+                        )?;
+                        execution.unavailable.push(HeldBody {
+                            body_id: body_id.into(),
+                            reason: "reclaimed_by_concurrent_pass".into(),
+                        });
+                    }
+                    None => {
+                        self.record_entry_outcome(
+                            plan_id,
+                            body_id,
+                            "unavailable",
+                            "not_registered",
+                            now_unix_seconds,
+                        )?;
+                        execution.unavailable.push(HeldBody {
+                            body_id: body_id.into(),
+                            reason: "not_registered".into(),
+                        });
+                    }
+                }
                 return Ok(());
             }
         } else {
@@ -2032,9 +2112,13 @@ impl SqliteStore {
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        // First recorded outcome wins: a concurrent cleanup or sweep
+        // may have recorded the entry already, and that record must not
+        // be overwritten here.
         tx.execute(
             "UPDATE reclaim_plan_entries SET outcome=?3, outcome_reason=?4, \
-             outcome_unix_seconds=?5 WHERE plan_id=?1 AND body_id=?2",
+             outcome_unix_seconds=?5 WHERE plan_id=?1 AND body_id=?2 \
+             AND outcome IS NULL",
             params![plan_id, body_id, outcome, reason, now_unix_seconds],
         )
         .map_err(map_err)?;
