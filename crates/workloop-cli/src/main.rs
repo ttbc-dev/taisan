@@ -1114,8 +1114,8 @@ fn run(cli: Cli) -> i32 {
                                 serde_json::to_value(execution).unwrap_or(serde_json::json!({}));
                             value["skipped"] = serde_json::to_value(&plan.skipped)
                                 .unwrap_or(serde_json::json!([]));
-                            value["held"] = serde_json::to_value(&plan.held)
-                                .unwrap_or(serde_json::json!([]));
+                            value["held"] =
+                                serde_json::to_value(&plan.held).unwrap_or(serde_json::json!([]));
                             finish("retention_cleanup", value)
                         }
                         // Phase 1 just ensured an open plan exists.
