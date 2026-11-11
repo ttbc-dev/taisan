@@ -68,6 +68,13 @@ trait OutboxHost {
     fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String>;
     fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str);
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation);
+    /// Seed one authoritative issue read for fixtures that declare
+    /// `issue_read`. Fixtures that do not declare it leave the default.
+    fn seed_issue(&mut self, _issue: &IssueRef, _source_revision: &str, _content_digest: &str) {}
+    /// The scoped issue read, when this fixture declares `issue_read`.
+    fn issue_read(&self, _issue: &IssueRef) -> Option<(String, String, IssueState)> {
+        None
+    }
 }
 
 impl OutboxHost for FixtureGithub {
@@ -91,6 +98,13 @@ impl OutboxHost for FixtureGithub {
     }
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
         self.emit(store, config, observation, NOW).unwrap();
+    }
+    fn seed_issue(&mut self, issue: &IssueRef, source_revision: &str, content_digest: &str) {
+        self.set_issue(issue, source_revision, content_digest, IssueState::Open);
+    }
+    fn issue_read(&self, issue: &IssueRef) -> Option<(String, String, IssueState)> {
+        self.issue_read(issue)
+            .map(|read| (read.source_revision, read.content_digest, read.state))
     }
 }
 
@@ -253,6 +267,14 @@ fn intent(store: &SqliteStore, action_id: &str) -> HostActionIntent {
         .unwrap()
 }
 
+// MATRIX-CODE-BEGIN
+// The table and runner below are the host-neutral matrix: no provider
+// name or provider condition may appear in this region. Each row names
+// the contract capabilities it exercises; a fixture either runs the
+// unchanged scenario (when its declared set covers the row) or produces
+// an explicit unsupported outcome (when it does not). There is no skip
+// path.
+
 /// One host-neutral scenario: the capabilities it requires plus the
 /// assertions every conforming fixture must satisfy. `run` panics on a
 /// contract violation, so a completed scenario is a covered matrix row.
@@ -262,8 +284,182 @@ struct Scenario {
     run: fn(&mut dyn OutboxHost, &SqliteStore, &WorkloopConfig),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MatrixOutcome {
+    Covered,
+    Unsupported { capability: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixResult {
+    row: &'static str,
+    outcome: MatrixOutcome,
+}
+
 fn covered(requires: &[&'static str], declared: &BTreeSet<&'static str>) -> bool {
     requires.iter().all(|r| declared.contains(r))
+}
+
+/// A concrete action for a capability whose operation is in the
+/// executable vocabulary. Used only when a fixture does not declare the
+/// capability: the fixture must refuse it explicitly.
+fn unsupported_operation_action(capability: &str) -> Option<HostAction> {
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("conformance-unsupported"),
+        display_number: Some(1),
+    };
+    match capability {
+        "push_ref" => Some(HostAction::PushRef {
+            branch: "conformance/unsupported".into(),
+            produced: rev("conformance-head"),
+        }),
+        "change_request_create" => Some(HostAction::OpenChangeRequest {
+            source_branch: "conformance/unsupported".into(),
+            target_branch: "main".into(),
+            title: "unsupported".into(),
+            body: String::new(),
+        }),
+        "change_request_update" => Some(HostAction::UpdateChangeRequest {
+            change,
+            expected_head: rev("conformance-head"),
+            title: None,
+            body: None,
+        }),
+        "comment_write" | "comment_create" => Some(HostAction::PostComment {
+            change,
+            expected_head: rev("conformance-head"),
+            marker: "conformance".into(),
+            body: "unsupported".into(),
+        }),
+        _ => None,
+    }
+}
+
+fn unsupported_operation_label(capability: &str) -> &str {
+    match capability {
+        "push_ref" => "push_ref",
+        "change_request_create" => "open_change_request",
+        "change_request_update" => "update_change_request",
+        "comment_write" | "comment_create" => "post_comment",
+        other => other,
+    }
+}
+
+/// The contract operation a declarable-but-unimplemented capability
+/// would need. The matrix asserts the operation is absent from the
+/// executable vocabulary — a declared capability without an operation
+/// cannot be silently counted as covered.
+fn absent_operation_name(capability: &str) -> Option<&'static str> {
+    match capability {
+        "inline_comment" => Some("post_inline_comment"),
+        "review_feedback" => Some("publish_review_feedback"),
+        "approve" => Some("approve_change"),
+        "request_changes" => Some("request_changes"),
+        "thread_reply" => Some("thread_reply"),
+        "thread_resolve" => Some("resolve_thread"),
+        "mark_ready" | "ready" => Some("mark_ready"),
+        _ => None,
+    }
+}
+
+/// Turn one undeclared required capability into an explicit unsupported
+/// result: an admission rejection, a `failed` receipt naming the
+/// operation, or a type-level absent operation. Never a skip.
+fn assert_unsupported_capability(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    capability: &'static str,
+) {
+    let cap = HostCapability::from_name(capability)
+        .unwrap_or_else(|| panic!("matrix capability {capability:?} is not in the contract set"));
+    assert!(
+        !config.declared_capabilities.contains(&cap),
+        "fixture declared {capability:?}: the covered scenario must run, not be reported unsupported"
+    );
+
+    if capability == "issue_read" {
+        let writes_before = fixture.applied().len();
+        let decision = handle_command(
+            store,
+            config,
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("conformance".into()),
+                idempotency_key: format!("unsupported-{capability}"),
+                body: CommandBody::Submit {
+                    intent: "requires an undeclared capability".into(),
+                    sources: vec![SourceSnapshot {
+                        issue: IssueRef {
+                            repository: repo(),
+                            issue: IssueId::trusted("1"),
+                            display_number: Some(1),
+                        },
+                        source_revision: "r1".into(),
+                        content_digest: "d1".into(),
+                    }],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        match decision {
+            CommandDecision::Rejected { reason, .. } => {
+                assert_eq!(reason, RejectionCode::UnsupportedCapability);
+            }
+            other => panic!("undeclared {capability} must reject admission: {other:?}"),
+        }
+        assert_eq!(
+            fixture.applied().len(),
+            writes_before,
+            "an unsupported capability never writes"
+        );
+    } else if let Some(action) = unsupported_operation_action(capability) {
+        let (work_id, _eid) = submit(store, config, &format!("unsupported-{capability}"));
+        let action_id = insert_intent(store, &work_id, &repo(), action);
+        let writes_before = fixture.applied().len();
+        fixture.apply(store, config);
+        match intent(store, &action_id).status {
+            HostActionStatus::Failed { ref reason } => {
+                let operation = unsupported_operation_label(capability);
+                assert!(
+                    reason.contains("unsupported") && reason.contains(operation),
+                    "undeclared {capability} must fail explicitly as {operation}: {reason}"
+                );
+            }
+            other => panic!("undeclared {capability} must not be applied or dropped: {other:?}"),
+        }
+        assert_eq!(
+            fixture.applied().len(),
+            writes_before,
+            "an unsupported operation lands no write"
+        );
+    } else if let Some(operation) = absent_operation_name(capability) {
+        assert!(
+            serde_json::from_value::<HostAction>(serde_json::json!({ "action": operation }))
+                .is_err(),
+            "matrix operation {operation} for {capability:?} is in the vocabulary; it needs a covered scenario"
+        );
+    } else {
+        panic!("matrix capability {capability:?} has no explicit unsupported probe");
+    }
+}
+
+/// Reached only if a fixture declares an optional capability whose
+/// executable operation is absent: that is a contract gap, not a row
+/// that may pass silently.
+fn declared_capability_without_operation(
+    _fixture: &mut dyn OutboxHost,
+    _store: &SqliteStore,
+    _config: &WorkloopConfig,
+) {
+    panic!("a declared optional capability has no executable operation; the row cannot be covered");
 }
 
 /// HC-BASE-01/02: `push_ref` and `open_change_request` each produce an
@@ -738,6 +934,39 @@ fn stale_head_evidence_cannot_complete(
     );
 }
 
+/// HC-READ-01: an issue read is scoped by (repository, issue ID) and
+/// preserves the source revision and content digest it observed. The
+/// same display number on another repository is a different issue, not
+/// an interchangeable read.
+fn issue_reads_are_scoped_and_revision_bound(
+    fixture: &mut dyn OutboxHost,
+    _store: &SqliteStore,
+    _config: &WorkloopConfig,
+) {
+    let issue = IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted("issue-1"),
+        display_number: Some(1),
+    };
+    fixture.seed_issue(&issue, "source-rev-1", "content-digest-1");
+    let read = fixture
+        .issue_read(&issue)
+        .expect("a fixture declaring issue_read serves the read");
+    assert_eq!(read.0, "source-rev-1");
+    assert_eq!(read.1, "content-digest-1");
+    assert_eq!(read.2, IssueState::Open);
+
+    let same_number_elsewhere = IssueRef {
+        repository: repo_b(),
+        issue: IssueId::trusted("issue-1"),
+        display_number: Some(1),
+    };
+    assert!(
+        fixture.issue_read(&same_number_elsewhere).is_none(),
+        "an issue read is scoped by repository; the shared display number is not an identity"
+    );
+}
+
 /// HC-PERM-01: authorization loss is distinct from support: with
 /// `host_write` denied the intents stay `pending` — no write, and no
 /// fabricated failure or unsupported claim.
@@ -997,6 +1226,11 @@ fn scenarios() -> Vec<Scenario> {
             run: stale_head_evidence_cannot_complete,
         },
         Scenario {
+            id: "HC-READ-01 issue read is scoped and revision-bound",
+            requires: &["issue_read"],
+            run: issue_reads_are_scoped_and_revision_bound,
+        },
+        Scenario {
             id: "HC-PERM-01 denied permission is not unsupported",
             requires: &[],
             run: denied_permission_is_not_unsupported,
@@ -1016,60 +1250,339 @@ fn scenarios() -> Vec<Scenario> {
             requires: &[],
             run: unsupported_capability_stays_explicit,
         },
+        Scenario {
+            id: "HC-OPT-01 approve review write stays explicitly unsupported",
+            requires: &["approve"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-02 ready marking stays explicitly unsupported",
+            requires: &["mark_ready"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-03 request-changes review write stays explicitly unsupported",
+            requires: &["request_changes"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-04 inline comment stays explicitly unsupported",
+            requires: &["inline_comment"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-05 review feedback stays explicitly unsupported",
+            requires: &["review_feedback"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-06 thread reply stays explicitly unsupported",
+            requires: &["thread_reply"],
+            run: declared_capability_without_operation,
+        },
+        Scenario {
+            id: "HC-OPT-07 thread resolve stays explicitly unsupported",
+            requires: &["thread_resolve"],
+            run: declared_capability_without_operation,
+        },
     ]
 }
 
-/// Run every scenario the fixture's declared set covers and return the
-/// (covered, skipped-for-missing-capabilities) matrix rows.
-fn run_suite(fixture: &mut dyn OutboxHost) -> (Vec<&'static str>, Vec<&'static str>) {
+/// Execute every matrix row against one fixture. A row whose required
+/// capabilities are declared runs the unchanged scenario; every
+/// undeclared required capability is asserted to produce an explicit
+/// unsupported result. The returned list has exactly one outcome per
+/// row, so no row can be silently skipped.
+fn run_suite(fixture: &mut dyn OutboxHost) -> Vec<MatrixResult> {
     let declared = fixture.declared_names();
-    let mut covered_ids = Vec::new();
-    let mut skipped_ids = Vec::new();
+    let mut results = Vec::new();
     for scenario in scenarios() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let config = config_for(fixture);
+        let missing: Vec<&'static str> = scenario
+            .requires
+            .iter()
+            .copied()
+            .filter(|required| !declared.contains(required))
+            .collect();
         if covered(scenario.requires, &declared) {
-            let store = SqliteStore::in_memory(2).unwrap();
-            let config = config_for(fixture);
             (scenario.run)(fixture, &store, &config);
-            covered_ids.push(scenario.id);
+            results.push(MatrixResult {
+                row: scenario.id,
+                outcome: MatrixOutcome::Covered,
+            });
         } else {
-            skipped_ids.push(scenario.id);
+            for capability in &missing {
+                assert_unsupported_capability(fixture, &store, &config, capability);
+            }
+            results.push(MatrixResult {
+                row: scenario.id,
+                outcome: MatrixOutcome::Unsupported {
+                    capability: missing[0],
+                },
+            });
         }
     }
-    (covered_ids, skipped_ids)
+    results
+}
+
+fn covered_rows(results: &[MatrixResult]) -> Vec<&'static str> {
+    results
+        .iter()
+        .filter(|r| r.outcome == MatrixOutcome::Covered)
+        .map(|r| r.row)
+        .collect()
+}
+
+fn unsupported_rows(results: &[MatrixResult]) -> Vec<(&'static str, &'static str)> {
+    results
+        .iter()
+        .filter_map(|r| match r.outcome {
+            MatrixOutcome::Unsupported { capability } => Some((r.row, capability)),
+            MatrixOutcome::Covered => None,
+        })
+        .collect()
+}
+// MATRIX-CODE-END
+
+struct RegisteredFixture {
+    name: &'static str,
+    build: fn() -> Box<dyn OutboxHost>,
+}
+
+/// Every host implementation registered with the matrix. The registry
+/// is outside the host-neutral matrix region above: a fixture's type
+/// name identifies the implementation for reporting, never a branch in
+/// shared assertions.
+fn registered_fixtures() -> Vec<RegisteredFixture> {
+    vec![
+        RegisteredFixture {
+            name: "fixture-github",
+            build: || Box::new(FixtureGithub::new()),
+        },
+        RegisteredFixture {
+            name: "fixture-gitlab",
+            build: || Box::new(GitlabFixture::new()),
+        },
+        RegisteredFixture {
+            name: "fixture-sparse",
+            build: || Box::new(SparseHost::new()),
+        },
+    ]
+}
+
+#[test]
+fn conformance_matrix_runs_every_row_against_every_registered_fixture() {
+    let rows = scenarios();
+    let fixtures = registered_fixtures();
+    assert!(fixtures.len() >= 3, "independent fixtures are registered");
+    let mut total = 0;
+    let mut unsupported = 0;
+    for registration in &fixtures {
+        let mut fixture = (registration.build)();
+        let results = run_suite(&mut *fixture);
+        assert_eq!(
+            results.len(),
+            rows.len(),
+            "{}: every matrix row has an outcome",
+            registration.name
+        );
+        total += results.len();
+        unsupported += unsupported_rows(&results).len();
+    }
+    assert_eq!(total, rows.len() * fixtures.len());
+    assert!(
+        unsupported > 0,
+        "undeclared optional capabilities produce explicit unsupported rows"
+    );
 }
 
 #[test]
 fn fixture_github_covers_the_full_baseline() {
     let mut fixture = FixtureGithub::new();
-    let (covered_ids, skipped_ids) = run_suite(&mut fixture);
-    assert_eq!(skipped_ids, Vec::<&'static str>::new());
-    assert_eq!(covered_ids.len(), scenarios().len(), "{covered_ids:?}");
+    let results = run_suite(&mut fixture);
+    for result in &results {
+        if result.row.starts_with("HC-OPT-") {
+            assert!(
+                matches!(result.outcome, MatrixOutcome::Unsupported { .. }),
+                "optional row is explicit-unsupported: {result:?}"
+            );
+        } else {
+            assert_eq!(
+                result.outcome,
+                MatrixOutcome::Covered,
+                "baseline row is covered: {result:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn sparse_host_runs_the_same_suite_within_its_declared_set() {
     let mut fixture = SparseHost::new();
-    let (covered_ids, skipped_ids) = run_suite(&mut fixture);
-    // The head-bound update scenario requires a capability this fixture
-    // does not declare; every baseline row still runs unchanged.
+    let results = run_suite(&mut fixture);
     assert_eq!(
-        skipped_ids,
-        vec!["HC-BASE-03/04 expected-head mismatch aborts head-bound writes"]
+        unsupported_rows(&results),
+        vec![
+            (
+                "HC-BASE-03/04 expected-head mismatch aborts head-bound writes",
+                "change_request_update"
+            ),
+            (
+                "HC-READ-01 issue read is scoped and revision-bound",
+                "issue_read"
+            ),
+            (
+                "HC-OPT-01 approve review write stays explicitly unsupported",
+                "approve"
+            ),
+            (
+                "HC-OPT-02 ready marking stays explicitly unsupported",
+                "mark_ready"
+            ),
+            (
+                "HC-OPT-03 request-changes review write stays explicitly unsupported",
+                "request_changes"
+            ),
+            (
+                "HC-OPT-04 inline comment stays explicitly unsupported",
+                "inline_comment"
+            ),
+            (
+                "HC-OPT-05 review feedback stays explicitly unsupported",
+                "review_feedback"
+            ),
+            (
+                "HC-OPT-06 thread reply stays explicitly unsupported",
+                "thread_reply"
+            ),
+            (
+                "HC-OPT-07 thread resolve stays explicitly unsupported",
+                "thread_resolve"
+            ),
+        ]
     );
-    assert_eq!(covered_ids.len(), scenarios().len() - 1);
+    assert_eq!(covered_rows(&results).len(), scenarios().len() - 9);
 }
 
 /// `GitlabFixture` — a remote model whose change-request identity is a
 /// per-project IID and whose head follows the source branch — runs the
 /// unchanged suite within its declared set. Its declared set differs
-/// from `FixtureGithub`'s (no `issue_read`) yet still covers every
-/// scenario's requirement list, so no row is skipped.
+/// from `FixtureGithub`'s (no `issue_read`): the issue-read row and every
+/// optional row produce explicit unsupported outcomes rather than
+/// disappearing.
 #[test]
 fn gitlab_fixture_runs_the_same_suite_within_its_declared_set() {
     let mut fixture = GitlabFixture::new();
-    let (covered_ids, skipped_ids) = run_suite(&mut fixture);
-    assert_eq!(skipped_ids, Vec::<&'static str>::new());
-    assert_eq!(covered_ids.len(), scenarios().len(), "{covered_ids:?}");
+    let results = run_suite(&mut fixture);
+    for result in &results {
+        if result.row.starts_with("HC-OPT-") || result.row.starts_with("HC-READ-") {
+            assert!(
+                matches!(result.outcome, MatrixOutcome::Unsupported { .. }),
+                "undeclared row is explicit-unsupported: {result:?}"
+            );
+        } else {
+            assert_eq!(
+                result.outcome,
+                MatrixOutcome::Covered,
+                "baseline row is covered: {result:?}"
+            );
+        }
+    }
+}
+
+/// Static check: the matrix table and runner contain no provider-name
+/// branch or provider-specific expectation. The fixture registry (which
+/// necessarily names implementation types for reporting) is outside the
+/// marked region; shared assertions bind only recorded intents,
+/// receipts, and scoped identities.
+#[test]
+fn matrix_code_has_no_host_name_branches() {
+    const SOURCE: &str = include_str!("host_conformance.rs");
+    let begin = SOURCE
+        .find("// MATRIX-CODE-BEGIN")
+        .expect("matrix region start marker");
+    let end = SOURCE
+        .find("// MATRIX-CODE-END")
+        .expect("matrix region end marker");
+    let matrix = SOURCE[begin..end].to_ascii_lowercase();
+    for provider in ["github", "gitlab"] {
+        assert!(
+            !matrix.contains(provider),
+            "matrix code names provider {provider:?}; shared assertions must stay host-neutral"
+        );
+    }
+    assert!(
+        !matrix.contains("fixture.name ==") && !matrix.contains("fixture.name !="),
+        "matrix code branches on a fixture name"
+    );
+    // The whole suite may name fixture types, but no conditional may
+    // branch on a provider name anywhere.
+    for line in SOURCE.lines() {
+        let lower = line.to_ascii_lowercase();
+        let names_provider = lower.contains("github") || lower.contains("gitlab");
+        let branches = lower.contains("== ")
+            || lower.contains("!= ")
+            || lower.trim_start().starts_with("match ");
+        assert!(
+            !(names_provider && branches),
+            "host-name branch in conformance suite: {line}"
+        );
+    }
+}
+
+/// Doc check: the U9.1 evidence record must defer any exchangeability
+/// claim to #114 and must not assert a GitLab spike result or a
+/// satisfied cross-host exchangeability claim.
+#[test]
+fn evidence_defers_exchangeability_to_114() {
+    let evidence = include_str!("../../../docs/evidence/u9.1.md");
+    let lower = evidence.to_ascii_lowercase();
+    assert!(
+        lower.contains("#114"),
+        "evidence must name #114 as the owner of the exchangeability claim"
+    );
+    assert!(
+        lower.contains("deferred"),
+        "evidence must mark the exchangeability claim deferred"
+    );
+    for positive in [
+        "exchangeability claim: pass",
+        "exchangeability: pass",
+        "exchangeability is satisfied",
+        "exchangeability proven",
+        "exchangeable across",
+        "interchangeable across",
+    ] {
+        assert!(
+            !lower.contains(positive),
+            "evidence asserts a satisfied exchangeability claim: {positive:?}"
+        );
+    }
+    for line in evidence.lines() {
+        let l = line.to_ascii_lowercase();
+        if l.contains("exchangeability") {
+            assert!(
+                l.contains("#114")
+                    || l.contains("defer")
+                    || l.contains("not claim")
+                    || l.contains("no cross-host")
+                    || l.contains("not asserted"),
+                "satisfied exchangeability claim outside a deferral: {line}"
+            );
+        }
+        if l.contains("spike") {
+            assert!(
+                l.contains("not run")
+                    || l.contains("defer")
+                    || l.contains("not claim")
+                    || l.contains("no gitlab spike")
+                    || l.contains("#114")
+                    || l.contains("no live"),
+                "evidence asserts a spike result: {line}"
+            );
+        }
+    }
 }
 
 /// The capability difference is part of the contract surface: this

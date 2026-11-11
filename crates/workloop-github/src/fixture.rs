@@ -281,6 +281,12 @@ impl FixtureGithub {
         );
     }
 
+    /// The authoritative read this fixture reports for one issue source,
+    /// keyed by the scoped issue identity (repository + issue ID).
+    pub fn issue_read(&self, issue: &IssueRef) -> Option<IssueRead> {
+        self.issues.get(&issue.to_string()).cloned()
+    }
+
     pub fn applied(&self) -> &[String] {
         &self.applied
     }
