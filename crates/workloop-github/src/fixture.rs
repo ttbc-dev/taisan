@@ -16,7 +16,8 @@ use workloop_core::identity::{
     SourceSnapshot,
 };
 use workloop_core::observation::{
-    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact,
+    Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -139,6 +140,34 @@ pub struct FixtureGithub {
     /// current authoritative read. A declared source with no row is an
     /// unavailable read — the host cannot answer it.
     issues: BTreeMap<String, IssueRead>,
+    /// `issue` → the actor the remote attributes its content to. A read
+    /// of an issue with no attributed actor reports the reading actor.
+    issue_actors: BTreeMap<String, HostActorRef>,
+    /// `repository` → the recorded default-branch head and the actor
+    /// the remote attributes it to.
+    repositories: BTreeMap<String, RepoHead>,
+    /// `(repository, branch)` → the actor that last moved the ref.
+    branch_actors: BTreeMap<(String, String), HostActorRef>,
+    /// `change_request_id` → the actor the remote attributes its head
+    /// to (the opener or the last pusher).
+    change_actors: BTreeMap<String, HostActorRef>,
+    /// `change_request_id` → the full scoped ref, learned at open or
+    /// registration time so raw-id mutators can bump the scoped
+    /// subject version.
+    change_refs: BTreeMap<String, ChangeRequestRef>,
+    /// `(change_request_id, check name)` → the remote's check-run
+    /// record.
+    checks: BTreeMap<(String, String), CheckRun>,
+    /// `change_request_id` → the review stream, oldest first.
+    reviews: BTreeMap<String, Vec<ReviewRecord>>,
+    /// Object ids the remote knows. A read naming an unknown object is
+    /// partial — the host never invents a revision.
+    objects: std::collections::BTreeSet<String>,
+    /// `ReadSubject::key()` → the remote's version of that subject.
+    /// Every mutation bumps the version of each subject it touched;
+    /// reads carry the version they observed, so a delayed delivery of
+    /// an older read can never outrank a newer one.
+    versions: BTreeMap<String, u64>,
     next_id: u64,
     /// `repository` → next display number: numbering is a per-repository
     /// namespace, as on a real host.
@@ -170,6 +199,41 @@ pub struct IssueRead {
     pub source_revision: String,
     pub content_digest: String,
     pub state: IssueState,
+}
+
+/// The remote's record of a repository's default-branch head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHead {
+    pub head: String,
+    pub actor: HostActorRef,
+}
+
+/// The remote's record of one check-run on a change request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRun {
+    pub run_id: String,
+    pub head: String,
+    pub actor: HostActorRef,
+}
+
+/// One review in a change request's review stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub review_id: String,
+    pub actor: HostActorRef,
+}
+
+/// What one typed `read` resolved against the synthetic remote: the
+/// observed revision in its per-kind form, the remote's version of the
+/// subject at read time, the actor the remote reports, and the read's
+/// completeness. A missing required field is `Partial` — the host never
+/// invents a revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRead {
+    pub revision: Option<ReadRevision>,
+    pub subject_version: u64,
+    pub actor: HostActorRef,
+    pub completeness: Completeness,
 }
 
 /// What one source-refresh pass read: head movements ingested, heads
@@ -255,9 +319,13 @@ impl FixtureGithub {
     }
 
     /// Test control: what the synthetic remote believes the change head is.
+    /// Moves the scoped `pr` subject's version when the change id is
+    /// registered; an unregistered id keeps version 0.
     pub fn set_head(&mut self, change_id: &str, head_object: &str) {
+        self.note_object(head_object);
         self.changes
             .insert(change_id.to_string(), head_object.to_string());
+        self.bump_change(change_id);
     }
 
     /// Test control: the authoritative read the synthetic remote returns
@@ -279,6 +347,9 @@ impl FixtureGithub {
                 state,
             },
         );
+        self.bump(&ReadSubject::Issue {
+            issue: issue.clone(),
+        });
     }
 
     pub fn applied(&self) -> &[String] {
@@ -292,6 +363,324 @@ impl FixtureGithub {
         self.branches
             .get(&(repository.to_string(), branch.to_string()))
             .cloned()
+    }
+
+    fn bump(&mut self, subject: &ReadSubject) {
+        *self.versions.entry(subject.key()).or_insert(0) += 1;
+    }
+
+    fn subject_version(&self, subject: &ReadSubject) -> u64 {
+        self.versions.get(&subject.key()).copied().unwrap_or(0)
+    }
+
+    /// Bump the scoped `pr` subject for a change id; a change the remote
+    /// never registered keeps version 0 — its reads stay consistent but
+    /// unordered, which the ledger treats as the first recorded state.
+    fn bump_change(&mut self, change_id: &str) {
+        if let Some(change) = self.change_refs.get(change_id) {
+            let subject = ReadSubject::Pr {
+                change: change.clone(),
+            };
+            self.bump(&subject);
+        }
+    }
+
+    fn note_object(&mut self, object: &str) {
+        self.objects.insert(object.to_string());
+    }
+
+    /// Test control: objects the remote already knows — e.g. a fetched
+    /// base/head pair a diff read can reference.
+    pub fn seed_objects(&mut self, objects: &[&str]) {
+        for object in objects {
+            self.note_object(object);
+        }
+    }
+
+    /// Test control: the remote's record of a repository's
+    /// default-branch head and the actor attributed to it.
+    pub fn set_repository(&mut self, repository: &RepositoryRef, head: &str, actor: &HostActorRef) {
+        self.note_object(head);
+        self.repositories.insert(
+            repository.to_string(),
+            RepoHead {
+                head: head.to_string(),
+                actor: actor.clone(),
+            },
+        );
+        self.bump(&ReadSubject::Repository {
+            repository: repository.clone(),
+        });
+    }
+
+    /// Test control: the actor the remote attributes an issue's content
+    /// to; reads of an issue without one report the reading actor.
+    pub fn set_issue_actor(&mut self, issue: &IssueRef, actor: &HostActorRef) {
+        self.issue_actors.insert(issue.to_string(), actor.clone());
+    }
+
+    /// Test control: move a branch head as the given actor — the
+    /// typed, versioned counterpart of a remote ref update.
+    pub fn set_branch(
+        &mut self,
+        repository: &RepositoryRef,
+        branch: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        self.note_object(head);
+        self.branches.insert(
+            (repository.to_string(), branch.to_string()),
+            head.to_string(),
+        );
+        self.branch_actors
+            .insert((repository.to_string(), branch.to_string()), actor.clone());
+        self.bump(&ReadSubject::Head {
+            repository: repository.clone(),
+            branch: branch.to_string(),
+        });
+    }
+
+    /// Test control: register a change's scoped ref so raw-id mutators
+    /// can bump its subject version, then move its head as `actor`.
+    pub fn set_change_head(&mut self, change: &ChangeRequestRef, head: &str, actor: &HostActorRef) {
+        self.note_object(head);
+        self.change_refs
+            .insert(change.change_request.as_str().to_string(), change.clone());
+        self.changes
+            .insert(change.change_request.as_str().to_string(), head.to_string());
+        self.change_actors
+            .insert(change.change_request.as_str().to_string(), actor.clone());
+        self.bump(&ReadSubject::Pr {
+            change: change.clone(),
+        });
+    }
+
+    /// Test control: the remote's check-run record for
+    /// `(change, check)` — run id, examined head, and producing actor.
+    pub fn set_check(
+        &mut self,
+        change: &ChangeRequestRef,
+        check: &str,
+        run_id: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        if !head.is_empty() {
+            self.note_object(head);
+        }
+        self.checks.insert(
+            (
+                change.change_request.as_str().to_string(),
+                check.to_string(),
+            ),
+            CheckRun {
+                run_id: run_id.to_string(),
+                head: head.to_string(),
+                actor: actor.clone(),
+            },
+        );
+        self.bump(&ReadSubject::Check {
+            change: change.clone(),
+            check: check.to_string(),
+        });
+    }
+
+    /// Test control: append one review to a change's review stream.
+    pub fn add_review(&mut self, change: &ChangeRequestRef, review_id: &str, actor: &HostActorRef) {
+        self.reviews
+            .entry(change.change_request.as_str().to_string())
+            .or_default()
+            .push(ReviewRecord {
+                review_id: review_id.to_string(),
+                actor: actor.clone(),
+            });
+        self.bump(&ReadSubject::Review {
+            change: change.clone(),
+        });
+    }
+
+    /// Resolve one typed read target against the remote: the observed
+    /// revision in its per-kind form, the remote's version of the
+    /// subject at read time, the actor the remote reports, and the
+    /// read's completeness. An absent subject or a missing required
+    /// field is a `Partial` read — the host never invents a revision.
+    pub fn read(&self, subject: &ReadSubject, reader: &HostActorRef) -> RemoteRead {
+        let version = self.subject_version(subject);
+        let partial = |reason: &str| RemoteRead {
+            revision: None,
+            subject_version: version,
+            actor: reader.clone(),
+            completeness: Completeness::Partial {
+                reason: reason.to_string(),
+            },
+        };
+        let complete = |revision: ReadRevision, actor: HostActorRef| RemoteRead {
+            revision: Some(revision),
+            subject_version: version,
+            actor,
+            completeness: Completeness::Complete,
+        };
+        let sha = |repository: &RepositoryRef, object: &str| {
+            CommitRevision::new(repository.clone(), object)
+                .map(|revision| ReadRevision::Sha { revision })
+        };
+        match subject {
+            ReadSubject::Repository { repository } => {
+                match self.repositories.get(&repository.to_string()) {
+                    Some(state) => match sha(repository, &state.head) {
+                        Ok(revision) => complete(revision, state.actor.clone()),
+                        Err(_) => partial("repository head is not a valid object id"),
+                    },
+                    None => partial("repository is not on the remote"),
+                }
+            }
+            ReadSubject::Issue { issue } => match self.issues.get(&issue.to_string()) {
+                Some(read) => {
+                    let actor = self
+                        .issue_actors
+                        .get(&issue.to_string())
+                        .cloned()
+                        .unwrap_or_else(|| reader.clone());
+                    if read.state == IssueState::Unavailable {
+                        return RemoteRead {
+                            completeness: Completeness::Unavailable {
+                                reason: "issue read is unavailable".into(),
+                            },
+                            ..partial("issue read is unavailable")
+                        };
+                    }
+                    if read.source_revision.is_empty() || read.content_digest.is_empty() {
+                        return partial("issue read is missing its revision or digest");
+                    }
+                    complete(
+                        ReadRevision::Issue {
+                            source_revision: read.source_revision.clone(),
+                            content_digest: read.content_digest.clone(),
+                        },
+                        actor,
+                    )
+                }
+                None => partial("issue is not on the remote"),
+            },
+            ReadSubject::Pr { change } => match self.changes.get(change.change_request.as_str()) {
+                Some(head) => {
+                    let actor = self
+                        .change_actors
+                        .get(change.change_request.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| reader.clone());
+                    match sha(&change.repository, head) {
+                        Ok(revision) => complete(revision, actor),
+                        Err(_) => partial("change head is not a valid object id"),
+                    }
+                }
+                None => partial("change request is not on the remote"),
+            },
+            ReadSubject::Head { repository, branch } => {
+                match self.branches.get(&(repository.to_string(), branch.clone())) {
+                    Some(head) => {
+                        let actor = self
+                            .branch_actors
+                            .get(&(repository.to_string(), branch.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| reader.clone());
+                        match sha(repository, head) {
+                            Ok(revision) => complete(revision, actor),
+                            Err(_) => partial("branch head is not a valid object id"),
+                        }
+                    }
+                    None => partial("branch is not on the remote"),
+                }
+            }
+            ReadSubject::Diff { snapshot } => {
+                let known = self.objects.contains(snapshot.base().object.as_str())
+                    && self.objects.contains(snapshot.head().object.as_str());
+                if known {
+                    complete(
+                        ReadRevision::DiffSnapshot {
+                            snapshot_id: snapshot.snapshot_id(),
+                        },
+                        reader.clone(),
+                    )
+                } else {
+                    partial("diff base or head is not on the remote")
+                }
+            }
+            ReadSubject::Check { change, check } => {
+                match self
+                    .checks
+                    .get(&(change.change_request.as_str().to_string(), check.clone()))
+                {
+                    Some(run) => {
+                        if run.run_id.is_empty() {
+                            return partial("check read is missing its check-run id");
+                        }
+                        match CommitRevision::new(change.repository.clone(), &run.head) {
+                            Ok(head) => complete(
+                                ReadRevision::Check {
+                                    check_run_id: run.run_id.clone(),
+                                    head,
+                                },
+                                run.actor.clone(),
+                            ),
+                            Err(_) => partial("check head is not a valid object id"),
+                        }
+                    }
+                    None => partial("check is not on the remote"),
+                }
+            }
+            ReadSubject::Review { change } => {
+                match self
+                    .reviews
+                    .get(change.change_request.as_str())
+                    .and_then(|rs| rs.last())
+                {
+                    Some(review) if !review.review_id.is_empty() => complete(
+                        ReadRevision::Review {
+                            review_id: review.review_id.clone(),
+                        },
+                        review.actor.clone(),
+                    ),
+                    _ => partial("change request has no review on the remote"),
+                }
+            }
+        }
+    }
+
+    /// Poll one typed read target and deliver the Observation through
+    /// the shared ingest pipeline — the same path a webhook delivery
+    /// would use. The delivery identity is the subject at the observed
+    /// version, so a re-poll of an unchanged subject deduplicates and a
+    /// delayed delivery of an older read is recorded as history only.
+    pub fn observe(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        work_id: Option<&WorkId>,
+        subject: &ReadSubject,
+        reader: &HostActorRef,
+        now_unix_seconds: i64,
+    ) -> Result<IngestReceipt, StoreError> {
+        let read = self.read(subject, reader);
+        let observation = Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "fixture.poll".into(),
+                event_id: format!("{}@{}", subject.key(), read.subject_version),
+            }),
+            subject_work_id: work_id.cloned(),
+            subject_execution_id: None,
+            fact: ObservationFact::HostRead {
+                subject: subject.clone(),
+                revision: read.revision,
+                subject_version: read.subject_version,
+                actor: read.actor,
+                completeness: read.completeness,
+            },
+            observed_unix_seconds: now_unix_seconds,
+        };
+        self.emit(store, config, observation, now_unix_seconds)
     }
 
     /// Feed a synthetic Observation (change_head, check, review, an
@@ -644,6 +1033,15 @@ impl FixtureGithub {
                     (intent.repository.to_string(), branch.clone()),
                     produced.object.clone(),
                 );
+                self.note_object(&produced.object);
+                self.branch_actors.insert(
+                    (intent.repository.to_string(), branch.clone()),
+                    authenticated.clone(),
+                );
+                self.bump(&ReadSubject::Head {
+                    repository: intent.repository.clone(),
+                    branch: branch.clone(),
+                });
                 self.applied.push(format!(
                     "push_ref:{}:{}",
                     intent.repository, produced.object
@@ -693,6 +1091,16 @@ impl FixtureGithub {
                     change.change_request.as_str().to_string(),
                     head_object.clone(),
                 );
+                self.note_object(&head_object);
+                self.change_refs
+                    .insert(change.change_request.as_str().to_string(), change.clone());
+                self.change_actors.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
                 self.applied.push(format!(
                     "open_change:{}:{}",
                     intent.repository, change.change_request
@@ -731,6 +1139,7 @@ impl FixtureGithub {
             } => {
                 let actual = self.changes.get(change.change_request.as_str()).cloned();
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    self.bump_change(change.change_request.as_str());
                     self.applied.push(format!(
                         "update_change:{}:{}",
                         intent.repository, change.change_request
