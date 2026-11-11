@@ -534,7 +534,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
             // only after the push actually succeeded — a lease-rejected or
             // otherwise failed push is recorded through the ordinary
             // Failed path, never fault-injected.
-            if matches!(&push, Ok(_))
+            if push.is_ok()
                 && std::env::var("S1_BRIDGE_KILL_AFTER_APPLY").as_deref() == Ok("push_ref")
             {
                 eprintln!(
