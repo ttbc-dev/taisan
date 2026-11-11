@@ -77,13 +77,15 @@ def main():
         headings[claim_id] = variant
 
     referenced = set()
+    row_to_claims = {}
     for row_id, (_c, _v, result) in rows.items():
         valid = VALID.match(result)
         if valid:
             referenced.add(valid.group(1))
+            row_to_claims[row_id] = valid.group(1)
     for claim_id in sorted(referenced):
         if claim_id not in headings:
-            fail(f'{row_id}: referenced claim {claim_id} has no claim block')
+            fail(f'referenced claim {claim_id} has no claim block')
     for claim_id in sorted(set(headings) - referenced):
         fail(f'claim {claim_id} is never referenced by a valid cell')
 
@@ -100,6 +102,9 @@ def main():
         row = rows.get(claim['criterion'])
         if not row:
             fail(f'{cid}: criterion {claim["criterion"]!r} not in the report table')
+        if row_to_claims.get(claim['criterion']) != cid:
+            fail(f'{cid}: criterion {claim["criterion"]!r} is not the citing row of this claim '
+                 f'(the cell must cite the claim for its own row: {row_to_claims.get(claim["criterion"])!r})')
         if row[1] != claim['variant']:
             fail(f'{cid}: variant {claim["variant"]!r} does not match the row variant {row[1]!r}')
         if claim['status'] != 'valid':
@@ -138,7 +143,9 @@ def main():
         if isinstance(receipts.get('pr'), str) and '#' not in receipts['pr']:
             fail(f'{cid}: remote_receipts.pr {receipts["pr"]!r} is not a PR reference')
         elif receipts.get('pr') is None:
-            fail(f'{cid}: remote_receipts.pr may not be null (every valid claim has a PR)')
+            reason = receipts.get('pr_reason')
+            if not isinstance(reason, str) or len(reason.strip()) < 20:
+                fail(f'{cid}: remote_receipts.pr is null without a pr_reason of ≥ 20 chars')
 
         def resolve(container, key, label):
             value = container.get(key)

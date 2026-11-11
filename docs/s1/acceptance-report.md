@@ -70,7 +70,8 @@ only with a reason.
     "commands": ["cmd-1", "cmd-3"]
   },
   "remote_receipts": {
-    "pr": "shimpeiws/coding-worker-smoke#14",
+    "pr": null,
+    "pr_reason": "no PR exists at submit time; PR #14 was opened later in the same run (see C-04)",
     "head": null,
     "head_reason": "no head exists at submit time; first published head was e01bf9ad12d99967e42f4e00063d94476b944468 (see C-04)",
     "checks": [],
@@ -101,7 +102,8 @@ only with a reason.
     "commands": ["cmd-1", "cmd-3"]
   },
   "remote_receipts": {
-    "pr": "shimpeiws/coding-worker-smoke#14",
+    "pr": null,
+    "pr_reason": "no PR exists at dispatch time; PR #14 was opened later in the same run (see C-04)",
     "head": null,
     "head_reason": "no head exists at dispatch time; see C-04 for the published head",
     "checks": [],
