@@ -22,11 +22,11 @@
   },
   "revision_config": {
     "materials_revision": "s1-fixtures-v1",
-    "taisan_core_revision": "exact SHA from installation-spec.revisions.taisan_core",
-    "taisan_cli_revision": "exact SHA from installation-spec.revisions.taisan_cli",
-    "github_adapter_revision": "exact SHA from installation-spec.revisions.github_adapter",
-    "worker_adapter_revision": "exact SHA from installation-spec.revisions.worker_adapter",
-    "configuration_identity": "installation-spec.configuration_identity",
+    "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=unresolved:store-open-read config_sha256=b04de3b7b83d17840784786dd8544fceff2a947c4af0dbe549447fd59c9bb821",
     "contract_version": 1
   },
   "rows": [

@@ -413,6 +413,111 @@ class S1MaterialsTest(unittest.TestCase):
         self.assertIn(slice_sha, evidence)
         self.assertNotIn('Slice revision | The tested tree is the uncommitted', evidence)
 
+    def test_checklist_top_level_revision_config_is_exact(self):
+        expected = prerequisites.expected_revision_config(self.install_spec)
+        self.assertEqual(self.checklist['revision_config'], expected)
+        broken = copy.deepcopy(self.checklist)
+        broken['revision_config']['taisan_core_revision'] = (
+            'exact SHA from installation-spec.revisions.taisan_core'
+        )
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(
+            any('revision_config.taisan_core_revision' in error for error in errors),
+            errors,
+        )
+        broken = copy.deepcopy(self.checklist)
+        broken['revision_config']['configuration_identity'] = (
+            'installation-spec.configuration_identity'
+        )
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(
+            any(
+                'revision_config.configuration_identity' in error
+                for error in errors
+            ),
+            errors,
+        )
+        broken = copy.deepcopy(self.checklist)
+        broken['revision_config']['taisan_core_revision'] = 'a' * 40
+        errors = prerequisites.validate_checklist_revision_config(
+            broken, self.install_spec
+        )
+        self.assertTrue(
+            any(error.startswith('revision_config:') for error in errors), errors
+        )
+
+    def test_missing_evidence_digest_record_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(FIXTURE_DIR, root / 'fixtures' / 's1')
+            shutil.copytree(ROOT / 'docs' / 's1', root / 'docs' / 's1')
+            shutil.copytree(
+                ROOT / 'docs' / 'evidence', root / 'docs' / 'evidence'
+            )
+            (root / 'docs' / 'evidence' / 'u8.1.md').unlink()
+            report = prerequisites.verify(root)
+            self.assertEqual(report['status'], 'failed')
+            self.assertTrue(
+                any(
+                    'missing required fixture content digest record' in error
+                    for error in report['errors']
+                ),
+                report['errors'],
+            )
+
+    def test_malformed_but_json_valid_types_fail_closed(self):
+        seed = copy.deepcopy(self.seeded_issue)
+        seed['title_template'] = 123
+        errors = prerequisites.validate_seeded_issue(seed)
+        self.assertTrue(any('title_template' in error for error in errors), errors)
+
+        seed = copy.deepcopy(self.seeded_issue)
+        seed['variants']['success'] = 'not-an-object'
+        errors = prerequisites.validate_seeded_issue(seed)
+        self.assertTrue(any('variants.success' in error for error in errors), errors)
+
+        spec = copy.deepcopy(self.install_spec)
+        spec['configuration_identity']['capabilities'].append({'name': 'bad'})
+        errors = prerequisites.validate_install_spec(spec)
+        self.assertTrue(any('capabilities' in error for error in errors), errors)
+
+        broken = copy.deepcopy(self.checklist)
+        broken['rows'][0]['id'] = ['not', 'a', 'string']
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(any('.id' in error for error in errors), errors)
+
+        broken = copy.deepcopy(self.checklist)
+        broken['rows'] = None
+        errors = prerequisites.validate_checklist(broken)
+        self.assertTrue(any('rows' in error for error in errors), errors)
+
+    def test_cli_fails_closed_on_malformed_input_types(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'install.json'
+            broken = copy.deepcopy(self.install_spec)
+            broken['configuration_identity']['capabilities'].append({'name': 'bad'})
+            path.write_text(json.dumps(broken))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    '--root',
+                    str(ROOT),
+                    '--install-spec',
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['status'], 'failed')
+            self.assertTrue(
+                any('capabilities' in error for error in output['errors']),
+                output['errors'],
+            )
+
     def test_cli_fails_closed_on_incomplete_install_spec(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'install.json'

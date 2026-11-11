@@ -229,7 +229,14 @@ def validate_checklist_revision_config(checklist: dict, spec: dict) -> list[str]
     """Check every checklist row against the install-spec revision/config."""
     errors: list[str] = []
     expected = expected_revision_config(spec)
-    rows = checklist.get("rows") if isinstance(checklist, dict) else None
+    if not isinstance(checklist, dict):
+        return errors
+    if checklist.get("revision_config") != expected:
+        errors.append(
+            "revision_config: does not match the exact installation-spec "
+            "revision/config"
+        )
+    rows = checklist.get("rows")
     if not isinstance(rows, list):
         return errors
     for index, row in enumerate(rows):
@@ -268,7 +275,9 @@ def validate_fixture_digest(root: Path) -> tuple[str, list[str]]:
     digest = fixture_content_digest(root)
     document = root / EVIDENCE_DOCUMENT
     if not document.is_file():
-        return digest, []
+        return digest, [
+            f"{EVIDENCE_DOCUMENT}: missing required fixture content digest record"
+        ]
     recorded = set(DIGEST_PATTERN.findall(document.read_text()))
     if not recorded:
         return digest, [f"{EVIDENCE_DOCUMENT}: missing fixture content digest"]
@@ -488,11 +497,16 @@ def validate_install_spec(spec: dict) -> list[str]:
                 "configuration_identity.capabilities: required non-empty array"
             )
         else:
-            if any(not isinstance(item, str) or not item.strip() for item in capabilities):
+            string_capabilities = [
+                item
+                for item in capabilities
+                if isinstance(item, str) and item.strip()
+            ]
+            if len(string_capabilities) != len(capabilities):
                 errors.append(
                     "configuration_identity.capabilities: entries must be non-empty strings"
                 )
-            missing = sorted(set(REQUIRED_CAPABILITIES) - set(capabilities))
+            missing = sorted(set(REQUIRED_CAPABILITIES) - set(string_capabilities))
             if missing:
                 errors.append(
                     "configuration_identity.capabilities: missing required S1 "
@@ -539,7 +553,12 @@ def validate_seeded_issue(seed: dict) -> list[str]:
         errors.append("kind: expected s1-seeded-issue")
     if seed.get("live_execution_authorized") is not False:
         errors.append("live_execution_authorized: preparation must not authorize live execution")
-    if not _nonempty(seed.get("title_template")) or "<run-tag>" not in seed["title_template"]:
+    title_template = seed.get("title_template")
+    if (
+        not isinstance(title_template, str)
+        or not title_template.strip()
+        or "<run-tag>" not in title_template
+    ):
         errors.append("title_template: required and must carry <run-tag>")
     if not _nonempty(seed.get("body_template")):
         errors.append("body_template: required")
@@ -578,12 +597,28 @@ def validate_seeded_issue(seed: dict) -> list[str]:
             outcome = entry.get("expected_outcome")
             if not isinstance(outcome, dict) or not _nonempty(outcome.get("work_state")):
                 errors.append(f"variants.{name}.expected_outcome.work_state: required")
-        success = variants.get("success", {}).get("expected_outcome", {})
-        attention = variants.get("Attention", {}).get("expected_outcome", {})
-        if success.get("work_state") != "succeeded":
-            errors.append("variants.success.expected_outcome.work_state: expected succeeded")
-        if attention.get("work_state") != "paused":
-            errors.append("variants.Attention.expected_outcome.work_state: expected paused")
+        success = variants.get("success")
+        success_outcome = (
+            success.get("expected_outcome") if isinstance(success, dict) else None
+        )
+        attention = variants.get("Attention")
+        attention_outcome = (
+            attention.get("expected_outcome") if isinstance(attention, dict) else None
+        )
+        if (
+            not isinstance(success_outcome, dict)
+            or success_outcome.get("work_state") != "succeeded"
+        ):
+            errors.append(
+                "variants.success.expected_outcome.work_state: expected succeeded"
+            )
+        if (
+            not isinstance(attention_outcome, dict)
+            or attention_outcome.get("work_state") != "paused"
+        ):
+            errors.append(
+                "variants.Attention.expected_outcome.work_state: expected paused"
+            )
     return errors
 
 
@@ -595,6 +630,44 @@ def _check_variants(prefix: str, variants, errors: list[str]) -> None:
         errors.append(
             f"{prefix}: expected exactly {list(VARIANTS)!r}, got {sorted(variants)!r}"
         )
+
+
+def _validate_revision_config(
+    prefix: str, revision_config, errors: list[str]
+) -> None:
+    """Validate one exact revision/config object, rejecting reference text."""
+    if not isinstance(revision_config, dict) or not revision_config:
+        errors.append(f"{prefix}: required")
+        return
+    for key in REVISION_KEYS:
+        value = revision_config.get(key)
+        if not _nonempty(value):
+            errors.append(f"{prefix}.{key}: required")
+            continue
+        if key in SHA_REVISION_KEYS:
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+                errors.append(
+                    f"{prefix}.{key}: expected an exact "
+                    f"40-hex commit SHA, got {value!r}"
+                )
+        elif key == "configuration_identity":
+            if not isinstance(value, str):
+                errors.append(f"{prefix}.{key}: expected a string, got {value!r}")
+                continue
+            lowered = value.lower()
+            if "installation-spec" in lowered or "exact sha" in lowered:
+                errors.append(
+                    f"{prefix}.{key}: expected the exact "
+                    f"configuration identity, not a reference ({value!r})"
+                )
+        elif key == "contract_version":
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                errors.append(
+                    f"{prefix}.{key}: expected a positive "
+                    f"integer, got {value!r}"
+                )
+        elif not isinstance(value, str):
+            errors.append(f"{prefix}.{key}: expected a string, got {value!r}")
 
 
 def validate_checklist(checklist: dict) -> list[str]:
@@ -616,6 +689,8 @@ def validate_checklist(checklist: dict) -> list[str]:
                 if not _nonempty(entry.get(key)):
                     errors.append(f"variants.{name}.{key}: required")
 
+    _validate_revision_config("revision_config", checklist.get("revision_config"), errors)
+
     rows = checklist.get("rows")
     if not isinstance(rows, list) or not rows:
         errors.append("rows: required non-empty array")
@@ -627,7 +702,7 @@ def validate_checklist(checklist: dict) -> list[str]:
             errors.append(f"{prefix}: expected object")
             continue
         row_id = row.get("id")
-        if not _nonempty(row_id):
+        if not isinstance(row_id, str) or not row_id.strip():
             errors.append(f"{prefix}.id: required")
         elif row_id in seen:
             errors.append(f"{prefix}.id: duplicate {row_id!r}")
@@ -644,45 +719,9 @@ def validate_checklist(checklist: dict) -> list[str]:
                 f"{prefix}.variant: must be one of {list(VARIANTS)!r}, "
                 f"got {row.get('variant')!r}"
             )
-        revision_config = row.get("revision_config")
-        if not isinstance(revision_config, dict) or not revision_config:
-            errors.append(f"{prefix}.revision_config: required")
-        else:
-            for key in REVISION_KEYS:
-                value = revision_config.get(key)
-                if not _nonempty(value):
-                    errors.append(f"{prefix}.revision_config.{key}: required")
-                    continue
-                if key in SHA_REVISION_KEYS:
-                    if not isinstance(value, str) or not re.fullmatch(
-                        r"[0-9a-f]{40}", value
-                    ):
-                        errors.append(
-                            f"{prefix}.revision_config.{key}: expected an exact "
-                            f"40-hex commit SHA, got {value!r}"
-                        )
-                elif key == "configuration_identity":
-                    lowered = str(value).lower()
-                    if "installation-spec" in lowered or "exact sha" in lowered:
-                        errors.append(
-                            f"{prefix}.revision_config.{key}: expected the exact "
-                            f"configuration identity, not a reference ({value!r})"
-                        )
-                elif key == "contract_version":
-                    if (
-                        isinstance(value, bool)
-                        or not isinstance(value, int)
-                        or value <= 0
-                    ):
-                        errors.append(
-                            f"{prefix}.revision_config.{key}: expected a positive "
-                            f"integer, got {value!r}"
-                        )
-                elif not isinstance(value, str):
-                    errors.append(
-                        f"{prefix}.revision_config.{key}: expected a string, "
-                        f"got {value!r}"
-                    )
+        _validate_revision_config(
+            f"{prefix}.revision_config", row.get("revision_config"), errors
+        )
         identities = row.get("identities")
         if not isinstance(identities, dict):
             errors.append(f"{prefix}.identities: required")
@@ -719,7 +758,8 @@ def validate_markdown(root: Path, checklist: dict) -> list[str]:
             errors.append(f"docs/s1/evidence-checklist.md: missing {heading!r}")
 
     documented = _markdown_row_ids(root / DOC_FILES["evidence-checklist-doc"])
-    rows = checklist.get("rows", [])
+    rows = checklist.get("rows")
+    rows = rows if isinstance(rows, list) else []
     fixture_ids = {row.get("id") for row in rows if isinstance(row, dict)}
     missing = sorted(documented - fixture_ids)
     if missing:
@@ -799,6 +839,8 @@ def verify(root: Path, install_spec: Path | None = None) -> dict:
             errors.extend(validate_markdown(root, checklist))
     except CheckFailure as exc:
         errors.extend(exc.errors)
+    except (TypeError, AttributeError, KeyError) as exc:
+        errors.append(f"preflight: malformed input type ({exc})")
 
     unresolved = install_spec_unresolved(spec) if resolved_spec else []
     status = "failed" if errors else ("prepared" if unresolved else "ok")
@@ -829,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = verify(args.root, args.install_spec)
-    except OSError as exc:
+    except (OSError, TypeError, AttributeError, KeyError) as exc:
         report = {
             "status": "failed",
             "installation_ready": False,

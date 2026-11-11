@@ -16,14 +16,15 @@ never appear; references appear by name only.
 The machine-readable fixture
 [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json)
 carries the same rows with an explicit `variant`, `revision_config`, and
-`identities` object for each entry. `revision_config` holds the exact
-commit SHAs and configuration identity derived from
-`installation-spec.json`, not reference text. `python3
-scripts/s1/check-prerequisites.py` asserts every row has one of
-`success`, `Attention`, or `recovery`, carries exact revision/config
-values (40-hex SHAs and a concrete config identity), and retains its
-Work/Execution/Invocation/action identity fields. Fixture results still
-support contract claims only.
+`identities` object for each entry, plus a top-level `revision_config`.
+Both the top-level object and every row hold the exact commit SHAs and
+configuration identity derived from `installation-spec.json`, not
+reference text. `python3 scripts/s1/check-prerequisites.py` asserts
+that the top-level object and every row carry exact revision/config
+values (40-hex SHAs and a concrete config identity), that every row has
+one of `success`, `Attention`, or `recovery`, and that each row retains
+its Work/Execution/Invocation/action identity fields. Fixture results
+still support contract claims only.
 
 ## Success variant
 

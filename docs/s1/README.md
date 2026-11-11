@@ -39,9 +39,10 @@ unresolved references: the shipped preparation fixture reports
 `status: prepared` with `installation_ready: false`, while a fully
 resolved install spec reports `status: ok`. Neither result is execution
 permission, and neither is live evidence. The preflight also recomputes
-the sha256 fixture content digest and fails closed when it no longer
-matches the digest recorded in `docs/evidence/u8.1.md`, so editing a
-fixture cannot leave the evidence digest silently stale. The retained
+the sha256 fixture content digest and fails closed when the record in
+`docs/evidence/u8.1.md` is missing or no longer matches, so neither
+deleting the record nor editing a fixture can leave the evidence digest
+silently stale. The retained
 scenario-bridge rehearsals (`docs/evidence/u8.2.md`, `u8.3.md`) are
 recorded separately from the S1 target profile; their adapter, reviewer,
 credential-reference and `host_write` values are cross-checked in their
