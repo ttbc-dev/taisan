@@ -61,6 +61,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "invocation_requests",
     "issue_claims",
     "observations",
+    "reclaim_plan_entries",
+    "reclaim_plans",
     "recovery_decisions",
     "recovery_intents",
     "resource_reservations",
@@ -81,7 +83,14 @@ const EXPECTED_TABLES: &[&str] = &[
 /// [`V2_ADDED_TABLES`] they are the set a stamped v1 file may
 /// legitimately lack and still be upgraded in place by the additive
 /// migration.
-const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
+const ADDITIVE_TABLES: &[&str] = &[
+    "body_catalog",
+    "body_pins",
+    "reclaim_plan_entries",
+    "reclaim_plans",
+    "recovery_intents",
+    "run_lease",
+];
 
 /// Tables the v1 → v2 migration adds. Everything else in
 /// `EXPECTED_TABLES` must already be present for a `user_version=1`
