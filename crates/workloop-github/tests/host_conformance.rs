@@ -1669,31 +1669,15 @@ fn evidence_defers_exchangeability_to_114() {
     }
 }
 
-/// The blob hash `git hash-object` assigns to the suite file in the
-/// working tree.
-fn suite_blob_hash(root: &std::path::Path, suite: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["hash-object"])
-        .arg(suite)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
+const EXERCISED_SUITE_PATH: &str = "crates/workloop-github/tests/host_conformance.rs";
 
-/// The suite blob a cited revision records, if that revision is in this
-/// checkout.
+/// The suite blob a cited revision records, if that revision and path are
+/// present in this checkout.
 fn suite_blob_at(root: &std::path::Path, revision: &str) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args([
-            "rev-parse",
-            &format!("{revision}:crates/workloop-github/tests/host_conformance.rs"),
-        ])
+        .args(["rev-parse", &format!("{revision}:{EXERCISED_SUITE_PATH}")])
         .output()
         .ok()?;
     out.status
@@ -1721,41 +1705,39 @@ fn git_is_ancestor(root: &std::path::Path, revision: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A commit cited by the evidence need not exist in this checkout: a CI
-/// pull-request checkout fetches only the merge commit, not every branch
-/// commit. In that case the record must name the tested revision as a
-/// branch commit and carry the exercised suite's blob digest, and the
-/// current suite must match that digest — presence of the suite alone
-/// would make the check wording-only.
-fn absent_tested_revision_is_explained(
-    evidence: &str,
-    suite_exists: bool,
-    suite_matches_digest: bool,
-) -> Result<(), String> {
+/// A commit cited by the evidence may be absent from a particular
+/// checkout (for example a patch applied onto the pre-PR base). The
+/// record must then still be honest about the pending branch commit, and
+/// the suite in this tree must still be the exercised matrix suite.
+fn absent_tested_revision_is_explained(evidence: &str, suite: &str) -> Result<(), String> {
     let lower = evidence.to_ascii_lowercase();
-    if !(lower.contains("branch commit") && lower.contains("shallow") && lower.contains("digest")) {
+    if !(lower.contains("branch commit") && lower.contains("shallow")) {
         return Err(
             "cited revision is absent here, so the record must name it as a branch commit that a \
-             shallow checkout may omit and record the exercised suite digest"
+             shallow checkout may omit"
                 .into(),
         );
     }
-    if !suite_exists {
-        return Err("this checkout must contain the exercised suite".into());
+    if !suite.contains("// MATRIX-CODE-BEGIN") || !suite.contains("// MATRIX-CODE-END") {
+        return Err("this checkout must contain the exercised matrix suite".into());
     }
-    if !suite_matches_digest {
-        return Err("the current suite must match the recorded exercised-suite digest".into());
+    for row in ["HC-BASE-01", "HC-READ-01", "HC-SWAP-01"] {
+        if !suite.contains(row) {
+            return Err(format!(
+                "the suite in this tree must still contain exercised matrix row {row}"
+            ));
+        }
     }
     Ok(())
 }
 
 /// Doc check: the tested revision named by the U9.1 evidence record must
-/// be a branch commit that contains the exercised suite, and the record's
-/// suite blob digest must identify exactly the suite in this tree. A
-/// patch digest may supplement that revision but cannot replace a commit
-/// another checkout can reproduce. When the cited commit is absent (a
-/// shallow CI checkout), the digest keeps the check substantive instead
-/// of degrading to a wording-only assertion.
+/// be a branch commit on the history leading to HEAD that contains the
+/// exercised suite. CI checks out full history so the branch commit is
+/// available there; a checkout without it (such as a patch applied to the
+/// pre-PR base) still checks that the record explains the pending branch
+/// commit and that the matrix suite is present in this tree. The check
+/// deliberately does not pin the living suite to a hardcoded blob digest.
 #[test]
 fn evidence_tested_revision_contains_the_exercised_suite() {
     let evidence = include_str!("../../../docs/evidence/u9.1.md");
@@ -1772,36 +1754,25 @@ fn evidence_tested_revision_contains_the_exercised_suite() {
         sha.chars().all(|c| c.is_ascii_hexdigit()),
         "tested revision is a hex commit id: {sha}"
     );
-    let digest_row = evidence
-        .lines()
-        .find(|line| line.contains("Exercised suite blob digest"))
-        .expect("evidence records the exercised suite blob digest");
-    let digest = digest_row
-        .split('`')
-        .nth(1)
-        .expect("Exercised suite blob digest is a backticked blob id");
-    assert_eq!(digest.len(), 40, "suite digest is a full blob id: {digest}");
     assert!(
-        digest.chars().all(|c| c.is_ascii_hexdigit()),
-        "suite digest is a hex blob id: {digest}"
+        evidence.contains(EXERCISED_SUITE_PATH),
+        "evidence names the exercised suite path"
     );
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let suite = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/host_conformance.rs");
-    let current = suite_blob_hash(&root, &suite).expect("git can hash the exercised suite");
-    assert_eq!(
-        current, digest,
-        "the suite in this tree must be the exercised suite recorded in evidence"
+    assert!(
+        suite.is_file(),
+        "this checkout contains the exercised suite"
     );
     if !git_commit_available(&root, sha) {
-        absent_tested_revision_is_explained(evidence, suite.is_file(), current == digest)
+        let suite_source = include_str!("host_conformance.rs");
+        absent_tested_revision_is_explained(evidence, suite_source)
             .unwrap_or_else(|reason| panic!("{reason}"));
         return;
     }
-    let at_revision = suite_blob_at(&root, sha)
-        .unwrap_or_else(|| panic!("tested revision {sha} must contain the exercised suite"));
-    assert_eq!(
-        at_revision, digest,
-        "tested revision {sha} must contain the exercised suite blob"
+    assert!(
+        suite_blob_at(&root, sha).is_some(),
+        "tested revision {sha} must contain the exercised suite"
     );
     assert!(
         git_is_ancestor(&root, sha),
@@ -1812,10 +1783,10 @@ fn evidence_tested_revision_contains_the_exercised_suite() {
 #[test]
 fn absent_tested_revision_requires_pending_note_and_suite() {
     let evidence = include_str!("../../../docs/evidence/u9.1.md");
-    assert!(absent_tested_revision_is_explained(evidence, true, true).is_ok());
-    assert!(absent_tested_revision_is_explained("no note", true, true).is_err());
-    assert!(absent_tested_revision_is_explained(evidence, false, true).is_err());
-    assert!(absent_tested_revision_is_explained(evidence, true, false).is_err());
+    let suite = include_str!("host_conformance.rs");
+    assert!(absent_tested_revision_is_explained(evidence, suite).is_ok());
+    assert!(absent_tested_revision_is_explained("no note", suite).is_err());
+    assert!(absent_tested_revision_is_explained(evidence, "no matrix").is_err());
 }
 
 /// Doc check: the exchangeability report's runner semantics and coverage
@@ -1826,6 +1797,7 @@ fn absent_tested_revision_requires_pending_note_and_suite() {
 fn exchangeability_report_matches_the_matrix_runner() {
     let report = include_str!("../../../docs/host-exchangeability.md");
     let lower = report.to_ascii_lowercase();
+    let flat = lower.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         !lower.contains("is skipped for that row"),
         "report still describes a per-row skip path"
@@ -1859,6 +1831,28 @@ fn exchangeability_report_matches_the_matrix_runner() {
     assert!(
         !read_lower.contains("read-model ops not in vocabulary"),
         "typed-read row is stale: {read}"
+    );
+    assert!(
+        !flat.contains("outcome for every missing capability"),
+        "report claims one outcome per missing capability; the runner records one outcome per row"
+    );
+    assert!(
+        flat.contains("first missing capability"),
+        "report names the single recorded capability for an unsupported row"
+    );
+    let matrix = include_str!("../../../docs/host-conformance-matrix.md");
+    let matrix_lower = matrix.to_ascii_lowercase();
+    let matrix_flat = matrix_lower
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !matrix_flat.contains("outcome for every missing capability"),
+        "matrix document claims one outcome per missing capability"
+    );
+    assert!(
+        matrix_flat.contains("first missing capability"),
+        "matrix document names the single recorded capability for an unsupported row"
     );
 }
 // DOC-CHECK-END

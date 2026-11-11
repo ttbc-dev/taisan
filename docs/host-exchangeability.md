@@ -28,10 +28,12 @@ against the real GitHub adapter, not these fixtures.
 
 Every row yields exactly one outcome per fixture. A fixture whose
 declared capability set covers the scenario's requirement list runs the
-unchanged scenario; a fixture that does not declare a required
-capability records an explicit `unsupported` outcome for every missing
-capability. There is no per-row skip path, and no fixture is
-substituted. Suite runner: `run_suite` in `host_conformance.rs`.
+unchanged scenario; a fixture that does not declare one or more required
+capabilities is recorded as a single explicit `unsupported` outcome
+naming the first missing capability, while every missing capability is
+asserted to be explicitly unsupported. There is no per-row skip path,
+and no fixture is substituted. Suite runner: `run_suite` in
+`host_conformance.rs`.
 
 | Matrix row | FixtureGithub | GitlabFixture | SparseHost | Live GitLab spike |
 | --- | --- | --- | --- | --- |

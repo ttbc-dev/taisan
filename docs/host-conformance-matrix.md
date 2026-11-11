@@ -35,8 +35,9 @@ The suite parameterizes over two axes:
   covers all of them, matching the contract rule that an optional
   capability may be absent but, once declared and required, may not be
   skipped or weakened. A row that a fixture cannot cover is recorded as
-  an explicit `unsupported` outcome for every missing capability — the
-  runner has no skip path.
+  a single explicit `unsupported` outcome naming the first missing
+  capability; every missing capability is still asserted to be
+  explicitly unsupported — the runner has no skip path.
 
 ## Baseline operations
 
