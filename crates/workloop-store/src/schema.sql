@@ -1,6 +1,6 @@
--- workloop v3 store: current-state tables enforcing structural
+-- workloop v4 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 3` marks the format; a stamped older file with
+-- `PRAGMA user_version = 4` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 

@@ -1023,11 +1023,47 @@ impl SqliteStore {
             if candidate.state == "present" {
                 let marked = self.mark_reclaiming(&candidate.body_id)?;
                 if !marked {
-                    report.held.push(HeldBody {
-                        body_id: candidate.body_id.clone(),
-                        reason: "pinned".into(),
-                    });
-                    continue;
+                    // A false return also means the row left `present`
+                    // (a concurrent pass moved it). Re-read instead of
+                    // reporting a false `pinned`: a row that is now
+                    // `reclaiming` resumes through the same delete path
+                    // below; a reclaimed row is skipped.
+                    match self.row_state(&candidate.body_id)? {
+                        Some(current) if current == "present" => {
+                            report.held.push(HeldBody {
+                                body_id: candidate.body_id.clone(),
+                                reason: "pinned".into(),
+                            });
+                            continue;
+                        }
+                        Some(current) if current == "reclaiming" => {
+                            // A concurrent pass marked the row; finish
+                            // it here under the same pin re-check an
+                            // interrupted pass requires, instead of
+                            // recording a false `pinned` hold.
+                            if self.row_pinned(&candidate.body_id)? {
+                                report.held.push(HeldBody {
+                                    body_id: candidate.body_id.clone(),
+                                    reason: "pinned".into(),
+                                });
+                                continue;
+                            }
+                        }
+                        Some(_) => {
+                            report.held.push(HeldBody {
+                                body_id: candidate.body_id.clone(),
+                                reason: "reclaimed_by_concurrent_pass".into(),
+                            });
+                            continue;
+                        }
+                        None => {
+                            report.held.push(HeldBody {
+                                body_id: candidate.body_id.clone(),
+                                reason: "not_registered".into(),
+                            });
+                            continue;
+                        }
+                    }
                 }
             } else {
                 // Resumed `reclaiming` row: re-check the pin before the
@@ -1989,13 +2025,19 @@ impl SqliteStore {
             });
             return Ok(());
         }
+        let mut marked = false;
         if state == "present" {
             // Pin re-checked inside the same immediate transaction the
             // sweep uses; a pin that appeared after planning holds the
             // body here. A false return means the row moved out of
             // `present` first (a concurrent pass won): re-read instead
-            // of reporting a false `held`/`pinned`.
-            if !self.mark_reclaiming(body_id)? {
+            // of reporting a false `held`/`pinned`. A row that is now
+            // `reclaiming` goes through the same resume path as an
+            // interrupted run — the concurrent pass may have marked it
+            // without deleting yet, and the delete is idempotent.
+            if self.mark_reclaiming(body_id)? {
+                marked = true;
+            } else {
                 match self.row_state(body_id)? {
                     Some(current) if current == "present" => {
                         self.record_entry_outcome(
@@ -2009,19 +2051,24 @@ impl SqliteStore {
                             body_id: body_id.into(),
                             reason: "pinned".into(),
                         });
+                        return Ok(());
+                    }
+                    Some(current) if current == "reclaiming" => {
+                        // fall through to the resume pin re-check below
                     }
                     Some(_) => {
                         self.record_entry_outcome(
                             plan_id,
                             body_id,
                             "unavailable",
-                            "reclaimed_by_concurrent_pass",
+                            "already_reclaimed",
                             now_unix_seconds,
                         )?;
                         execution.unavailable.push(HeldBody {
                             body_id: body_id.into(),
-                            reason: "reclaimed_by_concurrent_pass".into(),
+                            reason: "already_reclaimed".into(),
                         });
+                        return Ok(());
                     }
                     None => {
                         self.record_entry_outcome(
@@ -2035,14 +2082,16 @@ impl SqliteStore {
                             body_id: body_id.into(),
                             reason: "not_registered".into(),
                         });
+                        return Ok(());
                     }
                 }
-                return Ok(());
             }
-        } else {
-            // `reclaiming` row from an interrupted run: re-check the
-            // pin before retrying the delete, exactly as the sweep's
-            // resume path does.
+        }
+        if !marked {
+            // `reclaiming` row — either this run just lost the race to
+            // a concurrent pass, or an interrupted run left it for us:
+            // re-check the pin before retrying the delete, exactly as
+            // the sweep's resume path does.
             if self.row_pinned(body_id)? {
                 self.record_entry_outcome(plan_id, body_id, "held", "pinned", now_unix_seconds)?;
                 execution.held.push(HeldBody {
