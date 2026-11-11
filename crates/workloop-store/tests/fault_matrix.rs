@@ -247,7 +247,10 @@ fn observe(
 
 fn lp_20_equivalent_failure_pauses_at_the_limit() {
     let store = SqliteStore::in_memory(1).unwrap();
-    let (w, e1) = submit_work(&store, "lp20");
+    let mut cfg = config();
+    cfg.required_checks = vec!["ci".into(), "lint".into()];
+    let (w, e1) =
+        accepted_with_execution(handle_command(&store, &cfg, &submit("lp20"), NOW).unwrap());
     store
         .transact(|tx| {
             let mut work = tx.work(&w)?.unwrap();
@@ -268,24 +271,29 @@ fn lp_20_equivalent_failure_pauses_at_the_limit() {
     });
     seed_change(&store, &w, "sha-1", NOW);
 
-    let fail_check = |producer: &str| ObservationFact::Check {
+    let fail_check = |check_id: &str, producer: &str| ObservationFact::Check {
         change: change(),
         head: rev("sha-1"),
-        check_id: "ci".into(),
+        check_id: check_id.into(),
         producer: HostActorRef {
             host: host(),
             actor: HostActorId::trusted(producer),
         },
         conclusion: CheckConclusion::Failure,
     };
-    observe(&store, &w, Some(&e1), fail_check("ci-agent"));
-    let mid = execution(&store, &e1);
+    observe(&store, &w, Some(&e1), fail_check("ci", "ci-agent"));
+    // A non-equivalent failure resets the streak: the failing set is
+    // now ci+lint, a different classifier key than before.
+    observe(&store, &w, Some(&e1), fail_check("lint", "lint-agent"));
+    let reset = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(reset.equivalent_failure_streak, 1);
     assert_eq!(
-        mid.state,
-        ExecutionState::Waiting,
-        "one pass under the limit only counts the streak"
+        reset.equivalent_signature.as_deref(),
+        Some("checks:ci+lint:failure"),
+        "a non-equivalent failure resets the streak and the signature"
     );
-    observe(&store, &w, Some(&e1), fail_check("ci-agent-2"));
+    // Identical recurring failure (same failing set) reaches the limit.
+    observe(&store, &w, Some(&e1), fail_check("ci", "ci-agent-2"));
     let at_limit = execution(&store, &e1);
     assert_eq!(
         at_limit.state,
@@ -316,7 +324,7 @@ fn lp_20_equivalent_failure_pauses_at_the_limit() {
     assert_eq!(usage.equivalent_failure_streak, 2);
     assert_eq!(
         usage.equivalent_signature.as_deref(),
-        Some("checks:ci:failure")
+        Some("checks:ci+lint:failure")
     );
     let decisions = store.transact(|tx| tx.recovery_decisions(&w)).unwrap();
     assert!(

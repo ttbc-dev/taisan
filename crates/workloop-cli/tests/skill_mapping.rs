@@ -451,6 +451,16 @@ fn assert_paths_agree(tag: &str, scenario: fn(&Path, Path_) -> Output) {
         skill_surface, direct_surface,
         "{tag}: skill-path and direct-CLI envelopes differ"
     );
+    assert_eq!(
+        skill_surface.0, 0,
+        "{tag}: both paths must exit 0; skill-path envelope: {:?}",
+        skill_surface
+    );
+    assert_eq!(
+        skill_surface.1, "accepted",
+        "{tag}: these scenarios are seeded to be accepted; skill-path envelope: {:?}",
+        skill_surface
+    );
 }
 
 // ---- INV-001 / INV-005: static check of the shipped skill ----
@@ -561,7 +571,7 @@ fn scenario_capacity(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_retry(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-retry", "retry work");
+    let env = submit_at(root, "skill-eq-retry-setup", "retry work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
     force_state(
@@ -598,7 +608,7 @@ fn scenario_retry(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_resume(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-resume", "resume work");
+    let env = submit_at(root, "skill-eq-resume-setup", "resume work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
     pause_for_judgment(&store(root), &ExecutionId(execution_id.clone()));
@@ -631,7 +641,7 @@ fn scenario_resume(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_cancel(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-cancel", "cancel work");
+    let env = submit_at(root, "skill-eq-cancel-setup", "cancel work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let md = skill_md();
     let args = match path {
@@ -659,7 +669,7 @@ fn scenario_cancel(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_acknowledge(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-ack", "ack work");
+    let env = submit_at(root, "skill-eq-ack-setup", "ack work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
     pause_for_judgment(&store(root), &ExecutionId(execution_id.clone()));
@@ -697,7 +707,7 @@ fn scenario_acknowledge(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_judge_findings(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-judge", "judge work");
+    let env = submit_at(root, "skill-eq-judge-setup", "judge work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     open_change(root, &work_id, "h-eq");
     seal_review(root, &work_id, "h-eq", &["a", "b"]);
@@ -745,7 +755,7 @@ fn scenario_judge_findings(root: &Path, path: Path_) -> Output {
 }
 
 fn scenario_release_judgment(root: &Path, path: Path_) -> Output {
-    let env = submit_at(root, "skill-eq-release", "release work");
+    let env = submit_at(root, "skill-eq-release-setup", "release work");
     let work_id = env["work_id"].as_str().unwrap().to_string();
     let execution_id = env["execution_id"].as_str().unwrap().to_string();
     open_change(root, &work_id, "h-eq");
@@ -861,6 +871,28 @@ fn replay_identity_is_preserved_through_the_skill() {
     assert_eq!(second["execution_id"], first["execution_id"]);
     let list = run_at(&root, &["work-list"]);
     assert_eq!(list["result"]["items"].as_array().unwrap().len(), 1);
+
+    // The same Invocation through the direct CLI on a fresh
+    // installation produces the same request identity surface:
+    // accepted, kind submit, the caller's idempotency key echoed.
+    let direct_root = self::root("replay-direct");
+    let direct = run_at(
+        &direct_root,
+        &[
+            "submit",
+            "--intent",
+            "skill replay intent",
+            "--idempotency-key",
+            "skill-replay-1",
+        ],
+    );
+    assert_eq!(direct["status"], "accepted");
+    assert_eq!(direct["command"]["kind"], first["command"]["kind"]);
+    assert_eq!(
+        direct["command"]["idempotency_key"],
+        first["command"]["idempotency_key"]
+    );
+    assert_eq!(direct["result"]["kind"], first["result"]["kind"]);
 }
 
 // ---- INV-004: unknown-result recovery through the skill ----

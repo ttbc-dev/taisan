@@ -4253,8 +4253,9 @@ pub fn consume_due_recovery_intents(
         match store.transact(|tx| fire_due_intent(tx, &intent_id, now)) {
             Ok(FireOutcome::Ignored) => {}
             Ok(FireOutcome::Retired) => scan.retired += 1,
-            Ok(FireOutcome::Suppressed(reason)) => scan.held.push((intent_id, reason)),
-            Ok(FireOutcome::Held(reason)) => scan.held.push((intent_id, reason)),
+            Ok(FireOutcome::Suppressed(reason)) | Ok(FireOutcome::Held(reason)) => {
+                scan.held.push((intent_id, reason))
+            }
             Ok(FireOutcome::Consumed {
                 requeued,
                 failed_terminal,
