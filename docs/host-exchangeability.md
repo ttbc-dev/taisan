@@ -74,6 +74,21 @@ Core/Command change — fixture-level exchangeability for those
 operations only, with valid scenario evidence cited above. `SparseHost`
 proves the runner's declared-set skip path rather than full coverage.
 
+### Claim binding (fixture evidence only — spike not run)
+
+Every operation named in the claim is bound below to the matrix rows
+that back it on the fixture side. The live-spike side of every one of
+those rows is `incomplete — spike not run`; nothing in this table
+constitutes, or may be read as, live evidence.
+
+| Claimed operation | Backing rows (fixture side) | Live gate |
+| --- | --- | --- |
+| `push_ref` | HC-BASE-01/02 (`baseline_effects_apply`), HC-PART-01 (`partial_receipts_stay_separate`), HC-SWAP-01 (`config_swap_keeps_recorded_binding`) | not run — incomplete |
+| `open_change_request` | HC-BASE-02 (`baseline_effects_apply`), HC-PART-01 (`partial_receipts_stay_separate`) | not run — incomplete |
+| `update_change_request` | HC-BASE-03 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
+| `post_comment` | HC-BASE-04 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
+| read/check/review observations | HC-SNAP-01 (`stale_head_evidence_cannot_complete`), HC-CAP-01 (`unsupported_capability_stays_explicit`) | not run — incomplete |
+
 ## Remaining limitations
 
 - `HC-CAP-02` is exercised only by `SparseHost` — both

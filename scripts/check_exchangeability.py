@@ -6,14 +6,16 @@ Fail-closed assertions for the U9.5 exchangeability evidence report:
 1. Every HC-* row in the conformance matrix appears in the coverage
    matrix (the comparison applies the same matrix to both sides).
 2. Every live-spike cell of the coverage matrix is marked incomplete
-   while the spike has not run; a live cell may only cite recorded
-   authorized spike evidence otherwise (not this revision).
+   unless docs/evidence/u9.4-live-spike.md exists — a non-incomplete
+   live cell is only legal with that authorized-spike evidence record.
 3. Every coverage row in which at least one fixture cell is not
    `covered` has its rows listed (with reasons) in the remaining
    limitations section.
-4. The exchangeability claim names only operations that at least one
-   fixture cell marks covered, and every claimed operation section-cites
-   fixture-level evidence only (no live claim while the spike is unrun).
+4. The exchangeability claim names only operations with a binding in
+   the claim binding table, every bound row has at least one fixture
+   `covered` cell, and the claim stays fixture-scoped (no live claim
+   while the spike is unrun); structurally unsupported operations may
+   never appear in the claim.
 """
 
 import re
@@ -23,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / 'docs/host-conformance-matrix.md'
 REPORT = ROOT / 'docs/host-exchangeability.md'
+SPIKE_EVIDENCE = ROOT / 'docs/evidence/u9.4-live-spike.md'
 
 MATRIX_ROW = re.compile(r'^\|\s*(HC-[A-Z]+-\d+)\s*\|', re.MULTILINE)
 
@@ -55,7 +58,7 @@ def coverage_rows(text):
 
 
 def section(text, heading):
-    match = re.search(rf'^## {re.escape(heading)}\s*$(.*?)(?=^## |\Z)', text, re.MULTILINE | re.DOTALL)
+    match = re.search(rf'^#{{2,4}}\s*{re.escape(heading)}\s*$(.*?)(?=^#{{2,}} |\Z)', text, re.MULTILINE | re.DOTALL)
     if not match:
         raise AssertionError(f'section {heading!r} not found')
     return match.group(1)
@@ -74,11 +77,14 @@ def main():
     missing = matrix - compared
     assert not missing, f'matrix rows missing from the coverage matrix: {sorted(missing)}'
 
+    spike_ok = SPIKE_EVIDENCE.exists() and 'authorized' in SPIKE_EVIDENCE.read_text().lower()
     for label, ids, cells in rows:
         live = cells[3].lower()
-        assert live.startswith('incomplete'), (
-            f'coverage row {label!r}: live spike cell must be marked incomplete '
-            f'while the spike has not run, got {cells[3]!r}')
+        if live.startswith('incomplete'):
+            continue
+        assert spike_ok, (
+            f'coverage row {label!r}: live spike cell is {cells[3]!r} but '
+            'docs/evidence/u9.4-live-spike.md (with the authorized spike run) does not exist')
 
     limitations = section(report, 'Remaining limitations')
     uncovered = []
@@ -94,16 +100,23 @@ def main():
         assert marker in limitations, f'known incomplete row {marker} missing from limitations'
 
     claim = section(report, 'Exchangeability claim')
+    binding = section(report, 'Claim binding (fixture evidence only — spike not run)')
     claimed = re.findall(r'`([a-z_]+)`', claim)
     assert claimed, 'exchangeability claim names no operations'
-    covered_ids = set()
-    for label, ids, cells in rows:
-        if any(c.lower().startswith('covered') for c in cells[:2]):
-            covered_ids.update(ids)
     for op in sorted(set(claimed)):
-        assert re.search(rf'`{re.escape(op)}`', claim), op
         assert op not in ('approve_change', 'mark_ready', 'resolve_thread'), (
             f'{op} is structurally unsupported and may not appear in the exchangeability claim')
+        match = re.search(rf'^\|\s*`{re.escape(op)}`\s*\|([^|]+)\|', binding, re.MULTILINE)
+        assert match, f'claimed operation `{op}` has no binding row in the claim binding table'
+        bound = row_ids(match.group(1))
+        assert bound, f'binding row for `{op}` names no HC rows'
+        backed = []
+        for row_id in bound:
+            candidate = next((cells for label, ids, cells in rows if row_id in ids), None)
+            assert candidate is not None, f'binding row for `{op}` names {row_id}, absent from the coverage matrix'
+            if any(c.lower().startswith('covered') for c in candidate[:2]):
+                backed.append(row_id)
+        assert backed, f'claimed operation `{op}` has no fixture-`covered` backing row in {bound}'
     for marker in ('fixture-level exchangeability', 'only'):
         assert marker in claim, f'exchangeability claim must stay fixture-scoped ({marker!r} missing)'
     assert not re.search(r'live (spike )?(pass|succeed|evidence (is )?(valid|recorded))', claim, re.IGNORECASE), \

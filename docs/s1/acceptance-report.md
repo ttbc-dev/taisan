@@ -13,10 +13,12 @@ admission) or U9 (host exchangeability) evidence rows** — those are
 separate acceptance tracks; see [evidence-checklist.md](evidence-checklist.md#boundaries).
 
 `config_digest` is `sha256:<hex>` of the sanitized installation config
-file (`installation.json`) as retained on the host that ran the
-scenario, matching the identity recorded at run time. The U8.2/U8.3
-files were read and hashed for this report (they were not re-created);
-the U8.4 file is the one cited by the U8.4 record.
+file (`installation.json`). For U8.4 (this slice) it is the digest of
+`/Users/shin/s1-u84/installation.json`, matching the config recorded at
+run time. For U8.2/U8.3 the digests were taken from the retained files
+**at the time this report was written**, not captured at run time —
+those records predate this slice's digest definition, so the binding is
+weaker there; this is recorded here rather than papered over.
 
 | # | Criterion | Variant | Result |
 | --- | --- | --- | --- |
@@ -36,7 +38,7 @@ the U8.4 file is the one cited by the U8.4 record.
 | R-1 | duplicate submit (same key + payload) replays the original decision | recovery | absent — never exercised live; covered only by store/fault-matrix contract tests |
 | R-2 | duplicate key, changed payload → `idempotency_conflict` | recovery | absent — never exercised live |
 | R-3 | lost command response recovered via `command-result` | recovery | absent — never exercised live (u8.2/u8.3/u8.4 used only fresh idempotency keys) |
-| R-4 | publication result unknown (push/PR-create response lost); read-back reconciliation, no second write | recovery | valid — C-11 |
+| R-4 | publication result unknown (push/PR-create response lost); read-back reconciliation, no second write | recovery | invalid — U8.4 fault (a) did exercise a lost push response, but on this revision the original action's receipt was never recorded (`pending`, not `unknown`), and the bridge re-ran `git push` (an exact-lease no-op) instead of settling solely from a read-back; the R-4 checklist row's required evidence does not exist, so the claim fails linkage. fault (b) corroborates "no duplicate effect" (zero PRs) but is a definite failure, not a lost response |
 | R-5 | installation restart while an Invocation may be live | recovery | absent — fault (a) and fault (c) of U8.4 exercised restart with an unverified *host-effect intent* and a pending *RetryIntent*, respectively; the possibly-live *worker process* leg (unverified Invocation, PID/start-time re-verification, descendant inspection) remains unexercised on this revision |
 | R-6 | stale review / stale head rejected (`stale_head`) | recovery | absent — never exercised; recorded `stale_work_version` rejections are not the stale-head criterion |
 | R-7 | GitHub adapter outage; `unavailable` Observations; sources distinguish "no findings" from "source unavailable" | recovery | absent — never exercised |
@@ -349,38 +351,7 @@ only with a reason.
     ],
     "review": {"id": "5836140631", "author": "github-actions[bot]", "state": "COMMENTED", "occurrences": 0}
   },
-  "stop_proof": "inv-3 Exited with verified stop; fix_invocations_used was charged exactly once for inv-2 and not reset by either pause (u8.3 records the same for its inv-2)"
-}
-```
-
-### C-11 (R-4, recovery)
-```json
-{
-  "id": "C-11",
-  "criterion": "R-4",
-  "variant": "recovery",
-  "status": "valid",
-  "source": "docs/evidence/u8.4.md#fault-a--lost-response-worker-killed-between-apply-and-receipt-write",
-  "revision": "03d1513",
-  "config_digest": "sha256:7d53e3ecad0f85dfb62b2f5a4bc845bd5b058142328d863268a42b767d78ac3a",
-  "identities": {
-    "work": "w-3",
-    "executions": ["e-3"],
-    "invocations": ["inv-1"],
-    "actions": ["act-6887ecd9-4c0b-4570-a509-95ae87465bfb", "act-d2837364-48fc-41a4-8820-f3c8af5d9410"],
-    "commands": ["cmd-3"]
-  },
-  "remote_receipts": {
-    "pr": "shimpeiws/coding-worker-smoke#22",
-    "head": "d9420ec9515190a180cb8a823fd9ce806c045dff",
-    "checks": [
-      {"name": "verify", "id": "130332845105", "conclusion": "success"},
-      {"name": "verify", "id": "130332941011", "conclusion": "success"},
-      {"name": "review", "id": "130332940898", "conclusion": "success"}
-    ],
-    "review": {"id": "5854068886", "author": "github-actions[bot]", "state": "COMMENTED"}
-  },
-  "stop_proof": "inv-1 process exit recorded by the supervisor (process_state exit observed 1794373201Z); the unverified host-effect writer held its capacity reservation until the restart reconcile — hold at 2026-11-11T04:59:17Z, released after succeeded"
+  "stop_proof": "inv-3 Exited with verified stop; fix_invocations_used was charged exactly once for inv-3 (the Fix invocation) and not reset by either pause (u8.3 records the same for its inv-2)"
 }
 ```
 
