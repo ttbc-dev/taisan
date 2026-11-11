@@ -75,16 +75,18 @@ def main():
     for label, ids, cells in rows:
         compared.update(ids)
     missing = matrix - compared
-    assert not missing, f'matrix rows missing from the coverage matrix: {sorted(missing)}'
+    if missing:
+        raise AssertionError(f'matrix rows missing from the coverage matrix: {sorted(missing)}')
 
     spike_ok = SPIKE_EVIDENCE.exists() and re.search(r'u94-[0-9T]+Z?-r[0-9]+', SPIKE_EVIDENCE.read_text()) and 'authorized' in SPIKE_EVIDENCE.read_text().lower()
     for label, ids, cells in rows:
         live = cells[3].lower()
         if re.match(r'^incomplete\s+(—|-)\s+spike not run', live):
             continue
-        assert spike_ok, (
-            f'coverage row {label!r}: live spike cell must be `incomplete — spike not run` '
-            f'(or carry an authorized U9.4 spike record with a run tag), got {cells[3]!r}')
+        if not spike_ok:
+            raise AssertionError(
+                f'coverage row {label!r}: live spike cell must be `incomplete — spike not run` '
+                f'(or carry an authorized U9.4 spike record with a run tag), got {cells[3]!r}')
 
     limitations = section(report, 'Remaining limitations')
     uncovered = []
@@ -93,34 +95,43 @@ def main():
         if any(not c.lower().startswith(('covered', 'skipped')) for c in fixture_cells):
             uncovered.extend(ids)
     live_limitation = re.search(r'spike.*(not run|unproven)|live claim', limitations, re.IGNORECASE | re.DOTALL)
-    assert live_limitation, 'limitations must record the missing live spike evidence with its reason'
+    if not live_limitation:
+        raise AssertionError('limitations must record the missing live spike evidence with its reason')
     for row in sorted(set(uncovered)):
-        assert row in limitations, f'row {row} lacking full fixture coverage is not in the limitations list'
+        if row not in limitations:
+            raise AssertionError(f'row {row} lacking full fixture coverage is not in the limitations list')
     for marker in ('HC-READ-01', 'HC-LIFE-03'):
-        assert marker in limitations, f'known incomplete row {marker} missing from limitations'
+        if marker not in limitations:
+            raise AssertionError(f'known incomplete row {marker} missing from limitations')
 
     claim = section(report, 'Exchangeability claim')
     binding = section(report, 'Claim binding (fixture evidence only — spike not run)')
     claimed = re.findall(r'`([a-z_]+)`', claim)
-    assert claimed, 'exchangeability claim names no operations'
+    if not claimed:
+        raise AssertionError('exchangeability claim names no operations')
     for op in sorted(set(claimed)):
-        assert op not in ('approve_change', 'mark_ready', 'resolve_thread'), (
-            f'{op} is structurally unsupported and may not appear in the exchangeability claim')
+        if op in ('approve_change', 'mark_ready', 'resolve_thread'):
+            raise AssertionError(f'{op} is structurally unsupported and may not appear in the exchangeability claim')
         match = re.search(rf'^\|\s*`{re.escape(op)}`\s*\|([^|]+)\|', binding, re.MULTILINE)
-        assert match, f'claimed operation `{op}` has no binding row in the claim binding table'
+        if not match:
+            raise AssertionError(f'claimed operation `{op}` has no binding row in the claim binding table')
         bound = row_ids(match.group(1))
-        assert bound, f'binding row for `{op}` names no HC rows'
+        if not bound:
+            raise AssertionError(f'binding row for `{op}` names no HC rows')
         backed = []
         for row_id in bound:
             candidate = next((cells for label, ids, cells in rows if row_id in ids), None)
-            assert candidate is not None, f'binding row for `{op}` names {row_id}, absent from the coverage matrix'
+            if candidate is None:
+                raise AssertionError(f'binding row for `{op}` names {row_id}, absent from the coverage matrix')
             if any(c.lower().startswith('covered') for c in candidate[:2]):
                 backed.append(row_id)
-        assert backed, f'claimed operation `{op}` has no fixture-`covered` backing row in {bound}'
+        if not backed:
+            raise AssertionError(f'claimed operation `{op}` has no fixture-`covered` backing row in {bound}')
     for marker in ('fixture-level exchangeability', 'only'):
-        assert marker in claim, f'exchangeability claim must stay fixture-scoped ({marker!r} missing)'
-    assert not re.search(r'live (spike )?(pass|succeed|evidence (is )?(valid|recorded))', claim, re.IGNORECASE), \
-        'exchangeability claim asserts live spike evidence that does not exist'
+        if marker not in claim:
+            raise AssertionError(f'exchangeability claim must stay fixture-scoped ({marker!r} missing)')
+    if re.search(r'live (spike )?(pass|succeed|evidence (is )?(valid|recorded))', claim, re.IGNORECASE):
+        raise AssertionError('exchangeability claim asserts live spike evidence that does not exist')
 
     print('check_exchangeability: all assertions passed '
           f'({len(rows)} coverage rows, {len(matrix)} matrix rows)')

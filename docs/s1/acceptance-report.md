@@ -13,8 +13,8 @@ admission) or U9 (host exchangeability) evidence rows** — those are
 separate acceptance tracks; see [evidence-checklist.md](evidence-checklist.md#boundaries).
 
 `config_digest` is `sha256:<hex>` of the sanitized installation config
-file (`installation.json`). For U8.4 (this slice) it is the digest of
-`/Users/shin/s1-u84/installation.json`, matching the config recorded at
+file (`installation.json`). For U8.4 (this slice) it is the digest of the retained
+installation config used by this run (path not committed), matching the config recorded at
 run time. For U8.2/U8.3 the digests were taken from the retained files
 **at the time this report was written**, not captured at run time —
 those records predate this slice's digest definition, so the binding is

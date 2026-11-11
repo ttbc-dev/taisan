@@ -47,6 +47,8 @@ def main():
     rows = {}
     for match in ROW.finditer(text):
         row_id, criterion, variant, result = (g.strip() for g in match.groups())
+        if row_id in rows:
+            fail(f'duplicate row {row_id} — each S1 criterion must appear exactly once')
         rows[row_id] = (criterion, variant, result)
     for row_id in EXPECTED_ROWS:
         if row_id not in rows:
@@ -147,8 +149,19 @@ def main():
                 fail(f'{cid}: {label} is null without a reason of ≥ 20 chars')
             return None
 
-        resolve(receipts, 'head', 'remote_receipts.head')
-        resolve(receipts, 'review', 'remote_receipts.review')
+        head = resolve(receipts, 'head', 'remote_receipts.head')
+        if head is not None:
+            if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head):
+                fail(f'{cid}: remote_receipts.head must be a full git SHA, got {head!r}')
+
+        review = resolve(receipts, 'review', 'remote_receipts.review')
+        if review is not None:
+            if not isinstance(review, dict):
+                fail(f'{cid}: remote_receipts.review must be an object or null with a reason')
+            for key in ('id', 'author', 'state'):
+                if not isinstance(review.get(key), (str, int)) or str(review[key]).strip() == '':
+                    fail(f'{cid}: remote_receipts.review.{key} missing or empty')
+
         checks = resolve(receipts, 'checks', 'remote_receipts.checks')
         if checks is not None:
             if not isinstance(checks, list):
@@ -157,6 +170,14 @@ def main():
                 reason = receipts.get('checks_reason')
                 if not isinstance(reason, str) or len(reason.strip()) < 20:
                     fail(f'{cid}: empty remote_receipts.checks without a checks_reason of ≥ 20 chars')
+            else:
+                for i, check in enumerate(checks):
+                    if not isinstance(check, dict):
+                        fail(f'{cid}: remote_receipts.checks[{i}] must be an object')
+                    if not isinstance(check.get('name'), str) or not check['name'].strip():
+                        fail(f'{cid}: remote_receipts.checks[{i}].name missing or empty')
+                    if check.get('id') is None and not isinstance(check.get('conclusion'), str):
+                        fail(f'{cid}: remote_receipts.checks[{i}] carries neither id nor conclusion — unverifiable')
         resolve(claim, 'stop_proof', 'stop_proof')
 
     prose_and_table = '\n'.join(re.findall(r'^\|.*$', text, re.MULTILINE))
