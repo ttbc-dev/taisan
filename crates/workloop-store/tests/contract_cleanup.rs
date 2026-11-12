@@ -715,7 +715,7 @@ fn protected_installation_files_are_held_and_not_counted() {
         .retention_report(
             &settings(Some(100), Some(1000)),
             &fixture.root,
-            &[protected_abs.clone()],
+            std::slice::from_ref(&protected_abs),
             NOW,
         )
         .unwrap();
