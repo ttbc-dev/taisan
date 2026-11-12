@@ -7,12 +7,14 @@
 //! adapter would use. Remote identity: `gh` CLI credentials of the
 //! operator's account; every read-back is re-fetched, never assumed.
 //!
-//! One `tick` performs, in order: a one-time capability report grounded
-//! in real permission reads, source reads for every Work's declared
-//! spec sources, one bounded outbox drain, and a remote-fact poll
-//! (branch state, change head, check runs, reviews, and the real-diff
-//! invariant assessment). `issue-ref` prints the authoritative
-//! revision/digest pair `submit` requires.
+//! One `tick` performs, in order: a capability report grounded in real
+//! permission reads — emitted once, then re-emitted whenever the
+//! recorded report's support surface differs from this build's —
+//! source reads for every Work's declared spec sources, one bounded
+//! outbox drain, and a remote-fact poll (branch state, change head,
+//! check runs, reviews, and the real-diff invariant assessment).
+//! `issue-ref` prints the authoritative revision/digest pair `submit`
+//! requires.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -427,7 +429,7 @@ fn drain_outbox(ctx: &Ctx, reconcile_bound: usize) -> Result<(), String> {
         attempted.insert(intent.action_id.clone());
         // One intent's transient failure must not starve the rest of
         // the drain or skip the pass's reconcile/verify.
-        if let Err(e) = attempt(ctx, &intent, &format!("act:{}", intent.action_id), false) {
+        if let Err(e) = attempt(ctx, &intent, &format!("act:{}", intent.action_id)) {
             eprintln!("s1-bridge: attempt {} failed: {e}", intent.action_id);
         }
     }
@@ -1018,7 +1020,7 @@ fn reattempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), Stri
     let before = attempt_count(ctx, &intent.action_id)?;
     // An errored re-attempt recorded nothing on its way out — emit the
     // reconcile receipt so the bound still advances.
-    if let Err(e) = attempt(ctx, intent, key, true) {
+    if let Err(e) = attempt(ctx, intent, key) {
         emit_result_keyed(
             ctx,
             intent,
@@ -1066,25 +1068,10 @@ fn opened_change(
 /// be verified records `unknown` in every mode: even `pending` does
 /// not prove the intent was never attempted — a crash after the push
 /// landed but before the receipt wrote leaves it `pending` — so no
-/// push failure ever proves a definite no-effect (R42). `reconcile`
-/// keeps the same discipline for the injected `open_change_request`
-/// refusal: a re-try of an already-`unknown` intent records `unknown`,
-/// an initial attempt records the scenario's definite `failed`.
-fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> Result<(), String> {
-    // The settle status the injected refusal records: `failed` on an
-    // initial attempt (the scenario asserts a definite no-effect),
-    // `unknown` under reconcile — an already-unknown intent's original
-    // effect may have landed. Every genuine `push_ref` failure records
-    // `unknown` unconditionally: a pending intent can also carry a
-    // landed-but-unrecorded push (a post-push crash loses the receipt
-    // write), so no push failure ever proves a definite no-effect.
-    let uncertain = |reason: String| {
-        if reconcile {
-            HostActionStatus::Unknown { reason }
-        } else {
-            HostActionStatus::Failed { reason }
-        }
-    };
+/// push failure ever proves a definite no-effect (R42). The only
+/// `failed` this path records is the scenario-injected definite
+/// refusal.
+fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
     let execution = ctx
         .store
         .transact_deferred(|tx| {
@@ -1311,10 +1298,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                     ctx,
                     intent,
                     key,
-                    uncertain(
-                        "injected fault: partial effect (landed push, change_request_create refused)"
-                            .into(),
-                    ),
+                    HostActionStatus::Failed {
+                        reason:
+                            "injected fault: partial effect (landed push, change_request_create refused)"
+                                .into(),
+                    },
                     vec![],
                 );
                 return Ok(());
