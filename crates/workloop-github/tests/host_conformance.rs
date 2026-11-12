@@ -412,7 +412,7 @@ fn absent_operation_name(capability: &str) -> Option<&'static str> {
 }
 
 /// Turn one undeclared required capability into an explicit unsupported
-/// result: an admission rejection, a `failed` receipt naming the
+/// result: an admission rejection, an `unsupported` receipt naming the
 /// operation, or a type-level absent operation. Never a skip.
 fn assert_unsupported_capability(
     fixture: &mut dyn OutboxHost,
@@ -2409,9 +2409,9 @@ fn push_to_an_open_merge_requests_source_branch_surfaces_the_new_head() {
     );
 }
 
-/// An unsupported operation is reported as a failed receipt naming the
-/// operation — explicit, never counted as applied, never silently
-/// dropped.
+/// An unsupported operation is reported as an `unsupported` receipt
+/// naming the operation — explicit, never counted as applied, never
+/// silently dropped.
 #[test]
 fn sparse_host_unsupported_operations_stay_explicit() {
     let mut fixture = SparseHost::new();
