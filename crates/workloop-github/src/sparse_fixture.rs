@@ -1,8 +1,8 @@
 //! A second, independently structured fixture host for conformance
 //! parameterization. `SparseHost` declares only a subset of the baseline
-//! operations and reports every unsupported intent as a failed receipt —
-//! an unsupported operation stays explicit and is never counted as
-//! applied. Its remote model is a scoped event journal (repository +
+//! operations and reports every unsupported intent as an `unsupported`
+//! receipt — an unsupported operation stays explicit and is never
+//! counted as applied. Its remote model is a scoped event journal (repository +
 //! branch/change keys), deliberately different from `FixtureGithub`'s
 //! flat maps so shared-suite assertions cannot lean on one fixture's
 //! internals.
@@ -94,8 +94,8 @@ impl SparseHost {
     }
 
     /// Drain outstanding intents in outbox order, bounded to the intents
-    /// pending when each attempt starts. Unsupported operations receive a
-    /// `failed` receipt naming the unsupported operation — explicit, and
+    /// pending when each attempt starts. Unsupported operations receive
+    /// an `unsupported` receipt naming the operation — explicit, and
     /// never an `applied` claim.
     pub fn apply_outbox(
         &mut self,
