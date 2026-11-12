@@ -1405,13 +1405,14 @@ impl SqliteStore {
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        let transitioned = tx.execute(
-            "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
+        let transitioned = tx
+            .execute(
+                "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
              delete_failures=0, reclaimed_unix_seconds=?3 WHERE body_id=?1 \
              AND state='reclaiming'",
-            params![body_id, reason, now_unix_seconds],
-        )
-        .map_err(map_err)?;
+                params![body_id, reason, now_unix_seconds],
+            )
+            .map_err(map_err)?;
         tx.commit().map_err(internal)?;
         Ok(transitioned)
     }

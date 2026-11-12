@@ -478,13 +478,13 @@ pub fn run_pass(
             phases.push(PhaseReport::skipped(name, "shutdown"));
         } else if scope.is_some() {
             phases.push(PhaseReport::skipped(name, "work_scope"));
+        } else {
+            let now = clock();
+            if now >= deadline {
+                phases.push(PhaseReport::deferred_phase(name));
+            } else if !pass.settings.retention.enabled {
+                phases.push(PhaseReport::skipped(name, "retention_disabled"));
             } else {
-                let now = clock();
-                if now >= deadline {
-                    phases.push(PhaseReport::deferred_phase(name));
-                } else if !pass.settings.retention.enabled {
-                    phases.push(PhaseReport::skipped(name, "retention_disabled"));
-                } else {
                 // Single-owner maintenance: the sweep holds the same
                 // loop-independent installation maintenance lease as an
                 // explicit cleanup. A maintenance pass that loses the
@@ -509,8 +509,8 @@ pub fn run_pass(
                         phases.push(PhaseReport::skipped(name, &format!("already_running: {e}")))
                     }
                 }
-                }
             }
+        }
     }
 
     // Phase 8 — Attention derivation (recomputed read-only; always runs —
