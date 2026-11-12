@@ -10,9 +10,9 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `4` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, or `3` must carry
-//! the complete recognized schema of its version and upgrades
+//! `PRAGMA user_version` is the format gate: `5` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, `3`, or `4` must
+//! carry the complete recognized schema of its version and upgrades
 //! additively at open; a stamped file whose schema is foreign or
 //! incomplete, an unversioned database with user tables (a slice-0
 //! file — archive-only), and a newer version are all refused at open.
@@ -37,9 +37,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// The only store format this binary reads or writes. `2` adds the
 /// `invocations.descendants` column and the artifact-handoff and
 /// verification tables; `3` adds the `worker_request_exports` table;
-/// `4` adds the body catalogue's explicit `pin_state`. Older files
+/// `4` adds the body catalogue's explicit `pin_state`; `5` adds the
+/// `reclaim_plans` / `reclaim_plan_entries` tables. Older files
 /// upgrade additively at open.
-const FORMAT_VERSION: i64 = 4;
+const FORMAT_VERSION: i64 = 5;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -63,6 +64,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "invocation_requests",
     "issue_claims",
     "observations",
+    "reclaim_plan_entries",
+    "reclaim_plans",
     "recovery_decisions",
     "recovery_intents",
     "resource_reservations",
@@ -81,9 +84,9 @@ const EXPECTED_TABLES: &[&str] = &[
 
 /// The tables the run-lease slice added on top of the previous
 /// release's v1 store while it was still stamped `1`. Together with
-/// [`V2_ADDED_TABLES`] they are the set a stamped v1 file may
-/// legitimately lack and still be upgraded in place by the additive
-/// migration.
+/// [`V2_ADDED_TABLES`], [`V3_ADDED_TABLES`], and [`V5_ADDED_TABLES`]
+/// they are the set a stamped file may legitimately lack and still be
+/// upgraded in place by the additive migration.
 const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
 
 /// Tables the v1 → v2 migration adds. Everything else in
@@ -94,6 +97,11 @@ const V2_ADDED_TABLES: &[&str] = &["artifact_handoffs", "verification_results"];
 
 /// Tables the v2 → v3 migration adds (same additive shape as v1 → v2).
 const V3_ADDED_TABLES: &[&str] = &["worker_request_exports"];
+
+/// The tables the U2.6 two-phase cleanup slice adds on top of the
+/// format-4 store while it is still stamped `4`. Like the additive set
+/// they are installed by the same `SCHEMA` batch on upgrade.
+const V5_ADDED_TABLES: &[&str] = &["reclaim_plan_entries", "reclaim_plans"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -227,14 +235,15 @@ impl SqliteStore {
             // complete schema of its stamped version: a v1 file must
             // hold every expected table except the ones added since —
             // the run-lease slice's additive set, the two v2 additions,
-            // and the v3 addition — a v2 file everything except the v3
-            // addition, and a v3 file the complete set (v4 adds a
-            // column, not a table). A foreign or truncated stamped file
-            // fails this check untouched, and the accepted difference
-            // is a previous release's store: it holds every base table
-            // and none of the additions, so it is upgraded in place
-            // instead of being locked out with a misleading "not the
-            // recognized schema" refusal.
+            // and the v3 and v5 additions — a v2 file everything
+            // except the v3 and v5 additions, and a v3 or v4 file
+            // everything except the v5 additions (v4 adds a column,
+            // not a table). A foreign or truncated stamped file fails
+            // this check untouched, and the accepted difference is a
+            // previous release's store: it holds every base table and
+            // none of the additions, so it is upgraded in place instead
+            // of being locked out with a misleading "not the recognized
+            // schema" refusal.
             let present = table_set(&conn)?;
             let required_complete = if version == 1 {
                 EXPECTED_TABLES
@@ -243,15 +252,19 @@ impl SqliteStore {
                         !V2_ADDED_TABLES.contains(t)
                             && !ADDITIVE_TABLES.contains(t)
                             && !V3_ADDED_TABLES.contains(t)
+                            && !V5_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V3_ADDED_TABLES.contains(t))
+                    .filter(|t| !V3_ADDED_TABLES.contains(t) && !V5_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
-                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V5_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -382,6 +395,29 @@ impl SqliteStore {
         inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
         now_unix_seconds: i64,
     ) -> Result<RunLeaseGrant, RunLeaseError> {
+        self.acquire_lease(owner, inspect, now_unix_seconds, "default")
+    }
+
+    /// The loop-independent installation maintenance lease for explicit
+    /// tooling (cleanup, sweep-style passes). A second maintenance
+    /// writer is refused with `lock.held`; the loop's driver lease is
+    /// unaffected and vice versa.
+    pub fn acquire_maintenance_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
+        self.acquire_lease(owner, inspect, now_unix_seconds, "maintenance")
+    }
+
+    fn acquire_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+        lease_key: &str,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
         let mut guard = self.conn.lock().map_err(|_| {
             RunLeaseError::Store(StoreError::Internal {
                 detail: "store lock poisoned".into(),
@@ -393,15 +429,16 @@ impl SqliteStore {
         let existing: Option<(i32, String, String)> = tx
             .query_row(
                 "SELECT owner_pid, owner_started_at, owner_nonce \
-                 FROM run_lease WHERE lease_key='default'",
-                [],
+                 FROM run_lease WHERE lease_key=?1",
+                params![lease_key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(|e| RunLeaseError::Store(map_err(e)))?;
         let grant = match existing {
             None => {
-                insert_lease(&tx, owner, now_unix_seconds).map_err(RunLeaseError::Store)?;
+                insert_lease(&tx, owner, now_unix_seconds, lease_key)
+                    .map_err(RunLeaseError::Store)?;
                 RunLeaseGrant::Acquired
             }
             Some((pid, _started_at, nonce)) if nonce == owner.nonce && pid == owner.pid => {
@@ -409,8 +446,8 @@ impl SqliteStore {
                 // driver): refresh the acquisition stamp, keep ownership.
                 tx.execute(
                     "UPDATE run_lease SET acquired_unix_seconds=?1 \
-                     WHERE lease_key='default'",
-                    params![now_unix_seconds],
+                     WHERE lease_key=?2",
+                    params![now_unix_seconds, lease_key],
                 )
                 .map_err(|e| RunLeaseError::Store(map_err(e)))?;
                 RunLeaseGrant::Acquired
@@ -433,8 +470,14 @@ impl SqliteStore {
                             "UPDATE run_lease SET owner_pid=?1, \
                              owner_started_at=?2, owner_nonce=?3, \
                              acquired_unix_seconds=?4 \
-                             WHERE lease_key='default'",
-                            params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+                             WHERE lease_key=?5",
+                            params![
+                                owner.pid,
+                                owner.started_at,
+                                owner.nonce,
+                                now_unix_seconds,
+                                lease_key
+                            ],
                         )
                         .map_err(|e| RunLeaseError::Store(map_err(e)))?;
                         RunLeaseGrant::Reclaimed { previous_pid: pid }
@@ -449,9 +492,18 @@ impl SqliteStore {
         Ok(grant)
     }
 
+    /// Release only this owner's maintenance lease.
+    pub fn release_maintenance_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        self.release_lease(owner, "maintenance")
+    }
+
     /// Release only this owner's lease. A stale holder's release can
     /// never clear a lease that was reclaimed by another driver.
     pub fn release_run_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        self.release_lease(owner, "default")
+    }
+
+    fn release_lease(&self, owner: &RunLeaseOwner, lease_key: &str) -> Result<(), StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
@@ -459,9 +511,9 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
         tx.execute(
-            "DELETE FROM run_lease WHERE lease_key='default' \
+            "DELETE FROM run_lease WHERE lease_key=?3 \
              AND owner_nonce=?1 AND owner_pid=?2",
-            params![owner.nonce, owner.pid],
+            params![owner.nonce, owner.pid, lease_key],
         )
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;
@@ -527,11 +579,18 @@ fn insert_lease(
     tx: &rusqlite::Transaction<'_>,
     owner: &RunLeaseOwner,
     now_unix_seconds: i64,
+    lease_key: &str,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO run_lease (lease_key, owner_pid, owner_started_at, \
-         owner_nonce, acquired_unix_seconds) VALUES ('default', ?1, ?2, ?3, ?4)",
-        params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+         owner_nonce, acquired_unix_seconds) VALUES (?5, ?1, ?2, ?3, ?4)",
+        params![
+            owner.pid,
+            owner.started_at,
+            owner.nonce,
+            now_unix_seconds,
+            lease_key
+        ],
     )
     .map_err(map_err)?;
     Ok(())

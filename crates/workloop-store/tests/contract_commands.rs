@@ -3447,6 +3447,8 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
             "DROP TABLE artifact_handoffs;
              DROP TABLE verification_results;
              DROP TABLE worker_request_exports;
+             DROP TABLE reclaim_plan_entries;
+             DROP TABLE reclaim_plans;
              ALTER TABLE invocations DROP COLUMN descendants;
              ALTER TABLE body_catalog DROP COLUMN pin_state;",
         )
@@ -3478,12 +3480,14 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let store = SqliteStore::open(&db, 1).unwrap();
         accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
     };
-    // Reshape the file into a real v2 store: drop the v3 table and the
-    // v4 column, then stamp user_version=2.
+    // Reshape the file into a real v2 store: drop the v3 table, the
+    // v4 column, and the v5 tables, then stamp user_version=2.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "DROP TABLE worker_request_exports;
+             DROP TABLE reclaim_plan_entries;
+             DROP TABLE reclaim_plans;
              ALTER TABLE body_catalog DROP COLUMN pin_state;
              PRAGMA user_version=2;",
         )
@@ -3504,7 +3508,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "the upgrade lands on the current format");
+        assert_eq!(version, 5, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4549,7 +4553,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "the upgrade lands on the current format");
+        assert_eq!(version, 5, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);
