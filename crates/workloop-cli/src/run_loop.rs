@@ -25,11 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
-use workloop_core::domain::WorkId;
+use workloop_core::domain::{ExecutionState, WorkId};
 use workloop_core::identity::AdapterId;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
@@ -318,23 +318,32 @@ pub fn run_pass(
     // declaration is probed per distinct request workspace — the same
     // cwd the consume-time re-verification uses, so a recorded binding
     // always re-verifies at launch — and each in-scope unbound request
-    // records its binding in a following transaction. An idle pass
-    // probes nothing: no unbound request means no spawned worker. A
-    // probe that does not answer leaves the requests unbound; the
-    // supervisor's fail-closed selection handles them at consume.
+    // records its binding in a following transaction. The same gate the
+    // consume path applies holds here: a request whose Execution can no
+    // longer launch is never probed at all. An idle pass probes
+    // nothing: no unbound request means no spawned worker. A probe that
+    // does not answer leaves the requests unbound; the supervisor's
+    // fail-closed selection handles them at consume.
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;
         let result = store.transact(|tx| {
             let scan = dispatch_scan(tx, config, &mut *clock, Some(deadline), scope)?;
             // The binding pass stays inside the pass scope: a scoped
-            // `--work` run never writes another Work's requests.
-            let unbound = tx
-                .pending_requests()?
-                .into_iter()
-                .filter(|r| r.adapter_binding.is_none())
-                .filter(|r| scope.is_none_or(|w| r.work_id == *w))
-                .collect::<Vec<_>>();
+            // `--work` run never writes another Work's requests, and a
+            // request whose Execution is not Ready — paused, stopping,
+            // cancelled — is never probed since it can never launch.
+            let mut unbound = Vec::new();
+            for request in tx.pending_requests()? {
+                if request.adapter_binding.is_some()
+                    || !scope.is_none_or(|w| request.work_id == *w)
+                    || tx.execution(&request.execution_id)?.map(|e| e.state)
+                        != Some(ExecutionState::Ready)
+                {
+                    continue;
+                }
+                unbound.push(request);
+            }
             Ok((scan, unbound))
         });
         let result = result.and_then(|(scan, unbound)| {
@@ -350,6 +359,14 @@ pub fn run_pass(
                         .push(request.request_id.clone());
                 }
                 for (workspace, request_ids) in by_workspace {
+                    // The probe spawns inside the workspace the consume
+                    // path would create before launch; a fresh Work's
+                    // `ws-<work>` does not exist yet, so it is created
+                    // here first — a refused creation fails the phase
+                    // instead of silently skipping the binding.
+                    std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
+                        detail: format!("create workspace {}: {e}", workspace.display()),
+                    })?;
                     let Ok(declaration) = adapter::observe_worker_declaration(
                         &supervisor.port,
                         &supervisor.worker_argv,
