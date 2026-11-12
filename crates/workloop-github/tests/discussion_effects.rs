@@ -280,6 +280,15 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
             body: "review body".into(),
         },
     );
+    let reply_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::ReplyToThread {
+            change: change(),
+            thread_id: "th-1".into(),
+            body: "reply body".into(),
+        },
+    );
     let resolve_id = insert_intent(
         &store,
         &work_id,
@@ -331,6 +340,30 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
     };
     assert_eq!(*rid, format!("rv-{review_id}"));
     assert_eq!(*head, rev("head-1"));
+
+    // The reply receipt binds the remote-issued reply id and the digest
+    // of the remote's stored reply body, on the exact thread.
+    let reply = intent(&store, &reply_id);
+    let [
+        NormalizedEffectFact::ReplyPosted {
+            thread_id: rtid,
+            reply_id: rpid,
+            body_digest: reply_digest,
+            ..
+        },
+    ] = reply.effects.as_slice()
+    else {
+        panic!("reply receipt: {:?}", reply.effects)
+    };
+    assert_eq!(rtid, "th-1");
+    assert_eq!(*rpid, format!("rp-{reply_id}"), "remote-issued id");
+    let stored_reply_digest = workloop_core::domain::sha256_hex(
+        "reply-v1",
+        &workloop_core::domain::canonical_json(&serde_json::json!({
+            "body": "reply body",
+        })),
+    );
+    assert_eq!(*reply_digest, stored_reply_digest);
 
     // The resolve receipt reports the observed thread state and head.
     let resolve = intent(&store, &resolve_id);
