@@ -9,20 +9,23 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use workloop_core::domain::*;
 use workloop_core::observation::{
     ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
 };
 use workloop_core::ports::{
-    ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
 };
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::{
     DEFAULT_ISOLATION_PROFILE_ID, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
 };
+
+use crate::adapter;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -101,6 +104,74 @@ fn stat_of(pid: i32) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// What a timed-out probe may signal once the bound has elapsed. The
+/// waiter thread can already have reaped the leader between the bound
+/// expiring and the kill, freeing the pid for reuse, so the recorded
+/// `pid + lstart` is re-verified first — the same owner check
+/// `proof_identities` applies to a recorded group: pgid == the leader's
+/// pid (`process_group(0)`), a live process at that pid under a
+/// different start is a recycled owner and its group is foreign, while
+/// an absent owner leaves only this probe's own stragglers holding the
+/// group.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeSignalPlan {
+    /// The leader re-verified: it and the group this probe created are
+    /// still ours to signal.
+    LeaderAndGroup,
+    /// The pid is unallocated: a surviving group can only be held by
+    /// this probe's own stragglers — a group id is only minted by a
+    /// live process of that pid — so the group is still ours to signal.
+    GroupOnly,
+    /// A live process at the pid carries a different start (recycled,
+    /// foreign) or an occupied pid could not be verified: nothing is
+    /// signalled. A possibly-leaked straggler beats a signal to an
+    /// unrelated process.
+    Nothing,
+}
+
+fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
+    match lookup {
+        LstartLookup::Present(now) if now == recorded_lstart => ProbeSignalPlan::LeaderAndGroup,
+        LstartLookup::Absent => ProbeSignalPlan::GroupOnly,
+        LstartLookup::Failed(_) => {
+            // The process-table read failed, but a pid probe needs no
+            // table: `kill(pid, 0)` reporting ESRCH means the pid is
+            // unallocated and no foreign process can be heading a group
+            // under it — the group is still ours to signal. An
+            // occupied but unverifiable pid could be a recycled foreign
+            // owner, so it is left alone.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                ProbeSignalPlan::GroupOnly
+            } else {
+                ProbeSignalPlan::Nothing
+            }
+        }
+        _ => ProbeSignalPlan::Nothing,
+    }
+}
+
+/// Signal whatever of a bounded probe's leader and process group is
+/// still this probe's to stop. `recorded_lstart` is the leader identity
+/// captured while the pid was provably ours. Shared by the timeout and
+/// the wait-error paths so a wedged probe cannot outlive its bound on
+/// either one. Returns the plan applied so the caller can report an
+/// unsignalled bound as unknown fate rather than claiming `Bounded`.
+fn signal_probe_bound(pid: i32, recorded_lstart: &str) -> ProbeSignalPlan {
+    let plan = probe_signal_plan(pid, recorded_lstart, &lstart_of(pid));
+    match plan {
+        ProbeSignalPlan::LeaderAndGroup => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::GroupOnly => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::Nothing => {}
+    }
+    plan
 }
 
 impl PosixProcessControl {
@@ -337,6 +408,94 @@ impl ProcessControlPort for PosixProcessControl {
         let mut status = 0;
         unsafe {
             libc::waitpid(pid, &mut status, libc::WNOHANG);
+        }
+    }
+
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        let Some(program) = argv.first() else {
+            return Err(SpawnError::Refused {
+                reason: "empty argv".into(),
+            });
+        };
+        // Same containment as `spawn`: own process group so a bound can
+        // reach the whole tree the leader did not let escape. stderr is
+        // dropped — only the declared stdout payload is evidence.
+        let mut cmd = Command::new(program);
+        cmd.args(&argv[1..])
+            .current_dir(cwd)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().map_err(|e| SpawnError::Refused {
+            reason: format!("spawn {program}: {e}"),
+        })?;
+        let pid = child.id() as i32;
+        // Record the leader's `pid + lstart` while the pid is provably
+        // still ours — the handle is held, so it cannot have been
+        // recycled. The waiter below can reap the leader before the
+        // bound path signals, and only this identity separates our
+        // process from a reused pid there. When the identity cannot be
+        // captured no later signal is verifiable: the still-unreaped
+        // child is stopped now (signalling it is safe while the handle
+        // is held) and the probe's fate is reported unknown.
+        let started_at = match Self::identity_of(pid) {
+            Ok(identity) => identity.started_at,
+            Err(reason) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SpawnError::Unknown { reason });
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        });
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok(output)) => Ok(ProbeOutcome::Exited {
+                stdout: output.stdout,
+                success: output.status.success(),
+            }),
+            Ok(Err(e)) => {
+                // The wait itself failed and the child's fate is
+                // unknown — the bound still applies: signal whatever of
+                // the leader and its group is still this probe's before
+                // reporting the probe unknown, so a wedged group cannot
+                // outlive the bound on a wait-channel error either.
+                signal_probe_bound(pid, &started_at);
+                self.reap(pid);
+                Err(SpawnError::Unknown {
+                    reason: format!("wait {program}: {e}"),
+                })
+            }
+            Err(_) => {
+                // The bound elapsed: re-verify the recorded identity
+                // before signalling — the waiter may already have reaped
+                // the leader, freeing the pid for reuse (#152). The
+                // group id is the leader's pid by construction, so the
+                // plan decides exactly which of the leader and its
+                // group are still ours. A short drain then lets the
+                // waiter reap the direct child rather than leaving a
+                // zombie. When the plan signalled nothing the outcome
+                // is not `Bounded`: that variant promises the group and
+                // leader were stopped, so an unsignalled wedged probe
+                // reports unknown fate instead.
+                let plan = signal_probe_bound(pid, &started_at);
+                let _ = receiver.recv_timeout(Duration::from_secs(2));
+                match plan {
+                    ProbeSignalPlan::Nothing => Err(SpawnError::Unknown {
+                        reason: format!(
+                            "probe bound elapsed and the leader identity could not \
+                             be re-verified at {pid}; nothing was signalled"
+                        ),
+                    }),
+                    _ => Ok(ProbeOutcome::Bounded),
+                }
+            }
         }
     }
 }
@@ -774,11 +933,65 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         }
 
+        // The Execution state gates the describe probe too: a request
+        // that can never launch never starts the worker binary, not even
+        // the effect-free declaration probe.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+
+        // Resolve the request's adapter before any Invocation is
+        // recorded. A request that already carries a binding keeps it
+        // verbatim — a later `worker_argv` swap can only affect requests
+        // created after the change — but the bound argv is probed again
+        // and must still declare the stored binding; a mismatch is a
+        // configuration repair that authorizes no start. An unbound
+        // request selects now and records the binding in the consume
+        // commit. A failed `describe` is fail-closed: the adapter is not
+        // selectable and the request does not dispatch.
+        let (binding, repair_reason) = if exec_state != Some(ExecutionState::Ready) {
+            (None, None)
+        } else {
+            let workspace = self.workspace_of(&request.work_id);
+            std::fs::create_dir_all(&workspace)?;
+            match &request.adapter_binding {
+                Some(stored) => {
+                    match adapter::observe_worker_declaration(&self.port, &stored.argv, &workspace)
+                    {
+                        Ok(observed) => match adapter::select_adapter(&observed, stored) {
+                            adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
+                            adapter::AdapterSelection::ConfigurationRepair { reason } => {
+                                (None, Some(reason))
+                            }
+                        },
+                        Err(why) => (
+                            None,
+                            Some(format!("adapter.declaration_unavailable: {why}")),
+                        ),
+                    }
+                }
+                None => match adapter::observe_worker_declaration(
+                    &self.port,
+                    &self.worker_argv,
+                    &workspace,
+                ) {
+                    Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
+                    Err(why) => (
+                        None,
+                        Some(format!("adapter.declaration_unavailable: {why}")),
+                    ),
+                },
+            }
+        };
+
         // First consumption: persist the WorkerRequest export and the
         // Invocation inside the same commit that consumes the request —
         // crash order is export, then identity, then launch. The export
         // is durable before any process exists; a launch that fails or
-        // never returns leaves it behind for reconciliation.
+        // never returns leaves it behind for reconciliation. Recording
+        // the Invocation flips `consumed` itself; the explicit mark
+        // records the supervisor's handoff and is idempotent. The
+        // request's first adapter binding lands in the same commit.
         let invocation = Invocation {
             id: InvocationId(store.transact(|tx| tx.alloc_id("inv"))?),
             request_id: request.request_id.clone(),
@@ -806,6 +1019,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             process_identity: None,
         };
         store.transact(|tx| {
+            if request.adapter_binding.is_none()
+                && let Some(binding) = &binding
+            {
+                tx.apply(&Effect::BindRequestAdapter {
+                    request_id: request.request_id.clone(),
+                    binding: binding.clone(),
+                })?;
+            }
             tx.apply(&Effect::InsertInvocation {
                 invocation: invocation.clone(),
             })?;
@@ -818,15 +1039,46 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(())
         })?;
 
-        // Launch only for a freshly admitted Execution. A request consumed
-        // while the Execution wants stop (or is uncertain, waiting, or
-        // terminal) must not produce a writer — the invocation is
-        // abandoned so `drive_stops` can settle the Execution instead of
-        // leaving it blocked on a writer that never existed.
-        let exec_state = store
-            .transact(|tx| tx.execution(&request.execution_id))?
-            .map(|e| e.state);
-        if exec_state != Some(ExecutionState::Ready) {
+        if let Some(reason) = repair_reason {
+            // A declaration mismatch or an unanswered `describe` is a
+            // configuration repair: the attempt is recorded and abandoned,
+            // but no worker starts. The consumed request is terminal for
+            // its binding — a re-issued request binds a fresh declaration.
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchRefused {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+
+        // The pre-probe Execution-state read is stale by up to the full
+        // probe bound: re-read it after the consume commit so a stop or
+        // cancel committed while `describe` ran still blocks the spawn —
+        // the request is consumed, so blocking the launch abandons the
+        // recorded Invocation. The spawn also requires the recorded
+        // binding: when the pre-probe read skipped `describe` the bound
+        // argv was never re-verified, so a state that flipped back to
+        // Ready must not fall through to the configured `worker_argv`
+        // and launch with no recorded selection.
+        let launchable = binding.is_some()
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !launchable {
             store.transact(|tx| {
                 let mut next = invocation.clone();
                 next.state = InvocationState::Abandoned;
@@ -842,7 +1094,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let work_id = request.work_id.clone();
         let workspace = self.workspace_of(&work_id);
         std::fs::create_dir_all(&workspace)?;
-        let argv = self.worker_argv.clone();
+        // The bound argv is the recorded selection — a `worker_argv`
+        // change after binding never retargets this request, and the
+        // launchable gate above already proved a binding was recorded.
+        let argv = binding
+            .map(|binding| binding.argv)
+            .expect("a launch requires a recorded binding");
         match self.port.spawn(&argv, &workspace) {
             Ok(identity) => {
                 // Descendant coverage starts at launch: a writer that
@@ -2066,6 +2323,14 @@ mod tests {
             panic!("incomplete snapshot must not authorize signaling")
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     #[test]
@@ -2169,6 +2434,14 @@ mod tests {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     fn scripted_config() -> workloop_core::work::WorkloopConfig {
@@ -2320,5 +2593,79 @@ mod tests {
             LstartLookup::Present(s) => assert_eq!(s, "Sat Oct 4 06:14:00 2026"),
             other => panic!("expected Present, got {other:?}"),
         }
+    }
+
+    /// The bounded-probe signal plan applies the recorded-group owner
+    /// check: a leader that re-verifies is ours to signal, an absent
+    /// owner pid leaves only our own stragglers holding the group, and
+    /// a pid that lives under a different start is recycled — signalling
+    /// it would hit an unrelated process (#152).
+    #[test]
+    fn a_probe_timeout_signals_only_verified_identities() {
+        let recorded = "Sat Oct 4 06:14:00 2026";
+        assert_eq!(
+            probe_signal_plan(1, recorded, &LstartLookup::Present(recorded.into())),
+            ProbeSignalPlan::LeaderAndGroup
+        );
+        assert_eq!(
+            probe_signal_plan(1, recorded, &LstartLookup::Absent),
+            ProbeSignalPlan::GroupOnly
+        );
+        assert_eq!(
+            probe_signal_plan(
+                1,
+                recorded,
+                &LstartLookup::Present("Sun Nov 1 00:00:00 2026".into())
+            ),
+            ProbeSignalPlan::Nothing
+        );
+        // A failed lookup over an unallocated pid still reaches the
+        // group — `kill(pid, 0)` is enough to prove no foreign owner is
+        // heading a group under it.
+        assert_eq!(
+            probe_signal_plan(
+                i32::MAX,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
+            ProbeSignalPlan::GroupOnly
+        );
+        // A failed lookup over an occupied pid stays unverifiable — the
+        // group is left alone rather than risk a recycled foreign owner.
+        assert_eq!(
+            probe_signal_plan(
+                std::process::id() as i32,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
+            ProbeSignalPlan::Nothing
+        );
+    }
+
+    /// A probe that leaves a same-group straggler past the bound loses
+    /// the whole group: the leader's pid is the group id by
+    /// construction, so the straggler writes nothing after the bound.
+    #[test]
+    fn a_timed_out_probe_group_is_killed_with_its_leader() {
+        let marker =
+            std::env::temp_dir().join(format!("workloop-probe-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // The straggler writes the marker at ~1s if the group survives;
+        // the leader keeps the bound wedged well past that point.
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("(sleep 1; touch \"{}\") & sleep 30", marker.display()),
+        ];
+        let outcome = PosixProcessControl
+            .run_probe(&argv, Path::new("/tmp"), Duration::from_millis(50))
+            .expect("a spawned probe reports its outcome");
+        assert_eq!(outcome, ProbeOutcome::Bounded);
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(
+            !marker.exists(),
+            "a same-group straggler must be killed with the probe leader"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }

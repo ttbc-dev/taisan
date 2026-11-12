@@ -2153,6 +2153,13 @@ pub fn admit_queued_role(
         role: role.clone(),
         spec_revision: work.spec,
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
+        // Created unbound: the adapter binding is recorded later from a
+        // live `describe` declaration — either by the Phase-2
+        // dispatch-admission probe, which binds unbound pending
+        // requests to the current worker in a transaction following
+        // the admission scan, or by `execution` immediately before the
+        // first launch. It is never inferred from configuration.
+        adapter_binding: None,
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;

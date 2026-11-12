@@ -25,14 +25,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
-use workloop_core::domain::WorkId;
+use workloop_core::domain::{ExecutionId, ExecutionState, WorkId};
 use workloop_core::identity::AdapterId;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
+use workloop_exec::adapter;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::{SweepParams, SweepReport};
@@ -313,13 +314,122 @@ pub fn run_pass(
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
     // one store transaction and isolates each admission in its own
     // attempt savepoint, with deadline and scope supplied as facts).
+    // When the scan leaves unbound pending requests, the worker
+    // declaration is probed per distinct request workspace — the same
+    // cwd the consume-time re-verification uses, so a recorded binding
+    // always re-verifies at launch — and each in-scope unbound request
+    // records its binding in a following transaction. The same gate the
+    // consume path applies holds here: a request whose Execution can no
+    // longer launch is never probed at all. An idle pass probes
+    // nothing: no unbound request means no spawned worker. A probe that
+    // does not answer leaves the requests unbound; the supervisor's
+    // fail-closed selection handles them at consume.
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;
-        let result =
-            store.transact(|tx| dispatch_scan(tx, config, &mut *clock, Some(deadline), scope));
+        let result = store.transact(|tx| {
+            let scan = dispatch_scan(tx, config, &mut *clock, Some(deadline), scope)?;
+            // The binding pass stays inside the pass scope: a scoped
+            // `--work` run never writes another Work's requests, and a
+            // request whose Execution is not Ready — paused, stopping,
+            // cancelled — is never probed since it can never launch.
+            let mut unbound = Vec::new();
+            for request in tx.pending_requests()? {
+                if request.adapter_binding.is_some()
+                    || !scope.is_none_or(|w| request.work_id == *w)
+                    || tx.execution(&request.execution_id)?.map(|e| e.state)
+                        != Some(ExecutionState::Ready)
+                {
+                    continue;
+                }
+                unbound.push(request);
+            }
+            Ok((scan, unbound))
+        });
+        let result = result.and_then(|(scan, unbound)| {
+            let mut binding_cut = false;
+            if let Some(supervisor) = pass.supervisor
+                && !unbound.is_empty()
+            {
+                let mut by_workspace: std::collections::BTreeMap<
+                    PathBuf,
+                    Vec<(String, ExecutionId)>,
+                > = std::collections::BTreeMap::new();
+                for request in &unbound {
+                    by_workspace
+                        .entry(supervisor.workspace_of(&request.work_id))
+                        .or_default()
+                        .push((request.request_id.clone(), request.execution_id.clone()));
+                }
+                for (workspace, request_ids) in by_workspace {
+                    // Each probe spawns a bounded `describe`, so like
+                    // every other item loop the tick deadline is
+                    // checked before starting new work — a cut leaves
+                    // the remaining requests unbound and durable; the
+                    // consume path's fail-closed selection binds them.
+                    if clock() >= deadline {
+                        binding_cut = true;
+                        break;
+                    }
+                    // The dispatch-transaction Ready read is stale by
+                    // now: a lease-free command (e.g. cancel) can move
+                    // an Execution between it and this probe. Re-read
+                    // before spawning — a request whose Execution can
+                    // no longer launch is never probed at all.
+                    let still_ready = store.transact(|tx| {
+                        let mut ready = Vec::new();
+                        for (request_id, execution_id) in &request_ids {
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                ready.push((request_id.clone(), execution_id.clone()));
+                            }
+                        }
+                        Ok(ready)
+                    })?;
+                    if still_ready.is_empty() {
+                        continue;
+                    }
+                    // The probe spawns inside the workspace the consume
+                    // path would create before launch; a fresh Work's
+                    // `ws-<work>` does not exist yet, so it is created
+                    // here first — a refused creation fails the phase
+                    // instead of silently skipping the binding.
+                    std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
+                        detail: format!("create workspace {}: {e}", workspace.display()),
+                    })?;
+                    let Ok(declaration) = adapter::observe_worker_declaration(
+                        &supervisor.port,
+                        &supervisor.worker_argv,
+                        &workspace,
+                    ) else {
+                        continue;
+                    };
+                    let binding = declaration.binding(&supervisor.worker_argv);
+                    store.transact(|tx| {
+                        for (request_id, execution_id) in &still_ready {
+                            // The same gate once more inside the commit:
+                            // an Execution stopped between the pre-probe
+                            // read and this transaction is not bound.
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                tx.apply(&Effect::BindRequestAdapter {
+                                    request_id: request_id.clone(),
+                                    binding: binding.clone(),
+                                })?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            Ok((scan, binding_cut))
+        });
         push!(match result {
-            Ok(scan) => {
+            Ok((scan, binding_cut)) => {
                 let mut p = PhaseReport::completed(PHASES[1]);
                 p.processed = scan.admitted.len();
                 p.deferred = scan
@@ -327,6 +437,9 @@ pub fn run_pass(
                     .into_iter()
                     .map(|e| e.0)
                     .collect::<Vec<_>>();
+                if binding_cut {
+                    p.reason = Some("tick.deadline".into());
+                }
                 p
             }
             Err(e) => PhaseReport::failed(PHASES[1], e),

@@ -755,6 +755,7 @@ fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
         role: InvocationRole::Coding,
         spec_revision: 1,
         payload: serde_json::json!({}),
+        adapter_binding: None,
     };
     apply_effects(&store, &[Effect::InsertRequest { request: seeded }]);
 
@@ -1786,6 +1787,7 @@ fn admission_rolls_back_on_request_persistence_failure() {
                 role: InvocationRole::Coding,
                 spec_revision: 1,
                 payload: serde_json::json!({}),
+                adapter_binding: None,
             },
         }],
     );
@@ -3427,9 +3429,10 @@ fn a_newer_store_format_is_refused() {
 }
 
 /// Regression: a genuine v1 file upgrades to the current format in
-/// place — the new tables, the invocations.descendants column and the
-/// body catalogue's pin_state appear and stamped rows survive; a
-/// second open is a no-op because the migration is idempotent.
+/// place — the new tables, the added columns (invocations.descendants,
+/// body_catalog.pin_state, invocation_requests.adapter_binding) appear
+/// and stamped rows survive; a second open is a no-op because the
+/// migration is idempotent.
 #[test]
 fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
     let root = temp_root("upgrade-v1");
@@ -3440,7 +3443,8 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
         accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
     };
     // Reshape the file into a real v1 store: drop the tables added
-    // since v1 and the added columns, then stamp user_version=1.
+    // since v1 and the added columns (including the request adapter
+    // binding), then stamp user_version=1.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
@@ -3450,7 +3454,8 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
              DROP TABLE reclaim_plan_entries;
              DROP TABLE reclaim_plans;
              ALTER TABLE invocations DROP COLUMN descendants;
-             ALTER TABLE body_catalog DROP COLUMN pin_state;",
+             ALTER TABLE body_catalog DROP COLUMN pin_state;
+             ALTER TABLE invocation_requests DROP COLUMN adapter_binding;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -3468,9 +3473,10 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
 }
 
 /// Regression: a genuine v2 store upgrades to the current format in
-/// place — the worker_request_exports table and the body catalogue's
-/// pin_state appear and stamped rows survive; a second open is a
-/// no-op because the migration is idempotent.
+/// place — the worker_request_exports table, the reclaim-plan tables,
+/// and the pin_state/adapter_binding columns appear and stamped rows
+/// survive; a second open is a no-op because the migration is
+/// idempotent.
 #[test]
 fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
     let root = temp_root("upgrade-v2");
@@ -3481,7 +3487,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
     };
     // Reshape the file into a real v2 store: drop the v3 table, the
-    // v4 column, and the v5 tables, then stamp user_version=2.
+    // v4 and v6 columns, and the v5 tables, then stamp user_version=2.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
@@ -3489,6 +3495,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
              DROP TABLE reclaim_plan_entries;
              DROP TABLE reclaim_plans;
              ALTER TABLE body_catalog DROP COLUMN pin_state;
+             ALTER TABLE invocation_requests DROP COLUMN adapter_binding;
              PRAGMA user_version=2;",
         )
         .unwrap();
@@ -3508,7 +3515,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "the upgrade lands on the current format");
+        assert_eq!(version, 6, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4553,7 +4560,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "the upgrade lands on the current format");
+        assert_eq!(version, 6, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);
