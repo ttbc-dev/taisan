@@ -65,6 +65,42 @@ fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// One `ps` table row: `N` integer prefix fields followed by the
+/// locale-dependent lstart text. The tail is never field-counted — a
+/// localized `ps` renders different field text (e.g. ja_JP prints a CJK
+/// weekday and an `M/D` date), and any non-empty tail is still the
+/// process start the row carries. Blank lines are skipped (`Ok(None)`);
+/// a missing prefix field or an empty lstart tail is an incomplete row
+/// and a non-numeric prefix is an invalid row — either aborts the table
+/// read so a partial snapshot can never authorize a signal.
+fn parse_table_row<const N: usize>(line: &str) -> Result<Option<([i32; N], String)>, String> {
+    let mut it = line.split_whitespace();
+    let mut tokens = Vec::with_capacity(N);
+    for _ in 0..N {
+        match it.next() {
+            Some(tok) => tokens.push(tok),
+            None => {
+                return if line.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    Err(format!("incomplete process-table row: {line}"))
+                };
+            }
+        }
+    }
+    let lstart = it.collect::<Vec<_>>().join(" ");
+    if lstart.is_empty() {
+        return Err(format!("incomplete process-table row: {line}"));
+    }
+    let mut fields = [0i32; N];
+    for (slot, tok) in fields.iter_mut().zip(tokens) {
+        *slot = tok
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+    }
+    Ok(Some((fields, normalize_lstart(&lstart))))
+}
+
 /// One `ps`-based lstart lookup, keeping "the process is gone" separate
 /// from "the lookup could not be completed". Only `Absent` (and a
 /// verified start-time mismatch) may prove a stop; `Failed` proves
@@ -241,26 +277,9 @@ impl ProcessControlPort for PosixProcessControl {
             // Numeric prefix fields, then the locale-dependent lstart
             // string — its token count varies (e.g. ja_JP pads days
             // <10 with a space), so it is never field-counted.
-            let mut it = line.split_whitespace();
-            let (Some(pid_s), Some(ppid_s), Some(pgid_s)) = (it.next(), it.next(), it.next())
-            else {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                return Err(format!("incomplete process-table row: {line}"));
+            let Some(([pid, ppid, pgid], lstart)) = parse_table_row::<3>(line)? else {
+                continue;
             };
-            let lstart_raw = it.collect::<Vec<_>>().join(" ");
-            if lstart_raw.is_empty() {
-                return Err(format!("incomplete process-table row: {line}"));
-            }
-            let (Ok(pid), Ok(ppid), Ok(pgid)) = (
-                pid_s.parse::<i32>(),
-                ppid_s.parse::<i32>(),
-                pgid_s.parse::<i32>(),
-            ) else {
-                return Err(format!("invalid process-table row: {line}"));
-            };
-            let lstart = normalize_lstart(&lstart_raw);
             by_ppid
                 .entry(ppid)
                 .or_default()
@@ -299,24 +318,13 @@ impl ProcessControlPort for PosixProcessControl {
             // Same variable-width lstart handling as
             // `snapshot_descendants`: pid/pgid are numeric prefixes,
             // everything after is the start time.
-            let mut it = line.split_whitespace();
-            let (Some(pid_s), Some(g_s)) = (it.next(), it.next()) else {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                return Err(format!("incomplete process-table row: {line}"));
-            };
-            let lstart = it.collect::<Vec<_>>().join(" ");
-            if lstart.is_empty() {
-                return Err(format!("incomplete process-table row: {line}"));
-            }
-            let (Ok(pid), Ok(g)) = (pid_s.parse::<i32>(), g_s.parse::<i32>()) else {
-                return Err(format!("invalid process-table row: {line}"));
+            let Some(([pid, g], lstart)) = parse_table_row::<2>(line)? else {
+                continue;
             };
             if g == pgid {
                 out.push(ProcessIdentity {
                     pid,
-                    started_at: normalize_lstart(&lstart),
+                    started_at: lstart,
                     pgid: Some(g),
                 });
             }
@@ -2593,6 +2601,54 @@ mod tests {
             LstartLookup::Present(s) => assert_eq!(s, "Sat Oct 4 06:14:00 2026"),
             other => panic!("expected Present, got {other:?}"),
         }
+    }
+
+    /// `ps` renders `lstart` in the process locale — under ja_JP a CJK
+    /// weekday and an `M/D` date replace the ctime fields. The parser
+    /// takes the numeric prefix and treats the whole remaining tail as
+    /// the start string, so a localized row must never read back as an
+    /// incomplete table row (#158).
+    #[test]
+    fn a_localized_lstart_row_still_parses() {
+        // C-locale ctime row, including the space-padded day field.
+        let (fields, lstart) = parse_table_row::<3>("  247     1   247 Sat Oct  4 06:14:00 2026")
+            .unwrap()
+            .expect("a full row parses");
+        assert_eq!(fields, [247, 1, 247]);
+        assert_eq!(lstart, "Sat Oct 4 06:14:00 2026");
+
+        // The ja_JP row from the issue report: `水` (Wednesday) plus a
+        // numeric `M/D` date — the row that produced
+        // "incomplete process-table row" before the parse tolerated it.
+        let (fields, lstart) = parse_table_row::<3>("  247     1   247 水 11/11 14:15:57 2026")
+            .unwrap()
+            .expect("a localized row parses");
+        assert_eq!(fields, [247, 1, 247]);
+        assert_eq!(lstart, "水 11/11 14:15:57 2026");
+
+        // The two-prefix shape used by `group_members`, with the
+        // space-padded day ja_JP also emits (`木 11/ 5`).
+        let (fields, lstart) = parse_table_row::<2>("  247   247 木 11/ 5 06:14:00 2026")
+            .unwrap()
+            .expect("a localized group row parses");
+        assert_eq!(fields, [247, 247]);
+        assert_eq!(lstart, "木 11/ 5 06:14:00 2026");
+
+        // Blank lines are skipped; every other malformed row still
+        // aborts the table read.
+        assert_eq!(parse_table_row::<3>("   ").unwrap(), None);
+        assert_eq!(
+            parse_table_row::<3>("  247     1").unwrap_err(),
+            "incomplete process-table row:   247     1"
+        );
+        assert_eq!(
+            parse_table_row::<3>("  247     1   247").unwrap_err(),
+            "incomplete process-table row:   247     1   247"
+        );
+        assert_eq!(
+            parse_table_row::<3>("  abc     1   247 Sat Oct 4 06:14:00 2026").unwrap_err(),
+            "invalid process-table row:   abc     1   247 Sat Oct 4 06:14:00 2026"
+        );
     }
 
     /// The bounded-probe signal plan applies the recorded-group owner
