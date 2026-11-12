@@ -1404,8 +1404,11 @@ fn assert_clean_tracked_tree() {
 }
 
 /// The base fork point of a normal checkout: the first merge-base
-/// against a base branch this clone keeps. No base ref at all (a
-/// non-git source tree) fails the recorded run.
+/// against a base branch this clone keeps. A checkout that retains no
+/// base history at all — a depth-1 clone or a detached source tree —
+/// cites the deepest commit it does retain, the only fork point it
+/// can prove, rather than a placeholder. A non-git source tree fails
+/// the recorded run.
 fn base_revision() -> String {
     for revs in [
         ["merge-base", "HEAD", "origin/main"],
@@ -1416,41 +1419,54 @@ fn base_revision() -> String {
             return sha;
         }
     }
-    panic!(
-        "base_revision unavailable: this checkout has no merge-base \
-         against a base branch"
-    );
+    git_stdout(&["rev-list", "--max-parents=0", "HEAD"])
+        .and_then(|roots| roots.lines().next().map(str::to_string))
+        .expect("base_revision unavailable: this checkout retains no commit history")
+}
+
+/// The revision pair a CI run stamps, read from the workflow event
+/// payload: the Actions checkout is depth-1, so the clone keeps no
+/// reachable base history for a merge-base or a merge ref's parents
+/// to resolve, but the payload records the real commits — a
+/// pull_request run cites `head.sha` (the source-branch commit, not
+/// the synthetic merge ref) and `base.sha` (the base tip it merges
+/// onto); a push run cites `GITHUB_SHA` and `before`. `None` outside
+/// Actions or when the payload carries neither pair.
+fn ci_event_revisions() -> Option<(String, String)> {
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+        return None;
+    }
+    let event: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?,
+    )
+    .ok()?;
+    if let Some(pr) = event.get("pull_request") {
+        return Some((
+            pr.get("head")?.get("sha")?.as_str()?.to_string(),
+            pr.get("base")?.get("sha")?.as_str()?.to_string(),
+        ));
+    }
+    Some((
+        std::env::var("GITHUB_SHA").ok()?,
+        event.get("before")?.as_str()?.to_string(),
+    ))
 }
 
 /// The revision pair a recorded run stamps, validated fail-closed.
-/// CI pull-request checkouts are the synthetic merge ref, so the pair
-/// comes from its parents — GitHub merge commits record (base tip,
-/// source-branch head), the order its own merge-to-main history keeps
-/// (12cecb3, 18c1210) — and the record cites the PR-branch commit, not
-/// the merge commit. A normal checkout stamps `HEAD` and its merge-base.
+/// A CI run cites the workflow event's real head/base commits — the
+/// depth-1 checkout keeps no base history, but the payload does — a
+/// normal checkout stamps `HEAD` and its merge-base, and a checkout
+/// with no resolvable base ref cites the deepest commit it retains.
 /// Either way both values are full commit ids over a pristine tree.
 fn record_revisions() -> (String, String) {
     assert_clean_tracked_tree();
-    let merge_parents: Option<(String, String)> =
-        if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
-            git_stdout(&["rev-list", "--parents", "-n", "1", "HEAD"]).and_then(|line| {
-                let mut parts = line.split_whitespace();
-                let _merge = parts.next()?;
-                let base = parts.next()?.to_string();
-                let head = parts.next()?.to_string();
-                Some((base, head))
-            })
-        } else {
-            None
-        };
-    let (tested, base) = match merge_parents {
-        Some((base, head)) => (head, base),
-        None => (
+    let (tested, base) = ci_event_revisions().unwrap_or_else(|| {
+        (
             git_stdout(&["rev-parse", "HEAD"])
                 .expect("git rev-parse HEAD — a recorded run requires a git checkout"),
             base_revision(),
-        ),
-    };
+        )
+    });
     assert_commit_id(&tested, "tested_revision");
     assert_commit_id(&base, "base_revision");
     (tested, base)

@@ -38,10 +38,12 @@ The suite parameterizes over two axes:
   when the declared surface covers all of them, matching the rule that
   a required capability may be absent from a provider but, once
   declared, may not be weakened. `PosixProvider` does not declare
-  `spawn_unknown`, `liveness_unknown`, or `signal_audit` — a real
-  process cannot fake a lost identity capture or an uninspectable
-  liveness read, and the POSIX port keeps no signal log — so those
-  rows are reported skipped for it and covered by `ScriptedProvider`.
+  `spawn_unknown`, `liveness_unknown`, `signal_survived`, or
+  `signal_audit` — a real process cannot fake a lost identity
+  capture, an uninspectable liveness read, or a writer scripted to
+  survive its signal, and the POSIX port keeps no signal log — so
+  those rows are reported skipped for it and covered by
+  `ScriptedProvider`.
 
 ## Start semantics
 
@@ -128,9 +130,11 @@ the two runs, as are the paired records' `tested_revision`,
 once the bound-worker fields are projected out; the skip partition is
 identical (the POSIX model surface is binary-independent). Revision
 stamping is fail-closed: the run requires a pristine tracked tree and
-both revisions as full commit ids (a CI pull-request merge ref stamps
-its source-branch parent), so no record can carry a placeholder or
-describe an uncommitted worktree. `u46b_suite_source_has_no_adapter_name_branch`
+both revisions as full commit ids (a CI run stamps the workflow
+event's real head/base commits — the depth-1 checkout keeps no base
+history to resolve — and a checkout with no resolvable base ref cites
+the deepest commit it retains), so no record can carry a placeholder
+or describe an uncommitted worktree. `u46b_suite_source_has_no_adapter_name_branch`
 is the named static check: adapter-name literals may appear only
 inside the suite's marked identity boundary and never on a
 conditional, comparison, or assertion line, and the
