@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
 use workloop_core::observation::{
-    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    BranchState, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -183,6 +183,27 @@ impl SparseHost {
                 let key = (intent.repository.to_string(), branch.clone());
                 let actual = self.branches.get(&key).cloned();
                 if actual != expected_prior.as_ref().map(|p| p.object.clone()) {
+                    // The fresh position is recorded before the refusal
+                    // receipt — the same order `FixtureGithub` reports it,
+                    // so a receipt-driven re-issue derives its guard from
+                    // the observed remote, never the pre-read position.
+                    let state = match &actual {
+                        Some(head) => BranchState::At {
+                            revision: CommitRevision::new(intent.repository.clone(), head)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                        },
+                        None => BranchState::Absent,
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::BranchState {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            state,
+                        }),
+                        now,
+                    )?;
                     self.emit(
                         store,
                         config,

@@ -2456,3 +2456,81 @@ fn sparse_host_unsupported_operations_stay_explicit() {
     }
     assert!(fixture.applied().is_empty(), "no unsupported write landed");
 }
+
+/// A stale `push_ref` refusal surfaces the fresh remote position before
+/// the failed receipt on every fixture — `maybe_publish` derives the
+/// re-issue's `expected_prior` from `BranchState` observations, so the
+/// fresh position must precede the `stale_head` receipt in observation
+/// order.
+#[test]
+fn stale_push_refusal_surfaces_the_fresh_position_first() {
+    for mut fixture in [
+        Box::new(GitlabFixture::new()) as Box<dyn OutboxHost>,
+        Box::new(SparseHost::new()),
+    ] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let config = config_for(&*fixture);
+        let (work_id, _eid) = submit(&store, &config, "hc-stale-push");
+        // Seed the remote at head-other.
+        insert_intent(
+            &store,
+            &work_id,
+            &repo(),
+            HostAction::PushRef {
+                branch: "work/w".into(),
+                produced: rev("head-other"),
+                expected_prior: None,
+            },
+        );
+        fixture.apply(&store, &config);
+        // A second push recorded against head-old is now stale.
+        let stale_id = insert_intent(
+            &store,
+            &work_id,
+            &repo(),
+            HostAction::PushRef {
+                branch: "work/w".into(),
+                produced: rev("head-new"),
+                expected_prior: Some(rev("head-old")),
+            },
+        );
+        fixture.apply(&store, &config);
+
+        assert_eq!(
+            intent(&store, &stale_id).status,
+            HostActionStatus::Failed {
+                reason: "stale_head".into()
+            },
+            "the stale-head refusal is an explicit failed receipt"
+        );
+        assert_eq!(
+            fixture.remote_head(&repo(), "work/w"),
+            Some("head-other".to_string()),
+            "the refused write never moved the remote"
+        );
+        let observations = store
+            .transact(|tx| tx.observations_for_work(&work_id))
+            .unwrap();
+        let position_at = observations
+            .iter()
+            .rposition(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::BranchState {
+                        branch,
+                        state: BranchState::At { revision },
+                        ..
+                    } if branch == "work/w" && revision.object == "head-other"
+                )
+            })
+            .expect("the fresh position is recorded");
+        let receipt_at = observations
+            .iter()
+            .rposition(|o| matches!(o.fact, ObservationFact::HostActionResult { .. }))
+            .expect("the failed receipt is recorded");
+        assert!(
+            position_at < receipt_at,
+            "the fresh position is recorded before the stale_head receipt"
+        );
+    }
+}
