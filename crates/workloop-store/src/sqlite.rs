@@ -227,14 +227,13 @@ impl SqliteStore {
         } else if version < FORMAT_VERSION {
             // An upgrade is legitimate only for a file that holds the
             // complete schema of its own stamp. The exemptions shrink
-            // with the stamp: a v1 file may lack every later addition,
-            // a v2 file may lack only the v2 and v3 additions, a v3 file
-            // may lack only the v3 (reclaim-plan) additions — nothing
-            // else may be absent, so a truncated or foreign stamped
-            // file is refused instead of being silently re-created and
-            // re-stamped. A stamp-1 file holding every base table and
-            // none of the additions upgrades in place; a foreign stamped
-            // file fails untouched.
+            // with the stamp: a v1 file may lack every later addition
+            // (the previous release's stamp-1 store holds the base
+            // tables and none of the additions), a v2 file may lack
+            // only the v3 (reclaim-plan) additions, a v3 file may also
+            // lack only the v3 additions — nothing else may be absent,
+            // so a truncated or foreign stamped file is refused instead
+            // of being silently re-created and re-stamped.
             let present = table_set(&conn)?;
             let mut exempt: Vec<&str> = Vec::with_capacity(
                 ADDITIVE_TABLES.len() + V2_ADDED_TABLES.len() + V3_ADDED_TABLES.len(),

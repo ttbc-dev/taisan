@@ -577,13 +577,6 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Accounting fixture bodies whose path does not exist on disk must
-/// not be counted as present usage: the report lists them under
-/// `unknown` and excludes them from the pressure computation.
-/// Ghost bytes (a catalogue row whose file does not exist) must not
-/// authorize a size_pressure reclaim of a young unpinned body: the
-/// verified category total is under the cap, so no plan is written
-/// and the body stays `present`.
 /// An interrupted run resumes with its phase-1 operator context
 /// intact: the reopened plan carries the skipped and held lists it
 /// was created with, and the lists are dropped once the plan completes.
@@ -653,6 +646,10 @@ fn resumed_plan_keeps_the_phase_one_skipped_and_held_lists() {
     assert!(store.reclaim_plan_open().unwrap().is_none());
 }
 
+/// Ghost bytes (a catalogue row whose file does not exist) must not
+/// authorize a size_pressure reclaim of a young unpinned body: the
+/// verified category total is under the cap, so no plan is written
+/// and the body stays `present`.
 #[test]
 fn phantom_bytes_cannot_authorize_size_pressure() {
     let fixture = Fixture::new("phantom");
@@ -687,6 +684,9 @@ fn phantom_bytes_cannot_authorize_size_pressure() {
     assert_eq!(store.body_state("real").unwrap().unwrap().0, "present");
 }
 
+/// Accounting fixture bodies whose path does not exist on disk must
+/// not be counted as present usage: the report lists them under
+/// `unknown` and excludes them from the pressure computation.
 #[test]
 fn report_counts_unstatable_bodies_as_unknown_not_present() {
     let fixture = Fixture::new("unknown");

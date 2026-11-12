@@ -1093,6 +1093,19 @@ fn run(cli: Cli) -> i32 {
                     let _lease = match RunLeaseGuard::acquire(&store, now()) {
                         Ok(lease) => lease,
                         Err(e) => {
+                            // A live driver is `already_running`; a
+                            // lease whose owner cannot be inspected is
+                            // reported as the unknown lock state it is,
+                            // never as a concurrent run.
+                            let message = match &e {
+                                workloop_store::sqlite::RunLeaseError::Held { .. } => {
+                                    format!("already_running: {e}")
+                                }
+                                workloop_store::sqlite::RunLeaseError::Unavailable { .. } => {
+                                    format!("lock.unavailable: {e}")
+                                }
+                                workloop_store::sqlite::RunLeaseError::Store(_) => e.to_string(),
+                            };
                             return emit(envelope::error_envelope(
                                 Some(envelope::query_identity(
                                     "retention_cleanup",
@@ -1100,7 +1113,7 @@ fn run(cli: Cli) -> i32 {
                                     cli.idempotency_key.as_deref(),
                                 )),
                                 envelope::ErrorClass::Store,
-                                &format!("already_running: {e}"),
+                                &message,
                             ));
                         }
                     };
