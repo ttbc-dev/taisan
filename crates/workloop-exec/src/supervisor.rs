@@ -157,9 +157,11 @@ fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> 
 /// still this probe's to stop. `recorded_lstart` is the leader identity
 /// captured while the pid was provably ours. Shared by the timeout and
 /// the wait-error paths so a wedged probe cannot outlive its bound on
-/// either one.
-fn signal_probe_bound(pid: i32, recorded_lstart: &str) {
-    match probe_signal_plan(pid, recorded_lstart, &lstart_of(pid)) {
+/// either one. Returns the plan applied so the caller can report an
+/// unsignalled bound as unknown fate rather than claiming `Bounded`.
+fn signal_probe_bound(pid: i32, recorded_lstart: &str) -> ProbeSignalPlan {
+    let plan = probe_signal_plan(pid, recorded_lstart, &lstart_of(pid));
+    match plan {
         ProbeSignalPlan::LeaderAndGroup => unsafe {
             libc::kill(-pid, libc::SIGKILL);
             libc::kill(pid, libc::SIGKILL);
@@ -169,6 +171,7 @@ fn signal_probe_bound(pid: i32, recorded_lstart: &str) {
         },
         ProbeSignalPlan::Nothing => {}
     }
+    plan
 }
 
 impl PosixProcessControl {
@@ -477,10 +480,21 @@ impl ProcessControlPort for PosixProcessControl {
                 // plan decides exactly which of the leader and its
                 // group are still ours. A short drain then lets the
                 // waiter reap the direct child rather than leaving a
-                // zombie.
-                signal_probe_bound(pid, &started_at);
+                // zombie. When the plan signalled nothing the outcome
+                // is not `Bounded`: that variant promises the group and
+                // leader were stopped, so an unsignalled wedged probe
+                // reports unknown fate instead.
+                let plan = signal_probe_bound(pid, &started_at);
                 let _ = receiver.recv_timeout(Duration::from_secs(2));
-                Ok(ProbeOutcome::Bounded)
+                match plan {
+                    ProbeSignalPlan::Nothing => Err(SpawnError::Unknown {
+                        reason: format!(
+                            "probe bound elapsed and the leader identity could not \
+                             be re-verified at {pid}; nothing was signalled"
+                        ),
+                    }),
+                    _ => Ok(ProbeOutcome::Bounded),
+                }
             }
         }
     }
