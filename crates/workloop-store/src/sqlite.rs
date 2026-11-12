@@ -380,6 +380,29 @@ impl SqliteStore {
         inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
         now_unix_seconds: i64,
     ) -> Result<RunLeaseGrant, RunLeaseError> {
+        self.acquire_lease(owner, inspect, now_unix_seconds, "default")
+    }
+
+    /// The loop-independent installation maintenance lease for explicit
+    /// tooling (cleanup, sweep-style passes). A second maintenance
+    /// writer is refused with `lock.held`; the loop's driver lease is
+    /// unaffected and vice versa.
+    pub fn acquire_maintenance_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
+        self.acquire_lease(owner, inspect, now_unix_seconds, "maintenance")
+    }
+
+    fn acquire_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+        lease_key: &str,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
         let mut guard = self.conn.lock().map_err(|_| {
             RunLeaseError::Store(StoreError::Internal {
                 detail: "store lock poisoned".into(),
@@ -391,15 +414,16 @@ impl SqliteStore {
         let existing: Option<(i32, String, String)> = tx
             .query_row(
                 "SELECT owner_pid, owner_started_at, owner_nonce \
-                 FROM run_lease WHERE lease_key='default'",
-                [],
+                 FROM run_lease WHERE lease_key=?1",
+                params![lease_key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(|e| RunLeaseError::Store(map_err(e)))?;
         let grant = match existing {
             None => {
-                insert_lease(&tx, owner, now_unix_seconds).map_err(RunLeaseError::Store)?;
+                insert_lease(&tx, owner, now_unix_seconds, lease_key)
+                    .map_err(RunLeaseError::Store)?;
                 RunLeaseGrant::Acquired
             }
             Some((pid, _started_at, nonce)) if nonce == owner.nonce && pid == owner.pid => {
@@ -407,8 +431,8 @@ impl SqliteStore {
                 // driver): refresh the acquisition stamp, keep ownership.
                 tx.execute(
                     "UPDATE run_lease SET acquired_unix_seconds=?1 \
-                     WHERE lease_key='default'",
-                    params![now_unix_seconds],
+                     WHERE lease_key=?2",
+                    params![now_unix_seconds, lease_key],
                 )
                 .map_err(|e| RunLeaseError::Store(map_err(e)))?;
                 RunLeaseGrant::Acquired
@@ -431,8 +455,14 @@ impl SqliteStore {
                             "UPDATE run_lease SET owner_pid=?1, \
                              owner_started_at=?2, owner_nonce=?3, \
                              acquired_unix_seconds=?4 \
-                             WHERE lease_key='default'",
-                            params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+                             WHERE lease_key=?5",
+                            params![
+                                owner.pid,
+                                owner.started_at,
+                                owner.nonce,
+                                now_unix_seconds,
+                                lease_key
+                            ],
                         )
                         .map_err(|e| RunLeaseError::Store(map_err(e)))?;
                         RunLeaseGrant::Reclaimed { previous_pid: pid }
@@ -447,9 +477,18 @@ impl SqliteStore {
         Ok(grant)
     }
 
+    /// Release only this owner's maintenance lease.
+    pub fn release_maintenance_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        self.release_lease(owner, "maintenance")
+    }
+
     /// Release only this owner's lease. A stale holder's release can
     /// never clear a lease that was reclaimed by another driver.
     pub fn release_run_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        self.release_lease(owner, "default")
+    }
+
+    fn release_lease(&self, owner: &RunLeaseOwner, lease_key: &str) -> Result<(), StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
@@ -457,9 +496,9 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
         tx.execute(
-            "DELETE FROM run_lease WHERE lease_key='default' \
+            "DELETE FROM run_lease WHERE lease_key=?3 \
              AND owner_nonce=?1 AND owner_pid=?2",
-            params![owner.nonce, owner.pid],
+            params![owner.nonce, owner.pid, lease_key],
         )
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;
@@ -525,11 +564,18 @@ fn insert_lease(
     tx: &rusqlite::Transaction<'_>,
     owner: &RunLeaseOwner,
     now_unix_seconds: i64,
+    lease_key: &str,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO run_lease (lease_key, owner_pid, owner_started_at, \
-         owner_nonce, acquired_unix_seconds) VALUES ('default', ?1, ?2, ?3, ?4)",
-        params![owner.pid, owner.started_at, owner.nonce, now_unix_seconds],
+         owner_nonce, acquired_unix_seconds) VALUES (?5, ?1, ?2, ?3, ?4)",
+        params![
+            owner.pid,
+            owner.started_at,
+            owner.nonce,
+            now_unix_seconds,
+            lease_key
+        ],
     )
     .map_err(map_err)?;
     Ok(())

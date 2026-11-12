@@ -586,12 +586,52 @@ impl TickReport {
 pub struct RunLeaseGuard<'a> {
     store: &'a SqliteStore,
     owner: workloop_store::sqlite::RunLeaseOwner,
+    lease_key: &'static str,
 }
 
 impl<'a> RunLeaseGuard<'a> {
     pub fn acquire(
         store: &'a SqliteStore,
         now_unix_seconds: i64,
+    ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
+        Self::acquire_keyed(store, now_unix_seconds, "run", |store, owner, now| {
+            store.acquire_run_lease(owner, |recorded| PosixProcessControl.inspect(recorded), now)
+        })
+    }
+
+    /// The loop-independent maintenance lease for explicit tooling: a
+    /// second maintenance writer is refused, the loop driver's lease is
+    /// unaffected.
+    pub fn acquire_maintenance(
+        store: &'a SqliteStore,
+        now_unix_seconds: i64,
+    ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
+        Self::acquire_keyed(
+            store,
+            now_unix_seconds,
+            "maintenance",
+            |store, owner, now| {
+                store.acquire_maintenance_lease(
+                    owner,
+                    |recorded| PosixProcessControl.inspect(recorded),
+                    now,
+                )
+            },
+        )
+    }
+
+    fn acquire_keyed(
+        store: &'a SqliteStore,
+        now_unix_seconds: i64,
+        lease_key: &'static str,
+        acquire: impl FnOnce(
+            &SqliteStore,
+            &workloop_store::sqlite::RunLeaseOwner,
+            i64,
+        ) -> Result<
+            workloop_store::sqlite::RunLeaseGrant,
+            workloop_store::sqlite::RunLeaseError,
+        >,
     ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
         let identity =
             PosixProcessControl::identity_of(std::process::id() as i32).map_err(|reason| {
@@ -602,20 +642,23 @@ impl<'a> RunLeaseGuard<'a> {
         let owner = workloop_store::sqlite::RunLeaseOwner {
             pid: identity.pid,
             started_at: identity.started_at,
-            nonce: format!("run-{}", uuidish()),
+            nonce: format!("maintenance-{}", uuidish()),
         };
-        store.acquire_run_lease(
-            &owner,
-            |recorded| PosixProcessControl.inspect(recorded),
-            now_unix_seconds,
-        )?;
-        Ok(Self { store, owner })
+        acquire(store, &owner, now_unix_seconds)?;
+        Ok(Self {
+            store,
+            owner,
+            lease_key,
+        })
     }
 }
 
 impl Drop for RunLeaseGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.store.release_run_lease(&self.owner);
+        let _ = match self.lease_key {
+            "maintenance" => self.store.release_maintenance_lease(&self.owner),
+            _ => self.store.release_run_lease(&self.owner),
+        };
     }
 }
 

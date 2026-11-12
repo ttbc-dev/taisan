@@ -18,7 +18,7 @@ use workloop_core::identity::{
     CommitRevision, IssueId, IssueRef, RepositoryId, RepositoryRef, SourceSnapshot,
 };
 use workloop_core::projection::{self, Availability, CommandResultLookup, SourceStatus};
-use workloop_core::store::Store;
+use workloop_core::store::{ReadView, Store};
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
@@ -1012,31 +1012,32 @@ fn run(cli: Cli) -> i32 {
             // documented defaults apply (retention-policy.md). The
             // installation config owns the sweep bounds only.
             let category_settings = workloop_store::retention::CategorySettings::new();
-            let finish = |kind: &str, value: serde_json::Value| -> i32 {
-                emit((
-                    envelope::Envelope {
-                        schema_version: "1",
-                        status: "accepted",
-                        command: Some(envelope::query_identity(
-                            kind,
-                            &actor,
-                            cli.idempotency_key.as_deref(),
-                        )),
-                        work_id: None,
-                        execution_id: None,
-                        result: Some(value),
-                        reason: None,
-                        evidence_refs: vec![],
-                        sources: Some(vec![SourceStatus {
-                            source: "store".into(),
-                            availability: Availability::Known,
-                            observed_unix_seconds: None,
-                        }]),
-                        as_of: None,
-                    },
-                    envelope::EXIT_OK,
-                ))
-            };
+            let finish =
+                |kind: &str, value: serde_json::Value, as_of: Option<EventSequence>| -> i32 {
+                    emit((
+                        envelope::Envelope {
+                            schema_version: "1",
+                            status: "accepted",
+                            command: Some(envelope::query_identity(
+                                kind,
+                                &actor,
+                                cli.idempotency_key.as_deref(),
+                            )),
+                            work_id: None,
+                            execution_id: None,
+                            result: Some(value),
+                            reason: None,
+                            evidence_refs: vec![],
+                            sources: Some(vec![SourceStatus {
+                                source: "store".into(),
+                                availability: Availability::Known,
+                                observed_unix_seconds: None,
+                            }]),
+                            as_of,
+                        },
+                        envelope::EXIT_OK,
+                    ))
+                };
             let store_error = |kind: &str, e: workloop_core::store::StoreError| -> i32 {
                 emit(envelope::error_envelope(
                     Some(envelope::query_identity(
@@ -1050,10 +1051,21 @@ fn run(cli: Cli) -> i32 {
             };
             match command {
                 RetentionCommands::Report => {
-                    match store.retention_report(&category_settings, &state_root, now()) {
+                    let as_of = store
+                        .transact_deferred(|tx| {
+                            Ok::<_, workloop_core::store::StoreError>(tx.last_seq()?)
+                        })
+                        .ok();
+                    match store.retention_report(
+                        &category_settings,
+                        &state_root,
+                        &installation_files(&db_abs, &config_path),
+                        now(),
+                    ) {
                         Ok(report) => finish(
                             "retention_report",
                             serde_json::to_value(report).unwrap_or(serde_json::json!({})),
+                            as_of,
                         ),
                         Err(e) => store_error("retention_report", e),
                     }
@@ -1082,15 +1094,17 @@ fn run(cli: Cli) -> i32 {
                             Ok(plan) => finish(
                                 "retention_cleanup",
                                 serde_json::to_value(plan).unwrap_or(serde_json::json!({})),
+                                None,
                             ),
                             Err(e) => store_error("retention_cleanup", e),
                         };
                     }
-                    // Single-owner maintenance: while the installation
-                    // run lease is held, explicit cleanup refuses
-                    // instead of racing the loop's sweep — the loser
-                    // reports already_running.
-                    let _lease = match RunLeaseGuard::acquire(&store, now()) {
+                    // Single-owner maintenance: the installation
+                    // maintenance lease (loop-independent) serializes
+                    // explicit cleanup and any other maintenance pass;
+                    // the loser reports already_running. The loop's
+                    // driver lease is unaffected.
+                    let _lease = match RunLeaseGuard::acquire_maintenance(&store, now()) {
                         Ok(lease) => lease,
                         Err(e) => {
                             // A live driver is `already_running`; a
@@ -1152,12 +1166,13 @@ fn run(cli: Cli) -> i32 {
                                 .unwrap_or(serde_json::json!([]));
                             value["planned_held"] =
                                 serde_json::to_value(&plan.held).unwrap_or(serde_json::json!([]));
-                            finish("retention_cleanup", value)
+                            finish("retention_cleanup", value, None)
                         }
                         // Phase 1 just ensured an open plan exists.
                         Ok(None) => finish(
                             "retention_cleanup",
                             serde_json::json!({ "completed": true, "no_open_plan": true }),
+                            None,
                         ),
                         Err(e) => store_error("retention_cleanup", e),
                     }

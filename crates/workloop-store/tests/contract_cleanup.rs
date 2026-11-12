@@ -420,7 +420,7 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
     register(&store, "pinned", NOW - 10_000, 20, PinState::Active, &rel);
 
     let report = store
-        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, &[], NOW)
         .unwrap();
     let cas = report
         .categories
@@ -703,7 +703,7 @@ fn report_counts_unstatable_bodies_as_unknown_not_present() {
     );
 
     let report = store
-        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, &[], NOW)
         .unwrap();
     let cas = report
         .categories
@@ -742,7 +742,7 @@ fn report_exposes_pressure_metrics_and_unavailable_list() {
         .unwrap();
 
     let report = store
-        .retention_report(&settings(Some(100), Some(15)), &fixture.root, NOW)
+        .retention_report(&settings(Some(100), Some(15)), &fixture.root, &[], NOW)
         .unwrap();
     let cas = report
         .categories

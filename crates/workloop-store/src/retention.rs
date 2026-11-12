@@ -1588,14 +1588,18 @@ pub struct CategoryReport {
     pub reclaimed_count: u64,
     pub reclaimed_bytes: u64,
     pub reclaimed_by_reason: BTreeMap<String, u64>,
+    /// Cumulative bytes reclaimed, by reason.
+    pub reclaimed_bytes_by_reason: BTreeMap<String, u64>,
     /// Age of the oldest `present` body in the category, against
     /// `max_age_seconds`. `None` when the category holds nothing.
     pub oldest_present_age_seconds: Option<i64>,
     /// Bodies whose backing path could not be `stat`ed (missing,
     /// permission denied, unreadable). Reported as `unknown`, never
     /// counted as present usage or fed into the pressure computation.
+    /// The failed regions are named (bounded).
     pub unknown_count: u64,
     pub unknown_bytes: u64,
+    pub unknown_bodies: Vec<String>,
     pub over_max_bytes: bool,
     pub protected_over_limit: bool,
     /// `none`, `over_limit` (reclaimable excess exists) or
@@ -1626,6 +1630,10 @@ pub struct RetentionReport {
     /// The filesystem scan underpinning `unknown_*` is bounded; this
     /// flags that not every present body was stat'ed.
     pub unknown_scan_truncated: bool,
+    /// Managed rows pointing at the installation's protected files
+    /// (the store, its sidecars, the config). Never reclaimable; held
+    /// and named here — bounded.
+    pub held: Vec<HeldBody>,
 }
 
 /// The selected, bounded set both phase-1 entry points compute.
@@ -2568,6 +2576,7 @@ impl SqliteStore {
         &self,
         settings: &CategorySettings,
         root: &Path,
+        protected: &[PathBuf],
         now_unix_seconds: i64,
     ) -> Result<RetentionReport, StoreError> {
         let eligibility = self.catalogue_eligibility(settings, now_unix_seconds)?;
@@ -2594,13 +2603,14 @@ impl SqliteStore {
             .collect::<Result<BTreeMap<_, _>, _>>()
             .map_err(map_err)?
         };
-        let reasons: BTreeMap<String, BTreeMap<String, u64>> = {
+        let reasons: BTreeMap<String, Vec<(String, u64, u64)>> = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
             })?;
             let mut stmt = guard
                 .prepare(
-                    "SELECT category, COALESCE(reclaim_reason, 'unrecorded'), COUNT(*) \
+                    "SELECT category, COALESCE(reclaim_reason, 'unrecorded'), COUNT(*), \
+                     COALESCE(SUM(bytes), 0) \
                      FROM body_catalog WHERE state='reclaimed' \
                      GROUP BY category, COALESCE(reclaim_reason, 'unrecorded')",
                 )
@@ -2610,16 +2620,22 @@ impl SqliteStore {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)?.max(0) as u64,
                 ))
             })
             .map_err(map_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_err)?
             .into_iter()
-            .fold(BTreeMap::new(), |mut acc, (category, reason, count)| {
-                acc.entry(category).or_default().insert(reason, count);
-                acc
-            })
+            .fold(
+                BTreeMap::new(),
+                |mut acc, (category, reason, count, bytes)| {
+                    acc.entry(category)
+                        .or_default()
+                        .push((reason, count, bytes));
+                    acc
+                },
+            )
         };
         // Filesystem scan behind the `unknown` accounting: at most
         // UNKNOWN_SCAN_BOUND present bodies are stat'ed; a row whose
@@ -2631,7 +2647,12 @@ impl SqliteStore {
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
-        let (unknown, unknown_scan_truncated): (UnknownTotals, bool) = {
+        let (unknown, unknown_scan_truncated, held_protected, protected_excluded): (
+            UnknownTotals,
+            bool,
+            Vec<HeldBody>,
+            Vec<String>,
+        ) = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
             })?;
@@ -2660,9 +2681,25 @@ impl SqliteStore {
             let truncated = rows.len() > UNKNOWN_SCAN_BOUND;
             let mut acc: UnknownTotals = BTreeMap::new();
             let mut verified: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+            let mut held_protected: Vec<HeldBody> = Vec::new();
+            let mut protected_excluded: Vec<String> = Vec::new();
             for (entry_body_id, category, path, bytes, pin_state, pinned, created_at) in
                 rows.into_iter().take(UNKNOWN_SCAN_BOUND)
             {
+                // Protected installation files: never counted, never
+                // deleted — held and named.
+                if let Ok(managed) = managed_path(&root_abs, &path) {
+                    if is_protected(&managed, protected) {
+                        if held_protected.len() < UNKNOWN_SCAN_BOUND {
+                            held_protected.push(HeldBody {
+                                body_id: entry_body_id.clone(),
+                                reason: "protected_path".into(),
+                            });
+                        }
+                        protected_excluded.push(entry_body_id.clone());
+                        continue;
+                    }
+                }
                 let stat_ok = match managed_path(&root_abs, &path) {
                     Ok(managed) => std::fs::symlink_metadata(&managed).is_ok(),
                     Err(_) => false,
@@ -2698,7 +2735,7 @@ impl SqliteStore {
                 entry.4 = pinned_count;
                 entry.5 = created;
             }
-            (acc, truncated)
+            (acc, truncated, held_protected, protected_excluded)
         };
         let mut names: Vec<String> = eligibility
             .categories
@@ -2760,6 +2797,7 @@ impl SqliteStore {
                     e.category == category
                         && e.eligible
                         && !unknown_ids.iter().any(|id| id == &e.body_id)
+                        && !protected_excluded.iter().any(|id| id == &e.body_id)
                         && (e.age_expired || (e.category_over_max_bytes && over_max_bytes))
                 })
                 .collect();
@@ -2787,7 +2825,15 @@ impl SqliteStore {
                 reclaiming_bytes,
                 reclaimed_count,
                 reclaimed_bytes,
-                reclaimed_by_reason: reasons.get(&category).cloned().unwrap_or_default(),
+                reclaimed_by_reason: reasons
+                    .get(&category)
+                    .map(|v| v.iter().map(|(r, c, _)| (r.clone(), *c)).collect())
+                    .unwrap_or_default(),
+                reclaimed_bytes_by_reason: reasons
+                    .get(&category)
+                    .map(|v| v.iter().map(|(r, _, b)| (r.clone(), *b)).collect())
+                    .unwrap_or_default(),
+                unknown_bodies: unknown_ids.iter().take(16).cloned().collect(),
                 oldest_present_age_seconds: if oldest_measured == i64::MAX {
                     None
                 } else {
@@ -2841,6 +2887,7 @@ impl SqliteStore {
             unavailable,
             unavailable_truncated,
             unknown_scan_truncated,
+            held: held_protected,
         })
     }
 }
