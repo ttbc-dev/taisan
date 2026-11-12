@@ -5,13 +5,18 @@ the host-neutral required semantics from `docs/repository-host-contract.md`
 and names the scenario or test that proves it. The shared suite
 (`crates/workloop-github/tests/host_conformance.rs`,
 `conformance_matrix_runs_every_row_against_every_registered_fixture`)
-executes every row against every registered fixture: a fixture whose
-declared capability set covers the row runs the unchanged scenario, and
-a fixture that does not declare a required capability asserts an
-explicit `unsupported` outcome. No row is silently skipped and no
-fixture is substituted. Coverage claims are fixture-level modeled
-behavior — they do not claim production-host support (see the
-contract's release scope).
+parameterizes over the fixture implementations and executes its
+scenario set against every registered fixture: a fixture whose
+declared capability set covers a scenario runs the unchanged scenario,
+and a fixture that does not declare a required capability asserts an
+explicit `unsupported` outcome. No shared-suite row is silently skipped
+and no fixture is substituted. Rows outside the shared scenario table
+(HC-CAP-02, HC-DELIV-01, HC-LIFE-01/02 and HC-LIFE-03) are exercised by
+the named fixture-adapter or durable-store tests in their cells and are
+marked `not exercised` or `partial` where no shared-suite evidence
+exists; they are deliberate documented gaps, not silent skips. Coverage
+claims are fixture-level modeled behavior — they do not claim
+production-host support (see the contract's release scope).
 
 ## Parameterization
 
@@ -107,4 +112,6 @@ success.
   deferred to #114.
 - Rows marked uncovered are deliberate gaps recorded here, not silent
   skips inside the suite: the runner reports a covered or explicit
-  unsupported outcome for every row on every fixture.
+  unsupported outcome for every shared-suite row on every fixture, and
+  rows outside that set carry their named fixture-adapter or
+  durable-store evidence or an explicit `not exercised`/`partial` entry.

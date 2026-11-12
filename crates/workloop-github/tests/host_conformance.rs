@@ -296,8 +296,43 @@ struct MatrixResult {
     outcome: MatrixOutcome,
 }
 
-fn covered(requires: &[&'static str], declared: &BTreeSet<&'static str>) -> bool {
-    requires.iter().all(|r| declared.contains(r))
+/// Normalize a documented capability spelling through the contract set,
+/// so aliases such as `comment_create`/`comment_write` and
+/// `ready`/`mark_ready` name the same requirement.
+fn matrix_capability(name: &str) -> HostCapability {
+    HostCapability::from_name(name)
+        .unwrap_or_else(|| panic!("matrix capability {name:?} is not in the contract set"))
+}
+
+/// The requirements a declared set does not cover, compared by contract
+/// capability rather than by raw spelling.
+fn missing_capabilities(
+    requires: &[&'static str],
+    declared: &BTreeSet<HostCapability>,
+) -> Vec<&'static str> {
+    requires
+        .iter()
+        .copied()
+        .filter(|required| !declared.contains(&matrix_capability(required)))
+        .collect()
+}
+
+fn covered(requires: &[&'static str], declared: &BTreeSet<HostCapability>) -> bool {
+    missing_capabilities(requires, declared).is_empty()
+}
+
+/// Read capabilities the submit gate checks before any write. A
+/// source-bound submission also requires `issue_read`; the others are
+/// required for every Work.
+fn admission_gated_read(capability: &str) -> bool {
+    matches!(
+        capability,
+        "repository_read"
+            | "change_request_read"
+            | "checks_read"
+            | "review_findings_read"
+            | "issue_read"
+    )
 }
 
 /// A concrete action for a capability whose operation is in the
@@ -379,8 +414,21 @@ fn assert_unsupported_capability(
         "fixture declared {capability:?}: the covered scenario must run, not be reported unsupported"
     );
 
-    if capability == "issue_read" {
+    if admission_gated_read(capability) {
         let writes_before = fixture.applied().len();
+        let sources = if capability == "issue_read" {
+            vec![SourceSnapshot {
+                issue: IssueRef {
+                    repository: repo(),
+                    issue: IssueId::trusted("1"),
+                    display_number: Some(1),
+                },
+                source_revision: "r1".into(),
+                content_digest: "d1".into(),
+            }]
+        } else {
+            vec![]
+        };
         let decision = handle_command(
             store,
             config,
@@ -393,15 +441,7 @@ fn assert_unsupported_capability(
                 idempotency_key: format!("unsupported-{capability}"),
                 body: CommandBody::Submit {
                     intent: "requires an undeclared capability".into(),
-                    sources: vec![SourceSnapshot {
-                        issue: IssueRef {
-                            repository: repo(),
-                            issue: IssueId::trusted("1"),
-                            display_number: Some(1),
-                        },
-                        source_revision: "r1".into(),
-                        content_digest: "d1".into(),
-                    }],
+                    sources,
                     constraints: vec![],
                     verification_argv: vec![],
                 },
@@ -410,8 +450,14 @@ fn assert_unsupported_capability(
         )
         .unwrap();
         match decision {
-            CommandDecision::Rejected { reason, .. } => {
+            CommandDecision::Rejected {
+                reason, evidence, ..
+            } => {
                 assert_eq!(reason, RejectionCode::UnsupportedCapability);
+                assert!(
+                    evidence.iter().any(|missing| missing == cap.name()),
+                    "undeclared {capability} must be named in the rejection evidence: {evidence:?}"
+                );
             }
             other => panic!("undeclared {capability} must reject admission: {other:?}"),
         }
@@ -1294,17 +1340,17 @@ fn scenarios() -> Vec<Scenario> {
 /// unsupported result. The returned list has exactly one outcome per
 /// row, so no row can be silently skipped.
 fn run_suite(fixture: &mut dyn OutboxHost) -> Vec<MatrixResult> {
-    let declared = fixture.declared_names();
+    let declared: BTreeSet<HostCapability> = fixture
+        .declared_names()
+        .iter()
+        .copied()
+        .map(matrix_capability)
+        .collect();
     let mut results = Vec::new();
     for scenario in scenarios() {
         let store = SqliteStore::in_memory(2).unwrap();
         let config = config_for(fixture);
-        let missing: Vec<&'static str> = scenario
-            .requires
-            .iter()
-            .copied()
-            .filter(|required| !declared.contains(required))
-            .collect();
+        let missing = missing_capabilities(scenario.requires, &declared);
         if covered(scenario.requires, &declared) {
             (scenario.run)(fixture, &store, &config);
             results.push(MatrixResult {
@@ -1395,6 +1441,38 @@ fn conformance_matrix_runs_every_row_against_every_registered_fixture() {
         unsupported > 0,
         "undeclared optional capabilities produce explicit unsupported rows"
     );
+}
+
+#[test]
+fn documented_capability_aliases_normalize_for_matrix_coverage() {
+    let canonical = BTreeSet::from([HostCapability::CommentWrite, HostCapability::MarkReady]);
+    assert!(covered(&["comment_create", "mark_ready"], &canonical));
+    assert!(covered(&["comment_write", "ready"], &canonical));
+    assert!(missing_capabilities(&["comment_create"], &canonical).is_empty());
+    let aliases = BTreeSet::from([
+        matrix_capability("comment_write"),
+        matrix_capability("ready"),
+    ]);
+    assert!(covered(&["comment_create", "mark_ready"], &aliases));
+    assert!(!covered(&["comment_create", "approve"], &aliases));
+    assert_eq!(
+        missing_capabilities(&["comment_create", "approve"], &aliases),
+        vec!["approve"]
+    );
+}
+
+#[test]
+fn undeclared_read_capabilities_produce_explicit_unsupported_outcomes() {
+    let mut fixture = FixtureGithub::new();
+    let store = SqliteStore::in_memory(2).unwrap();
+    for capability in ["checks_read", "review_findings_read"] {
+        let mut declared = capabilities(&fixture.declared_names());
+        declared.remove(
+            &HostCapability::from_name(capability).expect("read capability is in the contract set"),
+        );
+        let config = config_with(declared, true);
+        assert_unsupported_capability(&mut fixture, &store, &config, capability);
+    }
 }
 
 #[test]

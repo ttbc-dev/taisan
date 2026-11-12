@@ -26,14 +26,17 @@ against the real GitHub adapter, not these fixtures.
 
 ## Coverage matrix
 
-Every row yields exactly one outcome per fixture. A fixture whose
-declared capability set covers the scenario's requirement list runs the
-unchanged scenario; a fixture that does not declare one or more required
-capabilities is recorded as a single explicit `unsupported` outcome
-naming the first missing capability, while every missing capability is
-asserted to be explicitly unsupported. There is no per-row skip path,
-and no fixture is substituted. Suite runner: `run_suite` in
-`host_conformance.rs`.
+Every shared-suite row yields exactly one outcome per fixture. A
+fixture whose declared capability set covers the scenario's requirement
+list runs the unchanged scenario; a fixture that does not declare one or
+more required capabilities is recorded as a single explicit
+`unsupported` outcome naming the first missing capability, while every
+missing capability is asserted to be explicitly unsupported. There is no
+per-row skip path, and no fixture is substituted. Rows outside the
+shared-suite scenario set are recorded with their own fixture-adapter or
+durable-store evidence, or as `not exercised`/`partial`; `run_suite`
+never executes them and they are not counted as shared-suite coverage.
+Suite runner: `run_suite` in `host_conformance.rs`.
 
 | Matrix row | FixtureGithub | GitlabFixture | SparseHost | Live GitLab spike |
 | --- | --- | --- | --- | --- |
