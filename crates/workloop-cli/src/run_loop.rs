@@ -347,6 +347,7 @@ pub fn run_pass(
             Ok((scan, unbound))
         });
         let result = result.and_then(|(scan, unbound)| {
+            let mut binding_cut = false;
             if let Some(supervisor) = pass.supervisor
                 && !unbound.is_empty()
             {
@@ -359,6 +360,15 @@ pub fn run_pass(
                         .push(request.request_id.clone());
                 }
                 for (workspace, request_ids) in by_workspace {
+                    // Each probe spawns a bounded `describe`, so like
+                    // every other item loop the tick deadline is
+                    // checked before starting new work — a cut leaves
+                    // the remaining requests unbound and durable; the
+                    // consume path's fail-closed selection binds them.
+                    if clock() >= deadline {
+                        binding_cut = true;
+                        break;
+                    }
                     // The probe spawns inside the workspace the consume
                     // path would create before launch; a fresh Work's
                     // `ws-<work>` does not exist yet, so it is created
@@ -386,10 +396,10 @@ pub fn run_pass(
                     })?;
                 }
             }
-            Ok(scan)
+            Ok((scan, binding_cut))
         });
         push!(match result {
-            Ok(scan) => {
+            Ok((scan, binding_cut)) => {
                 let mut p = PhaseReport::completed(PHASES[1]);
                 p.processed = scan.admitted.len();
                 p.deferred = scan
@@ -397,6 +407,9 @@ pub fn run_pass(
                     .into_iter()
                     .map(|e| e.0)
                     .collect::<Vec<_>>();
+                if binding_cut {
+                    p.reason = Some("tick.deadline".into());
+                }
                 p
             }
             Err(e) => PhaseReport::failed(PHASES[1], e),
