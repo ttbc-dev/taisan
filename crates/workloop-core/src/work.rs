@@ -2536,28 +2536,48 @@ fn assess(
             if matches!(status, HostActionStatus::Failed { .. })
                 && execution.state == ExecutionState::Waiting
             {
-                // A definite no-effect failure is safe to retry, bounded
-                // by the Work's transport account.
-                let work = tx
-                    .work(&execution.work_id)?
-                    .ok_or_else(|| StoreError::Internal {
-                        detail: "execution without work".into(),
-                    })?;
-                let mut usage = tx
-                    .work_usage(&execution.work_id)?
-                    .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
-                usage.transport_retries_used += 1;
-                let over = usage.transport_retries_used > work.policy.transport_max_retries;
-                tx.apply(&Effect::UpdateWorkUsage { usage })?;
-                if over {
+                if let HostActionStatus::Failed { reason } = status
+                    && is_authorization_verdict(reason)
+                {
+                    // An authorization/eligibility verdict is terminal
+                    // for the intent: retrying cannot change the
+                    // outcome, so it never consumes the transport
+                    // account or re-issues. The verdict itself pauses
+                    // for an operator decision instead of degrading to
+                    // a generic transport exhaustion.
                     pause_for_repair(
                         tx,
                         &execution,
-                        "transport_exhausted",
-                        "transport retry bound reached; human action required",
+                        "effect_authorization_denied",
+                        "the stage effect was denied or the actor was ineligible; \
+                         human action required",
                         vec![RepairPrerequisite::OperatorDecision],
                         now_unix_seconds,
                     )?;
+                } else {
+                    // A definite no-effect failure is safe to retry,
+                    // bounded by the Work's transport account.
+                    let work =
+                        tx.work(&execution.work_id)?
+                            .ok_or_else(|| StoreError::Internal {
+                                detail: "execution without work".into(),
+                            })?;
+                    let mut usage = tx
+                        .work_usage(&execution.work_id)?
+                        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+                    usage.transport_retries_used += 1;
+                    let over = usage.transport_retries_used > work.policy.transport_max_retries;
+                    tx.apply(&Effect::UpdateWorkUsage { usage })?;
+                    if over {
+                        pause_for_repair(
+                            tx,
+                            &execution,
+                            "transport_exhausted",
+                            "transport retry bound reached; human action required",
+                            vec![RepairPrerequisite::OperatorDecision],
+                            now_unix_seconds,
+                        )?;
+                    }
                 }
             }
             if matches!(status, HostActionStatus::Unsupported { .. })
@@ -2839,6 +2859,16 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
         }
         _ => false,
     })
+}
+
+/// Whether a failed host-action receipt reports an authorization or
+/// eligibility verdict — `denied` when the actor lacks the grant,
+/// `ineligible` when the actor's class cannot perform the operation.
+/// These are terminal for the intent and never transport failures:
+/// a retry cannot change the verdict, so it must not consume the
+/// transport retry account or re-issue the intent.
+fn is_authorization_verdict(reason: &str) -> bool {
+    reason == "denied" || reason == "ineligible"
 }
 
 /// Whether the fact marks material progress (a valid artifact, a
@@ -3463,8 +3493,15 @@ fn maybe_publish(
             .iter()
             .rfind(|i| matches!(i.action, HostAction::PushRef { .. }))
         {
-            match latest_push.status {
-                HostActionStatus::Failed { .. } => {
+            match &latest_push.status {
+                HostActionStatus::Failed { reason } => {
+                    // An authorization/eligibility verdict is terminal:
+                    // its receipt already paused for an operator
+                    // decision, and a re-issued push would be refused
+                    // the same way.
+                    if is_authorization_verdict(reason) {
+                        return Ok(());
+                    }
                     let usage = tx
                         .work_usage(&work.id)?
                         .unwrap_or_else(|| WorkUsage::new(&work.id));
@@ -3480,13 +3517,12 @@ fn maybe_publish(
             CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
         // The guard's expected prior is the freshest remote position
-        // this installation observed for the branch, in observation
-        // order: a branch-state read — including an explicit absent,
-        // which re-arms create — wins over the last applied push's
-        // read-back only when it is the newer record, and a first
-        // publish expects an absent ref. A pre-push prior read recorded
-        // before the push's applied receipt never outranks the head
-        // that receipt observed.
+        // this installation observed for the branch, ordered by
+        // (observed_unix_seconds, index) — the same ordering
+        // `current_target` applies to the same facts. A delayed older
+        // `BranchState` delivered after a newer applied read-back never
+        // moves the position backward; an explicit absent re-arms
+        // create, and a first publish expects an absent ref.
         enum BranchPosition {
             Unknown,
             Absent,
@@ -3497,42 +3533,50 @@ fn maybe_publish(
             .filter(|i| i.status == HostActionStatus::Applied)
             .map(|i| i.action_id.as_str())
             .collect();
-        let mut position = BranchPosition::Unknown;
-        for o in tx.observations_for_work(&work.id)? {
-            match &o.fact {
+        let mut latest: Option<(i64, usize, BranchPosition)> = None;
+        for (index, o) in tx.observations_for_work(&work.id)?.iter().enumerate() {
+            let candidate = match &o.fact {
                 ObservationFact::BranchState {
                     repository,
                     branch: state_branch,
                     state,
                 } if state_branch == &branch && repository == &work.binding.repository => {
-                    position = match state {
+                    Some(match state {
                         BranchState::At { revision } => BranchPosition::At(revision.clone()),
                         BranchState::Absent => BranchPosition::Absent,
-                    };
+                    })
                 }
                 ObservationFact::HostActionResult {
                     action_id,
                     status: HostActionStatus::Applied,
                     effects,
                     ..
-                } if applied_pushes.contains(action_id.as_str()) => {
-                    for e in effects {
-                        if let NormalizedEffectFact::RefPublished {
-                            repository,
-                            branch: ref_branch,
-                            observed,
-                            ..
-                        } = e
-                            && ref_branch == &branch
-                            && repository == &work.binding.repository
-                        {
-                            position = BranchPosition::At(observed.clone());
-                        }
+                } if applied_pushes.contains(action_id.as_str()) => effects.iter().find_map(|e| {
+                    if let NormalizedEffectFact::RefPublished {
+                        repository,
+                        branch: ref_branch,
+                        observed,
+                        ..
+                    } = e
+                        && ref_branch == &branch
+                        && repository == &work.binding.repository
+                    {
+                        Some(BranchPosition::At(observed.clone()))
+                    } else {
+                        None
                     }
-                }
-                _ => {}
+                }),
+                _ => None,
+            };
+            if let Some(candidate) = candidate
+                && latest
+                    .as_ref()
+                    .is_none_or(|(t, i, _)| (*t, *i) < (o.observed_unix_seconds, index))
+            {
+                latest = Some((o.observed_unix_seconds, index, candidate));
             }
         }
+        let position = latest.map(|(_, _, p)| p).unwrap_or(BranchPosition::Unknown);
         let expected_prior = match position {
             BranchPosition::At(revision) => Some(revision),
             BranchPosition::Absent | BranchPosition::Unknown => None,
