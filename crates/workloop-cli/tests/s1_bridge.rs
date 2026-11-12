@@ -601,8 +601,11 @@ fn applied_push_rearms_again_on_repeat_drift_to_the_same_head() {
     );
 }
 
-/// One intent's reconcile failure is logged, not propagated: sibling
-/// intents still reconcile and the pass still finishes.
+/// One intent's reconcile failure is contained: sibling intents still
+/// reconcile and the pass still finishes. The failing intent itself
+/// still records its reconcile receipt — an erroring read is unverified
+/// evidence, not a reason to retry the same pass forever (the bound
+/// must advance past it).
 #[test]
 fn reconcile_continues_past_one_intents_failure() {
     let fx = Fixture::new("isolation");
@@ -656,6 +659,11 @@ fn reconcile_continues_past_one_intents_failure() {
         fx.intent_status(&failing),
         HostActionStatus::Unknown { .. }
     ));
+    assert_eq!(
+        fx.result_receipts(&failing),
+        1,
+        "the unparseable read-back still records the reconcile receipt — the bound advances"
+    );
 }
 
 /// The U8.2 gap end to end: an applied push drifts, the bridge's
@@ -789,11 +797,13 @@ fn verify_receipt_dedupes_an_unchanged_applied_push() {
 }
 
 /// A pre-existing open change from the same source branch to a
-/// different base is not this intent's effect: the reconcile
-/// re-attempts the create instead of settling `applied` on a target
-/// the remote never showed.
+/// different base is not this intent's effect: the reconcile holds the
+/// intent `unknown` instead of settling `applied` on a target the
+/// remote never showed — and never re-issues `gh pr create` either,
+/// since a list that is merely stale would make the re-issued create
+/// the duplicate R-4 forbids.
 #[test]
-fn reconcile_open_reattempts_when_the_open_change_targets_another_base() {
+fn reconcile_open_holds_unknown_when_the_change_targets_another_base() {
     let fx = Fixture::new("open-base");
     let (work_id, _) = submit(&fx.store(), &fx.config(), "k-open-base");
     let action_id = insert_intent(
@@ -820,6 +830,10 @@ fn reconcile_open_reattempts_when_the_open_change_targets_another_base() {
         fx.intent_status(&action_id),
         HostActionStatus::Applied,
         "a different-base change never settles the intent applied"
+    );
+    assert!(
+        fx.pr_creates().is_empty(),
+        "reconcile settles by read only — never a second create"
     );
     // Once the remote answers an open change on the intent's own base,
     // the next pass settles it.
@@ -968,4 +982,85 @@ fn a_lost_create_response_never_creates_twice() {
         "the unverified create stays outstanding: {:?}",
         fx.intent_status(&action_id)
     );
+}
+
+/// `pending` does not prove the intent was never attempted: a crash
+/// after the push landed but before the receipt wrote leaves the
+/// intent `pending` with a landed-but-unrecorded effect. So a
+/// first-visible drain failure — no workspace clone, local head
+/// unreadable, prior-ref read failed — records `unknown`, never
+/// `failed` (a `failed` receipt would tell Core the effect provably
+/// did not happen and let it charge the transport account and
+/// blind-retry — R42).
+#[test]
+fn a_pending_push_with_no_workspace_stays_unknown() {
+    let fx = Fixture::new("pending-no-clone");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-pending-no-clone");
+    // No `seed_workspace` — the clone the push would run from is
+    // missing, exactly the post-push-crash recovery shape.
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Pending,
+        vec![],
+    );
+    // The remote shows the branch absent: if the push truly never ran,
+    // the reconcile re-attempt hits the same missing clone.
+    fx.write_fake("prior_ref", "");
+    for _ in 0..2 {
+        fx.tick(&[]);
+    }
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "a missing clone never proves the unrecorded push did not land: {:?}",
+        fx.intent_status(&action_id)
+    );
+    assert!(fx.pushes().is_empty());
+}
+
+/// A reconcile read that resolves but cannot be validated — the remote
+/// head read-back cannot construct a `CommitRevision` — still records
+/// the pass's `unknown` receipt, so the bound advances past the
+/// erroring read instead of retrying it every tick forever.
+#[test]
+fn reconcile_bound_advances_past_unparseable_remote_reads() {
+    let fx = Fixture::new("bound-errors");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-bound-errors");
+    fx.seed_workspace(&work_id);
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    // An oversized remote head: `ls-remote` resolves, `compare`
+    // answers, and the observed sha fails `CommitRevision::new`.
+    fx.write_fake(
+        "prior_ref",
+        &format!("{}\trefs/heads/{BRANCH}\n", "a".repeat(600)),
+    );
+    fx.write_fake("compare_status", "ahead\n");
+    for _ in 0..3 {
+        fx.tick(&["--reconcile-bound", "2"]);
+    }
+    let HostActionStatus::Unknown { reason } = fx.intent_status(&action_id) else {
+        panic!("expected unknown, got {:?}", fx.intent_status(&action_id));
+    };
+    assert_eq!(
+        reason,
+        "reconcile bound 2 reached; remote effect still unverified — held for operator action"
+    );
+    assert_eq!(
+        fx.result_receipts(&action_id),
+        3,
+        "one receipt per reconcile pass plus the bound-exhaustion receipt"
+    );
+    assert!(fx.pushes().is_empty());
 }

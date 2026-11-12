@@ -795,7 +795,25 @@ fn reconcile_push(
             }
         };
         if let Some(relation) = relation {
-            let observed = CommitRevision::new(intent.repository.clone(), remote_sha)?;
+            // An unparseable remote read-back leaves the effect
+            // unverified — recorded, so the bound still advances
+            // instead of letting the intent retry the same erroring
+            // read every pass.
+            let observed = match CommitRevision::new(intent.repository.clone(), remote_sha) {
+                Ok(observed) => observed,
+                Err(e) => {
+                    emit_result_keyed(
+                        ctx,
+                        intent,
+                        key,
+                        HostActionStatus::Unknown {
+                            reason: format!("remote head read-back was unparseable: {e}"),
+                        },
+                        vec![],
+                    );
+                    return Ok(());
+                }
+            };
             emit_result_keyed(
                 ctx,
                 intent,
@@ -815,13 +833,14 @@ fn reconcile_push(
     reattempt(ctx, intent, key)
 }
 
-/// Reconcile one `open_change_request`: an open change under the
-/// intent's source branch *and* target base settles `applied`; a list
-/// without one re-attempts the create — the host refuses only a
-/// duplicate head/base pair, so the next pass's read settles it.
-/// A pre-existing open change from the same source to a different base
-/// is not this intent's effect: settling `applied` on it would record
-/// a target the remote never showed.
+/// Reconcile one `open_change_request` by read only: an open change
+/// under the intent's source branch *and* target base settles
+/// `applied`; without one the intent stays `unknown` and burns the
+/// bound. A create is not idempotent — re-issuing `gh pr create`
+/// after a response may have been lost is exactly the duplicate R-4
+/// forbids, so the reconcile never resends the write; a pre-existing
+/// open change from the same source to a different base is not this
+/// intent's effect either.
 fn reconcile_open(
     ctx: &Ctx,
     intent: &HostActionIntent,
@@ -844,13 +863,38 @@ fn reconcile_open(
                     .find(|p| p["base"]["ref"].as_str() == Some(target_branch))
                     .cloned()
             }) else {
-                return reattempt(ctx, intent, key);
+                emit_result_keyed(
+                    ctx,
+                    intent,
+                    key,
+                    HostActionStatus::Unknown {
+                        reason: format!(
+                            "no open change on base {target_branch} for {source_branch}; create effect unverified"
+                        ),
+                    },
+                    vec![],
+                );
+                return Ok(());
             };
             let observed_target = first["base"]["ref"]
                 .as_str()
                 .unwrap_or(target_branch)
                 .to_string();
-            let (change, head) = opened_change(intent, &first)?;
+            let (change, head) = match opened_change(intent, &first) {
+                Ok(read) => read,
+                Err(e) => {
+                    emit_result_keyed(
+                        ctx,
+                        intent,
+                        key,
+                        HostActionStatus::Unknown {
+                            reason: format!("matching change read-back was unparseable: {e}"),
+                        },
+                        vec![],
+                    );
+                    return Ok(());
+                }
+            };
             let execution = latest_execution_id(ctx, &intent.work_id);
             let _ = ctx.emit(
                 Some((&intent.work_id, execution.as_ref())),
@@ -897,7 +941,20 @@ fn reconcile_open(
 /// bound keeps advancing.
 fn reattempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
     let before = attempt_count(ctx, &intent.action_id)?;
-    attempt(ctx, intent, key, true)?;
+    // An errored re-attempt recorded nothing on its way out — emit the
+    // reconcile receipt so the bound still advances.
+    if let Err(e) = attempt(ctx, intent, key, true) {
+        emit_result_keyed(
+            ctx,
+            intent,
+            key,
+            HostActionStatus::Unknown {
+                reason: format!("reconcile re-attempt errored: {e}"),
+            },
+            vec![],
+        );
+        return Ok(());
+    }
     if attempt_count(ctx, &intent.action_id)? == before {
         emit_result_keyed(
             ctx,
@@ -930,16 +987,22 @@ fn opened_change(
     Ok((change, head))
 }
 
-/// One guarded write attempt. `reconcile` marks a re-try of an
-/// already-`unknown` intent: the original effect is still unverified,
-/// so a re-try that cannot run or cannot land records `unknown` — a
-/// `failed` receipt would tell Core the effect provably did not happen
-/// and let it charge the transport account and blind-retry (R42). An
-/// initial attempt's identical failure is a definite no-effect and
-/// records `failed`.
+/// One guarded write attempt. A `push_ref` that cannot run or cannot
+/// be verified records `unknown` in every mode: even `pending` does
+/// not prove the intent was never attempted — a crash after the push
+/// landed but before the receipt wrote leaves it `pending` — so no
+/// push failure ever proves a definite no-effect (R42). `reconcile`
+/// keeps the same discipline for the injected `open_change_request`
+/// refusal: a re-try of an already-`unknown` intent records `unknown`,
+/// an initial attempt records the scenario's definite `failed`.
 fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> Result<(), String> {
-    // The settle status a re-try failure records: `unknown` while the
-    // effect is unverified, `failed` on an initial attempt.
+    // The settle status the injected refusal records: `failed` on an
+    // initial attempt (the scenario asserts a definite no-effect),
+    // `unknown` under reconcile — an already-unknown intent's original
+    // effect may have landed. Every genuine `push_ref` failure records
+    // `unknown` unconditionally: a pending intent can also carry a
+    // landed-but-unrecorded push (a post-push crash loses the receipt
+    // write), so no push failure ever proves a definite no-effect.
     let uncertain = |reason: String| {
         if reconcile {
             HostActionStatus::Unknown { reason }
@@ -970,7 +1033,12 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                     ctx,
                     intent,
                     key,
-                    uncertain(format!("no workspace clone at {}", repo_dir.display())),
+                    HostActionStatus::Unknown {
+                        reason: format!(
+                            "no workspace clone at {}; effect unverified",
+                            repo_dir.display()
+                        ),
+                    },
                     vec![],
                 );
                 return Ok(());
@@ -982,7 +1050,9 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                         ctx,
                         intent,
                         key,
-                        uncertain(format!("local head read failed: {e}")),
+                        HostActionStatus::Unknown {
+                            reason: format!("local head read failed: {e}; effect unverified"),
+                        },
                         vec![],
                     );
                     return Ok(());
@@ -1006,7 +1076,9 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                         ctx,
                         intent,
                         key,
-                        uncertain(format!("prior-ref read failed: {e}")),
+                        HostActionStatus::Unknown {
+                            reason: format!("prior-ref read failed: {e}; effect unverified"),
+                        },
                         vec![],
                     );
                     return Ok(());
@@ -1018,9 +1090,27 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
             let prior_state = if prior_sha.is_empty() {
                 BranchState::Absent
             } else {
-                BranchState::At {
-                    revision: CommitRevision::new(intent.repository.clone(), prior_sha.clone())?,
-                }
+                let revision = match CommitRevision::new(
+                    intent.repository.clone(),
+                    prior_sha.clone(),
+                ) {
+                    Ok(revision) => revision,
+                    Err(e) => {
+                        emit_result_keyed(
+                            ctx,
+                            intent,
+                            key,
+                            HostActionStatus::Unknown {
+                                reason: format!(
+                                    "prior-ref read-back was unparseable: {e}; effect unverified"
+                                ),
+                            },
+                            vec![],
+                        );
+                        return Ok(());
+                    }
+                };
+                BranchState::At { revision }
             };
             let _ = ctx.emit(
                 Some((&intent.work_id, Some(&execution.id))),
@@ -1068,8 +1158,26 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
             ])
             .ok();
             if observed.as_deref() == Some(local_head.as_str()) {
-                let observed =
-                    CommitRevision::new(intent.repository.clone(), observed.expect("checked"))?;
+                let observed = match CommitRevision::new(
+                    intent.repository.clone(),
+                    observed.expect("checked"),
+                ) {
+                    Ok(observed) => observed,
+                    Err(e) => {
+                        emit_result_keyed(
+                            ctx,
+                            intent,
+                            key,
+                            HostActionStatus::Unknown {
+                                reason: format!(
+                                    "remote head read-back was unparseable: {e}; effect unverified"
+                                ),
+                            },
+                            vec![],
+                        );
+                        return Ok(());
+                    }
+                };
                 // `produced` is the recorded artifact payload digest — a
                 // content identity, not a git object on this revision.
                 // `ancestor` records that the observed real head contains
@@ -1100,7 +1208,9 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                                 observed
                             ),
                         },
-                        Err(e) => uncertain(format!("push failed: {e}")),
+                        Err(e) => HostActionStatus::Unknown {
+                            reason: format!("push failed: {e}; effect unverified"),
+                        },
                     },
                     vec![],
                 );
