@@ -18,8 +18,11 @@ The suite parameterizes over two axes:
   `Supervisor<CountingPosix>` — an observational decorator that
   delegates spawn, inspect, and signal to `PosixProcessControl` and
   records every spawn call and spawned identity — which in turn spawns
-  the real `workloop-fixture-worker` binary: real process spawn, real
-  signals, real liveness reads. `ScriptedProvider` wraps
+  whichever worker binary the provider is bound to: `WorkerProvider::make`
+  binds the real `workloop-fixture-worker` binary by default, and
+  `PosixProvider::make_bound` binds an arbitrary worker binary (the
+  U4.6b rerun below binds the contract Worker) — real process spawn,
+  real signals, real liveness reads. `ScriptedProvider` wraps
   `Supervisor<ScriptedProcessControl>`, an independently implemented
   in-memory process table that can model start/liveness outcomes no
   argv can produce (a spawn whose identity capture was lost, an
@@ -115,13 +118,24 @@ executes the identical scenario table twice through the supervisor and
 the public Command/Query path — once bound to the reference worker,
 once to the independent contract Worker — and retains one
 [U4.6 record](worker-protocol.md#u46-evidence-record) per case per
-implementation. The records differ only in adapter identity: every
-case's Outcome signature — execution states, waiting reasons, terminal
-codes, invocation states and roles, writer-identity presence, intent
-statuses, and spawn-attempt counts — is equal across the two runs, and
-the skip partition is identical (the POSIX model surface is
-binary-independent). `u46b_suite_source_has_no_adapter_name_branch` is
-the named static check: adapter identities may appear only inside the
-suite's marked injection boundary, and never on a conditional,
-comparison, or assertion line — no case may branch on which worker is
+implementation, persisted by the run itself to
+`target/u4.6b-records.json`. The records differ only in adapter
+identity: every case's Outcome signature — execution states, waiting
+reasons, terminal codes, invocation states and roles, writer-identity
+presence, intent statuses, and spawn-attempt counts — is equal across
+the two runs, as are the paired records' `tested_revision`,
+`base_revision`, `evidence_refs`, and full `configuration_identity`
+once the bound-worker fields are projected out; the skip partition is
+identical (the POSIX model surface is binary-independent). Revision
+stamping is fail-closed: the run requires a pristine tracked tree and
+both revisions as full commit ids (a CI pull-request merge ref stamps
+its source-branch parent), so no record can carry a placeholder or
+describe an uncommitted worktree. `u46b_suite_source_has_no_adapter_name_branch`
+is the named static check: adapter-name literals may appear only
+inside the suite's marked identity boundary and never on a
+conditional, comparison, or assertion line, and the
+identity-revealing identifiers (the binary getters, the selection
+const, the bound-argv construction, the binding fields) appear outside
+that boundary only on branch-free data lines — the boundary holds the
+only identity comparison, so no case branches on which worker is
 bound.

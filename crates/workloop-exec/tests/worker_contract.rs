@@ -1360,23 +1360,100 @@ fn signature_refs(sig: &CaseSignature) -> Vec<String> {
     refs
 }
 
-/// `HEAD` / merge-base of this checkout at run time. The retained
-/// evidence stamps the committed slice SHA; in-test the live revision
-/// is the honest value.
-fn checkout_revision(argv: &[&str]) -> String {
+/// One git query whose trimmed stdout. `None` on any failure — the
+/// revision stamping below never substitutes a placeholder for it.
+fn git_stdout(argv: &[&str]) -> Option<String> {
     std::process::Command::new("git")
         .args(argv)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8(o.stdout)
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
+}
+
+/// A required revision field must be a full commit id: `unknown`, a
+/// truncated id, or any non-hex output fails the recorded run instead
+/// of being stamped into a record.
+fn assert_commit_id(sha: &str, what: &str) {
+    assert_eq!(sha.len(), 40, "{what} must be a full commit id: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "{what} must be a hex commit id: {sha}"
+    );
+}
+
+/// The recorded run stamps a pristine checkout: a cited commit only
+/// describes the exercised tree when no tracked file differs from it,
+/// so a dirty tree fails the run rather than mislabeling the record.
+fn assert_clean_tracked_tree() {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("git status on the recorded checkout");
+    assert!(out.status.success(), "git status failed: {out:?}");
+    let dirty = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        dirty.trim().is_empty(),
+        "the record's revisions must describe the exercised tree — \
+         uncommitted tracked changes:\n{dirty}"
+    );
+}
+
+/// The base fork point of a normal checkout: the first merge-base
+/// against a base branch this clone keeps. No base ref at all (a
+/// non-git source tree) fails the recorded run.
+fn base_revision() -> String {
+    for argv in [
+        ["merge-base", "HEAD", "origin/main"],
+        ["merge-base", "HEAD", "main"],
+        ["merge-base", "HEAD", "origin/HEAD"],
+    ] {
+        if let Some(sha) = git_stdout(&argv) {
+            return sha;
+        }
+    }
+    panic!(
+        "base_revision unavailable: this checkout has no merge-base \
+         against a base branch"
+    );
+}
+
+/// The revision pair a recorded run stamps, validated fail-closed.
+/// CI pull-request checkouts are the synthetic merge ref, so the pair
+/// comes from its parents — GitHub merge commits record (base tip,
+/// source-branch head), the order its own merge-to-main history keeps
+/// (12cecb3, 18c1210) — and the record cites the PR-branch commit, not
+/// the merge commit. A normal checkout stamps `HEAD` and its merge-base.
+/// Either way both values are full commit ids over a pristine tree.
+fn record_revisions() -> (String, String) {
+    assert_clean_tracked_tree();
+    let merge_parents: Option<(String, String)> =
+        if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+            git_stdout(&["rev-list", "--parents", "-n", "1", "HEAD"]).and_then(|line| {
+                let mut parts = line.split_whitespace();
+                let _merge = parts.next()?;
+                let base = parts.next()?.to_string();
+                let head = parts.next()?.to_string();
+                Some((base, head))
+            })
+        } else {
+            None
+        };
+    let (tested, base) = match merge_parents {
+        Some((base, head)) => (head, base),
+        None => (
+            git_stdout(&["rev-parse", "HEAD"])
+                .expect("git rev-parse HEAD — a recorded run requires a git checkout"),
+            base_revision(),
+        ),
+    };
+    assert_commit_id(&tested, "tested_revision");
+    assert_commit_id(&base, "base_revision");
+    (tested, base)
 }
 
 /// A retained record in the U4.6 evidence format — the closed field
@@ -1416,13 +1493,42 @@ fn case_record(
     })
 }
 
+/// The record with the bound-worker identity fields removed from every
+/// adapter selection entry: paired records must be equal after this
+/// projection — "differ only in adapter identity" asserted as whole-record
+/// equality rather than a field-by-field spot check. The request id and
+/// the installation identity are kept, so they are compared too.
+fn record_without_adapter_fields(record: &serde_json::Value) -> serde_json::Value {
+    let mut out = record.clone();
+    let Some(selection) = out
+        .get_mut("configuration_identity")
+        .and_then(|c| c.get_mut("adapter_selection"))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return out;
+    };
+    for entry in selection {
+        if let Some(obj) = entry.as_object_mut() {
+            for field in [
+                "adapter_id",
+                "adapter_version",
+                "runtime_version",
+                "capability_digest",
+                "argv",
+            ] {
+                obj.remove(field);
+            }
+        }
+    }
+    out
+}
+
 /// Run the identical suite against one bound worker binary and retain
 /// one U4.6-format record per case. The only variable between two
 /// calls is `bin` — the adapter selection the supervisor binds.
 fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
     let declared: BTreeSet<&'static str> = PosixProvider::declares().iter().copied().collect();
-    let tested = checkout_revision(&["rev-parse", "HEAD"]);
-    let base = checkout_revision(&["merge-base", "HEAD", "origin/main"]);
+    let (tested, base) = record_revisions();
     scenarios()
         .iter()
         .enumerate()
@@ -1482,11 +1588,25 @@ fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
 /// U4.6b named run: the identical suite executes twice through the
 /// supervisor and the public Command/Query path — once with the
 /// reference worker bound, once with the independent contract Worker —
-/// and produces per-case records that differ only in adapter identity.
+/// and produces per-case records that differ only in adapter identity:
+/// every other record field, including the full configuration identity
+/// modulo the bound-worker fields, is asserted equal. The twenty
+/// records are persisted under `target/` so the retained evidence can
+/// be re-derived from the run itself.
 #[test]
 fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
     let reference = run_recorded_suite("u46b-a", &fixture_bin());
     let rerun = run_recorded_suite("u46b-b", &contract_bin());
+    let retained = serde_json::json!({
+        "reference": reference.iter().map(|r| &r.record).collect::<Vec<_>>(),
+        "rerun": rerun.iter().map(|r| &r.record).collect::<Vec<_>>(),
+    });
+    let records = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u4.6b-records.json");
+    std::fs::write(
+        &records,
+        format!("{}\n", serde_json::to_string_pretty(&retained).unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("retain the U4.6 record set at {}: {e}", records.display()));
     assert_eq!(reference.len(), rerun.len(), "the identical case table");
     for (a, b) in reference.iter().zip(&rerun) {
         assert_eq!(a.id, b.id, "the identical suite table");
@@ -1514,17 +1634,33 @@ fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
             );
         }
         assert_eq!(a.record["claim_class"], "fixture_supported");
-        assert_eq!(a.record["command_scenario"], b.record["command_scenario"]);
+        // Paired records are equal field by field — revisions, claim
+        // class, scenario, result, evidence — and the whole
+        // configuration identity too, once the bound-worker fields are
+        // projected out: adapter identity is the only difference.
+        for key in [
+            "schema_version",
+            "tested_revision",
+            "base_revision",
+            "claim_class",
+            "command_scenario",
+            "result",
+            "evidence_refs",
+        ] {
+            assert_eq!(
+                a.record[key], b.record[key],
+                "{}: record field {key} equal across runs",
+                a.id
+            );
+        }
+        assert_eq!(
+            record_without_adapter_fields(&a.record),
+            record_without_adapter_fields(&b.record),
+            "{}: configuration identity equal modulo adapter identity",
+            a.id
+        );
         match (&a.bindings[..], &b.bindings[..]) {
-            ([x], [y]) => {
-                assert_ne!(
-                    x.adapter_id, y.adapter_id,
-                    "{}: the bound adapter is the only variable that changed",
-                    a.id
-                );
-                assert!(SUITE_ADAPTER_NAMES.contains(&x.adapter_id.as_str()));
-                assert!(SUITE_ADAPTER_NAMES.contains(&y.adapter_id.as_str()));
-            }
+            ([x], [y]) => assert_bound_adapters_differ(x, y, a.id),
             ([], []) => {}
             _ => panic!("{}: binding presence differs across runs", a.id),
         }
@@ -1539,15 +1675,19 @@ fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
     );
 }
 
-/// U4.6b static check: the suite source contains no adapter-name
-/// branch. Adapter identities exist only inside the marked boundary
-/// below, and there only as data — never on a conditional, comparison,
-/// or assertion line. No case may branch on which worker is bound.
+/// U4.6b static check: no line branches on which worker is bound.
+/// Adapter-name literals may appear only inside the marked boundary
+/// below and never on a conditional, comparison, or assertion line.
+/// The identity-revealing identifiers — the binary getters, the
+/// boundary list, the bound construction, the binding fields, the
+/// supervisor's bound argv — appear outside the boundary only on
+/// branch-free data lines, so every identity comparison lives in the
+/// boundary itself. No case may branch on which worker is bound.
 #[test]
 fn u46b_suite_source_has_no_adapter_name_branch() {
     const BEGIN: &str = "// ---- adapter identity boundary";
     const END: &str = "// ---- end adapter identity boundary";
-    const FORBIDDEN_ON_NAME_LINE: &[&str] = &[
+    const BRANCH_TOKENS: &[&str] = &[
         "if ",
         "if(",
         "match ",
@@ -1559,6 +1699,21 @@ fn u46b_suite_source_has_no_adapter_name_branch() {
         ".contains(",
         "starts_with(",
         "ends_with(",
+    ];
+    /// Beyond the adapter-name literals (scanned via
+    /// `SUITE_ADAPTER_NAMES`), these identifiers expose which worker is
+    /// bound — a branch on any of them decides adapter identity even
+    /// without naming an adapter.
+    const IDENTITY_TOKENS: &[&str] = &[
+        "fixture_bin",
+        "contract_bin",
+        "SUITE_ADAPTER_NAMES",
+        "make_bound",
+        "adapter_id",
+        "adapter_version",
+        "runtime_version",
+        "capability_digest",
+        "worker_argv",
     ];
     let lines: Vec<&str> = include_str!("worker_contract.rs").lines().collect();
     let markers = |marker: &str| {
@@ -1576,17 +1731,28 @@ fn u46b_suite_source_has_no_adapter_name_branch() {
     let (begin, end) = (begins[0], ends[0]);
     assert!(begin < end, "the boundary opens before it closes");
     for (n, line) in lines.iter().enumerate() {
+        let inside_boundary = n > begin && n < end;
+        let branches = BRANCH_TOKENS.iter().any(|t| line.contains(t));
         for name in SUITE_ADAPTER_NAMES {
             if line.contains(name) {
                 assert!(
-                    n > begin && n < end,
+                    inside_boundary,
                     "adapter name outside the identity boundary (line {}): {line}",
                     n + 1
                 );
-                for token in FORBIDDEN_ON_NAME_LINE {
+                assert!(
+                    !branches,
+                    "adapter-name conditional (line {}): {line}",
+                    n + 1
+                );
+            }
+        }
+        if !inside_boundary {
+            for token in IDENTITY_TOKENS {
+                if line.contains(token) {
                     assert!(
-                        !line.contains(token),
-                        "adapter-name conditional (line {}): {line}",
+                        !branches,
+                        "adapter-identity branch outside the identity boundary (line {}): {line}",
                         n + 1
                     );
                 }
@@ -1596,13 +1762,32 @@ fn u46b_suite_source_has_no_adapter_name_branch() {
 }
 
 // ---- adapter identity boundary (U4.6b) ---------------------------------
-// The only place worker adapter names may appear in this file, held as
-// plain data: the binaries the suite binds and the name list the
-// static check scans for. No scenario or provider may branch on them.
+// The only place worker adapter identities live: the binaries the suite
+// binds, the name list the static check scans for, and the one
+// comparison of bound identities. Adapter names stay plain data even
+// here; outside this boundary no line may branch on an identity field.
 
 /// Adapter identities the suite may be bound to — the set the static
 /// check scans the whole file for.
 const SUITE_ADAPTER_NAMES: &[&str] = &["workloop-fixture-worker", "workloop-contract-worker"];
+
+/// The one designated comparison of bound adapter identities — the
+/// non-vacuity proof the named equality run delegates to this
+/// boundary, so no case outside it branches on which worker is bound.
+fn assert_bound_adapters_differ(x: &RecordedBinding, y: &RecordedBinding, id: &str) {
+    assert_ne!(
+        x.adapter_id, y.adapter_id,
+        "{id}: the bound adapter is the only variable that changed"
+    );
+    assert!(
+        SUITE_ADAPTER_NAMES.contains(&x.adapter_id.as_str()),
+        "{id}: reference adapter in the declared set"
+    );
+    assert!(
+        SUITE_ADAPTER_NAMES.contains(&y.adapter_id.as_str()),
+        "{id}: bound adapter in the declared set"
+    );
+}
 
 /// The reference worker binary — the suite's baseline implementation.
 fn fixture_bin() -> String {
