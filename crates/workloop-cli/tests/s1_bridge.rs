@@ -230,6 +230,25 @@ impl Fixture {
             .transact(|tx| workloop_core::projection::outstanding_actions(tx, work_id))
             .unwrap()
     }
+
+    /// Recorded `host_action_result` receipts for one action.
+    fn result_receipts(&self, action_id: &str) -> usize {
+        self.store()
+            .transact(|tx| {
+                Ok(tx
+                    .all_observations()?
+                    .iter()
+                    .filter(|o| {
+                        matches!(
+                            &o.fact,
+                            ObservationFact::HostActionResult { action_id: id, .. }
+                                if id == action_id
+                        )
+                    })
+                    .count())
+            })
+            .unwrap()
+    }
 }
 
 fn submit(store: &SqliteStore, config: &WorkloopConfig, key: &str) -> (WorkId, ExecutionId) {
@@ -418,6 +437,7 @@ fn unknown_push_settles_from_the_remote_read_without_resend() {
     fx.seed_workspace(&work_id);
     // The remote already carries the pushed head — reconcile must
     // settle by the fact, never resend.
+    fx.write_fake("prior_ref", &format!("aaaa1111\trefs/heads/{BRANCH}\n"));
     fx.write_fake("remote_head", "aaaa1111\n");
     let action_id = insert_intent(
         &fx.store(),
@@ -582,7 +602,7 @@ fn reconcile_continues_past_one_intents_failure() {
     fx.seed_workspace(&work_id);
     // First intent (insertion order is reconcile order): an unknown
     // push whose remote read-back cannot construct a CommitRevision —
-    // `compare` reports `ahead` over an empty observed head.
+    // `compare` reports `ahead` over an oversized observed head.
     let failing = insert_intent(
         &fx.store(),
         &work_id,
@@ -607,11 +627,15 @@ fn reconcile_continues_past_one_intents_failure() {
         },
         vec![],
     );
+    fx.write_fake(
+        "prior_ref",
+        &format!("{}\trefs/heads/{BRANCH}\n", "a".repeat(600)),
+    );
     fx.write_fake("remote_head", "\n");
     fx.write_fake("compare_status", "ahead\n");
     fx.write_fake(
         "pulls_head",
-        r#"[{"node_id":"PR_x","number":7,"head":{"sha":"aaaa1111"}}]
+        r#"[{"node_id":"PR_x","number":7,"head":{"sha":"aaaa1111"},"base":{"ref":"main"}}]
 "#,
     );
     fx.tick(&[]);
@@ -664,4 +688,138 @@ fn applied_push_rearms_on_bound_actor_drift_and_resettles() {
     );
     assert_eq!(fx.pushes().len(), 1);
     assert!(fx.outstanding(&work_id).is_empty());
+}
+
+/// A provably absent remote branch is a definite "effect did not
+/// land" — the reconcile re-attempts the guarded write instead of
+/// recording `unknown` and burning the bound on an intent whose effect
+/// never landed.
+#[test]
+fn unknown_push_reattempts_when_the_remote_branch_is_absent() {
+    let fx = Fixture::new("absent");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-absent");
+    fx.seed_workspace(&work_id);
+    fx.write_fake("prior_ref", "");
+    fx.mark_push_lands();
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    fx.tick(&[]);
+    assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
+    assert_eq!(
+        fx.pushes().len(),
+        1,
+        "the absent branch re-attempts the push"
+    );
+}
+
+/// A reconcile re-try that cannot run leaves the effect `unknown` —
+/// never `failed`, which Core would charge to the transport account
+/// and blind-retry while the original effect is still unverified
+/// (docs/evidence-requirements.md R42).
+#[test]
+fn reconcile_reattempt_without_workspace_stays_unknown() {
+    let fx = Fixture::new("no-workspace");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-no-ws");
+    // Deliberately no seeded workspace clone: the re-attempt cannot run.
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    fx.tick(&[]);
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "an unverified effect never becomes a failed receipt: {:?}",
+        fx.intent_status(&action_id)
+    );
+    assert!(fx.pushes().is_empty());
+}
+
+/// An unchanged applied push re-verifies under the same delivery id
+/// and dedupes at the store: the verify pass must not mint a new
+/// `applied` receipt every tick — each one grows the observation table
+/// and resets the Work's no-progress clock.
+#[test]
+fn verify_receipt_dedupes_an_unchanged_applied_push() {
+    let fx = Fixture::new("verify-dedupe");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-verify-dedupe");
+    fx.seed_workspace(&work_id);
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Applied,
+        vec![ref_published()],
+    );
+    // The remote still carries the head the recorded receipt verified.
+    fx.write_fake("remote_head", "aaaa1111\n");
+    fx.tick(&[]);
+    let after_first = fx.result_receipts(&action_id);
+    assert!(after_first >= 1, "the first verify observation records");
+    fx.tick(&[]);
+    fx.tick(&[]);
+    assert_eq!(
+        fx.result_receipts(&action_id),
+        after_first,
+        "an unchanged push dedupes — no fresh applied observation per tick"
+    );
+    assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
+}
+
+/// A pre-existing open change from the same source branch to a
+/// different base is not this intent's effect: the reconcile
+/// re-attempts the create instead of settling `applied` on a target
+/// the remote never showed.
+#[test]
+fn reconcile_open_reattempts_when_the_open_change_targets_another_base() {
+    let fx = Fixture::new("open-base");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-open-base");
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: BRANCH.into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        HostActionStatus::Unknown {
+            reason: "create response lost".into(),
+        },
+        vec![],
+    );
+    fx.write_fake(
+        "pulls_head",
+        r#"[{"node_id":"PR_x","number":7,"head":{"sha":"aaaa1111"},"base":{"ref":"release"}}]
+"#,
+    );
+    fx.tick(&[]);
+    assert_ne!(
+        fx.intent_status(&action_id),
+        HostActionStatus::Applied,
+        "a different-base change never settles the intent applied"
+    );
+    // Once the remote answers an open change on the intent's own base,
+    // the next pass settles it.
+    fx.write_fake(
+        "pulls_head",
+        r#"[{"node_id":"PR_y","number":8,"head":{"sha":"aaaa1111"},"base":{"ref":"main"}}]
+"#,
+    );
+    fx.tick(&[]);
+    assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
 }

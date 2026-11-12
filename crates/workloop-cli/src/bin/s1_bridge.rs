@@ -376,7 +376,7 @@ fn drain_outbox(ctx: &Ctx, reconcile_bound: usize) -> Result<(), String> {
         attempted.insert(intent.action_id.clone());
         // One intent's transient failure must not starve the rest of
         // the drain or skip the pass's reconcile/verify.
-        if let Err(e) = attempt(ctx, &intent, &format!("act:{}", intent.action_id)) {
+        if let Err(e) = attempt(ctx, &intent, &format!("act:{}", intent.action_id), false) {
             eprintln!("s1-bridge: attempt {} failed: {e}", intent.action_id);
         }
     }
@@ -465,15 +465,21 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
             RefRelation::Ancestor => "ancestor",
             RefRelation::Diverged => "diverged",
         };
-        // The receipt ordinal keeps a *repeat* drift to an
-        // already-reported head a new record: without it the second
-        // `verify:<sha>:diverged` reuses the recorded delivery
-        // identity, dedupes, and Core's re-arm never runs.
-        let receipts = receipt_count(ctx, &intent.action_id)?;
+        // The applied-settlement ordinal keeps a *repeat* drift to an
+        // already-reported head a new record while an unchanged push
+        // dedupes: the generation advances only when an attempt receipt
+        // settles the intent `applied` again, so a second
+        // `verify:<sha>:diverged` after a reconcile lands in a later
+        // generation instead of reusing the recorded delivery identity.
+        // A per-tick ordinal would mint a fresh receipt on every
+        // re-observation — one new `applied` observation per tick would
+        // grow the observation table without bound and keep resetting
+        // the Work's no-progress clock.
+        let generation = applied_attempt_count(ctx, &intent.action_id)?;
         let _ = ctx.emit(
             Some((&intent.work_id, execution.as_ref().map(|e| &e.id))),
             format!(
-                "act:{}:verify:{sha}:{relation_key}:{receipts}",
+                "act:{}:verify:{sha}:{relation_key}:{generation}",
                 intent.action_id
             ),
             ObservationFact::HostActionResult {
@@ -531,52 +537,59 @@ fn emit_result_keyed(
     );
 }
 
-/// All recorded `host_action_result` receipts for one action — the
-/// durable tally the verify-receipt ordinal draws uniqueness from.
-fn receipt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
+/// Whether one recorded observation is an *attempt* receipt for this
+/// action — a drain `act:{id}` or reconcile `act:{id}:reconcile:{n}`
+/// emission. State-keyed verify receipts are evidence refreshes, not
+/// tries at the effect.
+fn is_attempt_receipt(o: &Observation, action_id: &str) -> bool {
+    let drain_key = format!("act:{action_id}");
+    let reconcile_prefix = format!("{drain_key}:reconcile:");
+    matches!(
+        &o.fact,
+        ObservationFact::HostActionResult { action_id: id, .. }
+            if id == action_id
+    ) && o.delivery.as_ref().is_some_and(|d| {
+        d.event_id == drain_key
+            || d.event_id
+                .strip_prefix(reconcile_prefix.as_str())
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+/// Recorded *attempt* receipts for one action. The reconcile bound
+/// applies to attempts: state-keyed verify receipts re-observing an
+/// applied push are evidence refreshes and must not spend the bound.
+fn attempt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
     ctx.store
         .transact_deferred(|tx| {
             Ok(tx
                 .all_observations()?
                 .iter()
-                .filter(|o| {
-                    matches!(
-                        &o.fact,
-                        ObservationFact::HostActionResult { action_id: id, .. }
-                            if id == action_id
-                    )
-                })
+                .filter(|o| is_attempt_receipt(o, action_id))
                 .count())
         })
         .map_err(|e| e.to_string())
 }
 
-/// Recorded *attempt* receipts for one action — drain and reconcile
-/// emissions under `act:{id}`/`act:{id}:reconcile:{n}` keys only. The
-/// reconcile bound applies to attempts: state-keyed verify receipts
-/// re-observing an applied push are evidence refreshes, not tries at
-/// the effect, and must not spend the bound.
-fn attempt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
-    let drain_key = format!("act:{action_id}");
-    let reconcile_prefix = format!("{drain_key}:reconcile:");
+/// The applied generation of one action — how many attempt receipts
+/// have already settled it `applied`. The verify delivery id keys on
+/// the generation so a drift after a re-apply is a new record while a
+/// re-verified unchanged push dedupes.
+fn applied_attempt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
     ctx.store
         .transact_deferred(|tx| {
             Ok(tx
                 .all_observations()?
                 .iter()
                 .filter(|o| {
-                    matches!(
-                        &o.fact,
-                        ObservationFact::HostActionResult { action_id: id, .. }
-                            if id == action_id
-                    ) && o.delivery.as_ref().is_some_and(|d| {
-                        d.event_id == drain_key
-                            || d.event_id
-                                .strip_prefix(reconcile_prefix.as_str())
-                                .is_some_and(|n| {
-                                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
-                                })
-                    })
+                    is_attempt_receipt(o, action_id)
+                        && matches!(
+                            &o.fact,
+                            ObservationFact::HostActionResult {
+                                status: HostActionStatus::Applied,
+                                ..
+                            }
+                        )
                 })
                 .count())
         })
@@ -660,7 +673,12 @@ fn reconcile_one(ctx: &Ctx, intent: &HostActionIntent, bound: usize) -> Result<(
 /// Reconcile one `push_ref`: re-read the remote head first — when it
 /// provably contains the pushed commit the intent settles `applied`
 /// with no resend — otherwise re-attempt through the lease-guarded
-/// push path.
+/// push path. The read goes through `git ls-remote`, the same ref read
+/// the attempt path guards its push on: empty output is the definite
+/// "branch absent" fact — the recorded effect did not land — while a
+/// transport error leaves the fact unreadable. A `gh api` failure
+/// conflates the two and would burn the bound holding an intent whose
+/// effect provably never landed.
 fn reconcile_push(
     ctx: &Ctx,
     intent: &HostActionIntent,
@@ -668,27 +686,41 @@ fn reconcile_push(
     produced: &CommitRevision,
     key: &str,
 ) -> Result<(), String> {
-    let remote = gh(&[
-        "api",
-        &format!("repos/{}/branches/{branch}", ctx.repo_display),
-        "--jq",
-        ".commit.sha",
-    ]);
-    let Ok(remote_sha) = remote else {
-        // The remote fact itself is unreadable: the attempt counts
-        // toward the bound but the intent stays reconcilable.
-        emit_result_keyed(
-            ctx,
-            intent,
-            key,
-            HostActionStatus::Unknown {
-                reason: "remote head still unreadable".into(),
-            },
-            vec![],
-        );
-        return Ok(());
-    };
     let repo_dir = ctx.workspace_of(&intent.work_id);
+    // `ls-remote` needs no repository context, but `git` runs against a
+    // real directory — the workspace clone when it exists.
+    let read_dir = if repo_dir.join(".git").exists() {
+        repo_dir.as_path()
+    } else {
+        ctx.workspace_root.as_path()
+    };
+    let remote = git(
+        read_dir,
+        &["ls-remote", &ctx.remote, &format!("refs/heads/{branch}")],
+    );
+    let remote_sha = match remote {
+        Ok(out) => out.split_whitespace().next().map(str::to_string),
+        Err(_) => {
+            // The remote fact itself is unreadable: the attempt counts
+            // toward the bound but the intent stays reconcilable.
+            emit_result_keyed(
+                ctx,
+                intent,
+                key,
+                HostActionStatus::Unknown {
+                    reason: "remote head still unreadable".into(),
+                },
+                vec![],
+            );
+            return Ok(());
+        }
+    };
+    let Some(remote_sha) = remote_sha else {
+        // The branch is provably absent — the recorded effect did not
+        // land — so the guarded write re-attempts instead of recording
+        // another `unknown` and burning the bound.
+        return reattempt(ctx, intent, key);
+    };
     let pushed = repo_dir
         .join(".git")
         .exists()
@@ -733,9 +765,12 @@ fn reconcile_push(
 }
 
 /// Reconcile one `open_change_request`: an open change under the
-/// intent's source branch settles `applied`; none re-attempts the
-/// create — the host refuses a duplicate head/base pair, so the next
-/// pass's read settles it.
+/// intent's source branch *and* target base settles `applied`; a list
+/// without one re-attempts the create — the host refuses only a
+/// duplicate head/base pair, so the next pass's read settles it.
+/// A pre-existing open change from the same source to a different base
+/// is not this intent's effect: settling `applied` on it would record
+/// a target the remote never showed.
 fn reconcile_open(
     ctx: &Ctx,
     intent: &HostActionIntent,
@@ -753,9 +788,17 @@ fn reconcile_open(
     ]);
     match pr {
         Ok(pr) => {
-            let Some(first) = pr.as_array().and_then(|a| a.first().cloned()) else {
+            let Some(first) = pr.as_array().and_then(|a| {
+                a.iter()
+                    .find(|p| p["base"]["ref"].as_str() == Some(target_branch))
+                    .cloned()
+            }) else {
                 return reattempt(ctx, intent, key);
             };
+            let observed_target = first["base"]["ref"]
+                .as_str()
+                .unwrap_or(target_branch)
+                .to_string();
             let (change, head) = opened_change(intent, &first)?;
             let execution = latest_execution_id(ctx, &intent.work_id);
             let _ = ctx.emit(
@@ -775,7 +818,7 @@ fn reconcile_open(
                     change,
                     head,
                     source_branch: source_branch.to_string(),
-                    target_branch: target_branch.to_string(),
+                    target_branch: observed_target,
                 }],
             );
             Ok(())
@@ -803,7 +846,7 @@ fn reconcile_open(
 /// bound keeps advancing.
 fn reattempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
     let before = attempt_count(ctx, &intent.action_id)?;
-    attempt(ctx, intent, key)?;
+    attempt(ctx, intent, key, true)?;
     if attempt_count(ctx, &intent.action_id)? == before {
         emit_result_keyed(
             ctx,
@@ -836,7 +879,23 @@ fn opened_change(
     Ok((change, head))
 }
 
-fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
+/// One guarded write attempt. `reconcile` marks a re-try of an
+/// already-`unknown` intent: the original effect is still unverified,
+/// so a re-try that cannot run or cannot land records `unknown` — a
+/// `failed` receipt would tell Core the effect provably did not happen
+/// and let it charge the transport account and blind-retry (R42). An
+/// initial attempt's identical failure is a definite no-effect and
+/// records `failed`.
+fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> Result<(), String> {
+    // The settle status a re-try failure records: `unknown` while the
+    // effect is unverified, `failed` on an initial attempt.
+    let uncertain = |reason: String| {
+        if reconcile {
+            HostActionStatus::Unknown { reason }
+        } else {
+            HostActionStatus::Failed { reason }
+        }
+    };
     let execution = ctx
         .store
         .transact_deferred(|tx| {
@@ -860,14 +919,24 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                     ctx,
                     intent,
                     key,
-                    HostActionStatus::Failed {
-                        reason: format!("no workspace clone at {}", repo_dir.display()),
-                    },
+                    uncertain(format!("no workspace clone at {}", repo_dir.display())),
                     vec![],
                 );
                 return Ok(());
             }
-            let local_head = git(&repo_dir, &["rev-parse", "HEAD"])?;
+            let local_head = match git(&repo_dir, &["rev-parse", "HEAD"]) {
+                Ok(head) => head,
+                Err(e) => {
+                    emit_result_keyed(
+                        ctx,
+                        intent,
+                        key,
+                        uncertain(format!("local head read failed: {e}")),
+                        vec![],
+                    );
+                    return Ok(());
+                }
+            };
             // Expected-prior-ref guard: read the remote ref, then push
             // under a lease on that exact value. A remote that moved
             // since the read rejects the push instead of being
@@ -886,9 +955,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                         ctx,
                         intent,
                         key,
-                        HostActionStatus::Failed {
-                            reason: format!("prior-ref read failed: {e}"),
-                        },
+                        uncertain(format!("prior-ref read failed: {e}")),
                         vec![],
                     );
                     return Ok(());
@@ -982,7 +1049,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                                 observed
                             ),
                         },
-                        Err(e) => HostActionStatus::Failed { reason: e },
+                        Err(e) => uncertain(format!("push failed: {e}")),
                     },
                     vec![],
                 );
@@ -1004,12 +1071,14 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
             if fault_hook_armed(ctx, "S1_BRIDGE_INJECT_FAIL_OPEN_PR", "1")
                 && push_landed_for(ctx, &intent.work_id, source_branch)
             {
-                emit_result(
+                emit_result_keyed(
                     ctx,
                     intent,
-                    HostActionStatus::Failed {
-                        reason: "injected fault: partial effect (landed push, change_request_create refused)".into(),
-                    },
+                    key,
+                    uncertain(
+                        "injected fault: partial effect (landed push, change_request_create refused)"
+                            .into(),
+                    ),
                     vec![],
                 );
                 return Ok(());
@@ -1037,10 +1106,34 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                             ctx.repo_display
                         ),
                     ])?;
-                    let first = pr
-                        .as_array()
-                        .and_then(|a| a.first().cloned())
-                        .ok_or_else(|| format!("created PR not found in read-back: {url}"))?;
+                    // The read-back must show the created change on the
+                    // intent's own base — a pre-existing open change to
+                    // a different target is not this effect's evidence.
+                    let Some(first) = pr.as_array().and_then(|a| {
+                        a.iter()
+                            .find(|p| p["base"]["ref"].as_str() == Some(target_branch))
+                            .cloned()
+                    }) else {
+                        // The create reported success but no matching
+                        // change reads back: the effect is unverified,
+                        // never failed.
+                        emit_result_keyed(
+                            ctx,
+                            intent,
+                            key,
+                            HostActionStatus::Unknown {
+                                reason: format!(
+                                    "pr create reported {url} but no matching change read back"
+                                ),
+                            },
+                            vec![],
+                        );
+                        return Ok(());
+                    };
+                    let observed_target = first["base"]["ref"]
+                        .as_str()
+                        .unwrap_or(target_branch)
+                        .to_string();
                     let (change, head) = opened_change(intent, &first)?;
                     let execution_id = Some(execution.id.clone());
                     let _ = ctx.emit(
@@ -1060,7 +1153,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                             change,
                             head,
                             source_branch: source_branch.clone(),
-                            target_branch: target_branch.clone(),
+                            target_branch: observed_target,
                         }],
                     );
                 }
