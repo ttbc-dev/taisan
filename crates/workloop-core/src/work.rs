@@ -2708,25 +2708,29 @@ fn reconcile_intent(
     ) {
         return Ok(());
     }
+    // A receipt authenticated as a different actor than the binding
+    // authorized is invalid evidence — whatever status it claims, it
+    // settles nothing. The intent stays outstanding as
+    // `unknown{actor_mismatch}`, never `applied` and never `failed`.
+    if authenticated_actor
+        .as_ref()
+        .is_some_and(|a| a != &intent.actor)
+    {
+        return tx.apply(&Effect::UpdateHostActionIntent {
+            action_id: action_id.to_string(),
+            status: HostActionStatus::Unknown {
+                reason: "actor_mismatch".into(),
+            },
+            authenticated_actor,
+            effects,
+        });
+    }
     let recorded = match status {
         HostActionStatus::Applied if effect_matches(&intent, &effects) => HostActionStatus::Applied,
         HostActionStatus::Applied => HostActionStatus::Unknown {
             reason: "applied claim carried no matching effect fact".into(),
         },
         other => other,
-    };
-    // A receipt authenticated as a different actor than the binding
-    // authorized is invalid evidence — record it as unknown.
-    let recorded = if recorded == HostActionStatus::Applied
-        && authenticated_actor
-            .as_ref()
-            .is_some_and(|a| a != &intent.actor)
-    {
-        HostActionStatus::Unknown {
-            reason: "receipt authenticated a different actor than the binding".into(),
-        }
-    } else {
-        recorded
     };
     tx.apply(&Effect::UpdateHostActionIntent {
         action_id: action_id.to_string(),

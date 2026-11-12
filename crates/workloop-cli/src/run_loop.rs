@@ -488,27 +488,49 @@ pub fn run_pass(
     // Phase 4 — host outbox (≤ 8 attempts per tick, then report the
     // untouched remainder; the tick deadline is checked before every
     // new item, so a late pass defers the drain instead of writing
-    // past the deadline).
+    // past the deadline). A read-only reconcile pass runs first so a
+    // receipt lost mid-flight settles from the remote's observed
+    // state before any new attempt — never by replaying the write.
     if gated!(3) {
         if !in_process_fixture {
             push!(PhaseReport::skipped(PHASES[3], "external_adapter"));
         } else {
-            let result = pass.host.apply_outbox_bounded(
-                pass.store,
-                pass.config,
-                clock,
-                Some(deadline),
-                scope,
-                OUTBOX_ITEMS_PER_TICK,
-            );
+            let result = pass
+                .host
+                .reconcile_outbox_bounded(
+                    pass.store,
+                    pass.config,
+                    clock,
+                    Some(deadline),
+                    scope,
+                    OUTBOX_ITEMS_PER_TICK,
+                )
+                .and_then(|reconciled| {
+                    pass.host
+                        .apply_outbox_bounded(
+                            pass.store,
+                            pass.config,
+                            clock,
+                            Some(deadline),
+                            scope,
+                            OUTBOX_ITEMS_PER_TICK,
+                        )
+                        .map(|applied| (reconciled, applied))
+                });
             push!(match result {
-                Ok(r) => {
+                Ok((reconciled, r)) => {
                     let mut p = PhaseReport::completed(PHASES[3]);
-                    p.processed = r.attempted;
+                    p.processed = reconciled.examined + r.attempted;
                     p.deferred = r.deferred;
                     p.reason = Some(format!(
-                        "applied={} failed={} unknown={} unsupported={}",
-                        r.applied, r.failed, r.unknown, r.unsupported
+                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={}",
+                        reconciled.applied,
+                        reconciled.failed,
+                        reconciled.still_unknown,
+                        r.applied,
+                        r.failed,
+                        r.unknown,
+                        r.unsupported
                     ));
                     p
                 }
