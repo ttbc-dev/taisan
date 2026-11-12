@@ -245,10 +245,7 @@ impl SqliteStore {
                     exempt.extend_from_slice(V2_ADDED_TABLES);
                     exempt.extend_from_slice(V3_ADDED_TABLES);
                 }
-                2 => {
-                    exempt.extend_from_slice(V2_ADDED_TABLES);
-                    exempt.extend_from_slice(V3_ADDED_TABLES);
-                }
+                2 => exempt.extend_from_slice(V3_ADDED_TABLES),
                 3 => exempt.extend_from_slice(V3_ADDED_TABLES),
                 _ => {}
             }

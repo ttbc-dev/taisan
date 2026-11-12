@@ -1961,11 +1961,12 @@ impl SqliteStore {
             .optional()
             .map_err(map_err)?;
         if let Some(id) = existing {
+            // Another process won the race: return its plan exactly as
+            // persisted (phase-1 evidence included), never a mixture
+            // of its entries with this process's fresh selection.
             drop(tx);
             drop(guard);
-            let mut plan = self.load_reclaim_plan(&id)?;
-            plan.skipped = skipped;
-            return Ok(plan);
+            return self.load_reclaim_plan(&id);
         }
         tx.execute(
             "INSERT INTO reclaim_plans (plan_id, created_unix_seconds, status, \
@@ -2624,7 +2625,9 @@ impl SqliteStore {
         // UNKNOWN_SCAN_BOUND present bodies are stat'ed; a row whose
         // path cannot be read contributes `unknown`, never present
         // bytes. One over the bound flips the truncated flag.
-        type UnknownTotals = BTreeMap<String, (u64, u64, u64, Vec<String>)>;
+        // (unknown count, unknown bytes, unknown pinned bytes,
+        // unknown ids, verified pinned count, verified oldest)
+        type UnknownTotals = BTreeMap<String, (u64, u64, u64, Vec<String>, u64, i64)>;
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
@@ -2634,12 +2637,12 @@ impl SqliteStore {
             })?;
             let mut stmt = guard
                 .prepare(
-                    "SELECT body_id, category, path, bytes, pin_state, pinned \
-                     FROM body_catalog WHERE state='present' \
+                    "SELECT body_id, category, path, bytes, pin_state, pinned, \
+                     registered_unix_seconds FROM body_catalog WHERE state='present' \
                      ORDER BY registered_unix_seconds, body_id LIMIT ?1",
                 )
                 .map_err(map_err)?;
-            let rows: Vec<(String, String, String, i64, String, i64)> = stmt
+            let rows: Vec<(String, String, String, i64, String, i64, i64)> = stmt
                 .query_map(params![(UNKNOWN_SCAN_BOUND + 1) as i64], |r| {
                     Ok((
                         r.get(0)?,
@@ -2648,6 +2651,7 @@ impl SqliteStore {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 })
                 .map_err(map_err)?
@@ -2655,48 +2659,47 @@ impl SqliteStore {
                 .map_err(map_err)?;
             let truncated = rows.len() > UNKNOWN_SCAN_BOUND;
             let mut acc: UnknownTotals = BTreeMap::new();
-            for (entry_body_id, category, path, bytes, pin_state, pinned) in
+            let mut verified: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+            for (entry_body_id, category, path, bytes, pin_state, pinned, created_at) in
                 rows.into_iter().take(UNKNOWN_SCAN_BOUND)
             {
                 let stat_ok = match managed_path(&root_abs, &path) {
                     Ok(managed) => std::fs::symlink_metadata(&managed).is_ok(),
                     Err(_) => false,
                 };
+                let is_pin = PinState::parse(&pin_state)
+                    .map(|p| p.is_pin())
+                    .unwrap_or(false)
+                    || pinned != 0;
                 if stat_ok {
+                    let v = verified.entry(category.clone()).or_insert((0, i64::MAX));
+                    if is_pin {
+                        v.0 += 1;
+                    }
+                    v.1 = v.1.min(created_at);
                     continue;
                 }
                 let entry = acc.entry(category).or_default();
                 entry.0 += 1;
                 entry.1 += bytes.max(0) as u64;
                 entry.3.push(entry_body_id);
-                let is_pin = PinState::parse(&pin_state)
-                    .map(|p| p.is_pin())
-                    .unwrap_or(false)
-                    || pinned != 0;
                 if is_pin {
                     entry.2 += bytes.max(0) as u64;
                 }
             }
+            // Fold the verified aggregates into the unknown entries so
+            // pinned_count and oldest age come from the same measured
+            // (stat'able) set; a category present only as ghosts
+            // reports no verified pins and no oldest age.
+            for (category, (pinned_count, created)) in verified {
+                let entry = acc
+                    .entry(category)
+                    .or_insert((0, 0, 0, Vec::new(), 0, i64::MAX));
+                entry.4 = pinned_count;
+                entry.5 = created;
+            }
             (acc, truncated)
         };
-        let oldest: BTreeMap<String, i64> = {
-            let guard = self.conn.lock().map_err(|_| StoreError::Internal {
-                detail: "store lock poisoned".into(),
-            })?;
-            let mut stmt = guard
-                .prepare(
-                    "SELECT category, MIN(registered_unix_seconds) \
-                     FROM body_catalog WHERE state='present' GROUP BY category",
-                )
-                .map_err(map_err)?;
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                .map_err(map_err)?
-                .collect::<Result<BTreeMap<_, _>, _>>()
-                .map_err(map_err)?
-        };
-        // Union of categories with present rows (from eligibility) and
-        // categories seen in `counts` (which may hold only reclaimed or
-        // reclaiming rows and would otherwise vanish).
         let mut names: Vec<String> = eligibility
             .categories
             .iter()
@@ -2727,16 +2730,18 @@ impl SqliteStore {
                 .get(&(category.clone(), "reclaimed".to_string()))
                 .copied()
                 .unwrap_or((0, 0));
-            let (unknown_count, unknown_bytes, unknown_pinned_bytes, unknown_ids) =
-                match unknown.get(&category) {
-                    Some((c, b, p, ids)) => (*c, *b, *p, ids.as_slice()),
-                    None => (0, 0, 0, &[][..]),
-                };
-            let pinned_count = eligibility
-                .entries
-                .iter()
-                .filter(|e| e.category == category && e.pin_state.is_pin())
-                .count() as u64;
+            let (
+                unknown_count,
+                unknown_bytes,
+                unknown_pinned_bytes,
+                unknown_ids,
+                pinned_count_measured,
+                oldest_measured,
+            ) = match unknown.get(&category) {
+                Some((c, b, p, ids, vc, vold)) => (*c, *b, *p, ids.as_slice(), *vc, *vold),
+                None => (0, 0, 0, &[][..], 0, i64::MAX),
+            };
+            let pinned_count = pinned_count_measured;
             // Pressure is computed on the verifiable remainder only:
             // bodies whose path cannot be stat'ed never count toward
             // present usage or pinned-byte caps.
@@ -2783,9 +2788,11 @@ impl SqliteStore {
                 reclaimed_count,
                 reclaimed_bytes,
                 reclaimed_by_reason: reasons.get(&category).cloned().unwrap_or_default(),
-                oldest_present_age_seconds: oldest
-                    .get(&category)
-                    .map(|created| now_unix_seconds.saturating_sub(*created)),
+                oldest_present_age_seconds: if oldest_measured == i64::MAX {
+                    None
+                } else {
+                    Some(now_unix_seconds.saturating_sub(oldest_measured))
+                },
                 unknown_count,
                 unknown_bytes,
                 over_max_bytes,

@@ -462,6 +462,40 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
     }
 }
 
+/// Regression (shadow review): a v2 store is by definition carrying
+/// the v2 additions; one that is missing them is refused, not re-created.
+#[test]
+fn a_stamp2_store_missing_v2_tables_is_refused() {
+    let unique = format!(
+        "taisan-cleanup-refused-v2-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE reclaim_plans; DROP TABLE reclaim_plan_entries; \
+             DROP TABLE artifact_handoffs; PRAGMA user_version=2;",
+        )
+        .unwrap();
+    }
+    let refused = SqliteStore::open(&db, 1);
+    assert!(
+        refused.is_err(),
+        "a stamp-2 store missing its own v2 tables must be refused"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Regression (shadow review): a format-3 store missing the U2.6
 /// reclaim-plan tables upgrades in place; a stamped store that is
 /// missing an *earlier* additive table (the previous release's own
