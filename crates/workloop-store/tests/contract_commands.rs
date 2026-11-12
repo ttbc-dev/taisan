@@ -3439,14 +3439,16 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
         let store = SqliteStore::open(&db, 1).unwrap();
         accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
     };
-    // Reshape the file into a real v1 store: drop the v2 additions and
-    // the descendants column, then stamp user_version=1.
+    // Reshape the file into a real v1 store: drop the tables added
+    // since v1 and the added columns, then stamp user_version=1.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "DROP TABLE artifact_handoffs;
              DROP TABLE verification_results;
-             ALTER TABLE invocations DROP COLUMN descendants;",
+             DROP TABLE worker_request_exports;
+             ALTER TABLE invocations DROP COLUMN descendants;
+             ALTER TABLE body_catalog DROP COLUMN pin_state;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 1i64).unwrap();
@@ -3459,6 +3461,51 @@ fn a_v1_store_upgrades_to_the_current_format_preserving_rows() {
             Ok(())
         })
         .unwrap();
+    // A second open must not re-migrate — the schema is already current.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+}
+
+/// Regression: a genuine v2 store upgrades to the current format in
+/// place — the worker_request_exports table and the body catalogue's
+/// pin_state appear and stamped rows survive; a second open is a
+/// no-op because the migration is idempotent.
+#[test]
+fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
+    let root = temp_root("upgrade-v2");
+    let db = root.join("store.db");
+    let request = submit("k-upgrade-v2");
+    let (work_id, _) = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
+    };
+    // Reshape the file into a real v2 store: drop the v3 table and the
+    // v4 column, then stamp user_version=2.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE worker_request_exports;
+             ALTER TABLE body_catalog DROP COLUMN pin_state;
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+    }
+    let store = SqliteStore::open(&db, 1).unwrap();
+    store
+        .transact(|tx| {
+            let work = tx.work(&work_id)?.expect("work row survives the upgrade");
+            assert_eq!(work.version, 1);
+            // The v3 table is installed and usable again.
+            assert!(tx.worker_request_export("worker:inv-nobody")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "the upgrade lands on the current format");
+    }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
 }
@@ -4422,6 +4469,39 @@ fn a_versioned_file_without_the_recognized_schema_is_refused() {
     );
 }
 
+/// Regression: a file stamped v2 but missing v2-era tables is refused —
+/// the additive migration may recreate only the post-v2 additions on an
+/// honest v2 file, never a damaged one.
+#[test]
+fn a_versioned_file_missing_the_v2_schema_is_refused() {
+    let root = temp_root("cutover-foreign-v2");
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE artifact_handoffs; PRAGMA user_version=2;")
+            .unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { detail }) => {
+            assert!(detail.contains("v2"), "detail: {detail}");
+        }
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("a stamped v2 file missing v2 tables must be refused"),
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='artifact_handoffs')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!exists, "a refused open must not recreate dropped tables");
+}
+
 /// Regression: a store created by the previous release — stamped v1,
 /// full base schema, none of this slice's additive tables — opens and
 /// is upgraded in place. Refusing it as "not the recognized schema"
@@ -4469,7 +4549,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3, "the upgrade lands on the current format");
+        assert_eq!(version, 4, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

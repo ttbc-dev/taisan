@@ -45,8 +45,8 @@ skipped for that row, never substituted. Suite runner:
 | HC-CAP-03 approval/ready explicit | covered — `approval_and_ready_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
 | HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
-| HC-READ-01 typed reads | incomplete — read-model ops not in vocabulary | incomplete — same | incomplete — same | incomplete |
-| HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete |
+| HC-READ-01 typed reads | incomplete — typed read-model operations absent from the contract vocabulary | incomplete — same | incomplete — same | incomplete — spike not run |
+| HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete — spike not run |
 
 HC-CAP-02 measures a fixture's own explicit-unsupported behavior; a
 fixture implementing every declared operation has nothing to exercise
@@ -74,14 +74,49 @@ Core/Command change — fixture-level exchangeability for those
 operations only, with valid scenario evidence cited above. `SparseHost`
 proves the runner's declared-set skip path rather than full coverage.
 
+### Claim binding (fixture evidence only — spike not run)
+
+Every operation named in the claim is bound below to the matrix rows
+that back it on the fixture side. The live-spike side of every one of
+those rows is `incomplete — spike not run`; nothing in this table
+constitutes, or may be read as, live evidence.
+
+| Claimed operation | Backing rows (fixture side) | Live gate |
+| --- | --- | --- |
+| `push_ref` | HC-BASE-01/02 (`baseline_effects_apply`), HC-PART-01 (`partial_receipts_stay_separate`), HC-SWAP-01 (`config_swap_keeps_recorded_binding`) | not run — incomplete |
+| `open_change_request` | HC-BASE-02 (`baseline_effects_apply`), HC-PART-01 (`partial_receipts_stay_separate`) | not run — incomplete |
+| `update_change_request` | HC-BASE-03 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
+| `post_comment` | HC-BASE-04 (`expected_head_mismatch_aborts_write`) | not run — incomplete |
+| read/check/review observations | HC-SNAP-01 (`stale_head_evidence_cannot_complete`) | not run — incomplete |
+
 ## Remaining limitations
 
+- `HC-CAP-02` is exercised only by `SparseHost` — both
+  full-baseline fixtures implement every declared operation, so there is
+  nothing for them to refuse (by design, not an omission), but that
+  means the row carries no `FixtureGithub`/`GitlabFixture` evidence.
+- `HC-BASE-03` and `HC-BASE-04` are `skipped` on `SparseHost` because
+  that fixture does not declare `change_request_update` or
+  `comment_create`; the declared-set skip is by design, but it means the
+  row carries no `SparseHost` evidence (both full-baseline fixtures
+  cover it).
+- `HC-DELIV-01`, `HC-LIFE-01` and `HC-LIFE-02` are exercised only by
+  `FixtureGithub` (the fixture adapter suite instantiates it only);
+  `GitlabFixture` and `SparseHost` have no delivery-idempotency or
+  deferred-settlement evidence.
+- `HC-READ-01` — no fixture evidence at all (read-model ops are not in
+  the vocabulary).
+- `HC-LIFE-03` is partial on every side — restart durability is
+  exercised via durable-store tests; rename and mid-Work actor change
+  are uncovered.
 - No live claim: U9.4 (#80) has not run; approval/readiness semantics,
   actor eligibility, denied-permission injection, and restart
-  reconciliation on a real host remain unproven.
+  reconciliation on a real host remain unproven — every live cell in
+  the coverage matrix is `incomplete — spike not run`, with this reason.
 - `approve_change` / `mark_ready` / thread operations are absent from
   the `HostAction` vocabulary — structurally unsupported, not yet
-  implementable (HC-CAP-03).
+  implementable (HC-CAP-03, covered by a fixture-independent type-level
+  check on all fixtures).
 - Typed read-model operations for issue content, comments, and threads
   are not in the contract vocabulary (HC-READ-01).
 - Rename, mid-Work actor change, and cross-instance delivery-ID

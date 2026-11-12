@@ -10,12 +10,12 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `3` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` or `2` must carry the
-//! complete recognized earlier schema and upgrades additively at open;
-//! a stamped file whose schema is foreign or incomplete, an unversioned
-//! database with user tables (a slice-0 file — archive-only), and a
-//! newer version are all refused at open.
+//! `PRAGMA user_version` is the format gate: `4` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, or `3` must carry
+//! the complete recognized schema of its version and upgrades
+//! additively at open; a stamped file whose schema is foreign or
+//! incomplete, an unversioned database with user tables (a slice-0
+//! file — archive-only), and a newer version are all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -30,14 +30,16 @@ use workloop_core::store::{
     Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent, RecoveryIntentState, Store,
     StoreError, TxView,
 };
+use workloop_core::worker::WorkerRequestExport;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// The only store format this binary reads or writes. `2` adds the
 /// `invocations.descendants` column and the artifact-handoff and
-/// verification tables; `3` adds the body catalogue's explicit
-/// `pin_state`. Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 3;
+/// verification tables; `3` adds the `worker_request_exports` table;
+/// `4` adds the body catalogue's explicit `pin_state`. Older files
+/// upgrade additively at open.
+const FORMAT_VERSION: i64 = 4;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -71,6 +73,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "stop_intents",
     "store_meta",
     "verification_results",
+    "worker_request_exports",
     "work_issue_refs",
     "work_usage",
     "works",
@@ -88,6 +91,9 @@ const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intent
 /// file to migrate — that check is what keeps a foreign stamped file
 /// refused instead of silently reshaped.
 const V2_ADDED_TABLES: &[&str] = &["artifact_handoffs", "verification_results"];
+
+/// Tables the v2 → v3 migration adds (same additive shape as v1 → v2).
+const V3_ADDED_TABLES: &[&str] = &["worker_request_exports"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -218,24 +224,41 @@ impl SqliteStore {
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
             // An upgrade is legitimate only for a file that holds the
-            // complete v1 schema: every expected table except the ones
-            // added since v1 — the run-lease slice's additive set plus
-            // the two v2 additions — must already be present. A foreign
-            // file stamped 1 fails this check untouched, and the one
-            // accepted difference is the previous release's store: it
-            // holds every base table and none of the additions, so it is
-            // upgraded in place instead of being locked out with a
-            // misleading "not the recognized schema" refusal.
+            // complete schema of its stamped version: a v1 file must
+            // hold every expected table except the ones added since —
+            // the run-lease slice's additive set, the two v2 additions,
+            // and the v3 addition — a v2 file everything except the v3
+            // addition, and a v3 file the complete set (v4 adds a
+            // column, not a table). A foreign or truncated stamped file
+            // fails this check untouched, and the accepted difference
+            // is a previous release's store: it holds every base table
+            // and none of the additions, so it is upgraded in place
+            // instead of being locked out with a misleading "not the
+            // recognized schema" refusal.
             let present = table_set(&conn)?;
-            let v1_complete = EXPECTED_TABLES
-                .iter()
-                .filter(|t| !V2_ADDED_TABLES.contains(t) && !ADDITIVE_TABLES.contains(t))
-                .all(|t| present.contains(*t));
-            if !v1_complete {
+            let required_complete = if version == 1 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| {
+                        !V2_ADDED_TABLES.contains(t)
+                            && !ADDITIVE_TABLES.contains(t)
+                            && !V3_ADDED_TABLES.contains(t)
+                    })
+                    .all(|t| present.contains(*t))
+            } else if version == 2 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V3_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else {
+                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
+            };
+            if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
-                    detail: "store file claims the v1 format but does \
-                             not hold the recognized schema"
-                        .into(),
+                    detail: format!(
+                        "store file claims the v{version} format but does \\
+                         not hold the recognized schema"
+                    ),
                 });
             }
             // Additive migration inside one transaction: the new tables,
@@ -732,6 +755,23 @@ fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite
         invalid_reason: row.get(9)?,
         attempt: row.get::<_, u32>(10)?,
         recorded_seq: row.get(11)?,
+    })
+}
+
+const WORKER_REQUEST_EXPORT_COLS: &str =
+    "invocation_id, request_id, profile_id, workspace_root, digest, state, process_identity";
+
+fn worker_request_export_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<WorkerRequestExport, rusqlite::Error> {
+    Ok(WorkerRequestExport {
+        invocation_id: InvocationId(row.get::<_, String>(0)?),
+        request_id: row.get(1)?,
+        profile_id: row.get(2)?,
+        workspace_root: row.get(3)?,
+        digest: row.get(4)?,
+        state: untag(&row.get::<_, String>(5)?)?,
+        process_identity: row.get(6)?,
     })
 }
 
@@ -1325,6 +1365,20 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn worker_request_export(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<WorkerRequestExport>, StoreError> {
+        self.query_opt(
+            &format!(
+                "SELECT {WORKER_REQUEST_EXPORT_COLS} FROM worker_request_exports \
+                 WHERE request_id=?1"
+            ),
+            params![request_id],
+            worker_request_export_from_row,
+        )
+    }
+
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {
         self.query_opt(
             &format!("SELECT {HANDOFF_COLS} FROM artifact_handoffs WHERE artifact_id=?1"),
@@ -1753,6 +1807,41 @@ impl TxView for Tx<'_> {
                         json(&invocation.evidence_refs)?,
                     ],
                 )?;
+            }
+            Effect::InsertWorkerRequestExport { export } => {
+                self.exec(
+                    "INSERT INTO worker_request_exports \
+                     (invocation_id, request_id, profile_id, workspace_root, \
+                      digest, state, process_identity) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        export.invocation_id.0,
+                        export.request_id,
+                        export.profile_id,
+                        export.workspace_root,
+                        export.digest,
+                        tag(&export.state),
+                        export.process_identity,
+                    ],
+                )?;
+            }
+            Effect::BindWorkerRequestExport {
+                request_id,
+                process_identity,
+            } => {
+                let n = self.exec(
+                    "UPDATE worker_request_exports \
+                     SET state='bound', process_identity=?2 \
+                     WHERE request_id=?1 AND state='exported'",
+                    params![request_id, process_identity],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "worker request export {request_id} is absent or already bound"
+                        ),
+                    });
+                }
             }
             Effect::UpdateInvocation {
                 invocation,
