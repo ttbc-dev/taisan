@@ -31,10 +31,22 @@ use workloop_core::ports::{ProbeOutcome, ProcessControlPort, SpawnError};
 pub struct WorkerDeclaration {
     pub adapter: AdapterId,
     pub adapter_version: String,
+    /// The declared runtime product identity (`runtime.name` or
+    /// `runtime.product`). A product swap under the same version string
+    /// is a different worker, so the product digests with the
+    /// capability surface while the version compares on its own.
+    pub runtime_product: String,
     pub runtime_version: String,
     pub protocol_versions: Vec<String>,
     pub roles: Vec<String>,
     pub capabilities: Vec<String>,
+    /// The declared `WorkerCapabilities` fields the supervisor does not
+    /// model individually — `resume`, `checkpoints`,
+    /// `runtime_artifact_store`, `local_retries` — kept verbatim so a
+    /// drift confined to any of them still shifts the capability
+    /// digest into a configuration repair instead of an invisible
+    /// launch.
+    pub declared_surface: serde_json::Value,
 }
 
 impl WorkerDeclaration {
@@ -54,9 +66,11 @@ impl WorkerDeclaration {
         let payload = serde_json::json!({
             "adapter": self.adapter.as_str(),
             "adapter_version": self.adapter_version,
+            "runtime_product": self.runtime_product,
             "protocol_versions": sorted(&self.protocol_versions),
             "roles": sorted(&self.roles),
             "capabilities": sorted(&self.capabilities),
+            "declared_surface": self.declared_surface,
         });
         sha256_hex(
             "worker-capability-declaration-v1",
@@ -198,6 +212,8 @@ fn observe_worker_declaration_within(
             })
             .unwrap_or_default()
     };
+    let runtime = value.get("runtime");
+    let declared = |key: &str| value.get(key).cloned().unwrap_or(serde_json::Value::Null);
     Ok(WorkerDeclaration {
         adapter,
         adapter_version: value
@@ -205,19 +221,26 @@ fn observe_worker_declaration_within(
             .and_then(|v| v.as_str())
             .unwrap_or("undeclared")
             .to_string(),
+        runtime_product: runtime
+            .and_then(|r| r.get("name").or_else(|| r.get("product")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("undeclared")
+            .to_string(),
         runtime_version: value
             .get("runtime_version")
-            .or_else(|| {
-                value
-                    .get("runtime")
-                    .and_then(|runtime| runtime.get("version"))
-            })
+            .or_else(|| runtime.and_then(|runtime| runtime.get("version")))
             .and_then(|v| v.as_str())
             .unwrap_or("undeclared")
             .to_string(),
         protocol_versions: strings("protocol_versions"),
         roles: strings("roles"),
         capabilities: strings("capabilities"),
+        declared_surface: serde_json::json!({
+            "resume": declared("resume"),
+            "checkpoints": declared("checkpoints"),
+            "runtime_artifact_store": declared("runtime_artifact_store"),
+            "local_retries": declared("local_retries"),
+        }),
     })
 }
 
@@ -231,10 +254,17 @@ mod tests {
         WorkerDeclaration {
             adapter: AdapterId::trusted(adapter),
             adapter_version: "1.0.0".into(),
+            runtime_product: "fixture-runtime".into(),
             runtime_version: runtime.into(),
             protocol_versions: vec!["taisan.worker/1".into()],
             roles: vec!["coding".into()],
             capabilities: vec!["workspace_write".into()],
+            declared_surface: serde_json::json!({
+                "resume": "unsupported",
+                "checkpoints": "workspace_commits",
+                "runtime_artifact_store": null,
+                "local_retries": "runtime_internal",
+            }),
         }
     }
 
@@ -262,6 +292,23 @@ mod tests {
                 assert!(reason.contains("adapter.version_mismatch"), "{reason}");
                 assert!(reason.contains("capability.digest_mismatch"), "{reason}");
                 assert!(!reason.contains("runtime.version_mismatch"), "{reason}");
+            }
+            other => panic!("expected configuration repair, got {other:?}"),
+        }
+    }
+
+    /// A drift confined to the unmodelled `WorkerCapabilities` fields
+    /// still shifts the capability digest, so it selects a
+    /// configuration repair rather than an invisible launch.
+    #[test]
+    fn a_declared_surface_drift_is_a_capability_repair() {
+        let argv = vec!["worker".into()];
+        let stored = declaration("adapter-a", "1.0.0").binding(&argv);
+        let mut changed = declaration("adapter-a", "1.0.0");
+        changed.declared_surface["resume"] = serde_json::json!("supported");
+        match select_adapter(&changed, &stored) {
+            AdapterSelection::ConfigurationRepair { reason } => {
+                assert!(reason.contains("capability.digest_mismatch"), "{reason}");
             }
             other => panic!("expected configuration repair, got {other:?}"),
         }

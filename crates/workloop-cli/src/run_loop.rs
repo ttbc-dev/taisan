@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
-use workloop_core::domain::{ExecutionState, WorkId};
+use workloop_core::domain::{ExecutionId, ExecutionState, WorkId};
 use workloop_core::identity::AdapterId;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
@@ -351,13 +351,15 @@ pub fn run_pass(
             if let Some(supervisor) = pass.supervisor
                 && !unbound.is_empty()
             {
-                let mut by_workspace: std::collections::BTreeMap<PathBuf, Vec<String>> =
-                    std::collections::BTreeMap::new();
+                let mut by_workspace: std::collections::BTreeMap<
+                    PathBuf,
+                    Vec<(String, ExecutionId)>,
+                > = std::collections::BTreeMap::new();
                 for request in &unbound {
                     by_workspace
                         .entry(supervisor.workspace_of(&request.work_id))
                         .or_default()
-                        .push(request.request_id.clone());
+                        .push((request.request_id.clone(), request.execution_id.clone()));
                 }
                 for (workspace, request_ids) in by_workspace {
                     // Each probe spawns a bounded `describe`, so like
@@ -368,6 +370,26 @@ pub fn run_pass(
                     if clock() >= deadline {
                         binding_cut = true;
                         break;
+                    }
+                    // The dispatch-transaction Ready read is stale by
+                    // now: a lease-free command (e.g. cancel) can move
+                    // an Execution between it and this probe. Re-read
+                    // before spawning — a request whose Execution can
+                    // no longer launch is never probed at all.
+                    let still_ready = store.transact(|tx| {
+                        let mut ready = Vec::new();
+                        for (request_id, execution_id) in &request_ids {
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                ready.push((request_id.clone(), execution_id.clone()));
+                            }
+                        }
+                        Ok(ready)
+                    })?;
+                    if still_ready.is_empty() {
+                        continue;
                     }
                     // The probe spawns inside the workspace the consume
                     // path would create before launch; a fresh Work's
@@ -386,11 +408,19 @@ pub fn run_pass(
                     };
                     let binding = declaration.binding(&supervisor.worker_argv);
                     store.transact(|tx| {
-                        for request_id in &request_ids {
-                            tx.apply(&Effect::BindRequestAdapter {
-                                request_id: request_id.clone(),
-                                binding: binding.clone(),
-                            })?;
+                        for (request_id, execution_id) in &still_ready {
+                            // The same gate once more inside the commit:
+                            // an Execution stopped between the pre-probe
+                            // read and this transaction is not bound.
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                tx.apply(&Effect::BindRequestAdapter {
+                                    request_id: request_id.clone(),
+                                    binding: binding.clone(),
+                                })?;
+                            }
                         }
                         Ok(())
                     })?;

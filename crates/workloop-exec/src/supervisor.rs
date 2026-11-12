@@ -1055,10 +1055,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // probe bound: re-read it after the consume commit so a stop or
         // cancel committed while `describe` ran still blocks the spawn —
         // the request is consumed, so blocking the launch abandons the
-        // recorded Invocation.
-        let launchable = store
-            .transact(|tx| tx.execution(&request.execution_id))?
-            .is_some_and(|e| e.state == ExecutionState::Ready);
+        // recorded Invocation. The spawn also requires the recorded
+        // binding: when the pre-probe read skipped `describe` the bound
+        // argv was never re-verified, so a state that flipped back to
+        // Ready must not fall through to the configured `worker_argv`
+        // and launch with no recorded selection.
+        let launchable = binding.is_some()
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
         if !launchable {
             store.transact(|tx| {
                 let mut next = invocation.clone();
@@ -1076,11 +1081,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let workspace = self.workspace_of(&work_id);
         std::fs::create_dir_all(&workspace)?;
         // The bound argv is the recorded selection — a `worker_argv`
-        // change after binding never retargets this request.
+        // change after binding never retargets this request, and the
+        // launchable gate above already proved a binding was recorded.
         let argv = binding
-            .as_ref()
-            .map(|binding| binding.argv.clone())
-            .unwrap_or_else(|| self.worker_argv.clone());
+            .map(|binding| binding.argv)
+            .expect("a launch requires a recorded binding");
         match self.port.spawn(&argv, &workspace) {
             Ok(identity) => {
                 // Descendant coverage starts at launch: a writer that

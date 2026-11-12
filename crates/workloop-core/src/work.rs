@@ -2156,9 +2156,9 @@ pub fn admit_queued_role(
         // Created unbound: the adapter binding is recorded later from a
         // live `describe` declaration — either by the Phase-2
         // dispatch-admission probe, which binds unbound pending
-        // requests to the current worker inside the admission
-        // transaction, or by `execution` immediately before the first
-        // launch. It is never inferred from configuration.
+        // requests to the current worker in a transaction following
+        // the admission scan, or by `execution` immediately before the
+        // first launch. It is never inferred from configuration.
         adapter_binding: None,
     };
     let mut next = execution.clone();

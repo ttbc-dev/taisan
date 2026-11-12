@@ -12,8 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 const USAGE: &str = "usage: workloop-fixture-worker <mode> [--interval-ms <n>] \
-    [--file <name>]\nmodes: clean-exit | exit-no-artifact | hang | setsid-escape | \
-    orphan-writer | zombie | path-reopen | makedirs-writer\ninternal: \
+    [--file <name>] [--runtime-version <v>] [--adapter-version <v>]\nmodes: \
+    clean-exit | exit-no-artifact | hang | setsid-escape | orphan-writer | \
+    zombie | path-reopen | makedirs-writer | describe\ninternal: \
     escaped-writer | exit-now";
 
 struct Args {
