@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "kind": "s1-seeded-issue",
+  "status": "prepared",
+  "live_execution_authorized": false,
+  "run_tag_template": "<run-tag>",
+  "title_template": "S1 seed <run-tag>: normalize greeting output",
+  "body_template": "Add a `greet(name)` helper to the sample module.\n\n- Return `Hello, <name>!` for non-empty, trimmed input.\n- Return `Hello!` for empty or whitespace-only input.\n- Restrict writes to the sample module and its test file.\n- Do not force-push, merge, or deploy.\n\nThe request intentionally leaves input validation for `None`/`null` callers and a docstring unstated; a reviewer is expected to flag at least one of them.",
+  "labels": [],
+  "label_policy": "The label set is empty and must stay disjoint from every label any automation lane selects on. Seeded issues are created manually or by the fixture procedure, never through a lane intake.",
+  "constraints": {
+    "writable_paths": [
+      "sample module",
+      "sample module test file"
+    ],
+    "force_push": false,
+    "merge": false,
+    "deploy": false
+  },
+  "verification_argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-v"
+  ],
+  "expected_review_gap": [
+    "missing docstring",
+    "unguarded None input"
+  ],
+  "zero_finding_policy": "A zero-finding review leaves the review/fix leg unexercised; record the run as review/fix-unexercised, adjust the seed, and rerun under a new run tag. Never reinterpret zero findings as success.",
+  "variants": {
+    "success": {
+      "purpose": "Expected path with one real review round and one converged fix round.",
+      "seed_adjustment": "None; the seeded request and engineered review gap are used unchanged.",
+      "expected_outcome": {
+        "work_state": "succeeded",
+        "required_path": [
+          "submit",
+          "dispatch",
+          "artifact",
+          "publish H1",
+          "checks and review with findings",
+          "judge and fix",
+          "publish H2",
+          "reassess H2",
+          "succeeded"
+        ],
+        "must_not": [
+          "merge",
+          "deploy",
+          "zero-finding success"
+        ]
+      }
+    },
+    "Attention": {
+      "purpose": "Bounded non-convergence or a human-judgment finding surfaces actionable Attention without silent settlement.",
+      "seed_adjustment": "Use the non-converging scenario Worker and a Work-wide fix bound so the review gap survives the fix round.",
+      "expected_outcome": {
+        "work_state": "paused",
+        "required_path": [
+          "submit",
+          "dispatch",
+          "publish H1",
+          "review with findings",
+          "fix bound exhausted",
+          "paused_judgment Attention"
+        ],
+        "must_not": [
+          "succeeded",
+          "silent retry past the bound",
+          "acknowledgement treated as repair"
+        ]
+      }
+    },
+    "recovery": {
+      "purpose": "Lost responses, unknown host effects, duplicate delivery, or restart reconciliation are recovered under the original identities.",
+      "seed_adjustment": "None; inject the abnormal input at the named step and retain the original seed and run tag.",
+      "expected_outcome": {
+        "work_state": "succeeded-or-typed-terminal",
+        "required_path": [
+          "submit",
+          "inject lost response or duplicate delivery or restart",
+          "reconcile by original identity",
+          "resume or retry within budget",
+          "typed terminal outcome"
+        ],
+        "must_not": [
+          "fresh-key duplicate Work",
+          "second push or PR creation from response loss",
+          "second writer while the old writer is unproven",
+          "unknown treated as failure"
+        ]
+      }
+    }
+  }
+}
