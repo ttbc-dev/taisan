@@ -107,3 +107,21 @@ missing the adapter identity, makes the adapter not selectable as
 compared or dispatched on. The capability digest sorts the declared
 protocol, role, and capability lists before hashing, so set-order
 changes do not masquerade as a capability change.
+
+## Shared suite rerun (U4.6b)
+
+`worker_contract.rs::u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality`
+executes the identical scenario table twice through the supervisor and
+the public Command/Query path — once bound to the reference worker,
+once to the independent contract Worker — and retains one
+[U4.6 record](worker-protocol.md#u46-evidence-record) per case per
+implementation. The records differ only in adapter identity: every
+case's Outcome signature — execution states, waiting reasons, terminal
+codes, invocation states and roles, writer-identity presence, intent
+statuses, and spawn-attempt counts — is equal across the two runs, and
+the skip partition is identical (the POSIX model surface is
+binary-independent). `u46b_suite_source_has_no_adapter_name_branch` is
+the named static check: adapter identities may appear only inside the
+suite's marked injection boundary, and never on a conditional,
+comparison, or assertion line — no case may branch on which worker is
+bound.

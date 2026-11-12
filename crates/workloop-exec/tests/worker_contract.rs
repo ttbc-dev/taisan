@@ -9,12 +9,16 @@
 //! - `PosixProvider`: `Supervisor<CountingPosix>` — an observational
 //!   decorator that delegates spawn/inspect/signal to
 //!   `PosixProcessControl` and records every spawn call and spawned
-//!   identity — spawning the real `workloop-fixture-worker` binary —
+//!   identity — spawning whichever worker binary it is bound to —
 //!   real spawn, real signals.
 //! - `ScriptedProvider`: `Supervisor<ScriptedProcessControl>`, an
 //!   independently implemented in-memory port that models spawn
 //!   outcomes no argv can produce (lost/unknown starts, uninspectable
 //!   liveness).
+//!
+//! The U4.6b rerun at the bottom of this file executes the identical
+//! suite twice — once per bound worker adapter — and retains one U4.6
+//! record per case per implementation.
 //!
 //! Scenario assertions bind the durable store plus facts observable at
 //! the port boundary — spawn count, delivered signals, recorded writer
@@ -51,13 +55,6 @@ fn host() -> HostInstanceId {
 
 fn repo() -> RepositoryRef {
     RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
-}
-
-fn fixture_bin() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/workloop-fixture-worker")
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn tmp_root(tag: &str) -> PathBuf {
@@ -381,6 +378,36 @@ struct PosixProvider {
     fail_next: Rc<Cell<bool>>,
 }
 
+impl PosixProvider {
+    /// A Posix provider bound to one worker binary — the only variable
+    /// the recorded U4.6b rerun changes between implementations.
+    fn make_bound(shape: WorkerShape, tag: &str, config: &WorkloopConfig, bin: &str) -> Self {
+        let spawned = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let fail_next = Rc::new(Cell::new(false));
+        let mode = match shape {
+            WorkerShape::CleanExit => "clean-exit",
+            WorkerShape::NoArtifact => "exit-no-artifact",
+            WorkerShape::Resident => "hang",
+        };
+        PosixProvider {
+            sup: Supervisor::new(
+                CountingPosix {
+                    spawned: spawned.clone(),
+                    calls: calls.clone(),
+                    fail_next: fail_next.clone(),
+                },
+                tmp_root(tag),
+                vec![bin.to_string(), mode.into()],
+                config.clone(),
+            ),
+            spawned,
+            calls,
+            fail_next,
+        }
+    }
+}
+
 impl WorkerProvider for PosixProvider {
     fn declares() -> &'static [&'static str] {
         // Real spawn semantics only: outcomes a process cannot fake
@@ -396,29 +423,7 @@ impl WorkerProvider for PosixProvider {
         ]
     }
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
-        let spawned = Rc::new(RefCell::new(Vec::new()));
-        let calls = Rc::new(Cell::new(0));
-        let fail_next = Rc::new(Cell::new(false));
-        let mode = match shape {
-            WorkerShape::CleanExit => vec![fixture_bin(), "clean-exit".into()],
-            WorkerShape::NoArtifact => vec![fixture_bin(), "exit-no-artifact".into()],
-            WorkerShape::Resident => vec![fixture_bin(), "hang".into()],
-        };
-        PosixProvider {
-            sup: Supervisor::new(
-                CountingPosix {
-                    spawned: spawned.clone(),
-                    calls: calls.clone(),
-                    fail_next: fail_next.clone(),
-                },
-                tmp_root(tag),
-                mode,
-                config.clone(),
-            ),
-            spawned,
-            calls,
-            fail_next,
-        }
+        Self::make_bound(shape, tag, config, &fixture_bin())
     }
     fn handle(&mut self) -> &mut dyn WorkerHandle {
         self
@@ -1243,3 +1248,376 @@ fn scripted_provider_runs_the_same_suite() {
     assert!(skipped.is_empty());
     assert_eq!(covered.len(), scenarios().len(), "{covered:?}");
 }
+
+// ---- the recorded rerun (U4.6b) ---------------------------------------
+
+/// The adapter-neutral outcome a covered case leaves behind: durable
+/// store facts plus the port-boundary spawn count. Two implementations
+/// must produce identical signatures; only adapter identity differs.
+#[derive(Debug, PartialEq)]
+struct CaseSignature {
+    executions: Vec<String>,
+    invocations: Vec<String>,
+    intent_statuses: Vec<String>,
+    spawn_calls: usize,
+}
+
+/// The adapter selection a covered case's durable request recorded —
+/// the `configuration_identity` half of the U4.6 record. It is absent
+/// for cases that never consume their request.
+#[derive(Debug)]
+struct RecordedBinding {
+    request_id: String,
+    adapter_id: String,
+    adapter_version: String,
+    runtime_version: String,
+    capability_digest: String,
+    argv: Vec<String>,
+}
+
+/// One case row of a recorded run: the retained U4.6 record plus the
+/// typed pieces the comparison asserts on.
+struct CaseRow {
+    id: &'static str,
+    result: String,
+    missing: Vec<&'static str>,
+    signature: Option<CaseSignature>,
+    bindings: Vec<RecordedBinding>,
+    record: serde_json::Value,
+}
+
+/// Read back the adapter-neutral Outcome signature and the recorded
+/// adapter bindings a finished scenario left in the store.
+fn collect_case(
+    store: &SqliteStore,
+    provider: &PosixProvider,
+) -> (CaseSignature, Vec<RecordedBinding>) {
+    let (mut executions, mut invocations, intents, bindings) = store
+        .transact(|tx| {
+            let mut executions = Vec::new();
+            let mut invocations = Vec::new();
+            let mut bindings = Vec::new();
+            for work in tx.works()? {
+                for e in tx.executions_for_work(&work.id)? {
+                    executions.push(format!(
+                        "state={:?} waiting={:?} terminal={:?} invocations_used={}",
+                        e.state, e.waiting_reason, e.terminal_code, e.invocations_used
+                    ));
+                    for i in tx.invocations_for_execution(&e.id)? {
+                        invocations.push(format!(
+                            "state={:?} role={:?} writer_identity={}",
+                            i.state,
+                            i.role,
+                            i.process_identity.is_some()
+                        ));
+                    }
+                    if let Some(req) = tx.request(&format!("{}:inv:0", e.id.0))?
+                        && let Some(b) = req.adapter_binding
+                    {
+                        bindings.push(RecordedBinding {
+                            request_id: req.request_id.clone(),
+                            adapter_id: b.adapter.as_str().to_string(),
+                            adapter_version: b.adapter_version,
+                            runtime_version: b.runtime_version,
+                            capability_digest: b.capability_digest,
+                            argv: b.argv,
+                        });
+                    }
+                }
+            }
+            let mut intents: Vec<String> = tx
+                .action_intents()?
+                .iter()
+                .map(|i| format!("{:?}", i.status))
+                .collect();
+            intents.sort();
+            Ok((executions, invocations, intents, bindings))
+        })
+        .unwrap();
+    executions.sort();
+    invocations.sort();
+    (
+        CaseSignature {
+            executions,
+            invocations,
+            intent_statuses: intents,
+            spawn_calls: provider.spawns(),
+        },
+        bindings,
+    )
+}
+
+/// The signature facts a retained record cites as evidence.
+fn signature_refs(sig: &CaseSignature) -> Vec<String> {
+    let mut refs: Vec<String> = sig
+        .executions
+        .iter()
+        .map(|e| format!("execution {e}"))
+        .chain(sig.invocations.iter().map(|i| format!("invocation {i}")))
+        .chain(sig.intent_statuses.iter().map(|s| format!("intent {s}")))
+        .collect();
+    refs.push(format!("spawn_attempts={}", sig.spawn_calls));
+    refs
+}
+
+/// `HEAD` / merge-base of this checkout at run time. The retained
+/// evidence stamps the committed slice SHA; in-test the live revision
+/// is the honest value.
+fn checkout_revision(argv: &[&str]) -> String {
+    std::process::Command::new("git")
+        .args(argv)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// A retained record in the U4.6 evidence format — the closed field
+/// set of `docs/worker-protocol.md#u46-evidence-record`.
+fn case_record(
+    id: &str,
+    result: &str,
+    tested: &str,
+    base: &str,
+    bindings: &[RecordedBinding],
+    evidence_refs: Vec<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "tested_revision": tested,
+        "base_revision": base,
+        "claim_class": "fixture_supported",
+        "configuration_identity": {
+            "installation": {
+                "host_instance": "test-host",
+                "repository": "local-repo",
+                "adapter": "worker-contract",
+                "contract_version": 1,
+            },
+            "adapter_selection": bindings.iter().map(|b| serde_json::json!({
+                "adapter_id": b.adapter_id,
+                "adapter_version": b.adapter_version,
+                "runtime_version": b.runtime_version,
+                "capability_digest": b.capability_digest,
+                "argv": b.argv,
+                "request_id": b.request_id,
+            })).collect::<Vec<_>>(),
+        },
+        "command_scenario": format!("worker_contract::{id}"),
+        "result": result,
+        "evidence_refs": evidence_refs,
+    })
+}
+
+/// Run the identical suite against one bound worker binary and retain
+/// one U4.6-format record per case. The only variable between two
+/// calls is `bin` — the adapter selection the supervisor binds.
+fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
+    let declared: BTreeSet<&'static str> = PosixProvider::declares().iter().copied().collect();
+    let tested = checkout_revision(&["rev-parse", "HEAD"]);
+    let base = checkout_revision(&["merge-base", "HEAD", "origin/main"]);
+    scenarios()
+        .iter()
+        .enumerate()
+        .map(|(i, scenario)| {
+            let missing: Vec<&'static str> = scenario
+                .requires
+                .iter()
+                .copied()
+                .filter(|r| !declared.contains(r))
+                .collect();
+            if !missing.is_empty() {
+                return CaseRow {
+                    id: scenario.id,
+                    result: "skipped".into(),
+                    missing: missing.clone(),
+                    signature: None,
+                    bindings: vec![],
+                    record: case_record(
+                        scenario.id,
+                        "skipped",
+                        &tested,
+                        &base,
+                        &[],
+                        vec![format!(
+                            "provider model surface does not declare: {}",
+                            missing.join(", ")
+                        )],
+                    ),
+                };
+            }
+            let store = SqliteStore::in_memory(2).unwrap();
+            let cfg = (scenario.config)();
+            let mut provider =
+                PosixProvider::make_bound(scenario.shape, &format!("{tag}-{i}"), &cfg, bin);
+            (scenario.run)(provider.handle(), &store);
+            let (signature, bindings) = collect_case(&store, &provider);
+            let record = case_record(
+                scenario.id,
+                "pass",
+                &tested,
+                &base,
+                &bindings,
+                signature_refs(&signature),
+            );
+            CaseRow {
+                id: scenario.id,
+                result: "pass".into(),
+                missing: vec![],
+                signature: Some(signature),
+                bindings,
+                record,
+            }
+        })
+        .collect()
+}
+
+/// U4.6b named run: the identical suite executes twice through the
+/// supervisor and the public Command/Query path — once with the
+/// reference worker bound, once with the independent contract Worker —
+/// and produces per-case records that differ only in adapter identity.
+#[test]
+fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
+    let reference = run_recorded_suite("u46b-a", &fixture_bin());
+    let rerun = run_recorded_suite("u46b-b", &contract_bin());
+    assert_eq!(reference.len(), rerun.len(), "the identical case table");
+    for (a, b) in reference.iter().zip(&rerun) {
+        assert_eq!(a.id, b.id, "the identical suite table");
+        assert_eq!(a.result, b.result, "{}: same result", a.id);
+        assert_eq!(a.missing, b.missing, "{}: same skip surface", a.id);
+        assert_eq!(
+            a.signature, b.signature,
+            "{}: identical Outcome under either adapter",
+            a.id
+        );
+        for key in [
+            "schema_version",
+            "tested_revision",
+            "base_revision",
+            "claim_class",
+            "configuration_identity",
+            "command_scenario",
+            "result",
+            "evidence_refs",
+        ] {
+            assert!(
+                a.record.get(key).is_some() && b.record.get(key).is_some(),
+                "{}: the record carries {key}",
+                a.id
+            );
+        }
+        assert_eq!(a.record["claim_class"], "fixture_supported");
+        assert_eq!(a.record["command_scenario"], b.record["command_scenario"]);
+        match (&a.bindings[..], &b.bindings[..]) {
+            ([x], [y]) => {
+                assert_ne!(
+                    x.adapter_id, y.adapter_id,
+                    "{}: the bound adapter is the only variable that changed",
+                    a.id
+                );
+                assert!(SUITE_ADAPTER_NAMES.contains(&x.adapter_id.as_str()));
+                assert!(SUITE_ADAPTER_NAMES.contains(&y.adapter_id.as_str()));
+            }
+            ([], []) => {}
+            _ => panic!("{}: binding presence differs across runs", a.id),
+        }
+    }
+    assert!(
+        reference
+            .iter()
+            .zip(&rerun)
+            .any(|(a, b)| matches!((&a.bindings[..], &b.bindings[..]), ([_], [_]))),
+        "at least one case bound an adapter in both runs — the \
+         adapter difference is exercised, not vacuous"
+    );
+}
+
+/// U4.6b static check: the suite source contains no adapter-name
+/// branch. Adapter identities exist only inside the marked boundary
+/// below, and there only as data — never on a conditional, comparison,
+/// or assertion line. No case may branch on which worker is bound.
+#[test]
+fn u46b_suite_source_has_no_adapter_name_branch() {
+    const BEGIN: &str = "// ---- adapter identity boundary";
+    const END: &str = "// ---- end adapter identity boundary";
+    const FORBIDDEN_ON_NAME_LINE: &[&str] = &[
+        "if ",
+        "if(",
+        "match ",
+        "matches!",
+        "==",
+        "!=",
+        "=>",
+        "assert",
+        ".contains(",
+        "starts_with(",
+        "ends_with(",
+    ];
+    let lines: Vec<&str> = include_str!("worker_contract.rs").lines().collect();
+    let markers = |marker: &str| {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with(marker))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    };
+    let begins = markers(BEGIN);
+    let ends = markers(END);
+    assert_eq!(begins.len(), 1, "exactly one boundary-begin marker");
+    assert_eq!(ends.len(), 1, "exactly one boundary-end marker");
+    let (begin, end) = (begins[0], ends[0]);
+    assert!(begin < end, "the boundary opens before it closes");
+    for (n, line) in lines.iter().enumerate() {
+        for name in SUITE_ADAPTER_NAMES {
+            if line.contains(name) {
+                assert!(
+                    n > begin && n < end,
+                    "adapter name outside the identity boundary (line {}): {line}",
+                    n + 1
+                );
+                for token in FORBIDDEN_ON_NAME_LINE {
+                    assert!(
+                        !line.contains(token),
+                        "adapter-name conditional (line {}): {line}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---- adapter identity boundary (U4.6b) ---------------------------------
+// The only place worker adapter names may appear in this file, held as
+// plain data: the binaries the suite binds and the name list the
+// static check scans for. No scenario or provider may branch on them.
+
+/// Adapter identities the suite may be bound to — the set the static
+/// check scans the whole file for.
+const SUITE_ADAPTER_NAMES: &[&str] = &["workloop-fixture-worker", "workloop-contract-worker"];
+
+/// The reference worker binary — the suite's baseline implementation.
+fn fixture_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-worker")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The independent deterministic contract Worker binary.
+fn contract_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-contract-worker")
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ---- end adapter identity boundary --------------------------------------

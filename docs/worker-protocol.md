@@ -296,7 +296,7 @@ A permanent refusal class (`provider_refused`) blocks the task immediately and c
 
 ## Shared Worker contract suite
 
-Both implementations run the same suite through the supervisor and the public Command/Query path. **Real**: the reference shim, run against a deterministic fake `claude` executable that replays scripted stream-json, plus a separate live smoke with the real runtime in U8. **Contract adapter**: an independently implemented deterministic Worker that shares no code with the shim and replays scripted results. The current fixture worker's process modes may be reused by the contract adapter's process cases.
+Both implementations run the same suite through the supervisor and the public Command/Query path. **Real**: the reference shim, run against a deterministic fake `claude` executable that replays scripted stream-json, plus a separate live smoke with the real runtime in U8. **Contract adapter**: an independently implemented deterministic Worker that shares no code with the shim and replays scripted results. The current fixture worker's process modes may be reused by the contract adapter's process cases. The U4.6b run executes the identical suite code twice — once with each adapter bound — and retains one [U4.6 record](#u46-evidence-record) per case per implementation; a named static check asserts the suite source contains no adapter-name branch.
 
 | ID | Case | Expected |
 | --- | --- | --- |
