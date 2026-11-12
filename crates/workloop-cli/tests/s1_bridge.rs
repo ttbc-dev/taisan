@@ -163,9 +163,12 @@ impl Fixture {
     }
 
     fn pr_creates(&self) -> Vec<String> {
+        // Create bodies can embed newlines (the action marker), so
+        // count invocation lines rather than raw lines.
         fs::read_to_string(self.fake.join("pr_creates.log"))
             .unwrap_or_default()
             .lines()
+            .filter(|l| l.starts_with("pr create"))
             .map(str::to_string)
             .collect()
     }
@@ -646,8 +649,10 @@ fn reconcile_continues_past_one_intents_failure() {
     fx.write_fake("compare_status", "ahead\n");
     fx.write_fake(
         "pulls_head",
-        r#"[{"node_id":"PR_x","number":7,"head":{"sha":"aaaa1111"},"base":{"ref":"main"}}]
+        &format!(
+            r#"[{{"node_id":"PR_x","number":7,"head":{{"sha":"aaaa1111"}},"base":{{"ref":"main"}},"body":"b\n\n<!-- workloop-action:{settled} -->"}}]
 "#,
+        ),
     );
     fx.tick(&[]);
     assert_eq!(
@@ -835,12 +840,16 @@ fn reconcile_open_holds_unknown_when_the_change_targets_another_base() {
         fx.pr_creates().is_empty(),
         "reconcile settles by read only — never a second create"
     );
-    // Once the remote answers an open change on the intent's own base,
-    // the next pass settles it.
+    // Once the remote answers an open change on the intent's own base
+    // carrying this intent's action marker, the next pass settles it —
+    // the marker proves the found change is this intent's effect, not
+    // a pre-existing one on the same branches.
     fx.write_fake(
         "pulls_head",
-        r#"[{"node_id":"PR_y","number":8,"head":{"sha":"aaaa1111"},"base":{"ref":"main"}}]
+        &format!(
+            r#"[{{"node_id":"PR_y","number":8,"head":{{"sha":"aaaa1111"}},"base":{{"ref":"main"}},"body":"b\n\n<!-- workloop-action:{action_id} -->"}}]
 "#,
+        ),
     );
     fx.tick(&[]);
     assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
@@ -982,6 +991,63 @@ fn a_lost_create_response_never_creates_twice() {
         "the unverified create stays outstanding: {:?}",
         fx.intent_status(&action_id)
     );
+    // When the remote later lists the change this intent actually
+    // created — identifiable by the embedded action marker — the
+    // reconcile adopts it and settles, still without a second create.
+    fx.write_fake(
+        "pulls_head",
+        &format!(
+            r#"[{{"node_id":"PR_z","number":9,"head":{{"sha":"aaaa1111"}},"base":{{"ref":"main"}},"body":"b\n\n<!-- workloop-action:{action_id} -->"}}]
+"#,
+        ),
+    );
+    fx.tick(&[]);
+    assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
+    assert_eq!(fx.pr_creates().len(), 1);
+}
+
+/// A pre-existing open change on the same source/base pair is *not*
+/// this intent's effect: after a lost create response nothing
+/// distinguishes it from the change this intent may have made, so a
+/// body without this action's marker stays `unknown` — adoption would
+/// borrow another change's identity for the `ChangeOpened` effect.
+#[test]
+fn a_preexisting_change_without_the_marker_is_never_adopted() {
+    let fx = Fixture::new("unmarked-pr");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-unmarked-pr");
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: BRANCH.into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        HostActionStatus::Unknown {
+            reason: "create response lost".into(),
+        },
+        vec![],
+    );
+    // The remote lists an open change on the intent's head/base that
+    // carries a *different* marker (or none): ambiguity, not adoption.
+    fx.write_fake(
+        "pulls_head",
+        r#"[{"node_id":"PR_old","number":5,"head":{"sha":"aaaa1111"},"base":{"ref":"main"},"body":"someone else's change\n\n<!-- workloop-action:act_other -->"}]
+"#,
+    );
+    for _ in 0..2 {
+        fx.tick(&[]);
+    }
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "a foreign or unmarked change is never adopted: {:?}",
+        fx.intent_status(&action_id)
+    );
+    assert!(fx.pr_creates().is_empty());
 }
 
 /// `pending` does not prove the intent was never attempted: a crash

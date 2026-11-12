@@ -833,14 +833,35 @@ fn reconcile_push(
     reattempt(ctx, intent, key)
 }
 
+/// The marker the bridge embeds in a created change's body —
+/// `ActionMarker` in the effect schema. Adoption of a remote change
+/// requires it: without a marker tying the entry to this intent's
+/// identity, a same head/base match only proves *some* change exists,
+/// and adopting its number into `ChangeOpened` borrows another
+/// change's identity for an effect this intent cannot be shown to
+/// have made.
+fn action_marker(intent: &HostActionIntent) -> String {
+    format!("<!-- workloop-action:{} -->", intent.action_id)
+}
+
+/// Does this pulls-list entry carry this intent's marker? The read is
+/// authoritative only for a change this intent itself created — a
+/// pre-existing or foreign change on the same branches is ambiguity,
+/// not adoption.
+fn marker_matches(intent: &HostActionIntent, entry: &serde_json::Value) -> bool {
+    entry["body"]
+        .as_str()
+        .is_some_and(|body| body.contains(&action_marker(intent)))
+}
+
 /// Reconcile one `open_change_request` by read only: an open change
-/// under the intent's source branch *and* target base settles
-/// `applied`; without one the intent stays `unknown` and burns the
-/// bound. A create is not idempotent — re-issuing `gh pr create`
-/// after a response may have been lost is exactly the duplicate R-4
-/// forbids, so the reconcile never resends the write; a pre-existing
-/// open change from the same source to a different base is not this
-/// intent's effect either.
+/// under the intent's source branch, target base *and* action marker
+/// settles `applied`; without one the intent stays `unknown` and
+/// burns the bound. A create is not idempotent — re-issuing
+/// `gh pr create` after a response may have been lost is exactly the
+/// duplicate R-4 forbids, so the reconcile never resends the write;
+/// and a pre-existing open change on the same branches without this
+/// intent's marker is ambiguity, never this intent's effect.
 fn reconcile_open(
     ctx: &Ctx,
     intent: &HostActionIntent,
@@ -860,7 +881,10 @@ fn reconcile_open(
         Ok(pr) => {
             let Some(first) = pr.as_array().and_then(|a| {
                 a.iter()
-                    .find(|p| p["base"]["ref"].as_str() == Some(target_branch))
+                    .find(|p| {
+                        p["base"]["ref"].as_str() == Some(target_branch)
+                            && marker_matches(intent, p)
+                    })
                     .cloned()
             }) else {
                 emit_result_keyed(
@@ -869,7 +893,7 @@ fn reconcile_open(
                     key,
                     HostActionStatus::Unknown {
                         reason: format!(
-                            "no open change on base {target_branch} for {source_branch}; create effect unverified"
+                            "no open change on base {target_branch} for {source_branch} carrying this action's marker; create effect unverified"
                         ),
                     },
                     vec![],
@@ -1244,6 +1268,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                 );
                 return Ok(());
             }
+            // The marker embeds this intent's identity in the change
+            // body: it is what lets a lost-response reconcile later
+            // adopt *this* intent's change rather than any pre-existing
+            // one on the same branches.
+            let marker = action_marker(intent);
             match gh(&[
                 "pr",
                 "create",
@@ -1256,7 +1285,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                 "--title",
                 title,
                 "--body",
-                body,
+                &format!("{body}\n\n{marker}"),
             ]) {
                 Ok(url) => {
                     let owner = ctx.repo_display.split('/').next().unwrap_or_default();
@@ -1292,11 +1321,16 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                         }
                     };
                     // The read-back must show the created change on the
-                    // intent's own base — a pre-existing open change to
-                    // a different target is not this effect's evidence.
+                    // intent's own base carrying this intent's marker —
+                    // a pre-existing open change to a different target,
+                    // or even the same target without the marker, is
+                    // not this effect's evidence.
                     let Some(first) = pr.as_array().and_then(|a| {
                         a.iter()
-                            .find(|p| p["base"]["ref"].as_str() == Some(target_branch))
+                            .find(|p| {
+                                p["base"]["ref"].as_str() == Some(target_branch)
+                                    && marker_matches(intent, p)
+                            })
                             .cloned()
                     }) else {
                         // The create reported success but no matching
