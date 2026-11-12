@@ -478,28 +478,39 @@ pub fn run_pass(
             phases.push(PhaseReport::skipped(name, "shutdown"));
         } else if scope.is_some() {
             phases.push(PhaseReport::skipped(name, "work_scope"));
-        } else {
-            let now = clock();
-            if now >= deadline {
-                phases.push(PhaseReport::deferred_phase(name));
-            } else if !pass.settings.retention.enabled {
-                phases.push(PhaseReport::skipped(name, "retention_disabled"));
             } else {
-                let r = pass.settings.retention.clone();
-                let params = SweepParams {
-                    interval_seconds: r.interval_seconds,
-                    max_bodies: r.max_bodies,
-                    max_bytes: r.max_bytes,
-                    delete_error_limit: r.delete_error_limit,
-                    protected: pass.settings.protected_paths.clone(),
-                };
-                let result = pass.store.retention_sweep(&params, pass.state_root, now);
-                push!(match result {
-                    Ok(report) => retention_phase(report),
-                    Err(e) => PhaseReport::failed(name, e),
-                });
+                let now = clock();
+                if now >= deadline {
+                    phases.push(PhaseReport::deferred_phase(name));
+                } else if !pass.settings.retention.enabled {
+                    phases.push(PhaseReport::skipped(name, "retention_disabled"));
+                } else {
+                // Single-owner maintenance: the sweep holds the same
+                // loop-independent installation maintenance lease as an
+                // explicit cleanup. A maintenance pass that loses the
+                // lease reports already_running instead of racing.
+                match RunLeaseGuard::acquire_maintenance(pass.store, now) {
+                    Ok(_maintenance) => {
+                        let r = pass.settings.retention.clone();
+                        let params = SweepParams {
+                            interval_seconds: r.interval_seconds,
+                            max_bodies: r.max_bodies,
+                            max_bytes: r.max_bytes,
+                            delete_error_limit: r.delete_error_limit,
+                            protected: pass.settings.protected_paths.clone(),
+                        };
+                        let result = pass.store.retention_sweep(&params, pass.state_root, now);
+                        push!(match result {
+                            Ok(report) => retention_phase(report),
+                            Err(e) => PhaseReport::failed(name, e),
+                        });
+                    }
+                    Err(e) => {
+                        phases.push(PhaseReport::skipped(name, &format!("already_running: {e}")))
+                    }
+                }
+                }
             }
-        }
     }
 
     // Phase 8 — Attention derivation (recomputed read-only; always runs —
@@ -642,7 +653,7 @@ impl<'a> RunLeaseGuard<'a> {
         let owner = workloop_store::sqlite::RunLeaseOwner {
             pid: identity.pid,
             started_at: identity.started_at,
-            nonce: format!("maintenance-{}", uuidish()),
+            nonce: format!("{lease_key}-{}", uuidish()),
         };
         acquire(store, &owner, now_unix_seconds)?;
         Ok(Self {

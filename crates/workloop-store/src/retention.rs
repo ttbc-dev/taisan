@@ -1118,13 +1118,24 @@ impl SqliteStore {
             attempted_bodies += 1;
             match delete_managed(&managed) {
                 Ok(reason) => {
-                    self.finish_reclaim(&candidate.body_id, &reason, now_unix_seconds)?;
-                    report.bytes_reclaimed += candidate.bytes;
-                    report.reclaimed.push(ReclaimedBody {
-                        body_id: candidate.body_id.clone(),
-                        bytes: candidate.bytes,
-                        reason,
-                    });
+                    let transitioned =
+                        self.finish_reclaim(&candidate.body_id, &reason, now_unix_seconds)?;
+                    if transitioned == 1 {
+                        report.bytes_reclaimed += candidate.bytes;
+                        report.reclaimed.push(ReclaimedBody {
+                            body_id: candidate.body_id.clone(),
+                            bytes: candidate.bytes,
+                            reason,
+                        });
+                    } else {
+                        // A concurrent maintenance pass completed this
+                        // body first; this pass never re-deletes, never
+                        // re-counts bytes.
+                        report.held.push(HeldBody {
+                            body_id: candidate.body_id.clone(),
+                            reason: "already_reclaimed".into(),
+                        });
+                    }
                 }
                 Err(detail) => {
                     let failures = self.record_delete_failure(&candidate.body_id)?;
@@ -1369,13 +1380,15 @@ impl SqliteStore {
                 params![body_id, reason, now_unix_seconds],
             )
             .map_err(map_err)?;
-        tx.execute(
-            "UPDATE reclaim_plan_entries SET outcome='reclaimed', \
-             outcome_reason=?2, outcome_unix_seconds=?3 \
-             WHERE plan_id=?1 AND body_id=?4 AND outcome IS NULL",
-            params![plan_id, reason, now_unix_seconds, body_id],
-        )
-        .map_err(map_err)?;
+        if transitioned == 1 {
+            tx.execute(
+                "UPDATE reclaim_plan_entries SET outcome='reclaimed', \
+                 outcome_reason=?2, outcome_unix_seconds=?3 \
+                 WHERE plan_id=?1 AND body_id=?4 AND outcome IS NULL",
+                params![plan_id, reason, now_unix_seconds, body_id],
+            )
+            .map_err(map_err)?;
+        }
         tx.commit().map_err(internal)?;
         Ok(transitioned)
     }
@@ -1385,14 +1398,14 @@ impl SqliteStore {
         body_id: &str,
         reason: &str,
         now_unix_seconds: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<usize, StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        tx.execute(
+        let transitioned = tx.execute(
             "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
              delete_failures=0, reclaimed_unix_seconds=?3 WHERE body_id=?1 \
              AND state='reclaiming'",
@@ -1400,7 +1413,7 @@ impl SqliteStore {
         )
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;
-        Ok(())
+        Ok(transitioned)
     }
 
     fn record_delete_failure(&self, body_id: &str) -> Result<i64, StoreError> {
@@ -1600,6 +1613,7 @@ pub struct CategoryReport {
     pub unknown_count: u64,
     pub unknown_bytes: u64,
     pub unknown_bodies: Vec<String>,
+    pub unknown_bodies_truncated: bool,
     pub over_max_bytes: bool,
     pub protected_over_limit: bool,
     /// `none`, `over_limit` (reclaimable excess exists) or
@@ -2834,6 +2848,7 @@ impl SqliteStore {
                     .map(|v| v.iter().map(|(r, _, b)| (r.clone(), *b)).collect())
                     .unwrap_or_default(),
                 unknown_bodies: unknown_ids.iter().take(16).cloned().collect(),
+                unknown_bodies_truncated: unknown_ids.len() > 16,
                 oldest_present_age_seconds: if oldest_measured == i64::MAX {
                     None
                 } else {
