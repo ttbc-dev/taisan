@@ -368,6 +368,7 @@ fn unsupported_operation_action(capability: &str) -> Option<HostAction> {
         "thread_reply" => Some(HostAction::ReplyToThread {
             change,
             thread_id: "conformance-thread".into(),
+            marker: "conformance".into(),
             body: "unsupported".into(),
         }),
         "thread_resolve" => Some(HostAction::ResolveThread {
@@ -1363,6 +1364,7 @@ fn thread_reply_applies_with_readback(
         HostAction::ReplyToThread {
             change: change.clone(),
             thread_id: "th-1".into(),
+            marker: "hc-reply".into(),
             body: "answered".into(),
         },
     );
@@ -1374,12 +1376,14 @@ fn thread_reply_applies_with_readback(
                 change: seen,
                 thread_id,
                 reply_id: rid,
+                marker,
                 ..
             },
         ] => {
             assert_eq!(reply.status, HostActionStatus::Applied);
             assert_eq!(*seen, change);
             assert_eq!(thread_id, "th-1");
+            assert_eq!(marker, "hc-reply", "the marked reply echoes its marker");
             assert!(
                 !rid.is_empty(),
                 "the receipt cites a remote-issued reply id"

@@ -265,11 +265,14 @@ pub enum HostAction {
         head: CommitRevision,
         body: String,
     },
-    /// Post one reply on the identified thread, preserving its exact
-    /// thread identity.
+    /// Post one marked reply on the identified thread, preserving its
+    /// exact thread identity. The persisted tag is the contract
+    /// operation name, matching `HostAction::name()`.
+    #[serde(rename = "thread_reply")]
     ReplyToThread {
         change: ChangeRequestRef,
         thread_id: String,
+        marker: String,
         body: String,
     },
     /// Resolve the identified thread, bound to the head its findings

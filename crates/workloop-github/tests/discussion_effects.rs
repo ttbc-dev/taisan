@@ -191,6 +191,7 @@ fn each_effect_type_persists_its_own_intent_and_receipt() {
         HostAction::ReplyToThread {
             change: change(),
             thread_id: "th-1".into(),
+            marker: "m".into(),
             body: "answered".into(),
         },
     );
@@ -286,6 +287,7 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
         HostAction::ReplyToThread {
             change: change(),
             thread_id: "th-1".into(),
+            marker: "workloop".into(),
             body: "reply body".into(),
         },
     );
@@ -348,6 +350,7 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
         NormalizedEffectFact::ReplyPosted {
             thread_id: rtid,
             reply_id: rpid,
+            marker: reply_marker,
             body_digest: reply_digest,
             ..
         },
@@ -356,6 +359,10 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
         panic!("reply receipt: {:?}", reply.effects)
     };
     assert_eq!(rtid, "th-1");
+    assert_eq!(
+        reply_marker, "workloop",
+        "the marked reply echoes its marker"
+    );
     assert_eq!(*rpid, format!("rp-{reply_id}"), "remote-issued id");
     let stored_reply_digest = workloop_core::domain::sha256_hex(
         "reply-v1",
@@ -548,6 +555,7 @@ fn ineligible_actor_is_explicit_and_distinct() {
         HostAction::ReplyToThread {
             change: change(),
             thread_id: "th-1".into(),
+            marker: "m".into(),
             body: "reply".into(),
         },
     );

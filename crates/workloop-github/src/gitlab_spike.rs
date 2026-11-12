@@ -34,6 +34,7 @@ pub const UNSUPPORTED_OPERATIONS: &[&str] = &[
     "publish_review_feedback",
     "approve_change",
     "request_changes",
+    "thread_reply",
     "resolve_thread",
     "mark_ready",
 ];

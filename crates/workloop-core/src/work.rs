@@ -2788,14 +2788,18 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
         ) => reviewed == change && reviewed_head == head,
         (
             HostAction::ReplyToThread {
-                change, thread_id, ..
+                change,
+                thread_id,
+                marker,
+                ..
             },
             NormalizedEffectFact::ReplyPosted {
                 change: replied,
                 thread_id: replied_thread,
+                marker: reply_marker,
                 ..
             },
-        ) => replied == change && replied_thread == thread_id,
+        ) => replied == change && replied_thread == thread_id && reply_marker == marker,
         (
             HostAction::ResolveThread {
                 change,

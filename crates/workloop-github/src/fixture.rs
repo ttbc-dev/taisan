@@ -1772,6 +1772,7 @@ impl FixtureGithub {
             HostAction::ReplyToThread {
                 change,
                 thread_id,
+                marker,
                 body,
             } => {
                 let belongs = self
@@ -1827,6 +1828,7 @@ impl FixtureGithub {
                         vec![NormalizedEffectFact::ReplyPosted {
                             change: change.clone(),
                             thread_id: thread_id.clone(),
+                            marker: marker.clone(),
                             reply_id: posted.0.clone(),
                             body_digest,
                         }],

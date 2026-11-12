@@ -516,6 +516,7 @@ fn discussion_and_ready_links_attribute_their_change_to_the_work() {
         HostAction::ReplyToThread {
             change: change_ref("cr-1"),
             thread_id: "th-1".into(),
+            marker: "m".into(),
             body: "reply".into(),
         },
         HostAction::ResolveThread {

@@ -432,6 +432,7 @@ pub enum NormalizedEffectFact {
         change: ChangeRequestRef,
         thread_id: String,
         reply_id: String,
+        marker: String,
         body_digest: String,
     },
     /// `target` echoes the diff target the write was bound to;
