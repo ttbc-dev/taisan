@@ -460,7 +460,15 @@ fn unsupported_and_denied_are_distinct_result_classes() {
     gh.remove_support("resolve_thread");
     // And the bound actor lacks the review grant.
     gh.deny("publish_review_feedback", &reviewer());
-    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    let report = gh
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, usize::MAX)
+        .unwrap();
+    assert_eq!(
+        report.unsupported, 1,
+        "the terminal unsupported receipt is counted in the pass report"
+    );
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.applied, 0);
 
     let resolve = intent(&store, &resolve_id);
     assert!(

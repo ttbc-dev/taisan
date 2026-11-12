@@ -362,6 +362,60 @@ fn diff_snapshot_identity_is_stable_per_pair() {
     );
 }
 
+/// AC: a diff subject's version moves when its base/head objects arrive
+/// on the remote — a partial read followed by the complete read of the
+/// same snapshot records both deliveries instead of colliding on one
+/// delivery identity.
+#[test]
+fn diff_read_records_the_later_complete_read_after_objects_arrive() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut fixture = FixtureGithub::new();
+
+    let snapshot = DiffSnapshot::new(change(), rev("base-1"), rev("head-3"));
+    let subject = ReadSubject::Diff {
+        snapshot: snapshot.clone(),
+    };
+
+    // Neither object is on the remote yet: the read is partial.
+    let receipt = fixture
+        .observe(&store, &config, None, &subject, &reader(), NOW)
+        .unwrap();
+    assert_eq!(receipt, IngestReceipt::Recorded);
+    let reads = recorded_reads(&store, &subject);
+    assert_eq!(reads.len(), 1);
+    assert!(
+        matches!(reads[0].3, Completeness::Partial { .. }),
+        "objects not yet on the remote read partial: {:?}",
+        reads[0].3
+    );
+    let absent = store.transact(|tx| current_read(tx, &subject)).unwrap();
+    assert_eq!(absent, None);
+
+    // The objects arrive; the same snapshot now reads complete under a
+    // new subject version — a distinct delivery identity, not a
+    // conflicting resend of the earlier partial read.
+    fixture.seed_objects(&["base-1", "head-3"]);
+    let receipt = fixture
+        .observe(&store, &config, None, &subject, &reader(), NOW + 1)
+        .unwrap();
+    assert_eq!(
+        receipt,
+        IngestReceipt::Recorded,
+        "the later complete read is recorded, never rejected as a resend"
+    );
+    let reads = recorded_reads(&store, &subject);
+    assert_eq!(reads.len(), 2, "both deliveries are retained");
+    let current = store.transact(|tx| current_read(tx, &subject)).unwrap();
+    assert_eq!(
+        current.map(|r| r.revision),
+        Some(ReadRevision::DiffSnapshot {
+            snapshot_id: snapshot.snapshot_id()
+        }),
+        "the complete read is the recorded current read"
+    );
+}
+
 /// AC: an observation that drives a decision carries both the revision
 /// it observed and the actor identity — a decision bound to revision r
 /// does not fire while only r−1 evidence exists.

@@ -394,8 +394,8 @@ pub fn run_pass(
                     p.processed = r.attempted;
                     p.deferred = r.deferred;
                     p.reason = Some(format!(
-                        "applied={} failed={} unknown={}",
-                        r.applied, r.failed, r.unknown
+                        "applied={} failed={} unknown={} unsupported={}",
+                        r.applied, r.failed, r.unknown, r.unsupported
                     ));
                     p
                 }

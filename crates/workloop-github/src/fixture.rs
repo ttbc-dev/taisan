@@ -338,6 +338,11 @@ pub struct OutboxReport {
     pub applied: usize,
     pub failed: usize,
     pub unknown: usize,
+    /// Terminal unsupported receipts — the host capability map lacks
+    /// the operation, so the intent is decided rather than pending.
+    /// Counted separately so a pass summary surfaces the outcome an
+    /// operator must act on instead of hiding it inside `attempted`.
+    pub unsupported: usize,
     /// Pending in-scope intents not attempted because the per-tick
     /// bound stopped the drain; they stay pending for the next pass.
     pub deferred: Vec<String>,
@@ -465,7 +470,20 @@ impl FixtureGithub {
     }
 
     fn subject_version(&self, subject: &ReadSubject) -> u64 {
-        self.versions.get(&subject.key()).copied().unwrap_or(0)
+        let version = self.versions.get(&subject.key()).copied().unwrap_or(0);
+        match subject {
+            // A diff read's remote state is its base/head objects: an
+            // object arriving on the remote moves the subject's version
+            // even though no mutator names the snapshot, so a partial
+            // read and the later complete read of the same pair deliver
+            // under distinct identities.
+            ReadSubject::Diff { snapshot } => {
+                version
+                    + u64::from(self.objects.contains(snapshot.base().object.as_str()))
+                    + u64::from(self.objects.contains(snapshot.head().object.as_str()))
+            }
+            _ => version,
+        }
     }
 
     /// Bump the scoped `pr` subject for a change id; a change the remote
@@ -1043,6 +1061,7 @@ impl FixtureGithub {
                 Some(HostActionStatus::Applied) => report.applied += 1,
                 Some(HostActionStatus::Failed { .. }) => report.failed += 1,
                 Some(HostActionStatus::Unknown { .. }) => report.unknown += 1,
+                Some(HostActionStatus::Unsupported { .. }) => report.unsupported += 1,
                 // Denied or unchanged: counted as attempted, still pending.
                 _ => {}
             }
@@ -1130,14 +1149,24 @@ impl FixtureGithub {
                     (intent.work_id.clone(), change.clone()),
                 );
             };
-            if let HostAction::UpdateChangeRequest { change, .. } = &intent.action {
-                note(change);
+            match &intent.action {
+                HostAction::UpdateChangeRequest { change, .. }
+                | HostAction::PostComment { change, .. }
+                | HostAction::PublishReviewFeedback { change, .. }
+                | HostAction::ReplyToThread { change, .. }
+                | HostAction::ResolveThread { change, .. }
+                | HostAction::MarkReady { change, .. } => note(change),
+                _ => {}
             }
             for effect in &intent.effects {
                 match effect {
                     NormalizedEffectFact::ChangeOpened { change, .. }
                     | NormalizedEffectFact::MetadataUpdated { change, .. }
-                    | NormalizedEffectFact::CommentPosted { change, .. } => note(change),
+                    | NormalizedEffectFact::CommentPosted { change, .. }
+                    | NormalizedEffectFact::ReviewPublished { change, .. }
+                    | NormalizedEffectFact::ReplyPosted { change, .. }
+                    | NormalizedEffectFact::ThreadResolved { change, .. }
+                    | NormalizedEffectFact::ReadyObserved { change, .. } => note(change),
                     _ => {}
                 }
             }
