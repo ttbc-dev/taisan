@@ -173,23 +173,25 @@ fn strip_comments(source: &str) -> String {
 }
 
 /// If `after` starts with a turbofish (`::<...>`), the index just past
-/// its closing `>`; otherwise `None`.
+/// its closing `>`; otherwise `None`. A `>` that is part of an `->` return
+/// arrow does not close the turbofish.
 fn skip_turbofish(after: &str) -> Option<usize> {
-    if !after.starts_with("::<") {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (index, c) in after.char_indices().skip(2) {
+    const PREFIX: &str = "::<";
+    let rest = after.strip_prefix(PREFIX)?;
+    let mut depth = 1usize;
+    let mut previous = '\0';
+    for (index, c) in rest.char_indices() {
         match c {
             '<' => depth += 1,
-            '>' => {
+            '>' if previous != '-' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(index + c.len_utf8());
+                    return Some(PREFIX.len() + index + c.len_utf8());
                 }
             }
             _ => {}
         }
+        previous = c;
     }
     None
 }
@@ -864,6 +866,19 @@ fn no_operation_beyond_the_four_is_reachable() {
         remote_call_sites(turbofish),
         vec!["approve_change"],
         "a turbofish does not hide a call"
+    );
+    let turbofish_arrow = "fn f() { self.remote.approve_change::<fn() -> u8>(x); }";
+    assert_eq!(
+        remote_call_sites(turbofish_arrow),
+        vec!["approve_change"],
+        "a return arrow inside a turbofish does not close it early"
+    );
+    let turbofish_commented =
+        "fn f() { self.remote /*a*/ .approve_change /*b*/ :: /*c*/ <u8> /*d*/ (x); }";
+    assert_eq!(
+        remote_call_sites(turbofish_commented),
+        vec!["approve_change"],
+        "comments around and inside a turbofish do not hide a call"
     );
     let commented_out = "fn f() { /* self.remote.approve_change(x); */ }";
     assert!(
