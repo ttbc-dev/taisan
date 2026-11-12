@@ -10,12 +10,12 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `3` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` must carry the complete
-//! recognized v1 schema and upgrades additively at open; a stamped file
-//! whose schema is foreign or incomplete, an unversioned database with
-//! user tables (a slice-0 file — archive-only), and a newer version are
-//! all refused at open.
+//! `PRAGMA user_version` is the format gate: `4` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, or `3` must carry
+//! the complete recognized schema of its version and upgrades
+//! additively at open; a stamped file whose schema is foreign or
+//! incomplete, an unversioned database with user tables (a slice-0
+//! file — archive-only), and a newer version are all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::sync::Mutex;
@@ -36,9 +36,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 
 /// The only store format this binary reads or writes. `2` adds the
 /// `invocations.descendants` column and the artifact-handoff and
-/// verification tables; `3` adds the `worker_request_exports` table.
-/// v1/v2 files upgrade additively at open.
-const FORMAT_VERSION: i64 = 3;
+/// verification tables; `3` adds the `worker_request_exports` table;
+/// `4` adds the body catalogue's explicit `pin_state`. Older files
+/// upgrade additively at open.
+const FORMAT_VERSION: i64 = 4;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -222,19 +223,18 @@ impl SqliteStore {
             }
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
-            // A v1 → v3 migration is legitimate only for a file that
-            // holds the complete v1 schema: every expected table except
-            // the ones added since v1 — the run-lease slice's additive
-            // set, the two v2 additions, and the v3 addition — must
-            // already be present. A v2 file must hold the complete v2
-            // schema (everything except the v3 addition); a stamped-2
-            // file missing the v2 tables passes neither gate.
-            // A foreign file stamped 1 fails this check untouched, and
-            // the one accepted difference is the previous release's
-            // store: it holds every base table and none of the
-            // additions, so it is upgraded in place instead of being
-            // locked out with a misleading "not the recognized schema"
-            // refusal.
+            // An upgrade is legitimate only for a file that holds the
+            // complete schema of its stamped version: a v1 file must
+            // hold every expected table except the ones added since —
+            // the run-lease slice's additive set, the two v2 additions,
+            // and the v3 addition — a v2 file everything except the v3
+            // addition, and a v3 file the complete set (v4 adds a
+            // column, not a table). A foreign or truncated stamped file
+            // fails this check untouched, and the accepted difference
+            // is a previous release's store: it holds every base table
+            // and none of the additions, so it is upgraded in place
+            // instead of being locked out with a misleading "not the
+            // recognized schema" refusal.
             let present = table_set(&conn)?;
             let required_complete = if version == 1 {
                 EXPECTED_TABLES
@@ -245,11 +245,13 @@ impl SqliteStore {
                             && !V3_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
-            } else {
+            } else if version == 2 {
                 EXPECTED_TABLES
                     .iter()
                     .filter(|t| !V3_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
+            } else {
+                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -259,12 +261,12 @@ impl SqliteStore {
                     ),
                 });
             }
-            // Additive migration inside one transaction: the new tables
-            // plus invocations.descendants and the pin-ledger
-            // reconstruction. A crash leaves the file stamped 1 and the
-            // migration reruns idempotently (CREATE IF NOT EXISTS; the
-            // column check guards a partial ALTER; the ledger insert is
-            // guarded by NOT EXISTS).
+            // Additive migration inside one transaction: the new tables,
+            // invocations.descendants, body_catalog.pin_state, and the
+            // pin-ledger reconstruction. A crash leaves the old stamp and
+            // the migration reruns idempotently (CREATE IF NOT EXISTS;
+            // each column check guards a partial ALTER; the ledger insert
+            // is guarded by NOT EXISTS).
             let tx = conn.unchecked_transaction().map_err(internal)?;
             tx.execute_batch(SCHEMA).map_err(internal)?;
             let has_descendants: bool = tx
@@ -281,6 +283,30 @@ impl SqliteStore {
                 )
                 .map_err(internal)?;
             }
+            let has_pin_state: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('body_catalog') \
+                     WHERE name='pin_state')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_pin_state {
+                tx.execute_batch(
+                    "ALTER TABLE body_catalog ADD COLUMN pin_state TEXT NOT NULL \
+                     DEFAULT 'none' CHECK (pin_state IN \
+                     ('none', 'active', 'paused', 'recovering', 'unknown-effect'))",
+                )
+                .map_err(internal)?;
+            }
+            // Existing protected rows were expressed as the bare boolean;
+            // materialize them as the catalogue's `active` pin state.
+            tx.execute(
+                "UPDATE body_catalog SET pin_state='active' \
+                 WHERE pinned=1 AND pin_state='none'",
+                [],
+            )
+            .map_err(internal)?;
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
             // unnamed `registered` dependency so the materialized flag

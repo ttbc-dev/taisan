@@ -1,6 +1,6 @@
--- workloop v2 store: current-state tables enforcing structural
+-- workloop v3 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 2` marks the format; a stamped v1 file with
+-- `PRAGMA user_version = 3` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 
@@ -336,7 +336,10 @@ CREATE TABLE IF NOT EXISTS recovery_intents (
 -- Managed body catalog: durable metadata rows only; the body itself is
 -- the file at `path`. `reclaiming` -> `reclaimed` is the two-phase
 -- deletion protocol; `eligible_after_unix_seconds` is NULL while a body
--- is unattributed and is never sweep-eligible.
+-- is unattributed and is never sweep-eligible. `pin_state` is the
+-- catalogue's explicit protective-dependency summary; any value other
+-- than `none` is a pin. `registered_unix_seconds` is the body's
+-- `created_at` for age eligibility.
 CREATE TABLE IF NOT EXISTS body_catalog (
     body_id TEXT PRIMARY KEY,
     category TEXT NOT NULL,
@@ -345,6 +348,9 @@ CREATE TABLE IF NOT EXISTS body_catalog (
     registered_unix_seconds INTEGER NOT NULL,
     eligible_after_unix_seconds INTEGER,
     pinned INTEGER NOT NULL DEFAULT 0,
+    pin_state TEXT NOT NULL DEFAULT 'none'
+        CHECK (pin_state IN
+               ('none', 'active', 'paused', 'recovering', 'unknown-effect')),
     state TEXT NOT NULL DEFAULT 'present'
         CHECK (state IN ('present', 'reclaiming', 'reclaimed')),
     reclaim_reason TEXT,
