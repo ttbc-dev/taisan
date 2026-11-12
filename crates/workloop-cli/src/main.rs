@@ -18,7 +18,7 @@ use workloop_core::identity::{
     CommitRevision, IssueId, IssueRef, RepositoryId, RepositoryRef, SourceSnapshot,
 };
 use workloop_core::projection::{self, Availability, CommandResultLookup, SourceStatus};
-use workloop_core::store::{ReadView, Store};
+use workloop_core::store::Store;
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
@@ -1051,11 +1051,7 @@ fn run(cli: Cli) -> i32 {
             };
             match command {
                 RetentionCommands::Report => {
-                    let as_of = store
-                        .transact_deferred(|tx| {
-                            Ok::<_, workloop_core::store::StoreError>(tx.last_seq()?)
-                        })
-                        .ok();
+                    let as_of = store.transact_deferred(|tx| tx.last_seq()).ok();
                     match store.retention_report(
                         &category_settings,
                         &state_root,

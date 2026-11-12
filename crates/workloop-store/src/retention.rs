@@ -2688,17 +2688,17 @@ impl SqliteStore {
             {
                 // Protected installation files: never counted, never
                 // deleted — held and named.
-                if let Ok(managed) = managed_path(&root_abs, &path) {
-                    if is_protected(&managed, protected) {
-                        if held_protected.len() < UNKNOWN_SCAN_BOUND {
-                            held_protected.push(HeldBody {
-                                body_id: entry_body_id.clone(),
-                                reason: "protected_path".into(),
-                            });
-                        }
-                        protected_excluded.push(entry_body_id.clone());
-                        continue;
+                if let Ok(managed) = managed_path(&root_abs, &path)
+                    && is_protected(&managed, protected)
+                {
+                    if held_protected.len() < UNKNOWN_SCAN_BOUND {
+                        held_protected.push(HeldBody {
+                            body_id: entry_body_id.clone(),
+                            reason: "protected_path".into(),
+                        });
                     }
+                    protected_excluded.push(entry_body_id.clone());
+                    continue;
                 }
                 let stat_ok = match managed_path(&root_abs, &path) {
                     Ok(managed) => std::fs::symlink_metadata(&managed).is_ok(),
