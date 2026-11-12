@@ -51,9 +51,10 @@ enum Commands {
         ticks: u32,
         #[arg(long, default_value_t = 3000)]
         interval_ms: u64,
-        /// Recorded-receipt bound for reconciling an `unknown` intent:
-        /// once one action_id accumulates this many receipts, the
-        /// reconcile pass retires it instead of reconciling forever.
+        /// Recorded-attempt bound for reconciling an `unknown` intent:
+        /// once one action_id accumulates this many attempt receipts,
+        /// the reconcile pass holds it for operator action instead of
+        /// reconciling forever.
         #[arg(long, default_value_t = DEFAULT_RECONCILE_BOUND)]
         reconcile_bound: usize,
     },
@@ -322,7 +323,11 @@ fn drain_outbox(ctx: &Ctx, reconcile_bound: usize) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let Some(intent) = next else { break };
         attempted.insert(intent.action_id.clone());
-        attempt(ctx, &intent, &format!("act:{}", intent.action_id))?;
+        // One intent's transient failure must not starve the rest of
+        // the drain or skip the pass's reconcile/verify.
+        if let Err(e) = attempt(ctx, &intent, &format!("act:{}", intent.action_id)) {
+            eprintln!("s1-bridge: attempt {} failed: {e}", intent.action_id);
+        }
     }
     reconcile_unknown(ctx, reconcile_bound)?;
     reverify_applied_pushes(ctx)
@@ -409,9 +414,17 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
             RefRelation::Ancestor => "ancestor",
             RefRelation::Diverged => "diverged",
         };
+        // The receipt ordinal keeps a *repeat* drift to an
+        // already-reported head a new record: without it the second
+        // `verify:<sha>:diverged` reuses the recorded delivery
+        // identity, dedupes, and Core's re-arm never runs.
+        let receipts = receipt_count(ctx, &intent.action_id)?;
         let _ = ctx.emit(
             Some((&intent.work_id, execution.as_ref().map(|e| &e.id))),
-            format!("act:{}:verify:{sha}:{relation_key}", intent.action_id),
+            format!(
+                "act:{}:verify:{sha}:{relation_key}:{receipts}",
+                intent.action_id
+            ),
             ObservationFact::HostActionResult {
                 action_id: intent.action_id.clone(),
                 authenticated_actor: Some(ctx.authenticated.clone()),
@@ -467,9 +480,8 @@ fn emit_result_keyed(
     );
 }
 
-/// Recorded `host_action_result` receipts for one action — each drain
-/// or reconcile pass emits at most one, so the count is the durable
-/// attempt tally the reconcile bound applies to.
+/// All recorded `host_action_result` receipts for one action — the
+/// durable tally the verify-receipt ordinal draws uniqueness from.
 fn receipt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
     ctx.store
         .transact_deferred(|tx| {
@@ -488,14 +500,48 @@ fn receipt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Recorded *attempt* receipts for one action — drain and reconcile
+/// emissions under `act:{id}`/`act:{id}:reconcile:{n}` keys only. The
+/// reconcile bound applies to attempts: state-keyed verify receipts
+/// re-observing an applied push are evidence refreshes, not tries at
+/// the effect, and must not spend the bound.
+fn attempt_count(ctx: &Ctx, action_id: &str) -> Result<usize, String> {
+    let drain_key = format!("act:{action_id}");
+    let reconcile_prefix = format!("{drain_key}:reconcile:");
+    ctx.store
+        .transact_deferred(|tx| {
+            Ok(tx
+                .all_observations()?
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        &o.fact,
+                        ObservationFact::HostActionResult { action_id: id, .. }
+                            if id == action_id
+                    ) && o.delivery.as_ref().is_some_and(|d| {
+                        d.event_id == drain_key
+                            || d.event_id
+                                .strip_prefix(reconcile_prefix.as_str())
+                                .is_some_and(|n| {
+                                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                                })
+                    })
+                })
+                .count())
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Bounded reconcile for `unknown` intents — the pass a pending-only
 /// drain cannot perform. Each intent re-reads the remote fact: when
 /// the fact proves the recorded effect landed the intent settles
 /// `applied` with no second write, otherwise the same guarded write
-/// path re-attempts. Every pass emits exactly one receipt per intent,
-/// so at `--reconcile-bound` receipts the intent retires `failed` —
-/// surfaced for operator reconciliation through the transport account
-/// — instead of staying outstanding forever.
+/// path re-attempts. Every pass emits at most one attempt receipt per
+/// intent, so at `--reconcile-bound` attempt receipts the intent is
+/// held `unknown` for operator action instead of reconciling forever —
+/// an unverified effect is never reported `failed`, which Core would
+/// charge to the transport account and blind-retry as a definite
+/// no-effect.
 fn reconcile_unknown(ctx: &Ctx, bound: usize) -> Result<(), String> {
     let intents = ctx
         .store
@@ -508,42 +554,56 @@ fn reconcile_unknown(ctx: &Ctx, bound: usize) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     for intent in intents {
-        let receipts = receipt_count(ctx, &intent.action_id)?;
-        // The delivery id keys on the attempt ordinal so each reconcile
-        // pass records a new receipt; an emit that failed before
-        // recording safely reuses the ordinal.
-        let key = format!("act:{}:reconcile:{receipts}", intent.action_id);
-        if receipts >= bound {
-            emit_result_keyed(
-                ctx,
-                &intent,
-                &key,
-                HostActionStatus::Failed {
-                    reason: format!(
-                        "reconcile bound {bound} reached; remote effect still unverified"
-                    ),
-                },
-                vec![],
-            );
-            continue;
-        }
-        match &intent.action {
-            HostAction::PushRef { branch, produced } => {
-                reconcile_push(ctx, &intent, branch, produced, &key)?
-            }
-            HostAction::OpenChangeRequest {
-                source_branch,
-                target_branch,
-                ..
-            } => reconcile_open(ctx, &intent, source_branch, target_branch, &key)?,
-            // Head-bound writes the bridge does not implement reconcile
-            // straight to their explicit failure through `attempt`.
-            HostAction::UpdateChangeRequest { .. } | HostAction::PostComment { .. } => {
-                reattempt(ctx, &intent, &key)?
-            }
+        // One intent's transient read/parse failure must not abort the
+        // pass — every other intent still reconciles and the caller's
+        // verify pass still runs.
+        if let Err(e) = reconcile_one(ctx, &intent, bound) {
+            eprintln!("s1-bridge: reconcile {} failed: {e}", intent.action_id);
         }
     }
     Ok(())
+}
+
+/// One intent's reconcile pass: re-read the remote fact and settle by
+/// it, or re-attempt through the guarded write path.
+fn reconcile_one(ctx: &Ctx, intent: &HostActionIntent, bound: usize) -> Result<(), String> {
+    let receipts = attempt_count(ctx, &intent.action_id)?;
+    if receipts >= bound {
+        // A fixed delivery id records the hold once and dedupes on
+        // later passes; `unknown` keeps the effect outstanding so no
+        // dependent write or terminal settle proceeds unverified.
+        emit_result_keyed(
+            ctx,
+            intent,
+            &format!("act:{}:reconcile:exhausted", intent.action_id),
+            HostActionStatus::Unknown {
+                reason: format!(
+                    "reconcile bound {bound} reached; remote effect still unverified — held for operator action"
+                ),
+            },
+            vec![],
+        );
+        return Ok(());
+    }
+    // The delivery id keys on the attempt ordinal so each reconcile
+    // pass records a new receipt; an emit that failed before
+    // recording safely reuses the ordinal.
+    let key = format!("act:{}:reconcile:{receipts}", intent.action_id);
+    match &intent.action {
+        HostAction::PushRef { branch, produced } => {
+            reconcile_push(ctx, intent, branch, produced, &key)
+        }
+        HostAction::OpenChangeRequest {
+            source_branch,
+            target_branch,
+            ..
+        } => reconcile_open(ctx, intent, source_branch, target_branch, &key),
+        // Head-bound writes the bridge does not implement reconcile
+        // straight to their explicit failure through `attempt`.
+        HostAction::UpdateChangeRequest { .. } | HostAction::PostComment { .. } => {
+            reattempt(ctx, intent, &key)
+        }
+    }
 }
 
 /// Reconcile one `push_ref`: re-read the remote head first — when it
@@ -691,9 +751,9 @@ fn reconcile_open(
 /// allowed on it — the pass still records one reconcile receipt so the
 /// bound keeps advancing.
 fn reattempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
-    let before = receipt_count(ctx, &intent.action_id)?;
+    let before = attempt_count(ctx, &intent.action_id)?;
     attempt(ctx, intent, key)?;
-    if receipt_count(ctx, &intent.action_id)? == before {
+    if attempt_count(ctx, &intent.action_id)? == before {
         emit_result_keyed(
             ctx,
             intent,

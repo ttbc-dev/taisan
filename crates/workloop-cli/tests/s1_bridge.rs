@@ -319,6 +319,35 @@ fn push_action() -> HostAction {
     }
 }
 
+/// The `RefPublished` effect an applied push intent recorded: remote
+/// head `aaaa1111` observed equal to the pushed revision.
+fn ref_published() -> NormalizedEffectFact {
+    NormalizedEffectFact::RefPublished {
+        repository: RepositoryRef::new(
+            HostInstanceId::trusted("github.test"),
+            RepositoryId::trusted("owner/repo"),
+        ),
+        branch: BRANCH.into(),
+        produced: CommitRevision::new(
+            RepositoryRef::new(
+                HostInstanceId::trusted("github.test"),
+                RepositoryId::trusted("owner/repo"),
+            ),
+            "produced-digest",
+        )
+        .unwrap(),
+        observed: CommitRevision::new(
+            RepositoryRef::new(
+                HostInstanceId::trusted("github.test"),
+                RepositoryId::trusted("owner/repo"),
+            ),
+            "aaaa1111",
+        )
+        .unwrap(),
+        relation: RefRelation::Equal,
+    }
+}
+
 #[test]
 fn capability_report_declares_only_implemented_operations_supported() {
     let fx = Fixture::new("capability");
@@ -432,7 +461,7 @@ fn unknown_push_reattempts_the_guarded_write_when_remote_diverged() {
 }
 
 #[test]
-fn unknown_push_retires_at_the_reconcile_bound() {
+fn unknown_push_holds_for_operator_at_the_reconcile_bound() {
     let fx = Fixture::new("bound");
     let (work_id, _) = submit(&fx.store(), &fx.config(), "k-bound");
     fx.seed_workspace(&work_id);
@@ -450,10 +479,15 @@ fn unknown_push_retires_at_the_reconcile_bound() {
     for _ in 0..3 {
         fx.tick(&["--reconcile-bound", "2"]);
     }
+    // Bound exhaustion holds the intent `unknown` for operator action —
+    // it is never converted into a `failed` receipt, which Core would
+    // charge to the transport account and blind-retry while the remote
+    // effect is still unverified (docs/recovery-policy.md,
+    // docs/evidence-requirements.md R42).
     assert_eq!(
         fx.intent_status(&action_id),
-        HostActionStatus::Failed {
-            reason: "reconcile bound 2 reached; remote effect still unverified".into()
+        HostActionStatus::Unknown {
+            reason: "reconcile bound 2 reached; remote effect still unverified — held for operator action".into()
         }
     );
     assert_eq!(
@@ -461,10 +495,135 @@ fn unknown_push_retires_at_the_reconcile_bound() {
         2,
         "re-attempts stop at the bound — the intent does not reconcile forever"
     );
-    assert!(
-        fx.outstanding(&work_id).is_empty(),
-        "a retired intent is not outstanding"
+    assert_eq!(
+        fx.outstanding(&work_id),
+        vec![action_id.clone()],
+        "a held intent stays outstanding — no dependent write or terminal settle proceeds unverified"
     );
+}
+
+/// The verify receipt that re-arms an applied push is an evidence
+/// refresh, not an attempt: it must not count against the reconcile
+/// bound. At bound 1 the re-armed intent still gets its one reconcile
+/// pass instead of exhausting on the verify receipt alone.
+#[test]
+fn rearmed_push_reconciles_against_attempt_receipts_only() {
+    let fx = Fixture::new("bound-verify");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-bound-verify");
+    fx.seed_workspace(&work_id);
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Applied,
+        vec![ref_published()],
+    );
+    fx.tick(&[]);
+    assert!(matches!(
+        fx.intent_status(&action_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    fx.mark_push_lands();
+    fx.tick(&["--reconcile-bound", "1"]);
+    assert_eq!(
+        fx.intent_status(&action_id),
+        HostActionStatus::Applied,
+        "the re-armed intent gets its reconcile pass — the verify receipt did not spend the bound"
+    );
+    assert_eq!(fx.pushes().len(), 1);
+}
+
+/// Repeat drift to an already-reported head still re-arms: the verify
+/// receipt's delivery id carries an ordinal, so a second
+/// `verify:<sha>:diverged` records instead of deduping against the
+/// first.
+#[test]
+fn applied_push_rearms_again_on_repeat_drift_to_the_same_head() {
+    let fx = Fixture::new("rearm-repeat");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-rearm-repeat");
+    fx.seed_workspace(&work_id);
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Applied,
+        vec![ref_published()],
+    );
+    // First drift re-arms; the re-attempted push lands and resettles.
+    fx.tick(&[]);
+    assert!(matches!(
+        fx.intent_status(&action_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    fx.mark_push_lands();
+    fx.tick(&[]);
+    assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
+    // The remote drifts back to the same head the first verify receipt
+    // already reported diverged — the identical report must still
+    // record and re-arm.
+    fx.write_fake("remote_head", "bbbb2222\n");
+    fx.tick(&[]);
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "repeat drift to the same head re-arms: {:?}",
+        fx.intent_status(&action_id)
+    );
+}
+
+/// One intent's reconcile failure is logged, not propagated: sibling
+/// intents still reconcile and the pass still finishes.
+#[test]
+fn reconcile_continues_past_one_intents_failure() {
+    let fx = Fixture::new("isolation");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-iso");
+    fx.seed_workspace(&work_id);
+    // First intent (insertion order is reconcile order): an unknown
+    // push whose remote read-back cannot construct a CommitRevision —
+    // `compare` reports `ahead` over an empty observed head.
+    let failing = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    // Second intent reconciles cleanly from the pulls read.
+    let settled = insert_intent(
+        &fx.store(),
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: BRANCH.into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        HostActionStatus::Unknown {
+            reason: "create response lost".into(),
+        },
+        vec![],
+    );
+    fx.write_fake("remote_head", "\n");
+    fx.write_fake("compare_status", "ahead\n");
+    fx.write_fake(
+        "pulls_head",
+        r#"[{"node_id":"PR_x","number":7,"head":{"sha":"aaaa1111"}}]
+"#,
+    );
+    fx.tick(&[]);
+    assert_eq!(
+        fx.intent_status(&settled),
+        HostActionStatus::Applied,
+        "the sibling intent reconciles past the failing one"
+    );
+    assert!(matches!(
+        fx.intent_status(&failing),
+        HostActionStatus::Unknown { .. }
+    ));
 }
 
 /// The U8.2 gap end to end: an applied push drifts, the bridge's
@@ -484,30 +643,7 @@ fn applied_push_rearms_on_bound_actor_drift_and_resettles() {
         &work_id,
         push_action(),
         HostActionStatus::Applied,
-        vec![NormalizedEffectFact::RefPublished {
-            repository: RepositoryRef::new(
-                HostInstanceId::trusted("github.test"),
-                RepositoryId::trusted("owner/repo"),
-            ),
-            branch: BRANCH.into(),
-            produced: CommitRevision::new(
-                RepositoryRef::new(
-                    HostInstanceId::trusted("github.test"),
-                    RepositoryId::trusted("owner/repo"),
-                ),
-                "produced-digest",
-            )
-            .unwrap(),
-            observed: CommitRevision::new(
-                RepositoryRef::new(
-                    HostInstanceId::trusted("github.test"),
-                    RepositoryId::trusted("owner/repo"),
-                ),
-                "aaaa1111",
-            )
-            .unwrap(),
-            relation: RefRelation::Equal,
-        }],
+        vec![ref_published()],
     );
     fx.tick(&[]);
     assert_eq!(
