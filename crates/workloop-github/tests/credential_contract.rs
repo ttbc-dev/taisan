@@ -178,6 +178,7 @@ fn push(branch: &str, object: &str) -> HostAction {
     HostAction::PushRef {
         branch: branch.into(),
         produced: rev(object),
+        expected_prior: None,
     }
 }
 

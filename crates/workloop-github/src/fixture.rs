@@ -12,11 +12,12 @@ use std::path::Path;
 
 use workloop_core::domain::{ExecutionId, WorkId};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, IssueRef, RepositoryRef,
-    SourceSnapshot,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorRef, IssueRef,
+    RepositoryRef, SourceSnapshot,
 };
 use workloop_core::observation::{
-    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
+    NormalizedEffectFact, Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -139,6 +140,68 @@ pub struct FixtureGithub {
     /// current authoritative read. A declared source with no row is an
     /// unavailable read — the host cannot answer it.
     issues: BTreeMap<String, IssueRead>,
+    /// `issue` → the actor the remote attributes its content to. A read
+    /// of an issue with no attributed actor reports the reading actor.
+    issue_actors: BTreeMap<String, HostActorRef>,
+    /// `repository` → the recorded default-branch head and the actor
+    /// the remote attributes it to.
+    repositories: BTreeMap<String, RepoHead>,
+    /// `(repository, branch)` → the actor that last moved the ref.
+    branch_actors: BTreeMap<(String, String), HostActorRef>,
+    /// `change_request_id` → the actor the remote attributes its head
+    /// to (the opener or the last pusher).
+    change_actors: BTreeMap<String, HostActorRef>,
+    /// `change_request_id` → the full scoped ref, learned at open or
+    /// registration time so raw-id mutators can bump the scoped
+    /// subject version.
+    change_refs: BTreeMap<String, ChangeRequestRef>,
+    /// `(change_request_id, check name)` → the remote's check-run
+    /// record.
+    checks: BTreeMap<(String, String), CheckRun>,
+    /// `change_request_id` → the review stream, oldest first.
+    reviews: BTreeMap<String, Vec<ReviewRecord>>,
+    /// The remote's stored comments, in post order: what a fresh read
+    /// of the discussion returns — the receipt's read-back source.
+    comments: Vec<PostedComment>,
+    /// `thread_id` → the remote's thread record: resolved state and
+    /// the posted reply stream.
+    threads: BTreeMap<String, RemoteThread>,
+    /// `change_request_id`s the remote currently reports ready
+    /// (non-draft).
+    ready_changes: std::collections::BTreeSet<String>,
+    /// Operation names the host's capability map does not contain:
+    /// attempts report `unsupported`, distinctly from any permission
+    /// verdict.
+    unsupported_ops: std::collections::BTreeSet<String>,
+    /// `(operation, actor)` pairs the remote denies — the bound actor
+    /// lacks the grant on this subject.
+    denied_ops: std::collections::BTreeSet<(String, String)>,
+    /// `(operation, actor)` pairs the remote marks ineligible — the
+    /// actor class cannot perform the operation on this subject
+    /// (e.g. the author reviewing their own change).
+    ineligible_ops: std::collections::BTreeSet<(String, String)>,
+    /// Object ids the remote knows. A read naming an unknown object is
+    /// partial — the host never invents a revision.
+    objects: std::collections::BTreeSet<String>,
+    /// `object` → parent object: the remote's commit ancestry, used to
+    /// classify the observed ref against the produced revision on a
+    /// read-back (`Equal`/`Ancestor`/`Diverged`).
+    parents: BTreeMap<String, String>,
+    /// `change_request_id` → the remote's stored title/body: what a
+    /// metadata update wrote and a fresh read returns.
+    change_meta: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// `action name` → failure reason: test-injected execution faults.
+    /// A matching attempt consumes the entry — one-shot per arming.
+    forced_failures: BTreeMap<String, String>,
+    /// Remote mutations a racing actor lands after each successful
+    /// adapter write, before the read-back — the write/read gap a real
+    /// adapter cannot close.
+    queued_mutations: std::collections::VecDeque<RemoteMutation>,
+    /// `ReadSubject::key()` → the remote's version of that subject.
+    /// Every mutation bumps the version of each subject it touched;
+    /// reads carry the version they observed, so a delayed delivery of
+    /// an older read can never outrank a newer one.
+    versions: BTreeMap<String, u64>,
     next_id: u64,
     /// `repository` → next display number: numbering is a per-repository
     /// namespace, as on a real host.
@@ -172,6 +235,92 @@ pub struct IssueRead {
     pub state: IssueState,
 }
 
+/// The remote's record of a repository's default-branch head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHead {
+    pub head: String,
+    pub actor: HostActorRef,
+}
+
+/// The remote's record of one check-run on a change request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRun {
+    pub run_id: String,
+    pub head: String,
+    pub actor: HostActorRef,
+}
+
+/// One review in a change request's review stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub review_id: String,
+    pub actor: HostActorRef,
+    /// The body the remote stored — what a fresh read of the review
+    /// returns for the receipt's digest.
+    pub body: String,
+}
+
+/// One comment the remote stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedComment {
+    /// The change the comment hangs on.
+    pub change_id: String,
+    /// The remote-issued comment identity — the read-back object id.
+    pub comment_id: String,
+    pub actor: HostActorRef,
+    pub body: String,
+}
+
+/// The remote's record of one review thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteThread {
+    /// The change the thread hangs on.
+    pub change_id: String,
+    pub resolved: bool,
+    /// Posted replies, in order: `(reply_id, actor, body)`.
+    pub replies: Vec<(String, HostActorRef, String)>,
+}
+
+/// What one typed `read` resolved against the synthetic remote: the
+/// observed revision in its per-kind form, the remote's version of the
+/// subject at read time, the actor the remote reports, and the read's
+/// completeness. A missing required field is `Partial` — the host never
+/// invents a revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRead {
+    pub revision: Option<ReadRevision>,
+    pub subject_version: u64,
+    pub actor: HostActorRef,
+    pub completeness: Completeness,
+}
+
+/// A remote mutation queued by test control to model a racing actor:
+/// applied after each successful adapter write, before the read-back —
+/// the write/read gap a real adapter cannot close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteMutation {
+    /// A racing actor moved a branch ref to `head` (descends from its
+    /// previous position).
+    MoveBranch {
+        repository: RepositoryRef,
+        branch: String,
+        head: String,
+        actor: HostActorRef,
+    },
+    /// A racing actor moved a change request's head.
+    MoveChange {
+        change: ChangeRequestRef,
+        head: String,
+        actor: HostActorRef,
+    },
+    /// A racing actor changed a change request's stored fields.
+    SetChangeMeta {
+        change: ChangeRequestRef,
+        title: Option<String>,
+        body: Option<String>,
+    },
+}
+
 /// What one source-refresh pass read: head movements ingested, heads
 /// already matching the recorded facts, and sources left for the next
 /// pass because the tick/source deadline stopped the read.
@@ -189,6 +338,11 @@ pub struct OutboxReport {
     pub applied: usize,
     pub failed: usize,
     pub unknown: usize,
+    /// Terminal unsupported receipts — the host capability map lacks
+    /// the operation, so the intent is decided rather than pending.
+    /// Counted separately so a pass summary surfaces the outcome an
+    /// operator must act on instead of hiding it inside `attempted`.
+    pub unsupported: usize,
     /// Pending in-scope intents not attempted because the per-tick
     /// bound stopped the drain; they stay pending for the next pass.
     pub deferred: Vec<String>,
@@ -226,6 +380,10 @@ impl FixtureGithub {
             "change_request_read",
             "change_request_update",
             "comment_create",
+            "review_feedback",
+            "thread_reply",
+            "thread_resolve",
+            "mark_ready",
             "checks_read",
             "review_findings_read",
             "issue_read",
@@ -255,9 +413,13 @@ impl FixtureGithub {
     }
 
     /// Test control: what the synthetic remote believes the change head is.
+    /// Moves the scoped `pr` subject's version when the change id is
+    /// registered; an unregistered id keeps version 0.
     pub fn set_head(&mut self, change_id: &str, head_object: &str) {
+        self.note_object(head_object);
         self.changes
             .insert(change_id.to_string(), head_object.to_string());
+        self.bump_change(change_id);
     }
 
     /// Test control: the authoritative read the synthetic remote returns
@@ -279,6 +441,9 @@ impl FixtureGithub {
                 state,
             },
         );
+        self.bump(&ReadSubject::Issue {
+            issue: issue.clone(),
+        });
     }
 
     /// The authoritative read this fixture reports for one issue source,
@@ -298,6 +463,478 @@ impl FixtureGithub {
         self.branches
             .get(&(repository.to_string(), branch.to_string()))
             .cloned()
+    }
+
+    fn bump(&mut self, subject: &ReadSubject) {
+        *self.versions.entry(subject.key()).or_insert(0) += 1;
+    }
+
+    fn subject_version(&self, subject: &ReadSubject) -> u64 {
+        let version = self.versions.get(&subject.key()).copied().unwrap_or(0);
+        match subject {
+            // A diff read's remote state is its base/head objects: an
+            // object arriving on the remote moves the subject's version
+            // even though no mutator names the snapshot, so a partial
+            // read and the later complete read of the same pair deliver
+            // under distinct identities.
+            ReadSubject::Diff { snapshot } => {
+                version
+                    + u64::from(self.objects.contains(snapshot.base().object.as_str()))
+                    + u64::from(self.objects.contains(snapshot.head().object.as_str()))
+            }
+            _ => version,
+        }
+    }
+
+    /// Bump the scoped `pr` subject for a change id; a change the remote
+    /// never registered keeps version 0 — its reads stay consistent but
+    /// unordered, which the ledger treats as the first recorded state.
+    fn bump_change(&mut self, change_id: &str) {
+        if let Some(change) = self.change_refs.get(change_id) {
+            let subject = ReadSubject::Pr {
+                change: change.clone(),
+            };
+            self.bump(&subject);
+        }
+    }
+
+    fn note_object(&mut self, object: &str) {
+        self.objects.insert(object.to_string());
+    }
+
+    /// Test control: objects the remote already knows — e.g. a fetched
+    /// base/head pair a diff read can reference.
+    pub fn seed_objects(&mut self, objects: &[&str]) {
+        for object in objects {
+            self.note_object(object);
+        }
+    }
+
+    /// Test control: record `child`'s parent in the remote's commit
+    /// ancestry — the fact a fast-forward push implies.
+    pub fn set_parent(&mut self, child: &str, parent: &str) {
+        self.note_object(child);
+        self.parents.insert(child.to_string(), parent.to_string());
+    }
+
+    /// Whether `ancestor` is on `object`'s recorded parent chain.
+    fn descends(&self, object: &str, ancestor: &str) -> bool {
+        let mut current = object;
+        for _ in 0..=self.parents.len() {
+            if current == ancestor {
+                return true;
+            }
+            let Some(parent) = self.parents.get(current) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
+    /// Test control: the next attempt of `action_name` faults at
+    /// execution and reports `Failed{reason}` — the write never reaches
+    /// the remote. One-shot; re-arm to repeat.
+    pub fn force_failure(&mut self, action_name: &str, reason: &str) {
+        self.forced_failures
+            .insert(action_name.to_string(), reason.to_string());
+    }
+
+    /// Test control: queue a remote mutation a racing actor lands after
+    /// the next successful adapter write, before its read-back.
+    pub fn queue_remote_mutation(&mut self, mutation: RemoteMutation) {
+        self.queued_mutations.push_back(mutation);
+    }
+
+    /// Apply every queued racing-actor mutation — the remote state the
+    /// read-back will observe.
+    fn apply_queued_mutations(&mut self) {
+        while let Some(mutation) = self.queued_mutations.pop_front() {
+            match mutation {
+                RemoteMutation::MoveBranch {
+                    repository,
+                    branch,
+                    head,
+                    actor,
+                } => {
+                    let key = (repository.to_string(), branch.clone());
+                    if let Some(old) = self.branches.get(&key).cloned() {
+                        self.parents.insert(head.clone(), old);
+                    }
+                    self.note_object(&head);
+                    self.branches.insert(key.clone(), head);
+                    self.branch_actors.insert(key, actor);
+                    self.bump(&ReadSubject::Head { repository, branch });
+                }
+                RemoteMutation::MoveChange {
+                    change,
+                    head,
+                    actor,
+                } => {
+                    let id = change.change_request.as_str().to_string();
+                    if let Some(old) = self.changes.get(&id).cloned() {
+                        self.parents.insert(head.clone(), old);
+                    }
+                    self.note_object(&head);
+                    self.changes.insert(id.clone(), head);
+                    self.change_actors.insert(id.clone(), actor);
+                    self.bump(&ReadSubject::Pr { change });
+                }
+                RemoteMutation::SetChangeMeta {
+                    change,
+                    title,
+                    body,
+                } => {
+                    let meta = self
+                        .change_meta
+                        .entry(change.change_request.as_str().to_string())
+                        .or_default();
+                    if title.is_some() {
+                        meta.0 = title;
+                    }
+                    if body.is_some() {
+                        meta.1 = body;
+                    }
+                    self.bump(&ReadSubject::Pr { change });
+                }
+            }
+        }
+    }
+
+    /// The remote's stored fields for a change — the fresh read a
+    /// metadata receipt reports.
+    fn change_fields(&self, change_id: &str) -> (Option<String>, Option<String>) {
+        self.change_meta.get(change_id).cloned().unwrap_or_default()
+    }
+
+    /// Test control: the remote's record of a repository's
+    /// default-branch head and the actor attributed to it.
+    pub fn set_repository(&mut self, repository: &RepositoryRef, head: &str, actor: &HostActorRef) {
+        self.note_object(head);
+        self.repositories.insert(
+            repository.to_string(),
+            RepoHead {
+                head: head.to_string(),
+                actor: actor.clone(),
+            },
+        );
+        self.bump(&ReadSubject::Repository {
+            repository: repository.clone(),
+        });
+    }
+
+    /// Test control: the actor the remote attributes an issue's content
+    /// to; reads of an issue without one report the reading actor.
+    pub fn set_issue_actor(&mut self, issue: &IssueRef, actor: &HostActorRef) {
+        self.issue_actors.insert(issue.to_string(), actor.clone());
+    }
+
+    /// Test control: move a branch head as the given actor — the
+    /// typed, versioned counterpart of a remote ref update.
+    pub fn set_branch(
+        &mut self,
+        repository: &RepositoryRef,
+        branch: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        self.note_object(head);
+        self.branches.insert(
+            (repository.to_string(), branch.to_string()),
+            head.to_string(),
+        );
+        self.branch_actors
+            .insert((repository.to_string(), branch.to_string()), actor.clone());
+        self.bump(&ReadSubject::Head {
+            repository: repository.clone(),
+            branch: branch.to_string(),
+        });
+    }
+
+    /// Test control: register a change's scoped ref so raw-id mutators
+    /// can bump its subject version, then move its head as `actor`.
+    pub fn set_change_head(&mut self, change: &ChangeRequestRef, head: &str, actor: &HostActorRef) {
+        self.note_object(head);
+        self.change_refs
+            .insert(change.change_request.as_str().to_string(), change.clone());
+        self.changes
+            .insert(change.change_request.as_str().to_string(), head.to_string());
+        self.change_actors
+            .insert(change.change_request.as_str().to_string(), actor.clone());
+        self.bump(&ReadSubject::Pr {
+            change: change.clone(),
+        });
+    }
+
+    /// Test control: the remote's check-run record for
+    /// `(change, check)` — run id, examined head, and producing actor.
+    pub fn set_check(
+        &mut self,
+        change: &ChangeRequestRef,
+        check: &str,
+        run_id: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        if !head.is_empty() {
+            self.note_object(head);
+        }
+        self.checks.insert(
+            (
+                change.change_request.as_str().to_string(),
+                check.to_string(),
+            ),
+            CheckRun {
+                run_id: run_id.to_string(),
+                head: head.to_string(),
+                actor: actor.clone(),
+            },
+        );
+        self.bump(&ReadSubject::Check {
+            change: change.clone(),
+            check: check.to_string(),
+        });
+    }
+
+    /// Test control: append one review to a change's review stream.
+    pub fn add_review(&mut self, change: &ChangeRequestRef, review_id: &str, actor: &HostActorRef) {
+        self.reviews
+            .entry(change.change_request.as_str().to_string())
+            .or_default()
+            .push(ReviewRecord {
+                review_id: review_id.to_string(),
+                actor: actor.clone(),
+                body: String::new(),
+            });
+        self.bump(&ReadSubject::Review {
+            change: change.clone(),
+        });
+    }
+
+    /// Test control: register an open thread on a change — the remote
+    /// thread a reply or resolve effect targets.
+    pub fn add_thread(&mut self, change: &ChangeRequestRef, thread_id: &str) {
+        self.threads.insert(
+            thread_id.to_string(),
+            RemoteThread {
+                change_id: change.change_request.as_str().to_string(),
+                ..RemoteThread::default()
+            },
+        );
+    }
+
+    /// The remote's thread record, for assertions on the post-effect
+    /// state.
+    pub fn thread(&self, thread_id: &str) -> Option<&RemoteThread> {
+        self.threads.get(thread_id)
+    }
+
+    /// Whether the remote reports the change as ready (non-draft).
+    pub fn is_ready(&self, change_id: &str) -> bool {
+        self.ready_changes.contains(change_id)
+    }
+
+    /// Test control: drop `operation` from the host's capability map —
+    /// attempts report `unsupported`, distinctly from a denied grant.
+    pub fn remove_support(&mut self, operation: &str) {
+        self.unsupported_ops.insert(operation.to_string());
+    }
+
+    /// Test control: `actor` lacks the grant for `operation` on the
+    /// subject — attempts record `Failed{reason: denied}`.
+    pub fn deny(&mut self, operation: &str, actor: &HostActorRef) {
+        self.denied_ops
+            .insert((operation.to_string(), actor.actor.as_str().to_string()));
+    }
+
+    /// Test control: `actor`'s class cannot perform `operation` on the
+    /// subject — attempts record `Failed{reason: ineligible}`.
+    pub fn mark_ineligible(&mut self, operation: &str, actor: &HostActorRef) {
+        self.ineligible_ops
+            .insert((operation.to_string(), actor.actor.as_str().to_string()));
+    }
+
+    /// Resolve one typed read target against the remote: the observed
+    /// revision in its per-kind form, the remote's version of the
+    /// subject at read time, the actor the remote reports, and the
+    /// read's completeness. An absent subject or a missing required
+    /// field is a `Partial` read — the host never invents a revision.
+    pub fn read(&self, subject: &ReadSubject, reader: &HostActorRef) -> RemoteRead {
+        let version = self.subject_version(subject);
+        let partial = |reason: &str| RemoteRead {
+            revision: None,
+            subject_version: version,
+            actor: reader.clone(),
+            completeness: Completeness::Partial {
+                reason: reason.to_string(),
+            },
+        };
+        let complete = |revision: ReadRevision, actor: HostActorRef| RemoteRead {
+            revision: Some(revision),
+            subject_version: version,
+            actor,
+            completeness: Completeness::Complete,
+        };
+        let sha = |repository: &RepositoryRef, object: &str| {
+            CommitRevision::new(repository.clone(), object)
+                .map(|revision| ReadRevision::Sha { revision })
+        };
+        match subject {
+            ReadSubject::Repository { repository } => {
+                match self.repositories.get(&repository.to_string()) {
+                    Some(state) => match sha(repository, &state.head) {
+                        Ok(revision) => complete(revision, state.actor.clone()),
+                        Err(_) => partial("repository head is not a valid object id"),
+                    },
+                    None => partial("repository is not on the remote"),
+                }
+            }
+            ReadSubject::Issue { issue } => match self.issues.get(&issue.to_string()) {
+                Some(read) => {
+                    let actor = self
+                        .issue_actors
+                        .get(&issue.to_string())
+                        .cloned()
+                        .unwrap_or_else(|| reader.clone());
+                    if read.state == IssueState::Unavailable {
+                        return RemoteRead {
+                            completeness: Completeness::Unavailable {
+                                reason: "issue read is unavailable".into(),
+                            },
+                            ..partial("issue read is unavailable")
+                        };
+                    }
+                    if read.source_revision.is_empty() || read.content_digest.is_empty() {
+                        return partial("issue read is missing its revision or digest");
+                    }
+                    complete(
+                        ReadRevision::Issue {
+                            source_revision: read.source_revision.clone(),
+                            content_digest: read.content_digest.clone(),
+                        },
+                        actor,
+                    )
+                }
+                None => partial("issue is not on the remote"),
+            },
+            ReadSubject::Pr { change } => match self.changes.get(change.change_request.as_str()) {
+                Some(head) => {
+                    let actor = self
+                        .change_actors
+                        .get(change.change_request.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| reader.clone());
+                    match sha(&change.repository, head) {
+                        Ok(revision) => complete(revision, actor),
+                        Err(_) => partial("change head is not a valid object id"),
+                    }
+                }
+                None => partial("change request is not on the remote"),
+            },
+            ReadSubject::Head { repository, branch } => {
+                match self.branches.get(&(repository.to_string(), branch.clone())) {
+                    Some(head) => {
+                        let actor = self
+                            .branch_actors
+                            .get(&(repository.to_string(), branch.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| reader.clone());
+                        match sha(repository, head) {
+                            Ok(revision) => complete(revision, actor),
+                            Err(_) => partial("branch head is not a valid object id"),
+                        }
+                    }
+                    None => partial("branch is not on the remote"),
+                }
+            }
+            ReadSubject::Diff { snapshot } => {
+                let known = self.objects.contains(snapshot.base().object.as_str())
+                    && self.objects.contains(snapshot.head().object.as_str());
+                if known {
+                    complete(
+                        ReadRevision::DiffSnapshot {
+                            snapshot_id: snapshot.snapshot_id(),
+                        },
+                        reader.clone(),
+                    )
+                } else {
+                    partial("diff base or head is not on the remote")
+                }
+            }
+            ReadSubject::Check { change, check } => {
+                match self
+                    .checks
+                    .get(&(change.change_request.as_str().to_string(), check.clone()))
+                {
+                    Some(run) => {
+                        if run.run_id.is_empty() {
+                            return partial("check read is missing its check-run id");
+                        }
+                        match CommitRevision::new(change.repository.clone(), &run.head) {
+                            Ok(head) => complete(
+                                ReadRevision::Check {
+                                    check_run_id: run.run_id.clone(),
+                                    head,
+                                },
+                                run.actor.clone(),
+                            ),
+                            Err(_) => partial("check head is not a valid object id"),
+                        }
+                    }
+                    None => partial("check is not on the remote"),
+                }
+            }
+            ReadSubject::Review { change } => {
+                match self
+                    .reviews
+                    .get(change.change_request.as_str())
+                    .and_then(|rs| rs.last())
+                {
+                    Some(review) if !review.review_id.is_empty() => complete(
+                        ReadRevision::Review {
+                            review_id: review.review_id.clone(),
+                        },
+                        review.actor.clone(),
+                    ),
+                    _ => partial("change request has no review on the remote"),
+                }
+            }
+        }
+    }
+
+    /// Poll one typed read target and deliver the Observation through
+    /// the shared ingest pipeline — the same path a webhook delivery
+    /// would use. The delivery identity is the subject at the observed
+    /// version, so a re-poll of an unchanged subject deduplicates and a
+    /// delayed delivery of an older read is recorded as history only.
+    pub fn observe(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        work_id: Option<&WorkId>,
+        subject: &ReadSubject,
+        reader: &HostActorRef,
+        now_unix_seconds: i64,
+    ) -> Result<IngestReceipt, StoreError> {
+        let read = self.read(subject, reader);
+        let observation = Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "fixture.poll".into(),
+                event_id: format!("{}@{}", subject.key(), read.subject_version),
+            }),
+            subject_work_id: work_id.cloned(),
+            subject_execution_id: None,
+            fact: ObservationFact::HostRead {
+                subject: subject.clone(),
+                revision: read.revision,
+                subject_version: read.subject_version,
+                actor: read.actor,
+                completeness: read.completeness,
+            },
+            observed_unix_seconds: now_unix_seconds,
+        };
+        self.emit(store, config, observation, now_unix_seconds)
     }
 
     /// Feed a synthetic Observation (change_head, check, review, an
@@ -424,6 +1061,7 @@ impl FixtureGithub {
                 Some(HostActionStatus::Applied) => report.applied += 1,
                 Some(HostActionStatus::Failed { .. }) => report.failed += 1,
                 Some(HostActionStatus::Unknown { .. }) => report.unknown += 1,
+                Some(HostActionStatus::Unsupported { .. }) => report.unsupported += 1,
                 // Denied or unchanged: counted as attempted, still pending.
                 _ => {}
             }
@@ -511,14 +1149,24 @@ impl FixtureGithub {
                     (intent.work_id.clone(), change.clone()),
                 );
             };
-            if let HostAction::UpdateChangeRequest { change, .. } = &intent.action {
-                note(change);
+            match &intent.action {
+                HostAction::UpdateChangeRequest { change, .. }
+                | HostAction::PostComment { change, .. }
+                | HostAction::PublishReviewFeedback { change, .. }
+                | HostAction::ReplyToThread { change, .. }
+                | HostAction::ResolveThread { change, .. }
+                | HostAction::MarkReady { change, .. } => note(change),
+                _ => {}
             }
             for effect in &intent.effects {
                 match effect {
                     NormalizedEffectFact::ChangeOpened { change, .. }
                     | NormalizedEffectFact::MetadataUpdated { change, .. }
-                    | NormalizedEffectFact::CommentPosted { change, .. } => note(change),
+                    | NormalizedEffectFact::CommentPosted { change, .. }
+                    | NormalizedEffectFact::ReviewPublished { change, .. }
+                    | NormalizedEffectFact::ReplyPosted { change, .. }
+                    | NormalizedEffectFact::ThreadResolved { change, .. }
+                    | NormalizedEffectFact::ReadyObserved { change, .. } => note(change),
                     _ => {}
                 }
             }
@@ -644,16 +1292,164 @@ impl FixtureGithub {
                 }
             };
 
+        // Support is validated distinctly from eligibility: an
+        // operation absent from the host's capability map is an
+        // explicit `unsupported` receipt — the write is never
+        // attempted and it is never a permission verdict.
+        if self.unsupported_ops.contains(intent.action.name()) {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Unsupported {
+                        reason: format!("unsupported operation: {}", intent.action.name()),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+        // Actor eligibility on the subject is checked before the
+        // write: `ineligible` (the actor's class cannot perform the
+        // operation here) and `denied` (the actor lacks the grant) are
+        // distinct explicit failure classes — both terminal, never
+        // conflated with `unsupported`.
+        let eligibility_key = || {
+            (
+                intent.action.name().to_string(),
+                authenticated.actor.as_str().to_string(),
+            )
+        };
+        let ineligible = self.ineligible_ops.contains(&eligibility_key());
+        let denied = self.denied_ops.contains(&eligibility_key());
+        if ineligible || denied {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Failed {
+                        reason: if ineligible { "ineligible" } else { "denied" }.into(),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+
+        // A test-armed execution fault: the write never reaches the
+        // remote; the failed receipt is explicit and the intent keeps
+        // its own record — a fault in one effect never rewrites the
+        // receipts of the others.
+        if let Some(reason) = self.forced_failures.remove(intent.action.name()) {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Failed { reason },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
-                self.branches.insert(
-                    (intent.repository.to_string(), branch.clone()),
-                    produced.object.clone(),
-                );
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The guarded fast-forward: the remote ref must still
+                // hold the position recorded at intent time (`None` =
+                // absent). A moved ref refuses the write — no ref
+                // update occurs, and the fresh position surfaces so
+                // the caller can re-issue against it.
+                let key = (intent.repository.to_string(), branch.clone());
+                let actual = self.branches.get(&key).cloned();
+                let expected = expected_prior.as_ref().map(|p| p.object.clone());
+                if actual != expected {
+                    // The fresh position is recorded before the refusal
+                    // receipt — the same order the bridge reports it, so
+                    // a receipt-driven re-issue derives its guard from
+                    // the observed remote, never the pre-read position.
+                    let state = match &actual {
+                        Some(head) => BranchState::At {
+                            revision: CommitRevision::new(intent.repository.clone(), head)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                        },
+                        None => BranchState::Absent,
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::BranchState {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            state,
+                        }),
+                        now,
+                    )?;
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "stale_head".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.branches.insert(key.clone(), produced.object.clone());
+                if let Some(prior) = &actual {
+                    self.parents.insert(produced.object.clone(), prior.clone());
+                }
+                self.note_object(&produced.object);
+                self.branch_actors.insert(key, authenticated.clone());
+                self.bump(&ReadSubject::Head {
+                    repository: intent.repository.clone(),
+                    branch: branch.clone(),
+                });
                 self.applied.push(format!(
                     "push_ref:{}:{}",
                     intent.repository, produced.object
                 ));
+                // Read-back: the remote may have raced between write and
+                // fresh read — the receipt reports what the read
+                // observes, never the attempted value.
+                self.apply_queued_mutations();
+                let observed_object = self.remote_head(&intent.repository, branch);
+                let (observed, relation) = match &observed_object {
+                    Some(object) if object == &produced.object => {
+                        (produced.clone(), RefRelation::Equal)
+                    }
+                    Some(object) => {
+                        let relation = if self.descends(object, &produced.object) {
+                            RefRelation::Ancestor
+                        } else {
+                            RefRelation::Diverged
+                        };
+                        (
+                            CommitRevision::new(intent.repository.clone(), object)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                            relation,
+                        )
+                    }
+                    None => {
+                        // The ref is gone after our write: the outcome
+                        // cannot be established as applied — report the
+                        // produced revision as diverged evidence.
+                        (produced.clone(), RefRelation::Diverged)
+                    }
+                };
                 self.emit(
                     store,
                     config,
@@ -664,8 +1460,8 @@ impl FixtureGithub {
                             repository: intent.repository.clone(),
                             branch: branch.clone(),
                             produced: produced.clone(),
-                            observed: produced.clone(),
-                            relation: RefRelation::Equal,
+                            observed,
+                            relation,
                         }],
                     )),
                     now,
@@ -674,7 +1470,8 @@ impl FixtureGithub {
             HostAction::OpenChangeRequest {
                 source_branch,
                 target_branch,
-                ..
+                title,
+                body,
             } => {
                 self.next_id += 1;
                 let display = {
@@ -699,11 +1496,34 @@ impl FixtureGithub {
                     change.change_request.as_str().to_string(),
                     head_object.clone(),
                 );
+                self.change_meta.insert(
+                    change.change_request.as_str().to_string(),
+                    (Some(title.clone()), Some(body.clone())),
+                );
+                self.note_object(&head_object);
+                self.change_refs
+                    .insert(change.change_request.as_str().to_string(), change.clone());
+                self.change_actors.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
                 self.applied.push(format!(
                     "open_change:{}:{}",
                     intent.repository, change.change_request
                 ));
-                let head = CommitRevision::new(intent.repository.clone(), head_object)
+                // Read-back: the receipt reports the head a fresh
+                // change-request lookup observes, not the value the
+                // write attempted.
+                self.apply_queued_mutations();
+                let observed_head = self
+                    .changes
+                    .get(change.change_request.as_str())
+                    .cloned()
+                    .unwrap_or(head_object);
+                let head = CommitRevision::new(intent.repository.clone(), observed_head)
                     .map_err(|detail| StoreError::Internal { detail })?;
                 self.emit(
                     store,
@@ -733,14 +1553,43 @@ impl FixtureGithub {
             HostAction::UpdateChangeRequest {
                 change,
                 expected_head,
-                ..
+                title,
+                body,
             } => {
                 let actual = self.changes.get(change.change_request.as_str()).cloned();
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    // The remote stores only the fields the request
+                    // carried — a PATCH never rewrites omitted fields.
+                    {
+                        let meta = self
+                            .change_meta
+                            .entry(change.change_request.as_str().to_string())
+                            .or_default();
+                        if title.is_some() {
+                            meta.0 = title.clone();
+                        }
+                        if body.is_some() {
+                            meta.1 = body.clone();
+                        }
+                    }
+                    self.bump_change(change.change_request.as_str());
                     self.applied.push(format!(
                         "update_change:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    // Read-back: the digest covers the remote's stored
+                    // fields after any racing update — never the
+                    // attempted payload.
+                    self.apply_queued_mutations();
+                    let (stored_title, stored_body) =
+                        self.change_fields(change.change_request.as_str());
+                    let fields_digest = workloop_core::domain::sha256_hex(
+                        "change-meta-v1",
+                        &workloop_core::domain::canonical_json(&serde_json::json!({
+                            "title": stored_title,
+                            "body": stored_body,
+                        })),
+                    );
                     self.emit(
                         store,
                         config,
@@ -750,7 +1599,7 @@ impl FixtureGithub {
                             vec![NormalizedEffectFact::MetadataUpdated {
                                 change: change.clone(),
                                 head: expected_head.clone(),
-                                fields_digest: "fixture".into(),
+                                fields_digest,
                             }],
                         )),
                         now,
@@ -789,14 +1638,39 @@ impl FixtureGithub {
                 change,
                 expected_head,
                 marker,
-                ..
+                body,
             } => {
                 let actual = self.changes.get(change.change_request.as_str()).cloned();
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
+                    let comment_id = format!("c-{}", intent.action_id);
+                    self.comments.push(PostedComment {
+                        change_id: change.change_request.as_str().to_string(),
+                        comment_id: comment_id.clone(),
+                        actor: authenticated.clone(),
+                        body: body.clone(),
+                    });
+                    self.bump(&ReadSubject::Pr {
+                        change: change.clone(),
+                    });
                     self.applied.push(format!(
                         "post_comment:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    // Read-back: the receipt cites the remote-issued
+                    // comment identity, read from the remote's stored
+                    // discussion — not the attempted payload.
+                    self.apply_queued_mutations();
+                    let posted = self
+                        .comments
+                        .iter()
+                        .find(|c| c.comment_id == comment_id)
+                        .expect("the just-written comment");
+                    let body_digest = workloop_core::domain::sha256_hex(
+                        "comment-v1",
+                        &workloop_core::domain::canonical_json(&serde_json::json!({
+                            "body": posted.body,
+                        })),
+                    );
                     self.emit(
                         store,
                         config,
@@ -805,10 +1679,10 @@ impl FixtureGithub {
                             HostActionStatus::Applied,
                             vec![NormalizedEffectFact::CommentPosted {
                                 change: change.clone(),
-                                comment_id: format!("c-{}", intent.action_id),
-                                actor: intent.actor.clone(),
+                                comment_id: posted.comment_id.clone(),
+                                actor: posted.actor.clone(),
                                 marker: marker.clone(),
-                                body_digest: "fixture".into(),
+                                body_digest,
                                 target: None,
                             }],
                         )),
@@ -827,6 +1701,325 @@ impl FixtureGithub {
                         )),
                         now,
                     )?;
+                }
+            }
+            HostAction::PublishReviewFeedback { change, head, body } => {
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let review_id = format!("rv-{}", intent.action_id);
+                self.reviews
+                    .entry(change.change_request.as_str().to_string())
+                    .or_default()
+                    .push(ReviewRecord {
+                        review_id: review_id.clone(),
+                        actor: authenticated.clone(),
+                        body: body.clone(),
+                    });
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.bump(&ReadSubject::Review {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "publish_review_feedback:{}:{}",
+                    intent.repository, change.change_request
+                ));
+                // Read-back: the receipt cites the remote-issued review
+                // id and the stored body digest.
+                self.apply_queued_mutations();
+                let posted = self
+                    .reviews
+                    .get(change.change_request.as_str())
+                    .and_then(|rs| rs.iter().find(|r| r.review_id == review_id))
+                    .expect("the just-written review");
+                let body_digest = workloop_core::domain::sha256_hex(
+                    "review-v1",
+                    &workloop_core::domain::canonical_json(&serde_json::json!({
+                        "body": posted.body,
+                    })),
+                );
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::ReviewPublished {
+                            change: change.clone(),
+                            review_id: posted.review_id.clone(),
+                            head: head.clone(),
+                            body_digest,
+                        }],
+                    )),
+                    now,
+                )?;
+            }
+            HostAction::ReplyToThread {
+                change,
+                thread_id,
+                marker,
+                body,
+            } => {
+                let belongs = self
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|t| t.change_id == change.change_request.as_str());
+                if !belongs {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "unknown thread".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let reply_id = format!("rp-{}", intent.action_id);
+                self.threads
+                    .get_mut(thread_id)
+                    .expect("checked")
+                    .replies
+                    .push((reply_id.clone(), authenticated.clone(), body.clone()));
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied
+                    .push(format!("thread_reply:{}:{}", intent.repository, thread_id));
+                // Read-back: the receipt cites the remote-issued reply
+                // identity on the exact thread.
+                self.apply_queued_mutations();
+                let posted = self
+                    .threads
+                    .get(thread_id)
+                    .and_then(|t| t.replies.iter().find(|(id, _, _)| id == &reply_id))
+                    .expect("the just-written reply");
+                let body_digest = workloop_core::domain::sha256_hex(
+                    "reply-v1",
+                    &workloop_core::domain::canonical_json(&serde_json::json!({
+                        "body": posted.2,
+                    })),
+                );
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Applied,
+                        vec![NormalizedEffectFact::ReplyPosted {
+                            change: change.clone(),
+                            thread_id: thread_id.clone(),
+                            marker: marker.clone(),
+                            reply_id: posted.0.clone(),
+                            body_digest,
+                        }],
+                    )),
+                    now,
+                )?;
+            }
+            HostAction::ResolveThread {
+                change,
+                thread_id,
+                head,
+            } => {
+                let belongs = self
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|t| t.change_id == change.change_request.as_str());
+                if !belongs {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "unknown thread".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.threads.get_mut(thread_id).expect("checked").resolved = true;
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "resolve_thread:{}:{}",
+                    intent.repository, thread_id
+                ));
+                // Read-back: the receipt reports the thread state a
+                // fresh read observes.
+                self.apply_queued_mutations();
+                let resolved = self.threads.get(thread_id).is_some_and(|t| t.resolved);
+                let observed_head = self.changes.get(change.change_request.as_str()).cloned();
+                if resolved && let Some(object) = observed_head {
+                    let observed = CommitRevision::new(intent.repository.clone(), object.clone())
+                        .map_err(|detail| StoreError::Internal { detail })?;
+                    // The receipt echoes the bound head and reports the
+                    // observed head's relation to it — a racing actor
+                    // may move the change across the write/read gap.
+                    let relation = if object == head.object {
+                        RefRelation::Equal
+                    } else if self.descends(&object, &head.object) {
+                        RefRelation::Ancestor
+                    } else {
+                        RefRelation::Diverged
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Applied,
+                            vec![NormalizedEffectFact::ThreadResolved {
+                                change: change.clone(),
+                                thread_id: thread_id.clone(),
+                                target: DiffTarget {
+                                    change: change.clone(),
+                                    head: head.clone(),
+                                    base: None,
+                                    target_revision: None,
+                                },
+                                observed,
+                                relation,
+                            }],
+                        )),
+                        now,
+                    )?;
+                } else {
+                    // The write may have been undone by a racing actor:
+                    // the outcome cannot be established — report
+                    // unknown, never a fabricated resolve.
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Unknown {
+                                reason: "thread not resolved at read-back".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                }
+            }
+            HostAction::MarkReady {
+                change,
+                expected_head,
+            } => {
+                let actual = self.changes.get(change.change_request.as_str()).cloned();
+                if actual.as_deref() != Some(expected_head.object.as_str()) {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "expected head moved".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(AttemptOutcome::Attempted);
+                }
+                self.ready_changes
+                    .insert(change.change_request.as_str().to_string());
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
+                self.applied.push(format!(
+                    "mark_ready:{}:{}",
+                    intent.repository, change.change_request
+                ));
+                // Read-back: the ready state and head a fresh read
+                // observes — not the attempted values.
+                self.apply_queued_mutations();
+                let ready = self.is_ready(change.change_request.as_str());
+                let observed_head = self.changes.get(change.change_request.as_str()).cloned();
+                match (ready, observed_head) {
+                    (true, Some(object)) => {
+                        let observed =
+                            CommitRevision::new(intent.repository.clone(), object.clone())
+                                .map_err(|detail| StoreError::Internal { detail })?;
+                        // Same bound-echo/observed split as the resolve
+                        // receipt: the remote may have raced the
+                        // write/read gap.
+                        let relation = if object == expected_head.object {
+                            RefRelation::Equal
+                        } else if self.descends(&object, &expected_head.object) {
+                            RefRelation::Ancestor
+                        } else {
+                            RefRelation::Diverged
+                        };
+                        self.emit(
+                            store,
+                            config,
+                            obs(result(
+                                intent.action_id.clone(),
+                                HostActionStatus::Applied,
+                                vec![NormalizedEffectFact::ReadyObserved {
+                                    change: change.clone(),
+                                    head: expected_head.clone(),
+                                    observed,
+                                    relation,
+                                }],
+                            )),
+                            now,
+                        )?;
+                    }
+                    _ => {
+                        self.emit(
+                            store,
+                            config,
+                            obs(result(
+                                intent.action_id.clone(),
+                                HostActionStatus::Unknown {
+                                    reason: "ready state not observed at read-back".into(),
+                                },
+                                vec![],
+                            )),
+                            now,
+                        )?;
+                    }
                 }
             }
         }

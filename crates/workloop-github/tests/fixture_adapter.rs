@@ -262,6 +262,7 @@ fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, Exec
                     HostAction::PushRef {
                         branch: format!("work/{}", work_id.0),
                         produced: rev("artifact-digest"),
+                        expected_prior: None,
                     },
                 ),
                 (
@@ -477,6 +478,7 @@ fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
         HostAction::PushRef {
             branch: "b".into(),
             produced: rev("head-x"),
+            expected_prior: None,
         },
         HostActionStatus::Pending,
     );
@@ -728,6 +730,7 @@ fn terminal_execution_still_authorizes_outstanding_effect_reconciliation() {
         HostAction::PushRef {
             branch: "work/terminal".into(),
             produced: rev("head-t"),
+            expected_prior: None,
         },
     );
     store
@@ -762,6 +765,7 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
         HostAction::PushRef {
             branch: "work/restricted".into(),
             produced: rev("head-r"),
+            expected_prior: None,
         },
         HostAction::UpdateChangeRequest {
             change: change(),
@@ -805,6 +809,7 @@ fn execution_denial_is_not_overridden_by_installation_permissions() {
         HostAction::PushRef {
             branch: "work/allowed".into(),
             produced: rev("head-a"),
+            expected_prior: None,
         },
     );
     gh.apply_outbox(&store, &config(), NOW).unwrap();
@@ -829,6 +834,7 @@ fn host_write_denied_leaves_the_outbox_pending() {
         HostAction::PushRef {
             branch: "work/w-1".into(),
             produced: rev("head-1"),
+            expected_prior: None,
         },
     );
     let mut read_only = config();
@@ -1213,6 +1219,7 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
         HostAction::PushRef {
             branch: "work/w-1".into(),
             produced: rev("head-9"),
+            expected_prior: None,
         },
     );
     store
@@ -1345,6 +1352,7 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
         HostAction::PushRef {
             branch: "work/w-1".into(),
             produced: rev("head-10"),
+            expected_prior: None,
         },
     );
     store

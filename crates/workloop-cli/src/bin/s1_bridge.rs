@@ -231,14 +231,21 @@ fn push_landed_for(ctx: &Ctx, work_id: &WorkId, branch: &str) -> bool {
 
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
-/// authorization is the credential's real `permissions` answer.
+/// authorization is the credential's real `permissions` answer. An
+/// operation `attempt` reports `Unsupported` for is denied support
+/// here — declaring it supported would authorize intents the bridge
+/// can never execute.
 fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     let perms = gh_json(&["api", &format!("repos/{}", ctx.repo_display)])?;
     let write = perms["permissions"]["push"].as_bool() == Some(true);
     let read = perms["permissions"]["pull"].as_bool() == Some(true);
-    let entry = |capability: HostCapability, granted: bool| CapabilityEntry {
+    let entry = |capability: HostCapability, supported: bool, granted: bool| CapabilityEntry {
         capability,
-        support: CapabilityState::Supported,
+        support: if supported {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Denied
+        },
         authorization: if granted {
             CapabilityState::Authorized
         } else {
@@ -248,16 +255,19 @@ fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     Ok(ObservationFact::CapabilityReport {
         host: ctx.config.host.repository.host.clone(),
         capabilities: vec![
-            entry(HostCapability::RepositoryRead, read),
-            entry(HostCapability::BranchRead, read),
-            entry(HostCapability::ChangeRequestRead, read),
-            entry(HostCapability::IssueRead, read),
-            entry(HostCapability::ChecksRead, read),
-            entry(HostCapability::ReviewFindingsRead, read),
-            entry(HostCapability::PushRef, write),
-            entry(HostCapability::ChangeRequestCreate, write),
-            entry(HostCapability::ChangeRequestUpdate, write),
-            entry(HostCapability::CommentWrite, write),
+            entry(HostCapability::RepositoryRead, true, read),
+            entry(HostCapability::BranchRead, true, read),
+            entry(HostCapability::ChangeRequestRead, true, read),
+            entry(HostCapability::IssueRead, true, read),
+            entry(HostCapability::ChecksRead, true, read),
+            entry(HostCapability::ReviewFindingsRead, true, read),
+            entry(HostCapability::PushRef, true, write),
+            entry(HostCapability::ChangeRequestCreate, true, write),
+            // Head-bound and discussion writes are outside the bridge's
+            // implementation surface (see `attempt`): support is denied
+            // even when the credential itself is authorized.
+            entry(HostCapability::ChangeRequestUpdate, false, write),
+            entry(HostCapability::CommentWrite, false, write),
         ],
     })
 }
@@ -380,7 +390,10 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     for intent in intents {
-        let HostAction::PushRef { branch, produced } = &intent.action else {
+        let HostAction::PushRef {
+            branch, produced, ..
+        } = &intent.action
+        else {
             continue;
         };
         let Ok(sha) = gh(&[
@@ -506,7 +519,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
         return Ok(());
     }
     match &intent.action {
-        HostAction::PushRef { branch, produced } => {
+        HostAction::PushRef {
+            branch,
+            produced,
+            expected_prior,
+        } => {
             let repo_dir = ctx.workspace_of(&intent.work_id);
             if !repo_dir.join(".git").exists() {
                 emit_result(
@@ -571,6 +588,25 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                     state: prior_state,
                 },
             );
+            // The guard binds the write to the position recorded at
+            // intent time, not to whatever a fresh read happens to
+            // return: a remote ref that moved since the intent was
+            // persisted refuses the write before it is attempted.
+            let expected = expected_prior
+                .as_ref()
+                .map(|p| p.object.as_str())
+                .unwrap_or_default();
+            if prior_sha != expected {
+                emit_result(
+                    ctx,
+                    intent,
+                    HostActionStatus::Failed {
+                        reason: "stale_head".into(),
+                    },
+                    vec![],
+                );
+                return Ok(());
+            }
             let lease = format!("--force-with-lease=refs/heads/{branch}:{prior_sha}");
             let push = git(
                 &repo_dir,
@@ -733,21 +769,19 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent) -> Result<(), String> {
                 ),
             }
         }
-        // Head-bound writes the bridge does not implement stay explicit
-        // failures — an unsupported effect is never an applied receipt.
-        HostAction::UpdateChangeRequest { .. } => emit_result(
+        // Head-bound and discussion writes the bridge does not
+        // implement stay explicit — an `unsupported` receipt is never
+        // an applied receipt or a permission verdict.
+        HostAction::UpdateChangeRequest { .. }
+        | HostAction::PostComment { .. }
+        | HostAction::PublishReviewFeedback { .. }
+        | HostAction::ReplyToThread { .. }
+        | HostAction::ResolveThread { .. }
+        | HostAction::MarkReady { .. } => emit_result(
             ctx,
             intent,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: update_change_request".into(),
-            },
-            vec![],
-        ),
-        HostAction::PostComment { .. } => emit_result(
-            ctx,
-            intent,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: post_comment".into(),
+            HostActionStatus::Unsupported {
+                reason: format!("unsupported operation: {}", intent.action.name()),
             },
             vec![],
         ),
@@ -1200,6 +1234,7 @@ mod tests {
             action: HostAction::PushRef {
                 branch: branch.into(),
                 produced,
+                expected_prior: None,
             },
             payload_digest: "digest".into(),
             status,

@@ -1,8 +1,8 @@
 //! A second, independently structured fixture host for conformance
 //! parameterization. `SparseHost` declares only a subset of the baseline
-//! operations and reports every unsupported intent as a failed receipt —
-//! an unsupported operation stays explicit and is never counted as
-//! applied. Its remote model is a scoped event journal (repository +
+//! operations and reports every unsupported intent as an `unsupported`
+//! receipt — an unsupported operation stays explicit and is never
+//! counted as applied. Its remote model is a scoped event journal (repository +
 //! branch/change keys), deliberately different from `FixtureGithub`'s
 //! flat maps so shared-suite assertions cannot lean on one fixture's
 //! internals.
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
 use workloop_core::observation::{
-    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    BranchState, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -94,8 +94,8 @@ impl SparseHost {
     }
 
     /// Drain outstanding intents in outbox order, bounded to the intents
-    /// pending when each attempt starts. Unsupported operations receive a
-    /// `failed` receipt naming the unsupported operation — explicit, and
+    /// pending when each attempt starts. Unsupported operations receive
+    /// an `unsupported` receipt naming the operation — explicit, and
     /// never an `applied` claim.
     pub fn apply_outbox(
         &mut self,
@@ -162,7 +162,7 @@ impl SparseHost {
                 config,
                 obs(result(
                     intent.action_id.clone(),
-                    HostActionStatus::Failed {
+                    HostActionStatus::Unsupported {
                         reason: format!("unsupported operation: {name}"),
                     },
                     vec![],
@@ -173,7 +173,51 @@ impl SparseHost {
         };
 
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The same fast-forward guard the main fixture models:
+                // a moved remote ref refuses the write.
+                let key = (intent.repository.to_string(), branch.clone());
+                let actual = self.branches.get(&key).cloned();
+                if actual != expected_prior.as_ref().map(|p| p.object.clone()) {
+                    // The fresh position is recorded before the refusal
+                    // receipt — the same order `FixtureGithub` reports it,
+                    // so a receipt-driven re-issue derives its guard from
+                    // the observed remote, never the pre-read position.
+                    let state = match &actual {
+                        Some(head) => BranchState::At {
+                            revision: CommitRevision::new(intent.repository.clone(), head)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                        },
+                        None => BranchState::Absent,
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::BranchState {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            state,
+                        }),
+                        now,
+                    )?;
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "stale_head".into(),
+                            },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(());
+                }
                 self.branches.insert(
                     (intent.repository.to_string(), branch.clone()),
                     produced.object.clone(),
@@ -261,14 +305,27 @@ impl SparseHost {
                     now,
                 )?;
             }
-            // This fixture implements no head-bound writes. Reporting
-            // `failed(unsupported)` keeps the intent's fate explicit —
-            // an unsupported capability is never an applied receipt.
+            // This fixture implements no head-bound or discussion
+            // writes. An explicit `unsupported` receipt keeps the
+            // intent's fate honest — an unsupported capability is
+            // never an applied receipt and never a permission verdict.
             HostAction::UpdateChangeRequest { .. } => {
                 unsupported(self, "update_change_request")?;
             }
             HostAction::PostComment { .. } => {
                 unsupported(self, "post_comment")?;
+            }
+            HostAction::PublishReviewFeedback { .. } => {
+                unsupported(self, "publish_review_feedback")?;
+            }
+            HostAction::ReplyToThread { .. } => {
+                unsupported(self, "thread_reply")?;
+            }
+            HostAction::ResolveThread { .. } => {
+                unsupported(self, "resolve_thread")?;
+            }
+            HostAction::MarkReady { .. } => {
+                unsupported(self, "mark_ready")?;
             }
         }
         Ok(())

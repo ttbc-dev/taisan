@@ -1032,6 +1032,7 @@ fn no_operation_beyond_the_four_is_reachable() {
         serde_json::json!({ "op": "update_change_request" }),
         serde_json::json!({ "op": "post_inline_comment" }),
         serde_json::json!({ "op": "publish_review_feedback" }),
+        serde_json::json!({ "op": "thread_reply" }),
         serde_json::json!({ "op": "request_changes" }),
     ] {
         assert!(

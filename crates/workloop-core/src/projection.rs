@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
-use crate::identity::{ChangeRequestRef, CommitRevision};
+use crate::identity::{ChangeRequestRef, CommitRevision, HostActorRef};
 use crate::observation::{
-    ArtifactFact, HostActionStatus, ObservationFact, Outcome, ProcessStateFact,
+    ArtifactFact, HostActionStatus, ObservationFact, Outcome, ProcessStateFact, ReadRevision,
+    ReadSubject,
 };
 use crate::store::{Deferral, ReadView, StoreError};
 
@@ -792,4 +793,68 @@ fn writer_state_of(
     } else {
         WriterState::Stopped
     }))
+}
+
+/// The recorded state of one typed host read subject: the complete read
+/// carrying the greatest `subject_version`. A delayed delivery of an
+/// older read, or a partial/unavailable one, is retained as history —
+/// neither can move the recorded revision backward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRead {
+    pub revision: ReadRevision,
+    pub subject_version: u64,
+    /// The actor the host reported for this read.
+    pub actor: HostActorRef,
+}
+
+/// The current recorded read for `subject`, or `None` when no complete
+/// read is on record. Ordering is by `subject_version` — the remote's
+/// version of that subject at read time — with the first delivery at a
+/// version holding the recorded revision when same-version reads
+/// conflict.
+pub fn current_read(
+    tx: &dyn ReadView,
+    subject: &ReadSubject,
+) -> Result<Option<RecordedRead>, StoreError> {
+    let mut current: Option<RecordedRead> = None;
+    for o in tx.all_observations()? {
+        let ObservationFact::HostRead {
+            subject: s,
+            revision,
+            subject_version,
+            actor,
+            completeness,
+        } = &o.fact
+        else {
+            continue;
+        };
+        if s != subject || !completeness.is_complete() {
+            continue;
+        }
+        let Some(revision) = revision else { continue };
+        if current
+            .as_ref()
+            .is_none_or(|c| *subject_version > c.subject_version)
+        {
+            current = Some(RecordedRead {
+                revision: revision.clone(),
+                subject_version: *subject_version,
+                actor: actor.clone(),
+            });
+        }
+    }
+    Ok(current)
+}
+
+/// Whether recorded evidence satisfies a decision bound to `required`:
+/// only the subject's current complete read qualifies, and only when it
+/// carries exactly that revision — a decision bound to revision r does
+/// not fire while the recorded read is still at r−1, and a stale
+/// delivery arriving afterward cannot revoke it.
+pub fn read_satisfies(
+    tx: &dyn ReadView,
+    subject: &ReadSubject,
+    required: &ReadRevision,
+) -> Result<bool, StoreError> {
+    Ok(current_read(tx, subject)?.is_some_and(|r| r.revision == *required))
 }

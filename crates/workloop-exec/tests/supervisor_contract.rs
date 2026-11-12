@@ -1597,6 +1597,7 @@ fn cancel_while_waiting_settles_once_no_writer_remains() {
     let HostAction::PushRef {
         branch: intent_branch,
         produced: intent_produced,
+        ..
     } = &intent.action
     else {
         panic!("the stage effect is a push_ref intent: {intent:?}")
@@ -2769,6 +2770,7 @@ fn a_mid_stop_crash_holds_the_slot_until_stop_and_effects_reconcile() {
                     action: HostAction::PushRef {
                         branch: format!("work/{}", w.0),
                         produced: CommitRevision::new(repo(), "0".repeat(40)).unwrap(),
+                        expected_prior: None,
                     },
                     payload_digest: "digest".into(),
                     status: HostActionStatus::Pending,

@@ -32,7 +32,7 @@ use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, HostInstanceId, RepositoryRef,
 };
 use workloop_core::observation::{
-    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    BranchState, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
@@ -244,7 +244,43 @@ impl GitlabFixture {
         };
 
         match &intent.action {
-            HostAction::PushRef { branch, produced } => {
+            HostAction::PushRef {
+                branch,
+                produced,
+                expected_prior,
+            } => {
+                // The same fast-forward guard the GitHub fixture
+                // models: a moved remote ref refuses the write.
+                let actual = self
+                    .projects
+                    .get(&intent.repository.to_string())
+                    .and_then(|p| p.branches.get(branch))
+                    .cloned();
+                if actual != expected_prior.as_ref().map(|p| p.object.clone()) {
+                    // The fresh position is recorded before the refusal
+                    // receipt — the same order `FixtureGithub` reports it,
+                    // so a receipt-driven re-issue derives its guard from
+                    // the observed remote, never the pre-read position.
+                    let state = match &actual {
+                        Some(head) => BranchState::At {
+                            revision: CommitRevision::new(intent.repository.clone(), head)
+                                .map_err(|detail| StoreError::Internal { detail })?,
+                        },
+                        None => BranchState::Absent,
+                    };
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::BranchState {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            state,
+                        }),
+                        now,
+                    )?;
+                    failed(self, intent.action_id.clone(), "stale_head")?;
+                    return Ok(());
+                }
                 let project = self
                     .projects
                     .entry(intent.repository.to_string())
@@ -463,6 +499,26 @@ impl GitlabFixture {
                 } else {
                     failed(self, intent.action_id.clone(), "expected head moved")?;
                 }
+            }
+            // Discussion and ready writes are outside this fixture's
+            // capability map — an explicit `unsupported` receipt, never
+            // a permission verdict or an invented success.
+            HostAction::PublishReviewFeedback { .. }
+            | HostAction::ReplyToThread { .. }
+            | HostAction::ResolveThread { .. }
+            | HostAction::MarkReady { .. } => {
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id.clone(),
+                        HostActionStatus::Unsupported {
+                            reason: format!("unsupported operation: {}", intent.action.name()),
+                        },
+                        vec![],
+                    )),
+                    now,
+                )?;
             }
         }
         Ok(())

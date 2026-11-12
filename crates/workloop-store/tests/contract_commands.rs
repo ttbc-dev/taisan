@@ -2919,6 +2919,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             HostAction::PushRef {
                 branch: format!("work/{}", w.0),
                 produced: rev("artifact-digest"),
+                expected_prior: None,
             },
         ),
         (
@@ -3105,6 +3106,7 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                         HostAction::PushRef {
                             branch: format!("work/{}", w.0),
                             produced: rev("artifact-digest"),
+                            expected_prior: None,
                         },
                         HostActionStatus::Applied,
                     ),
@@ -4355,6 +4357,278 @@ fn an_applied_push_retry_advances_the_chain() {
         .unwrap();
 }
 
+/// Regression: a delayed older `BranchState` delivered after a newer
+/// read-back must not move the re-issue guard backward — the freshest
+/// position is chosen by (observed_unix_seconds, index), never raw
+/// insertion order.
+#[test]
+fn a_delayed_older_branch_read_never_degrades_the_reissue_guard() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("dg1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_max_retries = 3;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "dg1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let branch = format!("work/{}", w.0);
+    let emit_at = |fact: ObservationFact, ts: i64| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: ts,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit_at(
+        ObservationFact::CapabilityReport {
+            host: host(),
+            capabilities: vec![
+                CapabilityEntry {
+                    capability: HostCapability::PushRef,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                },
+                CapabilityEntry {
+                    capability: HostCapability::ChangeRequestCreate,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                },
+            ],
+        },
+        NOW,
+    );
+    emit_at(
+        ObservationFact::Artifact {
+            invocation_id: invocation.id.clone(),
+            required_artifact: "artifact.json".into(),
+            state: ArtifactFact::Present {
+                digest: "artifact-digest".into(),
+            },
+        },
+        NOW,
+    );
+    let pushes = |store: &SqliteStore| {
+        store
+            .transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+    };
+    assert_eq!(pushes(&store).len(), 1);
+    // The remote's freshest read reports head-fresh at t=NOW+10.
+    emit_at(
+        ObservationFact::BranchState {
+            repository: repo(),
+            branch: branch.clone(),
+            state: BranchState::At {
+                revision: rev("head-fresh"),
+            },
+        },
+        NOW + 10,
+    );
+    emit_at(
+        ObservationFact::HostActionResult {
+            action_id: pushes(&store)[0].action_id.clone(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Failed {
+                reason: "declined".into(),
+            },
+            effects: vec![],
+        },
+        NOW,
+    );
+    let retry = pushes(&store);
+    assert_eq!(retry.len(), 2, "the failed push re-issues under the bound");
+    match &retry[1].action {
+        HostAction::PushRef { expected_prior, .. } => {
+            assert_eq!(
+                expected_prior.as_ref().map(|p| p.object.as_str()),
+                Some("head-fresh"),
+                "the re-issue guards on the freshest observed position"
+            );
+        }
+        other => panic!("expected push intent: {other:?}"),
+    }
+    // A delayed read observed BEFORE the fresh one lands late: it must
+    // not overwrite the fresher position.
+    emit_at(
+        ObservationFact::BranchState {
+            repository: repo(),
+            branch: branch.clone(),
+            state: BranchState::At {
+                revision: rev("head-stale"),
+            },
+        },
+        NOW + 1,
+    );
+    emit_at(
+        ObservationFact::HostActionResult {
+            action_id: retry[1].action_id.clone(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Failed {
+                reason: "declined".into(),
+            },
+            effects: vec![],
+        },
+        NOW,
+    );
+    let retry2 = pushes(&store);
+    assert_eq!(retry2.len(), 3, "the second failure also re-issues");
+    match &retry2[2].action {
+        HostAction::PushRef { expected_prior, .. } => {
+            assert_eq!(
+                expected_prior.as_ref().map(|p| p.object.as_str()),
+                Some("head-fresh"),
+                "a delayed older read never degrades the guard"
+            );
+        }
+        other => panic!("expected push intent: {other:?}"),
+    }
+}
+
+/// Regression: an authorization/eligibility verdict (`denied`,
+/// `ineligible`) is terminal for the intent — it never consumes the
+/// transport retry account, never re-issues the push, and pauses with
+/// the verdict's own classification rather than transport exhaustion.
+#[test]
+fn a_denied_stage_effect_is_terminal_not_a_transport_retry() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("az1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_max_retries = 3;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "az1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: invocation.clone(),
+        }],
+    );
+    let emit = |fact: ObservationFact| {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    let pushes = |store: &SqliteStore| {
+        store
+            .transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+    };
+    assert_eq!(pushes(&store).len(), 1);
+    emit(ObservationFact::HostActionResult {
+        action_id: pushes(&store)[0].action_id.clone(),
+        authenticated_actor: Some(publisher()),
+        status: HostActionStatus::Failed {
+            reason: "denied".into(),
+        },
+        effects: vec![],
+    });
+    assert_eq!(
+        pushes(&store).len(),
+        1,
+        "a denied verdict never re-issues the intent"
+    );
+    let usage = store
+        .transact(|tx| tx.work_usage(&w))
+        .unwrap()
+        .unwrap_or_else(|| WorkUsage::new(&w));
+    assert_eq!(
+        usage.transport_retries_used, 0,
+        "an authorization verdict is not a transport failure"
+    );
+    let e = store.transact(|tx| tx.execution(&e1)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("denied or the actor was ineligible"),
+        "the verdict's own classification surfaces: {:?}",
+        e.pause_reason
+    );
+}
+
 /// Regression: a `ChangeOpened` effect riding along on a NON-open
 /// receipt (e.g. a verified push) cannot establish the diff target —
 /// adoption requires an applied `open_change_request` intent whose
@@ -4377,6 +4651,7 @@ fn a_smuggled_open_effect_in_a_push_receipt_creates_no_diff_target() {
                 action: HostAction::PushRef {
                     branch: format!("work/{}", w.0),
                     produced: rev("artifact-digest"),
+                    expected_prior: None,
                 },
                 payload_digest: "test".into(),
                 status: HostActionStatus::Pending,

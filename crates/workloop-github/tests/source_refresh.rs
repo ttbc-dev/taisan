@@ -33,6 +33,18 @@ fn publisher() -> HostActorRef {
     }
 }
 
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+fn change_ref(id: &str) -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted(id),
+        display_number: None,
+    }
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
         host: HostTemplate {
@@ -191,7 +203,7 @@ fn issue_observations(store: &SqliteStore, work_id: &WorkId) -> Vec<(String, Str
         .collect()
 }
 
-fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
+fn queue_intent(store: &SqliteStore, work_id: &WorkId, action: HostAction) {
     store
         .transact(|tx| {
             let action_id = tx.alloc_id("act")?;
@@ -204,12 +216,7 @@ fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
                     repository: repo(),
                     role: ActorRole::Publication,
                     actor: publisher(),
-                    action: HostAction::OpenChangeRequest {
-                        source_branch: format!("work/{}", work_id.0),
-                        target_branch: "main".into(),
-                        title: "t".into(),
-                        body: String::new(),
-                    },
+                    action,
                     payload_digest: "digest".into(),
                     status: HostActionStatus::Pending,
                     authenticated_actor: None,
@@ -220,6 +227,19 @@ fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
             Ok(())
         })
         .unwrap();
+}
+
+fn queue_open_change(store: &SqliteStore, work_id: &WorkId) {
+    queue_intent(
+        store,
+        work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: format!("work/{}", work_id.0),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+    );
 }
 
 fn change_head_observations(store: &SqliteStore, work_id: &WorkId) -> Vec<String> {
@@ -466,6 +486,74 @@ fn refresh_is_scoped_to_one_work() {
         change_head_observations(&store, &w2).len(),
         1,
         "the other Work's head was not read in this pass"
+    );
+}
+
+/// Every change-bearing link attributes the change to its Work —
+/// a recorded `ReviewPublished`/`ReplyPosted`/`ThreadResolved`/
+/// `ReadyObserved` receipt or a pending intent carrying the change
+/// counts, so a scoped refresh re-reads the head of a change the Work
+/// touched through discussion/review effects alone.
+#[test]
+fn discussion_and_ready_links_attribute_their_change_to_the_work() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let (w, e) = submit(&store, "k-attr");
+    admit(&store, &e);
+
+    let mut gh = FixtureGithub::new();
+    gh.set_change_head(&change_ref("cr-1"), "head-1", &publisher());
+    gh.add_thread(&change_ref("cr-1"), "th-1");
+
+    // The Work's only recorded links to cr-1 are the discussion/review
+    // intents and their receipts — no UpdateChangeRequest intent and no
+    // ChangeOpened/MetadataUpdated/CommentPosted effect anywhere.
+    for action in [
+        HostAction::PublishReviewFeedback {
+            change: change_ref("cr-1"),
+            head: rev("head-1"),
+            body: "feedback".into(),
+        },
+        HostAction::ReplyToThread {
+            change: change_ref("cr-1"),
+            thread_id: "th-1".into(),
+            marker: "m".into(),
+            body: "reply".into(),
+        },
+        HostAction::ResolveThread {
+            change: change_ref("cr-1"),
+            thread_id: "th-1".into(),
+            head: rev("head-1"),
+        },
+        HostAction::MarkReady {
+            change: change_ref("cr-1"),
+            expected_head: rev("head-1"),
+        },
+    ] {
+        queue_intent(&store, &w, action);
+    }
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert!(
+        store
+            .transact(|tx| tx.action_intents())
+            .unwrap()
+            .iter()
+            .all(|i| i.status == HostActionStatus::Applied),
+        "every discussion/review effect applied"
+    );
+
+    // The remote moves; a Work-scoped refresh must re-read the head of
+    // the change the Work's receipts recorded.
+    gh.set_head("cr-1", "head-2");
+    let report = gh
+        .refresh_sources(&store, &config(), &mut || NOW, None, Some(&w))
+        .unwrap();
+    assert_eq!(
+        report.ingested, 1,
+        "the receipt-owned change's head moved: one read ingested"
+    );
+    assert_eq!(
+        change_head_observations(&store, &w).last().unwrap(),
+        "head-2"
     );
 }
 
