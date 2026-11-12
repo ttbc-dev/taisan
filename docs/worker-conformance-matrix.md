@@ -138,4 +138,6 @@ identity-revealing identifiers (the binary getters, the selection
 const, the bound-argv construction, the binding fields) appear outside
 that boundary only on branch-free data lines — the boundary holds the
 only identity comparison, so no case branches on which worker is
-bound.
+bound. The scan is lexical: it catches branches that mention an
+identity token, while branches through renamed aliases remain outside
+what a token scan can see.

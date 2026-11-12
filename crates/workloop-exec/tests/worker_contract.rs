@@ -1407,12 +1407,12 @@ fn assert_clean_tracked_tree() {
 /// against a base branch this clone keeps. No base ref at all (a
 /// non-git source tree) fails the recorded run.
 fn base_revision() -> String {
-    for argv in [
+    for revs in [
         ["merge-base", "HEAD", "origin/main"],
         ["merge-base", "HEAD", "main"],
         ["merge-base", "HEAD", "origin/HEAD"],
     ] {
-        if let Some(sha) = git_stdout(&argv) {
+        if let Some(sha) = git_stdout(&revs) {
             return sha;
         }
     }
@@ -1713,6 +1713,7 @@ fn u46b_suite_source_has_no_adapter_name_branch() {
         "adapter_version",
         "runtime_version",
         "capability_digest",
+        "argv",
         "worker_argv",
     ];
     let lines: Vec<&str> = include_str!("worker_contract.rs").lines().collect();
