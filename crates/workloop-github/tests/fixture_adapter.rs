@@ -1398,3 +1398,79 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
         Some("invocation_budget_exhausted")
     );
 }
+
+/// U5.4 partial-effect durability: the publication lane records the push
+/// receipt durably before the change-request effect exists. A crash
+/// between the two effects is a process restart, not a rollback — the
+/// push receipt survives and the missing create is never inferred.
+#[test]
+fn crash_after_publication_keeps_the_push_receipt_durable() {
+    let root =
+        std::env::temp_dir().join(format!("workloop-u54-push-receipt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.sqlite");
+    let (work_id, action_id) = {
+        let store = SqliteStore::open(&path, 1).unwrap();
+        let (work_id, execution_id) = submit(&store, "k-u54-crash");
+        store
+            .transact(|tx| admit_queued(tx, &config(), &execution_id, NOW).map(|_| ()))
+            .unwrap();
+        let admitted = store
+            .transact(|tx| tx.execution(&execution_id))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            admitted.state,
+            ExecutionState::Queued,
+            "the crash lands inside an admitted execution's publication window"
+        );
+        let action_id = insert_intent(
+            &store,
+            &work_id,
+            HostAction::PushRef {
+                branch: "work/u54".into(),
+                produced: rev("head-u54"),
+                expected_prior: None,
+            },
+        );
+        let mut gh = FixtureGithub::new();
+        gh.apply_outbox(&store, &config(), NOW).unwrap();
+        assert_eq!(
+            intent_status(&store, &action_id),
+            HostActionStatus::Applied,
+            "the push receipt is committed before the simulated crash"
+        );
+        // Crash before any change-request intent: dropping the store is
+        // the process boundary, and no create was ever recorded.
+        (work_id, action_id)
+    };
+
+    let store = SqliteStore::open(&path, 1).unwrap();
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    let push = intents
+        .iter()
+        .find(|intent| intent.action_id == action_id)
+        .expect("the applied push intent survives the crash");
+    assert_eq!(push.work_id, work_id);
+    assert_eq!(push.status, HostActionStatus::Applied);
+    assert!(
+        matches!(
+            push.effects.first(),
+            Some(NormalizedEffectFact::RefPublished {
+                produced,
+                relation: RefRelation::Equal,
+                ..
+            }) if produced.object == "head-u54"
+        ),
+        "the push receipt retains its normalized effect fact: {:?}",
+        push.effects
+    );
+    assert!(
+        !intents
+            .iter()
+            .any(|intent| matches!(intent.action, HostAction::OpenChangeRequest { .. })),
+        "the missing create is absent evidence, never an inferred success"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

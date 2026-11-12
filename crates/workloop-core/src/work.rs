@@ -2364,6 +2364,15 @@ pub fn handle_observation(
     obs: &Observation,
     now_unix_seconds: i64,
 ) -> Result<IngestReceipt, StoreError> {
+    // Stage records are authored by Core inside its own transaction; the
+    // ingest path — adapters, bridges, probes — carries no authority to
+    // write pipeline history, so a delivered `StageEvidence` fact is
+    // refused before it can enter the durable log.
+    if matches!(obs.fact, ObservationFact::StageEvidence { .. }) {
+        return Ok(IngestReceipt::Rejected(
+            "stage evidence is Core-authored; ingest cannot write pipeline records".into(),
+        ));
+    }
     store
         .transact(|tx| {
             tx.apply(&Effect::InsertObservation {
