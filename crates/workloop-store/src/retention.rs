@@ -2662,12 +2662,14 @@ impl SqliteStore {
         let root_abs = std::path::absolute(root).map_err(|e| StoreError::Internal {
             detail: format!("retention root {}: {e}", root.display()),
         })?;
-        let (unknown, unknown_scan_truncated, held_protected, protected_excluded): (
+        type ScanOutcome = (
             UnknownTotals,
             bool,
             Vec<HeldBody>,
             Vec<String>,
-        ) = {
+            BTreeMap<String, (u64, u64)>,
+        );
+        let (unknown, unknown_scan_truncated, held_protected, protected_excluded, protected_stats): ScanOutcome = {
             let guard = self.conn.lock().map_err(|_| StoreError::Internal {
                 detail: "store lock poisoned".into(),
             })?;
@@ -2698,6 +2700,7 @@ impl SqliteStore {
             let mut verified: BTreeMap<String, (u64, i64)> = BTreeMap::new();
             let mut held_protected: Vec<HeldBody> = Vec::new();
             let mut protected_excluded: Vec<String> = Vec::new();
+            let mut protected_stats: BTreeMap<String, (u64, u64)> = BTreeMap::new();
             for (entry_body_id, category, path, bytes, pin_state, pinned, created_at) in
                 rows.into_iter().take(UNKNOWN_SCAN_BOUND)
             {
@@ -2712,6 +2715,9 @@ impl SqliteStore {
                             reason: "protected_path".into(),
                         });
                     }
+                    let pstat = protected_stats.entry(category.clone()).or_insert((0, 0));
+                    pstat.0 += 1;
+                    pstat.1 += bytes.max(0) as u64;
                     protected_excluded.push(entry_body_id.clone());
                     continue;
                 }
@@ -2731,7 +2737,7 @@ impl SqliteStore {
                     v.1 = v.1.min(created_at);
                     continue;
                 }
-                let entry = acc.entry(category).or_default();
+                let entry = acc.entry(category).or_insert((0, 0, 0, Vec::new(), 0, i64::MAX));
                 entry.0 += 1;
                 entry.1 += bytes.max(0) as u64;
                 entry.3.push(entry_body_id);
@@ -2750,7 +2756,7 @@ impl SqliteStore {
                 entry.4 = pinned_count;
                 entry.5 = created;
             }
-            (acc, truncated, held_protected, protected_excluded)
+            (acc, truncated, held_protected, protected_excluded, protected_stats)
         };
         let mut names: Vec<String> = eligibility
             .categories
@@ -2774,6 +2780,13 @@ impl SqliteStore {
                 .get(&(category.clone(), "present".to_string()))
                 .copied()
                 .unwrap_or((0, 0));
+            let (present_count, present_bytes) = {
+                let (pcount, pbytes) = protected_stats.get(&category).copied().unwrap_or((0, 0));
+                (
+                    present_count.saturating_sub(pcount),
+                    present_bytes.saturating_sub(pbytes),
+                )
+            };
             let (reclaiming_count, reclaiming_bytes) = counts
                 .get(&(category.clone(), "reclaiming".to_string()))
                 .copied()

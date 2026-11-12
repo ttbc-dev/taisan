@@ -687,6 +687,55 @@ fn phantom_bytes_cannot_authorize_size_pressure() {
 /// Accounting fixture bodies whose path does not exist on disk must
 /// not be counted as present usage: the report lists them under
 /// `unknown` and excludes them from the pressure computation.
+/// A catalog row pointing at a protected installation file (the
+/// store, its sidecars, the config) is held — never counted in
+/// present usage, named under `held`, and excluded from pressure.
+#[test]
+fn protected_installation_files_are_held_and_not_counted() {
+    let fixture = Fixture::new("protected-report");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // The "protected" target is an existing file under the root: an
+    // installation file the operator designated protected.
+    let protected_rel = "bodies/protected-live.db";
+    let protected_abs = fixture.root.join(protected_rel);
+    std::fs::create_dir_all(protected_abs.parent().unwrap()).unwrap();
+    std::fs::write(&protected_abs, b"protected").unwrap();
+    register(
+        &store,
+        "protected",
+        NOW - 10_000,
+        8,
+        PinState::None,
+        protected_rel,
+    );
+    let rel_real = fixture.write_body("real", 10);
+    register(&store, "real", NOW - 10, 10, PinState::None, &rel_real);
+
+    let report = store
+        .retention_report(
+            &settings(Some(100), Some(1000)),
+            &fixture.root,
+            &[protected_abs.clone()],
+            NOW,
+        )
+        .unwrap();
+    let cas = report
+        .categories
+        .iter()
+        .find(|c| c.category == "cas")
+        .unwrap();
+    assert_eq!(cas.present_bytes, 10, "the protected row is excluded");
+    assert_eq!(cas.present_count, 1);
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.body_id == "protected" && h.reason == "protected_path"),
+        "the protected row is named under held: {report:?}"
+    );
+    assert_eq!(cas.pressure, "none");
+}
+
 #[test]
 fn report_counts_unstatable_bodies_as_unknown_not_present() {
     let fixture = Fixture::new("unknown");

@@ -506,7 +506,18 @@ pub fn run_pass(
                         });
                     }
                     Err(e) => {
-                        phases.push(PhaseReport::skipped(name, &format!("already_running: {e}")))
+                        let reason = match &e {
+                            workloop_store::sqlite::RunLeaseError::Held { .. } => {
+                                format!("already_running: {e}")
+                            }
+                            workloop_store::sqlite::RunLeaseError::Unavailable { .. } => {
+                                format!("lock.unavailable: {e}")
+                            }
+                            workloop_store::sqlite::RunLeaseError::Store(store_error) => {
+                                format!("store_error: {store_error}")
+                            }
+                        };
+                        phases.push(PhaseReport::skipped(name, &reason))
                     }
                 }
             }
