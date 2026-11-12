@@ -7,7 +7,7 @@
 //! support contract claims only — no live host is contacted.
 
 use workloop_core::identity::{
-    HostActorId, HostActorRef, HostInstanceId, RepositoryId, RepositoryRef,
+    ChangeRequestId, HostActorId, HostActorRef, HostInstanceId, RepositoryId, RepositoryRef,
 };
 use workloop_github::gitlab_spike::*;
 
@@ -25,6 +25,10 @@ fn scope() -> SpikeScope {
 
 fn repo() -> RepositoryRef {
     scope().repository()
+}
+
+fn change(id: &str) -> ChangeRequestId {
+    ChangeRequestId::trusted(id)
 }
 
 fn row(id: &str, op: SpikeOp) -> SpikeRow {
@@ -67,6 +71,7 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r3-comment",
             SpikeOp::CommentPost {
+                change_request: change("!1"),
                 source_branch: "spike/u94/w".into(),
                 expected_head: "head-1".into(),
                 body: "spike note".into(),
@@ -84,6 +89,7 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r5-stale-comment",
             SpikeOp::CommentPost {
+                change_request: change("!1"),
                 source_branch: "spike/u94/w".into(),
                 expected_head: "head-1".into(),
                 body: "stale note".into(),
@@ -92,8 +98,8 @@ fn plan() -> Vec<SpikeRow> {
         row(
             "r6-head-read",
             SpikeOp::HeadRead {
-                target: HeadTarget::ChangeFromBranch {
-                    source_branch: "spike/u94/w".into(),
+                target: HeadTarget::Change {
+                    change_request: change("!1"),
                 },
             },
         ),
@@ -113,6 +119,190 @@ fn applied_revision(record: &RowRecord) -> &workloop_core::identity::CommitRevis
         RowOutcome::Receipt(WriteReceipt::Applied { revision, .. }) => revision,
         other => panic!("{}: expected applied receipt: {other:?}", record.row_id),
     }
+}
+
+/// If `source[index]` starts a raw string (`r`, zero or more `#`, then
+/// `"`), the number of `#` delimiters and the index of the opening quote.
+fn raw_string_start(source: &[char], index: usize) -> Option<(usize, usize)> {
+    if source.get(index) != Some(&'r') {
+        return None;
+    }
+    let mut quote = index + 1;
+    let mut hashes = 0usize;
+    while source.get(quote) == Some(&'#') {
+        hashes += 1;
+        quote += 1;
+    }
+    (source.get(quote) == Some(&'"')).then_some((hashes, quote))
+}
+
+/// Whether `source[index]` (`'`) opens a char literal rather than a
+/// lifetime. A char literal is either an escape (`'\n'`, `'\''`) or one
+/// character followed by the closing quote (`'a'`, `'"'`); a lifetime
+/// such as `'static` has no closing quote immediately after its first
+/// character.
+fn is_char_literal(source: &[char], index: usize) -> bool {
+    match source.get(index + 1) {
+        Some('\\') => true,
+        Some(_) => source.get(index + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+/// Remove Rust comments while preserving literals, so a comment between
+/// the receiver and the method cannot hide a call site. Raw strings and
+/// char literals are lexed as literals too: a quote inside `r#"..."#` or
+/// `'"'` must not be mistaken for a string delimiter that swallows the
+/// following code.
+fn strip_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let chars: Vec<char> = source.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let c = chars[index];
+        match c {
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                index += 2;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                index += 2;
+                let mut depth = 1usize;
+                while index < chars.len() {
+                    if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        depth -= 1;
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            'r' if raw_string_start(&chars, index).is_some() => {
+                let (hashes, quote) = raw_string_start(&chars, index).unwrap();
+                out.extend(&chars[index..=quote]);
+                index = quote + 1;
+                loop {
+                    if index >= chars.len() {
+                        break;
+                    }
+                    if chars[index] == '"'
+                        && (1..=hashes).all(|offset| chars.get(index + offset) == Some(&'#'))
+                    {
+                        let end = index + 1 + hashes;
+                        out.extend(&chars[index..end]);
+                        index = end;
+                        break;
+                    }
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            '"' => {
+                out.push(c);
+                index += 1;
+                while index < chars.len() {
+                    let next = chars[index];
+                    out.push(next);
+                    index += 1;
+                    if next == '\\' {
+                        if index < chars.len() {
+                            out.push(chars[index]);
+                            index += 1;
+                        }
+                    } else if next == '"' {
+                        break;
+                    }
+                }
+            }
+            '\'' if is_char_literal(&chars, index) => {
+                out.push(c);
+                index += 1;
+                while index < chars.len() {
+                    let next = chars[index];
+                    out.push(next);
+                    index += 1;
+                    if next == '\\' {
+                        if index < chars.len() {
+                            out.push(chars[index]);
+                            index += 1;
+                        }
+                    } else if next == '\'' {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                out.push(c);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// If `after` starts with a turbofish (`::<...>`), the index just past
+/// its closing `>`; otherwise `None`. A `>` that is part of an `->` return
+/// arrow does not close the turbofish.
+fn skip_turbofish(after: &str) -> Option<usize> {
+    const PREFIX: &str = "::<";
+    let rest = after.strip_prefix(PREFIX)?;
+    let mut depth = 1usize;
+    let mut previous = '\0';
+    for (index, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' if previous != '-' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(PREFIX.len() + index + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+        previous = c;
+    }
+    None
+}
+
+/// Every `self.remote.<method>(` call site in `source`, independent of
+/// rustfmt's line breaks: comments are removed, whitespace is normalized
+/// away, and an optional turbofish is skipped before the call markers are
+/// parsed. Only a method followed by `(` counts.
+fn remote_call_sites(source: &str) -> Vec<String> {
+    let stripped = strip_comments(source);
+    let compact: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+    let marker = "self.remote.";
+    let mut sites = Vec::new();
+    let mut rest = compact.as_str();
+    while let Some(index) = rest.find(marker) {
+        let after = &rest[index + marker.len()..];
+        if after.is_empty() {
+            break;
+        }
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            let method = &after[..end];
+            let mut tail = &after[end..];
+            if let Some(skip) = skip_turbofish(tail) {
+                tail = &tail[skip..];
+            }
+            if tail.starts_with('(') {
+                sites.push(method.to_string());
+            }
+        }
+        rest = &after[end.max(1)..];
+    }
+    sites
 }
 
 /// Persist a scenario's journal under the test tmpdir — the retained
@@ -235,31 +425,45 @@ fn denial_lost_response_and_restart_retain_evidence() {
     let mut moved_default = scope();
     moved_default.repository = RepositoryId::trusted("installation-default-repo");
     let mut resumed = SpikeHarness::resume(&mut remote, None, journal, &moved_default);
+    assert_eq!(
+        resumed.journal().scope.repository,
+        scope().repository,
+        "the recorded scope wins over the moved default"
+    );
     resumed.reconcile();
-    let change = {
+    {
         let r2 = record(resumed.journal(), "r2-create");
         let reconciliation = r2.reconciliation.as_ref().expect("create reconciled");
-        assert_eq!(reconciliation.effect, ReconciledEffect::Present);
-        let change = reconciliation
-            .change
-            .clone()
-            .expect("the created MR is established");
+        // A lost create response leaves no IID: a head read of its source
+        // branch cannot establish which MR (if any) it made.
         assert_eq!(
-            change.repository,
+            reconciliation.effect,
+            ReconciledEffect::Indeterminate,
+            "a lost create is not reported present by branch coincidence"
+        );
+        assert!(reconciliation.change.is_none());
+        assert_eq!(
+            reconciliation
+                .observed
+                .as_ref()
+                .expect("the branch read is retained")
+                .repository,
             repo(),
             "reconciled under the recorded binding"
         );
-        change
-    };
+    }
     // The run continues under the recorded scope: remaining rows drive
-    // against the reconciled state; already-recorded rows are not
-    // re-driven.
+    // against the identity the fixture assigned; already-recorded rows
+    // are not re-driven.
     resumed.run(&plan()[2..]);
     let journal = resumed.into_journal();
     assert_eq!(journal.records.len(), plan().len());
     match &record(&journal, "r3-comment").outcome {
         RowOutcome::Receipt(WriteReceipt::Applied { fact, .. }) => match fact.as_ref() {
-            EffectFact::CommentPosted { change: c, .. } => assert_eq!(c, &change),
+            EffectFact::CommentPosted { change: c, .. } => {
+                assert_eq!(c.change_request, change("!1"));
+                assert_eq!(c.repository, repo());
+            }
             other => panic!("comment fact expected: {other:?}"),
         },
         other => panic!("the resumed comment applies: {other:?}"),
@@ -413,6 +617,317 @@ fn live_rows_require_the_recorded_authorization() {
     );
 }
 
+/// Scope identity is injective: the binding escapes its separator, and
+/// the actor's host instance participates in it. Two scopes that would
+/// collide under a naive `/` join — or that differ only in the actor's
+/// host — never cover each other's live authorization.
+#[test]
+fn scope_binding_separates_escaped_fields_and_the_actor_host() {
+    let actor = HostActorRef {
+        host: HostInstanceId::trusted("actor-host"),
+        actor: HostActorId::trusted("actor"),
+    };
+    let split_repo = SpikeScope {
+        host: HostInstanceId::trusted("h"),
+        repository: RepositoryId::trusted("r/x"),
+        branch_prefix: "p".into(),
+        actor: actor.clone(),
+    };
+    let split_prefix = SpikeScope {
+        host: HostInstanceId::trusted("h"),
+        repository: RepositoryId::trusted("r"),
+        branch_prefix: "x/p".into(),
+        actor: actor.clone(),
+    };
+    assert_ne!(
+        split_repo.binding(),
+        split_prefix.binding(),
+        "an opaque id containing `/` cannot merge two scopes"
+    );
+
+    let authorization = LiveAuthorization {
+        record: "owner approval — split-scope guard".into(),
+        binding: split_repo.binding(),
+    };
+    assert!(authorization.covers(&split_repo));
+    assert!(!authorization.covers(&split_prefix));
+
+    let mut other_actor_host = split_repo.clone();
+    other_actor_host.actor.host = HostInstanceId::trusted("other-actor-host");
+    assert_ne!(
+        split_repo.binding(),
+        other_actor_host.binding(),
+        "the actor's host instance is part of the bound identity"
+    );
+    assert!(!authorization.covers(&other_actor_host));
+
+    let mut backslash = split_repo.clone();
+    backslash.repository = RepositoryId::trusted("r\\x");
+    backslash.branch_prefix = "p".into();
+    let mut escaped_slash = split_repo.clone();
+    escaped_slash.repository = RepositoryId::trusted("r");
+    escaped_slash.branch_prefix = "\\x/p".into();
+    assert_ne!(
+        backslash.binding(),
+        escaped_slash.binding(),
+        "escaped backslashes and escaped slashes stay distinct"
+    );
+}
+
+/// The fixture remote keys project state by the structured
+/// `(host, repository)` identity, not a flat `host/repository` join.
+/// Two scopes whose fields contain `/` can serialize the same way; they
+/// must still keep separate branch and change-request state.
+#[test]
+fn fixture_projects_are_keyed_by_scoped_identity_not_a_flat_join() {
+    let split_repository =
+        RepositoryRef::new(HostInstanceId::trusted("h"), RepositoryId::trusted("r/x"));
+    let split_host = RepositoryRef::new(HostInstanceId::trusted("h/r"), RepositoryId::trusted("x"));
+    assert_eq!(
+        split_repository.to_string(),
+        split_host.to_string(),
+        "the naive join collides — the fixture must not key on it"
+    );
+
+    let mut remote = GitlabSpikeRemote::new();
+    let receipt = remote.guarded_push(&split_repository, "spike/u94/w", None, "head-1");
+    assert!(
+        matches!(receipt, WriteReceipt::Applied { .. }),
+        "the push lands under its own scope"
+    );
+    assert_eq!(
+        remote.branch_head(&split_repository, "spike/u94/w"),
+        Some("head-1".to_string())
+    );
+    assert_eq!(
+        remote.branch_head(&split_host, "spike/u94/w"),
+        None,
+        "a colliding join must not expose another scope's branch"
+    );
+}
+
+/// Two change requests can share one source branch. Comments and head
+/// reads name the IID they mean; the remote never picks an arbitrary
+/// MR from the branch.
+#[test]
+fn change_request_identity_is_the_iid_not_the_source_branch() {
+    let mut remote = GitlabSpikeRemote::new();
+    let rows = vec![
+        row(
+            "push",
+            SpikeOp::GuardedPush {
+                branch: "spike/u94/w".into(),
+                expected_prior: None,
+                produced: "head-1".into(),
+            },
+        ),
+        row(
+            "create-a",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "create-b",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "comment-b",
+            SpikeOp::CommentPost {
+                change_request: change("!2"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "to the second MR".into(),
+            },
+        ),
+        row(
+            "comment-a",
+            SpikeOp::CommentPost {
+                change_request: change("!1"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "to the first MR".into(),
+            },
+        ),
+        row(
+            "read-a",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!1"),
+                },
+            },
+        ),
+        row(
+            "read-b",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!2"),
+                },
+            },
+        ),
+        row(
+            "read-unknown",
+            SpikeOp::HeadRead {
+                target: HeadTarget::Change {
+                    change_request: change("!404"),
+                },
+            },
+        ),
+        row(
+            "comment-unknown",
+            SpikeOp::CommentPost {
+                change_request: change("!99"),
+                source_branch: "spike/u94/w".into(),
+                expected_head: "head-1".into(),
+                body: "no such MR".into(),
+            },
+        ),
+        row(
+            "comment-wrong-branch",
+            SpikeOp::CommentPost {
+                change_request: change("!1"),
+                source_branch: "spike/u94/other".into(),
+                expected_head: "head-1".into(),
+                body: "wrong branch".into(),
+            },
+        ),
+    ];
+    let mut harness = SpikeHarness::new(scope(), &mut remote, None);
+    harness.run(&rows);
+    assert_eq!(
+        harness.remote_mut().applied().len(),
+        5,
+        "push, two creates, and the two identity-addressed comments wrote"
+    );
+    let journal = harness.into_journal();
+
+    let commented_change = |id: &str| -> ChangeRequestId {
+        match &record(&journal, id).outcome {
+            RowOutcome::Receipt(WriteReceipt::Applied { fact, .. }) => match fact.as_ref() {
+                EffectFact::CommentPosted { change, .. } => change.change_request.clone(),
+                other => panic!("{id}: comment fact expected: {other:?}"),
+            },
+            other => panic!("{id}: applied comment expected: {other:?}"),
+        }
+    };
+    assert_eq!(commented_change("comment-b"), change("!2"));
+    assert_eq!(commented_change("comment-a"), change("!1"));
+
+    for (id, expected) in [("read-a", "!1"), ("read-b", "!2")] {
+        match &record(&journal, id).outcome {
+            RowOutcome::Observed(observed) => assert_eq!(
+                observed
+                    .change
+                    .as_ref()
+                    .map(|change| change.change_request.as_str()),
+                Some(expected),
+                "{id} resolves the IID it named"
+            ),
+            other => panic!("{id}: head read expected: {other:?}"),
+        }
+    }
+    match &record(&journal, "read-unknown").outcome {
+        RowOutcome::Observed(observed) => {
+            assert!(observed.change.is_none());
+            assert!(observed.head.is_none());
+        }
+        other => panic!("read-unknown: head read expected: {other:?}"),
+    }
+    for id in ["comment-unknown", "comment-wrong-branch"] {
+        assert!(
+            matches!(
+                record(&journal, id).outcome,
+                RowOutcome::Receipt(WriteReceipt::Failed { .. })
+            ),
+            "{id}: an unaddressable or mismatched IID is refused"
+        );
+    }
+}
+
+/// A lost create response leaves no IID. Even when other MRs share its
+/// source branch, reconciliation reports `indeterminate` rather than
+/// borrowing one of their identities as `present`.
+#[test]
+fn lost_create_does_not_borrow_another_change_requests_identity() {
+    let mut remote = GitlabSpikeRemote::new();
+    let mut harness = SpikeHarness::new(scope(), &mut remote, None);
+    harness.run(&[
+        row(
+            "push",
+            SpikeOp::GuardedPush {
+                branch: "spike/u94/w".into(),
+                expected_prior: None,
+                produced: "head-1".into(),
+            },
+        ),
+        row(
+            "create-a",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+        row(
+            "create-b",
+            SpikeOp::MrCreate {
+                source_branch: "spike/u94/w".into(),
+                target_branch: "main".into(),
+            },
+        ),
+    ]);
+    harness.remote_mut().lose_next_response();
+    harness.run(&[row(
+        "create-c",
+        SpikeOp::MrCreate {
+            source_branch: "spike/u94/w".into(),
+            target_branch: "main".into(),
+        },
+    )]);
+    assert!(matches!(
+        record(harness.journal(), "create-c").outcome,
+        RowOutcome::Receipt(WriteReceipt::Unknown { .. })
+    ));
+    assert_eq!(
+        harness.remote_mut().applied().len(),
+        4,
+        "the lost-response create landed as !3"
+    );
+    harness.reconcile();
+    {
+        let create_c = record(harness.journal(), "create-c");
+        let reconciliation = create_c.reconciliation.as_ref().expect("reconciled");
+        assert_eq!(reconciliation.effect, ReconciledEffect::Indeterminate);
+        assert!(
+            reconciliation.change.is_none(),
+            "no other MR's identity is attributed to the lost create"
+        );
+    }
+    // The effect did land as !3; it is addressable by IID, but the lost
+    // receipt itself still cannot claim that identity.
+    harness.run(&[row(
+        "read-c",
+        SpikeOp::HeadRead {
+            target: HeadTarget::Change {
+                change_request: change("!3"),
+            },
+        },
+    )]);
+    match &record(harness.journal(), "read-c").outcome {
+        RowOutcome::Observed(observed) => assert_eq!(
+            observed
+                .change
+                .as_ref()
+                .map(|change| change.change_request.as_str()),
+            Some("!3")
+        ),
+        other => panic!("read-c: head read expected: {other:?}"),
+    }
+}
+
 /// The narrow surface is closed: the harness reaches only the four
 /// operations — every remote call site in the module is one of the four
 /// `SpikeRemote` methods, the operation kind set holds exactly four,
@@ -422,19 +937,85 @@ fn live_rows_require_the_recorded_authorization() {
 #[test]
 fn no_operation_beyond_the_four_is_reachable() {
     const SOURCE: &str = include_str!("../src/gitlab_spike.rs");
-    let remote_calls = SOURCE.matches("self.remote.").count();
-    let allowed: usize = [
-        "self.remote.guarded_push(",
-        "self.remote.mr_create(",
-        "self.remote.comment_post(",
-        "self.remote.head_read(",
-    ]
-    .iter()
-    .map(|call| SOURCE.matches(call).count())
-    .sum();
+    const ALLOWED: [&str; 4] = ["guarded_push", "mr_create", "comment_post", "head_read"];
+    let calls = remote_call_sites(SOURCE);
+    assert!(
+        !calls.is_empty(),
+        "the static check must find the harness's remote call sites"
+    );
+    for call in &calls {
+        assert!(
+            ALLOWED.contains(&call.as_str()),
+            "remote call `{call}` is outside the four-operation surface"
+        );
+    }
+    // The check normalizes whitespace: a multi-line formatted call is
+    // still a call site, and an unknown method is still counted.
+    let formatted = "fn f() { self\n    .remote\n    .head_read(t); self.remote.mr_create(a, b); }";
     assert_eq!(
-        remote_calls, allowed,
-        "every remote call the harness makes is one of the four operations"
+        remote_call_sites(formatted),
+        vec!["head_read", "mr_create"],
+        "multi-line formatted calls are counted"
+    );
+    let outside = "fn f() { self . remote . approve_change(x); }";
+    assert_eq!(
+        remote_call_sites(outside),
+        vec!["approve_change"],
+        "an operation outside the four is counted rather than skipped"
+    );
+    let commented = "fn f() { self.remote /*c*/ .approve_change(x); }";
+    assert_eq!(
+        remote_call_sites(commented),
+        vec!["approve_change"],
+        "a comment between receiver and method does not hide a call"
+    );
+    let turbofish = "fn f() { self.remote.approve_change::<u8>(x); }";
+    assert_eq!(
+        remote_call_sites(turbofish),
+        vec!["approve_change"],
+        "a turbofish does not hide a call"
+    );
+    let turbofish_arrow = "fn f() { self.remote.approve_change::<fn() -> u8>(x); }";
+    assert_eq!(
+        remote_call_sites(turbofish_arrow),
+        vec!["approve_change"],
+        "a return arrow inside a turbofish does not close it early"
+    );
+    let turbofish_commented =
+        "fn f() { self.remote /*a*/ .approve_change /*b*/ :: /*c*/ <u8> /*d*/ (x); }";
+    assert_eq!(
+        remote_call_sites(turbofish_commented),
+        vec!["approve_change"],
+        "comments around and inside a turbofish do not hide a call"
+    );
+    let commented_out = "fn f() { /* self.remote.approve_change(x); */ }";
+    assert!(
+        remote_call_sites(commented_out).is_empty(),
+        "a commented-out call is not a call site"
+    );
+    let raw_string = "fn f() { let s = r#\"a \" b\"#; self.remote.head_read(t); }";
+    assert_eq!(
+        remote_call_sites(raw_string),
+        vec!["head_read"],
+        "a quote inside a raw string does not swallow the following call"
+    );
+    let raw_string_hashes = "fn f() { let s = br##\"a \"# b\"##; self.remote.mr_create(a, b); }";
+    assert_eq!(
+        remote_call_sites(raw_string_hashes),
+        vec!["mr_create"],
+        "hashed raw and byte raw strings are lexed as literals"
+    );
+    let quoted_char = "fn f() { let q = '\"'; self.remote.head_read(t); }";
+    assert_eq!(
+        remote_call_sites(quoted_char),
+        vec!["head_read"],
+        "a double quote inside a char literal does not swallow the following call"
+    );
+    let lifetime = "fn f<'a>(x: &'a str) { self.remote.comment_post(x); }";
+    assert_eq!(
+        remote_call_sites(lifetime),
+        vec!["comment_post"],
+        "a lifetime is not mistaken for an unterminated char literal"
     );
     assert_eq!(
         SpikeOpKind::ALL.len(),

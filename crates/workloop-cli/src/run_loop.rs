@@ -512,19 +512,41 @@ pub fn run_pass(
             } else if !pass.settings.retention.enabled {
                 phases.push(PhaseReport::skipped(name, "retention_disabled"));
             } else {
-                let r = pass.settings.retention.clone();
-                let params = SweepParams {
-                    interval_seconds: r.interval_seconds,
-                    max_bodies: r.max_bodies,
-                    max_bytes: r.max_bytes,
-                    delete_error_limit: r.delete_error_limit,
-                    protected: pass.settings.protected_paths.clone(),
-                };
-                let result = pass.store.retention_sweep(&params, pass.state_root, now);
-                push!(match result {
-                    Ok(report) => retention_phase(report),
-                    Err(e) => PhaseReport::failed(name, e),
-                });
+                // Single-owner maintenance: the sweep holds the same
+                // loop-independent installation maintenance lease as an
+                // explicit cleanup. A maintenance pass that loses the
+                // lease reports already_running instead of racing.
+                match RunLeaseGuard::acquire_maintenance(pass.store, now) {
+                    Ok(_maintenance) => {
+                        let r = pass.settings.retention.clone();
+                        let params = SweepParams {
+                            interval_seconds: r.interval_seconds,
+                            max_bodies: r.max_bodies,
+                            max_bytes: r.max_bytes,
+                            delete_error_limit: r.delete_error_limit,
+                            protected: pass.settings.protected_paths.clone(),
+                        };
+                        let result = pass.store.retention_sweep(&params, pass.state_root, now);
+                        push!(match result {
+                            Ok(report) => retention_phase(report),
+                            Err(e) => PhaseReport::failed(name, e),
+                        });
+                    }
+                    Err(e) => {
+                        let reason = match &e {
+                            workloop_store::sqlite::RunLeaseError::Held { .. } => {
+                                format!("already_running: {e}")
+                            }
+                            workloop_store::sqlite::RunLeaseError::Unavailable { .. } => {
+                                format!("lock.unavailable: {e}")
+                            }
+                            workloop_store::sqlite::RunLeaseError::Store(store_error) => {
+                                format!("store_error: {store_error}")
+                            }
+                        };
+                        phases.push(PhaseReport::skipped(name, &reason))
+                    }
+                }
             }
         }
     }
@@ -613,12 +635,52 @@ impl TickReport {
 pub struct RunLeaseGuard<'a> {
     store: &'a SqliteStore,
     owner: workloop_store::sqlite::RunLeaseOwner,
+    lease_key: &'static str,
 }
 
 impl<'a> RunLeaseGuard<'a> {
     pub fn acquire(
         store: &'a SqliteStore,
         now_unix_seconds: i64,
+    ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
+        Self::acquire_keyed(store, now_unix_seconds, "run", |store, owner, now| {
+            store.acquire_run_lease(owner, |recorded| PosixProcessControl.inspect(recorded), now)
+        })
+    }
+
+    /// The loop-independent maintenance lease for explicit tooling: a
+    /// second maintenance writer is refused, the loop driver's lease is
+    /// unaffected.
+    pub fn acquire_maintenance(
+        store: &'a SqliteStore,
+        now_unix_seconds: i64,
+    ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
+        Self::acquire_keyed(
+            store,
+            now_unix_seconds,
+            "maintenance",
+            |store, owner, now| {
+                store.acquire_maintenance_lease(
+                    owner,
+                    |recorded| PosixProcessControl.inspect(recorded),
+                    now,
+                )
+            },
+        )
+    }
+
+    fn acquire_keyed(
+        store: &'a SqliteStore,
+        now_unix_seconds: i64,
+        lease_key: &'static str,
+        acquire: impl FnOnce(
+            &SqliteStore,
+            &workloop_store::sqlite::RunLeaseOwner,
+            i64,
+        ) -> Result<
+            workloop_store::sqlite::RunLeaseGrant,
+            workloop_store::sqlite::RunLeaseError,
+        >,
     ) -> Result<Self, workloop_store::sqlite::RunLeaseError> {
         let identity =
             PosixProcessControl::identity_of(std::process::id() as i32).map_err(|reason| {
@@ -629,20 +691,23 @@ impl<'a> RunLeaseGuard<'a> {
         let owner = workloop_store::sqlite::RunLeaseOwner {
             pid: identity.pid,
             started_at: identity.started_at,
-            nonce: format!("run-{}", uuidish()),
+            nonce: format!("{lease_key}-{}", uuidish()),
         };
-        store.acquire_run_lease(
-            &owner,
-            |recorded| PosixProcessControl.inspect(recorded),
-            now_unix_seconds,
-        )?;
-        Ok(Self { store, owner })
+        acquire(store, &owner, now_unix_seconds)?;
+        Ok(Self {
+            store,
+            owner,
+            lease_key,
+        })
     }
 }
 
 impl Drop for RunLeaseGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.store.release_run_lease(&self.owner);
+        let _ = match self.lease_key {
+            "maintenance" => self.store.release_maintenance_lease(&self.owner),
+            _ => self.store.release_run_lease(&self.owner),
+        };
     }
 }
 

@@ -59,11 +59,18 @@ impl SpikeScope {
 
     /// Deterministic identity string a [`LiveAuthorization`] binds to.
     /// Not a hash — the scope is small and a readable binding is better
-    /// evidence than an opaque digest.
+    /// evidence than an opaque digest. Every field is escaped so a
+    /// separator inside an opaque id cannot merge two scopes, and the
+    /// actor's host instance is part of the binding: `(host, actor)` is
+    /// the contract's actor identity.
     pub fn binding(&self) -> String {
         format!(
-            "{}/{}/{}/{}",
-            self.host, self.repository, self.branch_prefix, self.actor.actor
+            "{}/{}/{}/{}/{}",
+            escape_binding_field(&self.host.to_string()),
+            escape_binding_field(&self.repository.to_string()),
+            escape_binding_field(&self.branch_prefix),
+            escape_binding_field(&self.actor.host.to_string()),
+            escape_binding_field(&self.actor.actor.to_string()),
         )
     }
 
@@ -78,6 +85,21 @@ impl SpikeScope {
             ))
         }
     }
+}
+
+/// Escape one binding field so joining with `/` stays injective:
+/// backslash and slash are both escaped, so `a/b` and `a` + `/b` cannot
+/// serialize to the same component sequence.
+fn escape_binding_field(field: &str) -> String {
+    let mut escaped = String::with_capacity(field.len());
+    for ch in field.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '/' => escaped.push_str("\\/"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// A recorded live authorization — the gate on every `RowLane::Live`
@@ -148,10 +170,13 @@ pub enum HeadTarget {
     /// The current head of `branch` — reassesses a push receipt and is
     /// the reconcile read for an unresolved push.
     Branch { branch: String },
-    /// The identity and current head of the change request opened from
-    /// `source_branch` — reassesses create/comment receipts and is the
-    /// reconcile read for an unresolved create.
-    ChangeFromBranch { source_branch: String },
+    /// The identity and current head of the change request named by its
+    /// host-scoped IID — reassesses a comment receipt and is the
+    /// reconcile read for an unresolved comment. Create reconciliation
+    /// never uses this target: a lost create response leaves no IID, so
+    /// only the source branch is readable and the effect stays
+    /// indeterminate.
+    Change { change_request: ChangeRequestId },
 }
 
 /// One operation a spike row carries — the closed set of four.
@@ -172,9 +197,12 @@ pub enum SpikeOp {
         source_branch: String,
         target_branch: String,
     },
-    /// Post one ordinary note on the change request opened from
-    /// `source_branch`, bound to `expected_head`.
+    /// Post one ordinary note on the change request named by
+    /// `change_request`, bound to `expected_head`. `source_branch` is
+    /// the IID's expected source branch, checked by the remote so a
+    /// stale plan cannot comment on the wrong change request.
     CommentPost {
+        change_request: ChangeRequestId,
         source_branch: String,
         expected_head: String,
         body: String,
@@ -380,11 +408,12 @@ pub trait SpikeRemote {
         source_branch: &str,
         target_branch: &str,
     ) -> WriteReceipt;
-    /// Post one ordinary note on the change request opened from
-    /// `source_branch`, bound to `expected_head`.
+    /// Post one ordinary note on change request `change_request`, bound
+    /// to `expected_head`; `source_branch` is its expected source.
     fn comment_post(
         &mut self,
         repository: &RepositoryRef,
+        change_request: &ChangeRequestId,
         source_branch: &str,
         expected_head: &str,
         body: &str,
@@ -393,17 +422,23 @@ pub trait SpikeRemote {
     fn head_read(&self, repository: &RepositoryRef, target: &HeadTarget) -> HeadObservation;
 }
 
-/// The head-read target reassessing an applied write of `op`.
-fn reassess_target(op: &SpikeOp) -> HeadTarget {
+/// The head-read target reassessing an applied write of `op`. A create's
+/// identity comes from its applied receipt; a comment already names the
+/// IID it wrote to.
+fn reassess_target(op: &SpikeOp, fact: &EffectFact) -> HeadTarget {
     match op {
         SpikeOp::GuardedPush { branch, .. } => HeadTarget::Branch {
             branch: branch.clone(),
         },
-        SpikeOp::MrCreate { source_branch, .. } | SpikeOp::CommentPost { source_branch, .. } => {
-            HeadTarget::ChangeFromBranch {
-                source_branch: source_branch.clone(),
-            }
-        }
+        SpikeOp::MrCreate { .. } => match fact {
+            EffectFact::ChangeOpened { change, .. } => HeadTarget::Change {
+                change_request: change.change_request.clone(),
+            },
+            _ => unreachable!("an applied create receipt carries its change identity"),
+        },
+        SpikeOp::CommentPost { change_request, .. } => HeadTarget::Change {
+            change_request: change_request.clone(),
+        },
         SpikeOp::HeadRead { .. } => unreachable!("a read has no write receipt to reassess"),
     }
 }
@@ -501,10 +536,10 @@ impl<'r, R: SpikeRemote> SpikeHarness<'r, R> {
             // Revision-bound reassessment: an applied write is followed
             // by a fresh head read whose observed revision must equal
             // the receipt's.
-            if let RowOutcome::Receipt(WriteReceipt::Applied { revision, .. }) = &record.outcome {
+            if let RowOutcome::Receipt(WriteReceipt::Applied { revision, fact }) = &record.outcome {
                 let observed = self
                     .remote
-                    .head_read(&self.scope.repository(), &reassess_target(&row.op))
+                    .head_read(&self.scope.repository(), &reassess_target(&row.op, fact))
                     .head;
                 record.reassessment = Some(Reassessment {
                     receipt: revision.clone(),
@@ -531,23 +566,43 @@ impl<'r, R: SpikeRemote> SpikeHarness<'r, R> {
             }
             let op = self.journal.records[i].op.clone();
             let repository = self.scope.repository();
-            let observed = match &op {
-                SpikeOp::GuardedPush { branch, .. } => self.remote.head_read(
-                    &repository,
-                    &HeadTarget::Branch {
-                        branch: branch.clone(),
-                    },
-                ),
-                SpikeOp::MrCreate { source_branch, .. }
-                | SpikeOp::CommentPost { source_branch, .. } => self.remote.head_read(
-                    &repository,
-                    &HeadTarget::ChangeFromBranch {
-                        source_branch: source_branch.clone(),
-                    },
-                ),
+            let (observed, effect) = match &op {
+                SpikeOp::GuardedPush { branch, .. } => {
+                    let observed = self.remote.head_read(
+                        &repository,
+                        &HeadTarget::Branch {
+                            branch: branch.clone(),
+                        },
+                    );
+                    let effect = reconcile_effect(&op, &repository, &observed);
+                    (observed, effect)
+                }
+                SpikeOp::CommentPost { change_request, .. } => {
+                    let observed = self.remote.head_read(
+                        &repository,
+                        &HeadTarget::Change {
+                            change_request: change_request.clone(),
+                        },
+                    );
+                    let effect = reconcile_effect(&op, &repository, &observed);
+                    (observed, effect)
+                }
+                // A lost create response leaves no IID to read. A head
+                // read can show the source branch, but not which change
+                // request (if any) this create made — the effect stays
+                // indeterminate rather than borrowing another MR's
+                // identity because it shares a source branch.
+                SpikeOp::MrCreate { source_branch, .. } => {
+                    let observed = self.remote.head_read(
+                        &repository,
+                        &HeadTarget::Branch {
+                            branch: source_branch.clone(),
+                        },
+                    );
+                    (observed, ReconciledEffect::Indeterminate)
+                }
                 SpikeOp::HeadRead { .. } => unreachable!("a read receipt is never unknown"),
             };
-            let effect = reconcile_effect(&op, &repository, &observed);
             self.journal.records[i].reconciliation = Some(Reconciliation {
                 change: observed.change,
                 observed: observed.head,
@@ -595,11 +650,13 @@ impl<'r, R: SpikeRemote> SpikeHarness<'r, R> {
                 target_branch,
             )),
             SpikeOp::CommentPost {
+                change_request,
                 source_branch,
                 expected_head,
                 body,
             } => RowOutcome::Receipt(self.remote.comment_post(
                 &repository,
+                change_request,
                 source_branch,
                 expected_head,
                 body,
@@ -635,13 +692,10 @@ fn reconcile_effect(
                 ReconciledEffect::Indeterminate
             }
         }
-        SpikeOp::MrCreate { .. } => {
-            if observed.change.is_some() {
-                ReconciledEffect::Present
-            } else {
-                ReconciledEffect::Absent
-            }
-        }
+        // A lost create response leaves no IID to compare, so a head read
+        // cannot establish which change request (if any) the create
+        // produced. Never borrow another MR's identity from the branch.
+        SpikeOp::MrCreate { .. } => ReconciledEffect::Indeterminate,
         // A head read cannot see a note: if the change request itself is
         // gone the effect is absent, otherwise indeterminate — a comment
         // read the narrow spike does not drive would be needed.
@@ -689,8 +743,10 @@ struct MergeRequest {
 /// item the fixture cannot model on opaque object ids.
 #[derive(Debug, Default)]
 pub struct GitlabSpikeRemote {
-    /// `repository` (host-scoped identity string) → project state.
-    projects: BTreeMap<String, Project>,
+    /// `(host, repository)` identity → project state. Keying on the
+    /// structured identity — never a flat `host/repository` join — keeps
+    /// distinct scopes whose opaque ids contain `/` from sharing state.
+    projects: BTreeMap<RepositoryRef, Project>,
     /// Operations whose writes the actor is denied — permission denial,
     /// not absence of support: reads and other operations are
     /// unaffected.
@@ -726,7 +782,7 @@ impl GitlabSpikeRemote {
     /// The head the remote records for `(repository, branch)`.
     pub fn branch_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
         self.projects
-            .get(&repository.to_string())
+            .get(repository)
             .and_then(|p| p.branches.get(branch).cloned())
     }
 
@@ -758,7 +814,7 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
+        let project = self.projects.entry(repository.clone()).or_default();
         let current = project.branches.get(branch);
         let guard_ok = match (expected_prior, current) {
             (Some(expected), Some(current)) => expected == current,
@@ -799,7 +855,7 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
+        let project = self.projects.entry(repository.clone()).or_default();
         // A merge request opens only against a branch that exists on
         // the remote — an absent branch is a failed receipt, never an
         // invented head.
@@ -833,6 +889,7 @@ impl SpikeRemote for GitlabSpikeRemote {
     fn comment_post(
         &mut self,
         repository: &RepositoryRef,
+        change_request: &ChangeRequestId,
         source_branch: &str,
         expected_head: &str,
         body: &str,
@@ -842,16 +899,20 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
-        let Some(mr) = project
-            .merge_requests
-            .values_mut()
-            .find(|m| m.source_branch == source_branch)
-        else {
+        let project = self.projects.entry(repository.clone()).or_default();
+        let Some(mr) = project.merge_requests.get_mut(change_request.as_str()) else {
             return WriteReceipt::Failed {
-                reason: format!("no change request from {source_branch}"),
+                reason: format!("no change request {change_request}"),
             };
         };
+        if mr.source_branch != source_branch {
+            return WriteReceipt::Failed {
+                reason: format!(
+                    "change request {change_request} is from {}, not {source_branch}",
+                    mr.source_branch
+                ),
+            };
+        }
         let head_object = project.branches.get(&mr.source_branch).cloned();
         if head_object.as_deref() != Some(expected_head) {
             return WriteReceipt::Failed {
@@ -863,7 +924,7 @@ impl SpikeRemote for GitlabSpikeRemote {
         mr.notes.push(body.to_string());
         let change = ChangeRequestRef {
             repository: repository.clone(),
-            change_request: ChangeRequestId::trusted(format!("!{}", mr.iid)),
+            change_request: change_request.clone(),
             display_number: Some(mr.iid),
         };
         self.applied
@@ -877,25 +938,23 @@ impl SpikeRemote for GitlabSpikeRemote {
         let head = |object: Option<&String>| {
             object.and_then(|o| CommitRevision::new(repository.clone(), o).ok())
         };
-        let project = self.projects.get(&repository.to_string());
+        let project = self.projects.get(repository);
         match target {
             HeadTarget::Branch { branch } => HeadObservation {
                 change: None,
                 head: head(project.and_then(|p| p.branches.get(branch))),
             },
-            HeadTarget::ChangeFromBranch { source_branch } => {
-                let mr = project.and_then(|p| {
-                    p.merge_requests
-                        .values()
-                        .find(|m| &m.source_branch == source_branch)
-                });
+            HeadTarget::Change { change_request } => {
+                let mr = project.and_then(|p| p.merge_requests.get(change_request.as_str()));
+                let head_object =
+                    mr.and_then(|m| project.and_then(|p| p.branches.get(m.source_branch.as_str())));
                 HeadObservation {
                     change: mr.map(|m| ChangeRequestRef {
                         repository: repository.clone(),
-                        change_request: ChangeRequestId::trusted(format!("!{}", m.iid)),
+                        change_request: change_request.clone(),
                         display_number: Some(m.iid),
                     }),
-                    head: head(project.and_then(|p| p.branches.get(source_branch.as_str()))),
+                    head: head(head_object),
                 }
             }
         }

@@ -1461,6 +1461,112 @@ fn clean_exit_records_artifact_and_publish_intent() {
     assert_eq!(intents.len(), 1);
 }
 
+/// Inspection read and stop-request wiring (U5.3, #93): a stop request
+/// reaches the supervised writer, and an inspection read reports the
+/// recorded writer_state for the supervision record.
+#[test]
+fn a_stop_request_reaches_the_writer_and_inspection_reads_writer_state() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("u53-inspect");
+    let port = PosixProcessControl;
+    let sup = supervisor("hang", root);
+    let (_w, eid) = submit_and_admit(&store, "k-u53-inspect");
+    sup.run_once(&store, NOW).unwrap();
+    wait_for(
+        || execution(&store, &eid).state == ExecutionState::Running,
+        "running",
+    );
+    // An inspection read returns the recorded writer_state.
+    let view = store
+        .transact(|tx| projection::supervision(tx, &eid))
+        .unwrap()
+        .expect("supervision record");
+    assert_eq!(view.writer_state, Some(WriterState::Running));
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let identity = invocation
+        .process_identity
+        .clone()
+        .expect("spawned identity recorded");
+    // A stop request reaches the writer: cancelling drives the stop
+    // path, and only a verified stop settles the record.
+    let e = execution(&store, &eid);
+    cancel(&store, &e.work_id, "k-u53-inspect-cancel");
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Stopping);
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        if execution(&store, &eid).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Cancelled);
+    assert!(
+        matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "the stop request reached the writer"
+    );
+    // The inspection read returns the recorded writer_state after the
+    // stop is verified.
+    let view = store
+        .transact(|tx| projection::supervision(tx, &eid))
+        .unwrap()
+        .expect("supervision record");
+    assert_eq!(view.writer_state, Some(WriterState::Stopped));
+}
+
+/// Artifact recollection (U5.3, #93): the artifact set recorded for the
+/// Execution matches exactly what the writer produced — digest for
+/// digest, per required artifact.
+#[test]
+fn artifact_recollection_records_exactly_what_the_writer_produced() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("u53-artifact");
+    let (w, eid) = submit_and_admit(&store, "k-u53-artifact");
+    let sup = supervisor("clean-exit", root);
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Waiting);
+    // What the writer produced, read back from its workspace.
+    let produced =
+        std::fs::read(sup.workspace_of(&w).join("artifact.json")).expect("produced artifact");
+    let produced_digest = sha256_hex("artifact-v1", &produced);
+    // The recorded artifact set for the Execution, per the recorded
+    // observation evidence.
+    let recorded: BTreeSet<String> = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::Artifact {
+                state: ArtifactFact::Present { digest },
+                ..
+            } => Some(digest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        BTreeSet::from([produced_digest]),
+        "the recorded artifact set matches what the writer produced"
+    );
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    let complete = store
+        .transact(|tx| projection::artifacts_complete(tx, &eid, &invocation))
+        .unwrap();
+    assert!(complete, "every required artifact is recorded present");
+}
+
 // ---- Stop settle when the writer is already (or never) resolved ----
 
 #[test]

@@ -21,6 +21,9 @@ use workloop_core::ports::{
     ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
 };
 use workloop_core::store::{Effect, Store, StoreError};
+use workloop_core::worker::{
+    DEFAULT_ISOLATION_PROFILE_ID, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
+};
 
 use crate::adapter;
 
@@ -527,6 +530,10 @@ pub struct Supervisor<P: ProcessControlPort> {
     pub worker_argv: Vec<String>,
     /// The installation config `work` decisions are made against.
     pub config: workloop_core::work::WorkloopConfig,
+    /// The approved isolation profile the WorkerRequest export names and
+    /// the launch binds. Enforcement is a separate slice; the id is
+    /// recorded here so the export and the reconciliation binding agree.
+    pub isolation_profile_id: String,
     /// Durable artifact-handoff layout; `None` keeps the file-artifact
     /// path only (fixture harnesses without git workspaces).
     pub handoff: Option<crate::handoff::HandoffLayout>,
@@ -545,9 +552,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
             workspace_root,
             worker_argv,
             config,
+            isolation_profile_id: DEFAULT_ISOLATION_PROFILE_ID.to_string(),
             handoff: None,
             locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Name the approved isolation profile the WorkerRequest export
+    /// carries and the launch binds (U4.2).
+    pub fn with_isolation_profile_id(mut self, isolation_profile_id: impl Into<String>) -> Self {
+        self.isolation_profile_id = isolation_profile_id.into();
+        self
     }
 
     /// Configure durable handoff transport (handoff repository + out
@@ -923,10 +938,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         };
 
-        // First consumption: persist the Invocation inside the same commit
-        // that consumes the request — crash order is identity before launch.
-        // Recording the Invocation flips `consumed` itself; the explicit
-        // mark records the supervisor's handoff and is idempotent. The
+        // First consumption: persist the WorkerRequest export and the
+        // Invocation inside the same commit that consumes the request —
+        // crash order is export, then identity, then launch. The export
+        // is durable before any process exists; a launch that fails or
+        // never returns leaves it behind for reconciliation. Recording
+        // the Invocation flips `consumed` itself; the explicit mark
+        // records the supervisor's handoff and is idempotent. The
         // request's first adapter binding lands in the same commit.
         let invocation = Invocation {
             id: InvocationId(store.transact(|tx| tx.alloc_id("inv"))?),
@@ -938,6 +956,21 @@ impl<P: ProcessControlPort> Supervisor<P> {
             descendants: vec![],
             required_artifacts: required_artifacts(request),
             evidence_refs: vec![],
+        };
+        let export_workspace = self.workspace_of(&request.work_id);
+        let export = WorkerRequest::start(
+            invocation.id.clone(),
+            self.isolation_profile_id.clone(),
+            export_workspace.to_string_lossy().into_owned(),
+        );
+        let export_record = WorkerRequestExport {
+            invocation_id: invocation.id.clone(),
+            request_id: export.request_id.clone(),
+            profile_id: export.profile_id.clone(),
+            workspace_root: export.workspace_root.clone(),
+            digest: export.digest(),
+            state: WorkerRequestExportState::Exported,
+            process_identity: None,
         };
         store.transact(|tx| {
             if request.adapter_binding.is_none()
@@ -953,6 +986,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
             })?;
             tx.apply(&Effect::MarkRequestConsumed {
                 request_id: request.request_id.clone(),
+            })?;
+            tx.apply(&Effect::InsertWorkerRequestExport {
+                export: export_record.clone(),
             })?;
             Ok(())
         })?;
@@ -1027,6 +1063,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     tx.apply(&Effect::UpdateInvocation {
                         invocation: next,
                         expected_state: InvocationState::Prepared,
+                    })?;
+                    // The launch binds the recorded request_id to the
+                    // spawned process handle — same transaction as the
+                    // running Invocation, so reconciliation can resolve
+                    // the writer through the binding or not at all.
+                    tx.apply(&Effect::BindWorkerRequestExport {
+                        request_id: export_record.request_id.clone(),
+                        process_identity: format!("{}@{}", identity.pid, identity.started_at),
                     })?;
                     Ok(())
                 })?;

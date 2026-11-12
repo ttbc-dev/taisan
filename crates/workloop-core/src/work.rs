@@ -4260,7 +4260,9 @@ pub fn consume_due_recovery_intents(
         match store.transact(|tx| fire_due_intent(tx, &intent_id, now)) {
             Ok(FireOutcome::Ignored) => {}
             Ok(FireOutcome::Retired) => scan.retired += 1,
-            Ok(FireOutcome::Held(reason)) => scan.held.push((intent_id, reason)),
+            Ok(FireOutcome::Suppressed(reason)) | Ok(FireOutcome::Held(reason)) => {
+                scan.held.push((intent_id, reason))
+            }
             Ok(FireOutcome::Consumed {
                 requeued,
                 failed_terminal,
@@ -4300,17 +4302,50 @@ enum FireOutcome {
     Ignored,
     Retired,
     Held(String),
+    /// The Work's equivalent-failure budget is spent: the automatic
+    /// requeue is refused and recorded as suppressed. The intent stays
+    /// `pending`; it is never silently consumed.
+    Suppressed(String),
     Consumed {
         requeued: bool,
         failed_terminal: bool,
     },
 }
 
+/// Fire one intent, keeping the recorded suppression state honest:
+/// any outcome other than `Suppressed` (and other than `Ignored`,
+/// which means nothing was learned) drops a stale
+/// `equivalent_failure_suppressed` deferral for this intent's
+/// Execution, so the capacity Query never shows a stall explanation
+/// for a condition that no longer holds. The re-read and revalidation
+/// happens in `fire_due_intent_inner`.
+fn fire_due_intent(
+    tx: &mut dyn TxView,
+    intent_id: &str,
+    now: i64,
+) -> Result<FireOutcome, StoreError> {
+    let outcome = fire_due_intent_inner(tx, intent_id, now)?;
+    if !matches!(outcome, FireOutcome::Suppressed(_) | FireOutcome::Ignored)
+        && let Some(execution_id) = tx
+            .recovery_intents()?
+            .into_iter()
+            .find(|i| i.intent_id == intent_id)
+            .and_then(|i| i.execution_id)
+        && tx
+            .deferrals()?
+            .iter()
+            .any(|d| d.execution_id == execution_id && d.reason == "equivalent_failure_suppressed")
+    {
+        tx.apply(&Effect::ClearDeferral { execution_id })?;
+    }
+    Ok(outcome)
+}
+
 /// Re-read one intent inside the firing transaction and apply the
 /// documented revalidation guards before any transition, so a stale
 /// list snapshot can never fire an intent twice or against a state
 /// that changed since the list was taken.
-fn fire_due_intent(
+fn fire_due_intent_inner(
     tx: &mut dyn TxView,
     intent_id: &str,
     now: i64,
@@ -4350,6 +4385,29 @@ fn fire_due_intent(
         // uncertain): a manual resume or another path owns the next
         // move. The intent stays visible and pending, never forced.
         return Ok(FireOutcome::Held("execution_active".into()));
+    }
+    // Equivalent-failure suppression: the Work's failure budget is
+    // spent, so the automatic requeue is refused and recorded as
+    // suppressed — never consumed, never silently held.
+    if let Some(usage) = tx.work_usage(&intent.work_id)?
+        && let Some(work) = tx.work(&intent.work_id)?
+        && usage.equivalent_failure_streak >= work.policy.equivalent_failure_limit
+    {
+        // Durably record the suppression — the intent stays Pending and
+        // the deferral on the Execution carries the recorded reason
+        // (visible through the capacity Query), the same mechanism the
+        // dispatch recovery_conflict path uses.
+        tx.apply(&Effect::RecordDeferral {
+            execution_id: execution.id.clone(),
+            reason: "equivalent_failure_suppressed".into(),
+            diagnostic: format!(
+                "automatic requeue refused: equivalent-failure streak {} reached the policy limit {}",
+                usage.equivalent_failure_streak, work.policy.equivalent_failure_limit
+            ),
+        })?;
+        return Ok(FireOutcome::Suppressed(
+            "equivalent_failure_suppressed".into(),
+        ));
     }
     if execution
         .repair_prerequisites

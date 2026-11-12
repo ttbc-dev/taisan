@@ -1,8 +1,8 @@
--- workloop v3 store: current-state tables enforcing structural
+-- workloop v6 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 3` marks the format; a stamped v1 or v2 file
--- with the complete recognized schema upgrades additively at open,
--- while an unversioned slice-0 database and a newer version are refused.
+-- `PRAGMA user_version = 6` marks the format; a stamped older file with
+-- the complete recognized schema upgrades additively at open, while an
+-- unversioned slice-0 database and a newer version are refused.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -339,7 +339,10 @@ CREATE TABLE IF NOT EXISTS recovery_intents (
 -- Managed body catalog: durable metadata rows only; the body itself is
 -- the file at `path`. `reclaiming` -> `reclaimed` is the two-phase
 -- deletion protocol; `eligible_after_unix_seconds` is NULL while a body
--- is unattributed and is never sweep-eligible.
+-- is unattributed and is never sweep-eligible. `pin_state` is the
+-- catalogue's explicit protective-dependency summary; any value other
+-- than `none` is a pin. `registered_unix_seconds` is the body's
+-- `created_at` for age eligibility.
 CREATE TABLE IF NOT EXISTS body_catalog (
     body_id TEXT PRIMARY KEY,
     category TEXT NOT NULL,
@@ -348,6 +351,9 @@ CREATE TABLE IF NOT EXISTS body_catalog (
     registered_unix_seconds INTEGER NOT NULL,
     eligible_after_unix_seconds INTEGER,
     pinned INTEGER NOT NULL DEFAULT 0,
+    pin_state TEXT NOT NULL DEFAULT 'none'
+        CHECK (pin_state IN
+               ('none', 'active', 'paused', 'recovering', 'unknown-effect')),
     state TEXT NOT NULL DEFAULT 'present'
         CHECK (state IN ('present', 'reclaiming', 'reclaimed')),
     reclaim_reason TEXT,
@@ -364,4 +370,53 @@ CREATE TABLE IF NOT EXISTS body_pins (
     body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
     dependency TEXT NOT NULL,
     PRIMARY KEY (body_id, dependency)
+);
+
+-- The durable WorkerRequest export for one Invocation (U4.2): written
+-- before any process is launched; `state` flips to 'bound' in the same
+-- commit that records the running Invocation's identity. An 'exported'
+-- row whose Invocation never launched is the crash window
+-- reconciliation tolerates — never a stop proof, never a release.
+CREATE TABLE IF NOT EXISTS worker_request_exports (
+    invocation_id TEXT PRIMARY KEY REFERENCES invocations(id),
+    request_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    workspace_root TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'exported'
+        CHECK (state IN ('exported', 'bound')),
+    process_identity TEXT
+);
+
+-- Two-phase bounded reclaim plans for explicit `retention cleanup`.
+-- Phase 1 computes the eligible set and persists it here (bounded by
+-- max_bodies/max_bytes); phase 2 executes it. An interrupted phase 2
+-- resumes from the pending entries; already-reclaimed bodies are
+-- skipped. The plan and every entry's outcome are durable metadata
+-- that survives the bodies they name.
+CREATE TABLE IF NOT EXISTS reclaim_plans (
+    plan_id TEXT PRIMARY KEY,
+    created_unix_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'completed')),
+    body_count INTEGER NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    completed_unix_seconds INTEGER
+);
+
+-- One row per planned body. `reason` is the eligibility reason that
+-- authorized planning; `outcome` is NULL while pending, then one of
+-- 'reclaimed' | 'unavailable' | 'held' | 'delete_failed'.
+CREATE TABLE IF NOT EXISTS reclaim_plan_entries (
+    plan_id TEXT NOT NULL REFERENCES reclaim_plans(plan_id),
+    body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
+    category TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    outcome TEXT
+        CHECK (outcome IS NULL OR outcome IN
+               ('reclaimed', 'unavailable', 'held', 'delete_failed')),
+    outcome_reason TEXT,
+    outcome_unix_seconds INTEGER,
+    PRIMARY KEY (plan_id, body_id)
 );
