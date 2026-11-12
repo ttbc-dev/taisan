@@ -791,13 +791,30 @@ fn reconcile_push(
             {
                 // The remote provably contains the pushed commit.
                 Ok("ahead") | Ok("identical") => Some(RefRelation::Ancestor),
-                // A readable negative answer proves the remote does not
-                // contain the pushed commit — only this drives the
-                // guarded re-attempt below.
-                Ok("behind") | Ok("diverged") => None,
-                // A failed or unrecognized compare read is unavailable
-                // evidence, never a reason to write: record the pass
-                // unverified and leave the remote untouched.
+                // `behind` proves the remote is a strict ancestor of
+                // the pushed commit — the re-attempt's lease push is a
+                // fast-forward, the only re-push an existing branch may
+                // take.
+                Ok("behind") => None,
+                // `diverged` means re-pushing would rewrite remote
+                // history — the publication contract forbids a
+                // non-fast-forward to an existing branch. And a failed
+                // or unrecognized compare read is unavailable evidence.
+                // Either way: record the pass unverified, never write.
+                Ok("diverged") => {
+                    emit_result_keyed(
+                        ctx,
+                        intent,
+                        key,
+                        HostActionStatus::Unknown {
+                            reason: format!(
+                                "remote {branch} diverged from the pushed revision — a re-push would not fast-forward; effect unverified"
+                            ),
+                        },
+                        vec![],
+                    );
+                    return Ok(());
+                }
                 _ => {
                     emit_result_keyed(
                         ctx,
@@ -899,23 +916,37 @@ fn reconcile_open(
     ]);
     match pr {
         Ok(pr) => {
-            let Some(first) = pr.as_array().and_then(|a| {
-                a.iter()
-                    .find(|p| {
-                        p["base"]["ref"].as_str() == Some(target_branch)
-                            && marker_matches(intent, p)
-                    })
-                    .cloned()
-            }) else {
+            // Adoption needs exactly one matching change: none means
+            // the effect never verified; more than one is ambiguity —
+            // either way the intent stays `unknown`.
+            let matches: Vec<serde_json::Value> = pr
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|p| {
+                            p["base"]["ref"].as_str() == Some(target_branch)
+                                && marker_matches(intent, p)
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let [first] = matches.as_slice() else {
+                let reason = if matches.is_empty() {
+                    format!(
+                        "no open change on base {target_branch} for {source_branch} carrying this action's marker; create effect unverified"
+                    )
+                } else {
+                    format!(
+                        "{} open changes on base {target_branch} for {source_branch} carry this action's marker — ambiguous; create effect unverified",
+                        matches.len()
+                    )
+                };
                 emit_result_keyed(
                     ctx,
                     intent,
                     key,
-                    HostActionStatus::Unknown {
-                        reason: format!(
-                            "no open change on base {target_branch} for {source_branch} carrying this action's marker; create effect unverified"
-                        ),
-                    },
+                    HostActionStatus::Unknown { reason },
                     vec![],
                 );
                 return Ok(());
@@ -924,7 +955,7 @@ fn reconcile_open(
                 .as_str()
                 .unwrap_or(target_branch)
                 .to_string();
-            let (change, head) = match opened_change(intent, &first) {
+            let (change, head) = match opened_change(intent, first) {
                 Ok(read) => read,
                 Err(e) => {
                     emit_result_keyed(
@@ -1340,19 +1371,31 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                             return Ok(());
                         }
                     };
-                    // The read-back must show the created change on the
+                    // The read-back must show exactly one change on the
                     // intent's own base carrying this intent's marker —
-                    // a pre-existing open change to a different target,
-                    // or even the same target without the marker, is
-                    // not this effect's evidence.
-                    let Some(first) = pr.as_array().and_then(|a| {
-                        a.iter()
-                            .find(|p| {
-                                p["base"]["ref"].as_str() == Some(target_branch)
-                                    && marker_matches(intent, p)
-                            })
-                            .cloned()
-                    }) else {
+                    // none, or several, leave the effect unverified
+                    // rather than borrowing a change's identity.
+                    let matches: Vec<serde_json::Value> = pr
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter(|p| {
+                                    p["base"]["ref"].as_str() == Some(target_branch)
+                                        && marker_matches(intent, p)
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let [first] = matches.as_slice() else {
+                        let reason = if matches.is_empty() {
+                            format!("pr create reported {url} but no matching change read back")
+                        } else {
+                            format!(
+                                "pr create reported {url} but {} marker-bearing changes read back — ambiguous",
+                                matches.len()
+                            )
+                        };
                         // The create reported success but no matching
                         // change reads back: the effect is unverified,
                         // never failed.
@@ -1360,11 +1403,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                             ctx,
                             intent,
                             key,
-                            HostActionStatus::Unknown {
-                                reason: format!(
-                                    "pr create reported {url} but no matching change read back"
-                                ),
-                            },
+                            HostActionStatus::Unknown { reason },
                             vec![],
                         );
                         return Ok(());
@@ -1373,7 +1412,7 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                         .as_str()
                         .unwrap_or(target_branch)
                         .to_string();
-                    let (change, head) = match opened_change(intent, &first) {
+                    let (change, head) = match opened_change(intent, first) {
                         Ok(read) => read,
                         Err(e) => {
                             emit_result_keyed(

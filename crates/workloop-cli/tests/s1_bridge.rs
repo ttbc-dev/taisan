@@ -469,12 +469,17 @@ fn unknown_push_settles_from_the_remote_read_without_resend() {
     assert!(fx.outstanding(&work_id).is_empty());
 }
 
+/// `compare` answering `behind` proves the remote is a strict ancestor
+/// of the pushed commit — the re-attempt's push is a fast-forward,
+/// the only write an existing branch may take.
 #[test]
-fn unknown_push_reattempts_the_guarded_write_when_remote_diverged() {
+fn unknown_push_reattempts_the_guarded_write_when_remote_behind() {
     let fx = Fixture::new("reattempt");
     let (work_id, _) = submit(&fx.store(), &fx.config(), "k-reattempt");
     fx.seed_workspace(&work_id);
-    // Remote does not contain the pushed head; the scripted push lands.
+    // Remote does not contain the pushed head but sits strictly behind
+    // it; the scripted push lands.
+    fx.write_fake("compare_status", "behind\n");
     fx.mark_push_lands();
     let action_id = insert_intent(
         &fx.store(),
@@ -491,13 +496,51 @@ fn unknown_push_reattempts_the_guarded_write_when_remote_diverged() {
     assert!(fx.outstanding(&work_id).is_empty());
 }
 
+/// `compare` answering `diverged` proves the remote has commits the
+/// push would drop — re-writing it would not be a fast-forward. The
+/// reconcile records `unknown` and never issues the push at all.
+#[test]
+fn unknown_push_never_rewrites_a_diverged_remote() {
+    let fx = Fixture::new("diverged-remote");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-diverged-remote");
+    fx.seed_workspace(&work_id);
+    // Even with a landing push scripted, no write may be attempted.
+    fx.write_fake("compare_status", "diverged\n");
+    fx.mark_push_lands();
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    for _ in 0..2 {
+        fx.tick(&[]);
+    }
+    let HostActionStatus::Unknown { reason } = fx.intent_status(&action_id) else {
+        panic!("expected unknown, got {:?}", fx.intent_status(&action_id));
+    };
+    assert!(
+        reason.contains("would not fast-forward"),
+        "the recorded reason names the non-fast-forward refusal: {reason}"
+    );
+    assert!(
+        fx.pushes().is_empty(),
+        "divergent remote history is never force-overwritten"
+    );
+}
+
 #[test]
 fn unknown_push_holds_for_operator_at_the_reconcile_bound() {
     let fx = Fixture::new("bound");
     let (work_id, _) = submit(&fx.store(), &fx.config(), "k-bound");
     fx.seed_workspace(&work_id);
-    // The scripted push never lands: every reconcile re-attempt reads
-    // back the same diverged remote.
+    // The remote sits strictly behind (a legal re-attempt) but the
+    // scripted push never lands: every reconcile re-attempt reads back
+    // the same behind remote.
+    fx.write_fake("compare_status", "behind\n");
     let action_id = insert_intent(
         &fx.store(),
         &work_id,
@@ -554,6 +597,9 @@ fn rearmed_push_reconciles_against_attempt_receipts_only() {
         fx.intent_status(&action_id),
         HostActionStatus::Unknown { .. }
     ));
+    // The drifted remote sits strictly behind the pushed head: the
+    // re-attempt is a fast-forward, the only legal re-push.
+    fx.write_fake("compare_status", "behind\n");
     fx.mark_push_lands();
     fx.tick(&["--reconcile-bound", "1"]);
     assert_eq!(
@@ -580,12 +626,14 @@ fn applied_push_rearms_again_on_repeat_drift_to_the_same_head() {
         HostActionStatus::Applied,
         vec![ref_published()],
     );
-    // First drift re-arms; the re-attempted push lands and resettles.
+    // First drift re-arms; the re-attempted push lands and resettles —
+    // the remote sits strictly behind, so the re-push fast-forwards.
     fx.tick(&[]);
     assert!(matches!(
         fx.intent_status(&action_id),
         HostActionStatus::Unknown { .. }
     ));
+    fx.write_fake("compare_status", "behind\n");
     fx.mark_push_lands();
     fx.tick(&[]);
     assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
@@ -700,6 +748,10 @@ fn applied_push_rearms_on_bound_actor_drift_and_resettles() {
     );
     assert_eq!(fx.outstanding(&work_id), vec![action_id.clone()]);
 
+    // The drifted remote sits strictly behind the pushed head: the
+    // guarded re-attempt fast-forwards it — the only re-push the
+    // publication contract allows an existing branch.
+    fx.write_fake("compare_status", "behind\n");
     fx.mark_push_lands();
     fx.tick(&[]);
     assert_eq!(
