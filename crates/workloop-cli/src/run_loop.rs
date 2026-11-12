@@ -314,33 +314,59 @@ pub fn run_pass(
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
     // one store transaction and isolates each admission in its own
     // attempt savepoint, with deadline and scope supplied as facts).
-    // The worker declaration is probed once before the transaction so
-    // each admitted request is created carrying its adapter binding —
-    // the stored declaration recorded at request creation. A probe that
-    // does not answer leaves the requests unbound; the supervisor's
-    // fail-closed selection handles them at consume.
+    // When the scan leaves unbound pending requests, the worker
+    // declaration is probed per distinct request workspace — the same
+    // cwd the consume-time re-verification uses, so a recorded binding
+    // always re-verifies at launch — and each in-scope unbound request
+    // records its binding in a following transaction. An idle pass
+    // probes nothing: no unbound request means no spawned worker. A
+    // probe that does not answer leaves the requests unbound; the
+    // supervisor's fail-closed selection handles them at consume.
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;
-        let binding = pass.supervisor.and_then(|supervisor| {
-            adapter::observe_worker_declaration(
-                &supervisor.port,
-                &supervisor.worker_argv,
-                &supervisor.workspace_root,
-            )
-            .ok()
-            .map(|declaration| declaration.binding(&supervisor.worker_argv))
-        });
         let result = store.transact(|tx| {
             let scan = dispatch_scan(tx, config, &mut *clock, Some(deadline), scope)?;
-            if let Some(binding) = &binding {
-                for request in tx.pending_requests()? {
-                    if request.adapter_binding.is_none() {
-                        tx.apply(&Effect::BindRequestAdapter {
-                            request_id: request.request_id.clone(),
-                            binding: binding.clone(),
-                        })?;
-                    }
+            // The binding pass stays inside the pass scope: a scoped
+            // `--work` run never writes another Work's requests.
+            let unbound = tx
+                .pending_requests()?
+                .into_iter()
+                .filter(|r| r.adapter_binding.is_none())
+                .filter(|r| scope.is_none_or(|w| r.work_id == *w))
+                .collect::<Vec<_>>();
+            Ok((scan, unbound))
+        });
+        let result = result.and_then(|(scan, unbound)| {
+            if let Some(supervisor) = pass.supervisor
+                && !unbound.is_empty()
+            {
+                let mut by_workspace: std::collections::BTreeMap<PathBuf, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for request in &unbound {
+                    by_workspace
+                        .entry(supervisor.workspace_of(&request.work_id))
+                        .or_default()
+                        .push(request.request_id.clone());
+                }
+                for (workspace, request_ids) in by_workspace {
+                    let Ok(declaration) = adapter::observe_worker_declaration(
+                        &supervisor.port,
+                        &supervisor.worker_argv,
+                        &workspace,
+                    ) else {
+                        continue;
+                    };
+                    let binding = declaration.binding(&supervisor.worker_argv);
+                    store.transact(|tx| {
+                        for request_id in &request_ids {
+                            tx.apply(&Effect::BindRequestAdapter {
+                                request_id: request_id.clone(),
+                                binding: binding.clone(),
+                            })?;
+                        }
+                        Ok(())
+                    })?;
                 }
             }
             Ok(scan)

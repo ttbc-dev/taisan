@@ -1,8 +1,8 @@
 //! Worker adapter selection and binding. One durable request is bound to
-//! exactly one adapter declaration: the binding recorded on the request at
-//! its creation is the stored declaration, immutable for the request's
-//! life. A later `worker_argv` change applies only to requests created
-//! after the change. At launch the bound argv is probed again; a
+//! exactly one adapter declaration: the first binding recorded on the
+//! request is the stored declaration, immutable for the request's
+//! life. A later `worker_argv` change applies only to requests not yet
+//! bound. At launch the bound argv is probed again; a
 //! declaration that no longer matches the request's stored binding is a
 //! configuration repair that authorizes no start, and a request refused
 //! on that repair is terminal for its binding — the operator abandons it

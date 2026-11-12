@@ -125,17 +125,49 @@ enum ProbeSignalPlan {
     /// live process of that pid — so the group is still ours to signal.
     GroupOnly,
     /// A live process at the pid carries a different start (recycled,
-    /// foreign) or the lookup itself failed: nothing is signalled. A
-    /// possibly-leaked straggler beats a signal to an unrelated
-    /// process.
+    /// foreign) or an occupied pid could not be verified: nothing is
+    /// signalled. A possibly-leaked straggler beats a signal to an
+    /// unrelated process.
     Nothing,
 }
 
-fn probe_signal_plan(recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
+fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
     match lookup {
         LstartLookup::Present(now) if now == recorded_lstart => ProbeSignalPlan::LeaderAndGroup,
         LstartLookup::Absent => ProbeSignalPlan::GroupOnly,
+        LstartLookup::Failed(_) => {
+            // The process-table read failed, but a pid probe needs no
+            // table: `kill(pid, 0)` reporting ESRCH means the pid is
+            // unallocated and no foreign process can be heading a group
+            // under it — the group is still ours to signal. An
+            // occupied but unverifiable pid could be a recycled foreign
+            // owner, so it is left alone.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                ProbeSignalPlan::GroupOnly
+            } else {
+                ProbeSignalPlan::Nothing
+            }
+        }
         _ => ProbeSignalPlan::Nothing,
+    }
+}
+
+/// Signal whatever of a bounded probe's leader and process group is
+/// still this probe's to stop. `recorded_lstart` is the leader identity
+/// captured while the pid was provably ours. Shared by the timeout and
+/// the wait-error paths so a wedged probe cannot outlive its bound on
+/// either one.
+fn signal_probe_bound(pid: i32, recorded_lstart: &str) {
+    match probe_signal_plan(pid, recorded_lstart, &lstart_of(pid)) {
+        ProbeSignalPlan::LeaderAndGroup => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::GroupOnly => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::Nothing => {}
     }
 }
 
@@ -425,9 +457,18 @@ impl ProcessControlPort for PosixProcessControl {
                 stdout: output.stdout,
                 success: output.status.success(),
             }),
-            Ok(Err(e)) => Err(SpawnError::Unknown {
-                reason: format!("wait {program}: {e}"),
-            }),
+            Ok(Err(e)) => {
+                // The wait itself failed and the child's fate is
+                // unknown — the bound still applies: signal whatever of
+                // the leader and its group is still this probe's before
+                // reporting the probe unknown, so a wedged group cannot
+                // outlive the bound on a wait-channel error either.
+                signal_probe_bound(pid, &started_at);
+                self.reap(pid);
+                Err(SpawnError::Unknown {
+                    reason: format!("wait {program}: {e}"),
+                })
+            }
             Err(_) => {
                 // The bound elapsed: re-verify the recorded identity
                 // before signalling — the waiter may already have reaped
@@ -437,16 +478,7 @@ impl ProcessControlPort for PosixProcessControl {
                 // group are still ours. A short drain then lets the
                 // waiter reap the direct child rather than leaving a
                 // zombie.
-                match probe_signal_plan(&started_at, &lstart_of(pid)) {
-                    ProbeSignalPlan::LeaderAndGroup => unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                        libc::kill(pid, libc::SIGKILL);
-                    },
-                    ProbeSignalPlan::GroupOnly => unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                    },
-                    ProbeSignalPlan::Nothing => {}
-                }
+                signal_probe_bound(pid, &started_at);
                 let _ = receiver.recv_timeout(Duration::from_secs(2));
                 Ok(ProbeOutcome::Bounded)
             }
@@ -1019,7 +1051,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         }
 
-        if exec_state != Some(ExecutionState::Ready) {
+        // The pre-probe Execution-state read is stale by up to the full
+        // probe bound: re-read it after the consume commit so a stop or
+        // cancel committed while `describe` ran still blocks the spawn —
+        // the request is consumed, so blocking the launch abandons the
+        // recorded Invocation.
+        let launchable = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !launchable {
             store.transact(|tx| {
                 let mut next = invocation.clone();
                 next.state = InvocationState::Abandoned;
@@ -2545,22 +2585,40 @@ mod tests {
     fn a_probe_timeout_signals_only_verified_identities() {
         let recorded = "Sat Oct 4 06:14:00 2026";
         assert_eq!(
-            probe_signal_plan(recorded, &LstartLookup::Present(recorded.into())),
+            probe_signal_plan(1, recorded, &LstartLookup::Present(recorded.into())),
             ProbeSignalPlan::LeaderAndGroup
         );
         assert_eq!(
-            probe_signal_plan(recorded, &LstartLookup::Absent),
+            probe_signal_plan(1, recorded, &LstartLookup::Absent),
             ProbeSignalPlan::GroupOnly
         );
         assert_eq!(
             probe_signal_plan(
+                1,
                 recorded,
                 &LstartLookup::Present("Sun Nov 1 00:00:00 2026".into())
             ),
             ProbeSignalPlan::Nothing
         );
+        // A failed lookup over an unallocated pid still reaches the
+        // group — `kill(pid, 0)` is enough to prove no foreign owner is
+        // heading a group under it.
         assert_eq!(
-            probe_signal_plan(recorded, &LstartLookup::Failed("ps unavailable".into())),
+            probe_signal_plan(
+                i32::MAX,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
+            ProbeSignalPlan::GroupOnly
+        );
+        // A failed lookup over an occupied pid stays unverifiable — the
+        // group is left alone rather than risk a recycled foreign owner.
+        assert_eq!(
+            probe_signal_plan(
+                std::process::id() as i32,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
             ProbeSignalPlan::Nothing
         );
     }
