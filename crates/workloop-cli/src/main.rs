@@ -1213,19 +1213,23 @@ fn build_supervisor(
             ));
         }
     }
-    Ok(Some(
-        Supervisor::new(
-            PosixProcessControl,
-            workspace_root.clone(),
-            installation.worker_argv.clone(),
-            config.clone(),
-        )
-        .with_handoff(workloop_exec::handoff::HandoffLayout {
+    let supervisor = Supervisor::new(
+        PosixProcessControl,
+        workspace_root.clone(),
+        installation.worker_argv.clone(),
+        config.clone(),
+    );
+    let supervisor = match &installation.worker_isolation_profile {
+        Some(profile) => supervisor.with_isolation_profile_id(profile.clone()),
+        None => supervisor,
+    };
+    Ok(Some(supervisor.with_handoff(
+        workloop_exec::handoff::HandoffLayout {
             repository,
             workspace_root,
             out_root: handoff_root.join("out"),
-        }),
-    ))
+        },
+    )))
 }
 
 /// Resolve an installation-relative path against the one state root.

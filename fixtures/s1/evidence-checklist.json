@@ -1,0 +1,745 @@
+{
+  "schema_version": 1,
+  "kind": "s1-criterion-to-evidence-checklist",
+  "status": "prepared",
+  "live_execution_authorized": false,
+  "variants": {
+    "success": {
+      "definition": "Expected path: submit, dispatch, artifact, publication, checks and review with findings, one bounded fix, H2 reassessment, succeeded.",
+      "checklist_section": "Success variant",
+      "expected_outcome": "succeeded"
+    },
+    "Attention": {
+      "definition": "A human-judgment hold, no-progress condition, or exhausted bound surfaces actionable Attention without silent settlement.",
+      "checklist_section": "Attention variant",
+      "expected_outcome": "paused with a versioned Attention item and no terminal success"
+    },
+    "recovery": {
+      "definition": "Duplicate delivery, lost response, unknown host effect, restart, stale head, outage, or budget exhaustion is reconciled under the original identities.",
+      "checklist_section": "Recovery variant",
+      "expected_outcome": "typed terminal outcome or preserved unknown/Attention, never a blind replay"
+    }
+  },
+  "revision_config": {
+    "materials_revision": "s1-fixtures-v1",
+    "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+    "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+    "contract_version": 1
+  },
+  "rows": [
+    {
+      "id": "S-1",
+      "criterion": "submit accepted; W1/E1 queued in one commit; no Invocation",
+      "source": "docs/v0.1.md#expected-path step 1 / docs/implementation-plan.md S1.1",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "accepted envelope with command_id",
+        "work_id W1",
+        "execution_id E1",
+        "store state queued with no invocation rows"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-2",
+      "criterion": "dispatch admission reserves capacity and write resources and records the first Invocation atomically; E1 ready to I1 coding running",
+      "source": "docs/v0.1.md#expected-path step 2 / docs/implementation-plan.md S1.2",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "capacity slot holder",
+        "workspace and branch reservation records",
+        "InvocationRequest and Invocation identity in one commit",
+        "recorded process identity"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-3",
+      "criterion": "I1 produces the immutable change artifact and the declared verification_argv passes against that artifact",
+      "source": "docs/v0.1.md#expected-path step 3 / docs/implementation-plan.md S1.3",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "Invocation result identity",
+        "artifact reference and digest",
+        "verification argv and passing exit evidence bound to the artifact"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-3a",
+      "criterion": "The separate invariant-check Invocation passes on the approved set before publication",
+      "source": "docs/v0.1.md#expected-path step 3 / docs/implementation-plan.md S1.3",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1-invariant-check"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "separate invariant-check Invocation identity",
+        "conformance evidence bound to the same produced head"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-4",
+      "criterion": "Stop proof precedes a push_ref intent and receipt, followed by a separate open_change_request intent, receipt and change_head Observation H1",
+      "source": "docs/v0.1.md#expected-path step 4 / docs/implementation-plan.md S1.4",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": [
+          "push_ref",
+          "open_change_request"
+        ]
+      },
+      "required_evidence": [
+        "writer stop proof",
+        "action_id and applied receipt for push_ref",
+        "distinct action_id and applied receipt for open_change_request",
+        "change_head Observation for H1"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-5",
+      "criterion": "Real checks and a real review arrive on H1 as Observations and the review carries at least one finding",
+      "source": "docs/v0.1.md#expected-path step 5 / docs/implementation-plan.md S1.5",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "named check Observations bound to H1",
+        "review and review_findings Observation bound to H1",
+        "reviewer identity",
+        "occurrence set with at least one finding"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-6",
+      "criterion": "judge_findings with expected_head H1 drives fix I2, stop proof, push_ref with prior ref H1, and verified H2",
+      "source": "docs/v0.1.md#expected-path step 6 / docs/implementation-plan.md S1.6",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I2"
+        ],
+        "action": [
+          "push_ref"
+        ]
+      },
+      "required_evidence": [
+        "judgment command identity and round bindings",
+        "Fix Invocation identity and stop proof",
+        "push receipt showing prior ref H1 and new ref H2"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-7",
+      "criterion": "Reassessment on H2 passes mechanical verification and invariant checks, configured CI, and a fresh H2 review with no unresolved finding",
+      "source": "docs/v0.1.md#expected-path step 7 / docs/implementation-plan.md S1.7",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I2"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "Invocation, artifact and verification evidence bound to H2",
+        "check Observations bound to H2",
+        "fresh H2 review evidence with no unresolved finding"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "S-8",
+      "criterion": "work records a succeeded Outcome with all required evidence references",
+      "source": "docs/v0.1.md#expected-path step 8 and completion boundary / docs/implementation-plan.md S1.8",
+      "variant": "success",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "PR reference",
+        "verified head H2",
+        "H2 artifact",
+        "supervisor checks",
+        "enabled invariant assessment",
+        "configured CI",
+        "H2 review evidence",
+        "all required effect receipts",
+        "writer-stop evidence"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "A-1",
+      "criterion": "A review finding requiring human judgment per policy pauses the Execution with paused(human_judgment) and derives Attention",
+      "source": "docs/v0.1.md#expected-path branches / docs/implementation-plan.md Human judgment",
+      "variant": "Attention",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "Execution paused state with reason",
+        "Attention item with attention_id, next_actor and next_action"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "A-2",
+      "criterion": "Attention remains visible until acknowledged and acknowledgement changes presentation only",
+      "source": "docs/v0.1.md#expected-path branches / docs/implementation-plan.md Human judgment",
+      "variant": "Attention",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "attention Query before and after acknowledge at the exact Attention version",
+        "underlying pause condition unchanged"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "A-3",
+      "criterion": "judge_findings and release_judgment requeue the Work without losing WIP or resetting budgets",
+      "source": "docs/implementation-plan.md Human judgment",
+      "variant": "Attention",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I2"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "judgment and release command identities",
+        "requeue decision record",
+        "usage ledger with consumed budgets unchanged"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "A-4",
+      "criterion": "The no_progress threshold is exceeded and surfaces Attention that auto-clears on material progress",
+      "source": "docs/implementation-plan.md Prolonged uncertain state",
+      "variant": "Attention",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "no_progress Attention item carrying Work, Execution, last progress timestamp and elapsed time",
+        "auto-clear on material progress"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-1",
+      "criterion": "Duplicate submit with the same key and payload returns the original decision and holds one Work and one Execution",
+      "source": "docs/v0.1.md#abnormal-input-matrix duplicate submit / docs/implementation-plan.md Duplicate submit, identical key/payload",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "command_result returns the original decision",
+        "one Work and one Execution",
+        "replayed command_id"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-2",
+      "criterion": "Duplicate submit key with changed payload is rejected as idempotency_conflict with the original retained and no state change",
+      "source": "docs/v0.1.md#abnormal-input-matrix duplicate submit / docs/implementation-plan.md Duplicate submit key, changed payload",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "rejected envelope with idempotency_conflict",
+        "original decision retained",
+        "no new state mutation"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-3",
+      "criterion": "A lost command response is recovered by original replay identity or command_result and no fresh-key duplicate is created",
+      "source": "docs/v0.1.md#abnormal-input-matrix / docs/implementation-plan.md Publication unknown",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "command-result lookup by origin, actor and idempotency_key",
+        "identical replay returns the decision",
+        "unknown preserved until recovered"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-4",
+      "criterion": "A lost publication response leaves host_action_result unknown and is reconciled by original action identity without a second write",
+      "source": "docs/v0.1.md#abnormal-input-matrix publication unknown / docs/implementation-plan.md Publication unknown",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": [
+          "push_ref",
+          "open_change_request"
+        ]
+      },
+      "required_evidence": [
+        "host_action_result unknown on the original action_id",
+        "read-back reconciliation against the recorded intent",
+        "separate typed receipts",
+        "no second push or PR creation"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-5",
+      "criterion": "Restart while an Invocation may be live reconciles the recorded process identity and starts no second writer",
+      "source": "docs/v0.1.md#abnormal-input-matrix installation restart / docs/implementation-plan.md Installation stop/restart",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "post-restart reconciliation of request and process identity",
+        "Execution uncertain or correctly running",
+        "descendant snapshot and PID/start-time re-verification",
+        "no duplicate writer"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-6",
+      "criterion": "A stale review or stale head remains evidence for its own head and never moves the current head backward",
+      "source": "docs/v0.1.md#abnormal-input-matrix stale review / docs/implementation-plan.md Stale head/review",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I2"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "stale_head rejection for judge_findings expected_head H1 after H2",
+        "old review retained as H1 evidence only",
+        "projection shows H2 current and unreviewed"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-7",
+      "criterion": "A GitHub adapter outage marks Observations unavailable, distinguishes unavailable from no findings, and never claims completion",
+      "source": "docs/v0.1.md#abnormal-input-matrix GitHub outage / docs/implementation-plan.md GitHub outage",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [],
+        "action": []
+      },
+      "required_evidence": [
+        "Observations marked unavailable",
+        "QueryResult.sources distinguishes no findings from source unavailable",
+        "no completion claimed",
+        "recovery Observations after restore"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-8",
+      "criterion": "Budget exhaustion stops safely, records the exhausted limit with WIP preserved, and retry creates E2 claiming the same workspace and branch",
+      "source": "docs/v0.1.md#abnormal-input-matrix budget exhaustion / docs/implementation-plan.md Invocation/review/runtime budget exhaustion",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1",
+          "E2"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": [
+          "push_ref",
+          "open_change_request"
+        ]
+      },
+      "required_evidence": [
+        "stopping or uncertain state while writers or effects may act",
+        "failed with exhausted limit code once safe",
+        "preserved WIP and evidence",
+        "E2 reservation records claiming the same workspace and branch"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    },
+    {
+      "id": "R-9",
+      "criterion": "Duplicate Observation delivery is inert: one recorded fact, no second intent or effect",
+      "source": "docs/v0.1.md#abnormal-input-matrix duplicate observation / docs/implementation-plan.md Duplicate Observation source event",
+      "variant": "recovery",
+      "identities": {
+        "work": [
+          "W1"
+        ],
+        "execution": [
+          "E1"
+        ],
+        "invocation": [
+          "I1"
+        ],
+        "action": []
+      },
+      "required_evidence": [
+        "duplicate ingest receipt",
+        "delivery identities showing deduplication",
+        "single recorded fact",
+        "no second intent or effect"
+      ],
+      "revision_config": {
+        "materials_revision": "s1-fixtures-v1",
+        "taisan_core_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "taisan_cli_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "github_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "worker_adapter_revision": "f24fce6aa93bc416d84e598a2b18b3055ba0e325",
+        "configuration_identity": "github.com/shimpeiws/coding-worker-smoke adapter=github contract=1 store=late-bound effects=local_git_write=true,repository_host_write=false,workspace_write=true config_sha256=9c91f4548005a626319b52e234d1e3631e375a5800703dd6f36022e59859f8ed",
+        "contract_version": 1
+      }
+    }
+  ]
+}

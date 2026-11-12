@@ -1,6 +1,6 @@
--- workloop v4 store: current-state tables enforcing structural
+-- workloop v5 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 4` marks the format; a stamped older file with
+-- `PRAGMA user_version = 5` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 
@@ -367,6 +367,22 @@ CREATE TABLE IF NOT EXISTS body_pins (
     body_id TEXT NOT NULL REFERENCES body_catalog(body_id),
     dependency TEXT NOT NULL,
     PRIMARY KEY (body_id, dependency)
+);
+
+-- The durable WorkerRequest export for one Invocation (U4.2): written
+-- before any process is launched; `state` flips to 'bound' in the same
+-- commit that records the running Invocation's identity. An 'exported'
+-- row whose Invocation never launched is the crash window
+-- reconciliation tolerates — never a stop proof, never a release.
+CREATE TABLE IF NOT EXISTS worker_request_exports (
+    invocation_id TEXT PRIMARY KEY REFERENCES invocations(id),
+    request_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    workspace_root TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'exported'
+        CHECK (state IN ('exported', 'bound')),
+    process_identity TEXT
 );
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.

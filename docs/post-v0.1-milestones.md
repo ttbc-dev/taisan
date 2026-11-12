@@ -28,3 +28,12 @@ Track delivery in [milestone 4](https://github.com/shimpeiws/taisan/milestone/4)
 | `worker-B129` | Blinded evaluator briefs bound to one case and actual evidence anchors. Check identity and automatable answer leakage, with a human pass for paraphrased leakage |
 
 The evaluation machinery is deferred, not its general safety principles. v0.1 must not misrepresent model judgments as human approval, count incomplete evidence as complete, or default missing acceptance criteria to success. #51 carries these principles into the evidence contract. Independent evaluation claims must remain unsupported until the corresponding later milestone is verified.
+
+## Proposed judge calibration experiment
+
+The [judge calibration proposal](judge-calibration-proposal.md) describes an
+E0-E4 investigation of review/fix judgments together with post-halt recovery
+judgments. It proposes decision-time evidence capture, independent labels,
+blinded prompt replay and a later Work-level trial measuring interventions
+alongside verified completion. It is a proposal under milestone 4, not an
+additional committed milestone, implementation authorization or v0.1 gate.

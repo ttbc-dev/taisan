@@ -569,9 +569,30 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "the upgrade lands on the current format");
+        assert_eq!(version, 5, "the upgrade lands on the current format");
     }
     drop(store);
+    // A stamp-4 file (the worker-request-export format, reclaim tables
+    // absent) upgrades the same way.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE reclaim_plan_entries; DROP TABLE reclaim_plans; PRAGMA user_version=4;",
+        )
+        .unwrap();
+    }
+    {
+        let upgraded = SqliteStore::open(&db, 1).expect("a stamp-4 store opens");
+        assert!(upgraded.reclaim_plan_open().unwrap().is_none());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 5,
+            "the stamp-4 upgrade lands on the current format"
+        );
+    }
     let again = SqliteStore::open(&db, 1).expect("reopen after upgrade is a no-op");
     assert!(again.reclaim_plan_open().unwrap().is_none());
     let _ = std::fs::remove_dir_all(&root);
