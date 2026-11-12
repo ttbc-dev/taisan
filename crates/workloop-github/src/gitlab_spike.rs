@@ -743,8 +743,10 @@ struct MergeRequest {
 /// item the fixture cannot model on opaque object ids.
 #[derive(Debug, Default)]
 pub struct GitlabSpikeRemote {
-    /// `repository` (host-scoped identity string) → project state.
-    projects: BTreeMap<String, Project>,
+    /// `(host, repository)` identity → project state. Keying on the
+    /// structured identity — never a flat `host/repository` join — keeps
+    /// distinct scopes whose opaque ids contain `/` from sharing state.
+    projects: BTreeMap<RepositoryRef, Project>,
     /// Operations whose writes the actor is denied — permission denial,
     /// not absence of support: reads and other operations are
     /// unaffected.
@@ -780,7 +782,7 @@ impl GitlabSpikeRemote {
     /// The head the remote records for `(repository, branch)`.
     pub fn branch_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
         self.projects
-            .get(&repository.to_string())
+            .get(repository)
             .and_then(|p| p.branches.get(branch).cloned())
     }
 
@@ -812,7 +814,7 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
+        let project = self.projects.entry(repository.clone()).or_default();
         let current = project.branches.get(branch);
         let guard_ok = match (expected_prior, current) {
             (Some(expected), Some(current)) => expected == current,
@@ -853,7 +855,7 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
+        let project = self.projects.entry(repository.clone()).or_default();
         // A merge request opens only against a branch that exists on
         // the remote — an absent branch is a failed receipt, never an
         // invented head.
@@ -897,7 +899,7 @@ impl SpikeRemote for GitlabSpikeRemote {
                 reason: "permission denied".into(),
             };
         }
-        let project = self.projects.entry(repository.to_string()).or_default();
+        let project = self.projects.entry(repository.clone()).or_default();
         let Some(mr) = project.merge_requests.get_mut(change_request.as_str()) else {
             return WriteReceipt::Failed {
                 reason: format!("no change request {change_request}"),
@@ -936,7 +938,7 @@ impl SpikeRemote for GitlabSpikeRemote {
         let head = |object: Option<&String>| {
             object.and_then(|o| CommitRevision::new(repository.clone(), o).ok())
         };
-        let project = self.projects.get(&repository.to_string());
+        let project = self.projects.get(repository);
         match target {
             HeadTarget::Branch { branch } => HeadObservation {
                 change: None,

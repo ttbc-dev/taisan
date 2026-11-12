@@ -121,52 +121,128 @@ fn applied_revision(record: &RowRecord) -> &workloop_core::identity::CommitRevis
     }
 }
 
-/// Remove Rust comments while preserving string literals, so a comment
-/// between the receiver and the method cannot hide a call site.
+/// If `source[index]` starts a raw string (`r`, zero or more `#`, then
+/// `"`), the number of `#` delimiters and the index of the opening quote.
+fn raw_string_start(source: &[char], index: usize) -> Option<(usize, usize)> {
+    if source.get(index) != Some(&'r') {
+        return None;
+    }
+    let mut quote = index + 1;
+    let mut hashes = 0usize;
+    while source.get(quote) == Some(&'#') {
+        hashes += 1;
+        quote += 1;
+    }
+    (source.get(quote) == Some(&'"')).then_some((hashes, quote))
+}
+
+/// Whether `source[index]` (`'`) opens a char literal rather than a
+/// lifetime. A char literal is either an escape (`'\n'`, `'\''`) or one
+/// character followed by the closing quote (`'a'`, `'"'`); a lifetime
+/// such as `'static` has no closing quote immediately after its first
+/// character.
+fn is_char_literal(source: &[char], index: usize) -> bool {
+    match source.get(index + 1) {
+        Some('\\') => true,
+        Some(_) => source.get(index + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+/// Remove Rust comments while preserving literals, so a comment between
+/// the receiver and the method cannot hide a call site. Raw strings and
+/// char literals are lexed as literals too: a quote inside `r#"..."#` or
+/// `'"'` must not be mistaken for a string delimiter that swallows the
+/// following code.
 fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars: Vec<char> = source.chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let c = chars[index];
         match c {
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                index += 2;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                index += 2;
+                let mut depth = 1usize;
+                while index < chars.len() {
+                    if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        depth -= 1;
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            'r' if raw_string_start(&chars, index).is_some() => {
+                let (hashes, quote) = raw_string_start(&chars, index).unwrap();
+                out.extend(&chars[index..=quote]);
+                index = quote + 1;
+                loop {
+                    if index >= chars.len() {
+                        break;
+                    }
+                    if chars[index] == '"'
+                        && (1..=hashes).all(|offset| chars.get(index + offset) == Some(&'#'))
+                    {
+                        let end = index + 1 + hashes;
+                        out.extend(&chars[index..end]);
+                        index = end;
+                        break;
+                    }
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
             '"' => {
                 out.push(c);
-                while let Some(next) = chars.next() {
+                index += 1;
+                while index < chars.len() {
+                    let next = chars[index];
                     out.push(next);
+                    index += 1;
                     if next == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            out.push(escaped);
+                        if index < chars.len() {
+                            out.push(chars[index]);
+                            index += 1;
                         }
                     } else if next == '"' {
                         break;
                     }
                 }
             }
-            '/' if chars.peek() == Some(&'/') => {
-                chars.next();
-                while let Some(&next) = chars.peek() {
-                    if next == '\n' {
+            '\'' if is_char_literal(&chars, index) => {
+                out.push(c);
+                index += 1;
+                while index < chars.len() {
+                    let next = chars[index];
+                    out.push(next);
+                    index += 1;
+                    if next == '\\' {
+                        if index < chars.len() {
+                            out.push(chars[index]);
+                            index += 1;
+                        }
+                    } else if next == '\'' {
                         break;
                     }
-                    chars.next();
                 }
             }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut depth = 1usize;
-                while let Some(next) = chars.next() {
-                    if next == '/' && chars.peek() == Some(&'*') {
-                        chars.next();
-                        depth += 1;
-                    } else if next == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
+            _ => {
+                out.push(c);
+                index += 1;
             }
-            _ => out.push(c),
         }
     }
     out
@@ -598,6 +674,38 @@ fn scope_binding_separates_escaped_fields_and_the_actor_host() {
     );
 }
 
+/// The fixture remote keys project state by the structured
+/// `(host, repository)` identity, not a flat `host/repository` join.
+/// Two scopes whose fields contain `/` can serialize the same way; they
+/// must still keep separate branch and change-request state.
+#[test]
+fn fixture_projects_are_keyed_by_scoped_identity_not_a_flat_join() {
+    let split_repository =
+        RepositoryRef::new(HostInstanceId::trusted("h"), RepositoryId::trusted("r/x"));
+    let split_host = RepositoryRef::new(HostInstanceId::trusted("h/r"), RepositoryId::trusted("x"));
+    assert_eq!(
+        split_repository.to_string(),
+        split_host.to_string(),
+        "the naive join collides — the fixture must not key on it"
+    );
+
+    let mut remote = GitlabSpikeRemote::new();
+    let receipt = remote.guarded_push(&split_repository, "spike/u94/w", None, "head-1");
+    assert!(
+        matches!(receipt, WriteReceipt::Applied { .. }),
+        "the push lands under its own scope"
+    );
+    assert_eq!(
+        remote.branch_head(&split_repository, "spike/u94/w"),
+        Some("head-1".to_string())
+    );
+    assert_eq!(
+        remote.branch_head(&split_host, "spike/u94/w"),
+        None,
+        "a colliding join must not expose another scope's branch"
+    );
+}
+
 /// Two change requests can share one source branch. Comments and head
 /// reads name the IID they mean; the remote never picks an arbitrary
 /// MR from the branch.
@@ -884,6 +992,30 @@ fn no_operation_beyond_the_four_is_reachable() {
     assert!(
         remote_call_sites(commented_out).is_empty(),
         "a commented-out call is not a call site"
+    );
+    let raw_string = "fn f() { let s = r#\"a \" b\"#; self.remote.head_read(t); }";
+    assert_eq!(
+        remote_call_sites(raw_string),
+        vec!["head_read"],
+        "a quote inside a raw string does not swallow the following call"
+    );
+    let raw_string_hashes = "fn f() { let s = br##\"a \"# b\"##; self.remote.mr_create(a, b); }";
+    assert_eq!(
+        remote_call_sites(raw_string_hashes),
+        vec!["mr_create"],
+        "hashed raw and byte raw strings are lexed as literals"
+    );
+    let quoted_char = "fn f() { let q = '\"'; self.remote.head_read(t); }";
+    assert_eq!(
+        remote_call_sites(quoted_char),
+        vec!["head_read"],
+        "a double quote inside a char literal does not swallow the following call"
+    );
+    let lifetime = "fn f<'a>(x: &'a str) { self.remote.comment_post(x); }";
+    assert_eq!(
+        remote_call_sites(lifetime),
+        vec!["comment_post"],
+        "a lifetime is not mistaken for an unterminated char literal"
     );
     assert_eq!(
         SpikeOpKind::ALL.len(),
