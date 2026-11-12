@@ -1275,15 +1275,16 @@ struct RecordedBinding {
     argv: Vec<String>,
 }
 
-/// One case row of a recorded run: the retained U4.6 record plus the
-/// typed pieces the comparison asserts on.
+/// One case row of a recorded run: the U4.6 record plus the typed
+/// pieces the comparison asserts on. The record is `None` when the
+/// run could not stamp a faithful revision — no stamp, no record.
 struct CaseRow {
     id: &'static str,
     result: String,
     missing: Vec<&'static str>,
     signature: Option<CaseSignature>,
     bindings: Vec<RecordedBinding>,
-    record: serde_json::Value,
+    record: Option<serde_json::Value>,
 }
 
 /// Read back the adapter-neutral Outcome signature and the recorded
@@ -1385,43 +1386,39 @@ fn assert_commit_id(sha: &str, what: &str) {
     );
 }
 
-/// The recorded run stamps a pristine checkout: a cited commit only
-/// describes the exercised tree when no tracked file differs from it,
-/// so a dirty tree fails the run rather than mislabeling the record.
-fn assert_clean_tracked_tree() {
-    let out = std::process::Command::new("git")
+/// Whether a cited commit could describe this checkout: no tracked
+/// file differs from `HEAD`. A git failure — no repository, an
+/// unreadable status — answers `false` rather than panicking, so the
+/// question itself never fails a run: the answer only decides whether
+/// the run may stamp and retain records.
+fn tracked_tree_is_pristine() -> bool {
+    std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("git status on the recorded checkout");
-    assert!(out.status.success(), "git status failed: {out:?}");
-    let dirty = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        dirty.trim().is_empty(),
-        "the record's revisions must describe the exercised tree — \
-         uncommitted tracked changes:\n{dirty}"
-    );
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// The base fork point of a normal checkout: the first merge-base
 /// against a base branch this clone keeps. A checkout that retains no
 /// base history at all — a depth-1 clone or a detached source tree —
 /// cites the deepest commit it does retain, the only fork point it
-/// can prove, rather than a placeholder. A non-git source tree fails
-/// the recorded run.
-fn base_revision() -> String {
+/// can prove, rather than a placeholder. A checkout that retains no
+/// commit history at all (a non-git source tree) yields `None`: the
+/// run then retains no records instead of stamping a guess.
+fn base_revision() -> Option<String> {
     for revs in [
         ["merge-base", "HEAD", "origin/main"],
         ["merge-base", "HEAD", "main"],
         ["merge-base", "HEAD", "origin/HEAD"],
     ] {
         if let Some(sha) = git_stdout(&revs) {
-            return sha;
+            return Some(sha);
         }
     }
     git_stdout(&["rev-list", "--max-parents=0", "HEAD"])
         .and_then(|roots| roots.lines().next().map(str::to_string))
-        .expect("base_revision unavailable: this checkout retains no commit history")
 }
 
 /// The revision pair a CI run stamps, read from the workflow event
@@ -1452,24 +1449,31 @@ fn ci_event_revisions() -> Option<(String, String)> {
     ))
 }
 
-/// The revision pair a recorded run stamps, validated fail-closed.
-/// A CI run cites the workflow event's real head/base commits — the
-/// depth-1 checkout keeps no base history, but the payload does — a
-/// normal checkout stamps `HEAD` and its merge-base, and a checkout
-/// with no resolvable base ref cites the deepest commit it retains.
-/// Either way both values are full commit ids over a pristine tree.
-fn record_revisions() -> (String, String) {
-    assert_clean_tracked_tree();
-    let (tested, base) = ci_event_revisions().unwrap_or_else(|| {
-        (
-            git_stdout(&["rev-parse", "HEAD"])
-                .expect("git rev-parse HEAD — a recorded run requires a git checkout"),
-            base_revision(),
-        )
-    });
+/// The revision pair a recorded run stamps, validated fail-closed —
+/// `None` whenever no trustworthy stamp exists: a tracked tree that
+/// differs from `HEAD`, a checkout git cannot answer, or a missing
+/// base ref. A run without a stamp still executes the suite and every
+/// record-independent assertion, but it builds and retains no
+/// records: a retained record must cite a commit that describes the
+/// exercised tree, so an unstamped run degrades to *no evidence*
+/// rather than to a placeholder. Where a stamp exists: a CI run cites
+/// the workflow event's real head/base commits (its depth-1 checkout
+/// keeps no base history to resolve, but the payload records the
+/// real commits), a normal checkout stamps `HEAD` and its merge-base,
+/// and a checkout with no resolvable base ref cites the deepest
+/// commit it retains. Either way both values are asserted to be full
+/// commit ids over a pristine tracked tree.
+fn record_revisions() -> Option<(String, String)> {
+    if !tracked_tree_is_pristine() {
+        return None;
+    }
+    let (tested, base) = match ci_event_revisions() {
+        Some(pair) => pair,
+        None => (git_stdout(&["rev-parse", "HEAD"])?, base_revision()?),
+    };
     assert_commit_id(&tested, "tested_revision");
     assert_commit_id(&base, "base_revision");
-    (tested, base)
+    Some((tested, base))
 }
 
 /// A retained record in the U4.6 evidence format — the closed field
@@ -1539,12 +1543,13 @@ fn record_without_adapter_fields(record: &serde_json::Value) -> serde_json::Valu
     out
 }
 
-/// Run the identical suite against one bound worker binary and retain
-/// one U4.6-format record per case. The only variable between two
-/// calls is `bin` — the adapter selection the supervisor binds.
+/// Run the identical suite against one bound worker binary, retaining
+/// one U4.6-format record per case when the checkout yields a faithful
+/// revision stamp. The only variable between two calls is `bin` — the
+/// adapter selection the supervisor binds.
 fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
     let declared: BTreeSet<&'static str> = PosixProvider::declares().iter().copied().collect();
-    let (tested, base) = record_revisions();
+    let stamp = record_revisions();
     scenarios()
         .iter()
         .enumerate()
@@ -1562,17 +1567,19 @@ fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
                     missing: missing.clone(),
                     signature: None,
                     bindings: vec![],
-                    record: case_record(
-                        scenario.id,
-                        "skipped",
-                        &tested,
-                        &base,
-                        &[],
-                        vec![format!(
-                            "provider model surface does not declare: {}",
-                            missing.join(", ")
-                        )],
-                    ),
+                    record: stamp.as_ref().map(|(tested, base)| {
+                        case_record(
+                            scenario.id,
+                            "skipped",
+                            tested,
+                            base,
+                            &[],
+                            vec![format!(
+                                "provider model surface does not declare: {}",
+                                missing.join(", ")
+                            )],
+                        )
+                    }),
                 };
             }
             let store = SqliteStore::in_memory(2).unwrap();
@@ -1581,14 +1588,16 @@ fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
                 PosixProvider::make_bound(scenario.shape, &format!("{tag}-{i}"), &cfg, bin);
             (scenario.run)(provider.handle(), &store);
             let (signature, bindings) = collect_case(&store, &provider);
-            let record = case_record(
-                scenario.id,
-                "pass",
-                &tested,
-                &base,
-                &bindings,
-                signature_refs(&signature),
-            );
+            let record = stamp.as_ref().map(|(tested, base)| {
+                case_record(
+                    scenario.id,
+                    "pass",
+                    tested,
+                    base,
+                    &bindings,
+                    signature_refs(&signature),
+                )
+            });
             CaseRow {
                 id: scenario.id,
                 result: "pass".into(),
@@ -1608,21 +1617,42 @@ fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
 /// every other record field, including the full configuration identity
 /// modulo the bound-worker fields, is asserted equal. The twenty
 /// records are persisted under `target/` so the retained evidence can
-/// be re-derived from the run itself.
+/// be re-derived from the run itself — but only when the checkout
+/// yields a faithful revision stamp: a dirty or non-git checkout runs
+/// the identical suite and every record-independent assertion below,
+/// builds no records, and retains none, so the prescribed
+/// `cargo test --workspace` stays runnable mid-edit without ever
+/// misstamping evidence.
 #[test]
 fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
     let reference = run_recorded_suite("u46b-a", &fixture_bin());
     let rerun = run_recorded_suite("u46b-b", &contract_bin());
-    let retained = serde_json::json!({
-        "reference": reference.iter().map(|r| &r.record).collect::<Vec<_>>(),
-        "rerun": rerun.iter().map(|r| &r.record).collect::<Vec<_>>(),
-    });
-    let records = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u4.6b-records.json");
-    std::fs::write(
-        &records,
-        format!("{}\n", serde_json::to_string_pretty(&retained).unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("retain the U4.6 record set at {}: {e}", records.display()));
+    let reference_records: Option<Vec<&serde_json::Value>> =
+        reference.iter().map(|r| r.record.as_ref()).collect();
+    let rerun_records: Option<Vec<&serde_json::Value>> =
+        rerun.iter().map(|r| r.record.as_ref()).collect();
+    match (reference_records, rerun_records) {
+        (Some(reference_records), Some(rerun_records)) => {
+            let retained = serde_json::json!({
+                "reference": reference_records,
+                "rerun": rerun_records,
+            });
+            let records =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u4.6b-records.json");
+            std::fs::write(
+                &records,
+                format!("{}\n", serde_json::to_string_pretty(&retained).unwrap()),
+            )
+            .unwrap_or_else(|e| panic!("retain the U4.6 record set at {}: {e}", records.display()));
+        }
+        (None, None) => {
+            eprintln!(
+                "u4.6b: no faithful revision stamp (dirty or non-git checkout) — \
+                 the suite ran; no records were retained"
+            );
+        }
+        _ => panic!("record retention differs across the two runs"),
+    }
     assert_eq!(reference.len(), rerun.len(), "the identical case table");
     for (a, b) in reference.iter().zip(&rerun) {
         assert_eq!(a.id, b.id, "the identical suite table");
@@ -1633,48 +1663,59 @@ fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
             "{}: identical Outcome under either adapter",
             a.id
         );
-        for key in [
-            "schema_version",
-            "tested_revision",
-            "base_revision",
-            "claim_class",
-            "configuration_identity",
-            "command_scenario",
-            "result",
-            "evidence_refs",
-        ] {
-            assert!(
-                a.record.get(key).is_some() && b.record.get(key).is_some(),
-                "{}: the record carries {key}",
-                a.id
-            );
+        match (&a.record, &b.record) {
+            (Some(ra), Some(rb)) => {
+                for key in [
+                    "schema_version",
+                    "tested_revision",
+                    "base_revision",
+                    "claim_class",
+                    "configuration_identity",
+                    "command_scenario",
+                    "result",
+                    "evidence_refs",
+                ] {
+                    assert!(
+                        ra.get(key).is_some() && rb.get(key).is_some(),
+                        "{}: the record carries {key}",
+                        a.id
+                    );
+                }
+                assert_eq!(ra["claim_class"], "fixture_supported");
+                // Paired records are equal field by field — revisions, claim
+                // class, scenario, result, evidence — and the whole
+                // configuration identity too, once the bound-worker fields are
+                // projected out: adapter identity is the only difference.
+                for key in [
+                    "schema_version",
+                    "tested_revision",
+                    "base_revision",
+                    "claim_class",
+                    "command_scenario",
+                    "result",
+                    "evidence_refs",
+                ] {
+                    assert_eq!(
+                        ra[key], rb[key],
+                        "{}: record field {key} equal across runs",
+                        a.id
+                    );
+                }
+                assert_eq!(
+                    record_without_adapter_fields(ra),
+                    record_without_adapter_fields(rb),
+                    "{}: configuration identity equal modulo adapter identity",
+                    a.id
+                );
+            }
+            (None, None) => {
+                // No faithful stamp on either side: neither run built a
+                // record, so the record fields above have nothing to
+                // compare. The case-table, result, skip-surface and
+                // signature equality above still ran unconditionally.
+            }
+            _ => panic!("{}: record retention differs across runs", a.id),
         }
-        assert_eq!(a.record["claim_class"], "fixture_supported");
-        // Paired records are equal field by field — revisions, claim
-        // class, scenario, result, evidence — and the whole
-        // configuration identity too, once the bound-worker fields are
-        // projected out: adapter identity is the only difference.
-        for key in [
-            "schema_version",
-            "tested_revision",
-            "base_revision",
-            "claim_class",
-            "command_scenario",
-            "result",
-            "evidence_refs",
-        ] {
-            assert_eq!(
-                a.record[key], b.record[key],
-                "{}: record field {key} equal across runs",
-                a.id
-            );
-        }
-        assert_eq!(
-            record_without_adapter_fields(&a.record),
-            record_without_adapter_fields(&b.record),
-            "{}: configuration identity equal modulo adapter identity",
-            a.id
-        );
         match (&a.bindings[..], &b.bindings[..]) {
             ([x], [y]) => assert_bound_adapters_differ(x, y, a.id),
             ([], []) => {}

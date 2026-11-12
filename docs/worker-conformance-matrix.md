@@ -121,7 +121,8 @@ the public Command/Query path — once bound to the reference worker,
 once to the independent contract Worker — and retains one
 [U4.6 record](worker-protocol.md#u46-evidence-record) per case per
 implementation, persisted by the run itself to
-`target/u4.6b-records.json`. The records differ only in adapter
+`target/u4.6b-records.json` when the checkout yields a faithful
+revision stamp. The records differ only in adapter
 identity: every case's Outcome signature — execution states, waiting
 reasons, terminal codes, invocation states and roles, writer-identity
 presence, intent statuses, and spawn-attempt counts — is equal across
@@ -129,12 +130,17 @@ the two runs, as are the paired records' `tested_revision`,
 `base_revision`, `evidence_refs`, and full `configuration_identity`
 once the bound-worker fields are projected out; the skip partition is
 identical (the POSIX model surface is binary-independent). Revision
-stamping is fail-closed: the run requires a pristine tracked tree and
-both revisions as full commit ids (a CI run stamps the workflow
-event's real head/base commits — the depth-1 checkout keeps no base
-history to resolve — and a checkout with no resolvable base ref cites
-the deepest commit it retains), so no record can carry a placeholder
-or describe an uncommitted worktree. `u46b_suite_source_has_no_adapter_name_branch`
+stamping is fail-closed: records are retained only when the run
+stamps a pristine tracked tree with both revisions as full commit ids
+(a CI run stamps the workflow event's real head/base commits — the
+depth-1 checkout keeps no base history to resolve — and a checkout
+with no resolvable base ref cites the deepest commit it retains), so
+no retained record can carry a placeholder or describe an uncommitted
+worktree. A checkout that cannot produce that stamp — uncommitted
+tracked changes, no git history — still runs the identical suite and
+every record-independent assertion, builds no records, and retains
+none, so the prescribed `cargo test --workspace` stays runnable
+mid-edit. `u46b_suite_source_has_no_adapter_name_branch`
 is the named static check: adapter-name literals may appear only
 inside the suite's marked identity boundary and never on a
 conditional, comparison, or assertion line, and the
