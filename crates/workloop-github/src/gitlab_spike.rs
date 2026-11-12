@@ -171,8 +171,11 @@ pub enum HeadTarget {
     /// the reconcile read for an unresolved push.
     Branch { branch: String },
     /// The identity and current head of the change request named by its
-    /// host-scoped IID — reassesses a create/comment receipt and is the
-    /// reconcile read for an unresolved create or comment.
+    /// host-scoped IID — reassesses a comment receipt and is the
+    /// reconcile read for an unresolved comment. Create reconciliation
+    /// never uses this target: a lost create response leaves no IID, so
+    /// only the source branch is readable and the effect stays
+    /// indeterminate.
     Change { change_request: ChangeRequestId },
 }
 

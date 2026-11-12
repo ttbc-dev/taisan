@@ -121,11 +121,86 @@ fn applied_revision(record: &RowRecord) -> &workloop_core::identity::CommitRevis
     }
 }
 
+/// Remove Rust comments while preserving string literals, so a comment
+/// between the receiver and the method cannot hide a call site.
+fn strip_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                out.push(c);
+                while let Some(next) = chars.next() {
+                    out.push(next);
+                    if next == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            out.push(escaped);
+                        }
+                    } else if next == '"' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    if next == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1usize;
+                while let Some(next) = chars.next() {
+                    if next == '/' && chars.peek() == Some(&'*') {
+                        chars.next();
+                        depth += 1;
+                    } else if next == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// If `after` starts with a turbofish (`::<...>`), the index just past
+/// its closing `>`; otherwise `None`.
+fn skip_turbofish(after: &str) -> Option<usize> {
+    if !after.starts_with("::<") {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, c) in after.char_indices().skip(2) {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Every `self.remote.<method>(` call site in `source`, independent of
-/// rustfmt's line breaks: whitespace is normalized away before the call
-/// markers are parsed, and only a method followed by `(` counts.
+/// rustfmt's line breaks: comments are removed, whitespace is normalized
+/// away, and an optional turbofish is skipped before the call markers are
+/// parsed. Only a method followed by `(` counts.
 fn remote_call_sites(source: &str) -> Vec<String> {
-    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let stripped = strip_comments(source);
+    let compact: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
     let marker = "self.remote.";
     let mut sites = Vec::new();
     let mut rest = compact.as_str();
@@ -137,9 +212,15 @@ fn remote_call_sites(source: &str) -> Vec<String> {
         let end = after
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(after.len());
-        let method = &after[..end];
-        if after[end..].starts_with('(') {
-            sites.push(method.to_string());
+        if end > 0 {
+            let method = &after[..end];
+            let mut tail = &after[end..];
+            if let Some(skip) = skip_turbofish(tail) {
+                tail = &tail[skip..];
+            }
+            if tail.starts_with('(') {
+                sites.push(method.to_string());
+            }
         }
         rest = &after[end.max(1)..];
     }
@@ -771,6 +852,23 @@ fn no_operation_beyond_the_four_is_reachable() {
         remote_call_sites(outside),
         vec!["approve_change"],
         "an operation outside the four is counted rather than skipped"
+    );
+    let commented = "fn f() { self.remote /*c*/ .approve_change(x); }";
+    assert_eq!(
+        remote_call_sites(commented),
+        vec!["approve_change"],
+        "a comment between receiver and method does not hide a call"
+    );
+    let turbofish = "fn f() { self.remote.approve_change::<u8>(x); }";
+    assert_eq!(
+        remote_call_sites(turbofish),
+        vec!["approve_change"],
+        "a turbofish does not hide a call"
+    );
+    let commented_out = "fn f() { /* self.remote.approve_change(x); */ }";
+    assert!(
+        remote_call_sites(commented_out).is_empty(),
+        "a commented-out call is not a call site"
     );
     assert_eq!(
         SpikeOpKind::ALL.len(),
