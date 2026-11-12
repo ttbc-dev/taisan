@@ -2560,6 +2560,24 @@ fn assess(
                     )?;
                 }
             }
+            if matches!(status, HostActionStatus::Unsupported { .. })
+                && execution.state == ExecutionState::Waiting
+            {
+                // The operation is outside the host's capability map:
+                // terminal and explicit, never a transport failure and
+                // never retried. Pause for an operator decision instead
+                // of wedging on an effect that can never land or
+                // re-issuing the intent without bound.
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "unsupported_effect",
+                    "the stage effect is outside the host's capability map; \
+                     human action required",
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+            }
             // A terminal settle that deferred on this outstanding effect
             // may complete now — but only when every writer is already
             // resolved, so the stop proof is on record (the same rule
@@ -3419,59 +3437,87 @@ fn maybe_publish(
         // when spent). Pending/unknown pushes are already caught by the
         // outstanding check above; an applied push for a stale produced
         // revision is exactly the republish case — fall through and
-        // record a fresh intent.
+        // record a fresh intent. An unsupported push is terminal: its
+        // receipt pauses the execution for an operator decision, and the
+        // intent is never re-issued.
         if let Some(latest_push) = work_intents
             .iter()
             .rfind(|i| matches!(i.action, HostAction::PushRef { .. }))
-            && let HostActionStatus::Failed { .. } = latest_push.status
         {
-            let usage = tx
-                .work_usage(&work.id)?
-                .unwrap_or_else(|| WorkUsage::new(&work.id));
-            if usage.transport_retries_used > work.policy.transport_max_retries {
-                return Ok(());
+            match latest_push.status {
+                HostActionStatus::Failed { .. } => {
+                    let usage = tx
+                        .work_usage(&work.id)?
+                        .unwrap_or_else(|| WorkUsage::new(&work.id));
+                    if usage.transport_retries_used > work.policy.transport_max_retries {
+                        return Ok(());
+                    }
+                }
+                HostActionStatus::Unsupported { .. } => return Ok(()),
+                _ => {}
             }
         }
         let produced =
             CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
         // The guard's expected prior is the freshest remote position
-        // this installation observed for the branch: the last recorded
-        // branch-state read (e.g. the fresh position a refusal surfaced)
-        // wins over the last applied push's read-back revision, and a
-        // first publish expects an absent ref.
-        let observed_position = tx
-            .observations_for_work(&work.id)?
+        // this installation observed for the branch, in observation
+        // order: a branch-state read — including an explicit absent,
+        // which re-arms create — wins over the last applied push's
+        // read-back only when it is the newer record, and a first
+        // publish expects an absent ref. A pre-push prior read recorded
+        // before the push's applied receipt never outranks the head
+        // that receipt observed.
+        enum BranchPosition {
+            Unknown,
+            Absent,
+            At(CommitRevision),
+        }
+        let applied_pushes: std::collections::BTreeSet<&str> = work_intents
             .iter()
-            .filter_map(|o| match &o.fact {
+            .filter(|i| i.status == HostActionStatus::Applied)
+            .map(|i| i.action_id.as_str())
+            .collect();
+        let mut position = BranchPosition::Unknown;
+        for o in tx.observations_for_work(&work.id)? {
+            match &o.fact {
                 ObservationFact::BranchState {
                     repository,
                     branch: state_branch,
-                    state: BranchState::At { revision },
+                    state,
                 } if state_branch == &branch && repository == &work.binding.repository => {
-                    Some(revision.clone())
+                    position = match state {
+                        BranchState::At { revision } => BranchPosition::At(revision.clone()),
+                        BranchState::Absent => BranchPosition::Absent,
+                    };
                 }
-                _ => None,
-            })
-            .next_back();
-        let expected_prior = observed_position.or_else(|| {
-            work_intents
-                .iter()
-                .filter(|i| i.status == HostActionStatus::Applied)
-                .flat_map(|i| i.effects.iter())
-                .filter_map(|e| match e {
-                    NormalizedEffectFact::RefPublished {
-                        repository,
-                        branch: ref_branch,
-                        observed,
-                        ..
-                    } if ref_branch == &branch && repository == &work.binding.repository => {
-                        Some(observed.clone())
+                ObservationFact::HostActionResult {
+                    action_id,
+                    status: HostActionStatus::Applied,
+                    effects,
+                    ..
+                } if applied_pushes.contains(action_id.as_str()) => {
+                    for e in effects {
+                        if let NormalizedEffectFact::RefPublished {
+                            repository,
+                            branch: ref_branch,
+                            observed,
+                            ..
+                        } = e
+                            && ref_branch == &branch
+                            && repository == &work.binding.repository
+                        {
+                            position = BranchPosition::At(observed.clone());
+                        }
                     }
-                    _ => None,
-                })
-                .next_back()
-        });
+                }
+                _ => {}
+            }
+        }
+        let expected_prior = match position {
+            BranchPosition::At(revision) => Some(revision),
+            BranchPosition::Absent | BranchPosition::Unknown => None,
+        };
         return record_intent(
             tx,
             &work,
@@ -3494,9 +3540,20 @@ fn maybe_publish(
     }
     if work_intents.iter().any(|i| {
         matches!(i.action, HostAction::OpenChangeRequest { .. })
-            && !matches!(i.status, HostActionStatus::Failed { .. })
+            && !matches!(
+                i.status,
+                HostActionStatus::Failed { .. } | HostActionStatus::Unsupported { .. }
+            )
     }) {
         // A pending/unknown open intent is outstanding; wait for its receipt.
+        return Ok(());
+    }
+    if work_intents.iter().any(|i| {
+        matches!(i.action, HostAction::OpenChangeRequest { .. })
+            && matches!(i.status, HostActionStatus::Unsupported { .. })
+    }) {
+        // An unsupported open is terminal — its receipt pauses the
+        // execution for an operator decision; never re-issue it.
         return Ok(());
     }
     let spec = tx

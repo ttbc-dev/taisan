@@ -231,14 +231,21 @@ fn push_landed_for(ctx: &Ctx, work_id: &WorkId, branch: &str) -> bool {
 
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
-/// authorization is the credential's real `permissions` answer.
+/// authorization is the credential's real `permissions` answer. An
+/// operation `attempt` reports `Unsupported` for is denied support
+/// here — declaring it supported would authorize intents the bridge
+/// can never execute.
 fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     let perms = gh_json(&["api", &format!("repos/{}", ctx.repo_display)])?;
     let write = perms["permissions"]["push"].as_bool() == Some(true);
     let read = perms["permissions"]["pull"].as_bool() == Some(true);
-    let entry = |capability: HostCapability, granted: bool| CapabilityEntry {
+    let entry = |capability: HostCapability, supported: bool, granted: bool| CapabilityEntry {
         capability,
-        support: CapabilityState::Supported,
+        support: if supported {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Denied
+        },
         authorization: if granted {
             CapabilityState::Authorized
         } else {
@@ -248,16 +255,19 @@ fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     Ok(ObservationFact::CapabilityReport {
         host: ctx.config.host.repository.host.clone(),
         capabilities: vec![
-            entry(HostCapability::RepositoryRead, read),
-            entry(HostCapability::BranchRead, read),
-            entry(HostCapability::ChangeRequestRead, read),
-            entry(HostCapability::IssueRead, read),
-            entry(HostCapability::ChecksRead, read),
-            entry(HostCapability::ReviewFindingsRead, read),
-            entry(HostCapability::PushRef, write),
-            entry(HostCapability::ChangeRequestCreate, write),
-            entry(HostCapability::ChangeRequestUpdate, write),
-            entry(HostCapability::CommentWrite, write),
+            entry(HostCapability::RepositoryRead, true, read),
+            entry(HostCapability::BranchRead, true, read),
+            entry(HostCapability::ChangeRequestRead, true, read),
+            entry(HostCapability::IssueRead, true, read),
+            entry(HostCapability::ChecksRead, true, read),
+            entry(HostCapability::ReviewFindingsRead, true, read),
+            entry(HostCapability::PushRef, true, write),
+            entry(HostCapability::ChangeRequestCreate, true, write),
+            // Head-bound and discussion writes are outside the bridge's
+            // implementation surface (see `attempt`): support is denied
+            // even when the credential itself is authorized.
+            entry(HostCapability::ChangeRequestUpdate, false, write),
+            entry(HostCapability::CommentWrite, false, write),
         ],
     })
 }
@@ -1224,6 +1234,7 @@ mod tests {
             action: HostAction::PushRef {
                 branch: branch.into(),
                 produced,
+                expected_prior: None,
             },
             payload_digest: "digest".into(),
             status,

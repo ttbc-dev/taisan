@@ -473,12 +473,16 @@ impl DiffSnapshot {
 
     /// The snapshot's stable identity: a digest over the exact triple,
     /// computed from the immutable fields — never a stored, driftable
-    /// value.
+    /// value. `display_number` is presentation metadata and takes no
+    /// part in the digest, matching the ref's identity semantics.
     pub fn snapshot_id(&self) -> String {
         crate::domain::sha256_hex(
             "diff-snapshot-v1",
             &crate::domain::canonical_json(&serde_json::json!({
-                "change": self.change,
+                "change": {
+                    "repository": self.change.repository,
+                    "change_request": self.change.change_request,
+                },
                 "base": self.base,
                 "head": self.head,
             })),

@@ -333,6 +333,15 @@ fn diff_snapshot_identity_is_stable_per_pair() {
     assert_ne!(snapshot.snapshot_id(), moved.snapshot_id());
     assert_eq!(snapshot, same);
 
+    // `display_number` is presentation metadata: the same triple under
+    // a different display number is the identical snapshot — equal
+    // under the ref's identity and identical under `snapshot_id`.
+    let mut relabeled = change();
+    relabeled.display_number = Some(99);
+    let display = DiffSnapshot::new(relabeled, rev("base-1"), rev("head-3"));
+    assert_eq!(snapshot, display);
+    assert_eq!(snapshot.snapshot_id(), display.snapshot_id());
+
     // Two reads of the same pair record the identical snapshot identity.
     fixture.seed_objects(&["base-1", "head-3"]);
     let subject = ReadSubject::Diff {

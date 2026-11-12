@@ -68,6 +68,10 @@ trait OutboxHost {
     fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String>;
     fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str);
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation);
+    /// Seed one discussion thread on a change for fixtures that declare
+    /// thread operations. Fixtures that do not declare them leave the
+    /// default — the covered scenario never runs there.
+    fn seed_thread(&mut self, _change: &ChangeRequestRef, _thread_id: &str) {}
     /// Seed one authoritative issue read for fixtures that declare
     /// `issue_read`. Fixtures that do not declare it leave the default.
     fn seed_issue(&mut self, _issue: &IssueRef, _source_revision: &str, _content_digest: &str) {}
@@ -98,6 +102,9 @@ impl OutboxHost for FixtureGithub {
     }
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
         self.emit(store, config, observation, NOW).unwrap();
+    }
+    fn seed_thread(&mut self, change: &ChangeRequestRef, thread_id: &str) {
+        self.add_thread(change, thread_id);
     }
     fn seed_issue(&mut self, issue: &IssueRef, source_revision: &str, content_digest: &str) {
         self.set_issue(issue, source_revision, content_digest, IssueState::Open);
@@ -333,6 +340,7 @@ fn unsupported_operation_action(capability: &str) -> Option<HostAction> {
         "push_ref" => Some(HostAction::PushRef {
             branch: "conformance/unsupported".into(),
             produced: rev("conformance-head"),
+            expected_prior: None,
         }),
         "change_request_create" => Some(HostAction::OpenChangeRequest {
             source_branch: "conformance/unsupported".into(),
@@ -352,6 +360,25 @@ fn unsupported_operation_action(capability: &str) -> Option<HostAction> {
             marker: "conformance".into(),
             body: "unsupported".into(),
         }),
+        "review_feedback" => Some(HostAction::PublishReviewFeedback {
+            change,
+            head: rev("conformance-head"),
+            body: "unsupported".into(),
+        }),
+        "thread_reply" => Some(HostAction::ReplyToThread {
+            change,
+            thread_id: "conformance-thread".into(),
+            body: "unsupported".into(),
+        }),
+        "thread_resolve" => Some(HostAction::ResolveThread {
+            change,
+            thread_id: "conformance-thread".into(),
+            head: rev("conformance-head"),
+        }),
+        "mark_ready" | "ready" => Some(HostAction::MarkReady {
+            change,
+            expected_head: rev("conformance-head"),
+        }),
         _ => None,
     }
 }
@@ -362,6 +389,10 @@ fn unsupported_operation_label(capability: &str) -> &str {
         "change_request_create" => "open_change_request",
         "change_request_update" => "update_change_request",
         "comment_write" | "comment_create" => "post_comment",
+        "review_feedback" => "publish_review_feedback",
+        "thread_reply" => "thread_reply",
+        "thread_resolve" => "resolve_thread",
+        "mark_ready" | "ready" => "mark_ready",
         other => other,
     }
 }
@@ -373,12 +404,8 @@ fn unsupported_operation_label(capability: &str) -> &str {
 fn absent_operation_name(capability: &str) -> Option<&'static str> {
     match capability {
         "inline_comment" => Some("post_inline_comment"),
-        "review_feedback" => Some("publish_review_feedback"),
         "approve" => Some("approve_change"),
         "request_changes" => Some("request_changes"),
-        "thread_reply" => Some("thread_reply"),
-        "thread_resolve" => Some("resolve_thread"),
-        "mark_ready" | "ready" => Some("mark_ready"),
         _ => None,
     }
 }
@@ -446,11 +473,11 @@ fn assert_unsupported_capability(
         let writes_before = fixture.applied().len();
         fixture.apply(store, config);
         match intent(store, &action_id).status {
-            HostActionStatus::Failed { ref reason } => {
+            HostActionStatus::Unsupported { ref reason } => {
                 let operation = unsupported_operation_label(capability);
                 assert!(
                     reason.contains("unsupported") && reason.contains(operation),
-                    "undeclared {capability} must fail explicitly as {operation}: {reason}"
+                    "undeclared {capability} must refuse explicitly as {operation}: {reason}"
                 );
             }
             other => panic!("undeclared {capability} must not be applied or dropped: {other:?}"),
@@ -1193,6 +1220,218 @@ fn unsupported_capability_stays_explicit(
     }
 }
 
+/// Push and open on `repo()`, returning the receipt's recorded change
+/// and observed head — the starting point for head-bound and
+/// discussion writes. The change identity is whatever the host issued,
+/// never a constructed guess.
+fn opened_change(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    key: &str,
+) -> (WorkId, ChangeRequestRef, CommitRevision) {
+    let (work_id, _eid) = submit(store, config, key);
+    insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        push_ref(fixture, &repo(), &format!("work/{key}"), "head-1"),
+    );
+    let open_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::OpenChangeRequest {
+            source_branch: format!("work/{key}"),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+    );
+    fixture.apply(store, config);
+    match &intent(store, &open_id).effects[..] {
+        [NormalizedEffectFact::ChangeOpened { change, head, .. }] => {
+            (work_id, change.clone(), head.clone())
+        }
+        other => panic!("open receipt missing ChangeOpened: {other:?}"),
+    }
+}
+
+/// HC-OPT-02: marking ready is a head-bound write whose applied
+/// receipt reports the ready state and head a fresh read observes.
+fn ready_marking_applies_with_fresh_readback(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+) {
+    let (work_id, change, head) = opened_change(fixture, store, config, "hc-opt-2");
+    let writes_before = fixture.applied().len();
+    let ready_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::MarkReady {
+            change: change.clone(),
+            expected_head: head.clone(),
+        },
+    );
+    fixture.apply(store, config);
+    let ready = intent(store, &ready_id);
+    match &ready.effects[..] {
+        [
+            NormalizedEffectFact::ReadyObserved {
+                change: seen,
+                head: observed,
+            },
+        ] => {
+            assert_eq!(ready.status, HostActionStatus::Applied);
+            assert_eq!(*seen, change);
+            assert_eq!(*observed, head);
+        }
+        other => panic!("ready receipt missing ReadyObserved: {other:?}"),
+    }
+    assert!(
+        fixture.applied().len() > writes_before,
+        "the ready write reached the remote"
+    );
+}
+
+/// HC-OPT-05: a head-bound review feedback write applies with a
+/// read-back receipt citing the remote-issued review identity.
+fn review_feedback_applies_with_readback(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+) {
+    let (work_id, change, head) = opened_change(fixture, store, config, "hc-opt-5");
+    let writes_before = fixture.applied().len();
+    let review_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::PublishReviewFeedback {
+            change: change.clone(),
+            head: head.clone(),
+            body: "feedback".into(),
+        },
+    );
+    fixture.apply(store, config);
+    let review = intent(store, &review_id);
+    match &review.effects[..] {
+        [
+            NormalizedEffectFact::ReviewPublished {
+                change: seen,
+                review_id: rid,
+                head: observed,
+                ..
+            },
+        ] => {
+            assert_eq!(review.status, HostActionStatus::Applied);
+            assert_eq!(*seen, change);
+            assert!(
+                !rid.is_empty(),
+                "the receipt cites a remote-issued review id"
+            );
+            assert_eq!(*observed, head);
+        }
+        other => panic!("review receipt missing ReviewPublished: {other:?}"),
+    }
+    assert!(
+        fixture.applied().len() > writes_before,
+        "the review write reached the remote"
+    );
+}
+
+/// HC-OPT-06: a thread reply preserves the exact thread identity and
+/// lands as a read-back receipt citing the remote-issued reply id.
+fn thread_reply_applies_with_readback(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+) {
+    let (work_id, change, _head) = opened_change(fixture, store, config, "hc-opt-6");
+    fixture.seed_thread(&change, "th-1");
+    let writes_before = fixture.applied().len();
+    let reply_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::ReplyToThread {
+            change: change.clone(),
+            thread_id: "th-1".into(),
+            body: "answered".into(),
+        },
+    );
+    fixture.apply(store, config);
+    let reply = intent(store, &reply_id);
+    match &reply.effects[..] {
+        [
+            NormalizedEffectFact::ReplyPosted {
+                change: seen,
+                thread_id,
+                reply_id: rid,
+                ..
+            },
+        ] => {
+            assert_eq!(reply.status, HostActionStatus::Applied);
+            assert_eq!(*seen, change);
+            assert_eq!(thread_id, "th-1");
+            assert!(
+                !rid.is_empty(),
+                "the receipt cites a remote-issued reply id"
+            );
+        }
+        other => panic!("reply receipt missing ReplyPosted: {other:?}"),
+    }
+    assert!(
+        fixture.applied().len() > writes_before,
+        "the reply write reached the remote"
+    );
+}
+
+/// HC-OPT-07: resolving a thread is head-bound — the applied receipt
+/// reports the resolved state and the head a fresh read observes.
+fn thread_resolve_applies_with_readback(
+    fixture: &mut dyn OutboxHost,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+) {
+    let (work_id, change, head) = opened_change(fixture, store, config, "hc-opt-7");
+    fixture.seed_thread(&change, "th-1");
+    let writes_before = fixture.applied().len();
+    let resolve_id = insert_intent(
+        store,
+        &work_id,
+        &repo(),
+        HostAction::ResolveThread {
+            change: change.clone(),
+            thread_id: "th-1".into(),
+            head: head.clone(),
+        },
+    );
+    fixture.apply(store, config);
+    let resolve = intent(store, &resolve_id);
+    match &resolve.effects[..] {
+        [
+            NormalizedEffectFact::ThreadResolved {
+                change: seen,
+                thread_id,
+                target,
+            },
+        ] => {
+            assert_eq!(resolve.status, HostActionStatus::Applied);
+            assert_eq!(*seen, change);
+            assert_eq!(thread_id, "th-1");
+            assert_eq!(target.head, head);
+        }
+        other => panic!("resolve receipt missing ThreadResolved: {other:?}"),
+    }
+    assert!(
+        fixture.applied().len() > writes_before,
+        "the resolve write reached the remote"
+    );
+}
+
 /// The shared suite, parameterized only over the fixture and its
 /// declared capability set. Baseline scenarios run wherever their
 /// requirements are declared.
@@ -1259,9 +1498,9 @@ fn scenarios() -> Vec<Scenario> {
             run: declared_capability_without_operation,
         },
         Scenario {
-            id: "HC-OPT-02 ready marking stays explicitly unsupported",
-            requires: &["mark_ready"],
-            run: declared_capability_without_operation,
+            id: "HC-OPT-02 ready marking applies with a fresh read-back",
+            requires: &["push_ref", "change_request_create", "mark_ready"],
+            run: ready_marking_applies_with_fresh_readback,
         },
         Scenario {
             id: "HC-OPT-03 request-changes review write stays explicitly unsupported",
@@ -1274,19 +1513,19 @@ fn scenarios() -> Vec<Scenario> {
             run: declared_capability_without_operation,
         },
         Scenario {
-            id: "HC-OPT-05 review feedback stays explicitly unsupported",
-            requires: &["review_feedback"],
-            run: declared_capability_without_operation,
+            id: "HC-OPT-05 review feedback applies with a read-back receipt",
+            requires: &["push_ref", "change_request_create", "review_feedback"],
+            run: review_feedback_applies_with_readback,
         },
         Scenario {
-            id: "HC-OPT-06 thread reply stays explicitly unsupported",
-            requires: &["thread_reply"],
-            run: declared_capability_without_operation,
+            id: "HC-OPT-06 thread reply applies with a read-back receipt",
+            requires: &["push_ref", "change_request_create", "thread_reply"],
+            run: thread_reply_applies_with_readback,
         },
         Scenario {
-            id: "HC-OPT-07 thread resolve stays explicitly unsupported",
-            requires: &["thread_resolve"],
-            run: declared_capability_without_operation,
+            id: "HC-OPT-07 thread resolve applies with a read-back receipt",
+            requires: &["push_ref", "change_request_create", "thread_resolve"],
+            run: thread_resolve_applies_with_readback,
         },
     ]
 }
@@ -1404,17 +1643,23 @@ fn conformance_matrix_runs_every_row_against_every_registered_fixture() {
 fn fixture_github_covers_the_full_baseline() {
     let mut fixture = FixtureGithub::new();
     let results = run_suite(&mut fixture);
+    // Only the optional capabilities whose operations are absent from
+    // the `HostAction` vocabulary stay explicit-unsupported; the
+    // declared discussion and ready writes run their covered rows.
     for result in &results {
-        if result.row.starts_with("HC-OPT-") {
+        if result.row.starts_with("HC-OPT-01")
+            || result.row.starts_with("HC-OPT-03")
+            || result.row.starts_with("HC-OPT-04")
+        {
             assert!(
                 matches!(result.outcome, MatrixOutcome::Unsupported { .. }),
-                "optional row is explicit-unsupported: {result:?}"
+                "operationless optional row is explicit-unsupported: {result:?}"
             );
         } else {
             assert_eq!(
                 result.outcome,
                 MatrixOutcome::Covered,
-                "baseline row is covered: {result:?}"
+                "declared row is covered: {result:?}"
             );
         }
     }
@@ -1440,7 +1685,7 @@ fn sparse_host_runs_the_same_suite_within_its_declared_set() {
                 "approve"
             ),
             (
-                "HC-OPT-02 ready marking stays explicitly unsupported",
+                "HC-OPT-02 ready marking applies with a fresh read-back",
                 "mark_ready"
             ),
             (
@@ -1452,15 +1697,15 @@ fn sparse_host_runs_the_same_suite_within_its_declared_set() {
                 "inline_comment"
             ),
             (
-                "HC-OPT-05 review feedback stays explicitly unsupported",
+                "HC-OPT-05 review feedback applies with a read-back receipt",
                 "review_feedback"
             ),
             (
-                "HC-OPT-06 thread reply stays explicitly unsupported",
+                "HC-OPT-06 thread reply applies with a read-back receipt",
                 "thread_reply"
             ),
             (
-                "HC-OPT-07 thread resolve stays explicitly unsupported",
+                "HC-OPT-07 thread resolve applies with a read-back receipt",
                 "thread_resolve"
             ),
         ]
@@ -1906,18 +2151,20 @@ fn gitlab_fixture_undeclared_issue_read_rejects_source_bound_work() {
     }
 }
 
-/// Approval and readiness stay outside the *write* vocabulary: their
-/// capability names exist (a fixture may declare them for read-side
-/// use), but no `HostAction` variant carries an approval, readiness, or
-/// thread write, so an applied receipt for one is not constructible —
-/// the unsupported state stays explicit at the type level on every
-/// conforming fixture.
+/// Decision and inline-position writes stay outside the *write*
+/// vocabulary: their capability names exist (a fixture may declare
+/// them for read-side use), but no `HostAction` variant carries an
+/// approval, change-request, or inline-comment write, so an applied
+/// receipt for one is not constructible — the unsupported state stays
+/// explicit at the type level on every conforming fixture. Head-bound
+/// discussion and ready writes are executable operations and are
+/// covered by the `HC-OPT-*` rows instead.
 #[test]
-fn approval_and_ready_stay_explicitly_unsupported() {
+fn decision_writes_stay_explicitly_unsupported() {
     for action in [
         serde_json::json!({ "action": "approve_change" }),
-        serde_json::json!({ "action": "mark_ready" }),
-        serde_json::json!({ "action": "resolve_thread" }),
+        serde_json::json!({ "action": "request_changes" }),
+        serde_json::json!({ "action": "post_inline_comment" }),
     ] {
         assert!(
             serde_json::from_value::<HostAction>(action.clone()).is_err(),
