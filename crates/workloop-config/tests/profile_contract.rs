@@ -51,6 +51,7 @@ credential_ref = "env:TAISAN_GH_TOKEN"
 
 [worker]
 argv = ["taisan-worker-shim", "--runtime", "claude-code-cli"]
+isolation_profile = "taisan-reference-v0.1"  # approved isolation profile; unknown names refuse at load
 runtime_version = ">=2.0.0"           # pinned to declared range, verified at preflight
 model = "claude-sonnet-4-6"           # pinned at load; re-checked after dispatch
 max_turns = 200
@@ -1103,4 +1104,34 @@ fn root_separation_refuses_nesting_violations() {
     // Relative inputs are refused rather than resolved against cwd.
     let err = validate_root_separation(Path::new("config.toml"), state, &workspace).unwrap_err();
     assert!(err.contains("absolute"), "expected absolute error: {err}");
+}
+
+/// The named isolation profile resolves against the closed approved
+/// registry at load (U2.3): approved ids pass validation, an unknown
+/// name is refused naming the key — a misspelled profile must never
+/// degrade into an unprofiled launch.
+#[test]
+fn worker_isolation_profile_resolves_against_the_approved_registry() {
+    for approved in ["taisan-reference-v0.1", "fixture-worker-v0.1"] {
+        let text = format!(
+            "{}\n[worker]\nisolation_profile = \"{approved}\"\n",
+            base_profile()
+        );
+        let profile = parse_profile(&text)
+            .unwrap_or_else(|e| panic!("approved profile '{approved}' must load: {e}"));
+        assert_eq!(profile.worker.isolation_profile.as_deref(), Some(approved));
+    }
+
+    let text = format!(
+        "{}\n[worker]\nisolation_profile = \"made-up\"\n",
+        base_profile()
+    );
+    let err = parse_profile(&text).unwrap_err();
+    assert!(
+        err.contains("worker.isolation_profile") && err.contains("not an approved profile"),
+        "expected the registry refusal: {err}"
+    );
+    // Absent names the default — no key, no override.
+    let profile = parse_profile(&base_profile()).unwrap();
+    assert!(profile.worker.isolation_profile.is_none());
 }

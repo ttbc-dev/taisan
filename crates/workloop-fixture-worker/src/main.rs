@@ -14,7 +14,7 @@ use std::time::Duration;
 const USAGE: &str = "usage: workloop-fixture-worker <mode> [--interval-ms <n>] \
     [--file <name>] [--runtime-version <v>] [--adapter-version <v>]\nmodes: \
     clean-exit | exit-no-artifact | hang | setsid-escape | orphan-writer | \
-    zombie | path-reopen | makedirs-writer | describe\ninternal: \
+    zombie | path-reopen | makedirs-writer | describe | env-report\ninternal: \
     escaped-writer | exit-now";
 
 struct Args {
@@ -183,6 +183,18 @@ fn main() {
             }
         }
         "exit-now" => std::process::exit(0),
+        // Dump the environment this process was launched under into
+        // `env.json` in the workspace — the contract suite's audit of
+        // what the launch environment actually contained.
+        "env-report" => {
+            let vars: serde_json::Map<String, serde_json::Value> = std::env::vars()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            write_artifact(
+                &ws.join(&args.file),
+                &serde_json::json!({"vars": vars}).to_string(),
+            );
+        }
         // Effect-free capability declaration. One adapter identity may be
         // probed with different runtime versions to prove that a version
         // change is a configuration repair rather than a silent upgrade.

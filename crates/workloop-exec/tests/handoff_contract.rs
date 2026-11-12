@@ -13,7 +13,7 @@ use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, Comman
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{IssueState, Observation, ObservationFact};
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome};
+use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, WorkerEnv};
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
@@ -693,7 +693,11 @@ fn only_a_proven_dead_invocation_exports() {
     // A live recorded writer blocks export even when the Invocation is
     // recorded `Done` (an unverified done claim resolves it the same).
     let live_identity = port
-        .spawn(&[fixture_bin(), "hang".into()], &ws_dir)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &ws_dir,
+            &WorkerEnv::default(),
+        )
         .expect("spawn live writer");
     let mut live = done_invocation(&e, "inv-live");
     live.process_identity = Some(live_identity.clone());

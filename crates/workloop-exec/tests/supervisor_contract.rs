@@ -11,7 +11,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, StopReceipt, WorkerEnv,
 };
 use workloop_core::projection::{self, WriterState};
 use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
@@ -243,7 +243,11 @@ fn spawn_records_identity_in_own_process_group() {
     let root = tmp_root("spawn");
     let port = PosixProcessControl;
     let identity = port
-        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     assert_eq!(identity.pgid, Some(identity.pid));
     assert!(!identity.started_at.is_empty());
@@ -259,7 +263,11 @@ fn signal_reverified_never_hits_a_reused_pid() {
     let root = tmp_root("reverify");
     let port = PosixProcessControl;
     let identity = port
-        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     // Corrupt the recorded verifier: a stale identity must not be signaled.
     let stale = ProcessIdentity {
@@ -290,7 +298,11 @@ fn zombie_counts_as_stopped() {
     let root = tmp_root("zombie");
     let port = PosixProcessControl;
     let leader = port
-        .spawn(&[fixture_bin(), "zombie".into()], &root)
+        .spawn(
+            &[fixture_bin(), "zombie".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     // The fixture holds an unreaped child; find it via the snapshot.
     wait_for(
@@ -319,7 +331,11 @@ fn reaped_identity_inspects_stopped_and_signals_already_gone() {
     let root = tmp_root("reaped");
     let port = PosixProcessControl;
     let identity = port
-        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     port.signal_verified(&identity, libc::SIGKILL);
     wait_for(
@@ -364,6 +380,7 @@ fn setsid_escapee_is_in_the_snapshot_and_signaled() {
                 "50".into(),
             ],
             &root,
+            &WorkerEnv::default(),
         )
         .expect("spawn");
     wait_for(
@@ -400,7 +417,11 @@ fn persist_failure_sends_no_signal() {
         config(),
     );
     let leader = port
-        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     let invocation = Invocation {
         id: InvocationId("inv-test".into()),
@@ -644,7 +665,11 @@ fn live_process_is_rereported_running_after_a_lost_running_observation() {
     let workspace = sup.workspace_of(&w);
     std::fs::create_dir_all(&workspace).unwrap();
     let identity = port
-        .spawn(&[fixture_bin(), "hang".into()], &workspace)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &workspace,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     store
         .transact(|tx| {
@@ -712,7 +737,11 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
     let workspace = sup.workspace_of(&w);
     std::fs::create_dir_all(&workspace).unwrap();
     let identity = port
-        .spawn(&[fixture_bin(), "clean-exit".into()], &workspace)
+        .spawn(
+            &[fixture_bin(), "clean-exit".into()],
+            &workspace,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     wait_for(
         || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
@@ -853,11 +882,16 @@ fn cancel_on_running_reaches_cancelled_only_after_stop_proof() {
 #[test]
 fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
     use std::path::Path;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     struct LiveTree(Vec<ProcessIdentity>);
     impl ProcessControlPort for LiveTree {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn in the poll path")
         }
         // The escapee is absent: it reparented out of the leader's ppid
@@ -884,6 +918,7 @@ fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -961,14 +996,19 @@ fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
 fn fresh_stop_snapshot_is_proven_before_settling() {
     use std::path::Path;
     use std::sync::Mutex;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     struct FreshSnapshotEscapee {
         escapee: ProcessIdentity,
         inspected: Mutex<BTreeSet<i32>>,
     }
     impl ProcessControlPort for FreshSnapshotEscapee {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn in the stop path")
         }
         // The escapee is still a live child at stop time: the stop
@@ -1004,6 +1044,7 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -1089,14 +1130,19 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
 fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
     use std::path::Path;
     use std::sync::Mutex;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     struct IntentEscapee {
         escapee: ProcessIdentity,
         signaled: Mutex<Vec<i32>>,
     }
     impl ProcessControlPort for IntentEscapee {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn in the poll path")
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -1131,6 +1177,7 @@ fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -1837,14 +1884,19 @@ fn failed_finish_reports_are_replayed_after_restart() {
 fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
     use std::cell::Cell;
     use std::path::Path;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     struct UnverifiedLeader {
         identity: ProcessIdentity,
         condition: &'static str,
     }
     impl ProcessControlPort for UnverifiedLeader {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             unreachable!()
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -1884,6 +1936,7 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -1938,11 +1991,16 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
 #[test]
 fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
     use std::path::Path;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     struct SignalPort(SignalOutcome);
     impl ProcessControlPort for SignalPort {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             unreachable!()
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -1967,6 +2025,7 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -2133,7 +2192,11 @@ fn stop_intent_is_durable_before_the_first_signal() {
         config(),
     );
     let leader = port
-        .spawn(&[fixture_bin(), "hang".into()], &root)
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
         .expect("spawn");
     let invocation = Invocation {
         id: InvocationId("inv-order".into()),
@@ -2874,7 +2937,7 @@ fn a_mid_stop_crash_holds_the_slot_until_stop_and_effects_reconcile() {
 fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
     use std::cell::Cell;
     use std::path::Path;
-    use workloop_core::ports::SpawnError;
+    use workloop_core::ports::{SpawnError, WorkerEnv};
 
     // A port whose liveness read can be failed on demand: spawn records
     // an identity, then `inspect` reports `unknown` until reconciled.
@@ -2883,7 +2946,12 @@ fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
         identity: ProcessIdentity,
     }
     impl ProcessControlPort for FlakyPort {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             Ok(self.identity.clone())
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -2915,6 +2983,7 @@ fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             Ok(ProbeOutcome::Exited {

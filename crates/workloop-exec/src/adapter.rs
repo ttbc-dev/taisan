@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use workloop_core::domain::{WorkerAdapterBinding, canonical_json, sha256_hex};
 use workloop_core::identity::AdapterId;
-use workloop_core::ports::{ProbeOutcome, ProcessControlPort, SpawnError};
+use workloop_core::ports::{ProbeOutcome, ProcessControlPort, SpawnError, WorkerEnv};
 
 /// The effect-free declaration an adapter reports through `describe`.
 /// `capabilities` and `roles` are part of the request binding's
@@ -151,24 +151,29 @@ pub fn select_adapter(
 /// failure is `Err`: no probe answer means no declaration and no
 /// selection, so a failed `describe` never produces a synthetic
 /// declaration that is then compared or dispatched on.
+/// `env` is the allowlisted environment the adapter runs under — the
+/// same profile environment a writer launch gets, so an untrusted
+/// adapter binary sees no host credential during declaration.
 pub fn observe_worker_declaration(
     port: &impl ProcessControlPort,
     argv: &[String],
     cwd: &Path,
+    env: &WorkerEnv,
 ) -> Result<WorkerDeclaration, String> {
-    observe_worker_declaration_within(port, argv, cwd, Duration::from_secs(5))
+    observe_worker_declaration_within(port, argv, cwd, env, Duration::from_secs(5))
 }
 
 fn observe_worker_declaration_within(
     port: &impl ProcessControlPort,
     argv: &[String],
     cwd: &Path,
+    env: &WorkerEnv,
     timeout: Duration,
 ) -> Result<WorkerDeclaration, String> {
     let mut probe_argv = argv.to_vec();
     probe_argv.push("describe".into());
     let outcome = port
-        .run_probe(&probe_argv, cwd, timeout)
+        .run_probe(&probe_argv, cwd, env, timeout)
         .map_err(|e| match e {
             SpawnError::Refused { reason } => format!("describe spawn refused: {reason}"),
             SpawnError::Unknown { reason } => format!("describe spawn unknown: {reason}"),
@@ -342,7 +347,12 @@ mod tests {
     }
 
     impl ProcessControlPort for Declaring {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             unimplemented!()
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -365,6 +375,7 @@ mod tests {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             self.outcome.clone()
@@ -386,8 +397,13 @@ mod tests {
             r#"{"adapter":"adapter-a","adapter_version":"1.0.0",
                "runtime_version":"2.0.0","capabilities":["workspace_write"]}"#,
         );
-        let observed = observe_worker_declaration(&port, &["worker".into()], Path::new("/tmp"))
-            .expect("declaration");
+        let observed = observe_worker_declaration(
+            &port,
+            &["worker".into()],
+            Path::new("/tmp"),
+            &WorkerEnv::default(),
+        )
+        .expect("declaration");
         assert_eq!(observed.adapter.as_str(), "adapter-a");
         assert_eq!(observed.runtime_version, "2.0.0");
     }
@@ -413,7 +429,13 @@ mod tests {
             declaring(r#"{"adapter_version":"1.0.0"}"#),
         ] {
             assert!(
-                observe_worker_declaration(&port, &["worker".into()], Path::new("/tmp")).is_err()
+                observe_worker_declaration(
+                    &port,
+                    &["worker".into()],
+                    Path::new("/tmp"),
+                    &WorkerEnv::default()
+                )
+                .is_err()
             );
         }
     }
@@ -432,6 +454,7 @@ mod tests {
                 &declaring(&body),
                 &["worker".into()],
                 Path::new("/tmp"),
+                &WorkerEnv::default(),
             )
             .expect_err("a malformed adapter identity must be refused");
             assert!(why.contains("invalid adapter identity"), "{why}");
@@ -446,6 +469,7 @@ mod tests {
             &crate::supervisor::PosixProcessControl,
             &argv,
             Path::new("/tmp"),
+            &WorkerEnv::default(),
             Duration::from_millis(50),
         );
         assert!(started.elapsed() < Duration::from_secs(4));

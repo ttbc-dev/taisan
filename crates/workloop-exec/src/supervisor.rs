@@ -19,13 +19,16 @@ use workloop_core::observation::{
 };
 use workloop_core::ports::{
     ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
+    WorkerEnv,
 };
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::{
-    DEFAULT_ISOLATION_PROFILE_ID, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
+    IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
+    default_isolation_profile,
 };
 
 use crate::adapter;
+use crate::isolation;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -195,8 +198,21 @@ impl PosixProcessControl {
     }
 }
 
+/// Apply the allowlisted worker environment: `env_clear` so nothing
+/// the supervisor inherited survives, then exactly the pairs the
+/// profile constructed.
+fn apply_worker_env(cmd: &mut Command, env: &WorkerEnv) {
+    cmd.env_clear();
+    cmd.envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+}
+
 impl ProcessControlPort for PosixProcessControl {
-    fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         let Some(program) = argv.first() else {
             return Err(SpawnError::Refused {
                 reason: "empty argv".into(),
@@ -206,6 +222,7 @@ impl ProcessControlPort for PosixProcessControl {
         // leader did not let escape.
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..]).current_dir(cwd).process_group(0);
+        apply_worker_env(&mut cmd, env);
         let child = cmd.spawn().map_err(|e| SpawnError::Refused {
             reason: format!("spawn {program}: {e}"),
         })?;
@@ -415,6 +432,7 @@ impl ProcessControlPort for PosixProcessControl {
         &self,
         argv: &[String],
         cwd: &Path,
+        env: &WorkerEnv,
         timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError> {
         let Some(program) = argv.first() else {
@@ -431,6 +449,7 @@ impl ProcessControlPort for PosixProcessControl {
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        apply_worker_env(&mut cmd, env);
         let mut child = cmd.spawn().map_err(|e| SpawnError::Refused {
             reason: format!("spawn {program}: {e}"),
         })?;
@@ -577,9 +596,11 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// The installation config `work` decisions are made against.
     pub config: workloop_core::work::WorkloopConfig,
     /// The approved isolation profile the WorkerRequest export names and
-    /// the launch binds. Enforcement is a separate slice; the id is
-    /// recorded here so the export and the reconciliation binding agree.
-    pub isolation_profile_id: String,
+    /// every worker launch and `describe` probe is contained under —
+    /// the environment each spawned process runs in is built from this
+    /// profile, never inherited (U2.3). Namespace enforcement remains a
+    /// separate slice; the export still records the profile id.
+    pub isolation_profile: IsolationProfile,
     /// Durable artifact-handoff layout; `None` keeps the file-artifact
     /// path only (fixture harnesses without git workspaces).
     pub handoff: Option<crate::handoff::HandoffLayout>,
@@ -598,16 +619,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
             workspace_root,
             worker_argv,
             config,
-            isolation_profile_id: DEFAULT_ISOLATION_PROFILE_ID.to_string(),
+            isolation_profile: default_isolation_profile(),
             handoff: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Name the approved isolation profile the WorkerRequest export
-    /// carries and the launch binds (U4.2).
-    pub fn with_isolation_profile_id(mut self, isolation_profile_id: impl Into<String>) -> Self {
-        self.isolation_profile_id = isolation_profile_id.into();
+    /// Run launches under the approved isolation profile the
+    /// WorkerRequest export carries — the profile also builds the
+    /// environment every spawn and `describe` probe runs under (U2.3).
+    /// Callers resolve the id through `isolation_profile` so an
+    /// unapproved name can never reach a launch.
+    pub fn with_isolation_profile(mut self, profile: IsolationProfile) -> Self {
+        self.isolation_profile = profile;
         self
     }
 
@@ -954,10 +978,30 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             let workspace = self.workspace_of(&request.work_id);
             std::fs::create_dir_all(&workspace)?;
-            match &request.adapter_binding {
-                Some(stored) => {
-                    match adapter::observe_worker_declaration(&self.port, &stored.argv, &workspace)
-                    {
+            // The probe runs under the profile's environment — an
+            // untrusted adapter binary sees no host credential even
+            // during the effect-free declaration. A preparation failure
+            // is fail-closed: the request does not dispatch under a
+            // degraded environment.
+            let probe_env = isolation::prepare(
+                &self.isolation_profile,
+                &isolation::scratch_root(&self.workspace_root).join(format!(
+                    "probe-{}",
+                    isolation::sanitize_key(&request.request_id)
+                )),
+            );
+            match probe_env {
+                Err(why) => (
+                    None,
+                    Some(format!("isolation.environment_preparation_failed: {why}")),
+                ),
+                Ok(env) => match &request.adapter_binding {
+                    Some(stored) => match adapter::observe_worker_declaration(
+                        &self.port,
+                        &stored.argv,
+                        &workspace,
+                        &env,
+                    ) {
                         Ok(observed) => match adapter::select_adapter(&observed, stored) {
                             adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
                             adapter::AdapterSelection::ConfigurationRepair { reason } => {
@@ -968,18 +1012,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             None,
                             Some(format!("adapter.declaration_unavailable: {why}")),
                         ),
-                    }
-                }
-                None => match adapter::observe_worker_declaration(
-                    &self.port,
-                    &self.worker_argv,
-                    &workspace,
-                ) {
-                    Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
-                    Err(why) => (
-                        None,
-                        Some(format!("adapter.declaration_unavailable: {why}")),
-                    ),
+                    },
+                    None => match adapter::observe_worker_declaration(
+                        &self.port,
+                        &self.worker_argv,
+                        &workspace,
+                        &env,
+                    ) {
+                        Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
+                        Err(why) => (
+                            None,
+                            Some(format!("adapter.declaration_unavailable: {why}")),
+                        ),
+                    },
                 },
             }
         };
@@ -1006,7 +1051,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let export_workspace = self.workspace_of(&request.work_id);
         let export = WorkerRequest::start(
             invocation.id.clone(),
-            self.isolation_profile_id.clone(),
+            self.isolation_profile.id.to_string(),
             export_workspace.to_string_lossy().into_owned(),
         );
         let export_record = WorkerRequestExport {
@@ -1100,7 +1145,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let argv = binding
             .map(|binding| binding.argv)
             .expect("a launch requires a recorded binding");
-        match self.port.spawn(&argv, &workspace) {
+        // The launch runs under the profile's environment — a
+        // preparation failure refuses the launch through the same path
+        // as a refused spawn; there is no degrade-to-inherited-env
+        // fallback.
+        let launch_env = match isolation::prepare(
+            &self.isolation_profile,
+            &isolation::scratch_root(&self.workspace_root)
+                .join(format!("inv-{}", isolation::sanitize_key(&invocation.id.0))),
+        ) {
+            Ok(env) => env,
+            Err(why) => {
+                self.refuse_launch(
+                    store,
+                    request,
+                    &invocation,
+                    format!("isolation.environment_preparation_failed: {why}"),
+                    now_unix_seconds,
+                )?;
+                return Ok(());
+            }
+        };
+        match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 // Descendant coverage starts at launch: a writer that
                 // escapes its tree before the first poll is still a
@@ -1145,24 +1211,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
-                store.transact(|tx| {
-                    let mut next = invocation.clone();
-                    next.state = InvocationState::Abandoned;
-                    tx.apply(&Effect::UpdateInvocation {
-                        invocation: next,
-                        expected_state: InvocationState::Prepared,
-                    })?;
-                    Ok(())
-                })?;
-                self.report(
-                    store,
-                    request,
-                    ObservationFact::LaunchRefused {
-                        invocation_id: invocation.id.clone(),
-                        reason,
-                    },
-                    now_unix_seconds,
-                )?;
+                self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
                 self.report(
@@ -1177,6 +1226,38 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Record a launch refusal: the consumed request's Invocation is
+    /// abandoned and `LaunchRefused` is reported — the request is
+    /// terminal for its binding, never retried under a degraded setup.
+    fn refuse_launch(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation: &Invocation,
+        reason: String,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        store.transact(|tx| {
+            let mut next = invocation.clone();
+            next.state = InvocationState::Abandoned;
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: next,
+                expected_state: InvocationState::Prepared,
+            })?;
+            Ok(())
+        })?;
+        self.report(
+            store,
+            request,
+            ObservationFact::LaunchRefused {
+                invocation_id: invocation.id.clone(),
+                reason,
+            },
+            now_unix_seconds,
+        )?;
         Ok(())
     }
 
@@ -2304,7 +2385,12 @@ mod tests {
     struct SnapshotFailure;
 
     impl ProcessControlPort for SnapshotFailure {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn expected")
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -2327,6 +2413,7 @@ mod tests {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -2402,7 +2489,12 @@ mod tests {
     }
 
     impl ProcessControlPort for ScriptedGroup {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn expected")
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -2438,6 +2530,7 @@ mod tests {
             &self,
             _: &[String],
             _: &Path,
+            _: &WorkerEnv,
             _: Duration,
         ) -> Result<ProbeOutcome, SpawnError> {
             panic!("no probe expected")
@@ -2658,7 +2751,12 @@ mod tests {
             format!("(sleep 1; touch \"{}\") & sleep 30", marker.display()),
         ];
         let outcome = PosixProcessControl
-            .run_probe(&argv, Path::new("/tmp"), Duration::from_millis(50))
+            .run_probe(
+                &argv,
+                Path::new("/tmp"),
+                &WorkerEnv::default(),
+                Duration::from_millis(50),
+            )
             .expect("a spawned probe reports its outcome");
         assert_eq!(outcome, ProbeOutcome::Bounded);
         std::thread::sleep(Duration::from_millis(1600));

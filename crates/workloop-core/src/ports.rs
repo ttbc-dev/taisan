@@ -78,15 +78,34 @@ pub enum ProbeOutcome {
     Bounded,
 }
 
+/// The complete environment a spawned worker or probe runs under — an
+/// allowlist constructed by the isolation profile, never the
+/// supervisor's inherited environment. The port applies it verbatim:
+/// a variable not listed here does not exist for the child, so a host
+/// credential (`GH_TOKEN`, `SSH_AUTH_SOCK`, `HOME` pointing at the
+/// owner's home, a git credential helper config) cannot leak in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerEnv {
+    /// The child's whole environment as `name=value` pairs.
+    pub vars: Vec<(String, String)>,
+}
+
 /// How `execution` supervises real worker processes. Implementations must
 /// satisfy the crash rules in `docs/lifecycle.md`: record `pid + start
 /// time`, snapshot write-capable descendants with the stop intent, signal
 /// only re-verified identities, read state not presence, and reap spawned
 /// children.
 pub trait ProcessControlPort {
-    /// Spawn `argv` with `cwd` in its own process group. Returns the
-    /// leader's host-observable identity on success.
-    fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError>;
+    /// Spawn `argv` with `cwd` in its own process group under `env` — the
+    /// allowlisted environment the isolation profile built; the caller's
+    /// environment is never inherited. Returns the leader's
+    /// host-observable identity on success.
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError>;
 
     /// The leader plus every write-capable descendant, captured while the
     /// leader still exists. After the leader exits, orphans reparent and
@@ -123,13 +142,17 @@ pub trait ProcessControlPort {
     /// own process group, and when `timeout` elapses the whole group plus
     /// the leader is signalled to stop and the leader reaped — a wedged
     /// probe can never hold a dispatch pass open or leak a same-group
-    /// child past the bound. `SpawnError` means no probe ran (`Refused`)
-    /// or its fate is unknown (`Unknown`); a caller must treat either as
+    /// child past the bound. The probe runs under `env`, the same
+    /// allowlisted environment a writer launch gets — an untrusted
+    /// adapter binary must not see more during declaration than it does
+    /// during execution. `SpawnError` means no probe ran (`Refused`) or
+    /// its fate is unknown (`Unknown`); a caller must treat either as
     /// "the adapter did not answer".
     fn run_probe(
         &self,
         argv: &[String],
         cwd: &Path,
+        env: &WorkerEnv,
         timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError>;
 }

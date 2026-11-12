@@ -198,6 +198,11 @@ pub struct RoleSection {
 pub struct WorkerSection {
     #[serde(default)]
     pub argv: Vec<String>,
+    /// The approved isolation profile every worker launch binds. Absent
+    /// names the reference profile; an unknown name is refused at load
+    /// — a misspelled profile must never degrade into an unprofiled
+    /// launch (U2.3).
+    pub isolation_profile: Option<String>,
     pub runtime_version: Option<String>,
     pub model: Option<String>,
     pub max_turns: Option<u32>,
@@ -459,6 +464,7 @@ impl Profile {
         }
         self.validate_hosts()?;
         self.validate_roles()?;
+        self.validate_worker()?;
         self.validate_allowlist()?;
         self.validate_capabilities()?;
         self.validate_recovery()?;
@@ -555,6 +561,24 @@ impl Profile {
                 .as_deref()
                 .ok_or_else(|| format!("roles.{name}: missing 'credential_ref'"))?;
             check_credential_ref(name, credential_ref)?;
+        }
+        Ok(())
+    }
+
+    /// The named isolation profile must resolve against the approved
+    /// registry — the same resolution the dispatch path uses, so a name
+    /// refused here can never be launched under.
+    fn validate_worker(&self) -> Result<(), String> {
+        if let Some(id) = &self.worker.isolation_profile {
+            workloop_core::worker::isolation_profile(id).ok_or_else(|| {
+                let approved: Vec<&str> =
+                    workloop_core::worker::approved_isolation_profile_ids().collect();
+                format!(
+                    "worker.isolation_profile: '{id}' is not an approved profile \
+                     (approved: {})",
+                    approved.join(", ")
+                )
+            })?;
         }
         Ok(())
     }

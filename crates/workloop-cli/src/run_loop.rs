@@ -34,6 +34,7 @@ use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
 use workloop_exec::adapter;
+use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::{SweepParams, SweepReport};
@@ -399,10 +400,21 @@ pub fn run_pass(
                     std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
                         detail: format!("create workspace {}: {e}", workspace.display()),
                     })?;
+                    // The probe runs under the profile's environment —
+                    // a prep failure skips the binding exactly like an
+                    // unanswered describe: the consume path's
+                    // fail-closed selection refuses the launch.
+                    let Ok(env) = isolation::prepare(
+                        &supervisor.isolation_profile,
+                        &isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind"),
+                    ) else {
+                        continue;
+                    };
                     let Ok(declaration) = adapter::observe_worker_declaration(
                         &supervisor.port,
                         &supervisor.worker_argv,
                         &workspace,
+                        &env,
                     ) else {
                         continue;
                     };
