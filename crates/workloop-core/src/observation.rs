@@ -434,14 +434,25 @@ pub enum NormalizedEffectFact {
         reply_id: String,
         body_digest: String,
     },
+    /// `target` echoes the diff target the write was bound to;
+    /// `observed` is the head a fresh read reports after the write, and
+    /// `relation` records how it relates to `target.head` — a racing
+    /// actor may move the change across the write/read gap.
     ThreadResolved {
         change: ChangeRequestRef,
         thread_id: String,
         target: DiffTarget,
+        observed: CommitRevision,
+        relation: RefRelation,
     },
+    /// `head` echoes the head the write was bound to; `observed` is the
+    /// head a fresh read reports after the write, and `relation`
+    /// records how it relates to `head`.
     ReadyObserved {
         change: ChangeRequestRef,
         head: CommitRevision,
+        observed: CommitRevision,
+        relation: RefRelation,
     },
 }
 

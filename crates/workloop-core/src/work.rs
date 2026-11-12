@@ -2806,8 +2806,16 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
                 change: resolved,
                 thread_id: resolved_thread,
                 target,
+                observed,
+                relation,
             },
-        ) => resolved == change && resolved_thread == thread_id && &target.head == head,
+        ) => {
+            resolved == change
+                && resolved_thread == thread_id
+                && &target.head == head
+                && observed.repository == head.repository
+                && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
+        }
         (
             HostAction::MarkReady {
                 change,
@@ -2816,8 +2824,15 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
             NormalizedEffectFact::ReadyObserved {
                 change: readied,
                 head,
+                observed,
+                relation,
             },
-        ) => readied == change && head == expected_head,
+        ) => {
+            readied == change
+                && head == expected_head
+                && observed.repository == expected_head.repository
+                && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
+        }
         _ => false,
     })
 }

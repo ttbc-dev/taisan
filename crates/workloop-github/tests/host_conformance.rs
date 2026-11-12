@@ -1281,12 +1281,16 @@ fn ready_marking_applies_with_fresh_readback(
         [
             NormalizedEffectFact::ReadyObserved {
                 change: seen,
-                head: observed,
+                head: bound,
+                observed,
+                relation,
             },
         ] => {
             assert_eq!(ready.status, HostActionStatus::Applied);
             assert_eq!(*seen, change);
+            assert_eq!(*bound, head, "the bound head is echoed");
             assert_eq!(*observed, head);
+            assert_eq!(*relation, RefRelation::Equal);
         }
         other => panic!("ready receipt missing ReadyObserved: {other:?}"),
     }
@@ -1417,12 +1421,16 @@ fn thread_resolve_applies_with_readback(
                 change: seen,
                 thread_id,
                 target,
+                observed,
+                relation,
             },
         ] => {
             assert_eq!(resolve.status, HostActionStatus::Applied);
             assert_eq!(*seen, change);
             assert_eq!(thread_id, "th-1");
-            assert_eq!(target.head, head);
+            assert_eq!(target.head, head, "the bound target is echoed");
+            assert_eq!(*observed, head);
+            assert_eq!(*relation, RefRelation::Equal);
         }
         other => panic!("resolve receipt missing ThreadResolved: {other:?}"),
     }

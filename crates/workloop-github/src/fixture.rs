@@ -1373,18 +1373,10 @@ impl FixtureGithub {
                 let actual = self.branches.get(&key).cloned();
                 let expected = expected_prior.as_ref().map(|p| p.object.clone());
                 if actual != expected {
-                    self.emit(
-                        store,
-                        config,
-                        obs(result(
-                            intent.action_id.clone(),
-                            HostActionStatus::Failed {
-                                reason: "stale_head".into(),
-                            },
-                            vec![],
-                        )),
-                        now,
-                    )?;
+                    // The fresh position is recorded before the refusal
+                    // receipt — the same order the bridge reports it, so
+                    // a receipt-driven re-issue derives its guard from
+                    // the observed remote, never the pre-read position.
                     let state = match &actual {
                         Some(head) => BranchState::At {
                             revision: CommitRevision::new(intent.repository.clone(), head)
@@ -1400,6 +1392,18 @@ impl FixtureGithub {
                             branch: branch.clone(),
                             state,
                         }),
+                        now,
+                    )?;
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id.clone(),
+                            HostActionStatus::Failed {
+                                reason: "stale_head".into(),
+                            },
+                            vec![],
+                        )),
                         now,
                     )?;
                     return Ok(AttemptOutcome::Attempted);
@@ -1884,6 +1888,18 @@ impl FixtureGithub {
                 let resolved = self.threads.get(thread_id).is_some_and(|t| t.resolved);
                 let observed_head = self.changes.get(change.change_request.as_str()).cloned();
                 if resolved && let Some(object) = observed_head {
+                    let observed = CommitRevision::new(intent.repository.clone(), object.clone())
+                        .map_err(|detail| StoreError::Internal { detail })?;
+                    // The receipt echoes the bound head and reports the
+                    // observed head's relation to it — a racing actor
+                    // may move the change across the write/read gap.
+                    let relation = if object == head.object {
+                        RefRelation::Equal
+                    } else if self.descends(&object, &head.object) {
+                        RefRelation::Ancestor
+                    } else {
+                        RefRelation::Diverged
+                    };
                     self.emit(
                         store,
                         config,
@@ -1895,11 +1911,12 @@ impl FixtureGithub {
                                 thread_id: thread_id.clone(),
                                 target: DiffTarget {
                                     change: change.clone(),
-                                    head: CommitRevision::new(intent.repository.clone(), object)
-                                        .map_err(|detail| StoreError::Internal { detail })?,
+                                    head: head.clone(),
                                     base: None,
                                     target_revision: None,
                                 },
+                                observed,
+                                relation,
                             }],
                         )),
                         now,
@@ -1958,6 +1975,19 @@ impl FixtureGithub {
                 let observed_head = self.changes.get(change.change_request.as_str()).cloned();
                 match (ready, observed_head) {
                     (true, Some(object)) => {
+                        let observed =
+                            CommitRevision::new(intent.repository.clone(), object.clone())
+                                .map_err(|detail| StoreError::Internal { detail })?;
+                        // Same bound-echo/observed split as the resolve
+                        // receipt: the remote may have raced the
+                        // write/read gap.
+                        let relation = if object == expected_head.object {
+                            RefRelation::Equal
+                        } else if self.descends(&object, &expected_head.object) {
+                            RefRelation::Ancestor
+                        } else {
+                            RefRelation::Diverged
+                        };
                         self.emit(
                             store,
                             config,
@@ -1966,8 +1996,9 @@ impl FixtureGithub {
                                 HostActionStatus::Applied,
                                 vec![NormalizedEffectFact::ReadyObserved {
                                     change: change.clone(),
-                                    head: CommitRevision::new(intent.repository.clone(), object)
-                                        .map_err(|detail| StoreError::Internal { detail })?,
+                                    head: expected_head.clone(),
+                                    observed,
+                                    relation,
                                 }],
                             )),
                             now,

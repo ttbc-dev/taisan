@@ -17,7 +17,7 @@ use workloop_core::store::*;
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
 };
-use workloop_github::fixture::FixtureGithub;
+use workloop_github::fixture::{FixtureGithub, RemoteMutation};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -336,7 +336,11 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
     let resolve = intent(&store, &resolve_id);
     let [
         NormalizedEffectFact::ThreadResolved {
-            thread_id, target, ..
+            thread_id,
+            target,
+            observed,
+            relation,
+            ..
         },
     ] = resolve.effects.as_slice()
     else {
@@ -344,6 +348,8 @@ fn applied_receipts_cite_the_freshly_read_object_identity() {
     };
     assert_eq!(thread_id, "th-1");
     assert_eq!(target.head, rev("head-1"));
+    assert_eq!(*observed, rev("head-1"));
+    assert_eq!(*relation, RefRelation::Equal);
     assert!(gh.thread("th-1").unwrap().resolved);
 }
 
@@ -526,4 +532,119 @@ fn ineligible_actor_is_explicit_and_distinct() {
         }
     );
     assert!(gh.thread("th-1").unwrap().replies.is_empty());
+}
+
+/// AC: a racing actor moving the change across the write/read gap does
+/// not wedge a landed head-bound write — the resolve receipt binds the
+/// observed head's `Ancestor` relation to the bound head, and the
+/// intent reconciles `applied` instead of degrading to `unknown`, like
+/// the push path's `RefPublished` evidence.
+#[test]
+fn raced_resolve_reconciles_applied_on_ancestor_observation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "u34-raced-resolve");
+    admit(&store, &eid);
+
+    let resolve_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::ResolveThread {
+            change: change(),
+            thread_id: "th-1".into(),
+            head: rev("head-1"),
+        },
+    );
+
+    let mut gh = FixtureGithub::new();
+    gh.set_change_head(&change(), "head-1", &reviewer());
+    gh.add_thread(&change(), "th-1");
+    // The racer moves the change head between the write and its
+    // read-back — the resolve lands, the fresh read sees the moved head.
+    gh.queue_remote_mutation(RemoteMutation::MoveChange {
+        change: change(),
+        head: "head-2".into(),
+        actor: HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("racer"),
+        },
+    });
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+
+    let resolve = intent(&store, &resolve_id);
+    assert_eq!(
+        resolve.status,
+        HostActionStatus::Applied,
+        "the raced resolve reconciles applied, not unknown: {:?}",
+        resolve.status
+    );
+    let [
+        NormalizedEffectFact::ThreadResolved {
+            target,
+            observed,
+            relation,
+            ..
+        },
+    ] = resolve.effects.as_slice()
+    else {
+        panic!("resolve receipt: {:?}", resolve.effects)
+    };
+    assert_eq!(target.head, rev("head-1"), "the bound head is echoed");
+    assert_eq!(
+        *observed,
+        rev("head-2"),
+        "the read-back head is the racer's"
+    );
+    assert_eq!(*relation, RefRelation::Ancestor);
+}
+
+/// AC: the same write/read race on `mark_ready` — the receipt reports
+/// the observed head's `Ancestor` relation and reconciles `applied`.
+#[test]
+fn raced_mark_ready_reconciles_applied_on_ancestor_observation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "u34-raced-ready");
+    admit(&store, &eid);
+
+    let ready_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::MarkReady {
+            change: change(),
+            expected_head: rev("head-1"),
+        },
+    );
+
+    let mut gh = FixtureGithub::new();
+    gh.set_change_head(&change(), "head-1", &reviewer());
+    gh.queue_remote_mutation(RemoteMutation::MoveChange {
+        change: change(),
+        head: "head-2".into(),
+        actor: HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("racer"),
+        },
+    });
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+
+    let ready = intent(&store, &ready_id);
+    assert_eq!(
+        ready.status,
+        HostActionStatus::Applied,
+        "the raced mark_ready reconciles applied, not unknown: {:?}",
+        ready.status
+    );
+    let [
+        NormalizedEffectFact::ReadyObserved {
+            head,
+            observed,
+            relation,
+            ..
+        },
+    ] = ready.effects.as_slice()
+    else {
+        panic!("ready receipt: {:?}", ready.effects)
+    };
+    assert_eq!(*head, rev("head-1"), "the bound head is echoed");
+    assert_eq!(*observed, rev("head-2"));
+    assert_eq!(*relation, RefRelation::Ancestor);
 }

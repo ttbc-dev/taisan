@@ -197,10 +197,14 @@ fn stale_head_refuses_the_write_and_surfaces_the_fresh_position() {
         "the remote ref is untouched"
     );
     // The refusal surfaces the fresh remote position so the caller can
-    // re-issue against it.
-    let positions: Vec<String> = store
+    // re-issue against it — and the position lands before the failed
+    // receipt in observation order, so a receipt-driven re-issue
+    // derives its guard from the observed remote, never the pre-read
+    // position.
+    let observations = store
         .transact(|tx| tx.observations_for_work(&work_id))
-        .unwrap()
+        .unwrap();
+    let positions: Vec<String> = observations
         .iter()
         .filter_map(|o| match &o.fact {
             ObservationFact::BranchState {
@@ -212,6 +216,16 @@ fn stale_head_refuses_the_write_and_surfaces_the_fresh_position() {
         })
         .collect();
     assert_eq!(positions, vec!["head-other".to_string()]);
+    let position_at = observations
+        .iter()
+        .position(|o| matches!(o.fact, ObservationFact::BranchState { .. }));
+    let receipt_at = observations
+        .iter()
+        .position(|o| matches!(o.fact, ObservationFact::HostActionResult { .. }));
+    assert!(
+        position_at < receipt_at,
+        "the fresh position is recorded before the stale_head receipt"
+    );
 }
 
 /// AC: each write effect persists its own pending intent before
