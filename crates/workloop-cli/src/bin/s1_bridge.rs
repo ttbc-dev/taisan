@@ -239,6 +239,22 @@ fn push_landed_for(ctx: &Ctx, work_id: &WorkId, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The capability support surface this build implements — the
+/// bridge-local half of the report an older binary's recorded report
+/// may predate. Authorization stays a live permission read.
+const IMPLEMENTED: &[(HostCapability, bool)] = &[
+    (HostCapability::RepositoryRead, true),
+    (HostCapability::BranchRead, true),
+    (HostCapability::ChangeRequestRead, true),
+    (HostCapability::IssueRead, true),
+    (HostCapability::ChecksRead, true),
+    (HostCapability::ReviewFindingsRead, true),
+    (HostCapability::PushRef, true),
+    (HostCapability::ChangeRequestCreate, true),
+    (HostCapability::ChangeRequestUpdate, false),
+    (HostCapability::CommentWrite, false),
+];
+
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
 /// authorization is the credential's real `permissions` answer.
@@ -265,38 +281,73 @@ fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     };
     Ok(ObservationFact::CapabilityReport {
         host: ctx.config.host.repository.host.clone(),
-        capabilities: vec![
-            entry(HostCapability::RepositoryRead, true, read),
-            entry(HostCapability::BranchRead, true, read),
-            entry(HostCapability::ChangeRequestRead, true, read),
-            entry(HostCapability::IssueRead, true, read),
-            entry(HostCapability::ChecksRead, true, read),
-            entry(HostCapability::ReviewFindingsRead, true, read),
-            entry(HostCapability::PushRef, true, write),
-            entry(HostCapability::ChangeRequestCreate, true, write),
-            entry(HostCapability::ChangeRequestUpdate, false, write),
-            entry(HostCapability::CommentWrite, false, write),
-        ],
+        capabilities: IMPLEMENTED
+            .iter()
+            .map(|(capability, implemented)| {
+                entry(
+                    *capability,
+                    *implemented,
+                    match capability {
+                        HostCapability::PushRef
+                        | HostCapability::ChangeRequestCreate
+                        | HostCapability::ChangeRequestUpdate
+                        | HostCapability::CommentWrite => write,
+                        _ => read,
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
-/// One-time capability report — later permission drift is left to a
-/// production adapter's reporting cadence.
+/// The capability report is emitted whenever the recorded report's
+/// support surface is not this build's: stores created before this
+/// change can carry an older report that marked unimplemented writes
+/// `supported`, and Core reads the latest report — never re-emitting
+/// would leave the stale support state authoritative forever. A store
+/// already holding a current report skips the permission read
+/// entirely; later permission drift is left to a production adapter's
+/// reporting cadence.
 fn ensure_capability_report(ctx: &Ctx) -> Result<(), String> {
-    let have = ctx
+    let (count, latest) = ctx
         .store
         .transact_deferred(|tx| {
-            Ok(tx
-                .all_observations()?
+            let observations = tx.all_observations()?;
+            let count = observations
                 .iter()
-                .any(|o| matches!(o.fact, ObservationFact::CapabilityReport { .. })))
+                .filter(|o| matches!(o.fact, ObservationFact::CapabilityReport { .. }))
+                .count();
+            let latest = observations
+                .iter()
+                .enumerate()
+                .filter_map(|(index, o)| match &o.fact {
+                    ObservationFact::CapabilityReport { host, capabilities }
+                        if host == &ctx.config.host.repository.host =>
+                    {
+                        Some((o.observed_unix_seconds, index, capabilities.clone()))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(t, i, _)| (*t, *i))
+                .map(|(_, _, capabilities)| capabilities);
+            Ok((count, latest))
         })
         .map_err(|e| e.to_string())?;
-    if have {
+    let stale = latest.as_deref().is_none_or(|latest| {
+        latest.len() != IMPLEMENTED.len()
+            || latest.iter().any(|e| {
+                IMPLEMENTED
+                    .iter()
+                    .find(|(capability, _)| *capability == e.capability)
+                    .map(|(_, implemented)| *implemented)
+                    != Some(matches!(e.support, CapabilityState::Supported))
+            })
+    });
+    if !stale {
         return Ok(());
     }
     let fact = capability_report(ctx)?;
-    ctx.emit(None, "cap:initial".into(), fact)
+    ctx.emit(None, format!("cap:{count}"), fact)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -1099,13 +1150,37 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
             ]) {
                 Ok(url) => {
                     let owner = ctx.repo_display.split('/').next().unwrap_or_default();
-                    let pr = gh_json(&[
+                    // The create reported success: anything short of a
+                    // matching read-back leaves the effect unverified —
+                    // recording `unknown` hands the intent to the
+                    // reconcile pass, whose read settles or re-attempts
+                    // without a blind duplicate create (a failed or
+                    // propagated outcome would let the drain re-issue
+                    // `gh pr create` after a create that may have
+                    // landed — the lost-response case R-4 forbids).
+                    let pr = match gh_json(&[
                         "api",
                         &format!(
                             "repos/{}/pulls?head={owner}:{source_branch}&state=open",
                             ctx.repo_display
                         ),
-                    ])?;
+                    ]) {
+                        Ok(pr) => pr,
+                        Err(e) => {
+                            emit_result_keyed(
+                                ctx,
+                                intent,
+                                key,
+                                HostActionStatus::Unknown {
+                                    reason: format!(
+                                        "pr create reported {url} but read-back failed, effect unverified: {e}"
+                                    ),
+                                },
+                                vec![],
+                            );
+                            return Ok(());
+                        }
+                    };
                     // The read-back must show the created change on the
                     // intent's own base — a pre-existing open change to
                     // a different target is not this effect's evidence.
@@ -1134,7 +1209,23 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str, reconcile: bool) -> 
                         .as_str()
                         .unwrap_or(target_branch)
                         .to_string();
-                    let (change, head) = opened_change(intent, &first)?;
+                    let (change, head) = match opened_change(intent, &first) {
+                        Ok(read) => read,
+                        Err(e) => {
+                            emit_result_keyed(
+                                ctx,
+                                intent,
+                                key,
+                                HostActionStatus::Unknown {
+                                    reason: format!(
+                                        "pr create reported {url} but read-back was unparseable, effect unverified: {e}"
+                                    ),
+                                },
+                                vec![],
+                            );
+                            return Ok(());
+                        }
+                    };
                     let execution_id = Some(execution.id.clone());
                     let _ = ctx.emit(
                         Some((&intent.work_id, execution_id.as_ref())),

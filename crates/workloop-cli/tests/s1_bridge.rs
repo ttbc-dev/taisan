@@ -162,6 +162,14 @@ impl Fixture {
             .collect()
     }
 
+    fn pr_creates(&self) -> Vec<String> {
+        fs::read_to_string(self.fake.join("pr_creates.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     fn store(&self) -> SqliteStore {
         SqliteStore::open(&self.db, 1).unwrap()
     }
@@ -822,4 +830,142 @@ fn reconcile_open_reattempts_when_the_open_change_targets_another_base() {
     );
     fx.tick(&[]);
     assert_eq!(fx.intent_status(&action_id), HostActionStatus::Applied);
+}
+
+/// A store carrying an older report that marked unimplemented writes
+/// `supported` gets a corrected report superseding it — the recorded
+/// report is never the final word when this build's support surface
+/// differs (Core reads the latest report).
+#[test]
+fn a_stale_capability_report_is_superseded() {
+    let fx = Fixture::new("cap-stale");
+    let supported = |capability: HostCapability| CapabilityEntry {
+        capability,
+        support: CapabilityState::Supported,
+        authorization: CapabilityState::Authorized,
+    };
+    // The pre-change report: every write wrongly `supported`.
+    let stale = Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Host {
+                host: HostInstanceId::trusted("github.test"),
+            },
+            source: "github.s1-bridge".into(),
+            event_id: "cap:0".into(),
+        }),
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::CapabilityReport {
+            host: HostInstanceId::trusted("github.test"),
+            capabilities: [
+                HostCapability::RepositoryRead,
+                HostCapability::BranchRead,
+                HostCapability::ChangeRequestRead,
+                HostCapability::IssueRead,
+                HostCapability::ChecksRead,
+                HostCapability::ReviewFindingsRead,
+                HostCapability::PushRef,
+                HostCapability::ChangeRequestCreate,
+                HostCapability::ChangeRequestUpdate,
+                HostCapability::CommentWrite,
+            ]
+            .into_iter()
+            .map(supported)
+            .collect(),
+        },
+        observed_unix_seconds: NOW,
+    };
+    fx.store()
+        .transact(|tx| tx.apply(&Effect::InsertObservation { observation: stale }))
+        .unwrap();
+    fx.tick(&[]);
+    let reports: Vec<Vec<CapabilityEntry>> = fx
+        .store()
+        .transact(|tx| {
+            Ok(tx
+                .all_observations()?
+                .iter()
+                .filter_map(|o| match &o.fact {
+                    ObservationFact::CapabilityReport { capabilities, .. } => {
+                        Some(capabilities.clone())
+                    }
+                    _ => None,
+                })
+                .collect())
+        })
+        .unwrap();
+    assert_eq!(
+        reports.len(),
+        2,
+        "the stale report is superseded, not trusted forever"
+    );
+    let latest = reports.last().unwrap();
+    for capability in [
+        HostCapability::ChangeRequestUpdate,
+        HostCapability::CommentWrite,
+    ] {
+        let entry = latest
+            .iter()
+            .find(|e| e.capability == capability)
+            .unwrap_or_else(|| panic!("report lacks {}", capability.name()));
+        assert_eq!(
+            entry.support,
+            CapabilityState::Denied,
+            "the corrected report denies the unimplemented {}",
+            capability.name()
+        );
+    }
+    // A second tick emits no third report — a current report is not
+    // re-emitted.
+    fx.tick(&[]);
+    let count = fx
+        .store()
+        .transact(|tx| {
+            Ok(tx
+                .all_observations()?
+                .iter()
+                .filter(|o| matches!(o.fact, ObservationFact::CapabilityReport { .. }))
+                .count())
+        })
+        .unwrap();
+    assert_eq!(count, 2, "a current report is not re-emitted per tick");
+}
+
+/// A lost create response must never produce a second `gh pr create`:
+/// the read-back failure records `unknown` and hands the intent to the
+/// reconcile read instead of letting the drain re-issue the write —
+/// the lost-response case R-4 forbids a duplicate create.
+#[test]
+fn a_lost_create_response_never_creates_twice() {
+    let fx = Fixture::new("lost-create");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-lost-create");
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: BRANCH.into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+        HostActionStatus::Pending,
+        vec![],
+    );
+    // The create lands but the pulls read-back is unparseable.
+    fx.write_fake("pulls_head", "not-json\n");
+    fx.tick(&[]);
+    fx.tick(&[]);
+    assert_eq!(
+        fx.pr_creates().len(),
+        1,
+        "exactly one create — the unverified effect never duplicates"
+    );
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "the unverified create stays outstanding: {:?}",
+        fx.intent_status(&action_id)
+    );
 }
