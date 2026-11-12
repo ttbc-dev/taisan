@@ -61,7 +61,7 @@ pub struct ReclaimedBody {
 }
 
 /// One body the pass declined, with the recorded reason.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HeldBody {
     pub body_id: String,
@@ -1354,20 +1354,21 @@ impl SqliteStore {
         body_id: &str,
         reason: &str,
         now_unix_seconds: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<usize, StoreError> {
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
         let tx = guard
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        tx.execute(
-            "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
+        let transitioned = tx
+            .execute(
+                "UPDATE body_catalog SET state='reclaimed', reclaim_reason=?2, \
              delete_failures=0, reclaimed_unix_seconds=?3 WHERE body_id=?1 \
              AND state='reclaiming'",
-            params![body_id, reason, now_unix_seconds],
-        )
-        .map_err(map_err)?;
+                params![body_id, reason, now_unix_seconds],
+            )
+            .map_err(map_err)?;
         tx.execute(
             "UPDATE reclaim_plan_entries SET outcome='reclaimed', \
              outcome_reason=?2, outcome_unix_seconds=?3 \
@@ -1376,7 +1377,7 @@ impl SqliteStore {
         )
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;
-        Ok(())
+        Ok(transitioned)
     }
 
     fn finish_reclaim(
@@ -1702,14 +1703,34 @@ impl SqliteStore {
             .map_err(map_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_err)?;
+        let (skipped, held): (Vec<HeldBody>, Vec<HeldBody>) = {
+            let phase1: Option<String> = guard
+                .query_row(
+                    "SELECT value FROM store_meta WHERE key=?1",
+                    params![format!("reclaim_plan_phase1:{plan_id}")],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_err)?;
+            match phase1
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            {
+                Some(v) => (
+                    serde_json::from_value(v["skipped"].clone()).unwrap_or_default(),
+                    serde_json::from_value(v["held"].clone()).unwrap_or_default(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
         Ok(ReclaimPlan {
             plan_id: plan_id.to_string(),
             created_unix_seconds: created,
             status,
             entries: rows,
             total_bytes: total_bytes.max(0) as u64,
-            skipped: Vec::new(),
-            held: Vec::new(),
+            skipped,
+            held,
         })
     }
 
@@ -1971,6 +1992,15 @@ impl SqliteStore {
             )
             .map_err(map_err)?;
         }
+        // Phase-1 held/skipped evidence travels with the plan row, so
+        // an interrupted run resumes with the same operator-facing
+        // context it was created with.
+        let phase1 = serde_json::json!({ "skipped": skipped, "held": held }).to_string();
+        tx.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?1, ?2)",
+            params![format!("reclaim_plan_phase1:{plan_id}"), phase1],
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(internal)?;
         Ok(ReclaimPlan {
             plan_id,
@@ -2089,6 +2119,39 @@ impl SqliteStore {
             if entry.outcome.is_some() {
                 execution.already_recorded += 1;
                 continue;
+            }
+            // Re-read the entry's outcome: a concurrent maintenance
+            // writer may have recorded it since this plan was read.
+            // The loser of that race is already_recorded, never a
+            // second reclaim.
+            let still_pending: Option<Option<String>> = {
+                let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+                    detail: "store lock poisoned".into(),
+                })?;
+                guard
+                    .query_row(
+                        "SELECT outcome FROM reclaim_plan_entries \
+                         WHERE plan_id=?1 AND body_id=?2",
+                        params![plan.plan_id, entry.body_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?
+            };
+            match still_pending {
+                Some(Some(_)) => {
+                    execution.already_recorded += 1;
+                    continue;
+                }
+                Some(None) => {}
+                None => {
+                    return Err(StoreError::Internal {
+                        detail: format!(
+                            "plan entry {} vanished from plan {}",
+                            entry.body_id, plan.plan_id
+                        ),
+                    });
+                }
             }
             self.execute_entry(
                 &plan.plan_id,
@@ -2372,13 +2435,33 @@ impl SqliteStore {
                 } else {
                     entry_reason.unwrap_or("age_expired")
                 };
-                self.finish_reclaim_and_record(plan_id, body_id, recorded, now_unix_seconds)?;
-                execution.bytes_reclaimed += bytes;
-                execution.reclaimed.push(ReclaimedBody {
-                    body_id: body_id.into(),
-                    bytes,
-                    reason: recorded.into(),
-                });
+                let transitioned =
+                    self.finish_reclaim_and_record(plan_id, body_id, recorded, now_unix_seconds)?;
+                if transitioned == 1 {
+                    execution.bytes_reclaimed += bytes;
+                    execution.reclaimed.push(ReclaimedBody {
+                        body_id: body_id.into(),
+                        bytes,
+                        reason: recorded.into(),
+                    });
+                } else {
+                    // A concurrent maintenance writer completed this
+                    // body first: record it as already_recorded (the
+                    // outcome write is first-write-wins) and never
+                    // double-count its bytes.
+                    execution.already_recorded += 1;
+                    self.record_entry_outcome(
+                        plan_id,
+                        body_id,
+                        "unavailable",
+                        "already_reclaimed",
+                        now_unix_seconds,
+                    )?;
+                    execution.unavailable.push(HeldBody {
+                        body_id: body_id.into(),
+                        reason: "already_reclaimed".into(),
+                    });
+                }
             }
             Err(detail) => {
                 let failures = self.record_delete_failure(body_id)?;
@@ -2461,6 +2544,11 @@ impl SqliteStore {
             "UPDATE reclaim_plans SET status='completed', completed_unix_seconds=?2 \
              WHERE plan_id=?1 AND status='open'",
             params![plan_id, now_unix_seconds],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM store_meta WHERE key=?1",
+            params![format!("reclaim_plan_phase1:{plan_id}")],
         )
         .map_err(map_err)?;
         tx.commit().map_err(internal)?;

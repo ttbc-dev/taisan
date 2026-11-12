@@ -226,28 +226,41 @@ impl SqliteStore {
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
             // An upgrade is legitimate only for a file that holds the
-            // complete v1 schema: every expected table except the ones
-            // added since v1 — the run-lease slice's additive set plus
-            // the two v2 additions — must already be present. A foreign
-            // file stamped 1 fails this check untouched, and the one
-            // accepted difference is the previous release's store: it
-            // holds every base table and none of the additions, so it is
-            // upgraded in place instead of being locked out with a
-            // misleading "not the recognized schema" refusal.
+            // complete schema of its own stamp. The exemptions shrink
+            // with the stamp: a v1 file may lack every later addition,
+            // a v2 file may lack only the v2 and v3 additions, a v3 file
+            // may lack only the v3 (reclaim-plan) additions — nothing
+            // else may be absent, so a truncated or foreign stamped
+            // file is refused instead of being silently re-created and
+            // re-stamped. A stamp-1 file holding every base table and
+            // none of the additions upgrades in place; a foreign stamped
+            // file fails untouched.
             let present = table_set(&conn)?;
+            let mut exempt: Vec<&str> = Vec::with_capacity(
+                ADDITIVE_TABLES.len() + V2_ADDED_TABLES.len() + V3_ADDED_TABLES.len(),
+            );
+            match version {
+                1 => {
+                    exempt.extend_from_slice(ADDITIVE_TABLES);
+                    exempt.extend_from_slice(V2_ADDED_TABLES);
+                    exempt.extend_from_slice(V3_ADDED_TABLES);
+                }
+                2 => {
+                    exempt.extend_from_slice(V2_ADDED_TABLES);
+                    exempt.extend_from_slice(V3_ADDED_TABLES);
+                }
+                3 => exempt.extend_from_slice(V3_ADDED_TABLES),
+                _ => {}
+            }
             let v1_complete = EXPECTED_TABLES
                 .iter()
-                .filter(|t| {
-                    !V2_ADDED_TABLES.contains(t)
-                        && !V3_ADDED_TABLES.contains(t)
-                        && !ADDITIVE_TABLES.contains(t)
-                })
+                .filter(|t| !exempt.contains(t))
                 .all(|t| present.contains(*t));
             if !v1_complete {
                 return Err(StoreError::UnsupportedFormat {
-                    detail: "store file claims the v1 format but does \
-                             not hold the recognized schema"
-                        .into(),
+                    detail: format!(
+                        "store file claims format {version} but does not hold the recognized schema"
+                    ),
                 });
             }
             // Additive migration inside one transaction: the new tables,

@@ -1086,6 +1086,24 @@ fn run(cli: Cli) -> i32 {
                             Err(e) => store_error("retention_cleanup", e),
                         };
                     }
+                    // Single-owner maintenance: while the installation
+                    // run lease is held, explicit cleanup refuses
+                    // instead of racing the loop's sweep — the loser
+                    // reports already_running.
+                    let _lease = match RunLeaseGuard::acquire(&store, now()) {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            return emit(envelope::error_envelope(
+                                Some(envelope::query_identity(
+                                    "retention_cleanup",
+                                    &actor,
+                                    cli.idempotency_key.as_deref(),
+                                )),
+                                envelope::ErrorClass::Store,
+                                &format!("already_running: {e}"),
+                            ));
+                        }
+                    };
                     // Phase 1 (persist the bounded plan), then phase 2
                     // execute it; an interrupted run resumes the open
                     // plan and skips already-recorded entries. Bodies

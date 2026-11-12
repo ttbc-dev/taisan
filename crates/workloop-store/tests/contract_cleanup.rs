@@ -462,11 +462,44 @@ fn protected_over_limit_body_is_retained_and_admission_proceeds() {
     }
 }
 
-/// Regression (shadow review): a store stamped with the format this
-/// slice bumps from (3), created before this slice — full base schema,
-/// no reclaim-plan tables — must open and upgrade in place. Refusing
-/// it as "not the recognized schema" would lock existing installations
-/// out of their own stores.
+/// Regression (shadow review): a format-3 store missing the U2.6
+/// reclaim-plan tables upgrades in place; a stamped store that is
+/// missing an *earlier* additive table (the previous release's own
+/// format-3 schema, e.g. body_catalog) is refused instead of being
+/// silently re-created empty.
+#[test]
+fn a_stamped_store_missing_an_earlier_additive_table_is_refused() {
+    let unique = format!(
+        "taisan-cleanup-refused-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // A stamp-3 file without its own format-3 catalogue is not a
+        // truncated v3 store to be repaired — it is a corrupt or
+        // foreign file and must be refused untouched, not silently
+        // re-created empty.
+        conn.execute_batch(
+            "DROP TABLE reclaim_plans; DROP TABLE reclaim_plan_entries; \
+             DROP TABLE body_catalog; PRAGMA user_version=3;",
+        )
+        .unwrap();
+    }
+    let refused = SqliteStore::open(&db, 1);
+    assert!(refused.is_err(), "a corrupt stamp-3 store must be refused");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
     let unique = format!(
@@ -517,6 +550,75 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
 /// authorize a size_pressure reclaim of a young unpinned body: the
 /// verified category total is under the cap, so no plan is written
 /// and the body stays `present`.
+/// An interrupted run resumes with its phase-1 operator context
+/// intact: the reopened plan carries the skipped and held lists it
+/// was created with, and the lists are dropped once the plan completes.
+#[test]
+fn resumed_plan_keeps_the_phase_one_skipped_and_held_lists() {
+    let fixture = Fixture::new("resume-evidence");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let rel_big = fixture.write_body("big", 20);
+    let rel_planned = fixture.write_body("planned", 10);
+    let rel_pin = fixture.write_body("pin", 10);
+    register(&store, "big", NOW - 10_000, 20, PinState::None, &rel_big);
+    register(
+        &store,
+        "planned",
+        NOW - 9_000,
+        10,
+        PinState::None,
+        &rel_planned,
+    );
+    register(&store, "pin", NOW - 8_000, 10, PinState::Active, &rel_pin);
+
+    let plan = store
+        .reclaim_plan_create(
+            &settings(Some(100), None),
+            &PlanBounds {
+                max_bodies: 256,
+                max_bytes: 10,
+            },
+            &fixture.root,
+            &[],
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(plan.entries.len(), 1);
+    assert_eq!(
+        plan.skipped.len(),
+        1,
+        "over-bound body is skipped, not planned"
+    );
+    assert_eq!(plan.held.len(), 1, "pinned otherwise-eligible body is held");
+
+    // A resume (reopen / create-after-crash) recovers the same lists.
+    let reopened = store.reclaim_plan_open().unwrap().unwrap();
+    assert_eq!(reopened.skipped.len(), 1);
+    assert_eq!(reopened.held.len(), 1);
+    let r2 = store
+        .reclaim_plan_create(
+            &settings(Some(100), None),
+            &bounds(),
+            &fixture.root,
+            &[],
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(
+        r2.skipped.len(),
+        1,
+        "resume must not lose the phase-1 lists"
+    );
+    assert_eq!(r2.held.len(), 1);
+
+    let execution = store
+        .reclaim_plan_execute(&settings(Some(100), None), &fixture.root, &[], 3, NOW)
+        .unwrap()
+        .unwrap();
+    assert!(execution.completed);
+    assert!(store.reclaim_plan_open().unwrap().is_none());
+}
+
 #[test]
 fn phantom_bytes_cannot_authorize_size_pressure() {
     let fixture = Fixture::new("phantom");
