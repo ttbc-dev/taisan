@@ -8,3 +8,4 @@ pub mod projection;
 pub mod stage;
 pub mod store;
 pub mod work;
+pub mod worker;

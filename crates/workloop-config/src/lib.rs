@@ -132,6 +132,13 @@ pub struct Installation {
     pub capacity: u32,
     #[serde(default)]
     pub worker_argv: Vec<String>,
+    /// Name of the approved isolation profile the WorkerRequest export
+    /// records and the launch binds (U4.2). Absent names the approved
+    /// reference profile. Enforcement of the profile's egress/namespace
+    /// settings is the U2.3/U2.4 slice; absent means no override, not
+    /// no profile.
+    #[serde(default)]
+    pub worker_isolation_profile: Option<String>,
     #[serde(default = "default_workspace_root")]
     pub workspace_root: String,
     #[serde(default)]
@@ -444,6 +451,7 @@ fn load_or_create_with(
         required_checks: vec![],
         capacity: default_capacity(),
         worker_argv: vec![],
+        worker_isolation_profile: None,
         workspace_root: default_workspace_root(),
         allowed_effects: None,
         budget: None,

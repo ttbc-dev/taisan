@@ -176,3 +176,45 @@ fn tick_report_events_round_trip_through_the_audit_log() {
     assert_eq!(store.count_events("tick_report").unwrap(), 1);
     assert_eq!(store.count_events("effect").unwrap(), 0);
 }
+
+#[test]
+fn maintenance_lease_is_independent_of_the_driver_lease() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let driver = owner(201, "Mon Jan  1 00:00:00 2024", "nonce-driver");
+    let maint_a = owner(202, "Mon Jan  1 00:00:00 2024", "nonce-maint-a");
+    let maint_b = owner(203, "Mon Jan  1 00:00:00 2024", "nonce-maint-b");
+
+    store.acquire_run_lease(&driver, alive, NOW).unwrap();
+    // The maintenance lease is granted while the driver lease is held.
+    store
+        .acquire_maintenance_lease(&maint_a, alive, NOW)
+        .unwrap();
+    // A second maintenance writer is refused; the driver lease is untouched.
+    match store.acquire_maintenance_lease(&maint_b, alive, NOW) {
+        Err(RunLeaseError::Held { owner_pid }) => assert_eq!(owner_pid, 202),
+        other => panic!("expected lock.held, got {other:?}"),
+    }
+    store.release_maintenance_lease(&maint_a).unwrap();
+    store
+        .acquire_maintenance_lease(&maint_b, alive, NOW)
+        .unwrap();
+    // A second driver is still refused while the driver lease is held.
+    match store.acquire_run_lease(
+        &owner(204, "Mon Jan  1 00:00:00 2024", "nonce-driver2"),
+        alive,
+        NOW,
+    ) {
+        Err(RunLeaseError::Held { owner_pid }) => assert_eq!(owner_pid, 201),
+        other => panic!("expected lock.held, got {other:?}"),
+    }
+    // Maintenance release does not disturb the driver lease either.
+    store.release_maintenance_lease(&maint_b).unwrap();
+    store.release_run_lease(&driver).unwrap();
+    store
+        .acquire_run_lease(
+            &owner(204, "Mon Jan  1 00:00:00 2024", "nonce-driver2"),
+            alive,
+            NOW,
+        )
+        .unwrap();
+}
