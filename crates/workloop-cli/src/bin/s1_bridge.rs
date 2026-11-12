@@ -787,11 +787,31 @@ fn reconcile_push(
                 "--jq",
                 ".status",
             ])
-            .ok()
             .as_deref()
             {
-                Some("ahead") | Some("identical") => Some(RefRelation::Ancestor),
-                _ => None,
+                // The remote provably contains the pushed commit.
+                Ok("ahead") | Ok("identical") => Some(RefRelation::Ancestor),
+                // A readable negative answer proves the remote does not
+                // contain the pushed commit — only this drives the
+                // guarded re-attempt below.
+                Ok("behind") | Ok("diverged") => None,
+                // A failed or unrecognized compare read is unavailable
+                // evidence, never a reason to write: record the pass
+                // unverified and leave the remote untouched.
+                _ => {
+                    emit_result_keyed(
+                        ctx,
+                        intent,
+                        key,
+                        HostActionStatus::Unknown {
+                            reason:
+                                "compare read-back unavailable or unrecognized; effect unverified"
+                                    .into(),
+                        },
+                        vec![],
+                    );
+                    return Ok(());
+                }
             }
         };
         if let Some(relation) = relation {

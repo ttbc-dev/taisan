@@ -18,7 +18,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
-use workloop_core::work::{WorkloopConfig, handle_command};
+use workloop_core::work::{WorkloopConfig, handle_command, handle_observation};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -1129,4 +1129,152 @@ fn reconcile_bound_advances_past_unparseable_remote_reads() {
         "one receipt per reconcile pass plus the bound-exhaustion receipt"
     );
     assert!(fx.pushes().is_empty());
+}
+
+/// A compare read that fails — or answers anything but a readable
+/// containment status — is unavailable evidence: the pass records
+/// `unknown` and leaves the remote untouched. Only a readable
+/// `diverged`/`behind` may drive the guarded re-attempt; an
+/// unreadable read can never license a write.
+#[test]
+fn an_unreadable_compare_read_never_drives_a_push() {
+    let fx = Fixture::new("compare-down");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-compare-down");
+    fx.seed_workspace(&work_id);
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Unknown {
+            reason: "push response lost".into(),
+        },
+        vec![],
+    );
+    // The remote ref resolves to a different head; the compare read
+    // then fails outright — no containment answer at all.
+    fx.write_fake("prior_ref", &format!("cccc3333\trefs/heads/{BRANCH}\n"));
+    fs::remove_file(fx.fake.join("compare_status")).unwrap();
+    for _ in 0..2 {
+        fx.tick(&[]);
+    }
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "unavailable evidence holds the intent unknown: {:?}",
+        fx.intent_status(&action_id)
+    );
+    assert!(
+        fx.pushes().is_empty(),
+        "a failed compare read never drives a guarded write"
+    );
+}
+
+/// An `applied` intent re-arms only on a receipt that evidences the
+/// drift itself: a bare `unknown` HostActionResult — even from the
+/// intent's bound actor — is a stale transport record, never a
+/// downgrade. A `RefPublished{Diverged}` fact for the intent's own
+/// branch and produced revision is the re-arm.
+#[test]
+fn an_unknown_receipt_without_drift_evidence_never_rearms() {
+    let fx = Fixture::new("no-drift-rearm");
+    let (work_id, _) = submit(&fx.store(), &fx.config(), "k-no-drift-rearm");
+    let action_id = insert_intent(
+        &fx.store(),
+        &work_id,
+        push_action(),
+        HostActionStatus::Applied,
+        vec![ref_published()],
+    );
+    let bound_actor = HostActorRef {
+        host: HostInstanceId::trusted("github.test"),
+        actor: HostActorId::trusted("pub-agent"),
+    };
+    let deliver = |event_id: &str, effects: Vec<NormalizedEffectFact>| {
+        let obs = Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Host {
+                    host: HostInstanceId::trusted("github.test"),
+                },
+                source: "github.s1-bridge".into(),
+                event_id: event_id.into(),
+            }),
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            observed_unix_seconds: NOW,
+            fact: ObservationFact::HostActionResult {
+                action_id: action_id.clone(),
+                authenticated_actor: Some(bound_actor.clone()),
+                status: HostActionStatus::Unknown {
+                    reason: "transport hiccup".into(),
+                },
+                effects,
+            },
+        };
+        handle_observation(&fx.store(), &fx.config(), &obs, NOW).unwrap();
+    };
+    // A stale transport-unknown carries no drift fact: the settled
+    // intent sticks.
+    deliver("stale-unknown-1", vec![]);
+    // A diverged fact for a *different* branch is not this intent's
+    // drift either.
+    deliver(
+        "stale-unknown-2",
+        vec![NormalizedEffectFact::RefPublished {
+            repository: RepositoryRef::new(
+                HostInstanceId::trusted("github.test"),
+                RepositoryId::trusted("owner/repo"),
+            ),
+            branch: "work/other".into(),
+            produced: CommitRevision::new(
+                RepositoryRef::new(
+                    HostInstanceId::trusted("github.test"),
+                    RepositoryId::trusted("owner/repo"),
+                ),
+                "produced-digest",
+            )
+            .unwrap(),
+            observed: CommitRevision::new(
+                RepositoryRef::new(
+                    HostInstanceId::trusted("github.test"),
+                    RepositoryId::trusted("owner/repo"),
+                ),
+                "cccc3333",
+            )
+            .unwrap(),
+            relation: RefRelation::Diverged,
+        }],
+    );
+    assert_eq!(
+        fx.intent_status(&action_id),
+        HostActionStatus::Applied,
+        "no drift evidence, no re-arm"
+    );
+    // The real drift fact — this intent's branch, produced revision,
+    // relation diverged — re-arms it.
+    let mut drift = ref_published();
+    if let NormalizedEffectFact::RefPublished {
+        relation, observed, ..
+    } = &mut drift
+    {
+        *relation = RefRelation::Diverged;
+        *observed = CommitRevision::new(
+            RepositoryRef::new(
+                HostInstanceId::trusted("github.test"),
+                RepositoryId::trusted("owner/repo"),
+            ),
+            "cccc3333",
+        )
+        .unwrap();
+    }
+    deliver("real-drift", vec![drift]);
+    assert!(
+        matches!(
+            fx.intent_status(&action_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "the drift fact re-arms: {:?}",
+        fx.intent_status(&action_id)
+    );
 }
