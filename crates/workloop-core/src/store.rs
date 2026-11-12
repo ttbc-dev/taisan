@@ -7,6 +7,7 @@ use crate::identity::{
     RepositoryRef, StoreId,
 };
 use crate::observation::{HostActionStatus, NormalizedEffectFact, Observation};
+use crate::worker::WorkerRequestExport;
 
 /// A write `work` asks the store to apply inside the caller's transaction.
 /// The store maps each variant to constrained SQL; it never interprets
@@ -166,6 +167,21 @@ pub enum Effect {
     /// the handed-off commit. Unique per `(artifact_id, requirement)`.
     InsertVerificationResult {
         result: VerificationResult,
+    },
+    /// The durable WorkerRequest export for one Invocation. Written
+    /// before any process is launched; a launch that fails or never
+    /// returns leaves the export behind for reconciliation.
+    InsertWorkerRequestExport {
+        export: WorkerRequestExport,
+    },
+    /// Binds the recorded export's `request_id` to the spawned process
+    /// identity, in the same transaction that records the running
+    /// Invocation. Binding a missing export is a `ConstraintConflict` —
+    /// the export is committed before the launch, so its absence here
+    /// means the record and the launch disagree.
+    BindWorkerRequestExport {
+        request_id: String,
+        process_identity: String,
     },
 }
 
@@ -453,6 +469,16 @@ pub trait ReadView {
 
     /// The durable handoff record for one artifact id; `None` = absent.
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError>;
+    /// The durable WorkerRequest export recorded for a deterministic
+    /// request identity; `None` = absent. The supervisor writes this
+    /// binding at launch; callers (tests today, lost-start reconciliation
+    /// later) read it back to resolve the spawned writer. The running
+    /// Invocation row remains the primary reconciliation key; this binding
+    /// is the durable audit record of the launch.
+    fn worker_request_export(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<WorkerRequestExport>, StoreError>;
     /// The first recorded handoff row for an Invocation; an Invocation
     /// may carry one handoff per required artifact.
     fn handoff_for_invocation(

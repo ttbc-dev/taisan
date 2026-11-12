@@ -18,6 +18,42 @@ authorization under the [implementation start gate](../design-closure.md#impleme
 | [seeded-issue.md](seeded-issue.md) | The deterministic seeded-issue definition and the fixture procedure that produces it, including the label rule that keeps seeded inputs out of every automation lane |
 | [evidence-checklist.md](evidence-checklist.md) | The criterion-to-evidence checklist: every S1 step and abnormal-input row mapped to the recorded identities and receipts a run must retain, split into success / Attention / recovery variants |
 
+## Machine-readable fixtures and preflight
+
+The prose above is paired with three fixture files that carry the
+checkable fields:
+
+| Fixture | Contents |
+| --- | --- |
+| [`fixtures/s1/installation-spec.json`](../../fixtures/s1/installation-spec.json) | Sole-repository allowlist, credential reference (never a value), reviewer and Worker runtime identities, pinned material revision and configuration identity |
+| [`fixtures/s1/seeded-issue.json`](../../fixtures/s1/seeded-issue.json) | Deterministic title/body templates, the empty label set and label policy, verification argv, and the expected outcome for each `success`, `Attention`, and `recovery` variant |
+| [`fixtures/s1/evidence-checklist.json`](../../fixtures/s1/evidence-checklist.json) | Every S1 criterion row with its variant assignment, exact revision/config values, Work/Execution/Invocation/action identities, and required evidence |
+
+`python3 scripts/s1/check-prerequisites.py` validates the install-spec
+fields (allowlist, credential reference, reviewer identity, revision,
+configuration, **capability/required-check/budget content**) and all
+three materials, fails closed on any missing or invalid entry, and
+never executes the live scenario. Binding identities that only a
+read-only host/store interaction can resolve are carried as explicit
+unresolved references: the shipped preparation fixture reports
+`status: prepared` with `installation_ready: false`, while a fully
+resolved install spec reports `status: ok`. Resolving those late-bound
+identities does not stale the prepared checklist, because its exact
+configuration identity pins the declared configuration (host, repository,
+adapter, contract, capabilities, required checks, allowed effects, and
+budget) and leaves the store identity to the execution evidence. A
+change to the declared configuration still fails closed until the
+checklist is regenerated. Neither result is execution permission, and
+neither is live evidence. The preflight also recomputes
+the sha256 fixture content digest and fails closed when the record in
+`docs/evidence/u8.1.md` is missing or no longer matches, so neither
+deleting the record nor editing a fixture can leave the evidence digest
+silently stale. The retained
+scenario-bridge rehearsals (`docs/evidence/u8.2.md`, `u8.3.md`) are
+recorded separately from the S1 target profile; their adapter, reviewer,
+credential-reference and `host_write` values are cross-checked in their
+exact recorded forms against those documents.
+
 ## Recorded decisions (owner, 2026-11-09)
 
 - **Isolated test repository**: `shimpeiws/coding-worker-smoke`
