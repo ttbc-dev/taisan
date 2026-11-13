@@ -1923,6 +1923,41 @@ fn an_empty_review_stream_seals_a_complete_round_and_passes_the_review_lane() {
         ExecutionState::Succeeded,
         "a complete-empty round passes the enabled review lane"
     );
+
+    // A head move: the empty stream at the new head records under its
+    // own identity instead of colliding with the recorded one, and the
+    // superseded head's complete-empty evidence stays.
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), change.change_request.as_str(), "head-2");
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 20)
+        .unwrap();
+    let moved = observations(&store, &work_id);
+    assert!(
+        moved.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-2" && occurrences.is_empty()
+        )),
+        "the empty stream records again at the new head under its own identity"
+    );
+    assert!(
+        moved.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-1" && occurrences.is_empty()
+        )),
+        "the superseded head's complete-empty evidence stays"
+    );
 }
 
 #[test]
