@@ -170,9 +170,14 @@ the exercised slice:
 | `u46c_interrupted_export_import_recovers_under_changed_config_without_duplicate_artifact_ids` | WS-11: two real fixture writers finish under the prior selection, the configuration changes, and the restarted supervisor walks the [crash-recovery table](worker-protocol.md#crash-recovery) — no export row, truncated bundle, interrupted import with leftover quarantine, `imported` row without a ref, ref present with the row still `imported` — each window recovering to `acknowledged` with exactly one artifact ID (the repository's `refs/taisan/artifacts/` set is asserted after every window and after a final full pass). A second artifact whose workspace was lost before acknowledgement converges on `recovery_exhausted` at exactly the configured bound, never acknowledged and never minting a ref. Recovery under the changed configuration launches no worker. |
 | `u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config` | WS-11/WS-01: a real fixture writer launched under the prior selection finishes in a git workspace and the Execution waits mid-Execution when `worker_argv` changes and the supervisor restarts. The restarted supervisor recollects the artifact to `acknowledged`, records the declared verification `Pass` on the exact handed-off commit, and leaves the workspace `.git`, the managed work branch, and the handoff repository's produced closure intact through the verified handoff — while the request binding never moves. |
 
-Two named checks guard the evidence machinery itself:
+Three named checks guard the evidence machinery itself:
 `u46c_revision_stamp_is_fail_closed` (a stamp is either two full
 commit ids over a pristine checkout or no stamp at all — never a
-placeholder) and `u46c_retained_record_carries_the_closed_field_set`
+placeholder), `u46c_retained_record_carries_the_closed_field_set`
 (the record carries exactly the closed U4.6 field set, the closed
-claim class, and every binding field on each adapter-selection entry).
+claim class, and every binding field on each adapter-selection entry),
+and `u46c_evidence_record_cites_the_tested_revision` (the evidence
+record names full tested/base commit ids, transcribes every retained
+scenario record under that tested revision, and verifies the cited
+commit contains the exercised suite and is on the branch history to
+`HEAD`).
