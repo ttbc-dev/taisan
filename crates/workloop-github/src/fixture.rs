@@ -151,10 +151,23 @@ pub struct FixtureGithub {
     /// `change_request_id` → the actor the remote attributes its head
     /// to (the opener or the last pusher).
     change_actors: BTreeMap<String, HostActorRef>,
+    /// `change_request_id` → the actor that created the change request.
+    /// Recorded when the change is registered or opened and never
+    /// rewritten by a later head move — the stable attribution a
+    /// lost-receipt create reconciles from, while [`Self::change_actors`]
+    /// keeps tracking whoever moved the head last for reads.
+    change_openers: BTreeMap<String, HostActorRef>,
     /// `change_request_id` → the full scoped ref, learned at open or
     /// registration time so raw-id mutators can bump the scoped
     /// subject version.
     change_refs: BTreeMap<String, ChangeRequestRef>,
+    /// `change_request_id` → `(source_branch, target_branch)` recorded
+    /// at open — the tuple a reconcile read matches on when the
+    /// remote-issued id was never captured in a receipt.
+    change_sources: BTreeMap<String, (String, String)>,
+    /// `change_request_id` → the actor credited with the latest stored
+    /// metadata write (the opener at registration, then each updater).
+    meta_actors: BTreeMap<String, HostActorRef>,
     /// `(change_request_id, check name)` → the remote's check-run
     /// record.
     checks: BTreeMap<(String, String), CheckRun>,
@@ -166,9 +179,9 @@ pub struct FixtureGithub {
     /// `thread_id` → the remote's thread record: resolved state and
     /// the posted reply stream.
     threads: BTreeMap<String, RemoteThread>,
-    /// `change_request_id`s the remote currently reports ready
-    /// (non-draft).
-    ready_changes: std::collections::BTreeSet<String>,
+    /// `change_request_id` → the actor credited with the ready
+    /// (non-draft) transition. Absent = the remote reports draft.
+    ready_actors: std::collections::BTreeMap<String, HostActorRef>,
     /// Operation names the host's capability map does not contain:
     /// attempts report `unsupported`, distinctly from any permission
     /// verdict.
@@ -208,6 +221,11 @@ pub struct FixtureGithub {
     next_number: BTreeMap<String, u64>,
     /// The write history, for test assertions.
     applied: Vec<String>,
+    /// Test-armed kill switch: the next attempt that lands its remote
+    /// mutation "dies" before any receipt is persisted — the durable
+    /// record stays `pending` while the remote keeps the effect, and
+    /// the drain stops as a dead worker's would. One-shot.
+    crash_next_apply: bool,
     /// When installed, every pending intent's recorded credential
     /// binding is resolved and authenticated before its write — the
     /// adapter-boundary credential gate. Absent a book the fixture is
@@ -225,6 +243,10 @@ enum AttemptOutcome {
     CredentialBlocked(&'static str),
     /// The adapter attempted the write at the host.
     Attempted,
+    /// The remote mutation landed and the worker "died" before the
+    /// receipt could persist — the test-armed crash point between
+    /// apply and receipt-write.
+    Crashed,
 }
 
 /// What the synthetic remote reports for one source issue read.
@@ -258,6 +280,10 @@ pub struct ReviewRecord {
     /// The body the remote stored — what a fresh read of the review
     /// returns for the receipt's digest.
     pub body: String,
+    /// The object id the review was posted against: a review is bound
+    /// to the revision it reviewed, so the remote can distinguish a
+    /// review on an older head from the effect a later intent bound.
+    pub head: String,
 }
 
 /// One comment the remote stored.
@@ -268,6 +294,9 @@ pub struct PostedComment {
     /// The remote-issued comment identity — the read-back object id.
     pub comment_id: String,
     pub actor: HostActorRef,
+    /// The intent marker the posting carried — the idempotence key a
+    /// reconcile read matches on.
+    pub marker: String,
     pub body: String,
 }
 
@@ -277,8 +306,11 @@ pub struct RemoteThread {
     /// The change the thread hangs on.
     pub change_id: String,
     pub resolved: bool,
-    /// Posted replies, in order: `(reply_id, actor, body)`.
-    pub replies: Vec<(String, HostActorRef, String)>,
+    /// The actor the remote credits with the resolution — `None` while
+    /// the thread is open.
+    pub resolved_by: Option<HostActorRef>,
+    /// Posted replies, in order: `(reply_id, actor, marker, body)`.
+    pub replies: Vec<(String, HostActorRef, String, String)>,
 }
 
 /// What one typed `read` resolved against the synthetic remote: the
@@ -360,6 +392,50 @@ pub struct CredentialBlock {
     pub action_id: String,
     /// The `credential.*` failure class.
     pub code: &'static str,
+}
+
+/// What one reconcile pass did against the outstanding intents:
+/// per-pass counts only — a `still_unknown` intent is re-examined by
+/// the next pass and counted there too.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Outstanding in-scope intents the pass read against the remote.
+    /// Reading consumes the per-tick item budget the same way a write
+    /// attempt does.
+    pub examined: usize,
+    /// Intents the remote evidence settled `applied` — the receipt
+    /// records the remote's attribution and normalized facts.
+    pub applied: usize,
+    /// `unknown` intents a definitive-absence read settled `failed`.
+    pub failed: usize,
+    /// `unknown` intents the pass left `unknown` — the read was
+    /// indeterminate or the evidence did not match the intent.
+    pub still_unknown: usize,
+    /// Outstanding in-scope intents not examined because the bound
+    /// stopped the pass.
+    pub deferred: Vec<String>,
+    /// Intents whose recorded credential binding failed resolution or
+    /// actor verification during the pass; each stays outstanding
+    /// with its `credential.*` class recorded for the repair path.
+    pub credential_blocked: Vec<CredentialBlock>,
+}
+
+/// What one read-only comparison of an intent's recorded effect
+/// against the remote establishes — the tri-state every verdict in a
+/// reconcile or pre-write pass reduces to.
+enum ObservedEffect {
+    /// The remote shows the effect the intent recorded, attributed to
+    /// the actor the remote reports, with the normalized fact a fresh
+    /// read derives.
+    Present {
+        actor: HostActorRef,
+        fact: Box<NormalizedEffectFact>,
+    },
+    /// The remote definitively shows the effect did not land.
+    Absent,
+    /// The read establishes neither presence nor absence — the intent
+    /// stays outstanding.
+    Indeterminate { reason: String },
 }
 
 impl FixtureGithub {
@@ -696,8 +772,14 @@ impl FixtureGithub {
         });
     }
 
-    /// Test control: append one review to a change's review stream.
+    /// Test control: append one review to a change's review stream,
+    /// bound to the change's current head.
     pub fn add_review(&mut self, change: &ChangeRequestRef, review_id: &str, actor: &HostActorRef) {
+        let head = self
+            .changes
+            .get(change.change_request.as_str())
+            .cloned()
+            .unwrap_or_default();
         self.reviews
             .entry(change.change_request.as_str().to_string())
             .or_default()
@@ -705,6 +787,32 @@ impl FixtureGithub {
                 review_id: review_id.to_string(),
                 actor: actor.clone(),
                 body: String::new(),
+                head,
+            });
+        self.bump(&ReadSubject::Review {
+            change: change.clone(),
+        });
+    }
+
+    /// Test control: append one review carrying `body`, attributed to
+    /// `actor` and bound to revision `head` — the remote record a
+    /// reconcile read adopts when the review's receipt was lost.
+    pub fn seed_review(
+        &mut self,
+        change: &ChangeRequestRef,
+        review_id: &str,
+        actor: &HostActorRef,
+        body: &str,
+        head: &str,
+    ) {
+        self.reviews
+            .entry(change.change_request.as_str().to_string())
+            .or_default()
+            .push(ReviewRecord {
+                review_id: review_id.to_string(),
+                actor: actor.clone(),
+                body: body.to_string(),
+                head: head.to_string(),
             });
         self.bump(&ReadSubject::Review {
             change: change.clone(),
@@ -723,6 +831,102 @@ impl FixtureGithub {
         );
     }
 
+    /// Test control: mark a thread resolved, credited to `actor` — the
+    /// remote post-state a reconcile read settles from when the
+    /// resolve's receipt was lost.
+    pub fn set_thread_resolved(&mut self, thread_id: &str, actor: &HostActorRef) {
+        if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread.resolved = true;
+            thread.resolved_by = Some(actor.clone());
+        }
+    }
+
+    /// Test control: seed a comment the remote attributes to `actor`
+    /// carrying `marker` — the remote record a reconcile read adopts
+    /// when the comment's receipt was lost.
+    pub fn seed_comment(
+        &mut self,
+        change: &ChangeRequestRef,
+        comment_id: &str,
+        actor: &HostActorRef,
+        marker: &str,
+        body: &str,
+    ) {
+        self.comments.push(PostedComment {
+            change_id: change.change_request.as_str().to_string(),
+            comment_id: comment_id.to_string(),
+            actor: actor.clone(),
+            marker: marker.to_string(),
+            body: body.to_string(),
+        });
+    }
+
+    /// Test control: register a change the remote attributes to
+    /// `actor`, opened from `source_branch` onto `target_branch` —
+    /// the remote record a reconcile read adopts when the create's
+    /// receipt was lost.
+    pub fn register_change(
+        &mut self,
+        change: &ChangeRequestRef,
+        source_branch: &str,
+        target_branch: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        self.set_change_head(change, head, actor);
+        self.change_sources.insert(
+            change.change_request.as_str().to_string(),
+            (source_branch.to_string(), target_branch.to_string()),
+        );
+        self.change_openers
+            .insert(change.change_request.as_str().to_string(), actor.clone());
+        self.meta_actors
+            .insert(change.change_request.as_str().to_string(), actor.clone());
+    }
+
+    /// Test control: store a change's metadata fields and the actor
+    /// the remote credits with writing them — the remote post-state a
+    /// reconcile read of an update intent settles from.
+    pub fn set_change_meta(
+        &mut self,
+        change: &ChangeRequestRef,
+        title: Option<&str>,
+        body: Option<&str>,
+        actor: &HostActorRef,
+    ) {
+        let id = change.change_request.as_str().to_string();
+        let meta = self.change_meta.entry(id.clone()).or_default();
+        if title.is_some() {
+            meta.0 = title.map(str::to_string);
+        }
+        if body.is_some() {
+            meta.1 = body.map(str::to_string);
+        }
+        self.meta_actors.insert(id, actor.clone());
+        self.bump(&ReadSubject::Pr {
+            change: change.clone(),
+        });
+    }
+
+    /// Test control: arm the kill switch — the next attempt that lands
+    /// its remote mutation returns [`AttemptOutcome::Crashed`] before
+    /// any receipt is persisted. Models a worker killed between the
+    /// host write and the durable receipt-write: the intent stays
+    /// `pending`, the remote keeps the effect, and the drain stops.
+    pub fn set_crash_after_apply(&mut self) {
+        self.crash_next_apply = true;
+    }
+
+    /// Test control: mark a change ready (non-draft), credited to
+    /// `actor` — the remote post-state a reconcile read settles from.
+    pub fn set_ready(&mut self, change: &ChangeRequestRef, actor: &HostActorRef) {
+        self.ready_actors
+            .insert(change.change_request.as_str().to_string(), actor.clone());
+        self.bump(&ReadSubject::Pr {
+            change: change.clone(),
+        });
+    }
+
     /// The remote's thread record, for assertions on the post-effect
     /// state.
     pub fn thread(&self, thread_id: &str) -> Option<&RemoteThread> {
@@ -731,7 +935,7 @@ impl FixtureGithub {
 
     /// Whether the remote reports the change as ready (non-draft).
     pub fn is_ready(&self, change_id: &str) -> bool {
-        self.ready_changes.contains(change_id)
+        self.ready_actors.contains_key(change_id)
     }
 
     /// Test control: drop `operation` from the host's capability map —
@@ -1049,6 +1253,27 @@ impl FixtureGithub {
                     });
                 }
                 AttemptOutcome::Skipped => {}
+                // The test-armed crash point: the remote mutation
+                // landed but the worker "died" before the receipt —
+                // the intent stays `pending` and the drain stops the
+                // way a dead worker's would, the untouched remainder
+                // reported like a bound-exhausted remainder.
+                AttemptOutcome::Crashed => {
+                    report.attempted += 1;
+                    report.deferred = store.transact(|tx| {
+                        Ok(tx
+                            .action_intents()?
+                            .into_iter()
+                            .filter(|i| {
+                                i.status == HostActionStatus::Pending
+                                    && !attempted.contains(&i.action_id)
+                                    && in_scope(i)
+                            })
+                            .map(|i| i.action_id)
+                            .collect())
+                    })?;
+                    break;
+                }
             }
             let status = store.transact(|tx| {
                 Ok(tx
@@ -1067,6 +1292,635 @@ impl FixtureGithub {
             }
         }
         Ok(report)
+    }
+
+    /// Read-only reconciliation of every outstanding (`pending` or
+    /// `unknown`) outbox intent, in order. See
+    /// [`Self::reconcile_outbox_bounded`].
+    pub fn reconcile_outbox(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        now_unix_seconds: i64,
+    ) -> Result<ReconcileReport, StoreError> {
+        self.reconcile_outbox_bounded(
+            store,
+            config,
+            &mut || now_unix_seconds,
+            None,
+            None,
+            usize::MAX,
+        )
+    }
+
+    /// The bounded, optionally Work-scoped reconcile pass: compare each
+    /// outstanding intent's recorded effect against the remote's
+    /// current state and feed the verdict through the same
+    /// `host_action_result` receipt path a write attempt uses.
+    ///
+    /// The pass performs host reads only — remote state is mutated
+    /// solely inside [`Self::attempt`]. An observed effect settles
+    /// `applied` with the remote's own attribution and normalized
+    /// facts (never on this adapter's say-so), a definitive-absence
+    /// read settles an `unknown` intent `failed` — a `pending` intent
+    /// may simply not have been attempted yet, so absence leaves it
+    /// pending — and an indeterminate read changes nothing: the
+    /// intent stays outstanding for a later read. Reconciliation is
+    /// never a substitute for a write grant: the `host_write` check
+    /// stays in [`Self::attempt`] alone. Intents bound to another
+    /// host instance are left for that adapter.
+    pub fn reconcile_outbox_bounded(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError> {
+        let mut report = ReconcileReport::default();
+        let now = clock();
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
+        let outstanding = |i: &HostActionIntent| {
+            matches!(
+                i.status,
+                HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+            )
+        };
+        let mut examined = std::collections::HashSet::new();
+        loop {
+            if report.examined >= max_items || deadline.is_some_and(|d| clock() >= d) {
+                report.deferred = store.transact(|tx| {
+                    Ok(tx
+                        .action_intents()?
+                        .into_iter()
+                        .filter(|i| {
+                            outstanding(i) && !examined.contains(&i.action_id) && in_scope(i)
+                        })
+                        .map(|i| i.action_id)
+                        .collect())
+                })?;
+                break;
+            }
+            let next = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| outstanding(i) && !examined.contains(&i.action_id) && in_scope(i)))
+            })?;
+            let Some(intent) = next else { break };
+            let action_id = intent.action_id.clone();
+            examined.insert(action_id.clone());
+            // Not this instance's intent: leave it outstanding for the
+            // adapter bound to the recorded host — reconciliation never
+            // migrates an effect across host instances.
+            if self
+                .bound_host
+                .as_ref()
+                .is_some_and(|bound| *bound != intent.host)
+            {
+                continue;
+            }
+            // The same adapter-boundary credential gate apply uses: the
+            // intent's recorded role binding resolves and authenticates
+            // under the actor authorized at intent time — a rotated
+            // credential that authenticates as another actor cannot
+            // rebind or settle the outstanding action.
+            let mut verified_actor: Option<HostActorRef> = None;
+            if let Some(book) = &self.credentials {
+                let reference = store.transact(|tx| {
+                    Ok(tx.work(&intent.work_id)?.and_then(|work| {
+                        work.binding
+                            .actors
+                            .iter()
+                            .find(|binding| binding.role == intent.role)
+                            .map(|binding| binding.credential_ref.clone())
+                    }))
+                })?;
+                match bind_credential(reference.as_ref(), &intent.actor, book, &|credential| {
+                    book.authenticate(credential)
+                }) {
+                    Ok(actor) => verified_actor = Some(actor),
+                    Err(error) => {
+                        report.credential_blocked.push(CredentialBlock {
+                            action_id,
+                            code: error.code(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            report.examined += 1;
+            let reader = verified_actor.unwrap_or_else(|| intent.actor.clone());
+            let work_id = intent.work_id.clone();
+            let execution_id = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(&work_id)?
+                    .into_iter()
+                    .max_by_key(|execution| execution.ordinal)
+                    .map(|execution| execution.id))
+            })?;
+            let receipt = |actor: Option<HostActorRef>,
+                           status: HostActionStatus,
+                           effects: Vec<NormalizedEffectFact>| {
+                Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: execution_id.clone(),
+                    fact: ObservationFact::HostActionResult {
+                        action_id: action_id.clone(),
+                        authenticated_actor: actor,
+                        status,
+                        effects,
+                    },
+                    observed_unix_seconds: now,
+                }
+            };
+            match self.observe_effect(&intent) {
+                ObservedEffect::Present { actor, fact } => {
+                    // The remote's attribution authenticates the
+                    // receipt: an effect the remote credits to another
+                    // actor is recorded `unknown{actor_mismatch}` by
+                    // the durable ingest path, never `applied`. That
+                    // verdict is non-terminal, so the intent stays
+                    // outstanding — re-observing the identical
+                    // attribution and fact already on the record adds
+                    // nothing, and a persistently foreign-attributed
+                    // effect must not append a duplicate receipt on
+                    // every pass (reconcile receipts carry no delivery
+                    // identity, so the dedupe index never sees them).
+                    let already_recorded = matches!(
+                        &intent.status,
+                        HostActionStatus::Unknown { reason } if reason == "actor_mismatch"
+                    ) && intent.authenticated_actor.as_ref() == Some(&actor)
+                        && intent.effects.len() == 1
+                        && intent.effects[0] == *fact;
+                    if !already_recorded {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(Some(actor), HostActionStatus::Applied, vec![*fact]),
+                            now,
+                        )?;
+                    }
+                }
+                ObservedEffect::Absent => {
+                    // Absence settles only an intent that already
+                    // carries a verdict: `unknown` becomes `failed` — a
+                    // definite no-effect outcome. A `pending` intent is
+                    // possibly never attempted, so absence is not
+                    // evidence of failure.
+                    if let HostActionStatus::Unknown { .. } = intent.status {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(
+                                Some(reader.clone()),
+                                HostActionStatus::Failed {
+                                    reason: "reconcile: effect not observed".into(),
+                                },
+                                vec![],
+                            ),
+                            now,
+                        )?;
+                    }
+                }
+                ObservedEffect::Indeterminate { reason } => {
+                    // Update the record when the read's explanation
+                    // moved (e.g. the remote now attributes the
+                    // candidate differently); an unchanged reason needs
+                    // no new receipt.
+                    if let HostActionStatus::Unknown { reason: recorded } = &intent.status
+                        && recorded != &reason
+                    {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(
+                                Some(reader.clone()),
+                                HostActionStatus::Unknown { reason },
+                                vec![],
+                            ),
+                            now,
+                        )?;
+                    }
+                }
+            }
+            match store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })? {
+                Some(HostActionStatus::Applied) => report.applied += 1,
+                Some(HostActionStatus::Failed { .. }) => report.failed += 1,
+                Some(HostActionStatus::Unknown { .. }) => report.still_unknown += 1,
+                _ => {}
+            }
+        }
+        Ok(report)
+    }
+
+    /// The read-only half of reconciliation: compare `intent`'s
+    /// recorded effect against the synthetic remote's current state
+    /// and report presence, definitive absence, or indeterminacy.
+    /// Performs no mutation; every `Present` carries the actor the
+    /// remote attributes the effect to and the normalized fact a
+    /// fresh read derives.
+    fn observe_effect(&self, intent: &HostActionIntent) -> ObservedEffect {
+        let unattributable = || ObservedEffect::Indeterminate {
+            reason: "effect producer is not attributable".into(),
+        };
+        match &intent.action {
+            HostAction::PushRef {
+                branch, produced, ..
+            } => {
+                let key = (intent.repository.to_string(), branch.clone());
+                let Some(object) = self.branches.get(&key).cloned() else {
+                    return ObservedEffect::Absent;
+                };
+                let relation = if object == produced.object {
+                    RefRelation::Equal
+                } else if self.descends(&object, &produced.object) {
+                    RefRelation::Ancestor
+                } else {
+                    return ObservedEffect::Absent;
+                };
+                // The ref-mover record attributes the head, not the
+                // push that introduced `produced`: on an exact match
+                // the last mover is the pusher, but once a racing
+                // actor moved the branch on top of the landed commit,
+                // ancestry alone proves the push reached the branch
+                // and the mover says nothing about who produced it.
+                // The ancestor case therefore binds the intent's own
+                // actor — the same attribution the write path's
+                // read-back reports for identical remote state.
+                let actor = if relation == RefRelation::Equal {
+                    match self.branch_actors.get(&key).cloned() {
+                        Some(actor) => actor,
+                        None => return unattributable(),
+                    }
+                } else {
+                    intent.actor.clone()
+                };
+                let observed = if relation == RefRelation::Equal {
+                    produced.clone()
+                } else {
+                    match CommitRevision::new(intent.repository.clone(), object) {
+                        Ok(revision) => revision,
+                        Err(_) => {
+                            return ObservedEffect::Indeterminate {
+                                reason: "observed head is not a valid object id".into(),
+                            };
+                        }
+                    }
+                };
+                ObservedEffect::Present {
+                    actor,
+                    fact: Box::new(NormalizedEffectFact::RefPublished {
+                        repository: intent.repository.clone(),
+                        branch: branch.clone(),
+                        produced: produced.clone(),
+                        observed,
+                        relation,
+                    }),
+                }
+            }
+            HostAction::OpenChangeRequest {
+                source_branch,
+                target_branch,
+                ..
+            } => {
+                // The remote-issued id was never captured when the
+                // receipt was lost: match the change by its immutable
+                // (repository, source, target) identity instead.
+                let candidates: Vec<&ChangeRequestRef> = self
+                    .change_sources
+                    .iter()
+                    .filter(|(_, (source, target))| {
+                        source == source_branch && target == target_branch
+                    })
+                    .filter_map(|(id, _)| self.change_refs.get(id))
+                    .filter(|change| change.repository == intent.repository)
+                    .collect();
+                match candidates.as_slice() {
+                    [] => ObservedEffect::Absent,
+                    [change] => {
+                        let id = change.change_request.as_str();
+                        let Some(object) = self.changes.get(id) else {
+                            return ObservedEffect::Indeterminate {
+                                reason: "matching change request has no head on the remote".into(),
+                            };
+                        };
+                        let Some(actor) = self.change_openers.get(id).cloned() else {
+                            return unattributable();
+                        };
+                        match CommitRevision::new(intent.repository.clone(), object.clone()) {
+                            Ok(head) => ObservedEffect::Present {
+                                actor,
+                                fact: Box::new(NormalizedEffectFact::ChangeOpened {
+                                    change: (*change).clone(),
+                                    head,
+                                    source_branch: source_branch.clone(),
+                                    target_branch: target_branch.clone(),
+                                }),
+                            },
+                            Err(_) => ObservedEffect::Indeterminate {
+                                reason: "observed head is not a valid object id".into(),
+                            },
+                        }
+                    }
+                    _ => ObservedEffect::Indeterminate {
+                        reason: "multiple change requests match the recorded source/target".into(),
+                    },
+                }
+            }
+            HostAction::UpdateChangeRequest {
+                change,
+                expected_head,
+                title,
+                body,
+            } => {
+                let id = change.change_request.as_str();
+                // Metadata is overwriteable state: the effect is only
+                // verifiable at the head the intent bound. A moved
+                // head cannot distinguish "our update landed, then the
+                // head raced" from "never landed" — and coincidentally
+                // matching fields are not evidence enough to adopt.
+                // An intent that already recorded a verdict (`unknown`
+                // means an attempt was made and its receipt was lost)
+                // therefore stays outstanding: absence here is not
+                // definitive and presence cannot be proven. A `pending`
+                // intent has no recorded attempt, so the guarded write
+                // arbitrates instead — its stale-head refusal is the
+                // contract's verdict for a bound head that can no
+                // longer hold.
+                if self.changes.get(id).map(String::as_str) != Some(expected_head.object.as_str()) {
+                    return if matches!(intent.status, HostActionStatus::Unknown { .. }) {
+                        ObservedEffect::Indeterminate {
+                            reason: "head moved after a recorded attempt; \
+                                     landed-then-raced cannot be told from never-landed"
+                                .into(),
+                        }
+                    } else {
+                        ObservedEffect::Absent
+                    };
+                }
+                // The update's post-condition: every field the intent
+                // carried is what the remote now stores. Omitted fields
+                // are unconstrained — a PATCH never rewrites them.
+                let (stored_title, stored_body) = self.change_fields(id);
+                let applied = title
+                    .as_ref()
+                    .is_none_or(|t| stored_title.as_ref() == Some(t))
+                    && body
+                        .as_ref()
+                        .is_none_or(|b| stored_body.as_ref() == Some(b));
+                if !applied {
+                    return ObservedEffect::Absent;
+                }
+                let Some(actor) = self.meta_actors.get(id).cloned() else {
+                    return unattributable();
+                };
+                ObservedEffect::Present {
+                    actor,
+                    fact: Box::new(NormalizedEffectFact::MetadataUpdated {
+                        change: change.clone(),
+                        head: expected_head.clone(),
+                        fields_digest: workloop_core::domain::sha256_hex(
+                            "change-meta-v1",
+                            &workloop_core::domain::canonical_json(&serde_json::json!({
+                                "title": stored_title,
+                                "body": stored_body,
+                            })),
+                        ),
+                    }),
+                }
+            }
+            HostAction::PostComment {
+                change,
+                marker,
+                body,
+                ..
+            } => {
+                let marked: Vec<&PostedComment> = self
+                    .comments
+                    .iter()
+                    .filter(|comment| {
+                        comment.change_id == change.change_request.as_str()
+                            && &comment.marker == marker
+                    })
+                    .collect();
+                match marked.as_slice() {
+                    [] => ObservedEffect::Absent,
+                    [posted] if &posted.body == body => {
+                        let body_digest = workloop_core::domain::sha256_hex(
+                            "comment-v1",
+                            &workloop_core::domain::canonical_json(&serde_json::json!({
+                                "body": posted.body,
+                            })),
+                        );
+                        ObservedEffect::Present {
+                            actor: posted.actor.clone(),
+                            fact: Box::new(NormalizedEffectFact::CommentPosted {
+                                change: change.clone(),
+                                comment_id: posted.comment_id.clone(),
+                                actor: posted.actor.clone(),
+                                marker: marker.clone(),
+                                body_digest,
+                                target: None,
+                            }),
+                        }
+                    }
+                    [_] => ObservedEffect::Indeterminate {
+                        reason: "the recorded marker carries a different stored body".into(),
+                    },
+                    _ => ObservedEffect::Indeterminate {
+                        reason: "multiple comments carry the recorded marker".into(),
+                    },
+                }
+            }
+            HostAction::PublishReviewFeedback { change, head, body } => {
+                // A review is bound to the revision it was posted
+                // against: a body-identical review on an older head is
+                // not this intent's effect — only a record the remote
+                // binds to the intent's own head can settle it.
+                let candidates: Vec<&ReviewRecord> = self
+                    .reviews
+                    .get(change.change_request.as_str())
+                    .map(|records| {
+                        records
+                            .iter()
+                            .filter(|r| &r.body == body && r.head == head.object)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match candidates.as_slice() {
+                    [] => ObservedEffect::Absent,
+                    [review] => {
+                        let body_digest = workloop_core::domain::sha256_hex(
+                            "review-v1",
+                            &workloop_core::domain::canonical_json(&serde_json::json!({
+                                "body": review.body,
+                            })),
+                        );
+                        match CommitRevision::new(intent.repository.clone(), review.head.clone()) {
+                            Ok(reviewed) => ObservedEffect::Present {
+                                actor: review.actor.clone(),
+                                fact: Box::new(NormalizedEffectFact::ReviewPublished {
+                                    change: change.clone(),
+                                    review_id: review.review_id.clone(),
+                                    head: reviewed,
+                                    body_digest,
+                                }),
+                            },
+                            Err(_) => ObservedEffect::Indeterminate {
+                                reason: "the review's recorded revision is not a valid object id"
+                                    .into(),
+                            },
+                        }
+                    }
+                    _ => ObservedEffect::Indeterminate {
+                        reason: "multiple reviews carry the recorded body on the bound head".into(),
+                    },
+                }
+            }
+            HostAction::ReplyToThread {
+                change,
+                thread_id,
+                marker,
+                body,
+            } => {
+                let belongs = self
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|t| t.change_id == change.change_request.as_str());
+                let Some(thread) = self.threads.get(thread_id).filter(|_| belongs) else {
+                    return ObservedEffect::Absent;
+                };
+                let marked: Vec<&(String, HostActorRef, String, String)> = thread
+                    .replies
+                    .iter()
+                    .filter(|(_, _, m, _)| m == marker)
+                    .collect();
+                match marked.as_slice() {
+                    [] => ObservedEffect::Absent,
+                    [(reply_id, actor, _, stored_body)] if stored_body == body => {
+                        let body_digest = workloop_core::domain::sha256_hex(
+                            "reply-v1",
+                            &workloop_core::domain::canonical_json(&serde_json::json!({
+                                "body": stored_body,
+                            })),
+                        );
+                        ObservedEffect::Present {
+                            actor: actor.clone(),
+                            fact: Box::new(NormalizedEffectFact::ReplyPosted {
+                                change: change.clone(),
+                                thread_id: thread_id.clone(),
+                                marker: marker.clone(),
+                                reply_id: reply_id.clone(),
+                                body_digest,
+                            }),
+                        }
+                    }
+                    [_] => ObservedEffect::Indeterminate {
+                        reason: "the recorded marker carries a different stored body".into(),
+                    },
+                    _ => ObservedEffect::Indeterminate {
+                        reason: "multiple replies carry the recorded marker".into(),
+                    },
+                }
+            }
+            HostAction::ResolveThread {
+                change,
+                thread_id,
+                head,
+            } => {
+                let Some(thread) = self.threads.get(thread_id) else {
+                    return ObservedEffect::Absent;
+                };
+                if thread.change_id != change.change_request.as_str() || !thread.resolved {
+                    return ObservedEffect::Absent;
+                }
+                let Some(actor) = thread.resolved_by.clone() else {
+                    return unattributable();
+                };
+                let Some(object) = self.changes.get(change.change_request.as_str()).cloned() else {
+                    return ObservedEffect::Indeterminate {
+                        reason: "thread resolved but the change head is not readable".into(),
+                    };
+                };
+                let relation = if object == head.object {
+                    RefRelation::Equal
+                } else if self.descends(&object, &head.object) {
+                    RefRelation::Ancestor
+                } else {
+                    return ObservedEffect::Indeterminate {
+                        reason:
+                            "thread resolved but the bound head is not on the observed ancestry"
+                                .into(),
+                    };
+                };
+                match CommitRevision::new(intent.repository.clone(), object) {
+                    Ok(observed) => ObservedEffect::Present {
+                        actor,
+                        fact: Box::new(NormalizedEffectFact::ThreadResolved {
+                            change: change.clone(),
+                            thread_id: thread_id.clone(),
+                            target: DiffTarget {
+                                change: change.clone(),
+                                head: head.clone(),
+                                base: None,
+                                target_revision: None,
+                            },
+                            observed,
+                            relation,
+                        }),
+                    },
+                    Err(_) => ObservedEffect::Indeterminate {
+                        reason: "observed head is not a valid object id".into(),
+                    },
+                }
+            }
+            HostAction::MarkReady {
+                change,
+                expected_head,
+            } => {
+                let id = change.change_request.as_str();
+                let Some(actor) = self.ready_actors.get(id).cloned() else {
+                    return ObservedEffect::Absent;
+                };
+                let Some(object) = self.changes.get(id).cloned() else {
+                    return ObservedEffect::Indeterminate {
+                        reason: "ready but the change head is not readable".into(),
+                    };
+                };
+                let relation = if object == expected_head.object {
+                    RefRelation::Equal
+                } else if self.descends(&object, &expected_head.object) {
+                    RefRelation::Ancestor
+                } else {
+                    return ObservedEffect::Indeterminate {
+                        reason: "ready but the bound head is not on the observed ancestry".into(),
+                    };
+                };
+                match CommitRevision::new(intent.repository.clone(), object) {
+                    Ok(observed) => ObservedEffect::Present {
+                        actor,
+                        fact: Box::new(NormalizedEffectFact::ReadyObserved {
+                            change: change.clone(),
+                            head: expected_head.clone(),
+                            observed,
+                            relation,
+                        }),
+                    },
+                    Err(_) => ObservedEffect::Indeterminate {
+                        reason: "observed head is not a valid object id".into(),
+                    },
+                }
+            }
+        }
     }
 
     /// Phase 1 (read-only source refresh): re-read every declared issue
@@ -1311,6 +2165,43 @@ impl FixtureGithub {
             )?;
             return Ok(AttemptOutcome::Attempted);
         }
+        // Reconcile-before-write: an intent whose effect the remote
+        // already shows settles from the read — the receipt a crash
+        // dropped is recovered, and the write is never re-executed to
+        // discover whether it happened. An indeterminate read keeps
+        // the intent outstanding rather than authorizing a second
+        // write; only a definitive absence proceeds to the guarded
+        // write below.
+        match self.observe_effect(&intent) {
+            ObservedEffect::Present { actor, fact } => {
+                self.emit(
+                    store,
+                    config,
+                    obs(ObservationFact::HostActionResult {
+                        action_id: intent.action_id,
+                        authenticated_actor: Some(actor),
+                        status: HostActionStatus::Applied,
+                        effects: vec![*fact],
+                    }),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
+            ObservedEffect::Indeterminate { reason } => {
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id,
+                        HostActionStatus::Unknown { reason },
+                        vec![],
+                    )),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
+            ObservedEffect::Absent => {}
+        }
         // Actor eligibility on the subject is checked before the
         // write: `ineligible` (the actor's class cannot perform the
         // operation here) and `denied` (the actor lacks the grant) are
@@ -1422,6 +2313,9 @@ impl FixtureGithub {
                     "push_ref:{}:{}",
                     intent.repository, produced.object
                 ));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the remote may have raced between write and
                 // fresh read — the receipt reports what the read
                 // observes, never the attempted value.
@@ -1507,6 +2401,18 @@ impl FixtureGithub {
                     change.change_request.as_str().to_string(),
                     authenticated.clone(),
                 );
+                self.change_openers.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
+                self.change_sources.insert(
+                    change.change_request.as_str().to_string(),
+                    (source_branch.clone(), target_branch.clone()),
+                );
+                self.meta_actors.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
                 });
@@ -1514,6 +2420,9 @@ impl FixtureGithub {
                     "open_change:{}:{}",
                     intent.repository, change.change_request
                 ));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the receipt reports the head a fresh
                 // change-request lookup observes, not the value the
                 // write attempted.
@@ -1572,11 +2481,18 @@ impl FixtureGithub {
                             meta.1 = body.clone();
                         }
                     }
+                    self.meta_actors.insert(
+                        change.change_request.as_str().to_string(),
+                        authenticated.clone(),
+                    );
                     self.bump_change(change.change_request.as_str());
                     self.applied.push(format!(
                         "update_change:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    if std::mem::take(&mut self.crash_next_apply) {
+                        return Ok(AttemptOutcome::Crashed);
+                    }
                     // Read-back: the digest covers the remote's stored
                     // fields after any racing update — never the
                     // attempted payload.
@@ -1647,6 +2563,7 @@ impl FixtureGithub {
                         change_id: change.change_request.as_str().to_string(),
                         comment_id: comment_id.clone(),
                         actor: authenticated.clone(),
+                        marker: marker.clone(),
                         body: body.clone(),
                     });
                     self.bump(&ReadSubject::Pr {
@@ -1656,6 +2573,9 @@ impl FixtureGithub {
                         "post_comment:{}:{}",
                         intent.repository, change.change_request
                     ));
+                    if std::mem::take(&mut self.crash_next_apply) {
+                        return Ok(AttemptOutcome::Crashed);
+                    }
                     // Read-back: the receipt cites the remote-issued
                     // comment identity, read from the remote's stored
                     // discussion — not the attempted payload.
@@ -1728,6 +2648,10 @@ impl FixtureGithub {
                         review_id: review_id.clone(),
                         actor: authenticated.clone(),
                         body: body.clone(),
+                        // The head guard above already established
+                        // `actual == head.object`: the remote binds the
+                        // review to the revision it was posted against.
+                        head: head.object.clone(),
                     });
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
@@ -1739,6 +2663,9 @@ impl FixtureGithub {
                     "publish_review_feedback:{}:{}",
                     intent.repository, change.change_request
                 ));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the receipt cites the remote-issued review
                 // id and the stored body digest.
                 self.apply_queued_mutations();
@@ -1799,24 +2726,32 @@ impl FixtureGithub {
                     .get_mut(thread_id)
                     .expect("checked")
                     .replies
-                    .push((reply_id.clone(), authenticated.clone(), body.clone()));
+                    .push((
+                        reply_id.clone(),
+                        authenticated.clone(),
+                        marker.clone(),
+                        body.clone(),
+                    ));
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
                 });
                 self.applied
                     .push(format!("thread_reply:{}:{}", intent.repository, thread_id));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the receipt cites the remote-issued reply
                 // identity on the exact thread.
                 self.apply_queued_mutations();
                 let posted = self
                     .threads
                     .get(thread_id)
-                    .and_then(|t| t.replies.iter().find(|(id, _, _)| id == &reply_id))
+                    .and_then(|t| t.replies.iter().find(|(id, ..)| id == &reply_id))
                     .expect("the just-written reply");
                 let body_digest = workloop_core::domain::sha256_hex(
                     "reply-v1",
                     &workloop_core::domain::canonical_json(&serde_json::json!({
-                        "body": posted.2,
+                        "body": posted.3,
                     })),
                 );
                 self.emit(
@@ -1876,7 +2811,11 @@ impl FixtureGithub {
                     )?;
                     return Ok(AttemptOutcome::Attempted);
                 }
-                self.threads.get_mut(thread_id).expect("checked").resolved = true;
+                {
+                    let thread = self.threads.get_mut(thread_id).expect("checked");
+                    thread.resolved = true;
+                    thread.resolved_by = Some(authenticated.clone());
+                }
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
                 });
@@ -1884,6 +2823,9 @@ impl FixtureGithub {
                     "resolve_thread:{}:{}",
                     intent.repository, thread_id
                 ));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the receipt reports the thread state a
                 // fresh read observes.
                 self.apply_queued_mutations();
@@ -1961,8 +2903,10 @@ impl FixtureGithub {
                     )?;
                     return Ok(AttemptOutcome::Attempted);
                 }
-                self.ready_changes
-                    .insert(change.change_request.as_str().to_string());
+                self.ready_actors.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
                 });
@@ -1970,6 +2914,9 @@ impl FixtureGithub {
                     "mark_ready:{}:{}",
                     intent.repository, change.change_request
                 ));
+                if std::mem::take(&mut self.crash_next_apply) {
+                    return Ok(AttemptOutcome::Crashed);
+                }
                 // Read-back: the ready state and head a fresh read
                 // observes — not the attempted values.
                 self.apply_queued_mutations();
