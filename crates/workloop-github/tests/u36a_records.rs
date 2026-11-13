@@ -331,19 +331,15 @@ fn stale_head_never_rolls_back(adapter: &mut dyn ReadPathAdapter) -> ScenarioEvi
     );
 
     ScenarioEvidence {
-        observation_identities: vec![
-            format!(
-                "local:{}.poll:{}@{}",
-                adapter.poll_source(),
-                subject.key(),
-                landed.subject_version
-            ),
-            format!(
-                "(delayed delivery, no identity):{}@{}",
-                subject.key(),
-                stale_version
-            ),
-        ],
+        // Only real delivery identities — the delayed delivery recorded
+        // no identity, so nothing cites it here; the read-back receipts
+        // below carry what it established.
+        observation_identities: vec![format!(
+            "local:{}.poll:{}@{}",
+            adapter.poll_source(),
+            subject.key(),
+            landed.subject_version
+        )],
         read_back_receipts: vec![
             ReadBackReceipt {
                 target: subject.key(),

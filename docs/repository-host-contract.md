@@ -110,13 +110,13 @@ Every U3.6 suite run retains one record per exercised scenario per adapter — t
 | --- | --- |
 | `schema_version` | `1` |
 | `tested_revision` | Exact commit SHA on the PR branch that contains the exercised slice tree. A base revision or patch digest alone never satisfies this field; a patch digest may be retained alongside it |
-| `base_revision` | The base revision the run was exercised against — the merge-base fork point where the checkout retains reachable history; in CI, the platform-recorded event base (`pull_request.base.sha`, or the push `before`), which is the base that run actually tested |
+| `base_revision` | The base revision the run was exercised against — the merge-base fork point where the checkout retains reachable history (a truncated checkout cites the deepest commit it retains); in CI, the platform-recorded event base (`pull_request.base.sha`, or the push `before`), which is the base that run actually tested. A checkout that can prove neither retains no records |
 | `core_revision` | The exact revision of the Core implementation exercised — a commit SHA for in-repo builds |
 | `adapter_revision` | The exact revision of the adapter implementation exercised — a commit SHA for in-repo fixtures, an adapter-declared build identifier otherwise |
 | `config_identity` | The configuration the run bound: `install_identity` (`host_instance`, `repository`, `adapter`, `contract_version`) plus `config_digest`, a sha256 over the canonical configuration projection — the record's config-file identity |
 | `command_or_scenario` | The named scenario or command the record answers for |
 | `action_identities` | The durable action identities the scenario exercised — an empty array for a scenario performing no authorized writes |
-| `observation_identities` | The delivery identities the scenario's observations recorded |
+| `observation_identities` | The delivery identities the scenario's observations recorded — real identities only; an observation delivered with no delivery identity has nothing to cite here and is narrated in `read_back_receipts`, never fabricated as an identity |
 | `read_back_receipts` | The read-back receipts the scenario's facts were re-observed through: each entry names the subject or delivery it answered for and what the read-back established |
 | `result` | `pass`, `fail`, `skipped`, or `inconclusive` |
 | `claim_class` | Closed set: `fixture_contract` (local fixture/contract evidence) or `live_evidenced` (a separately authorized live scenario). Fixture results never satisfy a live claim |

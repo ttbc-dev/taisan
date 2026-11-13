@@ -246,11 +246,14 @@ fn tracked_tree_is_pristine(manifest_dir: &str) -> bool {
 /// The base fork point of a normal checkout. A candidate equal to HEAD
 /// is no fork point — `merge-base HEAD <ref>` answers HEAD itself when
 /// `<ref>` is the checked-out commit (a run on the base branch, or the
-/// only commit a shallow clone retains) — so it is rejected. A
-/// checkout that retains no base history at all cites the deepest
-/// commit it does retain; when that commit is HEAD itself — a depth-1
-/// clone — no fork point is provable and the answer is `None`, so the
-/// run retains no records rather than stamping `base == tested`.
+/// only commit a shallow clone retains) — so it is rejected. When no
+/// merge-base is provable, only a *truncated* checkout may cite the
+/// deepest commit it retains — a shallow clone's boundary commit is the
+/// deepest base it can prove. A full clone whose base refs are all
+/// unresolved (no origin, a run on the base branch itself) has no
+/// provable base: the repository root is not a base the run was
+/// exercised against, so the answer is `None` and the run retains no
+/// records.
 fn base_revision(manifest_dir: &str) -> Option<String> {
     let head = git_stdout(manifest_dir, &["rev-parse", "HEAD"])?;
     for revs in [
@@ -262,6 +265,14 @@ fn base_revision(manifest_dir: &str) -> Option<String> {
             Some(sha) if sha != head => return Some(sha),
             _ => {}
         }
+    }
+    // The deepest-retained-commit citation is only meaningful when the
+    // checkout is truncated — otherwise the repository root would
+    // masquerade as a fork point it is not.
+    if git_stdout(manifest_dir, &["rev-parse", "--is-shallow-repository"]).as_deref()
+        != Some("true")
+    {
+        return None;
     }
     match git_stdout(manifest_dir, &["rev-list", "--max-parents=0", "HEAD"])
         .and_then(|roots| roots.lines().next().map(str::to_string))
@@ -347,6 +358,10 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
 ///   `authorization_reference`, and a `fixture_contract` record does
 ///   not carry the key at all — its absence invalidates a live record
 ///   and its presence invalidates a fixture record;
+/// - the revision/scenario fields and the `install_identity` strings
+///   are strings, `contract_version` a non-negative integer — a
+///   present-but-wrong-typed scalar is a violation, so a record the
+///   typed form cannot deserialize never passes the raw check;
 /// - `config_identity` carries its own required fields
 ///   (`install_identity` with `host_instance`, `repository`,
 ///   `adapter`, `contract_version`, plus `config_digest`);
@@ -374,6 +389,22 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
         match object.get(field) {
             Some(v) if v.is_array() => {}
             Some(_) => violations.push(format!("{field} is not an array")),
+            None => {}
+        }
+    }
+    // String scalars: presence is the required-field check; a
+    // present-but-non-string value is a type violation the typed form
+    // could never deserialize.
+    for field in [
+        "tested_revision",
+        "base_revision",
+        "core_revision",
+        "adapter_revision",
+        "command_or_scenario",
+    ] {
+        match object.get(field) {
+            Some(v) if v.is_string() => {}
+            Some(_) => violations.push(format!("{field} is not a string")),
             None => {}
         }
     }
@@ -421,11 +452,22 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
                 }
                 match c.get("install_identity").and_then(|i| i.as_object()) {
                     Some(i) => {
-                        for field in ["host_instance", "repository", "adapter", "contract_version"]
-                        {
+                        for field in ["host_instance", "repository", "adapter"] {
                             match i.get(field) {
-                                Some(v) if !v.is_null() => {}
-                                _ => violations.push(format!("install_identity missing {field}")),
+                                Some(v) if v.is_string() => {}
+                                Some(_) => violations
+                                    .push(format!("install_identity.{field} is not a string")),
+                                None => {
+                                    violations.push(format!("install_identity missing {field}"))
+                                }
+                            }
+                        }
+                        match i.get("contract_version") {
+                            Some(v) if v.is_u64() => {}
+                            Some(_) => violations
+                                .push("install_identity.contract_version is not an integer".into()),
+                            None => {
+                                violations.push("install_identity missing contract_version".into())
                             }
                         }
                     }
@@ -632,6 +674,8 @@ mod tests {
             ("result", serde_json::json!(null)),
             ("schema_version", serde_json::json!(SCHEMA_VERSION + 1)),
             ("schema_version", serde_json::json!("1")),
+            ("tested_revision", serde_json::json!(7)),
+            ("command_or_scenario", serde_json::json!({"nested": true})),
         ] {
             let mut value = serde_json::to_value(record()).unwrap();
             value
@@ -641,6 +685,36 @@ mod tests {
             assert!(
                 validate_record_json(&value).is_err(),
                 "{field} = {injected} must invalidate the record"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_typed_install_identity_fields_are_invalid() {
+        // Nested scalars follow the same rule: present-but-wrong-typed
+        // is a violation, never a pass.
+        for (field, injected) in [
+            ("host_instance", serde_json::json!(7)),
+            ("repository", serde_json::json!(null)),
+            ("adapter", serde_json::json!(true)),
+            ("contract_version", serde_json::json!("1")),
+        ] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .get_mut("config_identity")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .get_mut("install_identity")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), injected.clone());
+            assert!(
+                validate_record_json(&value).is_err(),
+                "install_identity.{field} = {injected} must invalidate the record"
             );
         }
     }
@@ -728,15 +802,45 @@ mod tests {
     }
 
     #[test]
-    fn base_revision_cites_the_deepest_retained_commit() {
-        // Without an origin ref the deepest retained commit is the
-        // only fork point the checkout can prove.
+    fn base_revision_is_none_for_a_full_clone_without_base_refs() {
+        // A full clone whose base refs are all unresolved: the
+        // repository root is not a base the run was exercised against —
+        // retain no stamp rather than citing it as a fork point.
         let dir = git_repo("deep", 2);
-        let root = git(&dir, &["rev-list", "--max-parents=0", "HEAD"]);
         assert_eq!(
-            base_revision(dir.to_str().unwrap()).as_deref(),
-            Some(root.as_str())
+            base_revision(dir.to_str().unwrap()),
+            None,
+            "a full clone without base refs proves no base"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn base_revision_cites_the_deepest_commit_a_shallow_clone_retains() {
+        // A --depth 2 clone keeps the tip and its grafted parent:
+        // merge-base is unprovable across the boundary, so the boundary
+        // commit is the deepest base the checkout can cite.
+        let src = git_repo("src", 3);
+        let dir = std::env::temp_dir().join(format!("workloop-u36a-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        git(
+            std::env::temp_dir().as_path(),
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "2",
+                &format!("file://{}", src.display()),
+                dir.to_str().unwrap(),
+            ],
+        );
+        let boundary = git(&dir, &["rev-parse", "HEAD~1"]);
+        assert_eq!(
+            base_revision(dir.to_str().unwrap()).as_deref(),
+            Some(boundary.as_str()),
+            "the shallow boundary commit is the deepest provable base"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src).ok();
     }
 }
