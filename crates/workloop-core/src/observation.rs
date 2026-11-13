@@ -121,6 +121,15 @@ pub enum ObservationFact {
         complete: bool,
         items: Vec<AssessmentItem>,
     },
+    /// One durable stage-pipeline record. The loop writes an entry record
+    /// when it enters a stage and terminal records as evidence arrives;
+    /// the fact itself never authorizes a transition. Core persists these
+    /// records through its own transaction — `handle_observation` refuses
+    /// a delivered record, since ingest carries no authority to write
+    /// pipeline history.
+    StageEvidence {
+        evidence: crate::stage::StageEvidence,
+    },
     /// The normalized result for a recorded `HostActionIntent`. An
     /// `applied` result must carry at least one normalized effect fact
     /// matching the intent's immutable payload — an unsupported claim
