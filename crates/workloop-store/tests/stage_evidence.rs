@@ -331,9 +331,11 @@ fn ingest_refuses_a_delivered_stage_record() {
 /// U5.4 restart safety: `from_observations` rebuilds the recorded head
 /// from durable observations, so a stale-head observation can never
 /// promote itself to the recorded head after a restart — it stays
-/// history, and evidence bound to it is still refused. Stage records
-/// pinned to a stale or foreign revision are refused on replay the
-/// same way: they cannot move the head or satisfy a lane either.
+/// history. Stage records pinned to a retired or foreign revision are
+/// refused on replay the same way: they cannot move the head or
+/// satisfy a lane either. A record pinned to a head the pipeline
+/// adopted live — even one a `change_head` observation marked stale —
+/// restores that authoritative move and replays its lane.
 #[test]
 fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() {
     let root = std::env::temp_dir().join(format!("workloop-stage-heads-{}", std::process::id()));
@@ -342,6 +344,7 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
     let path = root.join("heads.sqlite");
     let current = head();
     let stale = CommitRevision::new(repo(), "head-stale").unwrap();
+    let adopted = CommitRevision::new(repo(), "head-adopted").unwrap();
     let execution_id = {
         let store = SqliteStore::open(&path, 2).unwrap();
         let (work_id, execution_id) = submit_work(&store, &config(), "k-heads");
@@ -380,10 +383,30 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             change: change(),
             head: stale.clone(),
         });
-        // Stage records pinned to stale and foreign revisions sit in
-        // the durable log the way a Core transaction would have written
-        // them; replay must refuse them exactly like the live `record`
-        // guard did — they can neither move the head nor close a lane.
+        emit(ObservationFact::ChangeHead {
+            change: change(),
+            head: adopted.clone(),
+        });
+        // The verify records pin the adopted head: live, Core moved the
+        // recorded head through `record_current_head` and the evidence
+        // bound to it — the pin is the only durable trace of that move.
+        persist(
+            &store,
+            &work_id,
+            &execution_id,
+            StageEvidence::entered(Stage::Verify, adopted.clone()),
+        );
+        persist(
+            &store,
+            &work_id,
+            &execution_id,
+            StageEvidence::complete(Stage::Verify, adopted.clone(), vec![fact("verify")]).unwrap(),
+        );
+        // Stage records pinned to a retired head and a foreign revision
+        // sit in the durable log the way a Core transaction would have
+        // written them; replay must refuse them exactly like the live
+        // `record` guard did — they can neither move the head nor
+        // close a lane.
         let foreign = CommitRevision::new(
             RepositoryRef::new(
                 HostInstanceId::trusted("foreign-host"),
@@ -392,13 +415,17 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             "head-durable",
         )
         .unwrap();
-        for revision in [stale.clone(), foreign] {
+        for revision in [current.clone(), foreign] {
             persist(
                 &store,
                 &work_id,
                 &execution_id,
-                StageEvidence::complete(Stage::Verify, revision, vec![fact("verify-off-head")])
-                    .unwrap(),
+                StageEvidence::complete(
+                    Stage::InvariantCheck,
+                    revision,
+                    vec![fact("invariant-off-head")],
+                )
+                .unwrap(),
             );
         }
         execution_id
@@ -411,13 +438,13 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
     let mut pipeline = StagePipeline::from_observations(LanePolicy::default(), &observations);
     assert_eq!(
         pipeline.current_head(),
-        Some(&current),
-        "the recorded head is restored, not the last observed one"
+        Some(&adopted),
+        "the recorded head follows the last accepted evidence pin"
     );
     assert_eq!(
         pipeline.stale_heads(),
-        std::slice::from_ref(&stale),
-        "the stale-head observation stays history"
+        [stale.clone(), adopted.clone()].as_slice(),
+        "the differing observations stay history even when one was later adopted"
     );
     assert!(pipeline.head_history().contains(&stale));
     assert!(
@@ -426,11 +453,19 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             .is_some_and(|record| record.status.is_complete()),
         "recorded evidence replays under the restored head"
     );
+    let verify = pipeline.latest(Stage::Verify).unwrap();
     assert!(
-        pipeline.latest(Stage::Verify).is_none(),
-        "stale and foreign stage records never satisfy a lane after restart"
+        verify.status.is_complete() && verify.revision == adopted,
+        "evidence bound to an observed-then-adopted head survives the restart"
     );
-    assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Verify));
+    assert!(
+        pipeline.latest(Stage::InvariantCheck).is_none(),
+        "retired and foreign stage records never satisfy a lane after restart"
+    );
+    assert_eq!(
+        pipeline.next_stage(),
+        NextStage::Open(Stage::InvariantCheck)
+    );
     assert_eq!(
         pipeline
             .record(StageEvidence::entered(Stage::Verify, stale.clone()))

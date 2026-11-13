@@ -440,8 +440,9 @@ fn a_rejected_first_record_never_pins_the_head() {
 }
 
 #[test]
-fn replay_restores_only_head_moves_the_pipeline_could_have_made() {
-    let current = head("head-replay");
+fn replay_restores_head_moves_and_refuses_retired_or_foreign_heads() {
+    let first = head("head-replay-first");
+    let adopted = head("head-replay-adopted");
     let stale = head("head-replay-stale");
     let moved = head("head-replay-moved");
     let foreign = CommitRevision::new(
@@ -473,54 +474,92 @@ fn replay_restores_only_head_moves_the_pipeline_could_have_made() {
         evidence.into_observation(work_id.clone(), execution_id.clone(), at)
     };
     let observations = vec![
-        head_fact(&current, 1),
-        record_fact(StageEvidence::entered(Stage::Code, current.clone()), 2),
+        head_fact(&first, 1),
+        record_fact(StageEvidence::entered(Stage::Code, first.clone()), 2),
         record_fact(
-            StageEvidence::complete(Stage::Code, current.clone(), vec![fact("code")]).unwrap(),
+            StageEvidence::complete(Stage::Code, first.clone(), vec![fact("code")]).unwrap(),
             3,
         ),
-        head_fact(&stale, 4),
-        // Stale and foreign records must not promote themselves.
+        // Both later heads are stale observations on replay; the
+        // evidence pin below is the only durable trace that the
+        // pipeline adopted `adopted` live through `record_current_head`.
+        head_fact(&adopted, 4),
+        head_fact(&stale, 5),
+        record_fact(StageEvidence::entered(Stage::Verify, adopted.clone()), 6),
         record_fact(
-            StageEvidence::complete(Stage::Verify, stale.clone(), vec![fact("verify-stale")])
-                .unwrap(),
-            5,
-        ),
-        record_fact(
-            StageEvidence::complete(Stage::Verify, foreign.clone(), vec![fact("verify-foreign")])
-                .unwrap(),
-            6,
-        ),
-        // A same-repository head the pipeline never held restores an
-        // authoritative move that left no change_head fact.
-        record_fact(
-            StageEvidence::complete(Stage::Verify, moved.clone(), vec![fact("verify-moved")])
-                .unwrap(),
+            StageEvidence::complete(Stage::Verify, adopted.clone(), vec![fact("verify")]).unwrap(),
             7,
+        ),
+        // A pin to a head the pipeline already held and moved past is
+        // refused, and so is a foreign-repository revision.
+        record_fact(
+            StageEvidence::complete(
+                Stage::InvariantCheck,
+                first.clone(),
+                vec![fact("invariant-old")],
+            )
+            .unwrap(),
+            8,
+        ),
+        record_fact(
+            StageEvidence::complete(
+                Stage::InvariantCheck,
+                foreign.clone(),
+                vec![fact("invariant-foreign")],
+            )
+            .unwrap(),
+            9,
+        ),
+        // A same-repository head with no `change_head` fact restores an
+        // authoritative move that left no observation behind.
+        record_fact(
+            StageEvidence::entered(Stage::InvariantCheck, moved.clone()),
+            10,
+        ),
+        record_fact(
+            StageEvidence::complete(
+                Stage::InvariantCheck,
+                moved.clone(),
+                vec![fact("invariant")],
+            )
+            .unwrap(),
+            11,
         ),
     ];
     let pipeline = StagePipeline::from_observations(all_lanes(), &observations);
     assert_eq!(
         pipeline.current_head(),
         Some(&moved),
-        "only the restorable head move became the recorded head"
+        "the last accepted evidence pin restored the final head"
     );
-    assert_eq!(pipeline.stale_heads(), std::slice::from_ref(&stale));
+    assert_eq!(
+        pipeline.stale_heads(),
+        [adopted.clone(), stale.clone()].as_slice(),
+        "both differing observations stayed stale history"
+    );
     assert!(pipeline.head_history().contains(&stale));
+    let verify = pipeline.latest(Stage::Verify).unwrap();
+    assert!(
+        verify.status.is_complete() && verify.revision == adopted,
+        "evidence bound to an observed-then-adopted head replays; the lane stays closed"
+    );
+    let invariant_records: Vec<_> = pipeline
+        .records()
+        .iter()
+        .filter(|record| record.stage == Stage::InvariantCheck)
+        .collect();
     assert_eq!(
-        pipeline
-            .records()
+        invariant_records.len(),
+        2,
+        "retired and foreign pins were refused; only the restorable move replayed"
+    );
+    assert!(
+        invariant_records
             .iter()
-            .filter(|record| record.stage == Stage::Verify)
-            .count(),
-        1,
-        "stale and foreign records were refused; only the restorable move replayed"
+            .all(|record| record.revision == moved),
+        "both invariant records bind the restored head"
     );
-    assert_eq!(pipeline.latest(Stage::Verify).unwrap().revision, moved);
-    assert_eq!(
-        pipeline.next_stage(),
-        NextStage::Open(Stage::InvariantCheck)
-    );
+    assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Publication));
 }
 
 #[test]

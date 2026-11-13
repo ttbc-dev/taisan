@@ -346,24 +346,31 @@ impl StagePipeline {
 
     /// Rebuild the stage view from durable observations. Recorded head
     /// observations replay through `observe_head` and each recorded
-    /// evidence re-runs the same guards it was first accepted under —
-    /// so a stale-head observation can never promote itself to the
-    /// recorded head after a restart. A durably recorded evidence also
-    /// pin-points the head it bound to: when it differs from the
-    /// replayed head, an authoritative move (`record_current_head`)
-    /// must have preceded it, and that move is restored before the
-    /// record replays — but only for a same-repository head the
-    /// pipeline has never held or observed. A revision already in head
-    /// history is stale or rolled-back, and a foreign-repository
-    /// revision was never this Work's head: both replay against the
-    /// recorded head and are refused exactly as they were live. The
-    /// restore commits only when the record itself is accepted, so a
-    /// refused record cannot move the head either. Invalid records are
-    /// ignored rather than silently repaired; the pipeline never
-    /// promotes evidence that did not satisfy the same order guard
-    /// when it was first recorded.
+    /// evidence re-runs the same guards it was first accepted under.
+    /// A durably recorded evidence also pin-points the head it bound
+    /// to: when it differs from the replayed head, an authoritative
+    /// move (`record_current_head`) must have preceded it — the pin is
+    /// the only durable trace that move leaves — so the move is
+    /// restored before the record replays. The restore is refused for
+    /// a foreign-repository revision, which was never this Work's
+    /// head, and for a head the pipeline already held and moved past,
+    /// which no live `record` could have accepted again. A
+    /// `change_head` observation that marked the revision stale does
+    /// not bar the restore, because live `record_current_head` adopts
+    /// exactly such observed heads; whether the revision was observed
+    /// at all is not part of the check, since an authoritative move
+    /// can leave no `change_head` fact behind. The restore commits
+    /// only when the record itself is accepted, so a refused record
+    /// cannot move the head either. Invalid records are ignored rather
+    /// than silently repaired; the pipeline never promotes evidence
+    /// that did not satisfy the same order guard when it was first
+    /// recorded.
     pub fn from_observations(lanes: LanePolicy, observations: &[Observation]) -> Self {
         let mut pipeline = Self::new(lanes);
+        // Heads that already held the recorded head and were superseded
+        // by a later adoption. An evidence pin may restore an
+        // authoritative move, but it can never resurrect one of these.
+        let mut retired: Vec<CommitRevision> = Vec::new();
         for observation in observations {
             match &observation.fact {
                 ObservationFact::ChangeHead { head, .. } => {
@@ -373,11 +380,15 @@ impl StagePipeline {
                     let restorable = pipeline.current_head().is_some_and(|current| {
                         *current != evidence.revision
                             && current.repository == evidence.revision.repository
-                    }) && !pipeline.head_history().contains(&evidence.revision);
+                            && !retired.contains(&evidence.revision)
+                    });
                     if restorable {
                         let mut candidate = pipeline.clone();
                         candidate.record_current_head(evidence.revision.clone());
                         if candidate.record(evidence.clone()).is_ok() {
+                            if let Some(previous) = pipeline.current_head() {
+                                retired.push(previous.clone());
+                            }
                             pipeline = candidate;
                         }
                     } else {
