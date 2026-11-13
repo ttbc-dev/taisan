@@ -344,7 +344,7 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
             base_revision(manifest_dir)?,
         ),
     };
-    if !is_commit_id(&tested) || !is_commit_id(&base) {
+    if !is_commit_id(&tested) || !is_commit_id(&base) || tested == base {
         return None;
     }
     Some((tested, base))
@@ -491,9 +491,9 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
                             }
                         }
                         match i.get("contract_version") {
-                            Some(v) if v.is_u64() => {}
+                            Some(v) if v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
                             Some(_) => violations
-                                .push("install_identity.contract_version is not an integer".into()),
+                                .push("install_identity.contract_version is not a u32".into()),
                             None => {
                                 violations.push("install_identity missing contract_version".into())
                             }
@@ -754,6 +754,12 @@ mod tests {
             ("repository", serde_json::json!(null)),
             ("adapter", serde_json::json!(true)),
             ("contract_version", serde_json::json!("1")),
+            // One past u32::MAX fits u64 but not the typed u32 field —
+            // parity with the typed form rejects it.
+            (
+                "contract_version",
+                serde_json::json!(u64::from(u32::MAX) + 1),
+            ),
         ] {
             let mut value = serde_json::to_value(record()).unwrap();
             value

@@ -561,6 +561,8 @@ fn read_path_records_retain_one_record_per_scenario_per_adapter() {
     let scenarios: BTreeSet<_> = rows.iter().map(|r| r.scenario).collect();
     assert_eq!(scenarios.len(), 2, "one record per scenario");
 
+    let retained_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u3.6a-records.json");
     if let Some((tested, base)) = &stamp {
         let records: Vec<serde_json::Value> = rows
             .iter()
@@ -581,16 +583,29 @@ fn read_path_records_retain_one_record_per_scenario_per_adapter() {
                 .unwrap_or_else(|v| panic!("retained record fails the field check: {v:?}"));
         }
         let retained = serde_json::json!({ "records": records });
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u3.6a-records.json");
         std::fs::write(
-            &path,
+            &retained_path,
             format!("{}\n", serde_json::to_string_pretty(&retained).unwrap()),
         )
-        .unwrap_or_else(|e| panic!("retain the U3.6a record set at {}: {e}", path.display()));
+        .unwrap_or_else(|e| {
+            panic!(
+                "retain the U3.6a record set at {}: {e}",
+                retained_path.display()
+            )
+        });
     } else {
         for row in &rows {
             assert!(row.record.is_none(), "an unstamped run retains no records");
+        }
+        // An unstamped run retains none — a stale record set from an
+        // earlier stamped run must not survive this one.
+        if retained_path.exists() {
+            std::fs::remove_file(&retained_path).unwrap_or_else(|e| {
+                panic!(
+                    "remove the stale U3.6a record set at {}: {e}",
+                    retained_path.display()
+                )
+            });
         }
         eprintln!(
             "u3.6a: no faithful revision stamp (dirty or non-git checkout) — \
