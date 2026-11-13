@@ -151,3 +151,33 @@ only identity comparison, so no case branches on which worker is
 bound. The scan is lexical: it catches branches that mention an
 identity token, while branches through renamed aliases remain outside
 what a token scan can see.
+
+## Swap-window recovery (U4.6c)
+
+`swap_recovery.rs` exercises crash, restart and recovery at the
+adapter-selection boundary, reusing the U4.6 record format and the
+fail-closed revision stamping of the rerun above. Three named
+scenarios each retain one [U4.6 record](worker-protocol.md#u46-evidence-record)
+to `target/u4.6c-<scenario>.json` when the checkout yields a faithful
+revision stamp — a dirty or non-git checkout runs every scenario and
+every record-independent assertion, builds no records, and retains
+none, so no retained record can cite a commit that does not contain
+the exercised slice:
+
+| Scenario | What it proves |
+| --- | --- |
+| `u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindings` | WS-20/WS-03: two Invocations are in flight under the prior selection when `worker_argv` changes and the supervisor restarts over the reopened durable store. Each in-flight Invocation reconciles against its recorded adapter ID, version and capability digest — the recorded binding and writer identity are unchanged, the recorded argv still re-verifies `Ready` against a fresh `describe`, and the changed argv selects a configuration repair (`adapter.identity_mismatch`, `capability.digest_mismatch`) for those stored bindings rather than a retarget. Spawn count proves no second writer; only a request created after the change binds the new adapter. The follow-up safe stop records a durable stop intent covering every recorded identity, inspects each stopped, and lands the terminal cancel with no further spawns. |
+| `u46c_interrupted_export_import_recovers_under_changed_config_without_duplicate_artifact_ids` | WS-11: two real fixture writers finish under the prior selection, the configuration changes, and the restarted supervisor walks the [crash-recovery table](worker-protocol.md#crash-recovery) — no export row, truncated bundle, interrupted import with leftover quarantine, `imported` row without a ref, ref present with the row still `imported` — each window recovering to `acknowledged` with exactly one artifact ID (the repository's `refs/taisan/artifacts/` set is asserted after every window and after a final full pass). A second artifact whose workspace was lost before acknowledgement converges on `recovery_exhausted` at exactly the configured bound, never acknowledged and never minting a ref. Recovery under the changed configuration launches no worker. |
+| `u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config` | WS-11/WS-01: a real fixture writer launched under the prior selection finishes in a git workspace and the Execution waits mid-Execution when `worker_argv` changes and the supervisor restarts. The restarted supervisor recollects the artifact to `acknowledged`, records the declared verification `Pass` on the exact handed-off commit, and leaves the workspace `.git`, the managed work branch, and the handoff repository's produced closure intact through the verified handoff — while the request binding never moves. |
+
+Three named checks guard the evidence machinery itself:
+`u46c_revision_stamp_is_fail_closed` (a stamp is either two full
+commit ids over a pristine checkout or no stamp at all — never a
+placeholder), `u46c_retained_record_carries_the_closed_field_set`
+(the record carries exactly the closed U4.6 field set, the closed
+claim class, and every binding field on each adapter-selection entry),
+and `u46c_evidence_record_cites_the_tested_revision` (the evidence
+record names full tested/base commit ids, transcribes every retained
+scenario record under that tested revision, and verifies the cited
+commit contains the exercised suite and is on the branch history to
+`HEAD`).
