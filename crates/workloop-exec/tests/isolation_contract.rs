@@ -23,7 +23,7 @@ use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::isolation_profile;
 use workloop_exec::isolation;
-use workloop_exec::scripted::ScriptedProcessControl;
+use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
@@ -167,6 +167,20 @@ fn wait_for(mut pred: impl FnMut() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
+/// Scratch-tree names under `dir` whose name starts with `prefix` —
+/// empty when the directory does not exist yet.
+fn read_tree_names(dir: &Path, prefix: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(prefix))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Names the profile passes through from the supervisor plus the names
 /// the isolation layer generates — the child's whole closed set.
 const ALLOWED_ENV_KEYS: &[&str] = &[
@@ -181,6 +195,10 @@ const ALLOWED_ENV_KEYS: &[&str] = &[
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_GLOBAL",
     "GIT_TERMINAL_PROMPT",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
 ];
 
 /// Credential and ambient-config names a host session commonly exports;
@@ -353,7 +371,12 @@ fn the_describe_probe_runs_under_the_scrubbed_environment() {
 /// environment denies every remote transport and every credential
 /// helper, and `GIT_TERMINAL_PROMPT=0` turns the remaining prompt into
 /// a failure — `git credential fill` yields nothing (INV-003). The
-/// file-local transport the handoff uses stays allowed.
+/// file-local transport the handoff uses stays allowed. Because
+/// repository-local `.git/config` outranks `GIT_CONFIG_GLOBAL`, the
+/// same holds inside a controlled repository whose own config plants
+/// the overrides: the command-scope `GIT_ALLOW_PROTOCOL=file` and
+/// empty `credential.helper` pins beat anything the workspace writes
+/// into `.git/config`.
 #[test]
 fn git_hygiene_denies_remote_transports_and_credential_helpers() {
     let scratch = tmp_root("githygiene").join("env");
@@ -370,14 +393,17 @@ fn git_hygiene_denies_remote_transports_and_credential_helpers() {
     assert!(body.contains("allow = never"), "{body}");
     assert!(body.contains("allow = always"), "{body}");
 
-    let run_git = |args: &[&str]| {
+    let here = std::env::current_dir().expect("cwd");
+    let run_git_in = |cwd: &Path, args: &[&str]| {
         std::process::Command::new("git")
             .env_clear()
             .envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(cwd)
             .args(args)
             .output()
             .expect("run git")
     };
+    let run_git = |args: &[&str]| run_git_in(&here, args);
     // A remote fetch is refused locally — before any network or
     // credential lookup runs.
     let out = run_git(&["ls-remote", "https://example.invalid/repo.git"]);
@@ -415,6 +441,79 @@ fn git_hygiene_denies_remote_transports_and_credential_helpers() {
     assert!(out.status.success());
     let out = run_git(&["ls-remote", local.to_str().unwrap()]);
     assert!(out.status.success(), "file transport stays allowed");
+
+    // A controlled repository whose own `.git/config` plants exactly
+    // the overrides a workspace could try: a credential helper that
+    // would drop a marker, and per-scheme transport grants. None of
+    // them may take effect under the launch environment.
+    let planted = tmp_root("githygiene-planted");
+    let out = run_git(&["init", "-q", planted.to_str().unwrap()]);
+    assert!(out.status.success());
+    let marker = planted.join("helper-ran");
+    let helper = format!("!touch {}", marker.display());
+    for (key, value) in [
+        ("credential.helper", helper.as_str()),
+        ("protocol.https.allow", "always"),
+        ("protocol.ssh.allow", "always"),
+    ] {
+        let out = run_git_in(&planted, &["config", key, value]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = run_git_in(&planted, &["ls-remote", "https://example.invalid/repo.git"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("transport 'https' not allowed"),
+        "a repo-local protocol grant must not reopen https: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_git_in(&planted, &["ls-remote", "ssh://example.invalid/repo.git"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("transport 'ssh' not allowed"),
+        "a repo-local protocol grant must not reopen ssh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut fill = std::process::Command::new("git")
+        .env_clear()
+        .envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .current_dir(&planted)
+        .args(["credential", "fill"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run git credential fill");
+    fill.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=github.com\n\n")
+        .unwrap();
+    let out = fill.wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "credential fill must not produce a credential"
+    );
+    assert!(
+        !marker.exists(),
+        "the repo-local credential helper must never run"
+    );
+    // The local transport stays allowed inside the planted repository
+    // too — the handoff path is unaffected by the pins.
+    let planted_local = planted.join("r.git");
+    let out = run_git_in(
+        &planted,
+        &["init", "-q", "--bare", planted_local.to_str().unwrap()],
+    );
+    assert!(out.status.success());
+    let out = run_git_in(&planted, &["ls-remote", planted_local.to_str().unwrap()]);
+    assert!(out.status.success(), "file transport stays allowed");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&planted);
 }
 
 /// An isolation profile name outside the approved registry resolves to
@@ -433,17 +532,24 @@ fn an_unknown_isolation_profile_id_fails_closed() {
     }
 }
 
-/// A workspace root whose isolation scratch cannot be created refuses
-/// the launch through the same recorded LaunchRefused path as a refused
-/// spawn — the Invocation is abandoned, no worker process is started,
-/// and the request is terminal for its binding (INV-005).
+/// A workspace root whose *launch* environment cannot be created
+/// refuses the launch through the launch path's `refuse_launch` — the
+/// describe probe ran under a working scratch first, so the refusal is
+/// the supervisor's launch branch, not the probe's fail-closed
+/// selection: the Invocation is abandoned, no worker process is
+/// started, and the request is terminal for its binding (INV-005).
 #[test]
 fn a_failed_environment_preparation_refuses_the_launch() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("envfail");
-    // `.isolation` occupied by a regular file: every environment
-    // preparation under it fails.
-    std::fs::write(root.join(".isolation"), "occupied").unwrap();
+    // The first Invocation on a fresh store is `inv-1`; its launch
+    // scratch key is `inv-inv-1` (the `inv-` scratch prefix plus the
+    // Invocation id). That tree is occupied by a regular file while
+    // the `probe-*` tree stays preparable, so only the launch
+    // preparation fails.
+    let iso = root.join(".isolation");
+    std::fs::create_dir_all(&iso).unwrap();
+    std::fs::write(iso.join("inv-inv-1"), "occupied").unwrap();
     let port = ScriptedProcessControl::new();
     let sup = Supervisor::new(
         port.clone(),
@@ -455,14 +561,23 @@ fn a_failed_environment_preparation_refuses_the_launch() {
     sup.consume_requests(&store, NOW).unwrap();
 
     assert_eq!(
+        port.probe_envs().len(),
+        1,
+        "the describe probe ran under the working scratch"
+    );
+    assert_eq!(
         port.spawn_calls(),
         0,
-        "no worker process started under a broken isolation setup"
+        "no worker process started under a broken launch environment"
     );
     let invocation = store
         .transact(|tx| tx.invocations_for_execution(&eid))
         .unwrap()
         .remove(0);
+    assert_eq!(
+        invocation.id.0, "inv-1",
+        "the occupied scratch key inv-inv-1 belongs to this Invocation"
+    );
     assert_eq!(invocation.state, InvocationState::Abandoned);
     assert!(invocation.process_identity.is_none());
     let reasons = observations(&store, &eid);
@@ -477,4 +592,173 @@ fn a_failed_environment_preparation_refuses_the_launch() {
     // under a degraded environment.
     sup.consume_requests(&store, NOW).unwrap();
     assert_eq!(port.spawn_calls(), 0);
+}
+
+/// A workspace root whose isolation scratch cannot even be created
+/// fails closed at the describe probe: no probe runs, nothing binds,
+/// and the Invocation is abandoned with the same recorded
+/// `LaunchRefused` evidence (INV-005).
+#[test]
+fn a_failed_probe_environment_fails_closed_before_binding() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("probefail");
+    // `.isolation` occupied by a regular file: no scratch under it —
+    // probe or launch — can be prepared.
+    std::fs::write(root.join(".isolation"), "occupied").unwrap();
+    let port = ScriptedProcessControl::new();
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (_work_id, eid) = submit_and_admit(&store, "k-iso-5");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    assert_eq!(
+        port.probe_envs().len(),
+        0,
+        "no probe ran under a broken isolation root"
+    );
+    assert_eq!(port.spawn_calls(), 0, "no worker process started");
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let reasons = observations(&store, &eid);
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("isolation.environment_preparation_failed")),
+        "the retained evidence names the refusal: {reasons:?}"
+    );
+}
+
+/// Scratch trees are reclaimed with their lifecycle: the probe's tree
+/// as soon as the declaration returns, the writer's tree when the
+/// Invocation is proven finished — `.isolation` never accumulates one
+/// dead tree per request, and nothing outside a live probe or writer
+/// holds worker-writable `HOME`/`TMPDIR` storage.
+#[test]
+fn isolation_scratch_trees_are_reclaimed_with_their_lifecycle() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("scratchrelease");
+    let port = ScriptedProcessControl::new();
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (_work_id, eid) = submit_and_admit(&store, "k-iso-4");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let iso = isolation::scratch_root(&root);
+    assert!(
+        read_tree_names(&iso, "probe-").is_empty(),
+        "the probe scratch is reclaimed as soon as describe returns"
+    );
+    assert_eq!(
+        read_tree_names(&iso, "inv-").len(),
+        1,
+        "the running writer keeps its scratch tree"
+    );
+
+    port.exit_all(0);
+    sup.poll_invocations(&store, NOW).unwrap();
+
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    assert_eq!(invocation.state, InvocationState::Done);
+    let leftovers = read_tree_names(&iso, "");
+    assert!(
+        leftovers.is_empty(),
+        "a finished Invocation leaves no scratch tree behind: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Spawn outcomes decide the launch scratch: a refused spawn starts no
+/// process, so its fully built tree is reclaimed with the refusal.
+#[test]
+fn a_refused_spawn_reclaims_the_launch_scratch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("spawnrefused");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Refused {
+        reason: "no slot".into(),
+    });
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (_work_id, eid) = submit_and_admit(&store, "k-iso-6");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    assert_eq!(port.spawn_calls(), 1);
+    let iso = isolation::scratch_root(&root);
+    assert!(
+        read_tree_names(&iso, "probe-").is_empty(),
+        "the probe scratch is reclaimed"
+    );
+    assert!(
+        !iso.join("inv-inv-1").exists(),
+        "a refused spawn's launch scratch is reclaimed — no process exists"
+    );
+    let refused = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    assert_eq!(refused.state, InvocationState::Abandoned);
+    let reasons = observations(&store, &eid);
+    assert!(
+        reasons.iter().any(|r| r.contains("no slot")),
+        "the refusal reason is recorded: {reasons:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An unknown spawn outcome keeps the launch scratch: the process may
+/// be live under that `HOME`/`TMPDIR`, and reclaiming it would yank
+/// the writer's filesystem out from under it.
+#[test]
+fn an_unknown_spawn_outcome_retains_the_launch_scratch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("spawnunknown");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (_work_id, eid) = submit_and_admit(&store, "k-iso-7");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    assert_eq!(port.spawn_calls(), 1);
+    let iso = isolation::scratch_root(&root);
+    assert!(
+        iso.join("inv-inv-1").exists(),
+        "an unknown spawn outcome keeps its launch scratch"
+    );
+    let unknown = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        unknown.state,
+        InvocationState::Prepared,
+        "an unknown start outcome is never resolved by a guess"
+    );
+    assert!(unknown.process_identity.is_none());
+    let _ = std::fs::remove_dir_all(&root);
 }

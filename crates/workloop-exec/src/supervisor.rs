@@ -660,6 +660,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
         self.workspace_root.join(format!("ws-{}", work_id.0))
     }
 
+    /// The scratch tree one Invocation's launch environment is built
+    /// under — its writer's `HOME`/`TMPDIR`, reclaimed when the
+    /// Invocation finishes or the launch is refused.
+    fn launch_scratch(&self, invocation_id: &str) -> PathBuf {
+        isolation::scratch_root(&self.workspace_root)
+            .join(format!("inv-{}", isolation::sanitize_key(invocation_id)))
+    }
+
     /// One supervisor pass: consume approved requests, inspect live
     /// invocations, drive stop intents and artifact handoffs, and run
     /// one recovery attempt for each Execution waiting on artifact
@@ -982,50 +990,53 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // untrusted adapter binary sees no host credential even
             // during the effect-free declaration. A preparation failure
             // is fail-closed: the request does not dispatch under a
-            // degraded environment.
-            let probe_env = isolation::prepare(
-                &self.isolation_profile,
-                &isolation::scratch_root(&self.workspace_root).join(format!(
-                    "probe-{}",
-                    isolation::sanitize_key(&request.request_id)
-                )),
-            );
+            // degraded environment. The probe's scratch tree is
+            // reclaimed as soon as the probe process is gone.
+            let probe_scratch = isolation::scratch_root(&self.workspace_root).join(format!(
+                "probe-{}",
+                isolation::sanitize_key(&request.request_id)
+            ));
+            let probe_env = isolation::prepare(&self.isolation_profile, &probe_scratch);
             match probe_env {
                 Err(why) => (
                     None,
                     Some(format!("isolation.environment_preparation_failed: {why}")),
                 ),
-                Ok(env) => match &request.adapter_binding {
-                    Some(stored) => match adapter::observe_worker_declaration(
-                        &self.port,
-                        &stored.argv,
-                        &workspace,
-                        &env,
-                    ) {
-                        Ok(observed) => match adapter::select_adapter(&observed, stored) {
-                            adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
-                            adapter::AdapterSelection::ConfigurationRepair { reason } => {
-                                (None, Some(reason))
-                            }
+                Ok(env) => {
+                    let selected = match &request.adapter_binding {
+                        Some(stored) => match adapter::observe_worker_declaration(
+                            &self.port,
+                            &stored.argv,
+                            &workspace,
+                            &env,
+                        ) {
+                            Ok(observed) => match adapter::select_adapter(&observed, stored) {
+                                adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
+                                adapter::AdapterSelection::ConfigurationRepair { reason } => {
+                                    (None, Some(reason))
+                                }
+                            },
+                            Err(why) => (
+                                None,
+                                Some(format!("adapter.declaration_unavailable: {why}")),
+                            ),
                         },
-                        Err(why) => (
-                            None,
-                            Some(format!("adapter.declaration_unavailable: {why}")),
-                        ),
-                    },
-                    None => match adapter::observe_worker_declaration(
-                        &self.port,
-                        &self.worker_argv,
-                        &workspace,
-                        &env,
-                    ) {
-                        Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
-                        Err(why) => (
-                            None,
-                            Some(format!("adapter.declaration_unavailable: {why}")),
-                        ),
-                    },
-                },
+                        None => match adapter::observe_worker_declaration(
+                            &self.port,
+                            &self.worker_argv,
+                            &workspace,
+                            &env,
+                        ) {
+                            Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
+                            Err(why) => (
+                                None,
+                                Some(format!("adapter.declaration_unavailable: {why}")),
+                            ),
+                        },
+                    };
+                    isolation::release(&probe_scratch);
+                    selected
+                }
             }
         };
 
@@ -1151,8 +1162,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // fallback.
         let launch_env = match isolation::prepare(
             &self.isolation_profile,
-            &isolation::scratch_root(&self.workspace_root)
-                .join(format!("inv-{}", isolation::sanitize_key(&invocation.id.0))),
+            &self.launch_scratch(&invocation.id.0),
         ) {
             Ok(env) => env,
             Err(why) => {
@@ -1232,6 +1242,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// Record a launch refusal: the consumed request's Invocation is
     /// abandoned and `LaunchRefused` is reported — the request is
     /// terminal for its binding, never retried under a degraded setup.
+    /// No process exists for this Invocation, so its scratch tree
+    /// (fully built for a refused spawn, partial for a refused
+    /// preparation) is reclaimed with the refusal.
     fn refuse_launch(
         &self,
         store: &impl Store,
@@ -1240,6 +1253,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         reason: String,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        isolation::release(&self.launch_scratch(&invocation.id.0));
         store.transact(|tx| {
             let mut next = invocation.clone();
             next.state = InvocationState::Abandoned;
@@ -1619,6 +1633,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
         invocation: &Invocation,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        // The writer is proven stopped before this is called: its
+        // scratch tree (HOME/TMPDIR) can never be read again and is
+        // reclaimed with the Invocation instead of accumulating under
+        // `.isolation`.
+        isolation::release(&self.launch_scratch(&invocation.id.0));
         let request = store
             .transact(|tx| tx.request(&invocation.request_id))?
             .ok_or(ExecError::Store(StoreError::Internal {

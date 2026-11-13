@@ -403,19 +403,25 @@ pub fn run_pass(
                     // The probe runs under the profile's environment —
                     // a prep failure skips the binding exactly like an
                     // unanswered describe: the consume path's
-                    // fail-closed selection refuses the launch.
-                    let Ok(env) = isolation::prepare(
-                        &supervisor.isolation_profile,
-                        &isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind"),
-                    ) else {
+                    // fail-closed selection refuses the launch. The
+                    // shared prebind scratch is reclaimed as soon as
+                    // the probe process is gone, so a fixed key never
+                    // accumulates storage between passes.
+                    let prebind_scratch =
+                        isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind");
+                    let Ok(env) =
+                        isolation::prepare(&supervisor.isolation_profile, &prebind_scratch)
+                    else {
                         continue;
                     };
-                    let Ok(declaration) = adapter::observe_worker_declaration(
+                    let declared = adapter::observe_worker_declaration(
                         &supervisor.port,
                         &supervisor.worker_argv,
                         &workspace,
                         &env,
-                    ) else {
+                    );
+                    isolation::release(&prebind_scratch);
+                    let Ok(declaration) = declared else {
                         continue;
                     };
                     let binding = declaration.binding(&supervisor.worker_argv);

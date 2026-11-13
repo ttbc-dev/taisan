@@ -9,11 +9,16 @@
 //! Generated entries replace the credential-bearing filesystem a
 //! plain `env_clear` cannot fix: `HOME` and `TMPDIR` point at a fresh
 //! installation-owned scratch (`~/.config/gh`, `~/.ssh`,
-//! `~/.git-credentials`, `~/.gitconfig` all resolve inside it), and
-//! `GIT_CONFIG_GLOBAL` names a generated config that empties every
-//! credential helper and denies every transport protocol except
-//! `file`, so a workspace's own repo config cannot route git traffic
-//! through a credential helper or an ssh/https remote.
+//! `~/.git-credentials`, `~/.gitconfig` all resolve inside it).
+//! Git is pinned through the environment because repository-local
+//! `.git/config` outranks `GIT_CONFIG_GLOBAL`: `GIT_ALLOW_PROTOCOL=file`
+//! denies every transport except the local one no matter which
+//! `protocol.<name>` a workspace plants, and `GIT_CONFIG_COUNT` sets an
+//! empty `credential.helper` at command scope — the highest precedence —
+//! so a planted helper is cleared before it can run. The generated
+//! `GIT_CONFIG_GLOBAL` file carries the same rules as a second layer
+//! (and as what `git config --global` reads), and `GIT_TERMINAL_PROMPT=0`
+//! turns a remaining prompt into a failure.
 //!
 //! This is the hygiene layer the worker protocol calls "required, not
 //! sufficient": same-UID filesystem reads outside the env boundary are
@@ -30,7 +35,10 @@ use workloop_core::worker::IsolationProfile;
 /// `GIT_CONFIG_GLOBAL` inside the launch: credential helpers emptied,
 /// every transport denied except `file` — the local transport the
 /// handoff transport legitimately uses. `protocol.file.allow` is the
-/// more specific key and overrides the blanket `never`.
+/// more specific key and overrides the blanket `never`. This file sits
+/// at global scope, which repository-local `.git/config` outranks, so
+/// [`prepare`] additionally pins `GIT_ALLOW_PROTOCOL=file` and an
+/// empty `credential.helper` at command scope.
 const GENERATED_GITCONFIG: &str = "[credential]\n\thelper =\n[protocol]\n\tallow = never\n[protocol \"file\"]\n\tallow = always\n";
 
 /// Build the environment for one launch or probe under `scratch`
@@ -38,7 +46,24 @@ const GENERATED_GITCONFIG: &str = "[credential]\n\thelper =\n[protocol]\n\tallow
 /// and writes the generated `gitconfig`, then returns the complete
 /// child environment. Errors name the failing path; callers must
 /// refuse the launch, never fall back to inherited variables.
+///
+/// A scratch tree left by an earlier use of this key — a re-probe, a
+/// failed release, a crashed pass — is swept first, so reuse starts
+/// from an empty tree or not at all; a non-directory occupier survives
+/// the sweep and fails the creation below. A refused preparation
+/// reclaims its own partial tree before returning the error.
 pub fn prepare(profile: &IsolationProfile, scratch: &Path) -> Result<WorkerEnv, String> {
+    let _ = std::fs::remove_dir_all(scratch);
+    match build(profile, scratch) {
+        Ok(env) => Ok(env),
+        Err(why) => {
+            let _ = std::fs::remove_dir_all(scratch);
+            Err(why)
+        }
+    }
+}
+
+fn build(profile: &IsolationProfile, scratch: &Path) -> Result<WorkerEnv, String> {
     let home = scratch.join("home");
     let tmp = scratch.join("tmp");
     for dir in [&home, &tmp] {
@@ -63,7 +88,30 @@ pub fn prepare(profile: &IsolationProfile, scratch: &Path) -> Result<WorkerEnv, 
         gitconfig.to_string_lossy().into_owned(),
     ));
     vars.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+    // Repository-local config outranks `GIT_CONFIG_GLOBAL`, so the two
+    // rules a workspace could otherwise override are also pinned at
+    // command scope: `GIT_ALLOW_PROTOCOL` beats every `protocol.*`
+    // config key (a planted `protocol.<name>.allow = always` cannot
+    // reopen a transport), and an empty `credential.helper` at
+    // `GIT_CONFIG_COUNT` clears every helper a lower scope accumulated.
+    vars.push(("GIT_ALLOW_PROTOCOL".to_string(), "file".to_string()));
+    vars.push(("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
+    vars.push((
+        "GIT_CONFIG_KEY_0".to_string(),
+        "credential.helper".to_string(),
+    ));
+    vars.push(("GIT_CONFIG_VALUE_0".to_string(), String::new()));
     Ok(WorkerEnv { vars })
+}
+
+/// Best-effort reclamation of a scratch tree once its probe or
+/// Invocation can no longer use it — after the probe process returns
+/// and after the writer is proven stopped or refused before it
+/// started. Never fails a caller: reclamation is not part of the
+/// launch's fail-closed contract, and a leftover tree is swept the
+/// next time the same key is prepared.
+pub fn release(scratch: &Path) {
+    let _ = std::fs::remove_dir_all(scratch);
 }
 
 /// The scratch root every launch and probe builds its environment
@@ -115,6 +163,13 @@ mod tests {
             map["GIT_CONFIG_GLOBAL"],
             scratch.join("gitconfig").to_string_lossy()
         );
+        // Command-scope pins: they outrank repository-local config, so
+        // a workspace's own `.git/config` cannot reopen a transport or
+        // restore a credential helper.
+        assert_eq!(map["GIT_ALLOW_PROTOCOL"], "file");
+        assert_eq!(map["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(map["GIT_CONFIG_KEY_0"], "credential.helper");
+        assert!(map.contains_key("GIT_CONFIG_VALUE_0"));
         assert!(scratch.join("gitconfig").exists());
         for denied in [
             "GH_TOKEN",
@@ -134,13 +189,45 @@ mod tests {
     #[test]
     fn prepare_fails_closed_when_scratch_is_unwritable() {
         // A file where the scratch root must be a directory: the launch
-        // is refused rather than retried under inherited env.
+        // is refused rather than retried under inherited env, and the
+        // occupier itself is never swept away by the cleanup.
         let root = tmp("blocked");
         let scratch = root.join("env");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&scratch, "not a dir").unwrap();
         let err = prepare(&default_isolation_profile(), &scratch).unwrap_err();
         assert!(err.contains("isolation scratch"), "{err}");
+        assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "not a dir");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_starts_a_reused_key_from_an_empty_tree() {
+        // A scratch tree left behind by an earlier use of the same key
+        // never leaks into the next environment.
+        let scratch = tmp("stale").join("env");
+        std::fs::create_dir_all(scratch.join("home")).unwrap();
+        std::fs::write(scratch.join("home").join("stale"), "old").unwrap();
+        prepare(&default_isolation_profile(), &scratch).unwrap();
+        assert!(!scratch.join("home").join("stale").exists());
+        let _ = std::fs::remove_dir_all(scratch.parent().unwrap());
+    }
+
+    #[test]
+    fn release_reclaims_a_scratch_tree_and_ignores_non_trees() {
+        let root = tmp("release");
+        let scratch = root.join("env");
+        prepare(&default_isolation_profile(), &scratch).unwrap();
+        assert!(scratch.join("home").exists());
+        release(&scratch);
+        assert!(!scratch.exists());
+        release(&scratch); // absent is already reclaimed
+        // A non-directory occupier is not a scratch tree: best-effort
+        // reclamation never deletes it.
+        let occupier = root.join("occupied");
+        std::fs::write(&occupier, "keep").unwrap();
+        release(&occupier);
+        assert_eq!(std::fs::read_to_string(&occupier).unwrap(), "keep");
         let _ = std::fs::remove_dir_all(&root);
     }
 
