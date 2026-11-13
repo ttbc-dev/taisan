@@ -369,12 +369,17 @@ fn rewind(store: &SqliteStore, artifact_id: &str, mutate: impl FnOnce(&mut Artif
 
 // ---- U4.6 record retention (fail-closed stamping) --------------------
 
-/// One git query whose trimmed stdout. `None` on any failure — the
-/// revision stamping never substitutes a placeholder for it.
-fn git_stdout(argv: &[&str]) -> Option<String> {
+/// The root the stamping helpers query: this checkout.
+fn stamping_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// One git query in `dir` whose trimmed stdout. `None` on any failure —
+/// the revision stamping never substitutes a placeholder for it.
+fn git_stdout_in(dir: &Path, argv: &[&str]) -> Option<String> {
     std::process::Command::new("git")
         .args(argv)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(dir)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -383,14 +388,29 @@ fn git_stdout(argv: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn git_stdout(argv: &[&str]) -> Option<String> {
+    git_stdout_in(&stamping_root(), argv)
+}
+
+/// GitHub records an all-zero `before` when a push creates a branch: a
+/// placeholder, never a revision to stamp into a record.
+const NULL_COMMIT_ID: &str = "0000000000000000000000000000000000000000";
+
 /// A required revision field must be a full commit id: `unknown`, a
 /// truncated id, or any non-hex output fails the recorded run instead
-/// of being stamped into a record.
+/// of being stamped into a record. The all-zero placeholder of a
+/// branch-creating push is refused here too — the record path degrades
+/// that expected event value to no stamp before it reaches this
+/// check, and this assertion keeps the contract for any other caller.
 fn assert_commit_id(sha: &str, what: &str) {
     assert_eq!(sha.len(), 40, "{what} must be a full commit id: {sha}");
     assert!(
         sha.chars().all(|c| c.is_ascii_hexdigit()),
         "{what} must be a hex commit id: {sha}"
+    );
+    assert_ne!(
+        sha, NULL_COMMIT_ID,
+        "{what} must never be the all-zero placeholder: {sha}"
     );
 }
 
@@ -401,36 +421,63 @@ fn assert_commit_id(sha: &str, what: &str) {
 /// the exercised slice never stamps a record. A git failure answers
 /// `false` rather than panicking, so the question itself never fails a
 /// run: the answer only decides whether the run may stamp records.
-fn tracked_tree_is_pristine() -> bool {
+fn tracked_tree_is_pristine_in(dir: &Path) -> bool {
     std::process::Command::new("git")
         .args(["status", "--porcelain"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(dir)
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
+}
+
+fn tracked_tree_is_pristine() -> bool {
+    tracked_tree_is_pristine_in(&stamping_root())
 }
 
 /// The base fork point of a normal checkout: the first merge-base
 /// against a base branch this clone keeps. A checkout that retains no
 /// base history at all cites the deepest commit it does retain; a
 /// checkout with no commit history yields `None` and retains no records.
-fn base_revision() -> Option<String> {
+fn base_revision_in(dir: &Path) -> Option<String> {
     for revs in [
         ["merge-base", "HEAD", "origin/main"],
         ["merge-base", "HEAD", "main"],
         ["merge-base", "HEAD", "origin/HEAD"],
     ] {
-        if let Some(sha) = git_stdout(&revs) {
+        if let Some(sha) = git_stdout_in(dir, &revs) {
             return Some(sha);
         }
     }
-    git_stdout(&["rev-list", "--max-parents=0", "HEAD"])
+    git_stdout_in(dir, &["rev-list", "--max-parents=0", "HEAD"])
         .and_then(|roots| roots.lines().next().map(str::to_string))
 }
 
+fn base_revision() -> Option<String> {
+    base_revision_in(&stamping_root())
+}
+
+/// The revision pair a workflow event payload names: a pull_request
+/// run cites `head.sha`/`base.sha`, a push run `GITHUB_SHA`/`before`.
+/// Pure over the payload so the placeholder case is testable without
+/// Actions.
+fn ci_event_revisions_from(
+    event: &serde_json::Value,
+    push_sha: Option<&str>,
+) -> Option<(String, String)> {
+    if let Some(pr) = event.get("pull_request") {
+        return Some((
+            pr.get("head")?.get("sha")?.as_str()?.to_string(),
+            pr.get("base")?.get("sha")?.as_str()?.to_string(),
+        ));
+    }
+    Some((
+        push_sha?.to_string(),
+        event.get("before")?.as_str()?.to_string(),
+    ))
+}
+
 /// The revision pair a CI run stamps, read from the workflow event
-/// payload — a pull_request run cites `head.sha`/`base.sha`, a push run
-/// `GITHUB_SHA`/`before`. `None` outside Actions or without the pair.
+/// payload. `None` outside Actions or without the pair.
 fn ci_event_revisions() -> Option<(String, String)> {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
         return None;
@@ -439,36 +486,44 @@ fn ci_event_revisions() -> Option<(String, String)> {
         &std::fs::read_to_string(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?,
     )
     .ok()?;
-    if let Some(pr) = event.get("pull_request") {
-        return Some((
-            pr.get("head")?.get("sha")?.as_str()?.to_string(),
-            pr.get("base")?.get("sha")?.as_str()?.to_string(),
-        ));
-    }
-    Some((
-        std::env::var("GITHUB_SHA").ok()?,
-        event.get("before")?.as_str()?.to_string(),
-    ))
+    ci_event_revisions_from(&event, std::env::var("GITHUB_SHA").ok().as_deref())
 }
 
 /// The revision pair a recorded run stamps, validated fail-closed —
 /// `None` whenever no trustworthy stamp exists (a dirty tree, a
-/// checkout git cannot answer). A run without a stamp still executes
-/// every scenario and every record-independent assertion, but builds
-/// and retains no records: a retained record must cite a commit that
-/// contains the exercised slice, so an unstamped run degrades to *no
-/// evidence* rather than to a placeholder.
-fn record_revisions() -> Option<(String, String)> {
-    if !tracked_tree_is_pristine() {
+/// checkout git cannot answer, or an all-zero placeholder in the CI
+/// event). A run without a stamp still executes every scenario and
+/// every record-independent assertion, but builds and retains no
+/// records: a retained record must cite a commit that contains the
+/// exercised slice, so an unstamped run degrades to *no evidence*
+/// rather than to a placeholder.
+fn record_revisions_from(
+    dir: &Path,
+    ci_pair: Option<(String, String)>,
+) -> Option<(String, String)> {
+    if !tracked_tree_is_pristine_in(dir) {
         return None;
     }
-    let (tested, base) = match ci_event_revisions() {
+    let (tested, base) = match ci_pair {
         Some(pair) => pair,
-        None => (git_stdout(&["rev-parse", "HEAD"])?, base_revision()?),
+        None => (
+            git_stdout_in(dir, &["rev-parse", "HEAD"])?,
+            base_revision_in(dir)?,
+        ),
     };
+    if tested == NULL_COMMIT_ID || base == NULL_COMMIT_ID {
+        // A branch-creating push reports an all-zero `before`: an
+        // expected GitHub value, so the run degrades to no record
+        // instead of stamping the placeholder or failing the run.
+        return None;
+    }
     assert_commit_id(&tested, "tested_revision");
     assert_commit_id(&base, "base_revision");
     Some((tested, base))
+}
+
+fn record_revisions() -> Option<(String, String)> {
+    record_revisions_from(&stamping_root(), ci_event_revisions())
 }
 
 fn installation() -> serde_json::Value {
@@ -768,15 +823,30 @@ fn u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindin
     }
     let invocation_n = invocations(&store, &exec_n).into_iter().next().unwrap();
     assert_eq!(invocation_n.state, InvocationState::Done);
+    let identity_n = invocation_n
+        .process_identity
+        .as_ref()
+        .expect("the new writer's recorded identity survives the stop");
     let intent_n = store
         .transact(|tx| tx.stop_intent(&invocation_n.id))
         .unwrap()
         .expect("durable stop intent for the new request");
+    assert!(
+        !intent_n.identities.is_empty(),
+        "the new writer's stop intent is not empty"
+    );
+    assert!(
+        intent_n.identities.iter().any(|i| i.pid == identity_n.pid),
+        "the intent covers the new writer's recorded identity"
+    );
     for id in &intent_n.identities {
-        assert!(matches!(
-            PosixProcessControl.inspect(id),
-            ProcessEvidence::Stopped { .. }
-        ));
+        assert!(
+            matches!(
+                PosixProcessControl.inspect(id),
+                ProcessEvidence::Stopped { .. }
+            ),
+            "every identity the intent recorded is inspected stopped"
+        );
     }
 
     let identity_json = serde_json::json!({
@@ -1140,6 +1210,11 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         !ref_exists(&repo_dir, &ref_2),
         "the lost workspace never mints an artifact ref"
     );
+    assert_eq!(
+        artifact_refs(&repo_dir),
+        vec![ref_1.clone()],
+        "the lost-workspace window holds exactly the acknowledged ref set"
+    );
 
     // Final: one row per invocation under its deterministic ID, one ref
     // total, no incomplete rows, no worker launched by recovery.
@@ -1391,12 +1466,30 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
 
 // ---- evidence machinery checks ---------------------------------------
 
+/// A pristine single-commit git fixture: the constructed input the
+/// fail-closed stamping checks run against.
+fn git_fixture(tag: &str) -> PathBuf {
+    let dir = tmp_root(tag);
+    git(&dir, &["init", "-b", "main"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
+    std::fs::write(dir.join("seed.txt"), "base").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "base"]);
+    dir
+}
+
 /// The stamping helpers are fail-closed: either both revisions are full
 /// commit ids stamped over a pristine tree, or there is no stamp at all
-/// — a dirty tree, a checkout git cannot answer, or an unresolvable
-/// base. A placeholder such as `unknown` is never produced.
+/// — a dirty tree, a checkout git cannot answer, an unresolvable base,
+/// or an all-zero placeholder in the CI event. A placeholder such as
+/// `unknown` is never produced. The negative paths are constructed
+/// here, not merely restated from the helper's own preconditions.
 #[test]
 fn u46c_revision_stamp_is_fail_closed() {
+    // The live checkout: a stamp, when one exists, is two full commit
+    // ids over a pristine tree; no stamp means one of the fail-closed
+    // conditions actually holds.
     match record_revisions() {
         Some((tested, base)) => {
             assert_commit_id(&tested, "tested_revision");
@@ -1409,10 +1502,71 @@ fn u46c_revision_stamp_is_fail_closed() {
         None => assert!(
             !tracked_tree_is_pristine()
                 || git_stdout(&["rev-parse", "HEAD"]).is_none()
-                || base_revision().is_none(),
-            "no stamp means a dirty tree or an unanswerable git — never a placeholder"
+                || base_revision().is_none()
+                || ci_event_revisions().is_some(),
+            "no stamp means a dirty tree, an unanswerable git, or an \
+             untrustworthy CI event — never a placeholder"
         ),
     }
+
+    // Positive control: a pristine fixture checkout stamps with two
+    // full commit ids.
+    let repo = git_fixture("stamp-pristine");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let (tested, base) =
+        record_revisions_from(&repo, None).expect("a pristine fixture yields a stamp");
+    assert_commit_id(&tested, "tested_revision");
+    assert_commit_id(&base, "base_revision");
+    assert_eq!(tested, head);
+
+    // A placeholder never stamps: the all-zero `before` GitHub reports
+    // for a branch-creating push parses as a normal event pair, and
+    // the stamping then yields no record; the required-field
+    // validator itself refuses the placeholder too.
+    let placeholder = "0".repeat(40);
+    let event = serde_json::json!({ "before": placeholder.clone(), "after": head.clone() });
+    let pair = ci_event_revisions_from(&event, Some(&head)).expect("push event yields the pair");
+    assert_eq!(pair.1, placeholder);
+    assert!(
+        record_revisions_from(&repo, Some(pair)).is_none(),
+        "an all-zero event revision yields no stamp, never a record"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_commit_id(&placeholder, "base_revision")).is_err(),
+        "the required-field validator refuses the all-zero placeholder"
+    );
+
+    // A dirty tree never stamps — an untracked file counts as dirt for
+    // this slice, which adds files.
+    std::fs::write(repo.join("dirt.txt"), "untracked").unwrap();
+    assert!(
+        !tracked_tree_is_pristine_in(&repo),
+        "the untracked file makes the fixture dirty"
+    );
+    assert!(
+        record_revisions_from(&repo, None).is_none(),
+        "a dirty tree yields no stamp"
+    );
+    std::fs::remove_file(repo.join("dirt.txt")).unwrap();
+
+    // A checkout git cannot answer never stamps: no repository at
+    // all...
+    let no_repo = tmp_root("stamp-no-repo");
+    assert!(
+        record_revisions_from(&no_repo, None).is_none(),
+        "a non-git tree yields no stamp"
+    );
+    // ... and a repository with no commit history to cite.
+    let no_commit = tmp_root("stamp-no-commit");
+    git(&no_commit, &["init", "-b", "main"]);
+    assert!(
+        tracked_tree_is_pristine_in(&no_commit),
+        "a repository with no commits has nothing to report as dirt"
+    );
+    assert!(
+        record_revisions_from(&no_commit, None).is_none(),
+        "a repository with no commit history yields no stamp"
+    );
 }
 
 /// The retained record carries exactly the closed field set of the U4.6

@@ -173,11 +173,19 @@ the exercised slice:
 Three named checks guard the evidence machinery itself:
 `u46c_revision_stamp_is_fail_closed` (a stamp is either two full
 commit ids over a pristine checkout or no stamp at all — never a
-placeholder), `u46c_retained_record_carries_the_closed_field_set`
+placeholder, including the all-zero `before` a branch-creating push
+reports, and the check constructs its dirty-tree, unanswerable-git and
+placeholder cases rather than restating the helper's preconditions),
+`u46c_retained_record_carries_the_closed_field_set`
 (the record carries exactly the closed U4.6 field set, the closed
 claim class, and every binding field on each adapter-selection entry),
 and `u46c_evidence_record_cites_the_tested_revision` (the evidence
 record names full tested/base commit ids, transcribes every retained
-scenario record under that tested revision, and verifies the cited
+scenario record under that tested revision, and — when the checkout
+retains the cited commit, as a full clone does — verifies the cited
 commit contains the exercised suite and is on the branch history to
-`HEAD`).
+`HEAD`; a checkout that omits the cited commit (a depth-1 clone or a
+base checkout with the patch applied) must explain it in the record,
+and the guard then requires this tree's slice to carry the three
+exercised scenarios, so the fallback cannot pass on the explanation
+words alone).
