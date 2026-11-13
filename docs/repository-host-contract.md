@@ -110,7 +110,7 @@ Every U3.6 suite run retains one record per exercised scenario per adapter — t
 | --- | --- |
 | `schema_version` | `1` |
 | `tested_revision` | Exact commit SHA on the PR branch that contains the exercised slice tree. A base revision or patch digest alone never satisfies this field; a patch digest may be retained alongside it |
-| `base_revision` | The fork point the exercised tree was applied to |
+| `base_revision` | The base revision the run was exercised against — the merge-base fork point where the checkout retains reachable history; in CI, the platform-recorded event base (`pull_request.base.sha`, or the push `before`), which is the base that run actually tested |
 | `core_revision` | The exact revision of the Core implementation exercised — a commit SHA for in-repo builds |
 | `adapter_revision` | The exact revision of the adapter implementation exercised — a commit SHA for in-repo fixtures, an adapter-declared build identifier otherwise |
 | `config_identity` | The configuration the run bound: `install_identity` (`host_instance`, `repository`, `adapter`, `contract_version`) plus `config_digest`, a sha256 over the canonical configuration projection — the record's config-file identity |

@@ -100,7 +100,9 @@ pub struct EvidenceRecord {
     /// tree — a base revision or patch digest never satisfies this
     /// field.
     pub tested_revision: String,
-    /// The fork point the exercised tree was applied to.
+    /// The base revision the run was exercised against — the
+    /// merge-base fork point where the checkout retains history, the
+    /// platform-recorded event base in CI.
     pub base_revision: String,
     /// The exact revision of the Core implementation exercised — a
     /// commit SHA for in-repo builds.
@@ -125,8 +127,29 @@ pub struct EvidenceRecord {
     /// The authorization a `live_evidenced` record cites. Required iff
     /// `claim_class` is `live_evidenced`; absent — never null — on a
     /// `fixture_contract` record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_authorization_reference"
+    )]
     pub authorization_reference: Option<String>,
+}
+
+/// Present-but-wrong-typed guard: an `authorization_reference` key may
+/// only ever hold a non-empty string. A `null` or non-string value must
+/// fail deserialization rather than normalize to `None`, which would
+/// silently turn a present key into an absent one — typed records and
+/// externally produced JSON answer the same contract.
+fn deserialize_authorization_reference<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(s) if !s.is_empty() => Ok(Some(s)),
+        other => Err(serde::de::Error::custom(format!(
+            "authorization_reference must be a non-empty string when present, got {other}"
+        ))),
+    }
 }
 
 impl EvidenceRecord {
@@ -252,8 +275,13 @@ fn base_revision(manifest_dir: &str) -> Option<String> {
 /// payload: the Actions checkout is depth-1, so the clone keeps no
 /// reachable base history, but the payload records the real commits —
 /// a pull_request run cites `head.sha` (the source-branch commit, not
-/// the synthetic merge ref) and `base.sha`; a push run cites
-/// `GITHUB_SHA` and `before`. `None` outside Actions or when the
+/// the synthetic merge ref) and `base.sha` (the base tip the run was
+/// exercised against — the commit the merge ref combined with head); a
+/// push run cites `GITHUB_SHA` and `before` (the tip the push was
+/// applied over). The CI base is therefore the platform-recorded event
+/// base, which differs from a merge-base fork point once the base
+/// branch has advanced; both describe the base the run was exercised
+/// against in its own environment. `None` outside Actions or when the
 /// payload carries neither pair.
 fn ci_event_revisions() -> Option<(String, String)> {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
@@ -283,8 +311,10 @@ fn is_commit_id(sha: &str) -> bool {
 }
 
 /// The revision pair a recorded run stamps: `tested` is the commit
-/// that contains the exercised slice tree, `base` the fork point it
-/// was applied to. Both are full commit ids over a pristine tracked
+/// that contains the exercised slice tree, `base` the base revision
+/// the run was exercised against — the merge-base fork point where the
+/// checkout retains history, the platform-recorded event base in CI.
+/// Both are full commit ids over a pristine tracked
 /// tree — `None` whenever no trustworthy stamp exists (a dirty
 /// checkout, an unreadable repository, missing base history), so a
 /// run without a stamp executes its assertions but retains no records
@@ -611,6 +641,31 @@ mod tests {
             assert!(
                 validate_record_json(&value).is_err(),
                 "{field} = {injected} must invalidate the record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_but_invalid_authorization_reference_cannot_deserialize() {
+        // A `null` or wrong-typed key must not normalize to absent —
+        // typed records and raw JSON answer the same contract.
+        for injected in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(""),
+        ] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("authorization_reference".into(), injected.clone());
+            assert!(
+                serde_json::from_value::<EvidenceRecord>(value.clone()).is_err(),
+                "authorization_reference = {injected} must fail deserialization"
+            );
+            assert!(
+                validate_record_json(&value).is_err(),
+                "authorization_reference = {injected} is also a raw-record violation"
             );
         }
     }

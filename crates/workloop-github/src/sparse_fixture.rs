@@ -57,6 +57,12 @@ impl SparseHost {
     /// The capability set this fixture declares: the baseline read/write
     /// set plus `push_ref` and `change_request_create` only. Head-bound
     /// metadata and comment writes are unsupported and reported as such.
+    /// This is the normalized-port vocabulary the U3.1 conformance
+    /// suite gates on — facts delivered through `emit`/`attempt`. The
+    /// typed-read surface is separate: this remote journals only
+    /// change-request and branch heads, so a typed read of any other
+    /// subject — including kinds this vocabulary declares — answers
+    /// `Partial` rather than an invented revision.
     pub fn declared_capabilities() -> &'static [&'static str] {
         &[
             "repository_read",
@@ -100,7 +106,12 @@ impl SparseHost {
     /// read's completeness. This remote journals only change-request
     /// and branch heads — a subject with no journal entry, or one the
     /// adapter's declared read set does not cover, is a `Partial`
-    /// read; the host never invents a revision.
+    /// read; the host never invents a revision. The declared
+    /// capability vocabulary covers the normalized port — check,
+    /// review and repository facts exercise it through `emit`
+    /// deliveries — so their typed reads here are honest `Partial`
+    /// answers for a subject the sparse remote does not journal, not a
+    /// failure to serve the declared vocabulary.
     pub fn read(&self, subject: &ReadSubject, reader: &HostActorRef) -> RemoteRead {
         let version = self.subject_version(subject);
         let partial = |reason: &str| RemoteRead {
