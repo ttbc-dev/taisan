@@ -993,3 +993,187 @@ fn lost_update_receipt_after_head_move_remains_unknown() {
         other => panic!("the stale-head guard decides: {other:?}"),
     }
 }
+
+/// A persistently foreign-attributed effect is recorded once: the
+/// re-observed `Present` carrying the attribution and fact already on
+/// the record is a no-op, so repeated reconcile passes never stream
+/// duplicate receipts for a verdict that cannot settle (reconcile
+/// receipts carry no delivery identity for the dedupe index to catch).
+#[test]
+fn foreign_attributed_effect_records_one_receipt_across_reconcile_passes() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "u35-once");
+    let mut gh = FixtureGithub::new();
+    gh.register_change(
+        &change("cr-9"),
+        "work/w",
+        "main",
+        "head-1",
+        &actor("other-agent"),
+    );
+    let open_id = insert_intent_with(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: "work/w".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+        HostActionStatus::Unknown {
+            reason: "response lost".into(),
+        },
+    );
+    let observations = |store: &SqliteStore, work_id: &WorkId| {
+        store
+            .transact(|tx| tx.observations_for_work(work_id))
+            .unwrap()
+            .len()
+    };
+
+    let first = gh.reconcile_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(first.still_unknown, 1);
+    assert_eq!(
+        intent(&store, &open_id).status,
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        },
+        "the foreign attribution settles nothing"
+    );
+    let after_first = observations(&store, &work_id);
+    assert!(
+        after_first > 0,
+        "the first pass records the observed attribution once"
+    );
+
+    // Every later pass re-observes the same Present and appends
+    // nothing: the verdict and its attribution are already durable.
+    for _ in 0..3 {
+        let report = gh.reconcile_outbox(&store, &config, NOW).unwrap();
+        assert_eq!(report.still_unknown, 1);
+        assert_eq!(
+            observations(&store, &work_id),
+            after_first,
+            "a re-observed identical effect appends no receipt"
+        );
+    }
+
+    // The write drain cannot restart the stream either: the intent is
+    // no longer pending.
+    gh.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(observations(&store, &work_id), after_first);
+    assert_eq!(
+        intent(&store, &open_id).status,
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        }
+    );
+}
+
+/// An ancestry-proved push reconciles from the intent's bound actor,
+/// not the last ref mover: a racing actor that pushed on top of our
+/// landed commit must not turn the recovered push into an
+/// `actor_mismatch` — ancestry is the evidence the push reached the
+/// branch, and the write path attributes identical remote state to
+/// the authenticated writer.
+#[test]
+fn ancestor_push_reconciles_from_the_bound_actor_not_the_last_ref_mover() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "u35-ancestor");
+    let mut gh = FixtureGithub::new();
+    // Our push landed head-1; a racing actor then moved the branch
+    // to head-2 on top of it.
+    gh.set_branch(&repo(), "work/w", "head-1", &publisher());
+    gh.set_parent("head-2", "head-1");
+    gh.set_branch(&repo(), "work/w", "head-2", &actor("racer"));
+
+    let push_id = insert_intent_with(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+        HostActionStatus::Unknown {
+            reason: "response lost".into(),
+        },
+    );
+
+    let report = gh.reconcile_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(report.applied, 1, "ancestry proves the push landed");
+    let settled = intent(&store, &push_id);
+    assert_eq!(settled.status, HostActionStatus::Applied);
+    assert_eq!(
+        settled.authenticated_actor,
+        Some(publisher()),
+        "the bound actor, never the racing ref mover"
+    );
+    match &settled.effects[..] {
+        [
+            NormalizedEffectFact::RefPublished {
+                produced,
+                observed,
+                relation,
+                ..
+            },
+        ] => {
+            assert_eq!(*produced, rev("head-1"));
+            assert_eq!(*observed, rev("head-2"), "the read-back observation");
+            assert_eq!(*relation, RefRelation::Ancestor);
+        }
+        other => panic!("push receipt missing RefPublished: {other:?}"),
+    }
+}
+
+/// The create reconciles from the opener record, not the mutable
+/// head-producer map: a lost-receipt open whose change head was later
+/// advanced by another actor still settles `applied` — the head mover
+/// never becomes the create's attribution.
+#[test]
+fn open_reconciles_from_the_opener_after_a_raced_head_move() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "u35-opener");
+    let mut gh = FixtureGithub::new();
+    gh.register_change(&change("cr-7"), "work/o", "main", "head-1", &publisher());
+    // Another actor moved the change's head after the create: the
+    // head-producer map now names the mover, the opener record does
+    // not move.
+    gh.set_change_head(&change("cr-7"), "head-2", &actor("other-agent"));
+
+    let open_id = insert_intent_with(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: "work/o".into(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: String::new(),
+        },
+        HostActionStatus::Unknown {
+            reason: "response lost".into(),
+        },
+    );
+
+    let report = gh.reconcile_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(report.applied, 1, "the opener's create is proven present");
+    let settled = intent(&store, &open_id);
+    assert_eq!(settled.status, HostActionStatus::Applied);
+    assert_eq!(settled.authenticated_actor, Some(publisher()));
+    match &settled.effects[..] {
+        [
+            NormalizedEffectFact::ChangeOpened {
+                change: opened,
+                head,
+                ..
+            },
+        ] => {
+            assert_eq!(opened, &change("cr-7"));
+            assert_eq!(*head, rev("head-2"), "the observed head at read time");
+        }
+        other => panic!("open receipt missing ChangeOpened: {other:?}"),
+    }
+}

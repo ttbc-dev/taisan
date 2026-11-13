@@ -27,6 +27,7 @@ use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
 use workloop_core::domain::{ExecutionId, ExecutionState, WorkId};
 use workloop_core::identity::AdapterId;
+use workloop_core::observation::HostActionStatus;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
 use workloop_core::store::{Effect, Store, StoreError};
@@ -516,12 +517,47 @@ pub fn run_pass(
                             OUTBOX_ITEMS_PER_TICK,
                         )
                         .map(|applied| (reconciled, applied))
+                })
+                .and_then(|(reconciled, r)| {
+                    // The phase reports every item left untouched for
+                    // the next pass: the reconcile pass's unread
+                    // remainder joins the write drain's unattempted
+                    // remainder (the drain only reports `pending`
+                    // intents, so an `unknown` the read never reached
+                    // would otherwise vanish), deduplicated, and an
+                    // item the drain settled in between is dropped —
+                    // it is no longer untouched.
+                    let mut deferred = reconciled.deferred.clone();
+                    for id in &r.deferred {
+                        if !deferred.contains(id) {
+                            deferred.push(id.clone());
+                        }
+                    }
+                    if !deferred.is_empty() {
+                        let outstanding: std::collections::HashSet<String> =
+                            pass.store.transact(|tx| {
+                                Ok(tx
+                                    .action_intents()?
+                                    .into_iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.status,
+                                            HostActionStatus::Pending
+                                                | HostActionStatus::Unknown { .. }
+                                        )
+                                    })
+                                    .map(|i| i.action_id)
+                                    .collect())
+                            })?;
+                        deferred.retain(|id| outstanding.contains(id));
+                    }
+                    Ok((reconciled, r, deferred))
                 });
             push!(match result {
-                Ok((reconciled, r)) => {
+                Ok((reconciled, r, deferred)) => {
                     let mut p = PhaseReport::completed(PHASES[3]);
                     p.processed = reconciled.examined + r.attempted;
-                    p.deferred = r.deferred;
+                    p.deferred = deferred;
                     p.reason = Some(format!(
                         "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={}",
                         reconciled.applied,
@@ -1305,6 +1341,208 @@ mod tests {
             "later gated phases defer; sweep and Attention still run: {:?}",
             report.phases
         );
+    }
+
+    fn insert_outbox_intent(
+        store: &SqliteStore,
+        work_id: &WorkId,
+        action: HostAction,
+        status: HostActionStatus,
+    ) -> String {
+        let cfg = config();
+        store
+            .transact(|tx| {
+                let action_id = tx.alloc_id("act")?;
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
+                        action_id: action_id.clone(),
+                        work_id: work_id.clone(),
+                        host: cfg.host.repository.host.clone(),
+                        repository: cfg.host.repository.clone(),
+                        role: ActorRole::Publication,
+                        actor: cfg.host.actors[0].actor.clone(),
+                        action,
+                        payload_digest: "digest".into(),
+                        status,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
+                    },
+                })?;
+                Ok(action_id)
+            })
+            .unwrap()
+    }
+
+    fn push_intent(branch: &str, produced: &str) -> HostAction {
+        HostAction::PushRef {
+            branch: branch.into(),
+            produced: CommitRevision::new(config().host.repository.clone(), produced).unwrap(),
+            expected_prior: None,
+        }
+    }
+
+    /// The reconcile pass's untouched remainder reaches the phase
+    /// report: when the tick deadline stops the read-only pass before
+    /// it examines an outstanding `unknown` intent, the write drain —
+    /// which only ever reports `pending` intents — cannot surface it,
+    /// so the phase's deferred list must carry it for the next pass.
+    #[test]
+    fn the_outbox_phase_reports_the_reconcile_remand_at_the_tick_deadline() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-remand");
+        let unknown_id = insert_outbox_intent(&store, &w, push_intent("work/unread", "head-1"), {
+            HostActionStatus::Unknown {
+                reason: "response lost".into(),
+            }
+        });
+        let settings = settings();
+        // Same budget as the write-drain deadline test: calls 1-7
+        // (pass start, the phase gates, refresh, dispatch) stay inside
+        // the budget, so the deadline trips where the reconcile item
+        // loop first consults it — before any intent is examined.
+        let mut calls = 0u32;
+        let report = run(&store, &settings, None, &mut || {
+            calls += 1;
+            if calls <= 7 { NOW } else { NOW + TICK as i64 }
+        });
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.phase, "host_outbox");
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed, 0,
+            "the deadline stops the read before its first item"
+        );
+        assert_eq!(
+            outbox.deferred,
+            vec![unknown_id.clone()],
+            "the reconcile pass's unread remainder is reported for the next pass"
+        );
+        assert!(report.deadline_exceeded);
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(intents[0].status, HostActionStatus::Unknown { .. }),
+            "the unread intent stays outstanding: {:?}",
+            intents[0].status
+        );
+    }
+
+    /// The reconcile pass's per-tick item bound stops the read before
+    /// every outstanding intent: the `unknown` remainder the write
+    /// drain cannot report (it drains `pending` only) must still reach
+    /// the phase's deferred list, while the examined intents settle
+    /// from the read alone.
+    #[test]
+    fn the_outbox_phase_reports_unknown_intents_past_the_reconcile_bound() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-bound");
+        let mut ids = Vec::new();
+        for n in 0..=OUTBOX_ITEMS_PER_TICK {
+            ids.push(insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/bound-{n}"), "head-1"),
+                HostActionStatus::Unknown {
+                    reason: "response lost".into(),
+                },
+            ));
+        }
+        let settings = settings();
+        let report = run(&store, &settings, None, &mut || NOW);
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.phase, "host_outbox");
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed, OUTBOX_ITEMS_PER_TICK,
+            "the bound stops the read at eight items"
+        );
+        assert_eq!(
+            outbox.deferred,
+            vec![ids[OUTBOX_ITEMS_PER_TICK].clone()],
+            "the unexamined unknown intent is reported for the next pass"
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), OUTBOX_ITEMS_PER_TICK + 1);
+        let failed = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Failed { .. }))
+            .count();
+        assert_eq!(
+            failed, OUTBOX_ITEMS_PER_TICK,
+            "the examined intents settled failed on definitive absence"
+        );
+        let outstanding: Vec<&str> = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Unknown { .. }))
+            .map(|i| i.action_id.as_str())
+            .collect();
+        assert_eq!(
+            outstanding,
+            vec![ids[OUTBOX_ITEMS_PER_TICK].as_str()],
+            "only the unexamined intent stays unknown"
+        );
+    }
+
+    /// The merged remainder never reports an item the same pass
+    /// already settled: eight unread `unknown` intents exhaust the
+    /// reconcile bound and defer two `pending` pushes the write drain
+    /// then lands — nothing is untouched, so the phase reports nothing
+    /// deferred.
+    #[test]
+    fn the_outbox_phase_drops_from_the_remand_what_the_drain_settled() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-merged");
+        for n in 0..OUTBOX_ITEMS_PER_TICK {
+            insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/unread-{n}"), "head-1"),
+                HostActionStatus::Unknown {
+                    reason: "response lost".into(),
+                },
+            );
+        }
+        let mut pending_ids = Vec::new();
+        for n in 0..2 {
+            pending_ids.push(insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/pending-{n}"), "head-2"),
+                HostActionStatus::Pending,
+            ));
+        }
+        let settings = settings();
+        let report = run(&store, &settings, None, &mut || NOW);
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed,
+            OUTBOX_ITEMS_PER_TICK + 2,
+            "eight reads plus two writes"
+        );
+        assert!(
+            outbox.deferred.is_empty(),
+            "every item was handled this pass: {:?}",
+            outbox.deferred
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        let applied: Vec<&str> = intents
+            .iter()
+            .filter(|i| i.status == HostActionStatus::Applied)
+            .map(|i| i.action_id.as_str())
+            .collect();
+        assert_eq!(
+            applied,
+            pending_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the deferred-then-reached pending pushes were settled by the drain"
+        );
+        let failed = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Failed { .. }))
+            .count();
+        assert_eq!(failed, OUTBOX_ITEMS_PER_TICK);
     }
 
     #[test]

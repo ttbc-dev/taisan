@@ -151,6 +151,12 @@ pub struct FixtureGithub {
     /// `change_request_id` → the actor the remote attributes its head
     /// to (the opener or the last pusher).
     change_actors: BTreeMap<String, HostActorRef>,
+    /// `change_request_id` → the actor that created the change request.
+    /// Recorded when the change is registered or opened and never
+    /// rewritten by a later head move — the stable attribution a
+    /// lost-receipt create reconciles from, while [`Self::change_actors`]
+    /// keeps tracking whoever moved the head last for reads.
+    change_openers: BTreeMap<String, HostActorRef>,
     /// `change_request_id` → the full scoped ref, learned at open or
     /// registration time so raw-id mutators can bump the scoped
     /// subject version.
@@ -872,6 +878,8 @@ impl FixtureGithub {
             change.change_request.as_str().to_string(),
             (source_branch.to_string(), target_branch.to_string()),
         );
+        self.change_openers
+            .insert(change.change_request.as_str().to_string(), actor.clone());
         self.meta_actors
             .insert(change.change_request.as_str().to_string(), actor.clone());
     }
@@ -1433,13 +1441,28 @@ impl FixtureGithub {
                     // The remote's attribution authenticates the
                     // receipt: an effect the remote credits to another
                     // actor is recorded `unknown{actor_mismatch}` by
-                    // the durable ingest path, never `applied`.
-                    self.emit(
-                        store,
-                        config,
-                        receipt(Some(actor), HostActionStatus::Applied, vec![*fact]),
-                        now,
-                    )?;
+                    // the durable ingest path, never `applied`. That
+                    // verdict is non-terminal, so the intent stays
+                    // outstanding — re-observing the identical
+                    // attribution and fact already on the record adds
+                    // nothing, and a persistently foreign-attributed
+                    // effect must not append a duplicate receipt on
+                    // every pass (reconcile receipts carry no delivery
+                    // identity, so the dedupe index never sees them).
+                    let already_recorded = matches!(
+                        &intent.status,
+                        HostActionStatus::Unknown { reason } if reason == "actor_mismatch"
+                    ) && intent.authenticated_actor.as_ref() == Some(&actor)
+                        && intent.effects.len() == 1
+                        && intent.effects[0] == *fact;
+                    if !already_recorded {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(Some(actor), HostActionStatus::Applied, vec![*fact]),
+                            now,
+                        )?;
+                    }
                 }
                 ObservedEffect::Absent => {
                     // Absence settles only an intent that already
@@ -1524,8 +1547,22 @@ impl FixtureGithub {
                 } else {
                     return ObservedEffect::Absent;
                 };
-                let Some(actor) = self.branch_actors.get(&key).cloned() else {
-                    return unattributable();
+                // The ref-mover record attributes the head, not the
+                // push that introduced `produced`: on an exact match
+                // the last mover is the pusher, but once a racing
+                // actor moved the branch on top of the landed commit,
+                // ancestry alone proves the push reached the branch
+                // and the mover says nothing about who produced it.
+                // The ancestor case therefore binds the intent's own
+                // actor — the same attribution the write path's
+                // read-back reports for identical remote state.
+                let actor = if relation == RefRelation::Equal {
+                    match self.branch_actors.get(&key).cloned() {
+                        Some(actor) => actor,
+                        None => return unattributable(),
+                    }
+                } else {
+                    intent.actor.clone()
                 };
                 let observed = if relation == RefRelation::Equal {
                     produced.clone()
@@ -1576,7 +1613,7 @@ impl FixtureGithub {
                                 reason: "matching change request has no head on the remote".into(),
                             };
                         };
-                        let Some(actor) = self.change_actors.get(id).cloned() else {
+                        let Some(actor) = self.change_openers.get(id).cloned() else {
                             return unattributable();
                         };
                         match CommitRevision::new(intent.repository.clone(), object.clone()) {
@@ -2361,6 +2398,10 @@ impl FixtureGithub {
                 self.change_refs
                     .insert(change.change_request.as_str().to_string(), change.clone());
                 self.change_actors.insert(
+                    change.change_request.as_str().to_string(),
+                    authenticated.clone(),
+                );
+                self.change_openers.insert(
                     change.change_request.as_str().to_string(),
                     authenticated.clone(),
                 );
