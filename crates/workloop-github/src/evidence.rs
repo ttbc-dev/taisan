@@ -285,11 +285,14 @@ fn base_revision(manifest_dir: &str) -> Option<String> {
 /// The revision pair a CI run stamps, read from the workflow event
 /// payload: the Actions checkout is depth-1, so the clone keeps no
 /// reachable base history, but the payload records the real commits —
-/// a pull_request run cites `head.sha` (the source-branch commit, not
-/// the synthetic merge ref) and `base.sha` (the base tip the run was
-/// exercised against — the commit the merge ref combined with head); a
-/// push run cites `GITHUB_SHA` and `before` (the tip the push was
-/// applied over). The CI base is therefore the platform-recorded event
+/// a pull_request run cites `head.sha` (the source-branch commit
+/// carrying the slice tree) and `base.sha` (the base tip the run was
+/// exercised against — the commit the merge ref combined with head);
+/// the default `pull_request` checkout is the synthetic merge of the
+/// two, so the (`tested_revision`, `base_revision`) pair describes the
+/// exercised merge tree; a push run cites `GITHUB_SHA` and `before`
+/// (the tip the push was applied over). The CI base is therefore the
+/// platform-recorded event
 /// base, which differs from a merge-base fork point once the base
 /// branch has advanced; both describe the base the run was exercised
 /// against in its own environment. `None` outside Actions or when the
@@ -367,7 +370,9 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
 ///   `adapter`, `contract_version`, plus `config_digest`);
 /// - `result` is the string `pass` / `fail` / `skipped` /
 ///   `inconclusive` — a present-but-non-string value is a violation;
-/// - the array fields are arrays.
+/// - the array fields are arrays of the typed element shape: identity
+///   arrays hold strings, `read_back_receipts` holds objects with
+///   string `target` and `observed`.
 ///
 /// Returns the list of violations; an empty list is a valid record.
 pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>> {
@@ -381,16 +386,39 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
             _ => violations.push(format!("missing required field: {field}")),
         }
     }
-    for field in [
-        "action_identities",
-        "observation_identities",
-        "read_back_receipts",
-    ] {
+    for field in ["action_identities", "observation_identities"] {
         match object.get(field) {
-            Some(v) if v.is_array() => {}
+            Some(v) if v.is_array() => {
+                for (i, element) in v.as_array().unwrap().iter().enumerate() {
+                    if !element.is_string() {
+                        violations.push(format!("{field}[{i}] is not a string"));
+                    }
+                }
+            }
             Some(_) => violations.push(format!("{field} is not an array")),
             None => {}
         }
+    }
+    match object.get("read_back_receipts") {
+        Some(v) if v.is_array() => {
+            for (i, element) in v.as_array().unwrap().iter().enumerate() {
+                match element.as_object() {
+                    Some(receipt) => {
+                        for field in ["target", "observed"] {
+                            match receipt.get(field) {
+                                Some(v) if v.is_string() => {}
+                                _ => violations.push(format!(
+                                    "read_back_receipts[{i}] missing string {field}"
+                                )),
+                            }
+                        }
+                    }
+                    None => violations.push(format!("read_back_receipts[{i}] is not an object")),
+                }
+            }
+        }
+        Some(_) => violations.push("read_back_receipts is not an array".into()),
+        None => {}
     }
     // String scalars: presence is the required-field check; a
     // present-but-non-string value is a type violation the typed form
@@ -690,6 +718,34 @@ mod tests {
     }
 
     #[test]
+    fn wrong_typed_array_elements_are_invalid() {
+        // Element shapes must match the typed form: identity arrays
+        // hold strings, receipts hold {target, observed} objects —
+        // anything else is a record the typed form cannot deserialize.
+        for (field, injected) in [
+            ("action_identities", serde_json::json!([7])),
+            ("observation_identities", serde_json::json!([null])),
+            ("read_back_receipts", serde_json::json!([{}])),
+            ("read_back_receipts", serde_json::json!([{"target": "t"}])),
+            (
+                "read_back_receipts",
+                serde_json::json!([{"target": 7, "observed": "o"}]),
+            ),
+            ("read_back_receipts", serde_json::json!([5])),
+        ] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), injected.clone());
+            assert!(
+                validate_record_json(&value).is_err(),
+                "{field} = {injected} must invalidate the record"
+            );
+        }
+    }
+
+    #[test]
     fn wrong_typed_install_identity_fields_are_invalid() {
         // Nested scalars follow the same rule: present-but-wrong-typed
         // is a violation, never a pass.
@@ -787,18 +843,40 @@ mod tests {
         dir
     }
 
+    /// A scratch clone of `src` at `--depth n` — a real shallow
+    /// checkout, so `--is-shallow-repository` and grafted boundary
+    /// commits behave as they do in CI.
+    fn shallow_clone(name: &str, src: &Path, depth: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("workloop-u36a-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        git(
+            std::env::temp_dir().as_path(),
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                depth,
+                &format!("file://{}", src.display()),
+                dir.to_str().unwrap(),
+            ],
+        );
+        dir
+    }
+
     #[test]
     fn base_revision_is_none_when_the_only_retained_commit_is_head() {
-        // A depth-1 clone outside CI: HEAD is also the deepest commit
-        // the checkout retains, so no fork point is provable — the
-        // stamp must not cite HEAD as its own base.
-        let dir = git_repo("shallow", 1);
+        // A depth-1 clone outside CI: HEAD is also the deepest (grafted)
+        // commit the checkout retains — no fork point is provable, so
+        // the stamp must not cite HEAD as its own base.
+        let src = git_repo("src-shallow", 2);
+        let dir = shallow_clone("depth1", &src, "1");
         assert_eq!(
             base_revision(dir.to_str().unwrap()),
             None,
             "a checkout retaining only HEAD proves no fork point"
         );
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src).ok();
     }
 
     #[test]
@@ -821,19 +899,7 @@ mod tests {
         // merge-base is unprovable across the boundary, so the boundary
         // commit is the deepest base the checkout can cite.
         let src = git_repo("src", 3);
-        let dir = std::env::temp_dir().join(format!("workloop-u36a-clone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        git(
-            std::env::temp_dir().as_path(),
-            &[
-                "clone",
-                "-q",
-                "--depth",
-                "2",
-                &format!("file://{}", src.display()),
-                dir.to_str().unwrap(),
-            ],
-        );
+        let dir = shallow_clone("clone", &src, "2");
         let boundary = git(&dir, &["rev-parse", "HEAD~1"]);
         assert_eq!(
             base_revision(dir.to_str().unwrap()).as_deref(),

@@ -103,11 +103,6 @@ trait ReadPathAdapter {
     /// The adapter implementation id a record binds.
     fn adapter_id(&self) -> &'static str;
 
-    /// The delivery source namespace the adapter's `observe` stamps —
-    /// delivery identities deduplicate within it, so a re-delivered
-    /// event must cite the adapter's own source.
-    fn poll_source(&self) -> &'static str;
-
     /// Test control: move the remote's change head — the racing actor
     /// whose delayed read arrives out of order.
     fn set_change_head(&mut self, change: &ChangeRequestRef, head: &str, actor: &HostActorRef);
@@ -142,9 +137,6 @@ impl ReadPathAdapter for FixtureGithub {
     fn adapter_id(&self) -> &'static str {
         "fixture-github"
     }
-    fn poll_source(&self) -> &'static str {
-        "fixture"
-    }
     fn set_change_head(&mut self, change: &ChangeRequestRef, head: &str, actor: &HostActorRef) {
         FixtureGithub::set_change_head(self, change, head, actor);
     }
@@ -176,9 +168,6 @@ impl ReadPathAdapter for SparseHost {
     fn adapter_id(&self) -> &'static str {
         "sparse-host"
     }
-    fn poll_source(&self) -> &'static str {
-        "sparse"
-    }
     fn set_change_head(&mut self, change: &ChangeRequestRef, head: &str, _actor: &HostActorRef) {
         self.set_head(&change.repository, change.change_request.as_str(), head);
     }
@@ -206,8 +195,12 @@ impl ReadPathAdapter for SparseHost {
     }
 }
 
-/// Every `HostRead` fact recorded for one subject, in delivery order.
-fn recorded_reads(store: &SqliteStore, subject: &ReadSubject) -> Vec<(Option<ReadRevision>, u64)> {
+/// Every `HostRead` fact recorded for one subject, in delivery order —
+/// `(delivery identity as recorded, revision, subject_version)`.
+fn recorded_reads(
+    store: &SqliteStore,
+    subject: &ReadSubject,
+) -> Vec<(Option<DeliveryId>, Option<ReadRevision>, u64)> {
     store
         .transact(|tx| tx.all_observations())
         .unwrap()
@@ -218,10 +211,23 @@ fn recorded_reads(store: &SqliteStore, subject: &ReadSubject) -> Vec<(Option<Rea
                 revision,
                 subject_version,
                 ..
-            } if s == subject => Some((revision.clone(), *subject_version)),
+            } if s == subject => Some((o.delivery.clone(), revision.clone(), *subject_version)),
             _ => None,
         })
         .collect()
+}
+
+/// The identity a retained record cites for one recorded delivery:
+/// `(scope, source, event_id)` read back from the store — never
+/// reconstructed from a declared source namespace, so the record cites
+/// only identities the adapter actually stamped.
+fn delivery_identity(delivery: &DeliveryId) -> String {
+    match &delivery.scope {
+        DeliveryScope::Local => format!("local:{}:{}", delivery.source, delivery.event_id),
+        DeliveryScope::Host { host } => {
+            format!("host:{host}:{}:{}", delivery.source, delivery.event_id)
+        }
+    }
 }
 
 /// Deliver one captured read as a delayed delivery: no delivery
@@ -323,23 +329,23 @@ fn stale_head_never_rolls_back(adapter: &mut dyn ReadPathAdapter) -> ScenarioEvi
         "{}: a stale delivery cannot roll the recorded head backward",
         adapter.adapter_id()
     );
+    let reads = recorded_reads(&store, &subject);
     assert_eq!(
-        recorded_reads(&store, &subject).len(),
+        reads.len(),
         2,
         "{}: both deliveries are retained as history",
         adapter.adapter_id()
     );
 
     ScenarioEvidence {
-        // Only real delivery identities — the delayed delivery recorded
-        // no identity, so nothing cites it here; the read-back receipts
-        // below carry what it established.
-        observation_identities: vec![format!(
-            "local:{}.poll:{}@{}",
-            adapter.poll_source(),
-            subject.key(),
-            landed.subject_version
-        )],
+        // Only real delivery identities read back from the store — the
+        // delayed delivery recorded no identity, so nothing cites it
+        // here; the read-back receipts below carry what it established.
+        observation_identities: reads
+            .iter()
+            .filter_map(|(delivery, ..)| delivery.as_ref())
+            .map(delivery_identity)
+            .collect(),
         read_back_receipts: vec![
             ReadBackReceipt {
                 target: subject.key(),
@@ -383,18 +389,21 @@ fn duplicate_delivery_deduplicates(adapter: &mut dyn ReadPathAdapter) -> Scenari
         adapter.adapter_id()
     );
 
-    // A re-delivery of the identical event under the same delivery
-    // identity deduplicates the same way — one effect, never two.
+    // A re-delivery of the identical event under the delivery identity
+    // the store actually recorded deduplicates the same way — a literal
+    // resend of the delivered event, never a reconstructed one.
+    let recorded = recorded_reads(&store, &subject);
+    assert_eq!(recorded.len(), 1, "{}", adapter.adapter_id());
     let read = adapter.read(&subject, &reader());
+    let delivered = recorded[0]
+        .0
+        .clone()
+        .expect("the first poll recorded a delivery identity");
     let redelivery = adapter.emit(
         &store,
         &config,
         Observation {
-            delivery: Some(DeliveryId {
-                scope: DeliveryScope::Local,
-                source: format!("{}.poll", adapter.poll_source()),
-                event_id: format!("{}@{}", subject.key(), read.subject_version),
-            }),
+            delivery: Some(delivered),
             subject_work_id: None,
             subject_execution_id: None,
             fact: ObservationFact::HostRead {
@@ -444,12 +453,14 @@ fn duplicate_delivery_deduplicates(adapter: &mut dyn ReadPathAdapter) -> Scenari
     );
 
     ScenarioEvidence {
-        observation_identities: vec![format!(
-            "local:{}.poll:{}@{}",
-            adapter.poll_source(),
-            subject.key(),
-            read.subject_version
-        )],
+        // Cited identities come from the store's recorded deliveries —
+        // the identities the adapter actually stamped, not a
+        // reconstructed namespace.
+        observation_identities: reads
+            .iter()
+            .filter_map(|(delivery, ..)| delivery.as_ref())
+            .map(delivery_identity)
+            .collect(),
         read_back_receipts: vec![
             ReadBackReceipt {
                 target: subject.key(),
