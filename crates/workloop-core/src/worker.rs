@@ -30,6 +30,65 @@ pub const WORKER_REQUEST_FORMAT_VERSION: &str = "taisan.worker.request/1";
 /// more is claimed here.
 pub const DEFAULT_ISOLATION_PROFILE_ID: &str = "taisan-reference-v0.1";
 
+/// The contract-harness profile: the fixture worker launches under the
+/// same permission boundary as the reference profile. The distinct id
+/// lets a suite distinguish "the installation named a profile" from the
+/// absent-key default.
+pub const FIXTURE_ISOLATION_PROFILE_ID: &str = "fixture-worker-v0.1";
+
+/// One approved isolation profile. The registry is closed: a
+/// `worker_isolation_profile` value outside this set is a
+/// misconfiguration that must fail closed at validation and at launch,
+/// never a silent downgrade to unprofiled execution
+/// (`docs/worker-protocol.md` selected profile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationProfile {
+    /// The recorded profile identity — the export carries it verbatim.
+    pub id: &'static str,
+    /// Environment variable names a launch may pass through from the
+    /// supervisor process. Everything not listed here and not generated
+    /// is absent from the worker's environment — the environment is an
+    /// allowlist, never an inheritance.
+    pub env_passthrough: &'static [&'static str],
+}
+
+/// The names every approved profile lets through: enough for process
+/// and locale setup, none of them credential-bearing.
+const ENV_PASSTHROUGH: &[&str] = &["PATH", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
+
+/// The closed registry of approved profiles. `isolation_profile` is the
+/// single resolution point shared by config validation and the
+/// supervisor so a name refused at load can never be launched under.
+const APPROVED_PROFILES: &[IsolationProfile] = &[
+    IsolationProfile {
+        id: DEFAULT_ISOLATION_PROFILE_ID,
+        env_passthrough: ENV_PASSTHROUGH,
+    },
+    IsolationProfile {
+        id: FIXTURE_ISOLATION_PROFILE_ID,
+        env_passthrough: ENV_PASSTHROUGH,
+    },
+];
+
+/// Resolve an approved profile id. `None` means "not approved" —
+/// callers must refuse, never fall back to an unprofiled launch.
+pub fn isolation_profile(id: &str) -> Option<IsolationProfile> {
+    APPROVED_PROFILES
+        .iter()
+        .find(|profile| profile.id == id)
+        .cloned()
+}
+
+/// The id an installation that names no profile runs under.
+pub fn default_isolation_profile() -> IsolationProfile {
+    isolation_profile(DEFAULT_ISOLATION_PROFILE_ID).expect("the reference profile is registered")
+}
+
+/// Every approved profile id, for error messages and listings.
+pub fn approved_isolation_profile_ids() -> impl Iterator<Item = &'static str> {
+    APPROVED_PROFILES.iter().map(|profile| profile.id)
+}
+
 /// The request kinds the reference boundary accepts. `resume` is
 /// listed so an incoming request asking for it is refused with
 /// [`Unsupported`] rather than silently dropped or reinterpreted.

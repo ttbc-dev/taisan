@@ -36,7 +36,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
 };
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -328,7 +328,12 @@ struct CountingPosix {
 }
 
 impl ProcessControlPort for CountingPosix {
-    fn spawn(&self, argv: &[String], cwd: &std::path::Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         // Count the attempt before delegating: the counter observes
         // start calls, not only the ones that produced a writer.
         self.calls.set(self.calls.get() + 1);
@@ -337,7 +342,7 @@ impl ProcessControlPort for CountingPosix {
                 reason: "adapter declined the request".into(),
             });
         }
-        let out = PosixProcessControl.spawn(argv, cwd);
+        let out = PosixProcessControl.spawn(argv, cwd, env);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
         }
@@ -365,9 +370,10 @@ impl ProcessControlPort for CountingPosix {
         &self,
         argv: &[String],
         cwd: &std::path::Path,
+        env: &WorkerEnv,
         timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError> {
-        PosixProcessControl.run_probe(argv, cwd, timeout)
+        PosixProcessControl.run_probe(argv, cwd, env, timeout)
     }
 }
 
@@ -451,7 +457,7 @@ impl WorkerHandle for PosixProvider {
     fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
         self.sup
             .port
-            .spawn(&self.sup.worker_argv.clone(), cwd)
+            .spawn(&self.sup.worker_argv.clone(), cwd, &WorkerEnv::default())
             .expect("direct spawn")
     }
     fn writer_alive(&self) -> bool {
@@ -583,7 +589,7 @@ impl WorkerHandle for ScriptedProvider {
     }
     fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
         self.port
-            .spawn(&["scripted".into()], cwd)
+            .spawn(&["scripted".into()], cwd, &WorkerEnv::default())
             .expect("direct spawn")
     }
     fn writer_alive(&self) -> bool {

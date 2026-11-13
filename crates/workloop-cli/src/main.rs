@@ -1219,10 +1219,10 @@ fn build_supervisor(
         installation.worker_argv.clone(),
         config.clone(),
     );
-    let supervisor = match &installation.worker_isolation_profile {
-        Some(profile) => supervisor.with_isolation_profile_id(profile.clone()),
-        None => supervisor,
-    };
+    // The isolation profile resolves fail-closed against the approved
+    // registry: an unapproved name in the installation file refuses
+    // supervisor construction — no dispatch can run unprofiled (U2.3).
+    let supervisor = supervisor.with_isolation_profile(installation.worker_isolation_profile()?);
     Ok(Some(supervisor.with_handoff(
         workloop_exec::handoff::HandoffLayout {
             repository,

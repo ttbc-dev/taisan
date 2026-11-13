@@ -35,6 +35,7 @@ use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
 use workloop_exec::adapter;
+use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::{SweepParams, SweepReport};
@@ -400,11 +401,28 @@ pub fn run_pass(
                     std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
                         detail: format!("create workspace {}: {e}", workspace.display()),
                     })?;
-                    let Ok(declaration) = adapter::observe_worker_declaration(
+                    // The probe runs under the profile's environment —
+                    // a prep failure skips the binding exactly like an
+                    // unanswered describe: the consume path's
+                    // fail-closed selection refuses the launch. The
+                    // shared prebind scratch is reclaimed as soon as
+                    // the probe process is gone, so a fixed key never
+                    // accumulates storage between passes.
+                    let prebind_scratch =
+                        isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind");
+                    let Ok(env) =
+                        isolation::prepare(&supervisor.isolation_profile, &prebind_scratch)
+                    else {
+                        continue;
+                    };
+                    let declared = adapter::observe_worker_declaration(
                         &supervisor.port,
                         &supervisor.worker_argv,
                         &workspace,
-                    ) else {
+                        &env,
+                    );
+                    isolation::release(&prebind_scratch);
+                    let Ok(declaration) = declared else {
                         continue;
                     };
                     let binding = declaration.binding(&supervisor.worker_argv);

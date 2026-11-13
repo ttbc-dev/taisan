@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use workloop_core::domain::ProcessIdentity;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
 };
 
 /// What the next `spawn` produces.
@@ -91,6 +91,11 @@ struct State {
     /// when the queue is empty.
     probes: VecDeque<Result<ProbeOutcome, SpawnError>>,
     default_probe: Option<Result<ProbeOutcome, SpawnError>>,
+    /// The environment each `spawn` was given, in call order — the
+    /// suite's audit of what the worker would have inherited.
+    spawn_envs: Vec<WorkerEnv>,
+    /// The environment each `run_probe` was given, in call order.
+    probe_envs: Vec<WorkerEnv>,
 }
 
 /// An in-memory `ProcessControlPort`. Clone the handle to steer the
@@ -211,12 +216,29 @@ impl ScriptedProcessControl {
     pub fn set_default_probe(&self, outcome: Result<ProbeOutcome, SpawnError>) {
         self.state.lock().unwrap().default_probe = Some(outcome);
     }
+
+    /// The environment every `spawn` was given, in call order — the
+    /// suite audits that no host credential name ever reaches a launch.
+    pub fn spawn_envs(&self) -> Vec<WorkerEnv> {
+        self.state.lock().unwrap().spawn_envs.clone()
+    }
+
+    /// The environment every `run_probe` was given, in call order.
+    pub fn probe_envs(&self) -> Vec<WorkerEnv> {
+        self.state.lock().unwrap().probe_envs.clone()
+    }
 }
 
 impl ProcessControlPort for ScriptedProcessControl {
-    fn spawn(&self, _argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        _argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         let mut s = self.state.lock().unwrap();
         s.spawn_calls += 1;
+        s.spawn_envs.push(env.clone());
         let plan = s
             .plans
             .pop_front()
@@ -436,10 +458,12 @@ impl ProcessControlPort for ScriptedProcessControl {
         &self,
         argv: &[String],
         _cwd: &Path,
+        env: &WorkerEnv,
         _timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError> {
         let outcome = {
             let mut s = self.state.lock().unwrap();
+            s.probe_envs.push(env.clone());
             s.probes.pop_front().or_else(|| s.default_probe.clone())
         };
         match outcome {

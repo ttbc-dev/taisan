@@ -14,8 +14,8 @@ use workloop_core::identity::*;
 use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
-    DEFAULT_ISOLATION_PROFILE_ID, Unsupported, WorkerRequest, WorkerRequestExportState,
-    WorkerRequestKind, export_request_id,
+    DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, Unsupported, WorkerRequest,
+    WorkerRequestExportState, WorkerRequestKind, export_request_id, isolation_profile,
 };
 use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
 use workloop_exec::supervisor::Supervisor;
@@ -135,7 +135,9 @@ fn supervisor(
 ) -> Supervisor<ScriptedProcessControl> {
     let sup = Supervisor::new(port, root, vec!["fixture-worker".into()], config());
     match profile {
-        Some(profile) => sup.with_isolation_profile_id(profile),
+        Some(id) => sup.with_isolation_profile(
+            isolation_profile(id).expect("tests run under an approved profile id"),
+        ),
         None => sup,
     }
 }
@@ -230,7 +232,7 @@ fn the_launch_binds_request_id_to_the_spawned_handle_under_the_named_profile() {
     let root = tmp_root("bind");
     let port = ScriptedProcessControl::new();
     port.set_default_plan(SpawnPlan::Resident);
-    let sup = supervisor(port, root, Some("profile-audit-42"));
+    let sup = supervisor(port, root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-3");
     sup.consume_requests(&store, NOW).unwrap();
     let invocation = only_invocation(&store, &eid);
@@ -252,7 +254,7 @@ fn the_launch_binds_request_id_to_the_spawned_handle_under_the_named_profile() {
         .unwrap()
         .expect("the binding is durable");
     assert_eq!(resolved.invocation_id, invocation.id);
-    assert_eq!(resolved.profile_id, "profile-audit-42");
+    assert_eq!(resolved.profile_id, FIXTURE_ISOLATION_PROFILE_ID);
 }
 
 #[test]

@@ -14,7 +14,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::ObservationFact;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
 };
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
@@ -329,9 +329,14 @@ struct CountingPosix {
 }
 
 impl ProcessControlPort for CountingPosix {
-    fn spawn(&self, argv: &[String], cwd: &std::path::Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         self.calls.set(self.calls.get() + 1);
-        PosixProcessControl.spawn(argv, cwd)
+        PosixProcessControl.spawn(argv, cwd, env)
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
@@ -355,9 +360,10 @@ impl ProcessControlPort for CountingPosix {
         &self,
         argv: &[String],
         cwd: &std::path::Path,
+        env: &WorkerEnv,
         timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError> {
-        PosixProcessControl.run_probe(argv, cwd, timeout)
+        PosixProcessControl.run_probe(argv, cwd, env, timeout)
     }
 }
 
@@ -399,6 +405,7 @@ fn ws_21_runtime_version_mismatch_is_configuration_repair_with_no_start() {
         &PosixProcessControl,
         &[fixture_bin(), "hang".into()],
         &root,
+        &WorkerEnv::default(),
     )
     .expect("the fixture declares its runtime");
     let (_work_b, exec_b) = submit_and_admit(&store, "ws21-b");

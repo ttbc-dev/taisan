@@ -133,10 +133,11 @@ pub struct Installation {
     #[serde(default)]
     pub worker_argv: Vec<String>,
     /// Name of the approved isolation profile the WorkerRequest export
-    /// records and the launch binds (U4.2). Absent names the approved
-    /// reference profile. Enforcement of the profile's egress/namespace
-    /// settings is the U2.3/U2.4 slice; absent means no override, not
-    /// no profile.
+    /// records and the launch binds (U2.3). Absent names the approved
+    /// reference profile. `worker_isolation_profile()` resolves it
+    /// fail-closed against the approved registry; the profile's
+    /// egress/namespace machinery is the U2.4/U4 slice — absent means
+    /// no override, not no profile.
     #[serde(default)]
     pub worker_isolation_profile: Option<String>,
     #[serde(default = "default_workspace_root")]
@@ -504,6 +505,27 @@ impl Installation {
                 _ => ActorKind::Human,
             },
             external_id: self.actor_id.clone(),
+        }
+    }
+
+    /// The approved isolation profile the installation names, or the
+    /// reference profile when the key is absent. The registry is
+    /// closed — a name outside it is a misconfiguration that fails
+    /// closed here, never a silent downgrade to unprofiled launches.
+    pub fn worker_isolation_profile(
+        &self,
+    ) -> Result<workloop_core::worker::IsolationProfile, String> {
+        match &self.worker_isolation_profile {
+            None => Ok(workloop_core::worker::default_isolation_profile()),
+            Some(id) => workloop_core::worker::isolation_profile(id).ok_or_else(|| {
+                let approved: Vec<&str> =
+                    workloop_core::worker::approved_isolation_profile_ids().collect();
+                format!(
+                    "installation worker_isolation_profile '{id}' is not an approved profile \
+                     (approved: {})",
+                    approved.join(", ")
+                )
+            }),
         }
     }
 
