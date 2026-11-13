@@ -1532,12 +1532,18 @@ fn webhook_review_delivery_records_partial_evidence_and_reads_findings_fresh() {
 
     // A redelivered event deduplicates — the fact it asserts (partial
     // evidence) is deterministic — while its fresh reads stay
-    // idempotent too.
+    // idempotent too: the whole delivery records nothing new.
+    let before_redelivery = observations(&store, &work_id).len();
     let second = adapter
         .deliver_webhook(&store, &config, &delivery, NOW + 20)
         .unwrap();
     assert_eq!(second, IngestReceipt::Duplicate);
     let after = observations(&store, &work_id);
+    assert_eq!(
+        after.len(),
+        before_redelivery,
+        "a redelivered review event records no new observation"
+    );
     assert_eq!(
         after
             .iter()
@@ -1547,7 +1553,7 @@ fn webhook_review_delivery_records_partial_evidence_and_reads_findings_fresh() {
                 .is_some_and(|d| d.source == "github.webhook"))
             .count(),
         1,
-        "a redelivered review event records no second observation"
+        "exactly one webhook-scoped observation per delivery GUID"
     );
 }
 
