@@ -10,7 +10,7 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
-use workloop_core::projection::{QueryResult, outstanding_actions};
+use workloop_core::projection::{Availability, QueryResult, outstanding_actions};
 use workloop_core::store::*;
 use workloop_core::work::{
     HostTemplate, IngestReceipt, WorkloopConfig, admit_queued, handle_command,
@@ -1785,5 +1785,263 @@ fn a_new_heads_review_inherits_no_finding_from_a_previous_head() {
                     && occurrences.iter().any(|occ| occ.source_key == "rf-rev-1-1")
         )),
         "the superseded head keeps its own finding evidence"
+    );
+}
+
+#[test]
+fn an_empty_review_stream_seals_a_complete_round_and_passes_the_review_lane() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "empty-stream");
+
+    // The host holds this Work's change with zero submitted reviews:
+    // the findings surface answers, the stream is empty.
+    let branch = format!("work/{}", work_id.0);
+    adapter.client_mut().seed_branch(&repo(), &branch, "head-1");
+    let pull = adapter
+        .client_mut()
+        .open_pull(&repo(), &branch, "main", "t", "b")
+        .unwrap();
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted(pull.id.clone()),
+        display_number: Some(pull.display_number),
+    };
+    assert_eq!(pull.head_sha, "head-1");
+
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change.clone(),
+                head: rev("head-1"),
+                source_branch: branch.clone(),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: change.clone(),
+            head: rev("head-1"),
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: change.clone(),
+            head: rev("head-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: DiffTarget {
+                change: change.clone(),
+                head: rev("head-1"),
+                base: None,
+                target_revision: None,
+            },
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Waiting,
+        "every other lane is green; the review lane waits on a round"
+    );
+
+    // The poll reads an empty stream with the findings surface
+    // answering: the complete-empty round is recorded for the head
+    // just observed, so the enabled review lane passes on it.
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    assert!(
+        observations(&store, &work_id).iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-1" && occurrences.is_empty()
+        )),
+        "an answered empty review stream is a complete-empty round"
+    );
+    let round = store
+        .transact(|tx| tx.latest_round(&work_id))
+        .unwrap()
+        .expect("the empty stream seals a round");
+    assert_eq!(round.completeness, "complete");
+    assert!(
+        store
+            .transact(|tx| tx.occurrences(&round.id))
+            .unwrap()
+            .is_empty(),
+        "the sealed round carries no occurrences"
+    );
+    let sources = match store
+        .transact(|tx| workloop_core::projection::work_detail(tx, &work_id, NOW + 10))
+        .unwrap()
+    {
+        QueryResult::Found { sources, .. } => sources,
+        other => panic!("work_detail: {other:?}"),
+    };
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.source.starts_with("review") && s.availability == Availability::Known),
+        "the review source answers as known, never unavailable: {sources:?}"
+    );
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        execution.state,
+        ExecutionState::Succeeded,
+        "a complete-empty round passes the enabled review lane"
+    );
+}
+
+#[test]
+fn a_review_delivery_on_an_empty_stream_records_the_complete_empty_round() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "wh-empty");
+    // No reviews are seeded: the fresh review-state read behind the
+    // delivery finds an empty stream and must still answer with the
+    // complete-empty round bound to the head GitHub reports now.
+    let delivery = WebhookDelivery {
+        event_id: "delivery-empty-1".into(),
+        emitted_at: NOW + 10,
+        fact: WebhookFact::Review {
+            change: change.clone(),
+            head: rev("head-1"),
+            review_id: "rev-9".into(),
+            source: "reviewer".into(),
+        },
+    };
+    let receipt = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 10)
+        .unwrap();
+    assert_eq!(receipt, IngestReceipt::Recorded);
+
+    let recorded = observations(&store, &work_id);
+    assert!(
+        recorded
+            .iter()
+            .any(|o| o.delivery.as_ref().is_some_and(|d| {
+                d.source == "github.webhook"
+                    && matches!(
+                        &o.fact,
+                        ObservationFact::Review {
+                            completeness: Completeness::Partial { .. },
+                            ..
+                        }
+                    )
+            })),
+        "the delivery itself is partial evidence"
+    );
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-1" && occurrences.is_empty()
+        )),
+        "the fresh read behind the delivery records the complete-empty round"
+    );
+
+    // A redelivery records nothing new: the empty-stream fact
+    // deduplicates under its content-derived identity.
+    let before_redelivery = recorded.len();
+    let second = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 20)
+        .unwrap();
+    assert_eq!(second, IngestReceipt::Duplicate);
+    assert_eq!(
+        observations(&store, &work_id).len(),
+        before_redelivery,
+        "a redelivered delivery records no new observation"
+    );
+}
+
+#[test]
+fn an_empty_stream_with_an_unread_findings_source_records_no_complete_round() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "empty-down");
+    // No reviews, and the findings surface does not answer: the empty
+    // stream records `unavailable` — never an empty clean round.
+    adapter.client_mut().lose_response("review_findings");
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    let recorded = observations(&store, &work_id);
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Unavailable { .. },
+                ..
+            }
+        )),
+        "the empty stream records its findings source as unavailable"
+    );
+    assert!(
+        !recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                ..
+            }
+        )),
+        "an unread findings surface never produces a complete round"
+    );
+
+    // The next successful read records the now-available empty state
+    // under its own identity instead of colliding with the recorded
+    // unavailable fact.
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 20)
+        .unwrap();
+    assert!(
+        observations(&store, &work_id).iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-1" && occurrences.is_empty()
+        )),
+        "an available source with an empty stream is a meaningful clean round"
     );
 }

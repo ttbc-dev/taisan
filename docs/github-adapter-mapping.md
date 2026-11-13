@@ -63,7 +63,7 @@ leaves intents `pending`, never a fabricated failure.
 | `change_request_read` | `GET …/pulls/{n}` | Head-bound reads feeding `ChangeHead` observations |
 | `change_request_list` | `GET …/pulls?head=…` | Reconciliation of `unknown` open effects by recorded source revision |
 | `review_read` | `GET …/pulls/{n}/reviews` | Review state for the examined head only |
-| `review_findings_read` | reviews + review comments + threads | Preserves old-head evidence and source availability: a complete round is claimed only after the findings surface answered (a review that requests changes counts as a finding); an unread surface records the review `unavailable`, never a clean empty round |
+| `review_findings_read` | reviews + review comments + threads | Preserves old-head evidence and source availability: a complete round is claimed only after the findings surface answered (a review that requests changes counts as a finding); an unread surface records the review `unavailable`, never a clean empty round; an empty review stream with that surface answered is the complete-empty round for the head it examined |
 | `comment_create` | `POST …/issues/{n}/comments` | Head-bound write; contract baseline names this `comment_write` — same operation, one mapping |
 | `thread_resolve` | GraphQL `resolveReviewThread` | Executable as `resolve_thread` (`HostAction::ResolveThread`); covered by HC-OPT-07 on fixtures declaring it |
 | `issue_read` | `GET …/issues/{n}` | Admission source reads with revision/digest provenance |

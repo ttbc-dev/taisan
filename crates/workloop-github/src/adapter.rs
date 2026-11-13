@@ -343,6 +343,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 &work_id,
                 &execution_id,
                 now_unix_seconds,
+                None,
             )?;
         }
         // The fresh read: what GitHub reports *now* is the recorded
@@ -484,7 +485,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         }
         // Reviews keep the commit they examined — a review of the
         // superseded head stays bound to it, and the round it seals
-        // carries the findings read from the host.
+        // carries the findings read from the host. The empty stream
+        // binds this read's own head, the revision just recorded as
+        // current.
         self.ingest_review_state(
             store,
             config,
@@ -492,6 +495,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             &work_id,
             &execution_id,
             now_unix_seconds,
+            Some(&head),
         )
     }
 
@@ -503,7 +507,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// order-independent: a later clean review never masks an earlier
     /// reviewer's findings. A findings read that fails records the
     /// review `unavailable` — the empty clean round is never claimed
-    /// without the findings source answering.
+    /// without the findings source answering. An empty stream is an
+    /// answer too: one fact for the stream itself, bound to `poll_head`
+    /// (or a fresh pull read when the caller has none), so a published
+    /// change with zero submitted reviews still seals the
+    /// complete-empty round the enabled review lane needs instead of
+    /// showing the review source unavailable with no round at all.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_review_state(
         &mut self,
         store: &impl Store,
@@ -512,6 +522,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         work_id: &WorkId,
         execution_id: &Option<ExecutionId>,
         now_unix_seconds: i64,
+        poll_head: Option<&CommitRevision>,
     ) -> Result<(), StoreError> {
         let Ok(reviews) = self
             .client
@@ -524,6 +535,78 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         let findings = self
             .client
             .review_findings(&change.repository, &change.change_request);
+        if reviews.is_empty() {
+            // The stream answered with no reviews: one fact for the
+            // stream itself, bound to the head GitHub reports now —
+            // the caller's fresh pull read when it has one, otherwise
+            // a pull read of our own. With no head the empty state
+            // binds to nothing and records nothing.
+            let head = match poll_head {
+                Some(head) => head.clone(),
+                None => {
+                    let Ok(pull) = self
+                        .client
+                        .read_pull(&change.repository, &change.change_request)
+                    else {
+                        return Ok(());
+                    };
+                    CommitRevision::new(change.repository.clone(), pull.head_sha)
+                        .map_err(|detail| StoreError::Internal { detail })?
+                }
+            };
+            let (completeness, occurrences) = match &findings {
+                Ok(findings) => (
+                    Completeness::Complete,
+                    review_occurrences(&reviews, findings, &head.object),
+                ),
+                Err(_) => (
+                    // The stream arrived but the findings surface did
+                    // not: recorded `unavailable` evidence that can
+                    // satisfy nothing — never an empty clean round.
+                    Completeness::Unavailable {
+                        reason: "review findings read failed".into(),
+                    },
+                    vec![],
+                ),
+            };
+            // The head joins the identity: the empty stream observed
+            // at a superseded head is different evidence from the
+            // empty stream at the current one, and an identical re-read
+            // still deduplicates.
+            let token = review_fact_token(&completeness, &occurrences);
+            self.ingest(
+                store,
+                config,
+                Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Host {
+                            host: change.repository.host.clone(),
+                        },
+                        source: "github.poll".into(),
+                        event_id: format!("review-empty:{change}@{}#{token}", head.object),
+                    }),
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: execution_id.clone(),
+                    fact: ObservationFact::Review {
+                        target: DiffTarget {
+                            change: change.clone(),
+                            head,
+                            base: None,
+                            target_revision: None,
+                        },
+                        // No reviewer: the stream itself is the
+                        // source of this fact.
+                        source: "github.reviews".into(),
+                        source_revision: None,
+                        completeness,
+                        occurrences,
+                    },
+                    observed_unix_seconds: now_unix_seconds,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
         for review in &reviews {
             let review_head =
                 CommitRevision::new(change.repository.clone(), review.commit_sha.clone())
