@@ -17,6 +17,8 @@ use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
+use workloop_github::adapter::GitHubAdapter;
+use workloop_github::api::InMemoryGitHub;
 use workloop_github::fixture::FixtureGithub;
 use workloop_github::gitlab_fixture::GitlabFixture;
 use workloop_github::sparse_fixture::SparseHost;
@@ -160,6 +162,31 @@ impl OutboxHost for SparseHost {
     }
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
         self.emit(store, config, observation, NOW).unwrap();
+    }
+}
+
+/// The real adapter on the same port, driven through the in-memory
+/// transport double: the unchanged scenarios record intents, drain
+/// them through the adapter's outbox, and ingest Observations through
+/// its `ingest` — the same two calls every registered host makes.
+impl OutboxHost for GitHubAdapter<InMemoryGitHub> {
+    fn declared_names(&self) -> BTreeSet<&'static str> {
+        Self::declared_capabilities().iter().copied().collect()
+    }
+    fn apply(&mut self, store: &SqliteStore, config: &WorkloopConfig) {
+        self.apply_outbox(store, config, NOW).unwrap();
+    }
+    fn applied(&self) -> &[String] {
+        self.applied()
+    }
+    fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+        self.client().branch_head(repository, branch)
+    }
+    fn set_change_head(&mut self, repository: &RepositoryRef, change_id: &str, head: &str) {
+        self.client_mut().set_pull_head(repository, change_id, head);
+    }
+    fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
+        self.ingest(store, config, observation, NOW).unwrap();
     }
 }
 
@@ -1622,6 +1649,10 @@ fn registered_fixtures() -> Vec<RegisteredFixture> {
             name: "fixture-sparse",
             build: || Box::new(SparseHost::new()),
         },
+        RegisteredFixture {
+            name: "adapter-real",
+            build: || Box::new(GitHubAdapter::new(InMemoryGitHub::new())),
+        },
     ]
 }
 
@@ -1746,6 +1777,31 @@ fn gitlab_fixture_runs_the_same_suite_within_its_declared_set() {
                 result.outcome,
                 MatrixOutcome::Covered,
                 "baseline row is covered: {result:?}"
+            );
+        }
+    }
+}
+
+/// The real adapter runs the unchanged suite within its declared set:
+/// every baseline, head-bound, partial-receipt, snapshot, permission,
+/// scope, swap, and admission row is covered; the issue-read row and
+/// the optional discussion/ready rows are explicit-unsupported because
+/// the adapter does not declare them — never skipped or weakened.
+#[test]
+fn real_adapter_runs_the_same_suite_within_its_declared_set() {
+    let mut adapter = GitHubAdapter::new(InMemoryGitHub::new());
+    let results = run_suite(&mut adapter);
+    for result in &results {
+        if result.row.starts_with("HC-READ-") || result.row.starts_with("HC-OPT-") {
+            assert!(
+                matches!(result.outcome, MatrixOutcome::Unsupported { .. }),
+                "undeclared row is explicit-unsupported: {result:?}"
+            );
+        } else {
+            assert_eq!(
+                result.outcome,
+                MatrixOutcome::Covered,
+                "declared row is covered: {result:?}"
             );
         }
     }
@@ -2471,6 +2527,7 @@ fn stale_push_refusal_surfaces_the_fresh_position_first() {
     for mut fixture in [
         Box::new(GitlabFixture::new()) as Box<dyn OutboxHost>,
         Box::new(SparseHost::new()),
+        Box::new(GitHubAdapter::new(InMemoryGitHub::new())),
     ] {
         let store = SqliteStore::in_memory(1).unwrap();
         let config = config_for(&*fixture);
