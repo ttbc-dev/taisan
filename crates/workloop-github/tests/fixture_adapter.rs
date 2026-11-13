@@ -237,6 +237,28 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
     })
 }
 
+/// A repeated artifact report for the finished coding Invocation — the
+/// observation that re-drives `maybe_publish` on the next pass.
+fn artifact_report(work_id: &WorkId, eid: &ExecutionId, event: &str) -> Observation {
+    Observation {
+        delivery: Some(DeliveryId {
+            scope: DeliveryScope::Local,
+            source: "test".into(),
+            event_id: event.into(),
+        }),
+        subject_work_id: Some(work_id.clone()),
+        subject_execution_id: Some(eid.clone()),
+        fact: ObservationFact::Artifact {
+            invocation_id: InvocationId(format!("{}-coding", eid.0)),
+            required_artifact: "artifact.json".into(),
+            state: ArtifactFact::Present {
+                digest: "artifact-digest".into(),
+            },
+        },
+        observed_unix_seconds: NOW,
+    }
+}
+
 /// Shared setup for completion-vs-evidence contract tests: an admitted
 /// Execution parked in `Waiting/Ci` with applied push_ref and
 /// open_change_request intents, so completion turns solely on the
@@ -1402,7 +1424,8 @@ fn budget_failure_waits_for_the_outstanding_outbox_effect() {
 /// U5.4 partial-effect durability: the publication lane records the push
 /// receipt durably before the change-request effect exists. A crash
 /// between the two effects is a process restart, not a rollback — the
-/// push receipt survives and the missing create is never inferred.
+/// push receipt survives and the missing create is never inferred; the
+/// next publish pass after reopen records it from the durable receipt.
 #[test]
 fn crash_after_publication_keeps_the_push_receipt_durable() {
     let root =
@@ -1410,47 +1433,62 @@ fn crash_after_publication_keeps_the_push_receipt_durable() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("store.sqlite");
-    let (work_id, action_id) = {
+    let mut gh = FixtureGithub::new();
+    let (work_id, eid, push_id) = {
         let store = SqliteStore::open(&path, 1).unwrap();
-        let (work_id, execution_id) = submit(&store, "k-u54-crash");
+        let (work_id, eid) = submit(&store, "k-u54-crash");
+        // Only the push capability is confirmed: the publish chain can
+        // record `push_ref`, but the `open_change_request` capability is
+        // still unreported, so the create intent cannot exist yet — the
+        // crash boundary this test exercises.
+        authorize(&store, &[HostCapability::PushRef]);
         store
-            .transact(|tx| admit_queued(tx, &config(), &execution_id, NOW).map(|_| ()))
+            .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
             .unwrap();
-        let admitted = store
-            .transact(|tx| tx.execution(&execution_id))
-            .unwrap()
+        store
+            .transact(|tx| {
+                let mut e = tx.execution(&eid)?.unwrap();
+                e.state = ExecutionState::Waiting;
+                e.waiting_reason = Some(WaitingReason::Reconciliation);
+                record_finished_coding(tx, &eid)?;
+                tx.apply(&Effect::UpdateExecution {
+                    execution: e,
+                    expected_state: ExecutionState::Ready,
+                })
+            })
             .unwrap();
-        assert_ne!(
-            admitted.state,
-            ExecutionState::Queued,
-            "the crash lands inside an admitted execution's publication window"
-        );
-        let action_id = insert_intent(
+        // The artifact report drives `maybe_publish`: the push intent is
+        // recorded, and the outbox commits its receipt — all inside the
+        // admitted execution's publication window.
+        gh.emit(
             &store,
-            &work_id,
-            HostAction::PushRef {
-                branch: "work/u54".into(),
-                produced: rev("head-u54"),
-                expected_prior: None,
-            },
-        );
-        let mut gh = FixtureGithub::new();
+            &config(),
+            artifact_report(&work_id, &eid, "art-u54-1"),
+            NOW,
+        )
+        .unwrap();
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), 1, "the publish chain queued the push");
+        assert!(matches!(intents[0].action, HostAction::PushRef { .. }));
+        let push_id = intents[0].action_id.clone();
         gh.apply_outbox(&store, &config(), NOW).unwrap();
+        assert_eq!(intent_status(&store, &push_id), HostActionStatus::Applied);
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
         assert_eq!(
-            intent_status(&store, &action_id),
-            HostActionStatus::Applied,
-            "the push receipt is committed before the simulated crash"
+            intents.len(),
+            1,
+            "the unconfirmed create capability left no second intent"
         );
-        // Crash before any change-request intent: dropping the store is
-        // the process boundary, and no create was ever recorded.
-        (work_id, action_id)
+        // Crash before the change-request effect exists: dropping the
+        // store is the process boundary, and no create was ever recorded.
+        (work_id, eid, push_id)
     };
 
     let store = SqliteStore::open(&path, 1).unwrap();
     let intents = store.transact(|tx| tx.action_intents()).unwrap();
     let push = intents
         .iter()
-        .find(|intent| intent.action_id == action_id)
+        .find(|intent| intent.action_id == push_id)
         .expect("the applied push intent survives the crash");
     assert_eq!(push.work_id, work_id);
     assert_eq!(push.status, HostActionStatus::Applied);
@@ -1461,7 +1499,7 @@ fn crash_after_publication_keeps_the_push_receipt_durable() {
                 produced,
                 relation: RefRelation::Equal,
                 ..
-            }) if produced.object == "head-u54"
+            }) if produced.object == "artifact-digest"
         ),
         "the push receipt retains its normalized effect fact: {:?}",
         push.effects
@@ -1471,6 +1509,38 @@ fn crash_after_publication_keeps_the_push_receipt_durable() {
             .iter()
             .any(|intent| matches!(intent.action, HostAction::OpenChangeRequest { .. })),
         "the missing create is absent evidence, never an inferred success"
+    );
+
+    // The restart is not a rollback: once the change-request capability
+    // is confirmed, the next publish pass records the create intent from
+    // the durable push receipt and the outbox applies it.
+    authorize(
+        &store,
+        &[HostCapability::PushRef, HostCapability::ChangeRequestCreate],
+    );
+    gh.emit(
+        &store,
+        &config(),
+        artifact_report(&work_id, &eid, "art-u54-2"),
+        NOW,
+    )
+    .unwrap();
+    let open = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|intent| matches!(intent.action, HostAction::OpenChangeRequest { .. }))
+        .expect("the publish chain records the create once its capability is confirmed");
+    assert_eq!(open.status, HostActionStatus::Pending);
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &open.action_id),
+        HostActionStatus::Applied
+    );
+    assert!(
+        gh.applied().iter().any(|a| a.starts_with("open_change:")),
+        "the resumed chain applied the recorded create: {:?}",
+        gh.applied()
     );
     let _ = std::fs::remove_dir_all(&root);
 }

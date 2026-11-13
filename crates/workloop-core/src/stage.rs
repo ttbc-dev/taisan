@@ -352,9 +352,16 @@ impl StagePipeline {
     /// pin-points the head it bound to: when it differs from the
     /// replayed head, an authoritative move (`record_current_head`)
     /// must have preceded it, and that move is restored before the
-    /// record replays. Invalid records are ignored rather than silently
-    /// repaired; the pipeline never promotes evidence that did not
-    /// satisfy the same order guard when it was first recorded.
+    /// record replays — but only for a same-repository head the
+    /// pipeline has never held or observed. A revision already in head
+    /// history is stale or rolled-back, and a foreign-repository
+    /// revision was never this Work's head: both replay against the
+    /// recorded head and are refused exactly as they were live. The
+    /// restore commits only when the record itself is accepted, so a
+    /// refused record cannot move the head either. Invalid records are
+    /// ignored rather than silently repaired; the pipeline never
+    /// promotes evidence that did not satisfy the same order guard
+    /// when it was first recorded.
     pub fn from_observations(lanes: LanePolicy, observations: &[Observation]) -> Self {
         let mut pipeline = Self::new(lanes);
         for observation in observations {
@@ -363,13 +370,19 @@ impl StagePipeline {
                     pipeline.observe_head(head);
                 }
                 ObservationFact::StageEvidence { evidence } => {
-                    if pipeline
-                        .current_head()
-                        .is_some_and(|current| *current != evidence.revision)
-                    {
-                        pipeline.record_current_head(evidence.revision.clone());
+                    let restorable = pipeline.current_head().is_some_and(|current| {
+                        *current != evidence.revision
+                            && current.repository == evidence.revision.repository
+                    }) && !pipeline.head_history().contains(&evidence.revision);
+                    if restorable {
+                        let mut candidate = pipeline.clone();
+                        candidate.record_current_head(evidence.revision.clone());
+                        if candidate.record(evidence.clone()).is_ok() {
+                            pipeline = candidate;
+                        }
+                    } else {
+                        let _ = pipeline.record(evidence.clone());
                     }
-                    let _ = pipeline.record(evidence.clone());
                 }
                 _ => {}
             }
@@ -467,13 +480,20 @@ impl StagePipeline {
         NextStage::Complete
     }
 
-    /// Whether this lane may open for work: its config lane is enabled
-    /// and every earlier stage has closed. A disabled lane never opens —
-    /// it is owed an explicit `disabled{reason}` record (`next_stage`
-    /// reports it). This is the direct order predicate a transition
-    /// consumes; it never looks at unrecorded attempts.
+    /// Whether this lane may open for work: its config lane is enabled,
+    /// every earlier stage has closed, and the lane itself is not
+    /// already closed. A disabled lane never opens — it is owed an
+    /// explicit `disabled{reason}` record (`next_stage` reports it).
+    /// This is the direct order predicate a transition consumes; it
+    /// never looks at unrecorded attempts.
     pub fn lane_opens(&self, stage: Stage) -> bool {
         if !self.lane_enabled(stage) {
+            return false;
+        }
+        if self
+            .latest(stage)
+            .is_some_and(|record| record.status.is_closed())
+        {
             return false;
         }
         for earlier in Stage::ORDER {
@@ -495,15 +515,15 @@ impl StagePipeline {
     /// repository is refused before it can satisfy a lane — and the
     /// order and lane guards run before the record is accepted, so
     /// neither a later lane nor a contradictory config record can enter
-    /// history as if it were valid.
+    /// history as if it were valid. The first accepted record also
+    /// records the head it binds to; a refused record never pins one.
     pub fn record(&mut self, evidence: StageEvidence) -> Result<(), StageError> {
         let stage = evidence.stage;
-        if self.current_head.is_none() {
-            // The first record also records the head it binds to — the
-            // same first-observation rule `observe_head` applies.
-            self.observe_head(&evidence.revision);
-        }
-        if self.current_head.as_ref() != Some(&evidence.revision) {
+        if self
+            .current_head
+            .as_ref()
+            .is_some_and(|current| *current != evidence.revision)
+        {
             return Err(StageError::StaleRevision { stage });
         }
         let enabled = self.lane_enabled(stage);
@@ -532,6 +552,13 @@ impl StagePipeline {
                 });
             }
             NextStage::Complete => return Err(StageError::LaneClosed { stage }),
+        }
+        if self.current_head.is_none() {
+            // The first accepted record also records the head it binds
+            // to — the same first-observation rule `observe_head`
+            // applies. Adoption waits for acceptance so a refused
+            // record cannot pin a head that later evidence must match.
+            self.observe_head(&evidence.revision);
         }
         self.records.push(evidence);
         Ok(())

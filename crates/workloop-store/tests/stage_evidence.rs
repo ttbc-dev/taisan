@@ -331,7 +331,9 @@ fn ingest_refuses_a_delivered_stage_record() {
 /// U5.4 restart safety: `from_observations` rebuilds the recorded head
 /// from durable observations, so a stale-head observation can never
 /// promote itself to the recorded head after a restart — it stays
-/// history, and evidence bound to it is still refused.
+/// history, and evidence bound to it is still refused. Stage records
+/// pinned to a stale or foreign revision are refused on replay the
+/// same way: they cannot move the head or satisfy a lane either.
 #[test]
 fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() {
     let root = std::env::temp_dir().join(format!("workloop-stage-heads-{}", std::process::id()));
@@ -378,6 +380,27 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             change: change(),
             head: stale.clone(),
         });
+        // Stage records pinned to stale and foreign revisions sit in
+        // the durable log the way a Core transaction would have written
+        // them; replay must refuse them exactly like the live `record`
+        // guard did — they can neither move the head nor close a lane.
+        let foreign = CommitRevision::new(
+            RepositoryRef::new(
+                HostInstanceId::trusted("foreign-host"),
+                RepositoryId::trusted("foreign-repo"),
+            ),
+            "head-durable",
+        )
+        .unwrap();
+        for revision in [stale.clone(), foreign] {
+            persist(
+                &store,
+                &work_id,
+                &execution_id,
+                StageEvidence::complete(Stage::Verify, revision, vec![fact("verify-off-head")])
+                    .unwrap(),
+            );
+        }
         execution_id
     };
 
@@ -402,6 +425,10 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             .latest(Stage::Code)
             .is_some_and(|record| record.status.is_complete()),
         "recorded evidence replays under the restored head"
+    );
+    assert!(
+        pipeline.latest(Stage::Verify).is_none(),
+        "stale and foreign stage records never satisfy a lane after restart"
     );
     assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Verify));
     assert_eq!(
