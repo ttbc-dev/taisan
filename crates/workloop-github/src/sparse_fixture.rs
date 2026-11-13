@@ -7,7 +7,7 @@
 //! flat maps so shared-suite assertions cannot lean on one fixture's
 //! internals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use workloop_core::domain::WorkId;
 use workloop_core::identity::{
@@ -45,8 +45,33 @@ pub struct SparseHost {
     next_id: u64,
     /// `repository` → next display number: a per-repository namespace.
     next_number: BTreeMap<String, u64>,
+    /// `object` → parent object: the remote's recorded commit ancestry,
+    /// used to classify an observed ref against the produced revision
+    /// on a read-back (`Equal`/`Ancestor`/`Diverged`).
+    parents: BTreeMap<String, String>,
+    /// Remote mutations a racing actor lands after each successful
+    /// adapter write, before the read-back — the write/read gap a real
+    /// adapter cannot close.
+    queued_mutations: VecDeque<SparseMutation>,
+    /// `action name` → failure reason: test-injected execution faults.
+    /// A matching attempt consumes the entry — one-shot per arming.
+    forced_failures: BTreeMap<String, String>,
     /// The write history, for test assertions.
     applied: Vec<String>,
+}
+
+/// A remote mutation queued by test control to model a racing actor:
+/// applied after each successful adapter write, before the read-back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SparseMutation {
+    /// A racing actor moved a branch ref to `head` (descends from its
+    /// previous position).
+    MoveBranch {
+        repository: RepositoryRef,
+        branch: String,
+        head: String,
+        actor: HostActorRef,
+    },
 }
 
 impl SparseHost {
@@ -227,6 +252,58 @@ impl SparseHost {
             .cloned()
     }
 
+    /// Test control: the next attempt of `action_name` faults at
+    /// execution and reports `Failed{reason}` — the write never reaches
+    /// the remote. One-shot; re-arm to repeat.
+    pub fn force_failure(&mut self, action_name: &str, reason: &str) {
+        self.forced_failures
+            .insert(action_name.to_string(), reason.to_string());
+    }
+
+    /// Test control: queue a remote mutation a racing actor lands after
+    /// the next successful adapter write, before its read-back.
+    pub fn queue_remote_mutation(&mut self, mutation: SparseMutation) {
+        self.queued_mutations.push_back(mutation);
+    }
+
+    /// Apply every queued racing-actor mutation — the remote state the
+    /// read-back will observe.
+    fn apply_queued_mutations(&mut self) {
+        while let Some(mutation) = self.queued_mutations.pop_front() {
+            match mutation {
+                SparseMutation::MoveBranch {
+                    repository,
+                    branch,
+                    head,
+                    actor,
+                } => {
+                    let key = (repository.to_string(), branch.clone());
+                    if let Some(old) = self.branches.get(&key).cloned() {
+                        self.parents.insert(head.clone(), old);
+                    }
+                    self.branches.insert(key.clone(), head);
+                    self.branch_actors.insert(key, actor);
+                    self.bump(&ReadSubject::Head { repository, branch });
+                }
+            }
+        }
+    }
+
+    /// Whether `ancestor` is on `object`'s recorded parent chain.
+    fn descends(&self, object: &str, ancestor: &str) -> bool {
+        let mut current = object;
+        for _ in 0..=self.parents.len() {
+            if current == ancestor {
+                return true;
+            }
+            let Some(parent) = self.parents.get(current) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
     /// Feed a synthetic Observation through the same ingest pipeline a
     /// real delivery would use.
     pub fn emit(
@@ -318,6 +395,28 @@ impl SparseHost {
             Ok(())
         };
 
+        // A test-armed execution fault reports a definite failure
+        // without touching the remote — but only for operations this
+        // adapter claims to support; an unsupported intent keeps its
+        // explicit unsupported receipt.
+        if matches!(
+            intent.action,
+            HostAction::PushRef { .. } | HostAction::OpenChangeRequest { .. }
+        ) && let Some(reason) = self.forced_failures.remove(intent.action.name())
+        {
+            self.emit(
+                store,
+                config,
+                obs(result(
+                    intent.action_id.clone(),
+                    HostActionStatus::Failed { reason },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(());
+        }
+
         match &intent.action {
             HostAction::PushRef {
                 branch,
@@ -372,6 +471,9 @@ impl SparseHost {
                     (intent.repository.to_string(), branch.clone()),
                     intent.actor.clone(),
                 );
+                if let Some(prior) = &actual {
+                    self.parents.insert(produced.object.clone(), prior.clone());
+                }
                 self.bump(&ReadSubject::Head {
                     repository: intent.repository.clone(),
                     branch: branch.clone(),
@@ -380,6 +482,27 @@ impl SparseHost {
                     "push_ref:{}:{}",
                     intent.repository, produced.object
                 ));
+                // Racing actors land their writes before the read-back:
+                // the receipt must report the observed post-state, not
+                // the attempted value.
+                self.apply_queued_mutations();
+                let observed_object = self.remote_head(&intent.repository, branch);
+                let (observed, relation) = match &observed_object {
+                    Some(object) if object == &produced.object => {
+                        (produced.clone(), RefRelation::Equal)
+                    }
+                    Some(object) => {
+                        let relation = if self.descends(object, &produced.object) {
+                            RefRelation::Ancestor
+                        } else {
+                            RefRelation::Diverged
+                        };
+                        let revision = CommitRevision::new(intent.repository.clone(), object)
+                            .map_err(|detail| StoreError::Internal { detail })?;
+                        (revision, relation)
+                    }
+                    None => (produced.clone(), RefRelation::Diverged),
+                };
                 self.emit(
                     store,
                     config,
@@ -390,8 +513,8 @@ impl SparseHost {
                             repository: intent.repository.clone(),
                             branch: branch.clone(),
                             produced: produced.clone(),
-                            observed: produced.clone(),
-                            relation: RefRelation::Equal,
+                            observed,
+                            relation,
                         }],
                     )),
                     now,
@@ -442,7 +565,19 @@ impl SparseHost {
                     "open_change:{}:{}",
                     intent.repository, change.change_request
                 ));
-                let head = CommitRevision::new(intent.repository.clone(), head_object)
+                // Racing actors land their writes before the read-back:
+                // the receipt reports the change head the remote holds
+                // at read-back time, never the attempted value.
+                self.apply_queued_mutations();
+                let observed_head = self
+                    .changes
+                    .get(&(
+                        intent.repository.to_string(),
+                        change.change_request.as_str().to_string(),
+                    ))
+                    .cloned()
+                    .unwrap_or(head_object);
+                let head = CommitRevision::new(intent.repository.clone(), observed_head)
                     .map_err(|detail| StoreError::Internal { detail })?;
                 self.emit(
                     store,
