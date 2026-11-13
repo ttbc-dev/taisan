@@ -762,3 +762,118 @@ fn an_unknown_spawn_outcome_retains_the_launch_scratch() {
     assert!(unknown.process_identity.is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A launch stopped through `drive_stops` — the cancel/fail/pause path
+/// the poll pass skips — releases its scratch tree with the proven
+/// exit, exactly like the poll path: `.isolation` never keeps an
+/// `inv-*` tree for a writer already proven stopped (#174).
+#[test]
+fn a_stop_driven_launch_reclaims_its_scratch_tree() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("stoprelease");
+    let port = ScriptedProcessControl::new();
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (work_id, eid) = submit_and_admit(&store, "k-iso-stop");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let iso = isolation::scratch_root(&root);
+    assert_eq!(
+        read_tree_names(&iso, "inv-").len(),
+        1,
+        "the running writer keeps its scratch tree"
+    );
+
+    // Cancel drives the Execution into `stopping`; the poll path skips
+    // it, so `drive_stops` owns the exit fact — and the launch
+    // scratch's reclamation.
+    let version = store
+        .transact(|tx| tx.work(&work_id))
+        .unwrap()
+        .map(|w| w.version)
+        .expect("work exists");
+    let d = handle_command(
+        &store,
+        &config(),
+        &req(
+            "k-iso-stop-cancel",
+            CommandBody::Cancel {
+                work_id: work_id.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "cancel: {d:?}"
+    );
+    sup.drive_stops(&store, NOW).unwrap();
+
+    let invocation = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap()
+        .remove(0);
+    assert_eq!(invocation.state, InvocationState::Done);
+    let leftovers = read_tree_names(&iso, "inv-");
+    assert!(
+        leftovers.is_empty(),
+        "a stop-driven launch leaves no scratch tree behind: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `.isolation` orphans are bounded once per supervisor pass: scratch
+/// trees no unresolved Invocation still owns — a crashed launch's
+/// `inv-*` leftover, an interrupted probe's `probe-*` tree — are
+/// reclaimed, while a live writer's tree and anything outside the
+/// owned prefixes are never touched (#174).
+#[test]
+fn isolation_scratch_orphans_are_swept_but_live_trees_are_kept() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("orphansweep");
+    let port = ScriptedProcessControl::new();
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec!["fixture-worker".into()],
+        config(),
+    );
+    let (_work_id, _eid) = submit_and_admit(&store, "k-iso-orphan");
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let iso = isolation::scratch_root(&root);
+    // Orphan trees a crashed pass could leave: an `inv-*` key no
+    // Invocation owns and a `probe-*` tree whose declaration never
+    // returned. A foreign entry is never the sweep's to touch.
+    for orphan in ["inv-inv-999", "probe-dead-request"] {
+        let dir = iso.join(orphan);
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::write(dir.join("gitconfig"), "x").unwrap();
+    }
+    let foreign = iso.join("not-ours");
+    std::fs::create_dir_all(&foreign).unwrap();
+
+    sup.run_once(&store, NOW).unwrap();
+
+    assert!(
+        !iso.join("inv-inv-999").exists(),
+        "an orphaned launch scratch is reclaimed"
+    );
+    assert!(
+        !iso.join("probe-dead-request").exists(),
+        "an interrupted probe's scratch is reclaimed"
+    );
+    assert!(
+        iso.join("inv-inv-1").exists(),
+        "the live writer's scratch is kept"
+    );
+    assert!(foreign.exists(), "foreign entries are never touched");
+    let _ = std::fs::remove_dir_all(&root);
+}

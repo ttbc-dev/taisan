@@ -22,7 +22,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{CapabilityEntry, CapabilityState, Observation, ObservationFact};
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
 };
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -250,9 +250,14 @@ struct CountingPosix {
 }
 
 impl ProcessControlPort for CountingPosix {
-    fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         self.calls.set(self.calls.get() + 1);
-        PosixProcessControl.spawn(argv, cwd)
+        PosixProcessControl.spawn(argv, cwd, env)
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
@@ -276,9 +281,10 @@ impl ProcessControlPort for CountingPosix {
         &self,
         argv: &[String],
         cwd: &Path,
+        env: &WorkerEnv,
         timeout: Duration,
     ) -> Result<ProbeOutcome, SpawnError> {
-        PosixProcessControl.run_probe(argv, cwd, timeout)
+        PosixProcessControl.run_probe(argv, cwd, env, timeout)
     }
 }
 
@@ -654,9 +660,13 @@ fn u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindin
         // The recorded adapter ID, version and capability digest still
         // hold under the recorded argv — the binding re-verifies Ready.
         let workspace = sup.workspace_of(&request(&store, exec).work_id);
-        let recorded =
-            adapter::observe_worker_declaration(&PosixProcessControl, &binding.argv, &workspace)
-                .expect("the recorded argv still declares");
+        let recorded = adapter::observe_worker_declaration(
+            &PosixProcessControl,
+            &binding.argv,
+            &workspace,
+            &WorkerEnv::default(),
+        )
+        .expect("the recorded argv still declares");
         assert_eq!(
             adapter::select_adapter(&recorded, binding),
             AdapterSelection::Ready(binding.clone()),
@@ -664,9 +674,13 @@ fn u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindin
         );
         // The changed configuration would be a repair for these
         // requests, not a retarget: it declares a different adapter.
-        let changed =
-            adapter::observe_worker_declaration(&PosixProcessControl, &changed_argv, &workspace)
-                .expect("the changed argv still declares");
+        let changed = adapter::observe_worker_declaration(
+            &PosixProcessControl,
+            &changed_argv,
+            &workspace,
+            &WorkerEnv::default(),
+        )
+        .expect("the changed argv still declares");
         match adapter::select_adapter(&changed, binding) {
             AdapterSelection::ConfigurationRepair { reason } => {
                 assert!(reason.contains("adapter.identity_mismatch"), "{reason}");
