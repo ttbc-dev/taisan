@@ -220,22 +220,32 @@ fn tracked_tree_is_pristine(manifest_dir: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The base fork point of a normal checkout. A checkout that retains
-/// no base history at all — a depth-1 clone or a detached source tree —
-/// cites the deepest commit it does retain, the only fork point it can
-/// prove. A checkout with no commit history at all yields `None`.
+/// The base fork point of a normal checkout. A candidate equal to HEAD
+/// is no fork point — `merge-base HEAD <ref>` answers HEAD itself when
+/// `<ref>` is the checked-out commit (a run on the base branch, or the
+/// only commit a shallow clone retains) — so it is rejected. A
+/// checkout that retains no base history at all cites the deepest
+/// commit it does retain; when that commit is HEAD itself — a depth-1
+/// clone — no fork point is provable and the answer is `None`, so the
+/// run retains no records rather than stamping `base == tested`.
 fn base_revision(manifest_dir: &str) -> Option<String> {
+    let head = git_stdout(manifest_dir, &["rev-parse", "HEAD"])?;
     for revs in [
         ["merge-base", "HEAD", "origin/main"],
         ["merge-base", "HEAD", "main"],
         ["merge-base", "HEAD", "origin/HEAD"],
     ] {
-        if let Some(sha) = git_stdout(manifest_dir, &revs) {
-            return Some(sha);
+        match git_stdout(manifest_dir, &revs) {
+            Some(sha) if sha != head => return Some(sha),
+            _ => {}
         }
     }
-    git_stdout(manifest_dir, &["rev-list", "--max-parents=0", "HEAD"])
+    match git_stdout(manifest_dir, &["rev-list", "--max-parents=0", "HEAD"])
         .and_then(|roots| roots.lines().next().map(str::to_string))
+    {
+        Some(sha) if sha != head => Some(sha),
+        _ => None,
+    }
 }
 
 /// The revision pair a CI run stamps, read from the workflow event
@@ -265,10 +275,11 @@ fn ci_event_revisions() -> Option<(String, String)> {
     ))
 }
 
-/// Whether `sha` is a full commit id — `unknown`, a truncated id, or
-/// any non-hex output is no stamp.
+/// Whether `sha` is a full commit id — `unknown`, a truncated id, any
+/// non-hex output, or GitHub's all-zero absent-revision sentinel (the
+/// `before` of a pushed new ref) is no stamp.
 fn is_commit_id(sha: &str) -> bool {
-    sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
+    sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) && !sha.bytes().all(|b| b == b'0')
 }
 
 /// The revision pair a recorded run stamps: `tested` is the commit
@@ -298,7 +309,10 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
 /// The field-presence check every retained record must pass. Asserts:
 ///
 /// - every field of `REQUIRED_FIELDS` is present (non-null);
-/// - `claim_class` is one of `fixture_contract` / `live_evidenced`;
+/// - `schema_version` is exactly `SCHEMA_VERSION` — a record of an
+///   unknown schema cannot be interpreted;
+/// - `claim_class` is the string `fixture_contract` or `live_evidenced`
+///   — a present-but-non-string value is a violation, never fail-open;
 /// - a `live_evidenced` record additionally carries a non-empty
 ///   `authorization_reference`, and a `fixture_contract` record does
 ///   not carry the key at all — its absence invalidates a live record
@@ -306,7 +320,8 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
 /// - `config_identity` carries its own required fields
 ///   (`install_identity` with `host_instance`, `repository`,
 ///   `adapter`, `contract_version`, plus `config_digest`);
-/// - `result` is one of `pass` / `fail` / `skipped` / `inconclusive`;
+/// - `result` is the string `pass` / `fail` / `skipped` /
+///   `inconclusive` — a present-but-non-string value is a violation;
 /// - the array fields are arrays.
 ///
 /// Returns the list of violations; an empty list is a valid record.
@@ -332,24 +347,40 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
             None => {}
         }
     }
-    match object.get("claim_class").and_then(|v| v.as_str()) {
-        Some("fixture_contract") => {
-            if object.contains_key("authorization_reference") {
-                violations.push(
-                    "authorization_reference must be absent on a fixture_contract record".into(),
-                );
-            }
-        }
-        Some("live_evidenced") => match object.get("authorization_reference") {
-            Some(v) if v.as_str().is_some_and(|s| !s.is_empty()) => {}
-            _ => violations.push("live_evidenced record missing authorization_reference".into()),
-        },
-        Some(other) => violations.push(format!("unknown claim_class: {other}")),
-        None => {}
+    match object.get("schema_version") {
+        Some(v) if v.as_u64() == Some(SCHEMA_VERSION) => {}
+        Some(_) => violations.push(format!("schema_version must be {SCHEMA_VERSION}")),
+        None => {} // absent is already flagged by the required-field check
     }
-    match object.get("result").and_then(|v| v.as_str()) {
-        Some("pass" | "fail" | "skipped" | "inconclusive") | None => {}
-        Some(other) => violations.push(format!("unknown result: {other}")),
+    // Absent claim_class/result are already flagged by the
+    // required-field check; a present-but-non-string value is a
+    // distinct violation, never fail-open.
+    if let Some(v) = object.get("claim_class") {
+        match v.as_str() {
+            Some("fixture_contract") => {
+                if object.contains_key("authorization_reference") {
+                    violations.push(
+                        "authorization_reference must be absent on a fixture_contract record"
+                            .into(),
+                    );
+                }
+            }
+            Some("live_evidenced") => match object.get("authorization_reference") {
+                Some(v) if v.as_str().is_some_and(|s| !s.is_empty()) => {}
+                _ => {
+                    violations.push("live_evidenced record missing authorization_reference".into())
+                }
+            },
+            Some(other) => violations.push(format!("unknown claim_class: {other}")),
+            None => violations.push("claim_class is not a string".into()),
+        }
+    }
+    if let Some(v) = object.get("result") {
+        match v.as_str() {
+            Some("pass" | "fail" | "skipped" | "inconclusive") => {}
+            Some(other) => violations.push(format!("unknown result: {other}")),
+            None => violations.push("result is not a string".into()),
+        }
     }
     if let Some(config) = object.get("config_identity") {
         match config.as_object() {
@@ -385,6 +416,7 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use workloop_core::domain::{AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy};
     use workloop_core::identity::*;
     use workloop_core::work::{HostTemplate, WorkloopConfig};
@@ -557,5 +589,99 @@ mod tests {
         assert_eq!(identity.install_identity.repository, "local-repo");
         assert_eq!(identity.install_identity.adapter, "sparse-host");
         assert_eq!(identity.install_identity.contract_version, 1);
+    }
+
+    #[test]
+    fn wrong_typed_closed_set_fields_are_invalid() {
+        // A present-but-wrong-typed or out-of-set closed-field value is
+        // a violation — the string matches must not fail open.
+        for (field, injected) in [
+            ("claim_class", serde_json::json!(7)),
+            ("claim_class", serde_json::json!(null)),
+            ("result", serde_json::json!(7)),
+            ("result", serde_json::json!(null)),
+            ("schema_version", serde_json::json!(SCHEMA_VERSION + 1)),
+            ("schema_version", serde_json::json!("1")),
+        ] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), injected.clone());
+            assert!(
+                validate_record_json(&value).is_err(),
+                "{field} = {injected} must invalidate the record"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_zero_sha_is_not_a_commit_id() {
+        // GitHub's absent-revision sentinel — a pushed new ref's
+        // `before` — must not stamp as a base.
+        assert!(!is_commit_id(&"0".repeat(40)));
+        assert!(!is_commit_id("abc"));
+        assert!(!is_commit_id(&"g".repeat(40)));
+        assert!(is_commit_id(&"a".repeat(40)));
+    }
+
+    fn git(dir: &Path, argv: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(argv)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {argv:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A scratch git repo under the OS temp dir with `commits` empty
+    /// commits — `commits == 1` is the shallow-clone shape: HEAD is
+    /// the deepest commit the checkout retains.
+    fn git_repo(name: &str, commits: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("workloop-u36a-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+        for i in 0..commits {
+            git(
+                &dir,
+                &["commit", "-q", "--allow-empty", "-m", &format!("c{i}")],
+            );
+        }
+        dir
+    }
+
+    #[test]
+    fn base_revision_is_none_when_the_only_retained_commit_is_head() {
+        // A depth-1 clone outside CI: HEAD is also the deepest commit
+        // the checkout retains, so no fork point is provable — the
+        // stamp must not cite HEAD as its own base.
+        let dir = git_repo("shallow", 1);
+        assert_eq!(
+            base_revision(dir.to_str().unwrap()),
+            None,
+            "a checkout retaining only HEAD proves no fork point"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn base_revision_cites_the_deepest_retained_commit() {
+        // Without an origin ref the deepest retained commit is the
+        // only fork point the checkout can prove.
+        let dir = git_repo("deep", 2);
+        let root = git(&dir, &["rev-list", "--max-parents=0", "HEAD"]);
+        assert_eq!(
+            base_revision(dir.to_str().unwrap()).as_deref(),
+            Some(root.as_str())
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

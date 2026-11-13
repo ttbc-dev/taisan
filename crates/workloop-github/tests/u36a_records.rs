@@ -305,9 +305,13 @@ fn stale_head_never_rolls_back(adapter: &mut dyn ReadPathAdapter) -> ScenarioEvi
         "{}: the recorded current read is head-2",
         adapter.adapter_id()
     );
+    // The version the landed delivery carries — cited in the record so
+    // the retained evidence names the identity actually recorded.
+    let landed = adapter.read(&subject, &reader());
 
     // The delayed read of the older revision arrives now — retained as
     // history, and the recorded revision stays at head-2.
+    let stale_version = stale.subject_version;
     let delayed = deliver_delayed(adapter, &store, &config, &subject, stale, NOW + 1);
     assert_eq!(delayed, IngestReceipt::Recorded);
     let current = store.transact(|tx| current_read(tx, &subject)).unwrap();
@@ -328,18 +332,32 @@ fn stale_head_never_rolls_back(adapter: &mut dyn ReadPathAdapter) -> ScenarioEvi
 
     ScenarioEvidence {
         observation_identities: vec![
-            format!("local:{}.poll:{}@2", adapter.poll_source(), subject.key()),
-            format!("(delayed delivery, no identity):{}@1", subject.key()),
+            format!(
+                "local:{}.poll:{}@{}",
+                adapter.poll_source(),
+                subject.key(),
+                landed.subject_version
+            ),
+            format!(
+                "(delayed delivery, no identity):{}@{}",
+                subject.key(),
+                stale_version
+            ),
         ],
         read_back_receipts: vec![
             ReadBackReceipt {
                 target: subject.key(),
-                observed: "ingest:Recorded head-2 @v2 before the stale delivery".into(),
+                observed: format!(
+                    "ingest:Recorded head-2 @v{} before the stale delivery",
+                    landed.subject_version
+                ),
             },
             ReadBackReceipt {
                 target: subject.key(),
-                observed: "ingest:Recorded delayed head-1 @v1; current_read stayed head-2 @v2"
-                    .into(),
+                observed: format!(
+                    "ingest:Recorded delayed head-1 @v{}; current_read stayed head-2 @v{}",
+                    stale_version, landed.subject_version
+                ),
             },
         ],
     }
@@ -431,9 +449,10 @@ fn duplicate_delivery_deduplicates(adapter: &mut dyn ReadPathAdapter) -> Scenari
 
     ScenarioEvidence {
         observation_identities: vec![format!(
-            "local:{}.poll:{}@1",
+            "local:{}.poll:{}@{}",
             adapter.poll_source(),
-            subject.key()
+            subject.key(),
+            read.subject_version
         )],
         read_back_receipts: vec![
             ReadBackReceipt {
@@ -442,7 +461,10 @@ fn duplicate_delivery_deduplicates(adapter: &mut dyn ReadPathAdapter) -> Scenari
             },
             ReadBackReceipt {
                 target: subject.key(),
-                observed: "ingest:Duplicate re-delivered event; current_read head-2 @v1".into(),
+                observed: format!(
+                    "ingest:Duplicate re-delivered event; current_read head-2 @v{}",
+                    read.subject_version
+                ),
             },
         ],
     }
@@ -472,26 +494,27 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ),
 ];
 
-/// Run the read-path scenario table against one adapter, retaining one
-/// record per scenario when the checkout yields a faithful stamp.
+/// Run the read-path scenario table against one adapter kind — a fresh
+/// adapter instance per scenario, so a scenario's remote mutations
+/// never leak ordering-token state into the next scenario — retaining
+/// one record per scenario when the checkout yields a faithful stamp.
 fn run_recorded(
-    adapter: &mut dyn ReadPathAdapter,
+    make_adapter: fn() -> Box<dyn ReadPathAdapter>,
     stamp: Option<&(String, String)>,
 ) -> Vec<RecordRow> {
     SCENARIOS
         .iter()
         .map(|&(id, run)| {
-            let evidence = run(adapter);
+            let mut adapter = make_adapter();
+            let adapter_id = adapter.adapter_id();
+            let evidence = run(adapter.as_mut());
             let record = stamp.map(|(tested, base)| EvidenceRecord {
                 schema_version: SCHEMA_VERSION,
                 tested_revision: tested.clone(),
                 base_revision: base.clone(),
                 core_revision: tested.clone(),
                 adapter_revision: tested.clone(),
-                config_identity: ConfigIdentity::for_config(
-                    &config(adapter.adapter_id()),
-                    adapter.adapter_id(),
-                ),
+                config_identity: ConfigIdentity::for_config(&config(adapter_id), adapter_id),
                 command_or_scenario: format!("u36a-read-path::{id}"),
                 action_identities: vec![],
                 observation_identities: evidence.observation_identities,
@@ -502,7 +525,7 @@ fn run_recorded(
             });
             RecordRow {
                 scenario: id,
-                adapter: adapter.adapter_id(),
+                adapter: adapter_id,
                 record,
             }
         })
@@ -519,8 +542,11 @@ fn run_recorded(
 fn read_path_records_retain_one_record_per_scenario_per_adapter() {
     let stamp = record_revisions(env!("CARGO_MANIFEST_DIR"));
     let mut rows = Vec::new();
-    rows.extend(run_recorded(&mut FixtureGithub::new(), stamp.as_ref()));
-    rows.extend(run_recorded(&mut SparseHost::new(), stamp.as_ref()));
+    rows.extend(run_recorded(
+        || Box::new(FixtureGithub::new()),
+        stamp.as_ref(),
+    ));
+    rows.extend(run_recorded(|| Box::new(SparseHost::new()), stamp.as_ref()));
 
     assert_eq!(rows.len(), 4, "two scenarios × two adapters");
     let adapters: BTreeSet<_> = rows.iter().map(|r| r.adapter).collect();
