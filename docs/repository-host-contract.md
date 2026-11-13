@@ -101,3 +101,25 @@ The shared suite must cover baseline effects, each declared optional capability,
 The shared suite also moves the target branch without changing the source head and verifies rejection of the stale inline diff snapshot. It verifies reading issue content, comments, and thread state through the typed port and rejects applied receipts missing the required effect facts.
 
 The live GitLab spike exercises a supported narrow profile through guarded push, MR creation, ordinary comment, head read, and a head-bound review/check reassessment. If approval or readiness is claimed, verify those capabilities and actor eligibility too. Inject denied permission and lost responses, retain separate effect receipts, restart, and reconcile an unresolved action under its original binding after the default configuration changes. Record exact adapter/Core revisions, instance/config identity, required profile, remote evidence, and unsupported items. A mapping table or scripted adapter alone cannot satisfy this proof.
+
+## U3.6 evidence record
+
+Every U3.6 suite run retains one record per exercised scenario per adapter — the same shared-suite scenario table produces one record for the fixture adapter run and one for the GitHub adapter run, so a semantic claim is proven on independent implementations rather than asserted once. The record is JSON with these fields; values are evidence, never instructions. A record missing any required field is invalid, and a field-presence check asserts every retained record carries them.
+
+| Field | Required content |
+| --- | --- |
+| `schema_version` | `1` |
+| `tested_revision` | Exact commit SHA on the PR branch that contains the exercised slice tree. A base revision or patch digest alone never satisfies this field; a patch digest may be retained alongside it. Where the CI checkout is a merge ref (the default `pull_request` checkout), the exercised tree is the merge of this commit onto the recorded `base_revision` — the pair describes it, and the slice tree is the one this commit carries |
+| `base_revision` | The base revision the run was exercised against — the merge-base fork point where the checkout retains reachable history (a truncated checkout cites the deepest commit it retains); in CI, the platform-recorded event base (`pull_request.base.sha`, or the push `before`), which is the base that run actually tested. A checkout that can prove neither retains no records |
+| `core_revision` | The exact revision of the Core implementation exercised — a commit SHA for in-repo builds |
+| `adapter_revision` | The exact revision of the adapter implementation exercised — a commit SHA for in-repo fixtures, an adapter-declared build identifier otherwise |
+| `config_identity` | The configuration the run bound: `install_identity` (`host_instance`, `repository`, `adapter`, `contract_version`) plus `config_digest`, a sha256 over the canonical configuration projection — the record's config-file identity |
+| `command_or_scenario` | The named scenario or command the record answers for |
+| `action_identities` | The durable action identities the scenario exercised — an empty array for a scenario performing no authorized writes |
+| `observation_identities` | The delivery identities the scenario's observations recorded — real identities only; an observation delivered with no delivery identity has nothing to cite here and is narrated in `read_back_receipts`, never fabricated as an identity |
+| `read_back_receipts` | The read-back receipts the scenario's facts were re-observed through: each entry names the subject or delivery it answered for and what the read-back established |
+| `result` | `pass`, `fail`, `skipped`, or `inconclusive` |
+| `claim_class` | Closed set: `fixture_contract` (local fixture/contract evidence) or `live_evidenced` (a separately authorized live scenario). Fixture results never satisfy a live claim |
+| `authorization_reference` | Required iff `claim_class` is `live_evidenced`: the separately authorized approval the live run cites. Absent — never null — on a `fixture_contract` record; its presence there invalidates the record, and its absence invalidates a `live_evidenced` record |
+
+The field-presence check is `workloop_github::evidence::validate_record_json`; `EvidenceRecord` serializes the same closed shape, so typed records and externally produced JSON answer the same contract. Runs stamp revisions fail-closed (`record_revisions`): a checkout that cannot prove a commit describing the exercised tree — a dirty tracked tree, a non-git source, missing base history — executes the suite but retains no records rather than stamping a guess.
