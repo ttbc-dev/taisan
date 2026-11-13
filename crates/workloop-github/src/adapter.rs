@@ -16,6 +16,14 @@
 //! - **Check and review facts** carry the exact head they examined —
 //!   the check run's SHA and the review's `commit_id` — never the
 //!   change's current head, so a newer head inherits nothing.
+//! - **Review findings come from the findings surface**: a complete
+//!   review round is claimed only after `review_findings` answered,
+//!   carrying every finding examined at the review's head plus one
+//!   occurrence per change-requesting review. A webhook delivery for a
+//!   review records partial evidence (the event carries no findings)
+//!   while the fresh review read behind that delivery records the
+//!   host's current review state; a failed findings read records the
+//!   review `unavailable` — an empty clean round is never invented.
 //! - **Head-bound writes** (`update_change_request`,
 //!   `post_comment`) re-read the head immediately before writing; a
 //!   mismatch against `expected_head` aborts before any write and
@@ -39,12 +47,12 @@ use workloop_core::identity::{
 };
 use workloop_core::observation::{
     BranchState, CheckConclusion, Completeness, DeliveryId, DeliveryScope, HostActionStatus,
-    NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    NormalizedEffectFact, Observation, ObservationFact, OccurrenceInput, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
-use crate::api::{ApiError, GitHubApi};
+use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding};
 
 /// One delivered GitHub webhook: the transport GUID GitHub assigned,
 /// the time it stamped on the event, and the fact the event asserts —
@@ -79,7 +87,10 @@ pub enum WebhookFact {
         producer: HostActorRef,
         conclusion: CheckConclusion,
     },
-    /// A review was submitted — on the exact head it examined.
+    /// A review was submitted — on the exact head it examined. The
+    /// event itself carries no findings, so it records partial
+    /// evidence; the fresh review read behind the delivery records the
+    /// findings the host reports.
     Review {
         change: ChangeRequestRef,
         head: CommitRevision,
@@ -276,7 +287,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     },
                     source: source.clone(),
                     source_revision: Some(review_id.clone()),
-                    completeness: Completeness::Complete,
+                    // The delivery asserts only that a review was
+                    // submitted: it carries no findings, so it is
+                    // partial evidence — never a complete round that
+                    // could pass the review lane on its own.
+                    completeness: Completeness::Partial {
+                        reason: "webhook delivery carries no review findings".into(),
+                    },
                     occurrences: vec![],
                 },
             ),
@@ -313,6 +330,20 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         )?;
         if matches!(&receipt, IngestReceipt::Rejected(_)) {
             return Ok(receipt);
+        }
+        // A review delivery is always followed by a fresh read of the
+        // review state (reviews plus findings) — the event asserted no
+        // findings, so what GitHub reports *now* is the only source
+        // that can record a complete round for this review.
+        if matches!(&delivery.fact, WebhookFact::Review { .. }) {
+            self.ingest_review_state(
+                store,
+                config,
+                change,
+                &work_id,
+                &execution_id,
+                now_unix_seconds,
+            )?;
         }
         // The fresh read: what GitHub reports *now* is the recorded
         // current head, ingested after (and therefore outranking) the
@@ -452,23 +483,86 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             )?;
         }
         // Reviews keep the commit they examined — a review of the
-        // superseded head stays bound to it.
-        let reviews = match self
+        // superseded head stays bound to it, and the round it seals
+        // carries the findings read from the host.
+        self.ingest_review_state(
+            store,
+            config,
+            change,
+            &work_id,
+            &execution_id,
+            now_unix_seconds,
+        )
+    }
+
+    /// Read one change's review state — the review stream plus the
+    /// findings surface — and ingest each review bound to the exact
+    /// revision it examined. Every review fact for one head carries
+    /// that head's full occurrence set (all findings examined there,
+    /// plus one occurrence per change-requesting review), so sealing is
+    /// order-independent: a later clean review never masks an earlier
+    /// reviewer's findings. A findings read that fails records the
+    /// review `unavailable` — the empty clean round is never claimed
+    /// without the findings source answering.
+    fn ingest_review_state(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        change: &ChangeRequestRef,
+        work_id: &WorkId,
+        execution_id: &Option<ExecutionId>,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let Ok(reviews) = self
             .client
             .reviews(&change.repository, &change.change_request)
-        {
-            Ok(reviews) => reviews,
-            Err(_) => return Ok(()),
+        else {
+            // Outage or unknown change: no facts invented — the next
+            // successful read catches up.
+            return Ok(());
         };
-        for review in reviews {
+        let findings = self
+            .client
+            .review_findings(&change.repository, &change.change_request);
+        for review in &reviews {
             let review_head =
                 CommitRevision::new(change.repository.clone(), review.commit_sha.clone())
                     .map_err(|detail| StoreError::Internal { detail })?;
+            let (completeness, occurrences) = match &findings {
+                Ok(findings) => (
+                    Completeness::Complete,
+                    review_occurrences(&reviews, findings, &review_head.object),
+                ),
+                Err(_) => (
+                    // The reviews arrived but the findings surface did
+                    // not: source availability is part of the fact, so
+                    // this review is recorded `unavailable` evidence
+                    // that can satisfy nothing.
+                    Completeness::Unavailable {
+                        reason: "review findings read failed".into(),
+                    },
+                    vec![],
+                ),
+            };
+            // The content-derived identity: a re-read that observes
+            // changed findings records the change (a new identity),
+            // while an identical re-read deduplicates — the same rule
+            // the check facts use for a changed conclusion.
+            let token = review_fact_token(&completeness, &occurrences);
             self.ingest(
                 store,
                 config,
-                host_obs(
-                    ObservationFact::Review {
+                Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Host {
+                            host: change.repository.host.clone(),
+                        },
+                        source: "github.poll".into(),
+                        event_id: format!("review:{change}@{}#{token}", review.review_id),
+                    }),
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: execution_id.clone(),
+                    fact: ObservationFact::Review {
                         target: DiffTarget {
                             change: change.clone(),
                             head: review_head,
@@ -477,12 +571,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         },
                         source: review.author.clone(),
                         source_revision: Some(review.review_id.clone()),
-                        completeness: Completeness::Complete,
-                        occurrences: vec![],
+                        completeness,
+                        occurrences,
                     },
-                    format!("review:{change}@{}", review.review_id),
-                    now_unix_seconds,
-                ),
+                    observed_unix_seconds: now_unix_seconds,
+                },
                 now_unix_seconds,
             )?;
         }
@@ -624,37 +717,34 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 HostAction::OpenChangeRequest {
                     source_branch,
                     target_branch,
-                    ..
+                    title,
+                    body,
                 } => {
-                    // Identify the effect by the source revision this
-                    // Work recorded when it issued the open — never by
-                    // the branch alone, which can also carry a change
-                    // request this Work did not open. With no recorded
-                    // push (a directly seeded branch), the branch's
-                    // current head is the only available revision.
-                    let source_revision =
-                        match recorded_source_revision(store, &intent, source_branch)? {
-                            Some(revision) => Some(revision),
-                            None => {
-                                match self.client.read_branch(&intent.repository, source_branch) {
-                                    Ok(Some(head)) => Some(
-                                        CommitRevision::new(intent.repository.clone(), head)
-                                            .map_err(|detail| StoreError::Internal { detail })?,
-                                    ),
-                                    _ => None,
-                                }
-                            }
-                        };
-                    if let Some(source_revision) = source_revision
+                    // Identify the effect by what this Work recorded
+                    // when it issued the open — the source revision of
+                    // its own applied push (when one is recorded) plus
+                    // the intent's own payload (target branch, title,
+                    // body). Neither the branch nor the revision alone
+                    // identifies the effect: the branch can carry a
+                    // change request this Work did not open, and a
+                    // pull request's head follows its source branch, so
+                    // a foreign change moves onto the recorded revision
+                    // after our push. With no recorded push the intent
+                    // stays `unknown` — branch identity alone never
+                    // adopts somebody else's change.
+                    if let Some(source_revision) =
+                        recorded_source_revision(store, &intent, source_branch)?
                         && let Ok(pulls) = self.client.list_pulls_on_branch(
                             &intent.repository,
                             source_branch,
                             &source_revision.object,
                         )
                     {
-                        let found = pulls
-                            .iter()
-                            .find(|pull| pull.target_branch == *target_branch);
+                        let found = pulls.iter().find(|pull| {
+                            pull.target_branch == *target_branch
+                                && pull.title == *title
+                                && pull.body == *body
+                        });
                         if let Some(pull) = found {
                             let change = ChangeRequestRef {
                                 repository: intent.repository.clone(),
@@ -677,12 +767,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                 }],
                             )?;
                         }
-                        // No change request at the recorded revision:
-                        // a matching change may exist with a moved
-                        // head, so the result stays undecidable —
-                        // `unknown` and outstanding, never a failed
-                        // claim or an adoption of somebody else's
-                        // change.
+                        // No change request matching the recorded
+                        // revision and payload: a matching change may
+                        // exist with a moved head, or only a foreign
+                        // change sits at this revision — the result
+                        // stays undecidable: `unknown` and outstanding,
+                        // never a failed claim or an adoption of
+                        // somebody else's change.
                     }
                 }
                 HostAction::PostComment { change, marker, .. } => {
@@ -1335,10 +1426,90 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     }
 }
 
+/// The occurrence set one target's review facts carry: every review
+/// finding examined at `commit`, plus one synthetic occurrence for
+/// each change-requesting review examined there. Every review fact for
+/// the same head carries the same set — sorted, so the sealed round
+/// and the fact's delivery identity never depend on transport order,
+/// and a later clean review never masks an earlier reviewer's findings.
+fn review_occurrences(
+    reviews: &[RemoteReview],
+    findings: &[RemoteReviewFinding],
+    commit: &str,
+) -> Vec<OccurrenceInput> {
+    let mut occurrences: Vec<OccurrenceInput> = findings
+        .iter()
+        .filter(|finding| finding.commit_sha == commit)
+        .map(|finding| OccurrenceInput {
+            source_key: finding.finding_id.clone(),
+            content_digest: Some(sha256_hex(
+                "review-finding-v1",
+                &canonical_json(&serde_json::json!({ "body": finding.body })),
+            )),
+            severity: None,
+            position: None,
+            thread_id: None,
+        })
+        .chain(
+            reviews
+                .iter()
+                .filter(|review| review.changes_requested && review.commit_sha == commit)
+                .map(|review| OccurrenceInput {
+                    source_key: format!("changes-requested:{}", review.review_id),
+                    content_digest: Some(sha256_hex(
+                        "review-change-request-v1",
+                        &canonical_json(&serde_json::json!({ "body": review.body })),
+                    )),
+                    severity: None,
+                    position: None,
+                    thread_id: None,
+                }),
+        )
+        .collect();
+    occurrences.sort_by(|a, b| {
+        (a.source_key.as_str(), a.content_digest.as_deref())
+            .cmp(&(b.source_key.as_str(), b.content_digest.as_deref()))
+    });
+    occurrences
+}
+
+/// The content identity of one review fact: completeness plus the
+/// occurrence set, digested. Changed review state (a new finding, a
+/// changed availability) records under a new delivery identity instead
+/// of colliding with the recorded row, while an identical re-read
+/// deduplicates — the same rule the check facts use for a changed
+/// conclusion.
+fn review_fact_token(completeness: &Completeness, occurrences: &[OccurrenceInput]) -> String {
+    let completeness = match completeness {
+        Completeness::Complete => "complete".to_string(),
+        Completeness::Partial { reason } => format!("partial:{reason}"),
+        Completeness::Unavailable { reason } => format!("unavailable:{reason}"),
+    };
+    let mut material: Vec<(String, String)> = occurrences
+        .iter()
+        .map(|o| {
+            (
+                o.source_key.clone(),
+                o.content_digest.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    material.sort();
+    sha256_hex(
+        "review-fact-v1",
+        &canonical_json(&serde_json::json!({
+            "completeness": completeness,
+            "occurrences": material,
+        })),
+    )
+}
+
 /// The source revision an `open_change_request` was issued against:
 /// the revision of the latest applied `push_ref` on the same branch for
 /// the same Work and repository. Returns `None` when no applied push is
-/// recorded; the caller then falls back to the branch's current head.
+/// recorded; the caller then leaves the intent `unknown` — without a
+/// recorded source revision, no read can tell this Work's open apart
+/// from a change request somebody else opened on the same branch.
 fn recorded_source_revision(
     store: &impl Store,
     intent: &HostActionIntent,

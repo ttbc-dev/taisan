@@ -9,6 +9,7 @@ use workloop_core::identity::{ChangeRequestId, RepositoryRef};
 use workloop_core::observation::CheckConclusion;
 use workloop_github::api::{
     ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemotePull, RemoteReview,
+    RemoteReviewFinding,
 };
 
 /// One pull request the in-memory remote stores.
@@ -64,6 +65,8 @@ pub struct InMemoryGitHub {
     checks: Vec<(String, RemoteCheckRun)>,
     /// `(repository, change id)` → reviews, oldest first.
     reviews: BTreeMap<(String, String), Vec<RemoteReview>>,
+    /// Posted review findings in submission order: `(repository, change id)`.
+    findings: Vec<(String, String, RemoteReviewFinding)>,
     /// Every mutation, in order — the write history assertions use.
     writes: Vec<String>,
     /// `operation` → refusal consumed before the next matching call
@@ -165,7 +168,63 @@ impl InMemoryGitHub {
                 commit_sha: commit_sha.to_string(),
                 author: author.to_string(),
                 body: String::new(),
+                changes_requested: false,
             });
+    }
+
+    /// Test control: seed a review that requests changes — the
+    /// host-native blocking decision, with its review body as the
+    /// finding text.
+    pub fn seed_changes_requested_review(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &str,
+        review_id: &str,
+        commit_sha: &str,
+        author: &str,
+        body: &str,
+    ) {
+        self.reviews
+            .entry((repository.to_string(), change_id.to_string()))
+            .or_default()
+            .push(RemoteReview {
+                review_id: review_id.to_string(),
+                commit_sha: commit_sha.to_string(),
+                author: author.to_string(),
+                body: body.to_string(),
+                changes_requested: true,
+            });
+    }
+
+    /// Test control: seed one review finding (an inline review comment)
+    /// on the revision its review examined.
+    pub fn seed_review_finding(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &str,
+        review_id: &str,
+        commit_sha: &str,
+        body: &str,
+    ) {
+        let finding_id = format!(
+            "rf-{}-{}",
+            review_id,
+            self.findings
+                .iter()
+                .filter(|(_, change, _)| change == change_id)
+                .count()
+                + 1
+        );
+        self.findings.push((
+            repository.to_string(),
+            change_id.to_string(),
+            RemoteReviewFinding {
+                finding_id,
+                review_id: review_id.to_string(),
+                commit_sha: commit_sha.to_string(),
+                body: body.to_string(),
+            },
+        ));
     }
 
     /// Test control: the next call of `operation` is refused before
@@ -258,6 +317,13 @@ impl GitHubApi for InMemoryGitHub {
             (repository.to_string(), branch.to_string()),
             new_head.to_string(),
         );
+        // GitHub keeps every open pull request on its source branch's
+        // current head: pushing the branch moves the pull's head too.
+        for ((repo, _), pull) in self.pulls.iter_mut() {
+            if *repo == repository.to_string() && pull.source_branch == branch {
+                pull.head_sha = new_head.to_string();
+            }
+        }
         self.writes
             .push(format!("push_ref:{repository}:{new_head}"));
         if let Some(err) = self.take_lost("write_ref") {
@@ -462,6 +528,23 @@ impl GitHubApi for InMemoryGitHub {
             .get(&Self::pull_key(repository, change_id))
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn review_findings(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<Vec<RemoteReviewFinding>, ApiError> {
+        if let Some(err) = self.take_lost("review_findings") {
+            return Err(err);
+        }
+        let repository = repository.to_string();
+        Ok(self
+            .findings
+            .iter()
+            .filter(|(repo, change, _)| *repo == repository && change == change_id.as_str())
+            .map(|(_, _, finding)| finding.clone())
+            .collect())
     }
 
     fn contains_revision(

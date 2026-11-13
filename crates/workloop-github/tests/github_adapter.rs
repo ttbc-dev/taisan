@@ -751,6 +751,18 @@ fn terminal_cancellation_defers_until_the_unknown_effect_reconciles() {
     store
         .transact(|tx| admit_queued(tx, &config, &eid, NOW).map(|_| ()))
         .unwrap();
+    // The real publish chain pushes the publication branch before the
+    // open, so reconciliation has the recorded source revision this
+    // Work pushed.
+    let push_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/cancel".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
     let open_id = insert_intent(
         &store,
         &work_id,
@@ -793,14 +805,16 @@ fn terminal_cancellation_defers_until_the_unknown_effect_reconciles() {
             })
         })
         .unwrap();
-    // The publication branch exists (pushed earlier in the real
-    // flow); the create's response is lost after it lands: the
-    // effect is outstanding.
-    adapter
-        .client_mut()
-        .seed_branch(&repo(), "work/cancel", "head-1");
+    // The push creates the publication branch through the outbox; the
+    // open's response is lost after it lands: the effect is
+    // outstanding.
     adapter.client_mut().lose_response("open_pull");
     adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &push_id),
+        HostActionStatus::Applied,
+        "the push lands before the open in the publish chain"
+    );
     assert!(matches!(
         intent_status(&store, &open_id),
         HostActionStatus::Unknown { .. }
@@ -1101,6 +1115,19 @@ fn unknown_open_reconciliation_requires_the_recorded_source_revision() {
     );
     adapter.apply_outbox(&store, &config, NOW).unwrap();
 
+    // GitHub keeps an open pull request on its source branch's head:
+    // the foreign change follows our push onto the recorded revision.
+    // A revision-only check would find it there — the intent's own
+    // payload is what still marks it foreign.
+    assert_eq!(
+        adapter
+            .client()
+            .pull(&repo(), foreign.id.as_str())
+            .map(|pull| pull.head_sha),
+        Some("our-head".to_string()),
+        "the foreign change's head follows the branch onto our revision"
+    );
+
     // The open's result is unknown, so reconciliation must identify it
     // by the recorded source revision, not merely by the branch.
     let open_id = insert_intent(
@@ -1175,5 +1202,582 @@ fn in_memory_transport_is_not_a_library_surface() {
     assert!(
         support.contains("pub struct InMemoryGitHub"),
         "the test-only in-memory transport lives in the test tree"
+    );
+}
+
+#[test]
+fn review_findings_from_the_host_block_the_review_lane_until_dispositioned() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "review-lane");
+
+    // The host holds this Work's change: one review that both carries
+    // an inline finding and requests changes.
+    let branch = format!("work/{}", work_id.0);
+    adapter.client_mut().seed_branch(&repo(), &branch, "head-1");
+    let pull = adapter
+        .client_mut()
+        .open_pull(&repo(), &branch, "main", "t", "b")
+        .unwrap();
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted(pull.id.clone()),
+        display_number: Some(pull.display_number),
+    };
+    assert_eq!(pull.head_sha, "head-1");
+    adapter.client_mut().seed_changes_requested_review(
+        &repo(),
+        pull.id.as_str(),
+        "rev-1",
+        "head-1",
+        "reviewer",
+        "apply the rename",
+    );
+    adapter.client_mut().seed_review_finding(
+        &repo(),
+        pull.id.as_str(),
+        "rev-1",
+        "head-1",
+        "nit: rename the helper",
+    );
+
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change.clone(),
+                head: rev("head-1"),
+                source_branch: branch.clone(),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: change.clone(),
+            head: rev("head-1"),
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: change.clone(),
+            head: rev("head-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: DiffTarget {
+                change: change.clone(),
+                head: rev("head-1"),
+                base: None,
+                target_revision: None,
+            },
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Waiting,
+        "every other lane is green; the review lane waits on a round"
+    );
+
+    // The poll reads the reviews plus the findings surface: the round
+    // it seals carries both occurrences — never an empty clean round.
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    let occurrences = observations(&store, &work_id)
+        .iter()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } => Some(occurrences.clone()),
+            _ => None,
+        })
+        .expect("the findings read seals a complete review fact");
+    let keys: Vec<&str> = occurrences.iter().map(|o| o.source_key.as_str()).collect();
+    assert_eq!(keys, ["changes-requested:rev-1", "rf-rev-1-1"]);
+
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_ne!(
+        execution.state,
+        ExecutionState::Succeeded,
+        "a finding-bearing review is never recorded as clean"
+    );
+    assert_eq!(execution.state, ExecutionState::Stopping);
+    assert_eq!(
+        execution.pause_reason.as_deref(),
+        Some("review findings require human disposition"),
+        "the findings demand a human disposition"
+    );
+
+    // JudgeFindings covers the sealed round exactly.
+    let (occurrence_ids, version) = store
+        .transact(|tx| {
+            let round = tx.latest_round(&work_id)?.expect("sealed round");
+            let ids: Vec<String> = tx
+                .occurrences(&round.id)?
+                .into_iter()
+                .map(|o| o.id)
+                .collect();
+            let version = tx.work(&work_id)?.expect("work").version;
+            Ok((ids, version))
+        })
+        .unwrap();
+    let head = rev("head-1");
+    let d = handle_command(
+        &store,
+        &config,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "judge-review-lane-1".into(),
+            body: CommandBody::JudgeFindings {
+                work_id: work_id.clone(),
+                expected_work_version: version,
+                expected_head: head.clone(),
+                decisions: occurrence_ids
+                    .iter()
+                    .map(|occurrence_id| FindingDecision {
+                        occurrence_id: occurrence_id.clone(),
+                        choice: FindingChoice::Accept,
+                        rationale: Some("acknowledged".into()),
+                    })
+                    .collect(),
+            },
+        },
+        NOW + 20,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+
+    // The writer stop proves the pause, and the recorded judgment
+    // releases the gate.
+    emit(
+        &adapter,
+        ObservationFact::ProcessState {
+            invocation_id: InvocationId(format!("{}-coding", eid.0)),
+            process_identity: String::new(),
+            state: ProcessStateFact::Exited,
+        },
+    );
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        execution.state,
+        ExecutionState::Paused,
+        "the repair pause settles once the writer stop is proven"
+    );
+    let version = store
+        .transact(|tx| Ok(tx.work(&work_id)?.expect("work").version))
+        .unwrap();
+    let d = handle_command(
+        &store,
+        &config,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "release-review-lane-1".into(),
+            body: CommandBody::ReleaseJudgment {
+                work_id: work_id.clone(),
+                expected_work_version: version,
+                expected_head: head.clone(),
+            },
+        },
+        NOW + 30,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+
+    // Back in the ci wait, the dispositioned round passes the review
+    // lane and the Work completes on evidence.
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&eid)?.expect("execution");
+            assert_eq!(execution.state, ExecutionState::Queued);
+            execution.state = ExecutionState::Waiting;
+            execution.waiting_reason = Some(WaitingReason::Ci);
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Queued,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: change.clone(),
+            head: rev("head-1"),
+        },
+    );
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        execution.state,
+        ExecutionState::Succeeded,
+        "only a dispositioned round lets the review lane pass"
+    );
+}
+
+#[test]
+fn webhook_review_delivery_records_partial_evidence_and_reads_findings_fresh() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "wh-review");
+    adapter.client_mut().seed_review(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-1",
+        "head-1",
+        "reviewer",
+    );
+    adapter.client_mut().seed_review_finding(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-1",
+        "head-1",
+        "nit: rename the helper",
+    );
+
+    let delivery = WebhookDelivery {
+        event_id: "delivery-review-1".into(),
+        emitted_at: NOW + 10,
+        fact: WebhookFact::Review {
+            change: change.clone(),
+            head: rev("head-1"),
+            review_id: "rev-1".into(),
+            source: "reviewer".into(),
+        },
+    };
+    let receipt = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 10)
+        .unwrap();
+    assert_eq!(receipt, IngestReceipt::Recorded);
+
+    let recorded = observations(&store, &work_id);
+    // The event carries no findings: it records partial evidence and
+    // never a complete round that could pass the review lane alone.
+    assert!(
+        recorded
+            .iter()
+            .any(|o| o.delivery.as_ref().is_some_and(|d| {
+                d.source == "github.webhook"
+                    && matches!(
+                        &o.fact,
+                        ObservationFact::Review {
+                            completeness: Completeness::Partial { .. },
+                            ..
+                        }
+                    )
+            })),
+        "the delivery itself is partial evidence"
+    );
+    assert!(
+        !recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if occurrences.is_empty()
+        )),
+        "no review is ever recorded as a clean empty round"
+    );
+    // The fresh review read behind the delivery records the findings
+    // the host reports for the review's exact head.
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if occurrences.iter().any(|occ| occ.source_key == "rf-rev-1-1")
+        )),
+        "the fresh read carries the host's findings"
+    );
+
+    // A redelivered event deduplicates — the fact it asserts (partial
+    // evidence) is deterministic — while its fresh reads stay
+    // idempotent too.
+    let second = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 20)
+        .unwrap();
+    assert_eq!(second, IngestReceipt::Duplicate);
+    let after = observations(&store, &work_id);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|o| o
+                .delivery
+                .as_ref()
+                .is_some_and(|d| d.source == "github.webhook"))
+            .count(),
+        1,
+        "a redelivered review event records no second observation"
+    );
+}
+
+#[test]
+fn a_failed_findings_read_records_the_review_unavailable_not_clean() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "findings-down");
+    adapter.client_mut().seed_review(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-1",
+        "head-1",
+        "reviewer",
+    );
+
+    // The reviews arrive but the findings surface does not: the
+    // review is recorded `unavailable` — source availability is part
+    // of the fact, so an empty clean round is never claimed.
+    adapter.client_mut().lose_response("review_findings");
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    let recorded = observations(&store, &work_id);
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Unavailable { .. },
+                ..
+            }
+        )),
+        "the review records its findings source as unavailable"
+    );
+    assert!(
+        !recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                ..
+            }
+        )),
+        "an unread findings surface never produces a complete round"
+    );
+
+    // The next successful read records the now-available state under a
+    // fresh content identity instead of colliding with the recorded
+    // unavailable fact.
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 20)
+        .unwrap();
+    let later = observations(&store, &work_id);
+    assert!(
+        later.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if occurrences.is_empty()
+        )),
+        "an available source with zero findings is a meaningful clean round"
+    );
+}
+
+#[test]
+fn unknown_open_without_a_recorded_push_is_never_reconciled_from_the_branch_alone() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = submit(&store, "no-push-open");
+    let branch = "work/no-push";
+
+    // A foreign change request already exists on the branch, at the
+    // branch's current head — exactly where a branch-only check would
+    // look — and a second change carries this Work's own payload
+    // (same branch, same target, same title and body).
+    adapter
+        .client_mut()
+        .seed_branch(&repo(), branch, "seed-head");
+    let foreign = adapter
+        .client_mut()
+        .open_pull(&repo(), branch, "main", "foreign", "")
+        .unwrap();
+    let ours = adapter
+        .client_mut()
+        .open_pull(&repo(), branch, "main", "ours", "b")
+        .unwrap();
+
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: branch.into(),
+            target_branch: "main".into(),
+            title: "ours".into(),
+            body: "b".into(),
+        },
+    );
+    adapter
+        .ingest(
+            &store,
+            &config,
+            Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id: open_id.clone(),
+                    authenticated_actor: Some(publisher()),
+                    status: HostActionStatus::Unknown {
+                        reason: "response lost".into(),
+                    },
+                    effects: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+
+    let resolved = adapter
+        .reconcile_outstanding(&store, &config, NOW + 10)
+        .unwrap();
+    assert!(
+        !resolved.contains(&open_id),
+        "with no recorded source revision the intent stays unknown"
+    );
+    assert!(matches!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    assert!(
+        !observations(&store, &work_id).iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::HostActionResult { action_id, effects, .. }
+                if action_id == &open_id
+                    && effects.iter().any(|effect| matches!(
+                        effect,
+                        NormalizedEffectFact::ChangeOpened { change, .. }
+                            if change.change_request.as_str() == foreign.id
+                                || change.change_request.as_str() == ours.id
+                    ))
+        )),
+        "neither the foreign change nor the payload match is adopted without a recorded push"
+    );
+}
+
+#[test]
+fn a_new_heads_review_inherits_no_finding_from_a_previous_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "head-leak");
+    adapter.client_mut().seed_review(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-1",
+        "head-1",
+        "reviewer",
+    );
+    adapter.client_mut().seed_review_finding(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-1",
+        "head-1",
+        "nit: rename the helper",
+    );
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    assert!(
+        observations(&store, &work_id).iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-1"
+                && occurrences.iter().any(|occ| occ.source_key == "rf-rev-1-1")
+        )),
+        "the finding is recorded against the head its review examined"
+    );
+
+    // A newer head with its own clean review: the old head's finding
+    // never migrates onto it, while the old-head evidence stays.
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), change.change_request.as_str(), "head-2");
+    adapter.client_mut().seed_review(
+        &repo(),
+        change.change_request.as_str(),
+        "rev-2",
+        "head-2",
+        "reviewer",
+    );
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 20)
+        .unwrap();
+    let recorded = observations(&store, &work_id);
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review {
+                target,
+                completeness: Completeness::Complete,
+                occurrences,
+                ..
+            } if target.head.object == "head-2" && occurrences.is_empty()
+        )),
+        "the new head's review carries no finding from the superseded head"
+    );
+    assert!(
+        !recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review { target, occurrences, .. }
+                if target.head.object == "head-2"
+                    && occurrences.iter().any(|occ| occ.source_key == "rf-rev-1-1")
+        )),
+        "an old-head finding is never re-labeled onto the new head"
+    );
+    assert!(
+        recorded.iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::Review { target, occurrences, .. }
+                if target.head.object == "head-1"
+                    && occurrences.iter().any(|occ| occ.source_key == "rf-rev-1-1")
+        )),
+        "the superseded head keeps its own finding evidence"
     );
 }

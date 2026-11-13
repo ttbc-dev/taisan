@@ -75,6 +75,25 @@ pub struct RemoteReview {
     /// The reviewing identity GitHub attributes the review to.
     pub author: String,
     pub body: String,
+    /// Whether GitHub reports the review as requesting changes. The
+    /// decision itself is a blocking finding even when the review
+    /// carries no inline comments.
+    pub changes_requested: bool,
+}
+
+/// One review finding — an inline review comment — as GitHub reports
+/// it. `commit_sha` is the exact revision the finding's review
+/// examined, so a finding never migrates onto a newer head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReviewFinding {
+    /// The host's stable comment id — the finding's identity.
+    pub finding_id: String,
+    /// The review the finding was submitted under.
+    pub review_id: String,
+    /// The exact revision the finding's review examined.
+    pub commit_sha: String,
+    /// The finding text — the content the occurrence digest covers.
+    pub body: String,
 }
 
 /// One issue comment on a pull request.
@@ -192,6 +211,18 @@ pub trait GitHubApi {
         repository: &RepositoryRef,
         change_id: &ChangeRequestId,
     ) -> Result<Vec<RemoteReview>, ApiError>;
+
+    /// The review findings (inline review comments) GitHub reports for
+    /// one pull request; each finding keeps the commit its review
+    /// examined. This is the surface behind `review_findings_read`:
+    /// when it cannot be read, the adapter records reviews with an
+    /// unavailable completeness — an empty finding set is never
+    /// claimed without this source answering.
+    fn review_findings(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<Vec<RemoteReviewFinding>, ApiError>;
 
     /// Whether `descendant`'s recorded ancestry contains `ancestor` —
     /// used to classify a push read-back (`Equal`/`Ancestor`/
