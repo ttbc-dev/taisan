@@ -16,10 +16,14 @@ use workloop_core::work::{
     HostTemplate, IngestReceipt, WorkloopConfig, admit_queued, handle_command,
 };
 use workloop_github::adapter::{GitHubAdapter, WebhookDelivery, WebhookFact};
-use workloop_github::api::InMemoryGitHub;
+use workloop_github::api::GitHubApi;
 use workloop_github::fixture::FixtureGithub;
 use workloop_github::port::IntegrationPort;
 use workloop_store::sqlite::SqliteStore;
+
+mod support;
+
+use support::InMemoryGitHub;
 
 const NOW: i64 = 1_700_000_000;
 
@@ -422,6 +426,45 @@ fn webhook_deliveries_deduplicate_on_source_event_id() {
         observations(&store, &work_id).len(),
         recorded,
         "a redelivered webhook records no new observation"
+    );
+}
+
+#[test]
+fn redelivered_webhook_after_a_head_move_records_the_new_head() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, _head) = push_and_open(&mut adapter, &store, &config, "wh-move");
+    let delivery = WebhookDelivery {
+        event_id: "delivery-guid-move".into(),
+        emitted_at: NOW + 10,
+        fact: WebhookFact::Check {
+            change: change.clone(),
+            head: rev("head-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    };
+    let first = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 10)
+        .unwrap();
+    assert_eq!(first, IngestReceipt::Recorded);
+
+    // The same delivery GUID arrives again after the host moved: the
+    // event deduplicates, but its fresh read still records the head
+    // the host reports now instead of reusing the old-read identity.
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), change.change_request.as_str(), "moved-head");
+    let second = adapter
+        .deliver_webhook(&store, &config, &delivery, NOW + 20)
+        .unwrap();
+    assert_eq!(second, IngestReceipt::Duplicate);
+    assert_eq!(
+        current_head(&store, &work_id),
+        Some(rev("moved-head")),
+        "the redelivered webhook's fresh read records the new head"
     );
 }
 
@@ -971,4 +1014,166 @@ fn declared_capabilities_are_backed_by_the_transport_surface() {
     }
     assert!(adapter.applied().is_empty());
     assert!(adapter.client().writes().is_empty());
+}
+
+#[test]
+fn fresh_read_records_a_head_that_was_observed_before() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, opened_head) = push_and_open(&mut adapter, &store, &config, "force-back");
+    assert_eq!(opened_head.object, "head-1");
+
+    // A poll while the change is at head-1 uses the content-derived
+    // read identity `pr:<change>@head-1`.
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 10)
+        .unwrap();
+    // The host moves to head-2, then force-pushes back to head-1.
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), change.change_request.as_str(), "head-2");
+    adapter
+        .refresh_change(&store, &config, &change, NOW + 20)
+        .unwrap();
+    assert_eq!(current_head(&store, &work_id), Some(rev("head-2")));
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), change.change_request.as_str(), "head-1");
+
+    // A webhook arrives for another fact; its mandatory fresh read
+    // reports the re-used head-1, which must become the recorded
+    // current head even though head-1 was observed before.
+    adapter
+        .deliver_webhook(
+            &store,
+            &config,
+            &WebhookDelivery {
+                event_id: "delivery-force-back".into(),
+                emitted_at: NOW + 30,
+                fact: WebhookFact::Check {
+                    change: change.clone(),
+                    head: rev("head-1"),
+                    check_id: "ci".into(),
+                    producer: publisher(),
+                    conclusion: CheckConclusion::Success,
+                },
+            },
+            NOW + 40,
+        )
+        .unwrap();
+    assert_eq!(
+        current_head(&store, &work_id),
+        Some(rev("head-1")),
+        "the fresh read records a head the host reports again after a force push"
+    );
+}
+
+#[test]
+fn unknown_open_reconciliation_requires_the_recorded_source_revision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = submit(&store, "foreign-open");
+    let branch = "work/foreign";
+
+    // A foreign change request already exists from the same source
+    // branch into the same target.
+    adapter
+        .client_mut()
+        .seed_branch(&repo(), branch, "foreign-head");
+    let foreign = adapter
+        .client_mut()
+        .open_pull(&repo(), branch, "main", "foreign", "")
+        .unwrap();
+    assert_eq!(foreign.head_sha, "foreign-head");
+
+    // Our publication moves the branch to the revision this Work
+    // recorded; the foreign change stays on its own older head.
+    insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: branch.into(),
+            produced: rev("our-head"),
+            expected_prior: Some(rev("foreign-head")),
+        },
+    );
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+
+    // The open's result is unknown, so reconciliation must identify it
+    // by the recorded source revision, not merely by the branch.
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: branch.into(),
+            target_branch: "main".into(),
+            title: "ours".into(),
+            body: "b".into(),
+        },
+    );
+    adapter
+        .ingest(
+            &store,
+            &config,
+            Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id: open_id.clone(),
+                    authenticated_actor: Some(publisher()),
+                    status: HostActionStatus::Unknown {
+                        reason: "response lost".into(),
+                    },
+                    effects: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+
+    let resolved = adapter
+        .reconcile_outstanding(&store, &config, NOW + 10)
+        .unwrap();
+    assert!(
+        !resolved.contains(&open_id),
+        "a foreign change request at another head is not this Work's effect"
+    );
+    assert!(
+        matches!(
+            intent_status(&store, &open_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "the unreconciled open stays outstanding"
+    );
+    assert!(
+        !observations(&store, &work_id).iter().any(|o| matches!(
+            &o.fact,
+            ObservationFact::HostActionResult { action_id, effects, .. }
+                if action_id == &open_id
+                    && effects.iter().any(|effect| matches!(
+                        effect,
+                        NormalizedEffectFact::ChangeOpened { change, .. }
+                            if change.change_request.as_str() == foreign.id
+                    ))
+        )),
+        "the adapter never adopts a change request it did not open"
+    );
+}
+
+#[test]
+fn in_memory_transport_is_not_a_library_surface() {
+    let api = include_str!("../src/api.rs");
+    assert!(
+        !api.contains("pub struct InMemoryGitHub"),
+        "the in-memory transport double must stay out of the library surface"
+    );
+    let support = include_str!("support/mod.rs");
+    assert!(
+        support.contains("pub struct InMemoryGitHub"),
+        "the test-only in-memory transport lives in the test tree"
+    );
 }

@@ -99,6 +99,11 @@ pub struct GitHubAdapter<C> {
     /// own adapter — an effect never migrates across hosts.
     bound_host: Option<HostInstanceId>,
     applied: Vec<String>,
+    /// Distinguishes successive local head reads. A read is evidence
+    /// of what the host reports *now*, so re-observing a head after a
+    /// force push must not deduplicate against an earlier read of the
+    /// same revision.
+    next_read: u64,
 }
 
 impl<C: GitHubApi> GitHubAdapter<C> {
@@ -107,6 +112,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: None,
             applied: Vec::new(),
+            next_read: 0,
         }
     }
 
@@ -117,7 +123,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: Some(host),
             applied: Vec::new(),
+            next_read: 0,
         }
+    }
+
+    fn next_read_event_id(&mut self, change: &ChangeRequestRef, head: &str, at: i64) -> String {
+        self.next_read = self.next_read.wrapping_add(1);
+        format!("read:{change}@{}@{at}#{}", head, self.next_read)
     }
 
     /// The capability set this adapter declares. Every name is backed
@@ -311,7 +323,14 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         {
             let head = CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
                 .map_err(|detail| StoreError::Internal { detail })?;
-            let event_id = format!("pr:{change}@{}", pull.head_sha);
+            // The read is keyed by the delivery that triggered it, not
+            // by the head it re-reports: a redelivery of the same
+            // webhook deduplicates, while a different delivery that
+            // observes a previously seen head (a force push back)
+            // still records the current head. Including the head keeps
+            // a redelivery after the host moved from reusing one
+            // identity for different content.
+            let event_id = format!("read:{change}:{}@{}", delivery.event_id, pull.head_sha);
             self.ingest(
                 store,
                 config,
@@ -383,6 +402,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 observed_unix_seconds: at,
             }
         };
+        let read_id = self.next_read_event_id(change, &head.object, now_unix_seconds);
         self.ingest(
             store,
             config,
@@ -390,7 +410,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 delivery: Some(DeliveryId {
                     scope: DeliveryScope::Local,
                     source: "github.poll".into(),
-                    event_id: format!("pr:{change}@{}", head.object),
+                    event_id: read_id,
                 }),
                 subject_work_id: Some(work_id.clone()),
                 subject_execution_id: execution_id.clone(),
@@ -606,48 +626,63 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     target_branch,
                     ..
                 } => {
-                    if let Ok(pulls) = self
-                        .client
-                        .list_pulls_on_branch(&intent.repository, source_branch)
+                    // Identify the effect by the source revision this
+                    // Work recorded when it issued the open — never by
+                    // the branch alone, which can also carry a change
+                    // request this Work did not open. With no recorded
+                    // push (a directly seeded branch), the branch's
+                    // current head is the only available revision.
+                    let source_revision =
+                        match recorded_source_revision(store, &intent, source_branch)? {
+                            Some(revision) => Some(revision),
+                            None => {
+                                match self.client.read_branch(&intent.repository, source_branch) {
+                                    Ok(Some(head)) => Some(
+                                        CommitRevision::new(intent.repository.clone(), head)
+                                            .map_err(|detail| StoreError::Internal { detail })?,
+                                    ),
+                                    _ => None,
+                                }
+                            }
+                        };
+                    if let Some(source_revision) = source_revision
+                        && let Ok(pulls) = self.client.list_pulls_on_branch(
+                            &intent.repository,
+                            source_branch,
+                            &source_revision.object,
+                        )
                     {
                         let found = pulls
                             .iter()
                             .find(|pull| pull.target_branch == *target_branch);
-                        match found {
-                            Some(pull) => {
-                                let change = ChangeRequestRef {
-                                    repository: intent.repository.clone(),
-                                    change_request: ChangeRequestId::trusted(pull.id.clone()),
-                                    display_number: Some(pull.display_number),
-                                };
-                                let head = CommitRevision::new(
-                                    intent.repository.clone(),
-                                    pull.head_sha.clone(),
-                                )
-                                .map_err(|detail| StoreError::Internal { detail })?;
-                                terminal = record(
-                                    self,
-                                    HostActionStatus::Applied,
-                                    vec![NormalizedEffectFact::ChangeOpened {
-                                        change,
-                                        head,
-                                        source_branch: source_branch.clone(),
-                                        target_branch: target_branch.clone(),
-                                    }],
-                                )?;
-                            }
-                            None => {
-                                terminal = record(
-                                    self,
-                                    HostActionStatus::Failed {
-                                        reason: "reconciled: no pull request opened from the \
-                                                 source branch"
-                                            .into(),
-                                    },
-                                    vec![],
-                                )?;
-                            }
+                        if let Some(pull) = found {
+                            let change = ChangeRequestRef {
+                                repository: intent.repository.clone(),
+                                change_request: ChangeRequestId::trusted(pull.id.clone()),
+                                display_number: Some(pull.display_number),
+                            };
+                            let head = CommitRevision::new(
+                                intent.repository.clone(),
+                                pull.head_sha.clone(),
+                            )
+                            .map_err(|detail| StoreError::Internal { detail })?;
+                            terminal = record(
+                                self,
+                                HostActionStatus::Applied,
+                                vec![NormalizedEffectFact::ChangeOpened {
+                                    change,
+                                    head,
+                                    source_branch: source_branch.clone(),
+                                    target_branch: target_branch.clone(),
+                                }],
+                            )?;
                         }
+                        // No change request at the recorded revision:
+                        // a matching change may exist with a moved
+                        // head, so the result stays undecidable —
+                        // `unknown` and outstanding, never a failed
+                        // claim or an adoption of somebody else's
+                        // change.
                     }
                 }
                 HostAction::PostComment { change, marker, .. } => {
@@ -1298,6 +1333,36 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         }
         Ok(())
     }
+}
+
+/// The source revision an `open_change_request` was issued against:
+/// the revision of the latest applied `push_ref` on the same branch for
+/// the same Work and repository. Returns `None` when no applied push is
+/// recorded; the caller then falls back to the branch's current head.
+fn recorded_source_revision(
+    store: &impl Store,
+    intent: &HostActionIntent,
+    source_branch: &str,
+) -> Result<Option<CommitRevision>, StoreError> {
+    store.transact(|tx| {
+        Ok(tx
+            .action_intents()?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.work_id == intent.work_id
+                    && candidate.repository == intent.repository
+                    && candidate.status == HostActionStatus::Applied
+                    && matches!(
+                        &candidate.action,
+                        HostAction::PushRef { branch, .. } if branch == source_branch
+                    )
+            })
+            .max_by_key(|candidate| candidate.created_seq)
+            .and_then(|candidate| match candidate.action {
+                HostAction::PushRef { produced, .. } => Some(produced),
+                _ => None,
+            }))
+    })
 }
 
 /// The Work (and its latest Execution) a change request belongs to in

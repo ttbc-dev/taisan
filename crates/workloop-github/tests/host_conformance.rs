@@ -18,11 +18,14 @@ use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_github::adapter::GitHubAdapter;
-use workloop_github::api::InMemoryGitHub;
 use workloop_github::fixture::FixtureGithub;
 use workloop_github::gitlab_fixture::GitlabFixture;
 use workloop_github::sparse_fixture::SparseHost;
 use workloop_store::sqlite::SqliteStore;
+
+mod support;
+
+use support::InMemoryGitHub;
 
 const NOW: i64 = 1_700_000_000;
 
