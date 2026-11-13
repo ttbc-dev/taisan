@@ -440,7 +440,7 @@ fn a_rejected_first_record_never_pins_the_head() {
 }
 
 #[test]
-fn replay_restores_head_moves_and_refuses_retired_or_foreign_heads() {
+fn replay_restores_head_moves_and_refuses_only_foreign_or_rejected_pins() {
     let first = head("head-replay-first");
     let adopted = head("head-replay-adopted");
     let stale = head("head-replay-stale");
@@ -490,31 +490,22 @@ fn replay_restores_head_moves_and_refuses_retired_or_foreign_heads() {
             StageEvidence::complete(Stage::Verify, adopted.clone(), vec![fact("verify")]).unwrap(),
             7,
         ),
-        // A pin to a head the pipeline already held and moved past is
-        // refused, and so is a foreign-repository revision.
+        // A pin whose record fails the stage guards cannot move the
+        // head: publication is still blocked behind invariant-check.
         record_fact(
             StageEvidence::complete(
-                Stage::InvariantCheck,
+                Stage::Publication,
                 first.clone(),
-                vec![fact("invariant-old")],
+                vec![fact("publication-early")],
             )
             .unwrap(),
             8,
-        ),
-        record_fact(
-            StageEvidence::complete(
-                Stage::InvariantCheck,
-                foreign.clone(),
-                vec![fact("invariant-foreign")],
-            )
-            .unwrap(),
-            9,
         ),
         // A same-repository head with no `change_head` fact restores an
         // authoritative move that left no observation behind.
         record_fact(
             StageEvidence::entered(Stage::InvariantCheck, moved.clone()),
-            10,
+            9,
         ),
         record_fact(
             StageEvidence::complete(
@@ -523,14 +514,30 @@ fn replay_restores_head_moves_and_refuses_retired_or_foreign_heads() {
                 vec![fact("invariant")],
             )
             .unwrap(),
+            10,
+        ),
+        // A foreign-repository pin is never this Work's head.
+        record_fact(
+            StageEvidence::complete(
+                Stage::Publication,
+                foreign.clone(),
+                vec![fact("publication-foreign")],
+            )
+            .unwrap(),
             11,
+        ),
+        // `record_current_head` places no restriction on its target, so
+        // a legal backward move replays the same way.
+        record_fact(
+            StageEvidence::entered(Stage::Publication, first.clone()),
+            12,
         ),
     ];
     let pipeline = StagePipeline::from_observations(all_lanes(), &observations);
     assert_eq!(
         pipeline.current_head(),
-        Some(&moved),
-        "the last accepted evidence pin restored the final head"
+        Some(&first),
+        "the last accepted pin restored a legal backward head move"
     );
     assert_eq!(
         pipeline.stale_heads(),
@@ -543,23 +550,24 @@ fn replay_restores_head_moves_and_refuses_retired_or_foreign_heads() {
         verify.status.is_complete() && verify.revision == adopted,
         "evidence bound to an observed-then-adopted head replays; the lane stays closed"
     );
-    let invariant_records: Vec<_> = pipeline
+    let publication_records: Vec<_> = pipeline
         .records()
         .iter()
-        .filter(|record| record.stage == Stage::InvariantCheck)
+        .filter(|record| record.stage == Stage::Publication)
         .collect();
     assert_eq!(
-        invariant_records.len(),
-        2,
-        "retired and foreign pins were refused; only the restorable move replayed"
+        publication_records.len(),
+        1,
+        "the guard-failing and foreign pins were refused; only the accepted entry replayed"
     );
-    assert!(
-        invariant_records
-            .iter()
-            .all(|record| record.revision == moved),
-        "both invariant records bind the restored head"
+    assert_eq!(publication_records[0].revision, first);
+    assert_eq!(
+        pipeline.next_stage(),
+        NextStage::Blocked {
+            stage: Stage::Publication,
+            status: StageStatus::Entered,
+        }
     );
-    assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Publication));
 }
 
 #[test]

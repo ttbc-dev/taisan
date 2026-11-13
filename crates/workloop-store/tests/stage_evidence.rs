@@ -331,11 +331,12 @@ fn ingest_refuses_a_delivered_stage_record() {
 /// U5.4 restart safety: `from_observations` rebuilds the recorded head
 /// from durable observations, so a stale-head observation can never
 /// promote itself to the recorded head after a restart — it stays
-/// history. Stage records pinned to a retired or foreign revision are
-/// refused on replay the same way: they cannot move the head or
-/// satisfy a lane either. A record pinned to a head the pipeline
-/// adopted live — even one a `change_head` observation marked stale —
-/// restores that authoritative move and replays its lane.
+/// history. Stage records pinned to a foreign revision, or whose
+/// record fails the stage guards, are refused on replay: they cannot
+/// move the head or satisfy a lane either. A record pinned to a head
+/// the pipeline adopted live — even one a `change_head` observation
+/// marked stale, or one it held before — restores that authoritative
+/// move and replays its lane.
 #[test]
 fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() {
     let root = std::env::temp_dir().join(format!("workloop-stage-heads-{}", std::process::id()));
@@ -402,11 +403,9 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
             &execution_id,
             StageEvidence::complete(Stage::Verify, adopted.clone(), vec![fact("verify")]).unwrap(),
         );
-        // Stage records pinned to a retired head and a foreign revision
-        // sit in the durable log the way a Core transaction would have
-        // written them; replay must refuse them exactly like the live
-        // `record` guard did — they can neither move the head nor
-        // close a lane.
+        // A pin whose record fails the stage guards cannot move the
+        // head: publication is still blocked behind invariant-check,
+        // and a foreign-repository pin is never this Work's head.
         let foreign = CommitRevision::new(
             RepositoryRef::new(
                 HostInstanceId::trusted("foreign-host"),
@@ -421,13 +420,21 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
                 &work_id,
                 &execution_id,
                 StageEvidence::complete(
-                    Stage::InvariantCheck,
+                    Stage::Publication,
                     revision,
-                    vec![fact("invariant-off-head")],
+                    vec![fact("publication-off-head")],
                 )
                 .unwrap(),
             );
         }
+        // `record_current_head` places no restriction on its target, so
+        // a legal backward move replays the same way.
+        persist(
+            &store,
+            &work_id,
+            &execution_id,
+            StageEvidence::entered(Stage::InvariantCheck, current.clone()),
+        );
         execution_id
     };
 
@@ -438,8 +445,8 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
     let mut pipeline = StagePipeline::from_observations(LanePolicy::default(), &observations);
     assert_eq!(
         pipeline.current_head(),
-        Some(&adopted),
-        "the recorded head follows the last accepted evidence pin"
+        Some(&current),
+        "the recorded head follows the last accepted pin — a legal backward move"
     );
     assert_eq!(
         pipeline.stale_heads(),
@@ -459,12 +466,20 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
         "evidence bound to an observed-then-adopted head survives the restart"
     );
     assert!(
-        pipeline.latest(Stage::InvariantCheck).is_none(),
-        "retired and foreign stage records never satisfy a lane after restart"
+        pipeline.latest(Stage::Publication).is_none(),
+        "guard-failing and foreign stage records never satisfy a lane after restart"
+    );
+    let invariant = pipeline.latest(Stage::InvariantCheck).unwrap();
+    assert_eq!(
+        invariant.revision, current,
+        "the accepted entry record binds the restored head"
     );
     assert_eq!(
         pipeline.next_stage(),
-        NextStage::Open(Stage::InvariantCheck)
+        NextStage::Blocked {
+            stage: Stage::InvariantCheck,
+            status: StageStatus::Entered,
+        }
     );
     assert_eq!(
         pipeline
