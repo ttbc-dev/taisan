@@ -9,12 +9,18 @@
 
 use std::collections::BTreeMap;
 
-use workloop_core::identity::{ChangeRequestId, ChangeRequestRef, CommitRevision};
+use workloop_core::domain::WorkId;
+use workloop_core::identity::{
+    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, RepositoryRef,
+};
 use workloop_core::observation::{
-    BranchState, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact, RefRelation,
+    BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, NormalizedEffectFact,
+    Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
+
+use crate::fixture::RemoteRead;
 
 /// Journal of every remote fact the fixture observed — the assertion
 /// surface shared with `FixtureGithub` via the applied-write history.
@@ -25,6 +31,17 @@ pub struct SparseHost {
     branches: BTreeMap<(String, String), String>,
     /// `(repository, change_request_id)` → head object id.
     changes: BTreeMap<(String, String), String>,
+    /// `(repository, change_request_id)` → the actor the remote
+    /// attributes the change's head to — the opener, or none for a
+    /// head planted by test control.
+    change_actors: BTreeMap<(String, String), HostActorRef>,
+    /// `(repository, branch)` → the actor that last moved the ref.
+    branch_actors: BTreeMap<(String, String), HostActorRef>,
+    /// `ReadSubject::key()` → the remote's version of that subject.
+    /// Every mutation bumps the version of each subject it touched;
+    /// reads carry the version they observed, so a delayed delivery of
+    /// an older read can never outrank a newer one.
+    versions: BTreeMap<String, u64>,
     next_id: u64,
     /// `repository` → next display number: a per-repository namespace.
     next_number: BTreeMap<String, u64>,
@@ -53,16 +70,138 @@ impl SparseHost {
     }
 
     /// Test control: what the remote believes the change head is.
-    pub fn set_head(
-        &mut self,
-        repository: &workloop_core::identity::RepositoryRef,
-        change_id: &str,
-        head_object: &str,
-    ) {
+    /// Moves the scoped `pr` subject's version — the moved head is a
+    /// different remote state its reads must order after.
+    pub fn set_head(&mut self, repository: &RepositoryRef, change_id: &str, head_object: &str) {
         self.changes.insert(
             (repository.to_string(), change_id.to_string()),
             head_object.to_string(),
         );
+        self.bump(&ReadSubject::Pr {
+            change: ChangeRequestRef {
+                repository: repository.clone(),
+                change_request: ChangeRequestId::trusted(change_id),
+                display_number: None,
+            },
+        });
+    }
+
+    fn bump(&mut self, subject: &ReadSubject) {
+        *self.versions.entry(subject.key()).or_insert(0) += 1;
+    }
+
+    fn subject_version(&self, subject: &ReadSubject) -> u64 {
+        self.versions.get(&subject.key()).copied().unwrap_or(0)
+    }
+
+    /// Resolve one typed read target against the remote: the observed
+    /// revision in its per-kind form, the remote's version of the
+    /// subject at read time, the actor the remote reports, and the
+    /// read's completeness. This remote journals only change-request
+    /// and branch heads — a subject with no journal entry, or one the
+    /// adapter's declared read set does not cover, is a `Partial`
+    /// read; the host never invents a revision.
+    pub fn read(&self, subject: &ReadSubject, reader: &HostActorRef) -> RemoteRead {
+        let version = self.subject_version(subject);
+        let partial = |reason: &str| RemoteRead {
+            revision: None,
+            subject_version: version,
+            actor: reader.clone(),
+            completeness: Completeness::Partial {
+                reason: reason.to_string(),
+            },
+        };
+        let complete = |revision: ReadRevision, actor: HostActorRef| RemoteRead {
+            revision: Some(revision),
+            subject_version: version,
+            actor,
+            completeness: Completeness::Complete,
+        };
+        match subject {
+            ReadSubject::Pr { change } => match self.changes.get(&(
+                change.repository.to_string(),
+                change.change_request.as_str().to_string(),
+            )) {
+                Some(head) => {
+                    let actor = self
+                        .change_actors
+                        .get(&(
+                            change.repository.to_string(),
+                            change.change_request.as_str().to_string(),
+                        ))
+                        .cloned()
+                        .unwrap_or_else(|| reader.clone());
+                    match CommitRevision::new(change.repository.clone(), head) {
+                        Ok(revision) => complete(ReadRevision::Sha { revision }, actor),
+                        Err(_) => partial("change head is not a valid object id"),
+                    }
+                }
+                None => partial("change request is not on the remote"),
+            },
+            ReadSubject::Head { repository, branch } => {
+                match self.branches.get(&(repository.to_string(), branch.clone())) {
+                    Some(head) => {
+                        let actor = self
+                            .branch_actors
+                            .get(&(repository.to_string(), branch.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| reader.clone());
+                        match CommitRevision::new(repository.clone(), head) {
+                            Ok(revision) => complete(ReadRevision::Sha { revision }, actor),
+                            Err(_) => partial("branch head is not a valid object id"),
+                        }
+                    }
+                    None => partial("branch is not on the remote"),
+                }
+            }
+            ReadSubject::Repository { .. } => {
+                partial("no repository default-branch record on the remote")
+            }
+            ReadSubject::Check { .. } => partial("no check record on the remote"),
+            ReadSubject::Review { .. } => partial("no review record on the remote"),
+            // `issue_read` and diff snapshots are outside this
+            // adapter's declared read set — a read it cannot perform
+            // is partial, never an invented revision.
+            ReadSubject::Issue { .. } | ReadSubject::Diff { .. } => {
+                partial("subject kind outside this adapter's declared read set")
+            }
+        }
+    }
+
+    /// Poll one typed read target and deliver the Observation through
+    /// the shared ingest pipeline — the same path a webhook delivery
+    /// would use. The delivery identity is the subject at the observed
+    /// version under this adapter's own source namespace, so a re-poll
+    /// of an unchanged subject deduplicates and a delayed delivery of
+    /// an older read is recorded as history only.
+    pub fn observe(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        work_id: Option<&WorkId>,
+        subject: &ReadSubject,
+        reader: &HostActorRef,
+        now_unix_seconds: i64,
+    ) -> Result<IngestReceipt, StoreError> {
+        let read = self.read(subject, reader);
+        let observation = Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Local,
+                source: "sparse.poll".into(),
+                event_id: format!("{}@{}", subject.key(), read.subject_version),
+            }),
+            subject_work_id: work_id.cloned(),
+            subject_execution_id: None,
+            fact: ObservationFact::HostRead {
+                subject: subject.clone(),
+                revision: read.revision,
+                subject_version: read.subject_version,
+                actor: read.actor,
+                completeness: read.completeness,
+            },
+            observed_unix_seconds: now_unix_seconds,
+        };
+        self.emit(store, config, observation, now_unix_seconds)
     }
 
     pub fn applied(&self) -> &[String] {
@@ -71,11 +210,7 @@ impl SparseHost {
 
     /// The head the remote records for `(repository, branch)` — a typed
     /// read independent of the write-history encoding.
-    pub fn remote_head(
-        &self,
-        repository: &workloop_core::identity::RepositoryRef,
-        branch: &str,
-    ) -> Option<String> {
+    pub fn remote_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
         self.branches
             .get(&(repository.to_string(), branch.to_string()))
             .cloned()
@@ -222,6 +357,14 @@ impl SparseHost {
                     (intent.repository.to_string(), branch.clone()),
                     produced.object.clone(),
                 );
+                self.branch_actors.insert(
+                    (intent.repository.to_string(), branch.clone()),
+                    intent.actor.clone(),
+                );
+                self.bump(&ReadSubject::Head {
+                    repository: intent.repository.clone(),
+                    branch: branch.clone(),
+                });
                 self.applied.push(format!(
                     "push_ref:{}:{}",
                     intent.repository, produced.object
@@ -274,6 +417,16 @@ impl SparseHost {
                     ),
                     head_object.clone(),
                 );
+                self.change_actors.insert(
+                    (
+                        intent.repository.to_string(),
+                        change.change_request.as_str().to_string(),
+                    ),
+                    intent.actor.clone(),
+                );
+                self.bump(&ReadSubject::Pr {
+                    change: change.clone(),
+                });
                 self.applied.push(format!(
                     "open_change:{}:{}",
                     intent.repository, change.change_request
