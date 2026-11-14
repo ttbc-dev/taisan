@@ -19,17 +19,23 @@
 //!   prepared issue-side append payload; when `gh` can read #102 the
 //!   live owner-document link, the `#124` child reference and the
 //!   transcribed acceptance criteria are asserted too, bounded to a
-//!   single read with a hermetic fallback.
+//!   single read with a hermetic fallback. In both paths
+//!   `issue_102_append_gap` checks whether the inspected #102 body
+//!   carries the record path itself and prints the pending issue-side
+//!   append as a gap — the pre-existing title and child reference
+//!   never prove the append.
 //! - `u46d_evidence_record_cites_the_tested_revision_or_the_explicit_gap`
 //!   — the record's own tested-revision cell is either a full commit
 //!   SHA that contains this exercised slice on the branch history to
 //!   `HEAD`, or the explicit `absent{reason}` gap; a base SHA never
 //!   satisfies it.
 //!
-//! Five failure-path tests exercise the rejections: a missing #102
+//! Failure-path and gap tests exercise the rejections: a missing #102
 //! criterion row, a duplicated or foreign row, an absent row that
-//! claims a pass, a row missing a column, and a base SHA transcribed
-//! in no cited record.
+//! claims a pass, a row missing a column, a base SHA transcribed in
+//! no cited record, an issue-append mapping row that claims a pass
+//! while the append is pending, and a linkage check that stays silent
+//! about the missing #102 record reference.
 //!
 //! The #102 criterion texts are transcribed with
 //! `gh issue view 102 -R shimpeiws/taisan --json body` (2026-11-13);
@@ -643,6 +649,48 @@ fn issue_102_body() -> Option<String> {
     }
 }
 
+/// Direct issue-side reference: an #102 body references the
+/// consolidated record only when it carries the record path itself.
+/// The owner-document link, the `#124` child reference and the record
+/// title are all satisfied by #102's pre-existing body and never prove
+/// the append; a body without the path yields the retained gap reason,
+/// which the linkage check prints as a gap — never as a pass.
+fn issue_102_append_gap(body: &str) -> Option<String> {
+    if body.contains(RECORD_PATH) {
+        return None;
+    }
+    Some(format!(
+        "GAP reported (not a pass): #102 does not reference {RECORD_PATH} — the prepared issue-side append payload is pending at handoff; the worker boundary forbids publishing to the issue tracker"
+    ))
+}
+
+/// The retained #102 body transcription inside the record: the
+/// contiguous bullet block under `## Issue #102 linkage`.
+fn retained_102_transcription(record: &str) -> String {
+    let heading = "## Issue #102 linkage";
+    let start = record
+        .find(heading)
+        .expect("the record retains #102's reference context");
+    let mut lines: Vec<&str> = Vec::new();
+    let mut started = false;
+    for line in record[start + heading.len()..].lines() {
+        if line.starts_with("## ") {
+            break;
+        }
+        if line.starts_with("- ") {
+            started = true;
+            lines.push(line);
+        } else if started {
+            break;
+        }
+    }
+    assert!(
+        !lines.is_empty(),
+        "the record retains the #102 body transcription as bullets"
+    );
+    lines.join("\n")
+}
+
 /// The `### U4.6 evidence record` section of the owner document, up
 /// to the next `## ` heading.
 fn protocol_section(protocol: &str) -> Result<String, String> {
@@ -852,6 +900,82 @@ fn u46d_schema_rejects_a_base_sha_transcribed_in_no_cited_record() {
     );
 }
 
+/// The issue-append criterion ("The finished record is appended or
+/// linked on #102") is unmet while no #102 body carries the record
+/// path itself, so its acceptance-criteria-mapping row must record an
+/// explicit gap — never a pass.
+#[test]
+fn u46d_issue_append_mapping_row_is_a_gap_not_a_pass() {
+    let root = repo_root();
+    let record = read_repo(&root, RECORD_PATH).expect("the consolidated record is retained");
+    let rows = parse_table(&record, &["Criterion", "Where exercised", "Result"])
+        .expect("the acceptance-criteria mapping table exists");
+    let row = rows
+        .iter()
+        .find(|r| r[0].starts_with("The finished record is appended or linked on #102"))
+        .expect("the issue-append criterion has a mapping row");
+    let result = row[2].trim();
+    let first_word = result.split_whitespace().next().unwrap_or("");
+    assert_ne!(
+        first_word, "pass",
+        "the issue-append criterion is unmet until #102 itself references {RECORD_PATH}; its mapping row must never claim a pass: {result}"
+    );
+    assert!(
+        result.starts_with("inconclusive")
+            || result.starts_with("absent{")
+            || result.contains("gap"),
+        "the mapping row must record the pending issue-side append as an explicit gap: {result}"
+    );
+}
+
+/// The linkage check must report the pending issue-side append as a
+/// gap whenever the #102 body it inspects carries no direct reference
+/// to the record path — the pre-existing owner-document link, `#124`
+/// child reference and record title never prove the append.
+#[test]
+fn u46d_linkage_reports_the_pending_issue_append_gap() {
+    let root = repo_root();
+    let record = read_repo(&root, RECORD_PATH).expect("the consolidated record is retained");
+    let retained = retained_102_transcription(&record);
+
+    // The scenario: every pre-existing #102 needle is satisfied by the
+    // retained body, yet the body carries no record path.
+    assert!(
+        retained.contains(ISSUE_102_OWNER_DOC_URL),
+        "the retained #102 body carries the owner-document link"
+    );
+    assert!(
+        retained.contains(ISSUE_102_CHILD_REF),
+        "the retained #102 body carries the #124 child reference"
+    );
+    assert!(
+        retained.contains(ISSUE_102_RECORD_TITLE),
+        "the retained #102 body carries the record title"
+    );
+    assert!(
+        !retained.contains(RECORD_PATH),
+        "the retained #102 body carries no direct reference to the record"
+    );
+
+    let gap = issue_102_append_gap(&retained)
+        .expect("the pending issue-side append must be reported as a gap, never as a silent pass");
+    assert!(
+        gap.contains("GAP reported"),
+        "the gap report is visible in the test output: {gap}"
+    );
+    assert!(
+        gap.contains(RECORD_PATH),
+        "the gap report names the missing record reference: {gap}"
+    );
+
+    // Once #102 carries the record path, the gap closes.
+    let linked = format!("{retained}\n- Consolidated record: `{RECORD_PATH}`");
+    assert!(
+        issue_102_append_gap(&linked).is_none(),
+        "a body that references {RECORD_PATH} reports no gap"
+    );
+}
+
 #[test]
 fn u46d_issue_102_references_the_consolidated_record() {
     let root = repo_root();
@@ -896,7 +1020,9 @@ fn u46d_issue_102_references_the_consolidated_record() {
 
     // Live hop: when `gh` can read #102, assert its owner-document
     // link, its child reference and the acceptance-criterion texts the
-    // completeness check transcribes against the live issue body.
+    // completeness check transcribes against the live issue body, then
+    // check the direct record reference itself — the pre-existing
+    // needles never prove the issue-side append.
     match issue_102_body() {
         Some(body) => {
             for needle in [
@@ -927,13 +1053,30 @@ fn u46d_issue_102_references_the_consolidated_record() {
                 live, transcribed,
                 "the completeness check's transcription must match the live #102 acceptance criteria"
             );
+            match issue_102_append_gap(&body) {
+                Some(gap) => println!("{gap}"),
+                None => println!(
+                    "live #102 directly references {RECORD_PATH} — the issue-side append is recorded"
+                ),
+            }
             println!(
-                "live #102 read asserted the owner-document link, the #124 record reference and both acceptance criteria"
+                "live #102 read asserted the owner-document link, the #124 child reference and both acceptance criteria"
             );
         }
-        None => println!(
-            "u46d: live #102 read unavailable — asserted the retained #102 transcription and the owner-document chain instead"
-        ),
+        None => {
+            let retained = retained_102_transcription(&record);
+            match issue_102_append_gap(&retained) {
+                Some(gap) => {
+                    println!("{gap} (hermetic fallback over the retained #102 transcription)")
+                }
+                None => {
+                    println!("the retained #102 transcription directly references {RECORD_PATH}")
+                }
+            }
+            println!(
+                "u46d: live #102 read unavailable — asserted the retained #102 transcription and the owner-document chain instead"
+            );
+        }
     }
 }
 
