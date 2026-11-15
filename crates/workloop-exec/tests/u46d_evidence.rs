@@ -12,7 +12,9 @@
 //!   row and every record-index entry carries the specified columns,
 //!   `record_refs[]` resolves into retained records, and each index
 //!   entry transcribes the cited record's tested revision,
-//!   configuration, command/scenario and result verbatim.
+//!   configuration, command/scenario and result verbatim; the
+//!   record's own index entry is validated against the record outside
+//!   its own index section, so a row is never its own evidence.
 //! - `u46d_issue_102_references_the_consolidated_record` — #102's
 //!   owner document links the consolidated record inside its U4.6
 //!   evidence-record section, the record cites #102 and retains the
@@ -28,14 +30,19 @@
 //!   — the record's own tested-revision cell is either a full commit
 //!   SHA that contains this exercised slice on the branch history to
 //!   `HEAD`, or the explicit `absent{reason}` gap; a base SHA never
-//!   satisfies it.
+//!   satisfies it, and the absent branch recomputes each retained
+//!   per-file sha256 digest from disk and fails closed on any
+//!   mismatch.
 //!
 //! Failure-path and gap tests exercise the rejections: a missing #102
 //! criterion row, a duplicated or foreign row, an absent row that
 //! claims a pass, a row missing a column, a base SHA transcribed in
 //! no cited record, an issue-append mapping row that claims a pass
-//! while the append is pending, and a linkage check that stays silent
-//! about the missing #102 record reference.
+//! while the append is pending, a linkage check that stays silent
+//! about the missing #102 record reference, a self-referential index
+//! entry whose scenario or hosts are transcribed only by rows inside
+//! the index section, and an absent-stamp record whose retained file
+//! digest is stale or missing.
 //!
 //! The #102 criterion texts are transcribed with
 //! `gh issue view 102 -R shimpeiws/taisan --json body` (2026-11-13);
@@ -46,6 +53,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 const RECORD_PATH: &str = "docs/evidence/u4.6d.md";
 const PROTOCOL_PATH: &str = "docs/worker-protocol.md";
@@ -99,6 +108,22 @@ fn first_backticked(line: &str) -> Option<&str> {
 
 fn is_full_commit_id(token: &str) -> bool {
     token.len() == 40 && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The sha256 of a file's actual bytes, hex-encoded — the digest the
+/// record's per-file sha256 column must carry to be trusted.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    use std::fmt::Write;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        }))
 }
 
 /// True when the text carries any hex run of at least 40 characters.
@@ -334,6 +359,23 @@ struct IndexEntry {
     absent: bool,
 }
 
+/// The record text a self-referential index entry is validated
+/// against: the `## Record index` section is removed, so a row that
+/// cites the record itself can never satisfy its own transcription
+/// checks with the row under validation as the only evidence.
+fn text_outside_index_section(text: &str) -> Result<String, String> {
+    let heading = "## Record index";
+    let start = text
+        .find(heading)
+        .ok_or_else(|| format!("the record carries no {heading:?} section"))?;
+    let after = &text[start + heading.len()..];
+    let end = match after.find("\n## ") {
+        Some(i) => start + heading.len() + i + 1,
+        None => text.len(),
+    };
+    Ok(format!("{}{}", &text[..start], &text[end..]))
+}
+
 /// Schema: every mapping row and every record-index entry conforms to
 /// the specified columns, and the two tables agree.
 fn schema_text(root: &Path, record: &str) -> Result<(), String> {
@@ -376,7 +418,14 @@ fn schema_text(root: &Path, record: &str) -> Result<(), String> {
     let mut index_map: BTreeMap<String, IndexEntry> = BTreeMap::new();
     for row in &index {
         let (file, label) = split_ref(&row[0])?;
-        let text = read_repo(root, file)?;
+        // A self-referential index entry is validated against the
+        // record under check outside its own index section: the row
+        // being validated must never be its own evidence.
+        let text = if file == RECORD_PATH {
+            text_outside_index_section(record)?
+        } else {
+            read_repo(root, file)?
+        };
         if !text.contains(label) {
             return Err(format!(
                 "record-index ref {} does not resolve: {file} carries no {label:?}",
@@ -547,15 +596,13 @@ fn slice_evidence(root: &Path, record: &str) -> Result<(), String> {
             return Err(format!("base revision must be a full commit id: {base}"));
         }
         for supplement in [SLICE_CHECK_PATH, PROTOCOL_PATH] {
-            let digested = record.lines().any(|line| {
-                line.contains(supplement)
-                    && line
-                        .split('`')
-                        .any(|tok| tok.len() == 64 && tok.chars().all(|c| c.is_ascii_hexdigit()))
-            });
+            let actual = file_sha256(&root.join(supplement))?;
+            let digested = record
+                .lines()
+                .any(|line| line.contains(supplement) && line.split('`').any(|tok| tok == actual));
             if !digested {
                 return Err(format!(
-                    "the exercised slice must retain a sha256 digest for {supplement}"
+                    "the exercised slice must retain the sha256 digest of {supplement} as it exists on disk (expected {actual})"
                 ));
             }
         }
@@ -897,6 +944,101 @@ fn u46d_schema_rejects_a_base_sha_transcribed_in_no_cited_record() {
     assert!(
         err.contains("appears in no cited record"),
         "failure names the untranscribed revision: {err}"
+    );
+}
+
+/// The record's own index entry (`docs/evidence/u4.6d.md#Tested
+/// revision`) cites the record itself, so its transcription checks must
+/// run against the record outside the index section: a scenario or
+/// installation host that occurs only inside the index section is never
+/// independent evidence of the row being validated.
+#[test]
+fn u46d_schema_self_index_entry_is_never_its_own_evidence() {
+    let root = repo_root();
+    let record = read_repo(&root, RECORD_PATH).expect("the consolidated record is retained");
+    let own_row_prefix = format!("| {RECORD_PATH}#Tested revision |");
+
+    // A record whose self-entry scenario is retained only by the index
+    // row itself: every occurrence on the other lines is scrubbed.
+    let scenario = "u46d_evidence.rs::u46d_completeness_every_102_criterion_has_a_row";
+    let scenario_only_in_row: String = record
+        .lines()
+        .map(|line| {
+            if line.starts_with(&own_row_prefix) {
+                line.to_string()
+            } else {
+                line.replace(scenario, "")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let err = schema_text(&root, &scenario_only_in_row)
+        .expect_err("a scenario transcribed only by the index row itself must fail");
+    assert!(
+        err.contains("is not transcribed"),
+        "the failure names the untranscribed scenario: {err}"
+    );
+
+    // A record whose self-entry installation hosts are retained only by
+    // rows inside the index section: every other line is scrubbed.
+    let host_scrubbed: String = record
+        .lines()
+        .map(|line| {
+            if line.starts_with("| docs/evidence/") {
+                line.to_string()
+            } else {
+                line.replace("swap-recovery-host", "swap-recovery-node")
+                    .replace("swap-host", "swap-node")
+                    .replace("test-host", "test-node")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(
+        host_scrubbed, record,
+        "the mutation must scrub the hosts from the non-index lines"
+    );
+    let err = schema_text(&root, &host_scrubbed)
+        .expect_err("hosts transcribed only inside the index section must fail");
+    assert!(
+        err.contains("does not appear in the cited record"),
+        "the failure names the untranscribed host: {err}"
+    );
+}
+
+/// The absent-stamp branch retains per-file sha256 digests as
+/// supplements of the pending stamp; a token that merely looks like a
+/// digest never suffices — the recorded sha256 must equal the file's
+/// actual bytes, or the guard fails closed.
+#[test]
+fn u46d_absent_stamp_rejects_a_stale_file_digest() {
+    let root = repo_root();
+    let record = read_repo(&root, RECORD_PATH).expect("the consolidated record is retained");
+
+    let actual = file_sha256(&root.join(SLICE_CHECK_PATH)).expect("the slice file is readable");
+    let tampered = record.replace(&actual, &"0".repeat(64));
+    assert_ne!(
+        tampered, record,
+        "the record must carry the slice's actual sha256 digest for the mutation to bite"
+    );
+    let err = slice_evidence(&root, &tampered)
+        .expect_err("a stale sha256 digest must fail the absent-stamp branch");
+    assert!(
+        err.contains("sha256") && err.contains(SLICE_CHECK_PATH),
+        "the failure names the digest mismatch: {err}"
+    );
+
+    // A record that retains no digest for the slice at all fails too.
+    let undigested: String = record
+        .lines()
+        .filter(|line| !line.contains(SLICE_CHECK_PATH))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let err = slice_evidence(&root, &undigested)
+        .expect_err("a missing sha256 digest must fail the absent-stamp branch");
+    assert!(
+        err.contains("sha256") && err.contains(SLICE_CHECK_PATH),
+        "the failure names the missing digest: {err}"
     );
 }
 

@@ -10,3 +10,4 @@ libc = "0.2"
 
 [dev-dependencies]
 workloop-github = { path = "../workloop-github" }
+sha2 = "0.11.1"

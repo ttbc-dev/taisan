@@ -715,6 +715,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "serde_json",
+ "sha2",
  "workloop-core",
  "workloop-github",
  "workloop-store",
