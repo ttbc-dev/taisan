@@ -391,3 +391,151 @@ fn per_finding_disposition_evidence_survives_repair() {
     assert_eq!(round.head_sha, h1);
     assert_eq!(round.findings().len(), 3);
 }
+
+#[test]
+fn a_round_without_a_fix_selection_holds_instead_of_consuming_budget() {
+    let mut ledger = ReviewRepair::new(WorkPolicy::default().max_fix_invocations);
+
+    // A zero-finding round has vacuous coverage but selects nothing
+    // to repair — it gets an empty assessment, not a fix pass.
+    let h_empty = head("head-empty");
+    ledger.record_current_head(h_empty.clone());
+    ledger.open_round("round-empty", h_empty).unwrap();
+    assert_eq!(
+        ledger.repair_gate("round-empty").unwrap(),
+        RepairGate::Blocked {
+            missing: vec![RepairPrerequisite::FindingsDecided]
+        }
+    );
+    assert!(matches!(
+        ledger.begin_repair("round-empty").unwrap(),
+        RepairAttempt::Held { .. }
+    ));
+
+    // An all-Dismiss/Accept round is fully dispositioned but has
+    // nothing to fix.
+    let h_dismiss = head("head-dismiss");
+    ledger.record_current_head(h_dismiss.clone());
+    ledger
+        .open_round("round-dismiss", h_dismiss.clone())
+        .unwrap();
+    ledger
+        .append_finding("round-dismiss", finding("f-1"))
+        .unwrap();
+    ledger
+        .append_finding("round-dismiss", finding("f-2"))
+        .unwrap();
+    ledger
+        .record_decisions(
+            "round-dismiss",
+            &h_dismiss,
+            vec![
+                disposition("f-1", FindingChoice::Dismiss),
+                disposition("f-2", FindingChoice::Accept),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.repair_gate("round-dismiss").unwrap(),
+        RepairGate::Blocked {
+            missing: vec![RepairPrerequisite::FindingsDecided]
+        }
+    );
+    assert!(matches!(
+        ledger.begin_repair("round-dismiss").unwrap(),
+        RepairAttempt::Held { .. }
+    ));
+
+    // An all-Wait round is fully covered but unresolved — it holds
+    // for Attention rather than starting a fix pass.
+    let h_wait = head("head-wait");
+    ledger.record_current_head(h_wait.clone());
+    ledger.open_round("round-wait", h_wait.clone()).unwrap();
+    ledger.append_finding("round-wait", finding("f-1")).unwrap();
+    ledger
+        .record_decisions(
+            "round-wait",
+            &h_wait,
+            vec![disposition("f-1", FindingChoice::Wait)],
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.repair_gate("round-wait").unwrap(),
+        RepairGate::Blocked {
+            missing: vec![RepairPrerequisite::FindingsDecided]
+        }
+    );
+    assert!(matches!(
+        ledger.begin_repair("round-wait").unwrap(),
+        RepairAttempt::Held { .. }
+    ));
+
+    assert_eq!(ledger.fix_invocations_used(), 0);
+    assert!(ledger.passes().is_empty());
+    assert!(ledger.exhaustion().is_none());
+}
+
+#[test]
+fn a_fix_selection_in_the_exact_set_unlocks_repair() {
+    let mut ledger = ReviewRepair::new(WorkPolicy::default().max_fix_invocations);
+    let h1 = head("head-1");
+    ledger.record_current_head(h1.clone());
+    ledger.open_round("round-1", h1.clone()).unwrap();
+    for id in ["f-fix", "f-dismiss", "f-accept", "f-wait"] {
+        ledger.append_finding("round-1", finding(id)).unwrap();
+    }
+    // The exact-set judgment selects one occurrence for repair; the
+    // other dispositions settle or wait independently of the pass.
+    ledger
+        .record_decisions(
+            "round-1",
+            &h1,
+            vec![
+                disposition("f-fix", FindingChoice::Fix),
+                disposition("f-dismiss", FindingChoice::Dismiss),
+                disposition("f-accept", FindingChoice::Accept),
+                disposition("f-wait", FindingChoice::Wait),
+            ],
+        )
+        .unwrap();
+    assert_eq!(ledger.repair_gate("round-1").unwrap(), RepairGate::Unlocked);
+    match ledger.begin_repair("round-1").unwrap() {
+        RepairAttempt::Started { pass } => {
+            assert_eq!(pass.ordinal, 1);
+            assert_eq!(pass.round_id, "round-1");
+            assert_eq!(pass.decided_head, h1);
+        }
+        other => panic!("a selected fix must start a pass: {other:?}"),
+    }
+    assert_eq!(ledger.fix_invocations_used(), 1);
+
+    // Re-deciding the only Fix selection to Dismiss closes the gate
+    // again: the latest exact-set judgment selects nothing to repair.
+    let h2 = head("head-2");
+    ledger.record_current_head(h2.clone());
+    ledger.open_round("round-2", h2.clone()).unwrap();
+    ledger.append_finding("round-2", finding("g-1")).unwrap();
+    ledger
+        .record_decisions("round-2", &h2, vec![disposition("g-1", FindingChoice::Fix)])
+        .unwrap();
+    assert_eq!(ledger.repair_gate("round-2").unwrap(), RepairGate::Unlocked);
+    ledger
+        .record_decisions(
+            "round-2",
+            &h2,
+            vec![disposition("g-1", FindingChoice::Dismiss)],
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.repair_gate("round-2").unwrap(),
+        RepairGate::Blocked {
+            missing: vec![RepairPrerequisite::FindingsDecided]
+        },
+        "the latest disposition governs: re-deciding to Dismiss unselects repair"
+    );
+    assert!(matches!(
+        ledger.begin_repair("round-2").unwrap(),
+        RepairAttempt::Held { .. }
+    ));
+    assert_eq!(ledger.fix_invocations_used(), 1);
+}

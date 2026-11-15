@@ -10,9 +10,11 @@
 //! change, and a finding observed later at the same head is appended,
 //! growing the round's required decision set. A repair pass unlocks
 //! only when the recorded current head equals the decisions'
-//! `decided_head` AND every finding in the round's set has a recorded
-//! disposition; reaching the fix bound records exhaustion and
-//! escalates rather than starting another pass.
+//! `decided_head` AND the round's finding set is completely
+//! dispositioned with at least one `Fix` selection — a pass exists to
+//! repair the selected occurrences, so a round whose judgment selects
+//! nothing never starts one; reaching the fix bound records
+//! exhaustion and escalates rather than starting another pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -90,8 +92,9 @@ pub enum RepairPrerequisite {
     /// The recorded current head equals the head the round's decisions
     /// were made against (`decided_head`).
     CurrentHead,
-    /// Every finding in the round's current set has a recorded
-    /// disposition for that round.
+    /// The round's current finding set is completely dispositioned
+    /// and selects at least one finding for repair (`Fix`). A fully
+    /// dispositioned set with no `Fix` selection has no repair work.
     FindingsDecided,
 }
 
@@ -413,8 +416,13 @@ impl ReviewRepair {
 
     /// Evaluate the round's repair prerequisites. Unlocked requires
     /// both: the recorded current head equals the round's `decided_head`
-    /// and every finding in the round's current set has a recorded
-    /// disposition.
+    /// and the round's current finding set is completely dispositioned
+    /// with at least one `Fix` selection. A pass exists to repair the
+    /// selected occurrences, so a round whose judgment selects nothing —
+    /// all `Dismiss`/`Accept`, all `Wait`, or no findings at all —
+    /// stays blocked: decided non-fix findings settle without a pass
+    /// and unresolved `Wait` findings route to Attention, neither of
+    /// which consumes fix budget.
     pub fn repair_gate(&self, round_id: &str) -> Result<RepairGate, ReviewError> {
         let round = self
             .round(round_id)
@@ -425,12 +433,16 @@ impl ReviewRepair {
         if self.current_head.as_ref() != Some(&round.head_sha) {
             missing.push(RepairPrerequisite::CurrentHead);
         }
-        let undecided = round.findings().iter().any(|finding| {
-            !self.decisions.iter().any(|decision| {
-                decision.round_id == round_id && decision.finding_id == finding.finding_id
-            })
-        });
-        if undecided {
+        let dispositions = self.dispositions_for(round_id);
+        let coverage_complete = round
+            .findings()
+            .iter()
+            .all(|finding| dispositions.contains_key(&finding.finding_id));
+        let fix_selected = round
+            .findings()
+            .iter()
+            .any(|finding| dispositions.get(&finding.finding_id) == Some(&FindingChoice::Fix));
+        if !(coverage_complete && fix_selected) {
             missing.push(RepairPrerequisite::FindingsDecided);
         }
         Ok(if missing.is_empty() {
