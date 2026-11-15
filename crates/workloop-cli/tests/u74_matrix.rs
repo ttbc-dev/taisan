@@ -7,8 +7,10 @@
 //! document) and once through the **direct CLI** (arguments built
 //! literally by the test). Each row asserts an identical
 //! status/diagnostic envelope (exit code, `schema_version`, `status`,
-//! `command.kind`, `reason.code`) on both paths plus the row's
-//! documented expectation. The row set is enumerated explicitly in
+//! `command.kind`, `reason.code`, addressed `work_id`, `reason.message`,
+//! and the `result` payload — with the per-row root directory
+//! normalized) on both paths plus the row's documented expectation.
+//! The row set is enumerated explicitly in
 //! `APPLICABLE_ROWS`, so no applicable row can be silently skipped;
 //! `run*` driver rows belong to the walkthrough's recovery leg and TUI/
 //! MCP remain excluded.
@@ -560,17 +562,30 @@ fn as_refs(args: &[String]) -> Vec<&str> {
 }
 
 /// The status/diagnostic surface of an envelope: what both paths must
-/// agree on. Volatile identities (command id, work/execution ids,
-/// timestamps, config paths) are intentionally excluded.
-fn status_surface(output: &Output) -> (i32, String, String, String, String) {
+/// agree on. Volatile identities (command id, timestamps, config
+/// paths) are intentionally excluded — the per-row root directory is
+/// normalized so path-valued fields (e.g. `init`'s `result.path`)
+/// compare equal across the two independently rooted installations —
+/// but the addressed scope (`work_id`), the diagnostic message, and
+/// the query/mutation `result` are part of the surface: two paths
+/// that query different scopes must not compare equal.
+fn status_surface(
+    root: &Path,
+    output: &Output,
+) -> (i32, String, String, String, String, String, String, String) {
     let code = output.status.code().unwrap_or(-1);
     let env = envelope(output);
+    let root_str = root.display().to_string();
+    let normalize = |v: &serde_json::Value| v.to_string().replace(&root_str, "<ROOT>");
     (
         code,
         env["schema_version"].as_str().unwrap_or("").to_string(),
         env["status"].as_str().unwrap_or("").to_string(),
         env["command"]["kind"].as_str().unwrap_or("").to_string(),
         env["reason"]["code"].as_str().unwrap_or("").to_string(),
+        env["work_id"].as_str().unwrap_or("").to_string(),
+        env["reason"]["message"].as_str().unwrap_or("").to_string(),
+        normalize(&env["result"]),
     )
 }
 
@@ -707,12 +722,22 @@ fn scenario(row: &str, root: &Path, path: Path_, md: &str) -> Output {
             output_at(root, &as_refs(&args))
         }
         "attention" => {
-            submit_at(root, "matrix-attn", "matrix attention work");
+            let env = submit_at(root, "matrix-attn", "matrix attention work");
+            let work_id = env["work_id"].as_str().unwrap().to_string();
+            let execution_id = env["execution_id"].as_str().unwrap().to_string();
+            pause_for_judgment(&store(root), &ExecutionId(execution_id));
             let args = match path {
-                Path_::Skill => skill_args(md, "attention", |_| true, &[]),
-                Path_::Direct => vec!["attention".into()],
+                Path_::Skill => skill_args(md, "attention", |_| true, &[("<WORK_ID>", &work_id)]),
+                Path_::Direct => vec!["attention".into(), "--work".into(), work_id],
             };
-            output_at(root, &as_refs(&args))
+            let out = output_at(root, &as_refs(&args));
+            let env = envelope(&out);
+            assert_eq!(
+                env["result"].as_array().map(|a| a.len()),
+                Some(1),
+                "the work-scoped Attention of the paused judgment is derived, not empty: {env}"
+            );
+            out
         }
         "capacity" => {
             submit_at(root, "matrix-cap", "matrix capacity work");
@@ -991,8 +1016,8 @@ fn every_applicable_matrix_row_passes_through_the_installed_skill_and_the_direct
         let direct_root = root(&format!("{row}-direct"));
         let skill = scenario(row, &skill_root, Path_::Skill, &installed_md);
         let direct = scenario(row, &direct_root, Path_::Direct, &installed_md);
-        let skill_surface = status_surface(&skill);
-        let direct_surface = status_surface(&direct);
+        let skill_surface = status_surface(&skill_root, &skill);
+        let direct_surface = status_surface(&direct_root, &direct);
         assert_eq!(
             skill_surface, direct_surface,
             "{row}: installed-skill and direct-CLI envelopes differ\nskill: {skill_surface:?}\ndirect: {direct_surface:?}"
@@ -1084,4 +1109,56 @@ fn a_clean_skill_install_into_a_fresh_environment_invokes_once_end_to_end() {
         "implicit installation recorded beside the store"
     );
     assert!(db.exists(), "the store exists after the invocation");
+}
+
+// ---- Walkthrough step-6 fresh-key claim ----
+
+/// The walkthrough's recovery leg claims a fresh idempotency key for
+/// the same payload is a **new** Command that queues a second Work —
+/// never a recovery of the first — and that each retained key
+/// recovers its own recorded command through `command-result`.
+#[test]
+fn a_fresh_key_for_the_same_payload_queues_a_second_work_not_a_recovery() {
+    let root = root("fresh-key");
+    let first = submit_at(&root, "fresh-key-1", "fresh key payload");
+    let second = submit_at(&root, "fresh-key-2", "fresh key payload");
+    let first_work = first["work_id"]
+        .as_str()
+        .expect("first work id")
+        .to_string();
+    let second_work = second["work_id"]
+        .as_str()
+        .expect("second work id")
+        .to_string();
+    assert_ne!(
+        first_work, second_work,
+        "the fresh key queued a second Work, not a replay: {second}"
+    );
+    assert_ne!(
+        first["command"]["id"], second["command"]["id"],
+        "the fresh key is a new Command: {second}"
+    );
+
+    // Each retained key recovers its own recorded decision — the
+    // original key recovers the original Work, the fresh key the
+    // second one.
+    for (key, work) in [("fresh-key-1", &first_work), ("fresh-key-2", &second_work)] {
+        let recovered = run_at(
+            &root,
+            &["command-result", "--origin", "cli", "--replay-key", key],
+        );
+        assert_eq!(recovered["status"], "accepted", "{key}: {recovered}");
+        assert_eq!(
+            recovered["result"]["work_id"].as_str(),
+            Some(work.as_str()),
+            "{key} recovers its own queued Work: {recovered}"
+        );
+    }
+
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(
+        list["result"]["items"].as_array().map(|a| a.len()),
+        Some(2),
+        "two distinct Works are recorded: {list}"
+    );
 }
