@@ -483,7 +483,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         "adapter_version": "1.0.0",
                         "runtime_version": "scripted-1.0.0",
                         "protocol_versions": ["taisan.worker/1"],
-                        "roles": ["coding", "fix", "review"],
+                        "roles": ["coding", "fix", "invariant_check", "review"],
                         "capabilities": ["workspace_write", "artifact_json", "process_control"],
                     })
                     .to_string()

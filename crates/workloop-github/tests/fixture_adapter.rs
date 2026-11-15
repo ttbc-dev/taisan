@@ -220,6 +220,23 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
             descendants: vec![],
         },
     })?;
+    // The invariant lane's own durable record: a completed read-only
+    // check Invocation after the producing one. Completion and
+    // publication gate on it — an assessment fact alone never
+    // substitutes.
+    tx.apply(&Effect::InsertInvocation {
+        invocation: Invocation {
+            id: InvocationId(format!("{}-invariant-check", eid.0)),
+            request_id: format!("{}:inv:check", eid.0),
+            execution_id: eid.clone(),
+            role: InvocationRole::InvariantCheck,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        },
+    })?;
     tx.apply(&Effect::InsertObservation {
         observation: Observation {
             delivery: None,
@@ -679,6 +696,22 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
                     state: InvocationState::Done,
                     process_identity: None,
                     required_artifacts: vec![artifact("artifact.json")],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            // The invariant lane's completed check Invocation: the
+            // publish gate requires its own durable record after the
+            // producing Invocation.
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-1-check".into()),
+                    request_id: format!("{}:inv:check", eid.0),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
                     evidence_refs: vec![],
                     descendants: vec![],
                 },

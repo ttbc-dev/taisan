@@ -2319,41 +2319,38 @@ fn persist_intent_row(
 }
 
 fn required_artifacts(request: &InvocationRequest) -> Vec<RequiredArtifact> {
-    request
-        .payload
-        .get("required_artifacts")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| {
-                    if let Some(name) = v.as_str() {
-                        return Some(RequiredArtifact {
-                            kind: name.to_string(),
-                            path: name.to_string(),
-                            expected_digest: None,
-                        });
-                    }
-                    let kind = v.get("kind").and_then(|k| k.as_str())?;
-                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(kind);
-                    Some(RequiredArtifact {
-                        kind: kind.to_string(),
-                        path: path.to_string(),
-                        expected_digest: v
-                            .get("expected_digest")
-                            .and_then(|d| d.as_str())
-                            .map(str::to_string),
-                    })
+    match request.payload.get("required_artifacts") {
+        // An explicitly declared set is authoritative — including the
+        // empty set a read-only role records. Only an absent or
+        // non-array declaration falls back to the writer default.
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| {
+                if let Some(name) = v.as_str() {
+                    return Some(RequiredArtifact {
+                        kind: name.to_string(),
+                        path: name.to_string(),
+                        expected_digest: None,
+                    });
+                }
+                let kind = v.get("kind").and_then(|k| k.as_str())?;
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(kind);
+                Some(RequiredArtifact {
+                    kind: kind.to_string(),
+                    path: path.to_string(),
+                    expected_digest: v
+                        .get("expected_digest")
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string),
                 })
-                .collect()
-        })
-        .filter(|v: &Vec<RequiredArtifact>| !v.is_empty())
-        .unwrap_or_else(|| {
-            vec![RequiredArtifact {
-                kind: "artifact.json".to_string(),
-                path: "artifact.json".to_string(),
-                expected_digest: None,
-            }]
-        })
+            })
+            .collect(),
+        _ => vec![RequiredArtifact {
+            kind: "artifact.json".to_string(),
+            path: "artifact.json".to_string(),
+            expected_digest: None,
+        }],
+    }
 }
 
 /// Whether `name` exists in the workspace root, checkpoints, or the

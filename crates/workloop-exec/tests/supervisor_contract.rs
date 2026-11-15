@@ -788,13 +788,18 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
         });
     assert!(exited, "the proven exit is recorded as evidence");
     let e = execution(&store, &eid);
-    assert_eq!(e.state, ExecutionState::Waiting);
-    assert_eq!(
-        e.waiting_reason,
-        Some(WaitingReason::HostWrite),
-        "artifact evidence queued the publish intent"
+    // Reconciliation resolves straight into the next step: the
+    // invariant lane is enabled, so the publish gate re-requests the
+    // pre-publication check under the same Execution and reservation
+    // (`waiting → ready`) before any host-write intent exists.
+    assert_eq!(e.state, ExecutionState::Ready);
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(pending.len(), 1, "exactly the check request is pending");
+    assert_eq!(pending[0].role, InvocationRole::InvariantCheck);
+    assert!(
+        store.transact(|tx| tx.action_intents()).unwrap().is_empty(),
+        "publication waits for the check's own Invocation evidence"
     );
-    assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
     port.reap(identity.pid);
 }
 
@@ -1508,6 +1513,62 @@ fn clean_exit_records_artifact_and_publish_intent() {
     assert_eq!(intents.len(), 1);
 }
 
+/// S-3a (#149): pre-publication invariant conformance is its own
+/// durable Invocation — a separate `invariant_check` record with its
+/// own id, request, lifecycle, and receipts — admitted `waiting →
+/// ready` under the same Execution reservation after the producing
+/// Invocation completes, and publication waits for its `Done` record.
+/// The check is read-only: it declares no required artifacts.
+#[test]
+fn invariant_check_runs_as_its_own_invocation_before_publication() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("invcheck");
+    let (_w, eid) = submit_and_admit(&store, "k-ic1");
+    let sup = supervisor("clean-exit", root);
+    for _ in 0..60 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting && e.waiting_reason == Some(WaitingReason::HostWrite)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "publication proceeded only after the check completed"
+    );
+    let invocations = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap();
+    assert_eq!(invocations.len(), 2, "coding plus the check Invocation");
+    let coding = &invocations[0];
+    let check = &invocations[1];
+    assert_eq!(coding.role, InvocationRole::Coding);
+    assert_eq!(check.role, InvocationRole::InvariantCheck);
+    assert_ne!(coding.id, check.id, "distinct invocation_id");
+    assert_ne!(
+        coding.request_id, check.request_id,
+        "distinct durable request"
+    );
+    assert_eq!(check.state, InvocationState::Done);
+    assert!(
+        check.required_artifacts.is_empty(),
+        "the read-only check declares no workspace artifact"
+    );
+    assert!(
+        check.process_identity.is_some(),
+        "the check carries its own process receipts"
+    );
+    // The publish intent exists only because the check completed: the
+    // outbox holds exactly the one publication write.
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    assert_eq!(intents.len(), 1);
+    assert!(matches!(intents[0].action, HostAction::PushRef { .. }));
+}
+
 /// Inspection read and stop-request wiring (U5.3, #93): a stop request
 /// reaches the supervised writer, and an inspection read reports the
 /// recorded writer_state for the supervision record.
@@ -1872,11 +1933,16 @@ fn failed_finish_reports_are_replayed_after_restart() {
                 ..
             }
         )));
-        assert_eq!(
-            execution(&store, &eid).waiting_reason,
-            Some(WaitingReason::HostWrite)
-        );
-        assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
+        // The replayed exit drives the same reconciliation: the
+        // invariant lane re-requests the pre-publication check under
+        // the same reservation, so the Execution is `ready` for that
+        // request and no publish intent exists yet.
+        let e = execution(&store, &eid);
+        assert_eq!(e.state, ExecutionState::Ready);
+        let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].role, InvocationRole::InvariantCheck);
+        assert!(store.transact(|tx| tx.action_intents()).unwrap().is_empty());
     }
 }
 

@@ -1760,26 +1760,38 @@ mod tests {
         let invocations = store
             .transact(|tx| tx.invocations_for_execution(&e))
             .unwrap();
-        assert_eq!(invocations.len(), 1, "one Invocation per request");
+        let coding: Vec<_> = invocations
+            .iter()
+            .filter(|i| i.role == InvocationRole::Coding)
+            .collect();
+        assert_eq!(coding.len(), 1, "one Invocation per request");
         assert!(
-            invocations[0].process_identity.is_some(),
+            coding[0].process_identity.is_some(),
             "the replayed request produced exactly one writer"
         );
         let execution = execution(&store, &e);
-        assert_eq!(execution.invocations_used, 1);
+        // The replayed coding admission is the first charge; when the
+        // exit lands inside this pass the publish gate may also admit
+        // the pre-publication invariant check — a distinct pending
+        // request, never a second writer for the replayed one.
+        let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+        assert!(
+            pending
+                .iter()
+                .all(|r| r.role == InvocationRole::InvariantCheck),
+            "the only follow-up request is the invariant check"
+        );
+        assert_eq!(
+            execution.invocations_used,
+            1 + pending.len() as u32,
+            "admissions equal the consumed coding request plus any pending check"
+        );
         assert!(execution.started_seq.is_some());
         let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
         assert_eq!(
             usage.first_dispatch_unix_seconds,
             Some(NOW),
             "the budget anchor is the first dispatch, never re-armed by restart"
-        );
-        assert!(
-            store
-                .transact(|tx| tx.pending_requests())
-                .unwrap()
-                .is_empty(),
-            "the consumed request never launches twice"
         );
     }
 

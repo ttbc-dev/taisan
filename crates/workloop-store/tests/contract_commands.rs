@@ -1563,6 +1563,72 @@ fn review_admission_never_exceeds_max_review_rounds() {
     assert_eq!(requests.len(), 1, "no second review request");
 }
 
+/// The installation binds a dedicated reviewer App identity for the
+/// review role.
+fn config_with_reviewer() -> WorkloopConfig {
+    let mut cfg = config();
+    cfg.host.actors.push(RoleBinding {
+        role: ActorRole::Review,
+        actor: HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("s1-reviewer[bot]"),
+        },
+        credential_ref: CredentialRef::trusted("cred-review"),
+    });
+    cfg
+}
+
+/// S-5 (#149): the review lane binds the configured reviewer App
+/// identity. Under a binding that names a review actor, only a review
+/// reported under that actor seals a round — the generic automation
+/// identity's review stays recorded as an observation but never becomes
+/// authoritative review evidence, and the sealed round carries the App
+/// slug, never `github-actions[bot]`.
+#[test]
+fn review_rounds_seal_only_for_the_bound_reviewer_actor() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let cfg = config_with_reviewer();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &cfg, &submit("revbind"), NOW).unwrap());
+    let emit_review = |source: &str| {
+        workloop_core::work::handle_observation(
+            &store,
+            &cfg,
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::Review {
+                    target: target("head-1"),
+                    source: source.into(),
+                    source_revision: None,
+                    completeness: Completeness::Complete,
+                    occurrences: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    // The generic automation identity is not the configured reviewer:
+    // its complete review is ingested but seals no round.
+    emit_review("github-actions[bot]");
+    assert!(
+        store
+            .transact(|tx| tx.rounds_for_work(&w))
+            .unwrap()
+            .is_empty(),
+        "a foreign-source review never seals a round"
+    );
+    // The configured reviewer App's review seals, and the durable
+    // round records that App slug as its source.
+    emit_review("s1-reviewer[bot]");
+    let rounds = store.transact(|tx| tx.rounds_for_work(&w)).unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].source, "s1-reviewer[bot]");
+}
+
 #[test]
 fn judge_rejects_head_with_no_observation() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -2741,6 +2807,23 @@ fn recorded_invocation(eid: &ExecutionId, id: &str) -> Invocation {
     }
 }
 
+/// The invariant lane's own durable record: a completed read-only
+/// check Invocation after the producing one — the publish gate and
+/// completion both require it.
+fn recorded_check_invocation(eid: &ExecutionId, id: &str) -> Invocation {
+    Invocation {
+        id: InvocationId(id.into()),
+        request_id: format!("{}:inv:check", eid.0),
+        execution_id: eid.clone(),
+        role: InvocationRole::InvariantCheck,
+        state: InvocationState::Done,
+        process_identity: None,
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+        descendants: vec![],
+    }
+}
+
 fn launch_refused(store: &SqliteStore, eid: &ExecutionId, invocation_id: &InvocationId) {
     workloop_core::work::handle_observation(
         store,
@@ -2890,10 +2973,19 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         path: "artifact.json".into(),
         expected_digest: Some("artifact-digest".into()),
     }];
+    let mut check = recorded_invocation(&e1, "sc1-check");
+    check.role = InvocationRole::InvariantCheck;
+    check.state = InvocationState::Done;
+    check.request_id = format!("{}:inv:1", e1.0);
     apply_effects(
         &store,
         &[
             Effect::InsertInvocation { invocation },
+            // The invariant lane also requires the check's own durable
+            // Invocation: a completed `invariant_check` recorded after
+            // the producing Invocation, declaring no workspace
+            // artifacts.
+            Effect::InsertInvocation { invocation: check },
             // The artifact evidence for the required artifact.
             Effect::InsertObservation {
                 observation: Observation {
@@ -3078,6 +3170,16 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                         expected_digest: None,
                     }];
                     tx.apply(&Effect::InsertInvocation { invocation })?;
+                    if scenario == "complete" {
+                        // Completion additionally requires the
+                        // invariant-check Invocation's own durable
+                        // record after the producing Invocation.
+                        let mut check = recorded_invocation(&eid, "check");
+                        check.role = InvocationRole::InvariantCheck;
+                        check.state = InvocationState::Done;
+                        check.request_id = format!("{}:inv:1", eid.0);
+                        tx.apply(&Effect::InsertInvocation { invocation: check })?;
+                    }
                     if scenario != "missing" {
                         tx.apply(&Effect::InsertObservation {
                             observation: Observation {
@@ -3905,9 +4007,14 @@ fn an_applied_push_receipt_records_the_next_stage_intent() {
     }];
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: invocation.clone(),
-        }],
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "pc1-check"),
+            },
+        ],
     );
     let emit = |fact: ObservationFact| {
         workloop_core::work::handle_observation(
@@ -4258,9 +4365,14 @@ fn an_applied_push_retry_advances_the_chain() {
     }];
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: invocation.clone(),
-        }],
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "pr1-check"),
+            },
+        ],
     );
     let emit = |fact: ObservationFact| {
         workloop_core::work::handle_observation(
@@ -4384,9 +4496,14 @@ fn a_delayed_older_branch_read_never_degrades_the_reissue_guard() {
     }];
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: invocation.clone(),
-        }],
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "dg1-check"),
+            },
+        ],
     );
     let branch = format!("work/{}", w.0);
     let emit_at = |fact: ObservationFact, ts: i64| {
@@ -4542,9 +4659,14 @@ fn a_denied_stage_effect_is_terminal_not_a_transport_retry() {
     }];
     apply_effects(
         &store,
-        &[Effect::InsertInvocation {
-            invocation: invocation.clone(),
-        }],
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "az1-check"),
+            },
+        ],
     );
     let emit = |fact: ObservationFact| {
         workloop_core::work::handle_observation(

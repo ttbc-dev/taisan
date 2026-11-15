@@ -206,7 +206,7 @@ fn main() {
                     "adapter_version": args.adapter_version.as_deref().unwrap_or("1.0.0"),
                     "runtime_version": args.runtime_version.as_deref().unwrap_or("fixture-1.0.0"),
                     "protocol_versions": ["taisan.worker/1"],
-                    "roles": ["coding", "fix", "review"],
+                    "roles": ["coding", "fix", "invariant_check", "review"],
                     "capabilities": ["workspace_write", "artifact_json", "process_control"],
                 })
             );

@@ -157,6 +157,23 @@ fn setup(state: InvocationState) -> (SqliteStore, WorkId, ExecutionId, Invocatio
                     descendants: vec![],
                 },
             })?;
+            // The invariant lane's own durable Invocation: a completed
+            // read-only check recorded after the producing Invocation.
+            // Publication and completion gate on it, never on an
+            // assessment fact alone.
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("invariant-check".into()),
+                    request_id: format!("{}:inv:1", execution_id.0),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
             let mut execution = tx.execution(&execution_id)?.unwrap();
             execution.state = ExecutionState::Waiting;
             execution.waiting_reason = Some(WaitingReason::Ci);
