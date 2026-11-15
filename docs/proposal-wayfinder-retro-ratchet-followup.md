@@ -1,98 +1,70 @@
-# Follow-up: reuse existing diagnostics for Retro; keep Wayfinder upstream
+# Follow-up: reuse diagnostic capabilities for Retro; keep Wayfinder upstream
 
 Status: **Proposal amendment — documentation only**  
 Related: [Wayfinder / Retro / Ratchet proposal](proposal-wayfinder-retro-ratchet.md), [PR #193](https://github.com/shimpeiws/taisan/pull/193).
 
-## Why this follow-up exists
+## Motivation
 
-The original proposal describes a read-only Retro CLI as the first experiment. That wording risks duplicating existing diagnostic and lane-recovery work in [hermes-setup](https://github.com/shimpeiws/hermes-setup). It also describes Wayfinder as selector-side planning without explicitly accounting for the existing **devflow** planning responsibility.
+The original proposal's “independent Retro CLI” is an implementation option, not a requirement. Before introducing a new executable, audit any existing **diagnostic capabilities available to the project**, including their input/output contracts and reusable failure-classification logic. Do not assume their presence or publish their provenance.
 
-**Revised recommendation:** audit and reuse existing diagnostics first. Treat Retro as a **cross-run learning and verification capability**, not a new diagnostic command by default. Treat Wayfinder as an optional *upstream devflow-like decision workflow*, not a taisan Core feature.
+Wayfinder should be treated as an optional **upstream planning responsibility** rather than part of taisan Core.
 
-This document supplements, rather than silently overwrites, the merged proposal. It changes no runtime behavior.
+This document contains only generalized design requirements and publicly shareable project concepts. It intentionally does not identify any private source repository, internal skill, script, path, configuration or incident.
 
-## What is actually present in hermes-setup
+## Responsibilities
 
-The [hermes-setup README](https://github.com/shimpeiws/hermes-setup/blob/main/README.md) describes:
+| Concern | Responsibility | Output |
+| --- | --- | --- |
+| Decision discovery | Upstream planning workflow | Decision record, rationale, implementation-ready specification |
+| Incident diagnosis | Operational diagnostic capability | Evidence-backed diagnosis and safe recovery recommendation |
+| Durable execution | taisan Core and adapters | Observations, outcomes, attention and evidence |
+| Retro learning | Cross-run analysis of recorded evidence | Recurrence hypothesis and proposed prevention |
+| Improvement verification | Regression tests, reproducible task replay and outcome metrics | Reproducible evidence and measured change |
+| Quality ratchet | Versioned repository checks | No new violations and controlled reduction of existing exceptions |
 
-- Coding-worker lane dispatch, ship/converge and bounded recovery.
-- Durable resume and shadow-review events; PR binding provenance and typed dropped/quarantined dispositions.
-- Finding-disposition reconciliation keyed by repository, PR, finding and commit.
-- Halt episodes, judgment waits, decision bundles and operator recovery flows.
-- Several narrowly scoped diagnostic/maintenance scripts and scheduled sweeps.
+Diagnosis answers **what is wrong in this execution and how to recover safely**. Retro asks **what recurring cause can be prevented and how can we verify that prevention**. Share evidence semantics and classifiers where possible; do not require a second command-line tool.
 
-These are promising **evidence sources and diagnostic precedents**, not proof that a reusable Retro API exists.
-
-**Unverified:** the user-mentioned *lane doctor* skill/script could not be located at the obvious `skills/lane-doctor/SKILL.md`, `docs/lane-doctor.md`, or `scripts/lane-doctor.py` paths. It may have a different name, live on a branch, or be part of another skill. Its exact overlap and code reuse cannot be asserted until located. Do not create a duplicate tool before that audit.
-
-## Clarify the responsibilities
-
-| Concern | Primary home | Purpose | Output |
-| --- | --- | --- | --- |
-| Decision discovery (Wayfinder) | Upstream planning / devflow-like workflow | Resolve unknowns before Work acceptance | Decision map, rationale, implementation-ready spec |
-| Run diagnostics (lane doctor and existing scripts) | Operational tooling around hermes-setup / future taisan | Determine what happened and what can safely resume **now** | Evidence-backed diagnosis, safe recovery recommendation |
-| Durable execution and reconciliation | taisan Core + adapters | Maintain authoritative Work/Execution/Invocation state | Observations, outcomes, attention and evidence |
-| Retro learning | Separate analysis *workflow* using existing diagnostics | Find recurring failure patterns across runs and propose prevention | Improvement hypothesis and reviewable change proposal |
-| Improvement verification | Tests / Trace2Eval / measured production outcomes | Test whether the proposed fix actually reduces recurrence | Reproducible regression evidence and KPI delta |
-| Ratchet | Repository checks and CI | Prevent new violations and reduce an approved legacy baseline | Versioned check results and shrinking exceptions |
-
-**Key distinction:** diagnosis is about the *current incident*; Retro is about *recurrent causes and verified future prevention*. The two should share evidence parsers and failure taxonomy, rather than necessarily share an executable or process.
-
-## Architecture preference
+## Preferred architecture
 
 ```text
-Existing hermes-setup diagnostics + lane doctor (audit exact implementation)
-                  |
-                  v
-          Shared evidence normalization
-                  |                     taisan durable observations
-                  +-------------------------------+
-                                                  |
-                                         Cross-run Retro analysis
-                                                  |
-                                improvement proposal / reviewed PR
-                                                  |
-                                  tests / Trace2Eval / KPI comparison
-                                                  |
-                                 approved changes to future Factory runs
+Existing diagnostic interfaces (if available)  +  taisan observations
+                         |
+                  Evidence normalization
+                         |
+                 Cross-run analysis
+                         |
+           Reviewable improvement proposal
+                         |
+             Regression / replay evaluation
+                         |
+          Approved change to future workflows
 ```
 
-A reusable library, an extension to an existing script, or a skill over existing commands are all acceptable. A new standalone CLI is **not** an architectural requirement. Do not migrate Hermes-specific code wholesale into taisan Core; isolate portable evidence schemas/classifiers from operational adapters.
+A library, existing command extension, or skill can be used. A standalone CLI should only be introduced if the source audit identifies a concrete missing entrypoint. Core remains authoritative for execution and safety.
 
-## Required source audit before implementation
+## Implementation prerequisites
 
-1. **Locate lane doctor precisely:** skill path, invocation, branch/PR, inputs, output schema and whether it is read-only or can take recovery actions.
-2. **Inventory existing scripts:** identify overlap in failure classification, run log parsing, halt/judgment episode extraction, finding reconciliation and provenance checking. Record file paths and call sites.
-3. **Trace evidence availability:** which fields are actually persisted/exportable in hermes-setup versus the implemented taisan Rust slice and which remain target design only.
-4. **Classify portability:** generic evidence/diagnosis, Hermes-specific control, and source-workflow compatibility; explicitly avoid two independent truth sources.
-5. **Select the smallest integration:** reuse a skill or library if possible; only introduce a new CLI if there is a concrete missing entrypoint.
-6. **Evaluate on historical incidents:** compare the candidate Retro output against existing lane doctor diagnoses, known human decisions and later fixes.
+1. Inventory available diagnostic interfaces and determine whether they are read-only or capable of changing execution state.
+2. Identify reusable parsers, classifiers and evidence contracts; document **only generic contracts** in public proposals.
+3. Verify which observations are implemented and exportable versus merely specified in the target design.
+4. Prevent duplicate truth sources and preserve exact artifact revision and provenance.
+5. Compare three **synthetic or explicitly approved, sanitized** incident fixtures: recovered failure, repeated review failure and uncertain publication.
+6. Identify a falsifiable improvement hypothesis that can be checked with a regression or replay evaluation.
 
-### Proposed first vertical slice
+Do not copy private logs, code excerpts, issue links, branch names, internal identifiers, infrastructure configuration, or private-repository URLs into this repository, PR descriptions, comments or test fixtures. The detailed provenance audit must stay in its authorized environment; publish only generalized conclusions after review.
 
-Using **three historical incidents** (one recovered halt, one repeated review/finding failure, one uncertain publication or PR binding), produce a read-only comparison:
+## Amendments to the merged proposal
 
-- What did existing diagnostics already identify?
-- What additional **cross-run** insight did Retro produce?
-- Which improvement is testable by a regression case or Trace2Eval?
-- What would count as fewer **avoidable** human interventions on a comparable workload?
-- What is missing or unknown in the evidence?
+- **Wayfinder:** upstream planning and decision mapping; approved handoff to Candidate/Work. No planning state machine in Core.
+- **Retro:** reuse existing diagnostic capabilities where demonstrably available; add cross-run analysis only for proven gaps. No mandatory new CLI.
+- **Ratchet:** unchanged; deterministic checks in CI, with explicit versioned exceptions that never waive Work invariants.
+- **Sequence:** capability audit → read-only Retro experiment → Ratchet pilot → optional Wayfinder pilot.
+- **Authority:** Factory changes require independent review and evidence-based evaluation; no autonomous self-approval.
 
-Exit only if Retro adds a falsifiable insight not already produced by incident diagnosis. Otherwise extend existing diagnostics instead of launching a new component.
+## Acceptance criteria
 
-## Impact on the merged proposal
-
-- **Wayfinder:** replace “selector-side new feature” with “upstream devflow-like decision mapping, with approved handoff into Candidate/Work.” No generic planning state in Core.
-- **Retro:** replace “independent CLI” with “reuse existing diagnostics and add cross-run improvement analysis where a gap is proven.” Do not assume lane doctor is already verified.
-- **Ratchet:** unchanged; keep deterministic versioned checks in repository CI and never use exception baselines to waive Work invariants.
-- **Priorities:** source audit → minimal Retro experiment → Ratchet pilot → optional Wayfinder experiment. No v0.1 release gate.
-- **Governance:** improvements to Factory prompts, policy or code require independent review and evidence-backed evaluation; no autonomous self-approval.
-
-## Acceptance criteria for a subsequent implementation proposal
-
-- [ ] Lane doctor implementation located and reviewed at exact source paths.
-- [ ] Existing diagnostic scripts and persisted evidence fields inventoried with code references.
-- [ ] Explicit reuse-vs-new-component decision with rationale.
-- [ ] Three historical incidents compared, including unknown/insufficient-evidence cases.
-- [ ] One proposed improvement linked to reproducible verification.
-- [ ] No expansion of taisan Core execution authority or v0.1 scope.
+- [ ] Diagnostic reuse decision is grounded in an authorized source audit, with no private provenance published.
+- [ ] Three sanitized fixtures demonstrate where cross-run analysis adds value beyond incident diagnosis.
+- [ ] One proposed improvement has reproducible verification.
+- [ ] No expansion of Core execution authority or v0.1 scope.
+- [ ] Public documentation and PR metadata contain no private source identifiers or operational details.
