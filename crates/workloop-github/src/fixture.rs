@@ -3072,3 +3072,38 @@ fn latest_recorded_head(
         .max_by_key(|(t, i, _)| (*t, *i))
         .map(|(_, _, h)| h))
 }
+
+/// The slice-0 fixture on the shared integration port: inbound facts
+/// through `ingest`, outbound writes through the recorded-intent
+/// outbox. The real adapter implements the same trait, so one
+/// contract test drives both.
+impl crate::port::IntegrationPort for FixtureGithub {
+    fn ingest(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        observation: Observation,
+        now_unix_seconds: i64,
+    ) -> Result<IngestReceipt, StoreError> {
+        self.emit(store, config, observation, now_unix_seconds)
+    }
+
+    fn apply_outbox(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        // Routed through the bounded drain (its unbounded form) so the
+        // trait method never shadows the inherent one.
+        self.apply_outbox_bounded(
+            store,
+            config,
+            &mut || now_unix_seconds,
+            None,
+            None,
+            usize::MAX,
+        )
+        .map(|_| ())
+    }
+}

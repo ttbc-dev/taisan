@@ -44,8 +44,10 @@ Concretely:
 - The built-in queue, state store, supervisor, CLI, and TUI are
   implemented in this repository's own Rust workspace. They do not call
   any source system.
-- The GitHub integration ships as a fixture adapter that performs no
-  network I/O; a real adapter is future work (see issue #17).
+- The GitHub integration ships as a fixture adapter and, behind the
+  same port, a real adapter whose every GitHub call goes through a
+  transport seam exercised by an in-memory double — no live network
+  I/O yet, and a live transport remains future work (see issue #17).
 - The Worker port is exercised by `workloop-fixture-worker`, a real local
   process with scripted failure modes — not by a source-system worker.
 - The Work Selector port is specified in
@@ -99,7 +101,9 @@ integrations.
 
 **Missing integrations:**
 
-- Real GitHub adapter (tracked by issue #17).
+- A live GitHub transport for the real adapter — the adapter and its
+  contract tests exist behind an in-memory transport double; no HTTPS
+  client or live GitHub call yet (tracked by issue #17).
 - A real Worker adapter — e.g. the Claude Code CLI reference worker; the
   port is exercised only by the fixture worker and arbitrary `worker_argv`
   processes.

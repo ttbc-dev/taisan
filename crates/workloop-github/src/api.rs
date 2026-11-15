@@ -1,0 +1,236 @@
+//! The GitHub transport seam: the API surfaces the real adapter calls.
+//! Nothing here decides receipts or Observations — that is the
+//! adapter's job — so a live implementation (HTTPS against the REST
+//! surfaces named in `docs/github-adapter-mapping.md`) and a test
+//! implementation satisfy the same trait and run the same adapter
+//! code. The in-memory double used by the contract tests lives in the
+//! test tree, never in this library surface:
+//!
+//! ```compile_fail
+//! use workloop_github::api::InMemoryGitHub;
+//! ```
+//!
+//! Every operation reports one of two failure classes:
+//! - [`ApiError::Refused`] — a definite no-effect refusal (guard
+//!   mismatch, validation error). The intent records `failed`.
+//! - [`ApiError::Unknown`] — the response was lost; the effect may or
+//!   may not have landed. The adapter records `unknown`, which stays
+//!   outstanding until reconciled by action ID, and never retries it
+//!   blindly.
+
+use workloop_core::identity::{ChangeRequestId, RepositoryRef};
+use workloop_core::observation::CheckConclusion;
+
+/// One transport-level failure of a GitHub API call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiError {
+    /// The host definitely refused the operation before any effect
+    /// landed — a definite no-effect failure, safe to record `failed`.
+    Refused { reason: String },
+    /// The response was lost after the request was issued: the effect
+    /// may or may not have landed. Never a `failed` claim and never a
+    /// silent replay.
+    Unknown { reason: String },
+}
+
+/// A pull request as GitHub reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePull {
+    /// The PR's stable node/database id — the change-request identity.
+    /// The display number is metadata, never an equality key.
+    pub id: String,
+    /// The display number (`#N`) — presentation only.
+    pub display_number: u64,
+    /// The exact head revision the PR currently points at.
+    pub head_sha: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub title: String,
+    pub body: String,
+    /// Whether GitHub reports the PR merged. Nothing in this adapter
+    /// can set it: merge is a human/policy action outside the port.
+    pub merged: bool,
+}
+
+/// One check run as GitHub reports it. `head_sha` is the exact
+/// revision the run examined — a run is never re-labeled onto a newer
+/// head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCheckRun {
+    pub check_run_id: String,
+    pub name: String,
+    pub head_sha: String,
+    pub conclusion: CheckConclusion,
+    /// The app identity that produced the run (display metadata for
+    /// the `producer` field of a Check Observation).
+    pub producer: String,
+}
+
+/// One review as GitHub reports it. `commit_sha` is the `commit_id`
+/// GitHub stamped on the review — the exact revision it examined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReview {
+    pub review_id: String,
+    pub commit_sha: String,
+    /// The reviewing identity GitHub attributes the review to.
+    pub author: String,
+    pub body: String,
+    /// Whether GitHub reports the review as requesting changes. The
+    /// decision itself is a blocking finding even when the review
+    /// carries no inline comments.
+    pub changes_requested: bool,
+}
+
+/// One review finding — an inline review comment — as GitHub reports
+/// it. `commit_sha` is the exact revision the finding's review
+/// examined, so a finding never migrates onto a newer head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReviewFinding {
+    /// The host's stable comment id — the finding's identity.
+    pub finding_id: String,
+    /// The review the finding was submitted under.
+    pub review_id: String,
+    /// The exact revision the finding's review examined.
+    pub commit_sha: String,
+    /// The finding text — the content the occurrence digest covers.
+    pub body: String,
+}
+
+/// One issue comment on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteComment {
+    pub comment_id: String,
+    pub body: String,
+    /// The workloop marker tag the posting intent carried, echoed by
+    /// the host so a lost response can be reconciled by marker.
+    pub marker: String,
+}
+
+/// The transport seam. A live implementation issues HTTPS calls; the
+/// contract tests supply their own in-memory implementation. The
+/// adapter performs no write that does not go through this trait, and
+/// every read it uses for a guard or a receipt comes back through it —
+/// the guard point is the API call itself, immediately before the
+/// write.
+pub trait GitHubApi {
+    /// The repository's recorded default-branch head — the
+    /// repository-level read that establishes the configured
+    /// repository is reachable before any subject read.
+    fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError>;
+
+    /// The current head of `branch`, or `None` when the ref is absent.
+    fn read_branch(
+        &mut self,
+        repository: &RepositoryRef,
+        branch: &str,
+    ) -> Result<Option<String>, ApiError>;
+
+    /// Move `branch` to `new_head` under an exact prior-ref guard:
+    /// `expected_prior` (`None` = absent) must still hold when the
+    /// write is issued, or the call refuses with no effect. Returns
+    /// the head the write set; the adapter re-reads the ref afterward
+    /// for the receipt's read-back.
+    fn write_ref(
+        &mut self,
+        repository: &RepositoryRef,
+        branch: &str,
+        new_head: &str,
+        expected_prior: Option<&str>,
+    ) -> Result<String, ApiError>;
+
+    /// Read one pull request by its stable id.
+    fn read_pull(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<RemotePull, ApiError>;
+
+    /// Open a pull request from `source_branch` into `target_branch`.
+    fn open_pull(
+        &mut self,
+        repository: &RepositoryRef,
+        source_branch: &str,
+        target_branch: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<RemotePull, ApiError>;
+
+    /// Update the stored metadata fields; omitted fields are never
+    /// rewritten. The head is not part of this call — the adapter
+    /// re-reads it immediately before calling.
+    fn update_pull(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<RemotePull, ApiError>;
+
+    /// Post one comment carrying `marker` and `body`; the returned
+    /// comment is the host's stored read-back.
+    fn comment_on_pull(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+        marker: &str,
+        body: &str,
+    ) -> Result<RemoteComment, ApiError>;
+
+    /// Find a comment by its marker on one pull request — the
+    /// reconciliation read for a comment whose response was lost.
+    fn find_comment(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+        marker: &str,
+    ) -> Result<Option<RemoteComment>, ApiError>;
+
+    /// List the pull requests opened from `source_branch` whose head is
+    /// the recorded source revision — the reconciliation read for an
+    /// `open_change_request` whose response was lost. Filtering by the
+    /// recorded revision, not merely the branch, prevents adopting a
+    /// change request this Work never opened.
+    fn list_pulls_on_branch(
+        &mut self,
+        repository: &RepositoryRef,
+        source_branch: &str,
+        head_sha: &str,
+    ) -> Result<Vec<RemotePull>, ApiError>;
+
+    /// The check runs GitHub reports for the exact `head_sha`.
+    fn check_runs(
+        &mut self,
+        repository: &RepositoryRef,
+        head_sha: &str,
+    ) -> Result<Vec<RemoteCheckRun>, ApiError>;
+
+    /// The review stream of one pull request; each review keeps the
+    /// commit it examined.
+    fn reviews(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<Vec<RemoteReview>, ApiError>;
+
+    /// The review findings (inline review comments) GitHub reports for
+    /// one pull request; each finding keeps the commit its review
+    /// examined. This is the surface behind `review_findings_read`:
+    /// when it cannot be read, the adapter records reviews with an
+    /// unavailable completeness — an empty finding set is never
+    /// claimed without this source answering.
+    fn review_findings(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<Vec<RemoteReviewFinding>, ApiError>;
+
+    /// Whether `descendant`'s recorded ancestry contains `ancestor` —
+    /// used to classify a push read-back (`Equal`/`Ancestor`/
+    /// `Diverged`).
+    fn contains_revision(
+        &mut self,
+        repository: &RepositoryRef,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, ApiError>;
+}
