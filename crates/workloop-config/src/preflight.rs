@@ -1174,6 +1174,12 @@ fn stage_isolation_primitives(profile: &Profile, options: &CheckOptions) -> Vec<
     Vec::new()
 }
 
+/// How many times stage (7) re-reads the main header and the WAL
+/// together before declaring the store uninspectable. A live store
+/// under write load can keep moving; the bound keeps `check` finite
+/// and fails closed rather than trusting a stale view.
+const STORE_INSPECT_ATTEMPTS: u32 = 3;
+
 /// Stage (7): the store is recognized or absent. `check` never opens
 /// the store (opening can journal, flip WAL, or migrate) — the header
 /// is read directly: magic, page count, and `user_version`. Absent or
@@ -1182,48 +1188,66 @@ fn stage_isolation_primitives(profile: &Profile, options: &CheckOptions) -> Vec<
 /// the store path named.
 fn stage_store(store_path: &Path) -> Vec<Diagnostic> {
     let display = store_path.display().to_string();
-    let mut header = [0u8; 100];
-    let read = match read_store_header(store_path, &mut header) {
-        Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
+    // Each attempt pairs a fresh main-header read with a WAL scan. A
+    // live store can checkpoint or restart its WAL mid-inspection, so
+    // only a quiet attempt classifies; a store that keeps moving fails
+    // closed as unreadable rather than trusting a stale view.
+    let mut attempt = 0;
+    let (page_count, version) = loop {
+        attempt += 1;
+        let mut header = [0u8; 100];
+        let read = match read_store_header(store_path, &mut header) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                return vec![Diagnostic::new(
+                    "store.unreadable",
+                    &display,
+                    format!("store read: {e}"),
+                )];
+            }
+        };
+        if read == 0 {
+            // A zero-length file is a fresh database; the first open
+            // bootstraps it under the store's own format gate.
+            return Vec::new();
+        }
+        if read < 100 || header[..16] != SQLITE_MAGIC[..] {
             return vec![Diagnostic::new(
-                "store.unreadable",
+                "store.corrupt",
                 &display,
-                format!("store read: {e}"),
+                format!("{display} is not a SQLite store file"),
             )];
         }
-    };
-    if read == 0 {
-        // A zero-length file is a fresh database; the first open
-        // bootstraps it under the store's own format gate.
-        return Vec::new();
-    }
-    if read < 100 || header[..16] != SQLITE_MAGIC[..] {
-        return vec![Diagnostic::new(
-            "store.corrupt",
-            &display,
-            format!("{display} is not a SQLite store file"),
-        )];
-    }
-    let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
-    let version = i64::from(u32::from_be_bytes([
-        header[60], header[61], header[62], header[63],
-    ]));
-    // A WAL-mode store keeps committed writes in `<store>-wal` until a
-    // checkpoint lands them in the main file, so the header's version
-    // and page count are stale exactly while committed frames are
-    // pending — a live initialized store would read as unversioned.
-    // Inspect the WAL's committed prefix instead: reads only, so the
-    // no-local-writes rule is unchanged.
-    let (page_count, version) = match wal_store_facts(store_path, &header) {
-        Ok(Some(facts)) => (
-            facts.committed_pages.unwrap_or(page_count),
-            facts.page1_user_version.unwrap_or(version),
-        ),
-        Ok(None) => (page_count, version),
-        Err(message) => {
-            return vec![Diagnostic::new("store.unreadable", &display, message)];
+        let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+        let version = i64::from(u32::from_be_bytes([
+            header[60], header[61], header[62], header[63],
+        ]));
+        // A WAL-mode store keeps committed writes in `<store>-wal` until
+        // a checkpoint lands them in the main file, so the header's
+        // version and page count are stale exactly while committed
+        // frames are pending — a live initialized store would read as
+        // unversioned. Inspect the WAL's committed prefix instead:
+        // reads only, so the no-local-writes rule is unchanged.
+        match wal_store_facts(store_path, &header) {
+            Ok(WalScan::Facts(facts)) => {
+                break (
+                    facts.committed_pages.unwrap_or(page_count),
+                    facts.page1_user_version.unwrap_or(version),
+                );
+            }
+            Ok(WalScan::Quiet) => break (page_count, version),
+            Ok(WalScan::Moved) if attempt < STORE_INSPECT_ATTEMPTS => continue,
+            Ok(WalScan::Moved) => {
+                return vec![Diagnostic::new(
+                    "store.unreadable",
+                    &display,
+                    "the store changed while it was being inspected",
+                )];
+            }
+            Err(message) => {
+                return vec![Diagnostic::new("store.unreadable", &display, message)];
+            }
         }
     };
     if version == 0 {
@@ -1272,6 +1296,18 @@ struct WalFacts {
     page1_user_version: Option<i64>,
 }
 
+/// The outcome of one WAL inspection attempt.
+enum WalScan {
+    /// No committed WAL facts — the main-file header is authoritative.
+    Quiet,
+    /// Committed facts from a WAL generation that stayed stable across
+    /// the whole scan.
+    Facts(WalFacts),
+    /// The WAL restarted or grew mid-scan — the main header and the
+    /// WAL must be inspected again together before classifying.
+    Moved,
+}
+
 fn wal_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(bytes[..4].try_into().expect("4-byte field"))
 }
@@ -1295,15 +1331,16 @@ fn wal_checksum(s1: &mut u32, s2: &mut u32, data: &[u8], big_endian: bool) {
 }
 
 /// Read the committed prefix of `<store>-wal` when `header` marks the
-/// database WAL-mode (format bytes 18/19). Returns `Ok(None)` when
-/// there is nothing committed in the WAL — the main header is then
-/// authoritative — and `Err` when the WAL cannot be inspected: the
-/// stage reports the check as unavailable rather than trusting a
-/// possibly stale header.
-fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFacts>, String> {
+/// database WAL-mode (format bytes 18/19). `Quiet` means there is
+/// nothing committed in the WAL — the main header is then
+/// authoritative — `Moved` means the store changed under the scan and
+/// the caller must inspect header and WAL together again, and `Err`
+/// means the WAL cannot be inspected: the stage reports the check as
+/// unavailable rather than trusting a possibly stale header.
+fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<WalScan, String> {
     use std::io::{Read, Seek, SeekFrom};
     if header[18] != 2 || header[19] != 2 {
-        return Ok(None);
+        return Ok(WalScan::Quiet);
     }
     let mut wal_name = store_path.as_os_str().to_os_string();
     wal_name.push("-wal");
@@ -1311,12 +1348,12 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFa
     let fail = |reason: &str| format!("write-ahead log {}: {reason}", wal_path.display());
     let mut file = match std::fs::File::open(&wal_path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WalScan::Quiet),
         Err(e) => return Err(fail(&e.to_string())),
     };
     let len = file.metadata().map_err(|e| fail(&e.to_string()))?.len();
     if len == 0 {
-        return Ok(None);
+        return Ok(WalScan::Quiet);
     }
     if len < WAL_HEADER_LEN as u64 {
         return Err(fail("the header is truncated"));
@@ -1354,7 +1391,7 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFa
     let mut page = vec![0u8; page_len];
     let mut offset = WAL_HEADER_LEN as u64;
     let mut pending_page1 = None;
-    let mut committed_page1 = None;
+    let mut committed_page1_version = None;
     let mut committed_pages = None;
     while offset + frame_len as u64 <= len {
         if file.read_exact(&mut frame_header).is_err() {
@@ -1372,12 +1409,15 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFa
             break;
         }
         if wal_u32(&frame_header[0..4]) == 1 {
-            pending_page1 = Some(offset + WAL_FRAME_HEADER_LEN as u64);
+            // `user_version` sits at bytes 60-63 of the page-1 image —
+            // read it now, while the frame is checksum-validated, so
+            // no later reread can observe recycled WAL content.
+            pending_page1 = Some(i64::from(wal_u32(&page[60..64])));
         }
         let n_truncate = wal_u32(&frame_header[4..8]);
         if n_truncate != 0 {
-            if let Some(image) = pending_page1.take() {
-                committed_page1 = Some(image);
+            if let Some(version) = pending_page1.take() {
+                committed_page1_version = Some(version);
             }
             committed_pages = Some(n_truncate);
         }
@@ -1386,39 +1426,20 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFa
 
     // The facts are only meaningful for the generation the scan
     // started in: a checkpoint restarting the WAL mid-scan rewrote the
-    // header, and the checkpoint also means the main header is current
-    // again — discard and let it speak.
+    // header, and appended frames mean the committed prefix moved on —
+    // either way the caller re-inspects header and WAL together.
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.read_exact(&mut wal_header))
         .map_err(|e| fail(&e.to_string()))?;
     if wal_header != generation_header {
-        return Ok(None);
+        return Ok(WalScan::Moved);
     }
-
-    // Recover `user_version` from the newest committed page-1 image.
-    // A committed page always opens with the database magic; anything
-    // else means the WAL shifted under the scan after all.
-    let page1_user_version = match committed_page1 {
-        Some(image_offset) => {
-            let mut image_head = [0u8; 64];
-            file.seek(SeekFrom::Start(image_offset))
-                .and_then(|_| file.read_exact(&mut image_head))
-                .map_err(|e| fail(&e.to_string()))?;
-            if image_head[..16] != SQLITE_MAGIC[..] {
-                return Err(fail("a committed page-1 image is not a database page"));
-            }
-            Some(i64::from(u32::from_be_bytes([
-                image_head[60],
-                image_head[61],
-                image_head[62],
-                image_head[63],
-            ])))
-        }
-        None => None,
-    };
-    Ok(Some(WalFacts {
+    if file.metadata().map_err(|e| fail(&e.to_string()))?.len() != len {
+        return Ok(WalScan::Moved);
+    }
+    Ok(WalScan::Facts(WalFacts {
         committed_pages,
-        page1_user_version,
+        page1_user_version: committed_page1_version,
     }))
 }
 
@@ -2302,6 +2323,142 @@ mod tests {
             BoundedRun::Exited { .. } => "exited",
             BoundedRun::TimedOut => "timed out",
             BoundedRun::SpawnFailed(_) => "spawn failed",
+        }
+    }
+
+    /// Build a synthetic WAL: valid header salts and cumulative
+    /// checksums over `frames` of `(pgno, n_truncate, page bytes)`.
+    /// Page-1 images carry `user_version` at bytes 60-63 exactly where
+    /// SQLite keeps it.
+    fn synthetic_wal(page_size: u32, frames: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut wal = Vec::new();
+        let mut header = vec![0u8; WAL_HEADER_LEN];
+        header[0..4].copy_from_slice(&WAL_MAGIC_LITTLE_ENDIAN.to_be_bytes());
+        header[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        let (salt1, salt2) = (0xA5A5_A5A5u32, 0x5A5A_5A5Au32);
+        header[16..20].copy_from_slice(&salt1.to_be_bytes());
+        header[20..24].copy_from_slice(&salt2.to_be_bytes());
+        let (mut s1, mut s2) = (0u32, 0u32);
+        wal_checksum(&mut s1, &mut s2, &header[..24], false);
+        header[24..28].copy_from_slice(&s1.to_be_bytes());
+        header[28..32].copy_from_slice(&s2.to_be_bytes());
+        wal.extend_from_slice(&header);
+        for (pgno, n_truncate, page) in frames {
+            let mut frame = vec![0u8; WAL_FRAME_HEADER_LEN];
+            frame[0..4].copy_from_slice(&pgno.to_be_bytes());
+            frame[4..8].copy_from_slice(&n_truncate.to_be_bytes());
+            frame[8..12].copy_from_slice(&salt1.to_be_bytes());
+            frame[12..16].copy_from_slice(&salt2.to_be_bytes());
+            wal_checksum(&mut s1, &mut s2, &frame[..8], false);
+            wal_checksum(&mut s1, &mut s2, page, false);
+            frame[16..20].copy_from_slice(&s1.to_be_bytes());
+            frame[20..24].copy_from_slice(&s2.to_be_bytes());
+            wal.extend_from_slice(&frame);
+            wal.extend_from_slice(page);
+        }
+        wal
+    }
+
+    /// A WAL-mode main header: format bytes 18/19 mark WAL, the rest is
+    /// irrelevant to the scan.
+    fn wal_mode_header() -> [u8; 100] {
+        let mut header = [0u8; 100];
+        header[..16].copy_from_slice(SQLITE_MAGIC);
+        header[18] = 2;
+        header[19] = 2;
+        header
+    }
+
+    /// `wal_store_facts` promotes `user_version` only from committed
+    /// page-1 frames — extracted inline from the checksum-validated
+    /// buffer — and the newest commit wins.
+    #[test]
+    fn wal_facts_come_from_committed_checksum_validated_frames() {
+        let dir = std::env::temp_dir().join(format!(
+            "preflight-wal-unit-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store.db");
+        let mut page1 = vec![0u8; 4096];
+        page1[..16].copy_from_slice(SQLITE_MAGIC);
+        page1[60..64].copy_from_slice(&6u32.to_be_bytes());
+        let mut page1_newer = vec![0u8; 4096];
+        page1_newer[..16].copy_from_slice(SQLITE_MAGIC);
+        page1_newer[60..64].copy_from_slice(&7u32.to_be_bytes());
+        let data_page = vec![0u8; 4096];
+        let wal = synthetic_wal(
+            4096,
+            &[
+                (1, 0, page1.clone()),
+                (2, 5, data_page.clone()), // commits txn 1: 5 pages, page1 v6
+                (1, 0, page1_newer.clone()),
+                (3, 6, data_page.clone()), // commits txn 2: page1 v7
+            ],
+        );
+        std::fs::write(dir.join("store.db-wal"), &wal).unwrap();
+        let _ = std::fs::write(&store, b"");
+
+        match wal_store_facts(&store, &wal_mode_header()) {
+            Ok(WalScan::Facts(facts)) => {
+                assert_eq!(facts.committed_pages, Some(6));
+                assert_eq!(facts.page1_user_version, Some(7));
+            }
+            other => panic!("expected committed facts, got {}", wal_scan_name(&other)),
+        }
+
+        // A frame whose bytes no longer match its checksum ends the
+        // committed prefix exactly where a SQLite reader would stop.
+        let mut tampered = wal.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        std::fs::write(dir.join("store.db-wal"), &tampered).unwrap();
+        match wal_store_facts(&store, &wal_mode_header()) {
+            Ok(WalScan::Facts(facts)) => {
+                // Only the first transaction survives the bad tail.
+                assert_eq!(facts.committed_pages, Some(5));
+                assert_eq!(facts.page1_user_version, Some(6));
+            }
+            other => panic!("expected committed facts, got {}", wal_scan_name(&other)),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-WAL headers and absent WALs report `Quiet` — the main
+    /// header stays authoritative.
+    #[test]
+    fn wal_facts_stay_quiet_without_a_wal_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "preflight-wal-quiet-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store.db");
+        let _ = std::fs::write(&store, b"");
+
+        let mut journal_header = wal_mode_header();
+        journal_header[18] = 1;
+        journal_header[19] = 1;
+        assert!(matches!(
+            wal_store_facts(&store, &journal_header),
+            Ok(WalScan::Quiet)
+        ));
+        assert!(matches!(
+            wal_store_facts(&store, &wal_mode_header()),
+            Ok(WalScan::Quiet)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wal_scan_name(scan: &Result<WalScan, String>) -> &'static str {
+        match scan {
+            Ok(WalScan::Quiet) => "quiet",
+            Ok(WalScan::Facts(_)) => "facts",
+            Ok(WalScan::Moved) => "moved",
+            Err(_) => "error",
         }
     }
 }
