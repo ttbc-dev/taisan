@@ -201,6 +201,18 @@ impl CommandDecision {
             Self::Accepted { command_id, .. } | Self::Rejected { command_id, .. } => command_id,
         }
     }
+
+    /// The sequence the decision's effects were anchored at. For an
+    /// accepted resume/release this is the `enqueued_seq` the command
+    /// assigned to the requeued Execution — the boundary between wait
+    /// generations.
+    pub fn committed_at(&self) -> EventSequence {
+        match self {
+            Self::Accepted { committed_at, .. } | Self::Rejected { committed_at, .. } => {
+                *committed_at
+            }
+        }
+    }
 }
 
 /// The canonical payload bytes stored with the decision so replay

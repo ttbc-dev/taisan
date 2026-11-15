@@ -1,3 +1,4 @@
+pub mod census;
 pub mod command;
 pub mod credential;
 pub mod domain;
