@@ -1,6 +1,6 @@
 # Selector and worker adapter boundaries
 
-Status: design contract for the adapter contracts, including the publication decision in ADR-001 below. This is not a claim of implemented real integrations. This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). The Worker role is exercised through the execution supervisor and a configurable `worker_argv` (the fixture worker in slice 0); the Work Selector port and the real GitHub adapter are not yet implemented. See [provenance](provenance.md) for the implementation audit.
+Status: design contract for the adapter contracts, including the publication decision in ADR-001 below. This is not a claim of implemented real integrations. This document refines [architecture](architecture.md), [module contracts](module-contracts.md), and [lifecycle](lifecycle.md). The Worker role is exercised through the execution supervisor and a configurable `worker_argv` (the fixture worker in slice 0); the snapshot-based reference Selector is implemented, while the external Selector command protocol below remains a design contract. See [provenance](provenance.md) for the implementation audit.
 
 ## Goal
 
@@ -29,18 +29,15 @@ The repository-host integration is also replaceable under [ADR-002](repository-h
 
 ### Selector contract
 
-A selector receives an explicit repository allowlist, selection policy, a snapshot/cursor of available source facts, and a bounded request (e.g. maximum candidates). It returns **proposals**, not commands:
+The existing reference Selector is a pure snapshot-based implementation. It receives an explicit repository allowlist, selection policy, a snapshot of available source facts, and a bounded request. It returns proposals, not commands. Its deterministic single-issue proposals enter the normal submit admission path.
 
-- stable proposal key and source revision/cursor;
-- one or more issue references; goal/intent, constraints, optional verification requirements;
-- rationale and provenance; optional grouping key;
-- declared required permissions/resources; no hidden expansion beyond allowlist.
+For v0.2, the [stateless external Selector protocol](selector-protocol.md) (#200) defines a versioned stdin/stdout JSON request and response for one configured argv command. The request supplies scoped repositories, unfinished-Work source exclusions, task defaults, a candidate bound, and a deadline. The adapter fetches source facts and owns selection, ranking, and complete grouping. This replaces the snapshot-input requirement only for the external protocol. It does not add an external command implementation or change the existing snapshot entry point.
 
-Core validates proposal shape, repository scope, source freshness, idempotency and overlap/admission policy. Acceptance creates Work and its first queued Execution through the normal Command path. A selector may return zero proposals or fail without stopping existing Work. A proposal does not reserve a slot or authorize a worker.
+The protocol retains the existing Proposal task fields and Proposal-to-submit translation. A complete grouped candidate has multiple source bindings and one task. It becomes one Work, never one execution per member. taisan validates the entire response before submitting any candidate, preserves candidate order, and handles ordinary admission rejections separately from response contract violations. Validation requires no second human approval before normal admission.
 
-**Reference selector:** list eligible GitHub issues from a configured allowlist, propose **one issue per Work**, no semantic grouping, deterministic order and stable proposal keys. This is intentionally simple. More sophisticated grouping belongs in any third-party adapter satisfying the contract.
+Core owns repository scope, source freshness, idempotency, source overlap, queue, execution, and Outcome. The adapter receives no store handle, Worker authority, or publication credential. It resolves its own source-read authentication. [Exact schemas, byte and count limits, identity rules, and failure examples](selector-protocol.md) are normative for dependent external-adapter implementation.
 
-The [identity/storage contract](identity-storage.md) settles same-scoped-Issue overlap: reject a new Work while unfinished Work owns that source Issue, for both manual and Selector admission. Stable proposal keys replay their original decision; safe terminal release permits a new explicit submission. Manual `submit` remains supported without a selector. Richer grouping and unattended selection remain deferred.
+The [identity/storage contract](identity-storage.md) settles same-scoped-Issue overlap. A new Work cannot claim a source Issue owned by unfinished Work, for both manual and Selector admission. Stable proposal keys replay their original decision. Safe terminal release permits a new explicit submission. Manual `submit` remains supported without a selector. The reference Selector continues to propose one Issue per Work; the external protocol permits adapter-owned grouping.
 
 ### Worker contract
 

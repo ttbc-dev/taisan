@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Stateless external Selector protocol version 1",
+  "description": "Structural schema. The accompanying protocol defines UTF-8 byte bounds and cross-field validation. Validate against #/$defs/request, success, or failure.",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+    },
+    "adapter": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,63}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "repository"
+      ],
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/id"
+        },
+        "repository": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "issue",
+        "display_number"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "issue": {
+          "$ref": "#/$defs/id"
+        },
+        "display_number": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            }
+          ]
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue",
+        "revision",
+        "content_digest"
+      ],
+      "properties": {
+        "issue": {
+          "$ref": "#/$defs/issue"
+        },
+        "revision": {
+          "$ref": "#/$defs/id"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+      },
+      "minItems": 0,
+      "maxItems": 64,
+      "uniqueItems": true
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+      },
+      "minItems": 0,
+      "maxItems": 64
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+      },
+      "minItems": 0,
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent",
+        "constraints",
+        "verification_argv"
+      ],
+      "properties": {
+        "intent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "verification_argv": {
+          "$ref": "#/$defs/argv"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_cursor",
+        "fetched_unix_seconds"
+      ],
+      "properties": {
+        "snapshot_cursor": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+            }
+          ]
+        },
+        "fetched_unix_seconds": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            }
+          ]
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "selector",
+        "selector_version",
+        "policy_revision",
+        "sources",
+        "task",
+        "required_permissions",
+        "provenance"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/digest"
+        },
+        "selector": {
+          "$ref": "#/$defs/adapter"
+        },
+        "selector_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "policy_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true
+        },
+        "task": {
+          "$ref": "#/$defs/task"
+        },
+        "required_permissions": {
+          "$ref": "#/$defs/permissions"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "capabilities",
+        "request_id",
+        "selector",
+        "selector_version",
+        "policy_revision",
+        "repositories",
+        "excluded_sources",
+        "max_candidates",
+        "deadline_unix_ms",
+        "task_constraints",
+        "verification_argv",
+        "required_permissions"
+      ],
+      "properties": {
+        "protocol_version": {
+          "const": "1"
+        },
+        "capabilities": {
+          "const": [
+            "grouped_sources_v1"
+          ]
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "selector": {
+          "$ref": "#/$defs/adapter"
+        },
+        "selector_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "policy_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "repositories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/repository"
+          },
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "excluded_sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue"
+          },
+          "minItems": 0,
+          "maxItems": 4096,
+          "uniqueItems": true
+        },
+        "max_candidates": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "deadline_unix_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "task_constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "verification_argv": {
+          "$ref": "#/$defs/argv"
+        },
+        "required_permissions": {
+          "$ref": "#/$defs/permissions"
+        }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "capabilities",
+        "request_id",
+        "status",
+        "candidates"
+      ],
+      "properties": {
+        "protocol_version": {
+          "const": "1"
+        },
+        "capabilities": {
+          "const": [
+            "grouped_sources_v1"
+          ]
+        },
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proposal"
+          },
+          "minItems": 0,
+          "maxItems": 32
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "request_id",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "protocol_version": {
+          "const": "1"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "status": {
+          "const": "error"
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_request",
+                "unsupported_version",
+                "unsupported_capability",
+                "input_limit",
+                "member_limit",
+                "source_unavailable",
+                "authentication_failed",
+                "deadline_exceeded",
+                "internal_error"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/success"
+    },
+    {
+      "$ref": "#/$defs/failure"
+    }
+  ]
+}

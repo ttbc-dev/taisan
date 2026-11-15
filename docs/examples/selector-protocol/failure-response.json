@@ -1,0 +1,9 @@
+{
+  "protocol_version": "1",
+  "request_id": "scan-001",
+  "status": "error",
+  "error": {
+    "code": "source_unavailable",
+    "message": "Source read unavailable."
+  }
+}

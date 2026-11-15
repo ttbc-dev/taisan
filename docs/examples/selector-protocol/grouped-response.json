@@ -1,0 +1,61 @@
+{
+  "protocol_version": "1",
+  "capabilities": [
+    "grouped_sources_v1"
+  ],
+  "request_id": "scan-001",
+  "status": "ok",
+  "candidates": [
+    {
+      "key": "b636ae575bbef3269289f01a74a10fe1b10502572e1fe40bf6426c2798f57447",
+      "selector": "public-issue-selector",
+      "selector_version": 1,
+      "policy_revision": 7,
+      "sources": [
+        {
+          "issue": {
+            "repository": {
+              "host": "public-host",
+              "repository": "repo-17"
+            },
+            "issue": "issue-21",
+            "display_number": 21
+          },
+          "revision": "revision-3",
+          "content_digest": "content-21"
+        },
+        {
+          "issue": {
+            "repository": {
+              "host": "public-host",
+              "repository": "repo-17"
+            },
+            "issue": "issue-22",
+            "display_number": 22
+          },
+          "revision": "revision-3",
+          "content_digest": "content-22"
+        }
+      ],
+      "task": {
+        "intent": "Document the parser and its error cases together.",
+        "constraints": [
+          "Keep the public API unchanged."
+        ],
+        "verification_argv": [
+          "cargo",
+          "test",
+          "-p",
+          "example-library"
+        ]
+      },
+      "required_permissions": [
+        "workspace_write"
+      ],
+      "provenance": {
+        "snapshot_cursor": null,
+        "fetched_unix_seconds": 1794787200
+      }
+    }
+  ]
+}
