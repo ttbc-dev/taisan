@@ -38,8 +38,13 @@ use workloop_store::sqlite::SqliteStore;
 const NOW: i64 = 1_700_000_000;
 
 /// The documented Command/Query surface of the skill: one entry point
-/// per operation, 1:1 with the CLI's workflow operations.
+/// per operation, 1:1 with the CLI's workflow operations. U7.4 adds
+/// the setup rows (`init`, `check`, exercised with and without
+/// `--probe`) the walkthrough and the applicable matrix enumerate; the
+/// twelve workflow operations below are U7.3's set.
 const DOCUMENTED_OPS: &[&str] = &[
+    "init",
+    "check",
     "submit",
     "work-list",
     "work-detail",

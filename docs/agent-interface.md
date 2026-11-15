@@ -32,7 +32,7 @@ Before mutation, the caller retains the installation/actor identity, idempotency
 
 ## Installation and invocation deliverables
 
-The eventual release must include runnable instructions for installing the CLI from the checkout, configuring one isolated installation, installing and discovering the provided skill in a supported coding agent, and invoking it with a sample issue, intent, constraints, and verification command. The instructions must name the supported agent and actual skill location/invocation once implemented. This scope decision makes no unsupported portability claim and provides no placeholder installation command for a nonexistent skill.
+The eventual release must include runnable instructions for installing the CLI from the checkout, configuring one isolated installation, installing and discovering the provided skill in a supported coding agent, and invoking it with a sample issue, intent, constraints, and verification command. The instructions must name the supported agent and actual skill location/invocation once implemented. This scope decision makes no unsupported portability claim and provides no placeholder installation command for a nonexistent skill. The delivered instructions are the [skill walkthrough](skill-walkthrough.md), captured against OpenCode; the shipped skill is `skills/taisan/SKILL.md`.
 
 The walkthrough must explain which installation and actor the skill uses, how credentials are supplied through installation configuration, how the execution loop runs independently of the conversation, and how to inspect or stop work directly through the CLI. It must cover a rejected action and recovery after a lost response. TUI and MCP installation must not be prerequisites.
 
