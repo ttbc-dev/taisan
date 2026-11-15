@@ -296,6 +296,33 @@ fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, Exec
                     observed_unix_seconds: NOW,
                 },
             })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(format!("{}-invariant-check", eid.0)),
+                    request_id: format!("{}:inv:check", eid.0),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: obs(
+                    &work_id,
+                    &eid,
+                    None,
+                    NOW,
+                    ObservationFact::ProcessState {
+                        invocation_id: InvocationId(format!("{}-invariant-check", eid.0)),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Exited,
+                        exit_code: Some(0),
+                    },
+                ),
+            })?;
             let mut execution = tx.execution(&eid)?.unwrap();
             execution.state = ExecutionState::Waiting;
             execution.waiting_reason = Some(WaitingReason::Ci);
@@ -863,6 +890,7 @@ fn terminal_cancellation_defers_until_the_unknown_effect_reconciles() {
                     invocation_id: InvocationId("inv-cancel".into()),
                     process_identity: String::new(),
                     state: ProcessStateFact::Exited,
+                    exit_code: None,
                 },
                 observed_unix_seconds: NOW,
             },
@@ -1389,6 +1417,7 @@ fn review_findings_from_the_host_block_the_review_lane_until_dispositioned() {
             invocation_id: InvocationId(format!("{}-coding", eid.0)),
             process_identity: String::new(),
             state: ProcessStateFact::Exited,
+            exit_code: None,
         },
     );
     let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();

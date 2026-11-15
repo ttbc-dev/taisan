@@ -56,4 +56,20 @@ PY
 | Local links in the protocol, boundary, and evidence documents | Passed |
 | `git diff --check` | Passed |
 
-The workspace-test failures occur in unchanged Rust files at the tested baseline. This issue changes documentation and JSON examples only. Live evidence is absent and is not inferred from fixture results.
+The workspace-test failures occur in unchanged Rust files at the tested baseline. The original #200 commit changes documentation and JSON examples only. Live evidence is absent and is not inferred from fixture results.
+
+## CI fixture correction for #221
+
+The first PR check on document revision `7b3c24c` reproduced the two missing `exit_code` initializers. After those compiled, three completion tests exposed another outdated fixture: `waiting_with_applied_publish` omitted the invariant-check Invocation and its own successful exit observation. An assessment alone does not satisfy that gate.
+
+The #221 correction adds the completed invariant-check Invocation and `Exited` observation with `Some(0)` to that shared fixture. The cancellation and pause observations use `exit_code: None`, because they prove stopping without claiming a successful check. Production behavior and the external Selector protocol are unchanged.
+
+After this correction, the following commands passed locally on the same runtime baseline:
+
+- `cargo fmt --check`
+- `cargo build --locked --workspace`
+- `cargo test --locked -p workloop-github --test github_adapter`, all 21 tests
+- `cargo test --locked --workspace`
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`
+
+These results supersede the initial repository-check failures above. They remain fixture evidence, with no live execution.
