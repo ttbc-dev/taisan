@@ -2725,14 +2725,34 @@ fn reconcile_intent(
         return Ok(());
     };
     // Terminal reconciliation sticks: a late receipt cannot resurrect a
-    // failed or unsupported intent or downgrade an applied one.
-    // `unknown` stays reconcilable — a later receipt for the same
-    // action_id is what resolves it.
+    // failed or unsupported intent or downgrade an applied one — with
+    // one drift exception. An `applied` intent whose remote fact later
+    // diverges is re-armable: an `unknown` receipt re-opens
+    // reconciliation, but only when authenticated by the intent's bound
+    // actor *and* the receipt's effects carry the drift fact itself. A
+    // stale or out-of-order transport-`unknown` without drift evidence
+    // is not a re-arm — it would demote a settled intent behind a
+    // receipt that proves nothing about the remote. An unauthenticated
+    // or unbound receipt is invalid evidence and can never re-open a
+    // reconciled intent. `unknown` stays reconcilable — a later
+    // receipt for the same action_id is what resolves it.
+    if intent.status == HostActionStatus::Applied {
+        let drift_rearm = matches!(status, HostActionStatus::Unknown { .. })
+            && authenticated_actor.as_ref() == Some(&intent.actor)
+            && is_drift_evidence(&intent, &effects);
+        if !drift_rearm {
+            return Ok(());
+        }
+        return tx.apply(&Effect::UpdateHostActionIntent {
+            action_id: action_id.to_string(),
+            status,
+            authenticated_actor,
+            effects,
+        });
+    }
     if matches!(
         intent.status,
-        HostActionStatus::Applied
-            | HostActionStatus::Failed { .. }
-            | HostActionStatus::Unsupported { .. }
+        HostActionStatus::Failed { .. } | HostActionStatus::Unsupported { .. }
     ) {
         return Ok(());
     }
@@ -2765,6 +2785,34 @@ fn reconcile_intent(
         status: recorded,
         authenticated_actor,
         effects,
+    })
+}
+
+/// Whether the receipt evidences real drift for this intent — a
+/// remote ref observation proving the pushed revision is no longer
+/// contained. Only a `push_ref` intent has a drift fact; for every
+/// other action an `unknown` receipt against an `applied` intent is a
+/// stale or out-of-order transport record, never re-arm evidence.
+fn is_drift_evidence(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -> bool {
+    let HostAction::PushRef {
+        branch, produced, ..
+    } = &intent.action
+    else {
+        return false;
+    };
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            NormalizedEffectFact::RefPublished {
+                repository,
+                branch: ref_branch,
+                produced: ref_produced,
+                relation: RefRelation::Diverged,
+                ..
+            } if repository == &intent.repository
+                && ref_branch == branch
+                && ref_produced == produced
+        )
     })
 }
 
