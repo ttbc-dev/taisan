@@ -34,9 +34,12 @@ installation may happen before the recorded authorization exists.
 >   profile (`github` adapter + dedicated `s1-reviewer` App +
 >   `S1_PUBLICATION_CREDENTIAL` + reference Worker); evidence will be
 >   classified Profile R and will not be claimed as target-profile
->   acceptance. [If the owner instead intends the target profile,
->   replace this clause — the target profile is not executable on the
->   current tree; see runbook §1.4/§1.6.]
+>   acceptance. This run's evidence is the live-evidence record for
+>   #113's per-variant criterion; target-profile certification is
+>   explicitly out of scope and remains tracked in #149/#183/#96.
+>   [If the owner instead intends the target profile, replace this
+>   clause — the target profile is not executable on the current tree;
+>   see runbook §1.4/§1.6.]
 > - **Variants**: `success`, `Attention`, and `recovery` — each under
 >   its own run tag, state directory, store, and seeded issue, per
 >   `docs/s1/live-runbook.md` §5–§7.

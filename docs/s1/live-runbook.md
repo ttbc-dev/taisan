@@ -87,23 +87,24 @@ the prepared materials with its own run tags, stores, seeds, and
 recorded identities; prior rehearsals are cited as methodology, never
 as this run's evidence.
 
-### 1.6 Decision required before execution
+### 1.6 Owner decision (communicated 2026-11-15; formal authorization to be recorded on #113)
 
-The owner chooses one of:
+The owner chose the hybrid path:
 
-- **Profile R (recommended for #113)**: run all three variants through
-  `s1-bridge` + the scenario Worker shims against
-  `shimpeiws/coding-worker-smoke`, recording every deviation from the
-  target profile in each evidence record. This is the only profile that
-  can execute on the current tree.
-- **Profile T**: defer #113 until the §1.4 blockers land (production
-  adapter, reviewer App, invariant-check Invocation, reference Worker,
-  scoped credential). No part of this runbook's live steps applies
-  unchanged; §9 lists the delta.
-
-The authorization draft ([live-authorization.md](live-authorization.md))
-is written for Profile R and says so explicitly. If the owner intends
-Profile T, the draft must not be recorded as-is.
+- **Execute Profile R now** — all three variants through `s1-bridge` +
+  the scenario Worker shims against `shimpeiws/coding-worker-smoke`,
+  recording every deviation from the target profile in each evidence
+  record. This is the only profile that can execute on the current
+  tree.
+- **#113 close interpretation** — the Profile R evidence is the
+  per-variant live-evidence record for #113's "live evidence exists per
+  variant" criterion (live run, exact revisions/config/identities
+  recorded, deviations marked). Target-profile certification is
+  explicitly **out of scope** for this run and remains tracked in
+  #149/#183/#96; Profile R evidence never substitutes for it.
+- **Profile T remains available later** — if the §1.4 blockers land,
+  §9's delta applies and a fresh target-profile run under new run tags
+  would be required; it is not implied by this decision.
 
 ## 2. Execution profiles
 
