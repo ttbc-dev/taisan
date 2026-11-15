@@ -10,9 +10,13 @@
 # Worker shim is U4.2, unimplemented): it is a deterministic worker
 # whose rounds are keyed to workspace state — the first Invocation
 # produces the requested change (leaving the engineered review-visible
-# gap), a later Fix Invocation produces the review fix. It holds no
-# repository-host credential and never performs a host write:
-# publication is the adapter side's job.
+# gap), a later Fix Invocation produces the review fix. The
+# pre-publication invariant check re-runs this same argv against a
+# snapshot copy of the workspace under a `check-*` name: the derived
+# `work/<id>` branch cannot exist there, so the shim verifies the
+# work branch HEAD already names — read-only, never a fresh change.
+# It holds no repository-host credential and never performs a host
+# write: publication is the adapter side's job.
 set -euo pipefail
 
 ws="$PWD"
@@ -30,14 +34,33 @@ cd "$ws"
 git config user.name "s1-worker"
 git config user.email "s1-worker@localhost"
 
+verify_only=0
 if ! git rev-parse --verify -q "$branch" >/dev/null; then
-    git checkout -q -b "$branch" origin/main
+    # The derived work branch is absent. In the check snapshot the
+    # workspace copy still has HEAD on the producing work branch —
+    # adopt it and verify that exact state read-only. A fresh clone
+    # sits on the default branch instead, so this never misfires on
+    # a real first Invocation.
+    current="$(git branch --show-current)"
+    case "$current" in
+        work/*)
+            branch="$current"
+            verify_only=1
+            ;;
+        *)
+            git checkout -q -b "$branch" origin/main
+            ;;
+    esac
 else
     git checkout -q "$branch"
     git merge -q --ff-only "origin/main" 2>/dev/null || true
 fi
 
-if git log --format=%s -20 "$branch" | grep "Add greet helper" >/dev/null; then
+if [ "$verify_only" = 1 ]; then
+    round=0
+elif git log --format=%s -20 "$branch" | grep "Guard greet input" >/dev/null; then
+    round=3
+elif git log --format=%s -20 "$branch" | grep "Add greet helper" >/dev/null; then
     round=2
     python3 - <<'PY'
 import pathlib
