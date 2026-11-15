@@ -423,7 +423,7 @@ pub struct ReconcileReport {
 /// What one read-only comparison of an intent's recorded effect
 /// against the remote establishes — the tri-state every verdict in a
 /// reconcile or pre-write pass reduces to.
-enum ObservedEffect {
+pub(crate) enum ObservedEffect {
     /// The remote shows the effect the intent recorded, attributed to
     /// the actor the remote reports, with the normalized fact a fresh
     /// read derives.
@@ -480,6 +480,13 @@ impl FixtureGithub {
     pub fn with_credentials(mut self, credentials: CredentialBook) -> Self {
         self.credentials = Some(credentials);
         self
+    }
+
+    /// Install or replace the credential environment on an existing
+    /// adapter — the test-control counterpart of
+    /// [`Self::with_credentials`].
+    pub fn install_credentials(&mut self, credentials: CredentialBook) {
+        self.credentials = Some(credentials);
     }
 
     /// Test control: mutate the seated credential environment between
