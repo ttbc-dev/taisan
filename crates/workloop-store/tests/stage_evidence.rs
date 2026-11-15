@@ -147,7 +147,7 @@ fn each_entered_stage_persists_a_durable_evidence_record_across_a_reopen() {
 
     {
         let store = SqliteStore::open(&path, 2).unwrap();
-        let mut pipeline = StagePipeline::new(LanePolicy::default());
+        let mut pipeline = StagePipeline::new(repo(), LanePolicy::default());
         assert_eq!(pipeline.observe_head(&revision), HeadObservation::Recorded);
         loop {
             match pipeline.next_stage() {
@@ -222,7 +222,7 @@ fn each_entered_stage_persists_a_durable_evidence_record_across_a_reopen() {
         assert_eq!(complete.revision, revision);
     }
 
-    let replayed = StagePipeline::from_observations(LanePolicy::default(), &observations);
+    let replayed = StagePipeline::from_observations(repo(), LanePolicy::default(), &observations);
     assert_eq!(replayed.records(), records.as_slice());
     assert_eq!(replayed.next_stage(), NextStage::Complete);
 
@@ -264,11 +264,11 @@ fn pipeline_binds_to_the_frozen_spec_lanes_and_refuses_a_differing_policy() {
         code_review: true,
     };
     assert_eq!(
-        StagePipeline::bind(&frozen, &drifted).unwrap_err(),
+        StagePipeline::bind(repo(), &frozen, &drifted).unwrap_err(),
         StageError::LanePolicyMismatch
     );
     assert_eq!(
-        StagePipeline::bind_from_observations(&frozen, &drifted, &[]).unwrap_err(),
+        StagePipeline::bind_from_observations(repo(), &frozen, &drifted, &[]).unwrap_err(),
         StageError::LanePolicyMismatch
     );
 
@@ -277,7 +277,7 @@ fn pipeline_binds_to_the_frozen_spec_lanes_and_refuses_a_differing_policy() {
     // owes its explicit `disabled{reason}` record even though the drifted
     // config would have enabled it.
     let revision = head();
-    let mut pipeline = StagePipeline::bind(&frozen, &frozen).unwrap();
+    let mut pipeline = StagePipeline::bind(repo(), &frozen, &frozen).unwrap();
     pipeline.observe_head(&revision);
     for stage in [Stage::Code, Stage::Verify] {
         pipeline
@@ -427,8 +427,9 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
                 .unwrap(),
             );
         }
-        // `record_current_head` places no restriction on its target, so
-        // a legal backward move replays the same way.
+        // `record_current_head` places no restriction on its target
+        // inside the Work's repository, so a legal backward move
+        // replays the same way.
         persist(
             &store,
             &work_id,
@@ -442,7 +443,8 @@ fn a_reopened_pipeline_restores_the_recorded_head_and_keeps_stale_heads_stale() 
     let observations = store
         .transact(|tx| tx.observations_for_execution(&execution_id))
         .unwrap();
-    let mut pipeline = StagePipeline::from_observations(LanePolicy::default(), &observations);
+    let mut pipeline =
+        StagePipeline::from_observations(repo(), LanePolicy::default(), &observations);
     assert_eq!(
         pipeline.current_head(),
         Some(&current),

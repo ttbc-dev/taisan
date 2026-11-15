@@ -25,6 +25,17 @@ fn head(object: &str) -> CommitRevision {
     CommitRevision::new(repository(), object).unwrap()
 }
 
+fn foreign_head(object: &str) -> CommitRevision {
+    CommitRevision::new(
+        RepositoryRef::new(
+            HostInstanceId::trusted("foreign-host"),
+            RepositoryId::trusted("foreign-repo"),
+        ),
+        object,
+    )
+    .unwrap()
+}
+
 fn fact(id: &str) -> EvidenceRef {
     EvidenceRef {
         id: id.into(),
@@ -51,7 +62,7 @@ fn enter_and_complete(pipeline: &mut StagePipeline, stage: Stage, revision: &Com
 /// Drive one full pass where every stage leaves an entry record and a
 /// complete record, persisting nothing outside the pipeline value.
 fn drive_pass(lanes: LanePolicy, revision: &CommitRevision) -> StagePipeline {
-    let mut pipeline = StagePipeline::new(lanes);
+    let mut pipeline = StagePipeline::new(repository(), lanes);
     assert_eq!(pipeline.observe_head(revision), HeadObservation::Recorded);
     loop {
         match pipeline.next_stage() {
@@ -71,7 +82,7 @@ fn drive_pass(lanes: LanePolicy, revision: &CommitRevision) -> StagePipeline {
 #[test]
 fn review_lane_never_opens_while_verify_is_incomplete() {
     let revision = head("head-1");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     pipeline.observe_head(&revision);
     enter_and_complete(&mut pipeline, Stage::Code, &revision);
     pipeline
@@ -154,7 +165,7 @@ fn every_entered_stage_persists_a_record_with_the_four_contract_fields() {
 #[test]
 fn a_missing_or_partial_verify_receipt_keeps_verify_incomplete_and_publication_closed() {
     let revision = head("head-3");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     pipeline.observe_head(&revision);
     enter_and_complete(&mut pipeline, Stage::Code, &revision);
 
@@ -223,10 +234,13 @@ fn a_missing_or_partial_verify_receipt_keeps_verify_incomplete_and_publication_c
 #[test]
 fn a_disabled_invariant_lane_records_its_reason_and_publication_proceeds() {
     let revision = head("head-4");
-    let mut pipeline = StagePipeline::new(LanePolicy {
-        invariant_check: false,
-        code_review: true,
-    });
+    let mut pipeline = StagePipeline::new(
+        repository(),
+        LanePolicy {
+            invariant_check: false,
+            code_review: true,
+        },
+    );
     pipeline.observe_head(&revision);
     enter_and_complete(&mut pipeline, Stage::Code, &revision);
     enter_and_complete(&mut pipeline, Stage::Verify, &revision);
@@ -280,7 +294,7 @@ fn a_disabled_invariant_lane_records_its_reason_and_publication_proceeds() {
 fn stale_head_observations_are_history_and_change_no_stage_state() {
     let newer = head("head-newer");
     let older = head("head-older");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     assert_eq!(pipeline.observe_head(&newer), HeadObservation::Recorded);
     enter_and_complete(&mut pipeline, Stage::Code, &newer);
 
@@ -313,7 +327,7 @@ fn stale_head_observations_are_history_and_change_no_stage_state() {
 #[test]
 fn a_completed_stage_cannot_be_reopened_and_a_later_lane_cannot_arrive_early() {
     let revision = head("head-5");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     pipeline.observe_head(&revision);
     enter_and_complete(&mut pipeline, Stage::Code, &revision);
     assert_eq!(
@@ -382,7 +396,7 @@ fn a_completed_stage_cannot_be_reopened_and_a_later_lane_cannot_arrive_early() {
 #[test]
 fn lane_opens_is_false_once_a_stage_is_closed() {
     let revision = head("head-6");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     pipeline.observe_head(&revision);
     assert!(pipeline.lane_opens(Stage::Code));
     enter_and_complete(&mut pipeline, Stage::Code, &revision);
@@ -408,7 +422,7 @@ fn lane_opens_is_false_once_a_stage_is_closed() {
 #[test]
 fn a_rejected_first_record_never_pins_the_head() {
     let revision = head("head-7");
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     assert_eq!(
         pipeline
             .record(
@@ -445,14 +459,7 @@ fn replay_restores_head_moves_and_refuses_only_foreign_or_rejected_pins() {
     let adopted = head("head-replay-adopted");
     let stale = head("head-replay-stale");
     let moved = head("head-replay-moved");
-    let foreign = CommitRevision::new(
-        RepositoryRef::new(
-            HostInstanceId::trusted("foreign-host"),
-            RepositoryId::trusted("foreign-repo"),
-        ),
-        "head-replay",
-    )
-    .unwrap();
+    let foreign = foreign_head("head-replay");
     let change = ChangeRequestRef {
         repository: repository(),
         change_request: ChangeRequestId::trusted("cr-1"),
@@ -526,14 +533,15 @@ fn replay_restores_head_moves_and_refuses_only_foreign_or_rejected_pins() {
             .unwrap(),
             11,
         ),
-        // `record_current_head` places no restriction on its target, so
-        // a legal backward move replays the same way.
+        // `record_current_head` places no restriction on its target
+        // inside the Work's repository, so a legal backward move
+        // replays the same way.
         record_fact(
             StageEvidence::entered(Stage::Publication, first.clone()),
             12,
         ),
     ];
-    let pipeline = StagePipeline::from_observations(all_lanes(), &observations);
+    let pipeline = StagePipeline::from_observations(repository(), all_lanes(), &observations);
     assert_eq!(
         pipeline.current_head(),
         Some(&first),
@@ -574,36 +582,43 @@ fn replay_restores_head_moves_and_refuses_only_foreign_or_rejected_pins() {
 fn evidence_against_a_stale_or_foreign_revision_never_satisfies_a_lane() {
     let current = head("head-current");
     let stale = head("head-stale");
-    let foreign = CommitRevision::new(
-        RepositoryRef::new(
-            HostInstanceId::trusted("foreign-host"),
-            RepositoryId::trusted("foreign-repo"),
-        ),
-        "head-current",
-    )
-    .unwrap();
-    let mut pipeline = StagePipeline::new(all_lanes());
+    let foreign = foreign_head("head-current");
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
     pipeline.observe_head(&current);
     enter_and_complete(&mut pipeline, Stage::Code, &current);
 
-    for revision in [stale, foreign] {
-        assert_eq!(
-            pipeline
-                .record(
-                    StageEvidence::complete(
-                        Stage::Verify,
-                        revision.clone(),
-                        vec![fact("verify-off-head")],
-                    )
-                    .unwrap(),
+    assert_eq!(
+        pipeline
+            .record(
+                StageEvidence::complete(
+                    Stage::Verify,
+                    stale.clone(),
+                    vec![fact("verify-off-head")],
                 )
-                .unwrap_err(),
-            StageError::StaleRevision {
-                stage: Stage::Verify
-            },
-            "evidence that does not bind to the recorded head is refused"
-        );
-    }
+                .unwrap(),
+            )
+            .unwrap_err(),
+        StageError::StaleRevision {
+            stage: Stage::Verify
+        },
+        "evidence that does not bind to the recorded head is refused"
+    );
+    assert_eq!(
+        pipeline
+            .record(
+                StageEvidence::complete(
+                    Stage::Verify,
+                    foreign.clone(),
+                    vec![fact("verify-foreign")],
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+        StageError::ForeignRepository {
+            stage: Stage::Verify
+        },
+        "foreign-repository evidence is refused on scope, not staleness"
+    );
     assert!(
         pipeline.latest(Stage::Verify).is_none(),
         "a refused record never enters durable history"
@@ -629,20 +644,141 @@ fn a_pipeline_refuses_a_lane_policy_that_differs_from_the_frozen_spec() {
     };
     let drifted = all_lanes();
     assert_eq!(
-        StagePipeline::bind(&frozen, &drifted).unwrap_err(),
+        StagePipeline::bind(repository(), &frozen, &drifted).unwrap_err(),
         StageError::LanePolicyMismatch,
         "a policy that differs from the frozen spec is refused"
     );
     assert_eq!(
-        StagePipeline::bind_from_observations(&frozen, &drifted, &[]).unwrap_err(),
+        StagePipeline::bind_from_observations(repository(), &frozen, &drifted, &[]).unwrap_err(),
         StageError::LanePolicyMismatch,
         "rebuilding under a drifted policy is refused the same way"
     );
 
-    let pipeline = StagePipeline::bind(&frozen, &frozen).unwrap();
+    let pipeline = StagePipeline::bind(repository(), &frozen, &frozen).unwrap();
     assert_eq!(pipeline.lanes(), &frozen);
     assert!(
         !pipeline.lane_opens(Stage::InvariantCheck),
         "the bound pipeline judges the frozen policy: the lane is disabled"
     );
+}
+
+#[test]
+fn a_foreign_first_head_is_refused_at_adoption_and_cannot_satisfy_a_lane() {
+    let revision = head("head-owned");
+    let foreign = foreign_head("head-foreign");
+    let mut pipeline = StagePipeline::new(repository(), all_lanes());
+
+    // A foreign-repository head observation is refused outright: it is
+    // never adopted and never enters history — not even as the first
+    // head, where nothing is recorded yet to compare it against.
+    assert_eq!(pipeline.observe_head(&foreign), HeadObservation::Foreign);
+    assert_eq!(pipeline.current_head(), None);
+    assert!(pipeline.head_history().is_empty());
+    assert!(pipeline.stale_heads().is_empty());
+
+    // Foreign evidence as the first record is refused before it can
+    // pin a head — previously the first record adopted whatever
+    // repository it named and could close the lane on it.
+    assert_eq!(
+        pipeline
+            .record(
+                StageEvidence::complete(Stage::Code, foreign.clone(), vec![fact("code-foreign")])
+                    .unwrap()
+            )
+            .unwrap_err(),
+        StageError::ForeignRepository { stage: Stage::Code }
+    );
+    assert_eq!(
+        pipeline.current_head(),
+        None,
+        "a refused foreign record never pins the head it claimed"
+    );
+    assert!(pipeline.records().is_empty());
+
+    // An authoritative head move into a foreign repository is refused
+    // the same way.
+    assert_eq!(
+        pipeline.record_current_head(foreign.clone()),
+        HeadObservation::Foreign
+    );
+    assert_eq!(pipeline.current_head(), None);
+
+    // The same-repository sequence still works: the first owned head
+    // is adopted and its evidence closes the lane.
+    assert_eq!(pipeline.observe_head(&revision), HeadObservation::Recorded);
+    enter_and_complete(&mut pipeline, Stage::Code, &revision);
+    assert!(
+        pipeline
+            .latest(Stage::Code)
+            .is_some_and(|record| record.status.is_complete()),
+        "same-repository evidence still satisfies the lane"
+    );
+    assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Verify));
+}
+
+#[test]
+fn replay_refuses_foreign_heads_and_evidence_before_the_first_owned_head() {
+    let revision = head("head-owned-replay");
+    let foreign = foreign_head("head-foreign-replay");
+    let change = ChangeRequestRef {
+        repository: repository(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let work_id = WorkId("w-foreign-replay".into());
+    let execution_id = ExecutionId("e-foreign-replay".into());
+    let head_fact = |head: &CommitRevision, at: i64| Observation {
+        delivery: None,
+        subject_work_id: None,
+        subject_execution_id: None,
+        fact: ObservationFact::ChangeHead {
+            change: change.clone(),
+            head: head.clone(),
+        },
+        observed_unix_seconds: at,
+    };
+    let record_fact = |evidence: StageEvidence, at: i64| {
+        evidence.into_observation(work_id.clone(), execution_id.clone(), at)
+    };
+    let observations = vec![
+        // A foreign first head and foreign evidence arriving before any
+        // owned head are refused at adoption: neither can become the
+        // recorded head or satisfy a lane.
+        head_fact(&foreign, 1),
+        record_fact(
+            StageEvidence::complete(Stage::Code, foreign.clone(), vec![fact("code-foreign")])
+                .unwrap(),
+            2,
+        ),
+        head_fact(&revision, 3),
+        record_fact(StageEvidence::entered(Stage::Code, revision.clone()), 4),
+        record_fact(
+            StageEvidence::complete(Stage::Code, revision.clone(), vec![fact("code")]).unwrap(),
+            5,
+        ),
+    ];
+    let pipeline = StagePipeline::from_observations(repository(), all_lanes(), &observations);
+    assert_eq!(
+        pipeline.current_head(),
+        Some(&revision),
+        "the first owned head is adopted; the foreign one never was"
+    );
+    assert_eq!(
+        pipeline.head_history(),
+        std::slice::from_ref(&revision),
+        "the foreign head entered no history"
+    );
+    assert!(pipeline.stale_heads().is_empty());
+    assert_eq!(
+        pipeline.records().len(),
+        2,
+        "only the same-repository records replayed"
+    );
+    assert!(
+        pipeline
+            .latest(Stage::Code)
+            .is_some_and(|record| record.status.is_complete()),
+        "the same-repository sequence still closes the lane"
+    );
+    assert_eq!(pipeline.next_stage(), NextStage::Open(Stage::Verify));
 }

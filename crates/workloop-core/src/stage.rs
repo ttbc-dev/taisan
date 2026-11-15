@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ExecutionId, LanePolicy, WorkId};
-use crate::identity::{CommitRevision, EvidenceRef};
+use crate::identity::{CommitRevision, EvidenceRef, RepositoryRef};
 use crate::observation::{Observation, ObservationFact};
 
 /// The canonical stage pipeline: code → verify → invariant-check? →
@@ -218,9 +218,15 @@ pub enum StageError {
         stage: Stage,
     },
     /// The record's revision does not equal the recorded current head —
-    /// evidence against a stale head or a foreign repository can never
-    /// satisfy a lane.
+    /// evidence against a stale head can never satisfy a lane.
     StaleRevision {
+        stage: Stage,
+    },
+    /// The record's revision belongs to a different repository than the
+    /// pipeline's binding. Foreign-repository evidence can never satisfy
+    /// a lane — not even as the first record, where no head is recorded
+    /// yet to compare the revision against.
+    ForeignRepository {
         stage: Stage,
     },
     /// The policy offered at pipeline construction differs from the
@@ -255,6 +261,11 @@ impl std::fmt::Display for StageError {
                 "{} evidence does not bind to the recorded current head",
                 stage.name()
             ),
+            Self::ForeignRepository { stage } => write!(
+                f,
+                "{} evidence names a repository outside the Work's binding",
+                stage.name()
+            ),
             Self::LanePolicyMismatch => write!(
                 f,
                 "the lane policy differs from the Work's frozen spec lanes"
@@ -284,22 +295,31 @@ pub enum NextStage {
     Complete,
 }
 
-/// Whether an observed head was adopted into the pipeline, already
-/// matched, or was stale history that changed nothing.
+/// Whether a head offered to the pipeline was adopted, already
+/// matched, was stale history that changed nothing, or named a
+/// different repository and was refused outright.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadObservation {
     Recorded,
     Unchanged,
     Stale,
+    /// The head names a repository outside the pipeline's binding. It is
+    /// refused at adoption: never recorded as current, never kept as
+    /// history — it was never this Work's head.
+    Foreign,
 }
 
-/// The Core-side stage machine. It consumes only supplied facts and
-/// recorded evidence: the loop persists records, the supervisor and host
-/// adapter supply the facts, and no code path infers a transition from a
-/// missing record. An old-head observation is retained in history and can
-/// never change the recorded current head or satisfy a stage.
+/// The Core-side stage machine, bound at construction to one Work's
+/// `RepositoryRef` and its lane policy. It consumes only supplied facts
+/// and recorded evidence: the loop persists records, the supervisor and
+/// host adapter supply the facts, and no code path infers a transition
+/// from a missing record. An old-head observation is retained in
+/// history and can never change the recorded current head or satisfy a
+/// stage; a head or record naming a foreign repository is refused at
+/// adoption — it was never this Work's.
 #[derive(Debug, Clone)]
 pub struct StagePipeline {
+    repository: RepositoryRef,
     lanes: LanePolicy,
     records: Vec<StageEvidence>,
     current_head: Option<CommitRevision>,
@@ -308,8 +328,13 @@ pub struct StagePipeline {
 }
 
 impl StagePipeline {
-    pub fn new(lanes: LanePolicy) -> Self {
+    /// A pipeline bound to `repository` — the Work's repository identity
+    /// (`Work.binding.repository`) — and judged under `lanes`. Every
+    /// head and record naming a different repository is refused at
+    /// adoption.
+    pub fn new(repository: RepositoryRef, lanes: LanePolicy) -> Self {
         Self {
+            repository,
             lanes,
             records: Vec::new(),
             current_head: None,
@@ -318,22 +343,28 @@ impl StagePipeline {
         }
     }
 
-    /// Bind the pipeline to the lane policy frozen into the Work's
-    /// `spec.payload.lanes` at request creation. "Invocation config" is
-    /// that snapshot, so a policy that differs from the frozen value —
-    /// a live installation config that drifted after the snapshot was
-    /// stamped — is refused, never silently adopted.
-    pub fn bind(frozen: &LanePolicy, policy: &LanePolicy) -> Result<Self, StageError> {
+    /// Bind the pipeline to the Work's repository and to the lane policy
+    /// frozen into the Work's `spec.payload.lanes` at request creation.
+    /// "Invocation config" is that snapshot, so a policy that differs
+    /// from the frozen value — a live installation config that drifted
+    /// after the snapshot was stamped — is refused, never silently
+    /// adopted.
+    pub fn bind(
+        repository: RepositoryRef,
+        frozen: &LanePolicy,
+        policy: &LanePolicy,
+    ) -> Result<Self, StageError> {
         if frozen != policy {
             return Err(StageError::LanePolicyMismatch);
         }
-        Ok(Self::new(frozen.clone()))
+        Ok(Self::new(repository, frozen.clone()))
     }
 
     /// The replay form of `bind`: the pipeline is judged under the
     /// frozen spec lanes, so rebuilding under a differing policy is
     /// refused rather than reinterpreted.
     pub fn bind_from_observations(
+        repository: RepositoryRef,
         frozen: &LanePolicy,
         policy: &LanePolicy,
         observations: &[Observation],
@@ -341,29 +372,39 @@ impl StagePipeline {
         if frozen != policy {
             return Err(StageError::LanePolicyMismatch);
         }
-        Ok(Self::from_observations(frozen.clone(), observations))
+        Ok(Self::from_observations(
+            repository,
+            frozen.clone(),
+            observations,
+        ))
     }
 
     /// Rebuild the stage view from durable observations. Recorded head
     /// observations replay through `observe_head` and each recorded
-    /// evidence re-runs the same guards it was first accepted under.
-    /// A durably recorded evidence also pin-points the head it bound
-    /// to: when it differs from the replayed head, an authoritative
-    /// move (`record_current_head`) must have preceded it — the pin is
-    /// the only durable trace that move leaves — so the move is
-    /// restored before the record replays. Live `record_current_head`
-    /// places no restriction on the target: it may adopt a head a
-    /// `change_head` observation marked stale, a head it held before,
-    /// or a head no observation ever named, so replay trusts any
-    /// same-repository pin the same way. A foreign-repository pin is
-    /// refused — it was never this Work's head. The restore commits
-    /// only when the record itself is accepted, so a refused record
-    /// cannot move the head either. Invalid records are ignored rather
-    /// than silently repaired; the pipeline never promotes evidence
-    /// that did not satisfy the same order guard when it was first
-    /// recorded.
-    pub fn from_observations(lanes: LanePolicy, observations: &[Observation]) -> Self {
-        let mut pipeline = Self::new(lanes);
+    /// evidence re-runs the same guards it was first accepted under; a
+    /// head or record naming a foreign repository is refused at
+    /// adoption, exactly as the live path refuses it. A durably
+    /// recorded evidence also pin-points the head it bound to: when it
+    /// differs from the replayed head, an authoritative move
+    /// (`record_current_head`) must have preceded it — the pin is the
+    /// only durable trace that move leaves — so the move is restored
+    /// before the record replays. Live `record_current_head` restricts
+    /// its target to the Work's repository but nothing inside it: it
+    /// may adopt a head a `change_head` observation marked stale, a
+    /// head it held before, or a head no observation ever named, so
+    /// replay trusts any same-repository pin the same way.
+    /// A foreign-repository pin is refused — it was never this Work's
+    /// head. The restore commits only when the record itself is
+    /// accepted, so a refused record cannot move the head either.
+    /// Invalid records are ignored rather than silently repaired; the
+    /// pipeline never promotes evidence that did not satisfy the same
+    /// order guard when it was first recorded.
+    pub fn from_observations(
+        repository: RepositoryRef,
+        lanes: LanePolicy,
+        observations: &[Observation],
+    ) -> Self {
+        let mut pipeline = Self::new(repository, lanes);
         for observation in observations {
             match &observation.fact {
                 ObservationFact::ChangeHead { head, .. } => {
@@ -388,6 +429,10 @@ impl StagePipeline {
             }
         }
         pipeline
+    }
+
+    pub fn repository(&self) -> &RepositoryRef {
+        &self.repository
     }
 
     pub fn lanes(&self) -> &LanePolicy {
@@ -425,10 +470,16 @@ impl StagePipeline {
         }
     }
 
-    /// Adopt a head only when none is recorded. Any later differing head
-    /// is an observation, not an authoritative transition: it stays in
-    /// history and cannot move the recorded head or any stage state.
+    /// Adopt a head only when none is recorded and the head belongs to
+    /// the pipeline's repository. A foreign-repository head is refused
+    /// outright — it is never this Work's head, so it enters no history.
+    /// Any later differing same-repository head is an observation, not
+    /// an authoritative transition: it stays in history and cannot move
+    /// the recorded head or any stage state.
     pub fn observe_head(&mut self, observed: &CommitRevision) -> HeadObservation {
+        if observed.repository != self.repository {
+            return HeadObservation::Foreign;
+        }
         match &self.current_head {
             None => {
                 self.current_head = Some(observed.clone());
@@ -445,13 +496,21 @@ impl StagePipeline {
     }
 
     /// Record an authoritative head transition decided by Core (for
-    /// example after adopting a verified publication receipt). This is the
-    /// only path that moves the current head after one is recorded.
-    pub fn record_current_head(&mut self, head: CommitRevision) {
-        if self.current_head.as_ref() != Some(&head) {
-            self.current_head = Some(head.clone());
-            self.head_history.push(head);
+    /// example after adopting a verified publication receipt). This is
+    /// the only path that moves the current head after one is recorded.
+    /// The target is restricted to the Work's repository — Core may
+    /// move the head anywhere inside it, but a foreign-repository head
+    /// is refused like any other foreign adoption.
+    pub fn record_current_head(&mut self, head: CommitRevision) -> HeadObservation {
+        if head.repository != self.repository {
+            return HeadObservation::Foreign;
         }
+        if self.current_head.as_ref() == Some(&head) {
+            return HeadObservation::Unchanged;
+        }
+        self.current_head = Some(head.clone());
+        self.head_history.push(head);
+        HeadObservation::Recorded
     }
 
     /// The earliest stage that is not closed. Because the scan is ordered,
@@ -510,15 +569,20 @@ impl StagePipeline {
         false
     }
 
-    /// Append one durable stage record. The record binds to the recorded
-    /// current head — evidence against a stale head or a foreign
-    /// repository is refused before it can satisfy a lane — and the
-    /// order and lane guards run before the record is accepted, so
-    /// neither a later lane nor a contradictory config record can enter
-    /// history as if it were valid. The first accepted record also
-    /// records the head it binds to; a refused record never pins one.
+    /// Append one durable stage record. The record binds to the
+    /// pipeline's repository and the recorded current head — evidence
+    /// naming a foreign repository is refused at adoption, before any
+    /// head comparison, and evidence against a stale head is refused
+    /// before it can satisfy a lane — and the order and lane guards run
+    /// before the record is accepted, so neither a later lane nor a
+    /// contradictory config record can enter history as if it were
+    /// valid. The first accepted record also records the head it binds
+    /// to; a refused record never pins one.
     pub fn record(&mut self, evidence: StageEvidence) -> Result<(), StageError> {
         let stage = evidence.stage;
+        if evidence.revision.repository != self.repository {
+            return Err(StageError::ForeignRepository { stage });
+        }
         if self
             .current_head
             .as_ref()
