@@ -132,6 +132,11 @@ pub struct Profile {
     pub hosts: BTreeMap<String, HostSection>,
     #[serde(default)]
     pub roles: BTreeMap<String, RoleSection>,
+    /// Observed identity evidence per bound role actor (see
+    /// [`IdentityEvidence`]). Absent is structurally valid — `check`
+    /// stage 2 is what refuses a success claim without it.
+    #[serde(default)]
+    pub identity_evidence: BTreeMap<String, IdentityEvidence>,
     #[serde(default)]
     pub worker: WorkerSection,
     #[serde(default)]
@@ -191,6 +196,31 @@ pub struct RoleSection {
     pub host: Option<String>,
     pub actor: Option<String>,
     pub credential_ref: Option<String>,
+}
+
+/// The persisted observed-identity evidence for one bound role actor,
+/// written by `init` from explicit observed pointers and refreshed by
+/// `check --probe`. Load validates structure and role coherence only;
+/// whether the evidence exists and still matches the bound actor is
+/// `check` stage 2's fail-closed question — a config carrying no
+/// evidence must load (so `check` can name the missing stage) but can
+/// never satisfy a success claim (docs/installation-config.md setup
+/// contract; `check` never reports success from config declarations
+/// alone).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityEvidence {
+    /// Observed actor login or application slug. Must equal the bound
+    /// role's `actor` — the bound identity is the verified adapter-side
+    /// identity, never a display alias.
+    pub login: String,
+    /// Observed host instance identity (the role's host endpoint).
+    pub host_instance: String,
+    /// Observed repository stable id, declared under the role's host.
+    pub repository: String,
+    /// When the observation was made (unix seconds). Refreshed by a
+    /// passing `check --probe`.
+    pub observed_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -464,6 +494,7 @@ impl Profile {
         }
         self.validate_hosts()?;
         self.validate_roles()?;
+        self.validate_identity_evidence()?;
         self.validate_worker()?;
         self.validate_allowlist()?;
         self.validate_capabilities()?;
@@ -530,6 +561,52 @@ impl Profile {
                         "hosts.{name}.repositories[{index}].display: control characters are refused"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Structural coherence of the observed-identity evidence: the key
+    /// is a known role that is actually bound, and every field is a
+    /// non-empty identifier without control characters. The match
+    /// against the bound actor (evidence completeness for success) is
+    /// deliberately `check` stage 2's question, not a load refusal —
+    /// otherwise a stale observation would surface as a parse failure
+    /// instead of the stage-scoped diagnostic the preflight contract
+    /// requires.
+    fn validate_identity_evidence(&self) -> Result<(), String> {
+        for (name, evidence) in &self.identity_evidence {
+            if ActorRole::from_name(name).is_none() {
+                return Err(format!(
+                    "identity_evidence: unknown role '{name}' — expected publication, review, or discussion"
+                ));
+            }
+            if !self.roles.contains_key(name) {
+                return Err(format!(
+                    "identity_evidence.{name}: role is not declared under [roles]"
+                ));
+            }
+            for (field, value) in [
+                ("login", &evidence.login),
+                ("host_instance", &evidence.host_instance),
+                ("repository", &evidence.repository),
+            ] {
+                if value.is_empty() {
+                    return Err(format!(
+                        "identity_evidence.{name}.{field}: must not be empty"
+                    ));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(format!(
+                        "identity_evidence.{name}.{field}: control characters are refused"
+                    ));
+                }
+            }
+            if evidence.observed_unix_seconds < 0 {
+                return Err(format!(
+                    "identity_evidence.{name}.observed_unix_seconds: negative observation time {} is refused",
+                    evidence.observed_unix_seconds
+                ));
             }
         }
         Ok(())

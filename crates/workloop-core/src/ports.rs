@@ -90,6 +90,105 @@ pub struct WorkerEnv {
     pub vars: Vec<(String, String)>,
 }
 
+/// One bound role actor whose remote identity `check --probe` reads.
+/// The context is pinned to the configuration the preflight already
+/// validated — the probe never picks its own host or repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRead {
+    /// Bound role name (`publication` / `review` / `discussion`).
+    pub role: String,
+    /// The bound actor identity the observation must match.
+    pub actor: String,
+    /// Host instance identity (the stable endpoint), from config.
+    pub host_instance: String,
+    /// Repository stable id the observation is pinned to, from config.
+    pub repository: String,
+}
+
+/// What a remote identity read observed for one bound actor: the actor
+/// login or application slug plus the host instance and repository the
+/// read was pinned to. Only these observed identifiers cross the port —
+/// never a credential value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedIdentity {
+    /// Observed actor login or application slug.
+    pub login: String,
+    /// Host instance the adapter reported for this read.
+    pub host_instance: String,
+    /// Repository stable id the adapter reported for this read.
+    pub repository: String,
+}
+
+/// One capability as a preflight probe reports it. Support and grant
+/// are evaluated separately per the repository-host contract, so
+/// `unsupported` never masquerades as `denied` and an unreadable answer
+/// stays `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+/// Whether the bound actor may perform the capability's operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityGrant {
+    Allowed,
+    Denied,
+    Unknown,
+}
+
+/// One requested capability's reported support and grant for a bound
+/// actor on the pinned repository context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityStatus {
+    /// Capability name as declared in configuration.
+    pub capability: String,
+    pub support: CapabilitySupport,
+    pub grant: CapabilityGrant,
+}
+
+/// The complete answer to one capability read: one status per requested
+/// capability, in request order. A missing entry is treated by the
+/// caller as `unknown`, never as an empty pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityObservation {
+    pub statuses: Vec<CapabilityStatus>,
+}
+
+/// The read-only adapter surface `check --probe` opts into. The trait
+/// exposes identity and capability *reads* only — there is no write
+/// method to call, so a probe run is read-only by construction: it can
+/// never create, mutate, or delete anything remotely. Dispatch-time
+/// revalidation stays mandatory; a passing probe is per-run evidence,
+/// never a standing grant.
+pub trait ProbePort {
+    /// Read the remote identity (actor login or app slug) for one
+    /// bound actor in the pinned host/repository context.
+    fn read_actor_identity(&mut self, read: &IdentityRead) -> Result<ObservedIdentity, String>;
+
+    /// Read the support/grant report for the requested capabilities of
+    /// one bound actor in the pinned repository context.
+    fn read_capabilities(&mut self, read: &CapabilityRead)
+    -> Result<CapabilityObservation, String>;
+}
+
+/// The capability set one bound actor's probe read covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRead {
+    /// Bound role name.
+    pub role: String,
+    /// The bound actor identity being evaluated.
+    pub actor: String,
+    /// Host instance identity (the stable endpoint), from config.
+    pub host_instance: String,
+    /// Repository stable id the read is pinned to, from config.
+    pub repository: String,
+    /// Required capability names for this role; the answer must carry
+    /// one status per name.
+    pub capabilities: Vec<String>,
+}
+
 /// How `execution` supervises real worker processes. Implementations must
 /// satisfy the crash rules in `docs/lifecycle.md`: record `pid + start
 /// time`, snapshot write-capable descendants with the stop intent, signal
