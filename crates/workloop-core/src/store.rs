@@ -371,6 +371,12 @@ pub struct CommandRecord {
     /// Work-scoped commands.
     pub execution_id: Option<ExecutionId>,
     pub accepted: bool,
+    /// The decision's `committed_at` — the sequence its effects were
+    /// anchored at. For an accepted resume/release this equals the
+    /// `enqueued_seq` of the Execution generation the command created,
+    /// which is how a census scopes release evidence to the current
+    /// wait. `None` when the stored decision could not be decoded.
+    pub committed_at: Option<EventSequence>,
     pub seq: EventSequence,
 }
 

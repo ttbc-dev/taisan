@@ -1693,17 +1693,19 @@ impl ReadView for Tx<'_> {
                 let decision: String = row.get(2)?;
                 // An undecodable decision can never prove acceptance:
                 // it reads as not-accepted so a census never treats an
-                // unreadable record as a recorded release.
-                let accepted = serde_json::from_str::<serde_json::Value>(&decision)
-                    .ok()
-                    .and_then(|v| v.get("status")?.as_str().map(str::to_string))
-                    .is_some_and(|s| s == "accepted");
+                // unreadable record as a recorded release. The check
+                // decodes the full CommandDecision — a bare
+                // `{"status":"accepted"}` envelope is not a decision.
+                let parsed = serde_json::from_str::<CommandDecision>(&decision).ok();
                 Ok(CommandRecord {
                     command_id: CommandId(row.get::<_, String>(0)?),
                     kind,
                     work_id,
                     execution_id,
-                    accepted,
+                    accepted: parsed
+                        .as_ref()
+                        .is_some_and(|d| matches!(d, CommandDecision::Accepted { .. })),
+                    committed_at: parsed.as_ref().map(CommandDecision::committed_at),
                     seq: row.get(3)?,
                 })
             },

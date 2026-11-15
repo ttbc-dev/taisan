@@ -15,8 +15,8 @@
 //!
 //! | detector | durable records |
 //! |---|---|
-//! | `judgment_waits` | `review_rounds` sealed without `round_judgments` coverage of `set_digest`; `paused` Executions whose `paused_judgment` Attention has no `attention_acks` row; undecodable store records |
-//! | `released_wait_blocked` | nonterminal `paused`/`waiting` Executions with a pause/waiting reason, Attention acknowledged, and no accepted `resume`/`retry` Command recorded |
+//! | `judgment_waits` | `review_rounds` sealed without `round_judgments` coverage of `set_digest`; `paused` Executions whose `paused_judgment` Attention has no `attention_acks` row for the current wait generation; undecodable store records |
+//! | `released_wait_blocked` | nonterminal `paused`/`waiting` Executions with a pause/waiting reason, Attention acknowledged for the current wait generation, and no accepted `resume`/`retry` Command committed inside it |
 //! | `orphaned_findings` | `finding_occurrences` on uncovered rounds with no unresolved writer Invocation; ownership `proven`/`foreign`/`uncertain` |
 //! | `parked_selector_starvation` | `deferrals` aged past the event-sequence threshold plus `capacity_slots`/`resource_reservations` context |
 //! | `stale_spec_halts` | `not_applicable_v0.1` — no spec-halt record exists in v0.1; reported explicitly, never dropped |
@@ -303,21 +303,43 @@ struct InvocationScan {
     any_unresolved: bool,
 }
 
+/// The generation suffix of an Attention id: `...:{exec}:{seq}:{count}`.
+/// The anchor is free text and may contain `:`, so the suffix is parsed
+/// from the right — evidence count, then `enqueued_seq`, then the
+/// Execution id — which is unambiguous regardless of anchor content.
+fn attention_generation(ack: &str) -> Option<(&str, &str)> {
+    let mut parts = ack.rsplit(':');
+    let _count = parts.next()?;
+    let seq = parts.next()?;
+    let exec = parts.next()?;
+    Some((exec, seq))
+}
+
+/// Whether `ack` names `execution`'s CURRENT wait generation. A
+/// resume/requeue bumps `enqueued_seq`, so an acknowledgement recorded
+/// against an earlier pause of the same Execution cannot clear the
+/// wait now open; the evidence-count segment is ignored so an ack
+/// recorded before later observations still counts as the wait having
+/// been seen.
+fn ack_names_current_wait(ack: &str, execution: &Execution) -> bool {
+    let Some((exec, seq)) = attention_generation(ack) else {
+        return false;
+    };
+    exec == execution.id.0 && seq.parse::<EventSequence>().ok() == Some(execution.enqueued_seq)
+}
+
 /// Attention-id structural match: `att:{work}:{reason}:{anchor}:{exec}:{seq}:{count}`.
-/// The anchor is free text and may contain `:`, so the match is prefix +
-/// execution segment, tolerant of anchor and evidence-count drift — an
-/// ack recorded against an earlier version of the same wait still
-/// counts as the wait having been seen.
+/// Prefix + reason + current-generation suffix; tolerant of anchor and
+/// evidence-count drift within the generation.
 fn ack_matches(ack: &str, work_id: &WorkId, reason: &str, execution: &Execution) -> bool {
     ack.starts_with(&format!("att:{}:{}:", work_id.0, reason))
-        && ack.contains(&format!(":{}:", execution.id.0))
+        && ack_names_current_wait(ack, execution)
 }
 
 /// Any recorded ack naming this Execution under any Attention reason —
 /// the "the wait was seen" signal for the released-wait detector.
 fn any_ack_matches(ack: &str, work_id: &WorkId, execution: &Execution) -> bool {
-    ack.starts_with(&format!("att:{}:", work_id.0))
-        && ack.contains(&format!(":{}:", execution.id.0))
+    ack.starts_with(&format!("att:{}:", work_id.0)) && ack_names_current_wait(ack, execution)
 }
 
 /// Judgment coverage: a `round_judgments` row exists for the round and
@@ -623,8 +645,13 @@ pub fn anomaly_census(
                 continue;
             }
             // A recorded release is an ACCEPTED resume/retry Command
-            // targeting this Execution. Rejected attempts stay visible
-            // in `release_commands` but cannot prove the wait was
+            // targeting this Execution AND committed inside the current
+            // wait generation: an accepted resume's `committed_at` is
+            // the `enqueued_seq` it assigned, so only a release newer
+            // than the current `enqueued_seq` can belong to this wait —
+            // an older accepted resume released an earlier pause, not
+            // this one. Rejected attempts stay visible in
+            // `release_commands` but cannot prove the wait was
             // released — the parent is still blocked.
             let release_commands: Vec<CommandRef> = work_commands
                 .iter()
@@ -643,9 +670,12 @@ pub fn anomaly_census(
                     seq: c.seq,
                 })
                 .collect();
-            let released = release_commands
-                .iter()
-                .any(|c| c.accepted && matches!(c.kind.as_str(), "resume" | "retry"));
+            let released = work_commands.iter().any(|c| {
+                c.execution_id.as_ref() == Some(&e.id)
+                    && c.accepted
+                    && matches!(c.kind.as_deref(), Some("resume" | "retry"))
+                    && c.committed_at.is_some_and(|at| at > e.enqueued_seq)
+            });
             if released {
                 continue;
             }

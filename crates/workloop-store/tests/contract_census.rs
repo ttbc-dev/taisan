@@ -411,14 +411,21 @@ fn ack_attention(store: &SqliteStore, work_id: &WorkId, attention_id: &str) {
 }
 
 fn attention_id_for(
+    store: &SqliteStore,
     work_id: &WorkId,
     reason: &str,
     anchor: &str,
     execution_id: &ExecutionId,
 ) -> String {
+    // The real projection embeds the Execution's current enqueued_seq
+    // in the occurrence suffix; the census scopes acknowledgements to
+    // that wait generation.
+    let enqueued_seq = store
+        .transact(|tx| Ok(tx.execution(execution_id)?.unwrap().enqueued_seq))
+        .unwrap();
     format!(
-        "att:{}:{}:{}:{}:0:0",
-        work_id.0, reason, anchor, execution_id.0
+        "att:{}:{}:{}:{}:{}:0",
+        work_id.0, reason, anchor, execution_id.0, enqueued_seq
     )
 }
 
@@ -535,7 +542,13 @@ fn released_wait_blocked_needs_ack_and_no_accepted_release() {
 
     // Acknowledged but no resume/retry: the released-wait parent is
     // blocked.
-    let att = attention_id_for(&work_id, "paused_judgment", "repair: needs human", &eid);
+    let att = attention_id_for(
+        &store,
+        &work_id,
+        "paused_judgment",
+        "repair: needs human",
+        &eid,
+    );
     ack_attention(&store, &work_id, &att);
     let c = census(&store);
     assert_eq!(c.released_wait_blocked.items.len(), 1, "{c:?}");
@@ -578,7 +591,13 @@ fn rejected_resume_does_not_count_as_a_release() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "c3b");
     pause_execution(&store, &eid, "repair: needs human");
-    let att = attention_id_for(&work_id, "paused_judgment", "repair: needs human", &eid);
+    let att = attention_id_for(
+        &store,
+        &work_id,
+        "paused_judgment",
+        "repair: needs human",
+        &eid,
+    );
     ack_attention(&store, &work_id, &att);
     // A resume against a stale work version is recorded but rejected —
     // the wait is still blocked, and the rejection stays visible.
@@ -607,6 +626,79 @@ fn rejected_resume_does_not_count_as_a_release() {
             .iter()
             .any(|r| r.kind == "resume" && !r.accepted),
         "the rejected attempt is evidence: {item:?}"
+    );
+}
+
+#[test]
+fn repause_is_a_new_wait_generation() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "c3c");
+    pause_execution(&store, &eid, "repair: needs human");
+
+    // First generation: acknowledged, then an accepted resume requeues
+    // the Execution under a new enqueued_seq.
+    let att1 = attention_id_for(
+        &store,
+        &work_id,
+        "paused_judgment",
+        "repair: needs human",
+        &eid,
+    );
+    ack_attention(&store, &work_id, &att1);
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "c3c-resume".into(),
+            body: CommandBody::Resume {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                execution_id: eid.clone(),
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+
+    // The Execution pauses again — a NEW wait generation. The old
+    // acknowledgement must not clear it.
+    pause_execution(&store, &eid, "repair: launch refused before spawn");
+    let c = census(&store);
+    assert!(
+        c.judgment_waits.items.iter().any(|i| matches!(
+            i,
+            JudgmentWaitItem::UnackedPausedJudgment { execution_id, .. } if *execution_id == eid
+        )),
+        "the second pause is unacknowledged: {c:?}"
+    );
+    assert!(c.released_wait_blocked.items.is_empty(), "{c:?}");
+
+    // Acknowledging the new wait clears detector 1 — but the accepted
+    // resume released the FIRST pause (its committed_at is the old
+    // generation's enqueued_seq), not this one, so detector 2 still
+    // reports the blocked wait.
+    let att2 = attention_id_for(
+        &store,
+        &work_id,
+        "paused_judgment",
+        "repair: launch refused before spawn",
+        &eid,
+    );
+    ack_attention(&store, &work_id, &att2);
+    let c = census(&store);
+    assert_eq!(c.released_wait_blocked.items.len(), 1, "{c:?}");
+    let item = &c.released_wait_blocked.items[0];
+    assert_eq!(item.execution_id, eid);
+    assert!(item.acked_attention_ids.contains(&att2), "{item:?}");
+    assert!(
+        !c.judgment_waits.items.iter().any(|i| matches!(
+            i,
+            JudgmentWaitItem::UnackedPausedJudgment { execution_id, .. } if *execution_id == eid
+        )),
+        "{c:?}"
     );
 }
 
