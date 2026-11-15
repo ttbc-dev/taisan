@@ -317,9 +317,13 @@ fn source_reads(ctx: &Ctx) -> Result<(), String> {
                         content_digest: digest,
                         state,
                     };
+                    // Delivery ids are deduped globally per
+                    // `(scope, source, event_id)`, so the Work identity
+                    // is part of the id: two Works reading the same
+                    // issue are distinct subject observations (#186).
                     let _ = ctx.emit(
                         Some((&work.id, None)),
-                        format!("issue:{num}:{revision}"),
+                        format!("issue:{}:{num}:{revision}", work.id.0),
                         fact,
                     );
                 }
@@ -327,7 +331,8 @@ fn source_reads(ctx: &Ctx) -> Result<(), String> {
                     let _ = ctx.emit(
                         Some((&work.id, None)),
                         format!(
-                            "issue:{}:unavailable:{}",
+                            "issue:{}:{}:unavailable:{}",
+                            work.id.0,
                             source.issue.display_number.unwrap_or(0),
                             now()
                         ),
@@ -929,6 +934,16 @@ fn parse_findings(body: &str) -> Result<Vec<OccurrenceInput>, String> {
         .collect())
 }
 
+/// Delivery id for a polled target-branch observation. The store
+/// dedupes deliveries globally per `(scope, source, event_id)` — the
+/// subject Work is not part of the key — so the id must carry the Work
+/// identity. Two Works polling the same `(branch, sha)` are distinct
+/// subject observations; an unscoped id drops the second as `Duplicate`
+/// and that Work never records its own target revision (#186).
+fn branch_poll_event_id(work_id: &WorkId, target_branch: &str, sha: &str) -> String {
+    format!("branch:{}:{target_branch}:{sha}", work_id.0)
+}
+
 /// Poll the real remote facts for every Work that has an opened change:
 /// target-branch revision, current head, check runs, submitted reviews,
 /// and the invariant assessment — each bound to the exact head it
@@ -960,7 +975,7 @@ fn poll_remote(ctx: &Ctx) -> Result<(), String> {
             {
                 let _ = ctx.emit(
                     Some((&work.id, execution.as_ref().map(|e| &e.id))),
-                    format!("branch:{target_branch}:{main_sha}"),
+                    branch_poll_event_id(&work.id, &target_branch, &main_sha),
                     ObservationFact::BranchState {
                         repository: work.binding.repository.clone(),
                         branch: target_branch.clone(),
@@ -1196,10 +1211,148 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
-    use workloop_core::identity::{ActorRole, HostInstanceId, RepositoryId, RepositoryRef};
+    use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
+    use workloop_core::identity::{
+        ActorRole, AdapterId, CredentialRef, HostInstanceId, RepositoryId, RepositoryRef,
+        RoleBinding,
+    };
+    use workloop_core::work::{HostTemplate, handle_command};
 
     const SCENARIO_REPO: &str = "shimpeiws/coding-worker-smoke";
+
+    fn test_ctx() -> Ctx {
+        let host = HostInstanceId::trusted("test-host");
+        let repository = RepositoryRef::new(host.clone(), RepositoryId::trusted("test-repo"));
+        let publisher = HostActorRef {
+            host: host.clone(),
+            actor: HostActorId::trusted("publisher"),
+        };
+        Ctx {
+            store: SqliteStore::in_memory(1).unwrap(),
+            config: WorkloopConfig {
+                host: HostTemplate {
+                    adapter: AdapterId::trusted("s1-bridge"),
+                    repository: repository.clone(),
+                    contract_version: 1,
+                    actors: vec![RoleBinding {
+                        role: ActorRole::Publication,
+                        actor: publisher.clone(),
+                        credential_ref: CredentialRef::trusted("cred-publication"),
+                    }],
+                },
+                declared_capabilities: BTreeSet::from([
+                    HostCapability::RepositoryRead,
+                    HostCapability::PushRef,
+                    HostCapability::ChangeRequestCreate,
+                    HostCapability::ChangeRequestRead,
+                    HostCapability::ChecksRead,
+                    HostCapability::ReviewFindingsRead,
+                ]),
+                lanes: LanePolicy::default(),
+                required_checks: vec![],
+                allowed_effects: AllowedEffects {
+                    workspace_write: true,
+                    host_write: true,
+                    network: false,
+                },
+                budget: ExecutionBudget::default(),
+                policy: WorkPolicy::default(),
+            },
+            workspace_root: PathBuf::from("/tmp"),
+            remote: "https://example.invalid/repo.git".into(),
+            repo_display: "example/repo".into(),
+            authenticated: publisher,
+        }
+    }
+
+    fn submit_work(ctx: &Ctx, key: &str) -> WorkId {
+        let decision = handle_command(
+            &ctx.store,
+            &ctx.config,
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("test".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Submit {
+                    intent: "poll the target branch".into(),
+                    sources: vec![],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            now(),
+        )
+        .unwrap();
+        match decision {
+            CommandDecision::Accepted { work_id, .. } => work_id.expect("accepted work"),
+            other => panic!("expected accepted, got {other:?}"),
+        }
+    }
+
+    /// Regression (#186): two Works polling the same repository while
+    /// the target branch sits at the same commit must each record their
+    /// own `BranchState` observation — the delivery id is scoped per
+    /// Work because store dedupe is global per `(scope, source,
+    /// event_id)` and does not include the subject.
+    #[test]
+    fn target_branch_poll_records_each_work_at_the_same_sha() {
+        let ctx = test_ctx();
+        let w1 = submit_work(&ctx, "k-w1");
+        let w2 = submit_work(&ctx, "k-w2");
+        let repository = ctx.config.host.repository.clone();
+        let sha = "30f43fa40dfa0cac4b4455c245516b10374285b0";
+        let fact = || ObservationFact::BranchState {
+            repository: repository.clone(),
+            branch: "main".into(),
+            state: BranchState::At {
+                revision: CommitRevision::new(repository.clone(), sha).unwrap(),
+            },
+        };
+        let poll = |work: &WorkId| {
+            ctx.emit(
+                Some((work, None)),
+                branch_poll_event_id(work, "main", sha),
+                fact(),
+            )
+            .unwrap()
+        };
+        assert_eq!(poll(&w1), IngestReceipt::Recorded);
+        assert_eq!(
+            poll(&w2),
+            IngestReceipt::Recorded,
+            "a second Work's identical target-branch fact must not dedupe \
+             against the first Work's delivery"
+        );
+        assert_eq!(
+            poll(&w1),
+            IngestReceipt::Duplicate,
+            "a single Work's unchanged re-poll still dedupes"
+        );
+        for work in [&w1, &w2] {
+            let observations = ctx
+                .store
+                .transact_deferred(|tx| tx.observations_for_work(work))
+                .unwrap();
+            assert!(
+                observations.iter().any(|o| matches!(
+                    &o.fact,
+                    ObservationFact::BranchState {
+                        branch,
+                        state: BranchState::At { revision },
+                        ..
+                    } if branch.as_str() == "main" && revision.object.as_str() == sha
+                )),
+                "work {} is missing its own target-branch observation",
+                work.0
+            );
+        }
+    }
 
     fn push_intent(
         work: &str,

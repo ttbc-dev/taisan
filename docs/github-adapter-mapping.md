@@ -107,6 +107,14 @@ cannot weaken them into a comment or a review submission (HC-CAP-03).
 - Observation delivery dedup = `(host instance, adapter source, delivery
   GUID)`; the same delivery ID under a different configured source is a
   distinct identity, not a duplicate.
+- A delivery event ID must be unique per distinct subject observation:
+  dedupe is global per `(host instance, adapter source, event id)` and
+  the observation's subject Work is not part of the key, so an ID reused
+  across subjects drops the later subject's fact as a duplicate. Poll
+  paths that read state shared by several Works (a target-branch head,
+  a shared source issue) must scope the ID by subject — e.g.
+  `branch:{work}:{branch}:{sha}` — while a single subject's unchanged
+  re-poll keeps deduplicating under the same ID.
 - The same SHA or review ID on another change request is not
   interchangeable evidence: every receipt and observation keeps its
   recorded repository/change binding (HC-SCOPE-01).

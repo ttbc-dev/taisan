@@ -9,7 +9,13 @@ use crate::identity::{
 /// Delivery identity for transports that assign one (webhooks, worker
 /// reports). The scope disambiguates which authority issued the id, so a
 /// host event id never deduplicates a local one and vice versa. An
-/// observation without delivery identity never deduplicates.
+/// observation without delivery identity never deduplicates. The store
+/// dedupes per `(scope, source, event_id)` only — the subject is not
+/// part of the key — so `event_id` must be unique per distinct subject
+/// observation: two subjects reporting the same host state (for example
+/// Works polling a shared target branch) need different ids, or the
+/// second delivery is dropped as a duplicate and that subject never
+/// records the fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryId {
     pub scope: DeliveryScope,
