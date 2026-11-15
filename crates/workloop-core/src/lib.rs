@@ -6,6 +6,7 @@ pub mod identity;
 pub mod observation;
 pub mod ports;
 pub mod projection;
+pub mod review;
 pub mod stage;
 pub mod store;
 pub mod work;
