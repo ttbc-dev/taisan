@@ -7,11 +7,11 @@
 //! flat maps so shared-suite assertions cannot lean on one fixture's
 //! internals.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use workloop_core::domain::WorkId;
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, RepositoryRef,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, HostActorRef, HostInstanceId, RepositoryRef,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, NormalizedEffectFact,
@@ -20,7 +20,10 @@ use workloop_core::observation::{
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
-use crate::fixture::RemoteRead;
+use crate::credential::bind_credential;
+use crate::fixture::{
+    CredentialBlock, CredentialBook, ObservedEffect, ReconcileReport, RemoteRead,
+};
 
 /// Journal of every remote fact the fixture observed — the assertion
 /// surface shared with `FixtureGithub` via the applied-write history.
@@ -31,6 +34,14 @@ pub struct SparseHost {
     branches: BTreeMap<(String, String), String>,
     /// `(repository, change_request_id)` → head object id.
     changes: BTreeMap<(String, String), String>,
+    /// `(repository, change_request_id)` → the scoped ref the remote
+    /// issued — the identity a reconcile read cites when a create's
+    /// receipt was lost.
+    change_refs: BTreeMap<(String, String), ChangeRequestRef>,
+    /// `(repository, change_request_id)` → `(source_branch,
+    /// target_branch)` — the immutable identity a lost create
+    /// reconciles against.
+    change_sources: BTreeMap<(String, String), (String, String)>,
     /// `(repository, change_request_id)` → the actor the remote
     /// attributes the change's head to — the opener, or none for a
     /// head planted by test control.
@@ -56,6 +67,16 @@ pub struct SparseHost {
     /// `action name` → failure reason: test-injected execution faults.
     /// A matching attempt consumes the entry — one-shot per arming.
     forced_failures: BTreeMap<String, String>,
+    /// `(operation, actor)` pairs the remote denies — an authorization
+    /// verdict on the grant axis, never the support axis.
+    denied_ops: BTreeSet<(String, String)>,
+    /// The credential environment this adapter resolves and
+    /// authenticates against before every write and reconcile read.
+    credentials: Option<CredentialBook>,
+    /// When set, this instance serves only intents recorded for this
+    /// host instance — the binding a removed adapter can no longer
+    /// answer for.
+    bound_host: Option<HostInstanceId>,
     /// The write history, for test assertions.
     applied: Vec<String>,
 }
@@ -98,6 +119,93 @@ impl SparseHost {
             "checks_read",
             "review_findings_read",
         ]
+    }
+
+    /// Bound to one host instance — the adapter drains and reconciles
+    /// only intents recorded for `host`.
+    pub fn for_host(host: HostInstanceId) -> Self {
+        Self {
+            bound_host: Some(host),
+            ..Self::default()
+        }
+    }
+
+    /// Install the credential environment this adapter resolves and
+    /// authenticates against before every write and reconcile read.
+    pub fn with_credentials(mut self, credentials: CredentialBook) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// Install or replace the credential environment on an existing
+    /// adapter — the test-control counterpart of
+    /// [`Self::with_credentials`].
+    pub fn install_credentials(&mut self, credentials: CredentialBook) {
+        self.credentials = Some(credentials);
+    }
+
+    /// Test control: mutate the seated credential environment between
+    /// passes — e.g. rotating a slot's value mid-Work.
+    pub fn credentials_mut(&mut self) -> Option<&mut CredentialBook> {
+        self.credentials.as_mut()
+    }
+
+    /// Test control: `actor` lacks the grant for `operation` on the
+    /// subject — attempts record `Failed{reason: denied}`, an
+    /// authorization verdict distinct from `unsupported`.
+    pub fn deny(&mut self, operation: &str, actor: &HostActorRef) {
+        self.denied_ops
+            .insert((operation.to_string(), actor.actor.as_str().to_string()));
+    }
+
+    /// Test control: move a branch head as the given actor — the
+    /// remote record a reconcile read settles a lost push receipt
+    /// from, and the position a guarded write compares against.
+    pub fn set_branch(
+        &mut self,
+        repository: &RepositoryRef,
+        branch: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        self.branches.insert(
+            (repository.to_string(), branch.to_string()),
+            head.to_string(),
+        );
+        self.branch_actors
+            .insert((repository.to_string(), branch.to_string()), actor.clone());
+        self.bump(&ReadSubject::Head {
+            repository: repository.clone(),
+            branch: branch.to_string(),
+        });
+    }
+
+    /// Test control: register a change the remote attributes to
+    /// `actor`, opened from `source_branch` onto `target_branch` —
+    /// the remote record a reconcile read adopts when the create's
+    /// receipt was lost.
+    pub fn plant_change(
+        &mut self,
+        change: &ChangeRequestRef,
+        source_branch: &str,
+        target_branch: &str,
+        head: &str,
+        actor: &HostActorRef,
+    ) {
+        let key = (
+            change.repository.to_string(),
+            change.change_request.as_str().to_string(),
+        );
+        self.changes.insert(key.clone(), head.to_string());
+        self.change_refs.insert(key.clone(), change.clone());
+        self.change_sources.insert(
+            key.clone(),
+            (source_branch.to_string(), target_branch.to_string()),
+        );
+        self.change_actors.insert(key, actor.clone());
+        self.bump(&ReadSubject::Pr {
+            change: change.clone(),
+        });
     }
 
     /// Test control: what the remote believes the change head is.
@@ -316,6 +424,313 @@ impl SparseHost {
         handle_observation(store, config, &observation, now_unix_seconds)
     }
 
+    /// Read-only reconciliation of every outstanding (`pending` or
+    /// `unknown`) outbox intent, in order — the same contract
+    /// `FixtureGithub::reconcile_outbox` implements: compare each
+    /// intent's recorded effect against the remote's current state and
+    /// feed the verdict through the normal receipt path.
+    ///
+    /// The pass performs host reads only — remote state is mutated
+    /// solely inside [`Self::attempt`]. An observed effect settles
+    /// `applied` with the remote's own attribution and normalized
+    /// facts, a definitive-absence read settles an `unknown` intent
+    /// `failed` (a `pending` intent may simply not have been attempted
+    /// yet, so absence leaves it pending), and an indeterminate read
+    /// changes nothing. Reconciliation is never a substitute for a
+    /// write grant: the `host_write` check stays in [`Self::attempt`]
+    /// alone, and a credential that authenticates as another actor
+    /// blocks the intent exactly as it does on the write path. Intents
+    /// bound to another host instance are left for that adapter.
+    pub fn reconcile_outbox(
+        &self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        now_unix_seconds: i64,
+    ) -> Result<ReconcileReport, StoreError> {
+        let mut report = ReconcileReport::default();
+        let outstanding = |i: &HostActionIntent| {
+            matches!(
+                i.status,
+                HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+            )
+        };
+        let mut examined = std::collections::HashSet::new();
+        loop {
+            let next = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| outstanding(i) && !examined.contains(&i.action_id)))
+            })?;
+            let Some(intent) = next else { break };
+            let action_id = intent.action_id.clone();
+            examined.insert(action_id.clone());
+            // Not this instance's intent: leave it outstanding for the
+            // adapter bound to the recorded host — reconciliation never
+            // migrates an effect across host instances.
+            if self
+                .bound_host
+                .as_ref()
+                .is_some_and(|bound| *bound != intent.host)
+            {
+                continue;
+            }
+            // The same adapter-boundary credential gate apply uses: the
+            // intent's recorded role binding resolves and authenticates
+            // under the actor authorized at intent time — a rotated
+            // credential that authenticates as another actor cannot
+            // rebind or settle the outstanding action.
+            let mut verified_actor: Option<HostActorRef> = None;
+            if let Some(book) = &self.credentials {
+                let reference = store.transact(|tx| {
+                    Ok(tx.work(&intent.work_id)?.and_then(|work| {
+                        work.binding
+                            .actors
+                            .iter()
+                            .find(|binding| binding.role == intent.role)
+                            .map(|binding| binding.credential_ref.clone())
+                    }))
+                })?;
+                match bind_credential(reference.as_ref(), &intent.actor, book, &|credential| {
+                    book.authenticate(credential)
+                }) {
+                    Ok(actor) => verified_actor = Some(actor),
+                    Err(error) => {
+                        report.credential_blocked.push(CredentialBlock {
+                            action_id,
+                            code: error.code(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            report.examined += 1;
+            let reader = verified_actor.unwrap_or_else(|| intent.actor.clone());
+            let work_id = intent.work_id.clone();
+            let execution_id = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(&work_id)?
+                    .into_iter()
+                    .max_by_key(|execution| execution.ordinal)
+                    .map(|execution| execution.id))
+            })?;
+            let receipt = |actor: Option<HostActorRef>,
+                           status: HostActionStatus,
+                           effects: Vec<NormalizedEffectFact>| {
+                Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id.clone()),
+                    subject_execution_id: execution_id.clone(),
+                    fact: ObservationFact::HostActionResult {
+                        action_id: action_id.clone(),
+                        authenticated_actor: actor,
+                        status,
+                        effects,
+                    },
+                    observed_unix_seconds: now_unix_seconds,
+                }
+            };
+            match self.observe_effect(&intent) {
+                ObservedEffect::Present { actor, fact } => {
+                    // The remote's attribution authenticates the
+                    // receipt: an effect the remote credits to another
+                    // actor is recorded `unknown{actor_mismatch}` by
+                    // the durable ingest path, never `applied`. That
+                    // verdict is non-terminal, so the intent stays
+                    // outstanding — re-observing the identical
+                    // attribution and fact already on the record adds
+                    // nothing.
+                    let already_recorded = matches!(
+                        &intent.status,
+                        HostActionStatus::Unknown { reason } if reason == "actor_mismatch"
+                    ) && intent.authenticated_actor.as_ref() == Some(&actor)
+                        && intent.effects.len() == 1
+                        && intent.effects[0] == *fact;
+                    if !already_recorded {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(Some(actor), HostActionStatus::Applied, vec![*fact]),
+                            now_unix_seconds,
+                        )?;
+                    }
+                }
+                ObservedEffect::Absent => {
+                    // Absence settles only an intent that already
+                    // carries a verdict: `unknown` becomes `failed` — a
+                    // definite no-effect outcome. A `pending` intent is
+                    // possibly never attempted, so absence is not
+                    // evidence of failure.
+                    if let HostActionStatus::Unknown { .. } = intent.status {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(
+                                Some(reader.clone()),
+                                HostActionStatus::Failed {
+                                    reason: "reconcile: effect not observed".into(),
+                                },
+                                vec![],
+                            ),
+                            now_unix_seconds,
+                        )?;
+                    }
+                }
+                ObservedEffect::Indeterminate { reason } => {
+                    // Update the record when the read's explanation
+                    // moved; an unchanged reason needs no new receipt.
+                    if let HostActionStatus::Unknown { reason: recorded } = &intent.status
+                        && recorded != &reason
+                    {
+                        self.emit(
+                            store,
+                            config,
+                            receipt(
+                                Some(reader.clone()),
+                                HostActionStatus::Unknown { reason },
+                                vec![],
+                            ),
+                            now_unix_seconds,
+                        )?;
+                    }
+                }
+            }
+            match store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })? {
+                Some(HostActionStatus::Applied) => report.applied += 1,
+                Some(HostActionStatus::Failed { .. }) => report.failed += 1,
+                Some(HostActionStatus::Unknown { .. }) => report.still_unknown += 1,
+                _ => {}
+            }
+        }
+        Ok(report)
+    }
+
+    /// The read-only half of reconciliation: compare `intent`'s
+    /// recorded effect against this remote's current state and report
+    /// presence, definitive absence, or indeterminacy. Performs no
+    /// mutation; every `Present` carries the actor the remote
+    /// attributes the effect to and the normalized fact a fresh read
+    /// derives. Operations this remote does not implement journal no
+    /// effect, so their read is definitively absent.
+    fn observe_effect(&self, intent: &HostActionIntent) -> ObservedEffect {
+        let unattributable = || ObservedEffect::Indeterminate {
+            reason: "effect producer is not attributable".into(),
+        };
+        match &intent.action {
+            HostAction::PushRef {
+                branch, produced, ..
+            } => {
+                let key = (intent.repository.to_string(), branch.clone());
+                let Some(object) = self.branches.get(&key).cloned() else {
+                    return ObservedEffect::Absent;
+                };
+                let relation = if object == produced.object {
+                    RefRelation::Equal
+                } else if self.descends(&object, &produced.object) {
+                    RefRelation::Ancestor
+                } else {
+                    return ObservedEffect::Absent;
+                };
+                // Same attribution rule as `FixtureGithub`: an exact
+                // head match credits the ref's last mover; once a
+                // racing actor moved the branch on, ancestry proves
+                // the push reached the branch and the intent's own
+                // actor is the honest attribution.
+                let actor = if relation == RefRelation::Equal {
+                    match self.branch_actors.get(&key).cloned() {
+                        Some(actor) => actor,
+                        None => return unattributable(),
+                    }
+                } else {
+                    intent.actor.clone()
+                };
+                let observed = if relation == RefRelation::Equal {
+                    produced.clone()
+                } else {
+                    match CommitRevision::new(intent.repository.clone(), object) {
+                        Ok(revision) => revision,
+                        Err(_) => {
+                            return ObservedEffect::Indeterminate {
+                                reason: "observed head is not a valid object id".into(),
+                            };
+                        }
+                    }
+                };
+                ObservedEffect::Present {
+                    actor,
+                    fact: Box::new(NormalizedEffectFact::RefPublished {
+                        repository: intent.repository.clone(),
+                        branch: branch.clone(),
+                        produced: produced.clone(),
+                        observed,
+                        relation,
+                    }),
+                }
+            }
+            HostAction::OpenChangeRequest {
+                source_branch,
+                target_branch,
+                ..
+            } => {
+                // The remote-issued id was never captured when the
+                // receipt was lost: match the change by its immutable
+                // (repository, source, target) identity instead.
+                let candidates: Vec<&ChangeRequestRef> = self
+                    .change_sources
+                    .iter()
+                    .filter(|(_, (source, target))| {
+                        source == source_branch && target == target_branch
+                    })
+                    .filter_map(|(key, _)| self.change_refs.get(key))
+                    .filter(|change| change.repository == intent.repository)
+                    .collect();
+                match candidates.as_slice() {
+                    [] => ObservedEffect::Absent,
+                    [change] => {
+                        let key = (
+                            change.repository.to_string(),
+                            change.change_request.as_str().to_string(),
+                        );
+                        let Some(object) = self.changes.get(&key) else {
+                            return ObservedEffect::Indeterminate {
+                                reason: "matching change request has no head on the remote".into(),
+                            };
+                        };
+                        let Some(actor) = self.change_actors.get(&key).cloned() else {
+                            return unattributable();
+                        };
+                        match CommitRevision::new(intent.repository.clone(), object.clone()) {
+                            Ok(head) => ObservedEffect::Present {
+                                actor,
+                                fact: Box::new(NormalizedEffectFact::ChangeOpened {
+                                    change: (*change).clone(),
+                                    head,
+                                    source_branch: source_branch.clone(),
+                                    target_branch: target_branch.clone(),
+                                }),
+                            },
+                            Err(_) => ObservedEffect::Indeterminate {
+                                reason: "observed head is not a valid object id".into(),
+                            },
+                        }
+                    }
+                    _ => ObservedEffect::Indeterminate {
+                        reason: "multiple change requests match the recorded source/target".into(),
+                    },
+                }
+            }
+            // This remote journals no effect for the operations it does
+            // not implement — absence is the honest read.
+            _ => ObservedEffect::Absent,
+        }
+    }
+
     /// Drain outstanding intents in outbox order, bounded to the intents
     /// pending when each attempt starts. Unsupported operations receive
     /// an `unsupported` receipt naming the operation — explicit, and
@@ -349,6 +764,16 @@ impl SparseHost {
         intent: HostActionIntent,
         now: i64,
     ) -> Result<(), StoreError> {
+        // Not this instance's intent: leave it pending for the adapter
+        // bound to the recorded host — an effect never migrates across
+        // host instances.
+        if self
+            .bound_host
+            .as_ref()
+            .is_some_and(|bound| *bound != intent.host)
+        {
+            return Ok(());
+        }
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
             Ok(tx
@@ -362,6 +787,32 @@ impl SparseHost {
         if !execution.allowed_effects.host_write {
             return Ok(());
         }
+        // The adapter-boundary credential gate, identical to
+        // `FixtureGithub`: with a book installed, the intent's recorded
+        // role binding resolves its credential slot and the resolved
+        // value is authenticated against the intent's authorized actor
+        // before any write. A failure leaves the intent pending — an
+        // actor mismatch never rebinds an outstanding action, and a
+        // same-actor renewal resolves the new secret under the
+        // original binding.
+        let mut verified_actor: Option<HostActorRef> = None;
+        if let Some(book) = &self.credentials {
+            let reference = store.transact(|tx| {
+                Ok(tx.work(&work_id)?.and_then(|work| {
+                    work.binding
+                        .actors
+                        .iter()
+                        .find(|binding| binding.role == intent.role)
+                        .map(|binding| binding.credential_ref.clone())
+                }))
+            })?;
+            match bind_credential(reference.as_ref(), &intent.actor, book, &|credential| {
+                book.authenticate(credential)
+            }) {
+                Ok(actor) => verified_actor = Some(actor),
+                Err(_) => return Ok(()),
+            }
+        }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
             delivery: None,
@@ -370,11 +821,12 @@ impl SparseHost {
             fact,
             observed_unix_seconds: now,
         };
+        let authenticated = verified_actor.unwrap_or_else(|| intent.actor.clone());
         let result =
             |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
                 ObservationFact::HostActionResult {
                     action_id,
-                    authenticated_actor: Some(intent.actor.clone()),
+                    authenticated_actor: Some(authenticated.clone()),
                     status,
                     effects,
                 }
@@ -395,26 +847,87 @@ impl SparseHost {
             Ok(())
         };
 
-        // A test-armed execution fault reports a definite failure
-        // without touching the remote — but only for operations this
-        // adapter claims to support; an unsupported intent keeps its
-        // explicit unsupported receipt.
+        // The operations this remote implements get the same
+        // pre-write sequence `FixtureGithub` runs: reconcile-before-
+        // write adopts an effect the remote already shows (the receipt
+        // a crash dropped is recovered, the write is never re-executed
+        // to discover whether it happened), an indeterminate read
+        // keeps the intent outstanding, then the grant check records
+        // `denied` — an authorization verdict on the grant axis,
+        // distinct from `unsupported` on the support axis — and only
+        // a definitive absence reaches the guarded write.
         if matches!(
             intent.action,
             HostAction::PushRef { .. } | HostAction::OpenChangeRequest { .. }
-        ) && let Some(reason) = self.forced_failures.remove(intent.action.name())
-        {
-            self.emit(
-                store,
-                config,
-                obs(result(
-                    intent.action_id.clone(),
-                    HostActionStatus::Failed { reason },
-                    vec![],
-                )),
-                now,
-            )?;
-            return Ok(());
+        ) {
+            match self.observe_effect(&intent) {
+                ObservedEffect::Present { actor, fact } => {
+                    self.emit(
+                        store,
+                        config,
+                        obs(ObservationFact::HostActionResult {
+                            action_id: intent.action_id,
+                            authenticated_actor: Some(actor),
+                            status: HostActionStatus::Applied,
+                            effects: vec![*fact],
+                        }),
+                        now,
+                    )?;
+                    return Ok(());
+                }
+                ObservedEffect::Indeterminate { reason } => {
+                    self.emit(
+                        store,
+                        config,
+                        obs(result(
+                            intent.action_id,
+                            HostActionStatus::Unknown { reason },
+                            vec![],
+                        )),
+                        now,
+                    )?;
+                    return Ok(());
+                }
+                ObservedEffect::Absent => {}
+            }
+            let eligibility_key = || {
+                (
+                    intent.action.name().to_string(),
+                    authenticated.actor.as_str().to_string(),
+                )
+            };
+            if self.denied_ops.contains(&eligibility_key()) {
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id,
+                        HostActionStatus::Failed {
+                            reason: "denied".into(),
+                        },
+                        vec![],
+                    )),
+                    now,
+                )?;
+                return Ok(());
+            }
+            // A test-armed execution fault: the write never reaches the
+            // remote; the failed receipt is explicit and the intent
+            // keeps its own record — a fault in one effect never
+            // rewrites the receipts of the others.
+            if let Some(reason) = self.forced_failures.remove(intent.action.name()) {
+                self.emit(
+                    store,
+                    config,
+                    obs(result(
+                        intent.action_id,
+                        HostActionStatus::Failed { reason },
+                        vec![],
+                    )),
+                    now,
+                )?;
+                return Ok(());
+            }
         }
 
         match &intent.action {
@@ -469,7 +982,7 @@ impl SparseHost {
                 );
                 self.branch_actors.insert(
                     (intent.repository.to_string(), branch.clone()),
-                    intent.actor.clone(),
+                    authenticated.clone(),
                 );
                 if let Some(prior) = &actual {
                     self.parents.insert(produced.object.clone(), prior.clone());
@@ -544,20 +1057,17 @@ impl SparseHost {
                     .get(&(intent.repository.to_string(), source_branch.clone()))
                     .cloned()
                     .unwrap_or_else(|| format!("{source_branch}-head"));
-                self.changes.insert(
-                    (
-                        intent.repository.to_string(),
-                        change.change_request.as_str().to_string(),
-                    ),
-                    head_object.clone(),
+                let change_key = (
+                    intent.repository.to_string(),
+                    change.change_request.as_str().to_string(),
                 );
-                self.change_actors.insert(
-                    (
-                        intent.repository.to_string(),
-                        change.change_request.as_str().to_string(),
-                    ),
-                    intent.actor.clone(),
+                self.changes.insert(change_key.clone(), head_object.clone());
+                self.change_refs.insert(change_key.clone(), change.clone());
+                self.change_sources.insert(
+                    change_key.clone(),
+                    (source_branch.clone(), target_branch.clone()),
                 );
+                self.change_actors.insert(change_key, authenticated.clone());
                 self.bump(&ReadSubject::Pr {
                     change: change.clone(),
                 });
