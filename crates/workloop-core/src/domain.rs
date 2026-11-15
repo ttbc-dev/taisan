@@ -187,6 +187,12 @@ pub enum InvocationRole {
     /// A bounded correction pass; counts against the Work-wide fix
     /// account, not just the Execution budget.
     Fix,
+    /// The pre-publication invariant-conformance check. Read-only: it
+    /// verifies the produced artifact against the approved invariant
+    /// set and never publishes — its own durable Invocation record,
+    /// lifecycle, and receipts are the gate evidence, distinct from
+    /// any assessment fact computed on the diff.
+    InvariantCheck,
     Review,
 }
 

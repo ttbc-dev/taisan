@@ -51,6 +51,14 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         process_identity: String,
         state: ProcessStateFact,
+        /// The proven exit status the supervisor collected when it
+        /// reaped the writer's own exit — `Some(0)` is the only
+        /// positive completion evidence a gate may count. `None`
+        /// means the process resolved without a proven status
+        /// (reparented, ended by a signal, or reported by a path that
+        /// never held the child); it is never a pass.
+        #[serde(default)]
+        exit_code: Option<i32>,
     },
     Artifact {
         invocation_id: InvocationId,

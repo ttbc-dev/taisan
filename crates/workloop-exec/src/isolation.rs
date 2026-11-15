@@ -120,10 +120,12 @@ pub fn release(scratch: &Path) {
 /// carries the scratch directories unresolved Invocations still own
 /// (a live or unproven writer's `HOME`/`TMPDIR` is never touched);
 /// every other `inv-*` entry is a leftover of a resolved or crashed
-/// launch, and every `probe-*` entry is a leftover of an interrupted
+/// launch, every `probe-*` entry is a leftover of an interrupted
 /// declaration — a probe holds its tree only for the synchronous
-/// `describe` call, so one found on disk is already dead. Entries
-/// outside the two owned prefixes are foreign and never touched.
+/// `describe` call, so one found on disk is already dead — and every
+/// `check-*` entry is a leftover of a resolved or crashed invariant
+/// check whose best-effort release failed. Entries outside the owned
+/// prefixes are foreign and never touched.
 pub fn sweep_orphans(scratch_root: &Path, keep: &HashSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(scratch_root) else {
         return;
@@ -133,7 +135,7 @@ pub fn sweep_orphans(scratch_root: &Path, keep: &HashSet<PathBuf>) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !(name.starts_with("inv-") || name.starts_with("probe-")) {
+        if !(name.starts_with("inv-") || name.starts_with("probe-") || name.starts_with("check-")) {
             continue;
         }
         if keep.contains(&entry.path()) {
@@ -274,20 +276,30 @@ mod tests {
         prepare(&default_isolation_profile(), &keep).unwrap();
         let orphan_inv = root.join("inv-inv-2");
         let orphan_probe = root.join("probe-req-1");
-        for dir in [&orphan_inv, &orphan_probe] {
+        let orphan_check = root.join("check-inv-3");
+        let kept_check = root.join("check-inv-4");
+        for dir in [&orphan_inv, &orphan_probe, &orphan_check, &kept_check] {
             std::fs::create_dir_all(dir.join("home")).unwrap();
         }
         let foreign = root.join("foreign");
         std::fs::create_dir_all(&foreign).unwrap();
 
-        let keep_set = std::collections::HashSet::from([keep.clone()]);
+        let keep_set = std::collections::HashSet::from([keep.clone(), kept_check.clone()]);
         sweep_orphans(&root, &keep_set);
 
         assert!(keep.exists(), "a kept scratch tree survives");
+        assert!(
+            kept_check.exists(),
+            "a kept check snapshot survives the sweep"
+        );
         assert!(!orphan_inv.exists(), "an unowned inv-* tree is reclaimed");
         assert!(
             !orphan_probe.exists(),
             "an unowned probe-* tree is reclaimed"
+        );
+        assert!(
+            !orphan_check.exists(),
+            "an unowned check-* snapshot is reclaimed"
         );
         assert!(foreign.exists(), "entries outside the prefixes are kept");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());

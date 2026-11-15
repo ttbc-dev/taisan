@@ -450,8 +450,16 @@ impl ProcessControlPort for ScriptedProcessControl {
         }
     }
 
-    fn reap(&self, pid: i32) {
-        self.state.lock().unwrap().procs.remove(&pid);
+    fn reap(&self, pid: i32) -> Option<i32> {
+        // The modeled exit status is collected with the reap, like a
+        // real waitpid: a process that ended by signal or was never
+        // observed exiting carries no proven code.
+        self.state
+            .lock()
+            .unwrap()
+            .procs
+            .remove(&pid)
+            .and_then(|p| p.exit_code)
     }
 
     fn run_probe(
@@ -483,7 +491,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         "adapter_version": "1.0.0",
                         "runtime_version": "scripted-1.0.0",
                         "protocol_versions": ["taisan.worker/1"],
-                        "roles": ["coding", "fix", "review"],
+                        "roles": ["coding", "fix", "invariant_check", "review"],
                         "capabilities": ["workspace_write", "artifact_json", "process_control"],
                     })
                     .to_string()

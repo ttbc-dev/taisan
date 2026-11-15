@@ -1958,7 +1958,15 @@ pub fn admit_queued_role(
     let Some(execution) = tx.execution(execution_id)? else {
         return Ok(None);
     };
-    if execution.state != ExecutionState::Queued {
+    // `queued` is the ordinary admission point. `waiting` admits only
+    // the pre-publication invariant check: lifecycle.md's
+    // `waiting → ready` transition issues the next step's request under
+    // the same Execution and reservation, and the check is the only
+    // role the publish gate re-requests from `waiting` today — every
+    // other role still requires a Command-driven requeue first.
+    if execution.state != ExecutionState::Queued
+        && !(execution.state == ExecutionState::Waiting && role == InvocationRole::InvariantCheck)
+    {
         return Ok(None);
     }
     let work = tx
@@ -2148,6 +2156,16 @@ pub fn admit_queued_role(
     }
 
     let seq = tx.alloc_seq()?;
+    let mut payload = serde_json::to_value(&execution.input).unwrap_or_default();
+    if role == InvocationRole::InvariantCheck
+        && let serde_json::Value::Object(map) = &mut payload
+    {
+        // The check is read-only: it declares no workspace artifact,
+        // so its durable record carries an explicitly empty required
+        // set rather than the writer default. Its evidence is the
+        // Invocation lifecycle plus receipts, never a produced diff.
+        map.insert("required_artifacts".into(), serde_json::json!([]));
+    }
     let request = InvocationRequest {
         // One durable request per recorded attempt; the attempt counter
         // makes re-admission ids unique.
@@ -2156,7 +2174,7 @@ pub fn admit_queued_role(
         execution_id: execution.id.clone(),
         role: role.clone(),
         spec_revision: work.spec,
-        payload: serde_json::to_value(&execution.input).unwrap_or_default(),
+        payload,
         // Created unbound: the adapter binding is recorded later from a
         // live `describe` declaration — either by the Phase-2
         // dispatch-admission probe, which binds unbound pending
@@ -2167,6 +2185,7 @@ pub fn admit_queued_role(
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
+    next.waiting_reason = None;
     // The runtime budget anchors at first dispatch; a resumed Execution
     // keeps its original anchor and counters.
     if next.started_seq.is_none() {
@@ -2180,7 +2199,7 @@ pub fn admit_queued_role(
     next.next_role = None;
     tx.apply(&Effect::UpdateExecution {
         execution: next.clone(),
-        expected_state: ExecutionState::Queued,
+        expected_state: execution.state.clone(),
     })?;
     // Work-wide accounting: first dispatch anchors automatic time; a fix
     // admission charges the fix account.
@@ -3034,6 +3053,18 @@ fn seal_round(
     else {
         return Ok(());
     };
+    // The review lane binds the configured reviewer identity: when the
+    // Work's host binding names a review actor, only a review reported
+    // under that actor seals a round. A review from any other source —
+    // the generic automation identity included — stays recorded as an
+    // observation but is never authoritative review evidence, so it can
+    // satisfy no lane and trigger no findings pause.
+    if let Some(work) = tx.work(work_id)?
+        && let Some(bound) = work.binding.actor_for(ActorRole::Review)
+        && source.as_str() != bound.actor.as_str()
+    {
+        return Ok(());
+    }
     if !completeness.is_complete() {
         // An incomplete review is recorded as evidence but never seals a
         // round; it can satisfy nothing.
@@ -3448,15 +3479,17 @@ fn assess_artifact(
     }
 }
 
-/// Once the coding Invocation's evidence is complete, record the next
-/// stage effect intent — the outbox row exists before any host write is
-/// attempted. Stage effects chain on each other's receipts: `push_ref`
-/// first, then `open_change_request` once the ref is published.
+/// Once the producing Invocation's evidence is complete — and, when
+/// the invariant lane is enabled, a completed invariant-check
+/// Invocation recorded after it — record the next stage effect intent:
+/// the outbox row exists before any host write is attempted. Stage
+/// effects chain on each other's receipts: `push_ref` first, then
+/// `open_change_request` once the ref is published.
 fn maybe_publish(
     tx: &mut dyn TxView,
-    _config: &WorkloopConfig,
+    config: &WorkloopConfig,
     execution: &Execution,
-    _now_unix_seconds: i64,
+    now_unix_seconds: i64,
 ) -> Result<(), StoreError> {
     if execution.state != ExecutionState::Waiting {
         return Ok(());
@@ -3465,9 +3498,16 @@ fn maybe_publish(
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
     }
-    let Some(latest) = invocations.last() else {
+    // The published artifact belongs to the latest producing
+    // Invocation (coding/fix). A check or review Invocation never
+    // re-publishes its own output as the produced revision.
+    let Some(producing) = invocations
+        .iter()
+        .rposition(|i| matches!(i.role, InvocationRole::Coding | InvocationRole::Fix))
+    else {
         return Ok(());
     };
+    let latest = &invocations[producing];
     if latest.state != InvocationState::Done {
         return Ok(());
     }
@@ -3484,6 +3524,34 @@ fn maybe_publish(
         .ok_or_else(|| StoreError::Internal {
             detail: "execution without work".into(),
         })?;
+    let spec = tx
+        .spec(&work.id, Some(work.approved_spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "work without spec".into(),
+        })?;
+    // Invariant lane: publication waits for the check's own durable
+    // Invocation evidence — a `Done` invariant-check recorded after
+    // the producing Invocation — never for an assessment fact alone.
+    // `Done` alone only records that the process resolved: the check
+    // must also carry a proven exit status of 0, so a failed or
+    // unverifiable check exit is resolved-but-not-conforming evidence
+    // and never opens the gate. A missing or superseded check
+    // re-requests under the same Execution reservation
+    // (`waiting → ready`); the attempt is budget-bounded like every
+    // other Invocation.
+    if spec.payload.lanes.invariant_check {
+        let checked = satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?;
+        if !checked {
+            admit_queued_role(
+                tx,
+                config,
+                &execution.id,
+                InvocationRole::InvariantCheck,
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+    }
     let intents = tx.action_intents()?;
     let work_intents: Vec<&HostActionIntent> =
         intents.iter().filter(|i| i.work_id == work.id).collect();
@@ -3639,11 +3707,6 @@ fn maybe_publish(
         // execution for an operator decision; never re-issue it.
         return Ok(());
     }
-    let spec = tx
-        .spec(&work.id, Some(work.approved_spec))?
-        .ok_or_else(|| StoreError::Internal {
-            detail: "work without spec".into(),
-        })?;
     record_intent(
         tx,
         &work,
@@ -3754,6 +3817,49 @@ fn artifact_digests(
     Ok(digests)
 }
 
+/// The check's positive process evidence: its Invocation resolved
+/// `Done` on a proven exit status of 0. `Done` alone records only
+/// that the process stopped — a failed, signaled, or status-unproven
+/// check exit is resolved-but-not-conforming and never counts.
+fn check_exited_zero(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    invocation: &Invocation,
+) -> Result<bool, StoreError> {
+    Ok(tx
+        .observations_for_execution(execution_id)?
+        .iter()
+        .any(|o| match &o.fact {
+            ObservationFact::ProcessState {
+                invocation_id,
+                state: ProcessStateFact::Exited,
+                exit_code,
+                ..
+            } => invocation_id == &invocation.id && exit_code == &Some(0),
+            _ => false,
+        }))
+}
+
+/// Whether `candidates` holds an invariant-check Invocation whose own
+/// evidence is positive — `Done` on a proven exit status of 0. This is
+/// the only check result publication and completion may count; both
+/// gates share it so they can never drift apart.
+fn satisfied_invariant_check(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    candidates: &[Invocation],
+) -> Result<bool, StoreError> {
+    for invocation in candidates {
+        if invocation.role == InvocationRole::InvariantCheck
+            && invocation.state == InvocationState::Done
+            && check_exited_zero(tx, execution_id, invocation)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// `succeeded` requires the required stage effects applied, the declared
 /// checks passing on the current target, the enabled lanes satisfied by
 /// their exact evidence, and no unresolved writer, gate, or outgoing
@@ -3775,7 +3881,11 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         return Ok(());
     }
     for invocation in &invocations {
+        // Only declared artifacts gate completion: a read-only role
+        // (the invariant check) records an explicitly empty required
+        // set — its lifecycle and receipts are the evidence.
         if invocation.state == InvocationState::Done
+            && !invocation.required_artifacts.is_empty()
             && artifact_digests(tx, &execution.id, invocation)?.is_empty()
         {
             return Ok(());
@@ -3880,7 +3990,10 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         }
     }
     // Invariant lane: a complete assessment on the current target whose
-    // every item is positive. Disabled lanes count nothing either way.
+    // every item is positive AND a completed invariant-check Invocation
+    // recorded after the latest producing Invocation. The assessment
+    // fact alone never substitutes for the check's own durable record.
+    // Disabled lanes count nothing either way.
     if spec.payload.lanes.invariant_check {
         let ok = observations.iter().any(|o| {
             matches!(
@@ -3897,7 +4010,16 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
                     })
             )
         });
-        if !ok {
+        let checked = match invocations.iter().rposition(|i| {
+            matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
+                && i.state == InvocationState::Done
+        }) {
+            Some(producing) => {
+                satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?
+            }
+            None => false,
+        };
+        if !(ok && checked) {
             return Ok(());
         }
     }

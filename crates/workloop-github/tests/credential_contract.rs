@@ -539,3 +539,105 @@ fn secret_values_never_enter_argv_logs_exports_or_durable_intents() {
 
     let _ = std::fs::remove_dir_all(&store_dir);
 }
+
+fn change() -> ChangeRequestRef {
+    ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    }
+}
+
+/// S-5 (#149): under the reviewer-App configuration a review intent
+/// resolves the review role's own credential slot and authenticates as
+/// the configured App slug — the produced review carries that identity.
+/// A credential that authenticates as the generic automation bot is an
+/// `actor_mismatch`: the review is never applied under
+/// `github-actions[bot]`.
+#[test]
+fn review_feedback_binds_the_configured_reviewer_app_identity() {
+    let reviewer = actor("s1-reviewer[bot]");
+    let bot = actor("github-actions[bot]");
+    let config = config_with(vec![
+        role_binding(
+            ActorRole::Publication,
+            "pub-agent",
+            "env:TAISAN_TEST_PUBLICATION_CRED",
+        ),
+        role_binding(
+            ActorRole::Review,
+            "s1-reviewer[bot]",
+            "env:TAISAN_TEST_REVIEW_APP_CRED",
+        ),
+    ]);
+    let mut book = CredentialBook::new();
+    book.seat_env("TAISAN_TEST_REVIEW_APP_CRED", "app-token");
+    book.seat_actor("app-token", reviewer.clone());
+    let mut fixture = FixtureGithub::new().with_credentials(book);
+    fixture.set_change_head(&change(), "head-1", &reviewer);
+
+    let store_dir = temp_dir("reviewer-app");
+    let store = SqliteStore::open(&store_dir.join("store.db"), 4).unwrap();
+    let work_id = submit(&store, &config, "reviewer-app-1");
+
+    let review_intent = |body: &str| {
+        insert_intent(
+            &store,
+            &work_id,
+            ActorRole::Review,
+            &reviewer,
+            HostAction::PublishReviewFeedback {
+                change: change(),
+                head: rev("head-1"),
+                body: body.into(),
+            },
+        )
+    };
+
+    // The App's own credential applies the review as the App slug.
+    let first = review_intent("ship it");
+    let report = fixture
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, usize::MAX)
+        .unwrap();
+    assert_eq!(report.applied, 1);
+    let applied = intent(&store, &first);
+    assert_eq!(applied.status, HostActionStatus::Applied);
+    assert_eq!(applied.authenticated_actor, Some(reviewer.clone()));
+    assert_eq!(
+        applied
+            .authenticated_actor
+            .as_ref()
+            .map(|a| a.actor.as_str()),
+        Some("s1-reviewer[bot]"),
+        "the review carries the configured App slug"
+    );
+    assert_ne!(
+        applied.authenticated_actor,
+        Some(bot.clone()),
+        "never the generic automation identity"
+    );
+
+    // A credential slot rotated to authenticate as the generic bot is
+    // an actor mismatch: the outstanding review stays pending and is
+    // never applied under `github-actions[bot]`.
+    let book = fixture.credentials_mut().unwrap();
+    book.seat_env("TAISAN_TEST_REVIEW_APP_CRED", "bot-token");
+    book.seat_actor("bot-token", bot);
+    let second = review_intent("re-check");
+    let report = fixture
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, usize::MAX)
+        .unwrap();
+    assert_eq!(
+        report.credential_blocked,
+        vec![workloop_github::fixture::CredentialBlock {
+            action_id: second.clone(),
+            code: "credential.actor_mismatch",
+        }]
+    );
+    let blocked = intent(&store, &second);
+    assert_eq!(blocked.status, HostActionStatus::Pending);
+    assert_eq!(blocked.authenticated_actor, None);
+    assert_eq!(blocked.actor, reviewer);
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
