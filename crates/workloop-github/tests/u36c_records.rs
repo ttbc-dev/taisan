@@ -761,12 +761,18 @@ fn only_effect(intent: &HostActionIntent) -> &NormalizedEffectFact {
 
 /// The evidence a scenario run leaves behind: the durable action
 /// identities it exercised, the observation delivery identities it
-/// recorded, and the read-back receipts its facts were re-observed
-/// through.
+/// recorded, the read-back receipts its facts were re-observed
+/// through, and the configuration identity the retained record binds.
 struct ScenarioEvidence {
     action_identities: Vec<String>,
     observation_identities: Vec<String>,
     read_back_receipts: Vec<ReadBackReceipt>,
+    /// The configuration the scenario's Work and intents were accepted
+    /// under — never a configuration the run did not exercise. A
+    /// scenario that changes binding mid-run still cites the original
+    /// binding's configuration; the change is narrated in
+    /// `read_back_receipts`.
+    config_identity: ConfigIdentity,
 }
 
 /// U3.6c reconciliation scenario 1 — a lost response leaves an
@@ -972,6 +978,7 @@ fn lost_response_unknown_effects_reconcile_by_action_identity_without_replay(
                 observed: "read-back:Pr read head-9 — agrees with ChangeOpened.head".into(),
             },
         ],
+        config_identity: ConfigIdentity::for_config(&config, adapter.adapter_id()),
     }
 }
 
@@ -1017,17 +1024,6 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
         .action_id
         .clone();
     let branch = format!("work/{}", work_id.0);
-
-    // An unknown-effect intent bound to the same Work and actor: its
-    // remote effect landed but the receipt was lost.
-    let retry_branch = format!("{branch}-retry");
-    let unknown_id = insert_intent_with(
-        &store,
-        &work_id,
-        push_intent(&retry_branch, "head-z", None),
-        unknown(),
-    );
-    adapter.set_branch(&repo(), &retry_branch, "head-z", &publisher());
 
     // The drift: every declared write capability loses authorization
     // for the bound actor — support stays declared on the support
@@ -1080,6 +1076,74 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
         }
     }
 
+    // The previously applied receipts stay intact — facts, not
+    // re-verified state.
+    for id in [&push_id, &open_id] {
+        let settled = intent(&store, id);
+        assert_eq!(
+            settled.status,
+            HostActionStatus::Applied,
+            "{id} receipt intact"
+        );
+        assert_eq!(settled.effects.len(), 1, "{id} keeps its effect fact");
+    }
+
+    // No new dependent effect is admitted while the drift stands: a
+    // Done fix Invocation's fresh artifact re-arms publication — its
+    // digest differs from every applied push's produced revision, so
+    // Core's `maybe_publish` reaches the intent gate — but the drifted
+    // capability report holds every write capability denied, so
+    // `record_intent` admits nothing. The Execution is still `Waiting`
+    // with no outstanding intents here, so the capability check is the
+    // only thing refusing the intent.
+    let mut fix = recorded_invocation(&eid, "u36c-coding-fix");
+    fix.request_id = format!("{}:inv:1", eid.0);
+    fix.role = InvocationRole::Fix;
+    fix.state = InvocationState::Done;
+    fix.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest-2".into()),
+    }];
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: fix.clone(),
+        }],
+    );
+    let recorded = intents(&store).len();
+    emit_fact(
+        adapter,
+        &store,
+        &config,
+        &work_id,
+        &eid,
+        ObservationFact::Artifact {
+            invocation_id: fix.id.clone(),
+            required_artifact: "artifact.json".into(),
+            state: ArtifactFact::Present {
+                digest: "artifact-digest-2".into(),
+            },
+        },
+    );
+    assert_eq!(
+        intents(&store).len(),
+        recorded,
+        "{}: no new dependent intent admitted under drift",
+        adapter.adapter_id()
+    );
+
+    // An unknown-effect intent bound to the same Work and actor: its
+    // remote effect landed but the receipt was lost.
+    let retry_branch = format!("{branch}-retry");
+    let unknown_id = insert_intent_with(
+        &store,
+        &work_id,
+        push_intent(&retry_branch, "head-z", None),
+        unknown(),
+    );
+    adapter.set_branch(&repo(), &retry_branch, "head-z", &publisher());
+
     // A new dependent effect attempted under the drift records
     // `denied` — an authorization verdict, terminal for the intent,
     // never retried and never an `unsupported` receipt.
@@ -1108,21 +1172,11 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
         adapter.adapter_id()
     );
 
-    // The previously applied receipts stay intact — facts, not
-    // re-verified state.
-    for id in [&push_id, &open_id] {
-        let settled = intent(&store, id);
-        assert_eq!(
-            settled.status,
-            HostActionStatus::Applied,
-            "{id} receipt intact"
-        );
-        assert_eq!(settled.effects.len(), 1, "{id} keeps its effect fact");
-    }
-
     // Reconciliation continues with reads only: the unknown intent
     // settles from the remote's own read under its original binding —
-    // the denied grant governs writes, never the read path.
+    // the denied grant governs writes, never the read path. Its
+    // `Applied` receipt is also what settles the pause recorded above
+    // once writer safety is proven.
     let writes_before = adapter.applied().len();
     let report = adapter.reconcile(&store, &config);
     assert_eq!(report.examined, 1, "only the unknown intent is outstanding");
@@ -1163,32 +1217,6 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
             .repair_prerequisites
             .contains(&RepairPrerequisite::OperatorDecision),
         "the pause waits on an operator decision"
-    );
-
-    // No new dependent effect is admitted while the drift stands: a
-    // fresh artifact would re-arm publication, but the drifted
-    // capability report holds every write capability denied — Core's
-    // intent gate records nothing.
-    let recorded = intents(&store).len();
-    emit_fact(
-        adapter,
-        &store,
-        &config,
-        &work_id,
-        &eid,
-        ObservationFact::Artifact {
-            invocation_id: InvocationId("u36c-coding".into()),
-            required_artifact: "artifact.json".into(),
-            state: ArtifactFact::Present {
-                digest: "artifact-digest-2".into(),
-            },
-        },
-    );
-    assert_eq!(
-        intents(&store).len(),
-        recorded,
-        "{}: no new dependent intent admitted under drift",
-        adapter.adapter_id()
     );
 
     // Reads stay served — the reconciliation read set remained
@@ -1254,6 +1282,14 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
                     .into(),
             },
             ReadBackReceipt {
+                target: "intent-gate".into(),
+                observed: "re-arm refused: the fix invocation's Present artifact \
+                           (artifact-digest-2) reached maybe_publish's intent gate \
+                           and the drifted report's Denied push_ref admitted no \
+                           intent — the durable action count is unchanged"
+                    .into(),
+            },
+            ReadBackReceipt {
                 target: retry_subject.key(),
                 observed: "read-back:Head read head-z — reads stayed authorized".into(),
             },
@@ -1262,6 +1298,7 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
                 observed: "read-back:Pr read — reads stayed authorized".into(),
             },
         ],
+        config_identity: ConfigIdentity::for_config(&config, adapter.adapter_id()),
     }
 }
 
@@ -1496,6 +1533,11 @@ fn actor_replacement_cannot_retarget_outstanding_actions(
                     .into(),
             },
         ],
+        // The record binds the configuration the exercised Work and its
+        // intents were accepted under; the post-change binding
+        // (`config_b`) applies only to the newly accepted Work and is
+        // narrated above.
+        config_identity: ConfigIdentity::for_config(&config_a, adapter.adapter_id()),
     }
 }
 
@@ -1619,6 +1661,11 @@ fn restart_and_config_change_reconcile_under_the_original_binding(
                 observed: "read-back:Pr read head-1 — agrees with ChangeOpened.head".into(),
             },
         ],
+        // The record binds the configuration the exercised Work and its
+        // intents were accepted under (`config_a`); the post-change
+        // configuration (`config_b`) that reconciliation ran against is
+        // narrated above.
+        config_identity: ConfigIdentity::for_config(&config_a, adapter.adapter_id()),
     }
 }
 
@@ -1782,6 +1829,7 @@ fn partial_receipts_across_restart_reconcile_each_constituent_independently(
                 observed: "read-back:Pr read head-1 — agrees with ChangeOpened.head".into(),
             },
         ],
+        config_identity: ConfigIdentity::for_config(&config, adapter.adapter_id()),
     }
 }
 
@@ -1842,7 +1890,7 @@ fn run_recorded(
                 base_revision: base.clone(),
                 core_revision: tested.clone(),
                 adapter_revision: tested.clone(),
-                config_identity: ConfigIdentity::for_config(&config(adapter_id), adapter_id),
+                config_identity: evidence.config_identity,
                 command_or_scenario: format!("u36c-reconciliation::{id}"),
                 action_identities: evidence.action_identities,
                 observation_identities: evidence.observation_identities,
