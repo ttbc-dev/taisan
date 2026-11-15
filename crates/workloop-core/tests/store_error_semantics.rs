@@ -245,6 +245,9 @@ impl ReadView for FailingTx<'_> {
     fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError> {
         unimplemented!()
     }
+    fn commands(&self) -> Result<Vec<workloop_core::store::CommandRecord>, StoreError> {
+        unimplemented!()
+    }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
         Ok(0)
     }

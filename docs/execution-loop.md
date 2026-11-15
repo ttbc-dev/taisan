@@ -139,7 +139,7 @@ A transition to `failed` with a manual retry command does not satisfy automatic 
 
 Observable material progress per Work: a new accepted artifact, a previously failing required check becoming valid and successful, or an unknown effect acquiring a verified result — the [recovery policy](recovery-policy.md#failure-and-progress-classification) definition applied by the loop. The persisted progress timestamp is the last material-progress commit for the Work; it rearms `recovery.no_progress_seconds` and nothing else. Missing or stale progress signal behavior: an absent timestamp (never-progressed Work) uses the first dispatch commit time; a corrupted signal is `unknown`, surfaced, and never treated as progress or as death.
 
-At threshold the loop emits an Attention item `no_progress` carrying Work, Execution, last progress timestamp, and elapsed. It clears automatically when material progress is recorded. Absence of progress never proves death, never authorizes a stop, and never authorizes a replacement writer. Cross-task doctor diagnosis is deferred.
+At threshold the loop emits an Attention item `no_progress` carrying Work, Execution, last progress timestamp, and elapsed. It clears automatically when material progress is recorded. Absence of progress never proves death, never authorizes a stop, and never authorizes a replacement writer. Cross-task doctor diagnosis is deferred; its Phase-1 input is the bounded read-only `anomalies` census ([module contracts](module-contracts.md#type-sketch)), which inventories every stuck lane state from durable records without mutating anything.
 
 ### Timeout recovery sequence
 

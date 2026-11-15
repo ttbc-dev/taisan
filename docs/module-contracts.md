@@ -113,6 +113,8 @@ type Query =
 	| { kind: "work_detail"; work_id: WorkId }
 	| { kind: "attention"; work_id?: WorkId }
 	| { kind: "capacity" }
+	| { kind: "anomalies"; item_limit?: number;
+	    deferral_age_events?: number }
 	| { kind: "command_result"; lookup:
 	    | { kind: "id"; command_id: CommandId }
 	    | { kind: "replay_key"; origin: string; actor: Actor; idempotency_key: string } };
@@ -172,6 +174,16 @@ type CapacityView = {
 	reservations: (ResourceReservation & { since: EventSequence })[];
 	deferred: { execution_id: ExecutionId; reason: RejectionCode;
 	            diagnostic: string; since: EventSequence }[] };
+type AnomalyCensus = { as_of: EventSequence;
+	judgment_waits: DetectorSection<JudgmentWaitItem>;
+	released_wait_blocked: DetectorSection<ReleasedWaitBlock>;
+	orphaned_findings: DetectorSection<OrphanedFinding>;
+	parked_selector_starvation: DetectorSection<ParkedDeferral>;
+	stale_spec_halts: DetectorSection<unknown>;
+	source_gate_holds: DetectorSection<SourceGateItem> };
+type DetectorSection<T> = { applicable: boolean; note?: string;
+	items: T[]; total: number; truncated: boolean; limit: number;
+	context?: unknown };
 ```
 
 `submit` has no Work ID: `work` allocates it only after accepting the Command. An existing-Work Command must carry the version the caller saw. A review judgment also carries its expected PR head. The server scopes the idempotency key to the installation, origin, and actor, and stores a digest of the canonical payload. The same key and payload return the saved `CommandDecision`; the same key with a different payload yields `idempotency_conflict`. A transport timeout has no `CommandDecision` yet from the caller's point of view, so the caller queries or replays rather than assuming rejection. v0.1 retains command keys and decisions indefinitely — a lost response must always be recoverable — and each adapter's actor identity comes from the installation config and stays stable across restarts. This replay guarantee is scoped to the active store authority. Under #50, the unversioned legacy store is preserved for read-only reference and not imported into the fresh store; archive inspection does not resume old Work or replay old keys into new execution. An explicit StoreId distinguishes those histories.
@@ -181,6 +193,8 @@ type CapacityView = {
 `work.preview(CommandRequest) → ActionPreview` uses saved facts and is advisory. It reserves neither capacity nor execution ownership. A Query never refreshes the repository host or starts a worker. `projection` exposes current Attention but does not evaluate Command eligibility. A Command handler may obtain a new Observation before deciding. The final Command decision always rechecks preconditions.
 
 The `capacity` Query returns a `CapacityView`: which Executions hold slots and why, all held resource reservations including external claims, and queued Executions deferred by a diagnostic such as a conflicting claim or an unavailable source. It is the explanation surface for queue stalls — no separate reservation bookkeeping exists for it to disagree with. `AttentionView` carries the investigation threshold that produced it and the next responsible actor/action; acknowledgement marks the displayed version as seen, and a new version is the only thing that resurfaces it.
+
+`anomalies` returns the bounded read-only anomaly census — the structured inventory of stuck lane states that a doctor pass consumes as its Phase-1 input. It writes nothing, launches nothing, and refreshes no external source; every detector section is always present and individually capped at `item_limit` items with `truncated` reporting the cap honestly, and an empty `items` with `applicable: true` is a clean bill for that detector rather than missing coverage. `judgment_waits` reports sealed `review_rounds` lacking `round_judgments` coverage of their `set_digest`, `paused` Executions whose `paused_judgment` Attention is unacknowledged, and undecodable store records — unreadable evidence is reported, never silently dropped. `released_wait_blocked` reports nonterminal `paused`/`waiting` Executions whose wait Attention was acknowledged but which saw no accepted `resume`/`retry` Command; rejected attempts stay visible as context. `orphaned_findings` reports `finding_occurrences` on uncovered rounds with no unresolved writer Invocation, each classified `proven` (bound to this installation's host with recorded invocations), `foreign` (bound to a different host binding), or `uncertain` (missing binding or unreadable source); `uncertain` and `foreign` are report-only and no write-capable path may consume them. `parked_selector_starvation` reports `deferrals` aged past `deferral_age_events` in event-sequence distance — queue-order time, not wall clock — with the capacity-slot and reservation context that explains them. `stale_spec_halts` is `not_applicable_v0.1`: no spec-halt record exists in the v0.1 store, so the section is emitted with `applicable: false` and an explicit note rather than dropped. `source_gate_holds` covers `works.source_gate` ∈ {`changed`, `needs_check`} holds and Executions `waiting` on `human_judgment` — the spec:ambiguous / needs-human sweep records.
 
 `WorkList` is the Kanban-style management view; its `queued` items have current Executions awaiting capacity. Phase, Outcome, and Attention count are derived from saved Work, Execution, and Observation records; there is no separate card status or card ID. `waiting` means an external check or automatic step is pending, `paused` means a safe stop awaits a decision, `stopping` means stop is not confirmed, `stopped` has a failed or cancelled Outcome, and `unknown` means evidence is insufficient. A stopped Work does not return to `queued` without an accepted Command. Pagination uses a stable order over committed enqueue sequences and the snapshot sequence. `submit` creates E1 `queued`; `retry` creates E2 `queued`; `resume` requeues the same E. Internal dispatch later reserves capacity and records an Invocation request in one commit. `WorkDetail.findings` contains findings actionable for the current review target, which is the PR head when a PR exists. Findings for earlier revisions remain in evidence history. An empty list with an unavailable review source is not evidence that review found no issues; `QueryResult.sources` carries that distinction.
 

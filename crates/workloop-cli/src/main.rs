@@ -170,6 +170,18 @@ enum Commands {
         work: Option<String>,
     },
     Capacity,
+    /// Bounded read-only anomaly census: every stuck lane state as
+    /// structured output — the lane-diagnosis Phase-1 input. Report
+    /// only: no remediation, no worker launch, no source refresh.
+    Anomalies {
+        /// Maximum items reported per detector section.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Deferral age, in event-sequence distance, that marks
+        /// selector starvation.
+        #[arg(long, default_value_t = 256)]
+        deferral_age_events: i64,
+    },
     CommandResult {
         #[arg(long)]
         command_id: Option<String>,
@@ -967,6 +979,39 @@ fn run(cli: Cli) -> i32 {
             let identity =
                 envelope::query_identity("capacity", &actor, cli.idempotency_key.as_deref());
             match store.transact_deferred(|tx| projection::capacity(tx)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
+        }
+        Commands::Anomalies {
+            limit,
+            deferral_age_events,
+        } => {
+            let identity =
+                envelope::query_identity("anomalies", &actor, cli.idempotency_key.as_deref());
+            let bounds = workloop_core::census::CensusBounds {
+                item_limit: limit,
+                deferral_age_events,
+            };
+            let host = config.host.repository.host.clone();
+            match store.transact_deferred(|tx| {
+                workloop_core::census::anomaly_census(tx, &bounds, &host).map(|census| {
+                    let as_of = census.as_of;
+                    workloop_core::projection::QueryResult::Found {
+                        value: census,
+                        as_of,
+                        sources: vec![SourceStatus {
+                            source: "store".into(),
+                            availability: Availability::Known,
+                            observed_unix_seconds: None,
+                        }],
+                    }
+                })
+            }) {
                 Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
                 Err(e) => emit(envelope::error_envelope(
                     Some(identity),

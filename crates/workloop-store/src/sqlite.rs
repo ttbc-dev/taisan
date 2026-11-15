@@ -27,8 +27,8 @@ use workloop_core::identity::{HostInstanceId, StoreId};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
-    Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent, RecoveryIntentState, Store,
-    StoreError, TxView,
+    CommandRecord, Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent,
+    RecoveryIntentState, Store, StoreError, TxView,
 };
 use workloop_core::worker::WorkerRequestExport;
 
@@ -1682,6 +1682,60 @@ impl ReadView for Tx<'_> {
             },
         )
     }
+
+    fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
+        self.query_all(
+            "SELECT command_id, canonical_payload, decision, seq \
+             FROM commands ORDER BY seq, command_id",
+            [],
+            |row| {
+                let (kind, work_id, execution_id) = command_target(&row.get::<_, Vec<u8>>(1)?);
+                let decision: String = row.get(2)?;
+                // An undecodable decision can never prove acceptance:
+                // it reads as not-accepted so a census never treats an
+                // unreadable record as a recorded release.
+                let accepted = serde_json::from_str::<serde_json::Value>(&decision)
+                    .ok()
+                    .and_then(|v| v.get("status")?.as_str().map(str::to_string))
+                    .is_some_and(|s| s == "accepted");
+                Ok(CommandRecord {
+                    command_id: CommandId(row.get::<_, String>(0)?),
+                    kind,
+                    work_id,
+                    execution_id,
+                    accepted,
+                    seq: row.get(3)?,
+                })
+            },
+        )
+    }
+}
+
+/// Reduce a stored canonical command payload to the census fields: the
+/// Command kind tag, the Work target, and the Execution target
+/// (`execution_id` for resume/cancel, `expected_execution_id` for
+/// retry). An undecodable payload yields a `None` kind — the caller
+/// surfaces it as an unreadable record rather than dropping it.
+fn command_target(payload: &[u8]) -> (Option<String>, Option<WorkId>, Option<ExecutionId>) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return (None, None, None);
+    };
+    let Some(body) = v.get("body") else {
+        return (None, None, None);
+    };
+    let Some(kind) = body.get("kind").and_then(|k| k.as_str()) else {
+        return (None, None, None);
+    };
+    let work_id = body
+        .get("work_id")
+        .and_then(|w| w.as_str())
+        .map(|s| WorkId(s.to_string()));
+    let execution_id = body
+        .get("execution_id")
+        .or_else(|| body.get("expected_execution_id"))
+        .and_then(|e| e.as_str())
+        .map(|s| ExecutionId(s.to_string()));
+    (Some(kind.to_string()), work_id, execution_id)
 }
 
 impl TxView for Tx<'_> {

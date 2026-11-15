@@ -352,6 +352,28 @@ pub struct RecoveryIntent {
     pub scheduled_seq: EventSequence,
 }
 
+/// One durable command decision reduced to what a read-only census needs:
+/// the Command kind and Work/Execution target parsed from the canonical
+/// payload, whether the decision was accepted, and the committed
+/// sequence. `kind` is `None` when the stored payload could not be
+/// decoded — an unreadable record the caller must surface, never
+/// silently drop; `work_id`/`execution_id` are `None` both for
+/// undecodable payloads and for commands that legitimately carry no
+/// such target. `accepted` is `false` for an undecodable decision: an
+/// unreadable decision can never prove a release happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRecord {
+    pub command_id: CommandId,
+    pub kind: Option<String>,
+    pub work_id: Option<WorkId>,
+    /// The Execution the command targets: `execution_id` for
+    /// resume/cancel, `expected_execution_id` for retry; `None` for
+    /// Work-scoped commands.
+    pub execution_id: Option<ExecutionId>,
+    pub accepted: bool,
+    pub seq: EventSequence,
+}
+
 /// Why the store refused an effect; `work` maps it to a rejection or
 /// re-reads and re-decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +563,12 @@ pub trait ReadView {
 
     /// All recorded recovery intents; Core filters by state/due time.
     fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError>;
+
+    /// Every durable command decision, oldest first, reduced to
+    /// [`CommandRecord`]. Read-only evidence for queries that must know
+    /// which Commands were ever accepted (e.g. whether a released wait
+    /// ever saw its resume/retry).
+    fn commands(&self) -> Result<Vec<CommandRecord>, StoreError>;
 
     fn last_seq(&self) -> Result<EventSequence, StoreError>;
 }
