@@ -145,6 +145,32 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
+/// The exit status of `pid` without consuming it: `waitid` with
+/// `WNOWAIT` reports a terminated child's status while leaving the
+/// zombie for `reap`, so the durable exit fact can be committed first
+/// and a failed write retried against the same proven status. Only a
+/// normal exit counts — a signaled, still-running, already-reaped, or
+/// non-child pid proves nothing and reports `None`.
+fn peek_exit_status(pid: i32) -> Option<i32> {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        ) != 0
+        {
+            return None;
+        }
+        if info.si_pid() == pid && info.si_code == libc::CLD_EXITED {
+            Some(info.si_status())
+        } else {
+            None
+        }
+    }
+}
+
 /// What a timed-out probe may signal once the bound has elapsed. The
 /// waiter thread can already have reaped the leader between the bound
 /// expiring and the kill, freeing the pid for reuse, so the recorded
@@ -351,11 +377,14 @@ impl ProcessControlPort for PosixProcessControl {
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
         let lstart = match lstart_of(identity.pid) {
-            // The pid is gone; this identity no longer exists.
+            // The pid is gone from the process table. If this identity
+            // is still our unreaped child the table read raced its exit;
+            // `waitid(WNOWAIT)` either proves the status non-destructively
+            // or reports nothing — it can never invent one.
             LstartLookup::Absent => {
                 return ProcessEvidence::Stopped {
                     identity: identity.clone(),
-                    exit_code: None,
+                    exit_code: peek_exit_status(identity.pid),
                 };
             }
             // The lookup itself failed: an incomplete process-table read
@@ -364,7 +393,9 @@ impl ProcessControlPort for PosixProcessControl {
             LstartLookup::Present(lstart) => lstart,
         };
         if normalize_lstart(&lstart) != normalize_lstart(&identity.started_at) {
-            // Reused pid: the recorded process is gone.
+            // Reused pid: the recorded process is gone. Its status is
+            // never peeked — the pid may now name a different child of
+            // this supervisor, whose exit must not be attributed here.
             return ProcessEvidence::Stopped {
                 identity: identity.clone(),
                 exit_code: None,
@@ -374,9 +405,11 @@ impl ProcessControlPort for PosixProcessControl {
             None => ProcessEvidence::Unknown {
                 reason: format!("pid {} present at lstart but stat unread", identity.pid),
             },
+            // A zombie still carries the recorded start time, so the
+            // non-destructive peek reports this exact process's exit.
             Some(stat) if stat.contains('Z') => ProcessEvidence::Stopped {
                 identity: identity.clone(),
-                exit_code: None,
+                exit_code: peek_exit_status(identity.pid),
             },
             Some(_) => ProcessEvidence::Alive {
                 identity: identity.clone(),
@@ -1479,20 +1512,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 continue;
             }
             match self.port.inspect(&identity) {
-                ProcessEvidence::Stopped { .. } => {
+                ProcessEvidence::Stopped { exit_code, .. } => {
                     // A persisted intent may name an escapee absent
                     // from every live snapshot — it is part of the
                     // proof set here too, not only in drive_stops.
                     let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
                     match self.prove_tree_stopped(store, &invocation, intent.as_ref())? {
                         TreeProof::Proven => {
-                            let exit_code = self.port.reap(identity.pid);
+                            // The status `inspect` proved non-destructively
+                            // is committed before the zombie is reaped:
+                            // a failed finish leaves the child for the
+                            // retry, which peeks the same status again.
                             self.finish_invocation(
                                 store,
                                 &invocation,
                                 now_unix_seconds,
                                 exit_code,
                             )?;
+                            let _ = self.port.reap(identity.pid);
                         }
                         // Live stragglers were re-signaled; the exit fact
                         // is withheld until the whole tree proves stopped.
@@ -1742,10 +1779,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
     /// Save every artifact fact before the exit fact resolves the writer.
     /// Interrupted reporting leaves the Invocation in the next scan.
-    /// `exit_code` is the status the port's reap proved for the
-    /// writer's own exit — `None` when no normal exit status could be
-    /// proven, which the exit fact records honestly rather than as a
-    /// pass.
+    /// `exit_code` is the status `inspect` proved for the writer's own
+    /// exit without consuming it — `None` when no normal exit status
+    /// could be proven, which the exit fact records honestly rather
+    /// than as a pass. Callers reap only after this commits, so a
+    /// failed report is retried against the same zombie's status.
     fn finish_invocation(
         &self,
         store: &impl Store,
@@ -1964,6 +2002,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // enumeration is inconclusive — never proof.
                 let mut all_stopped = true;
                 let mut any_unknown = false;
+                // The leader's exit status as `inspect` proved it
+                // non-destructively — committed by `finish_invocation`
+                // before the zombie is reaped, so a failed write is
+                // retried against the same status.
+                let mut leader_exit = None;
                 let proof = match self.proof_identities(&invocation, intent.as_ref()) {
                     Ok(ids) => ids,
                     Err(_) => {
@@ -1974,7 +2017,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 };
                 for id in &proof {
                     match self.port.inspect(id) {
-                        ProcessEvidence::Stopped { .. } => {}
+                        ProcessEvidence::Stopped { exit_code, .. } => {
+                            if id.pid == identity.pid {
+                                leader_exit = exit_code;
+                            }
+                        }
                         ProcessEvidence::Alive { .. } => {
                             all_stopped = false;
                             // Still writing: re-signal under re-verification.
@@ -1987,8 +2034,6 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                 }
                 if all_stopped {
-                    // The leader is our child: reap it so a killed writer
-                    // does not linger as a zombie of this supervisor.
                     // `finish_invocation` saves the artifact facts,
                     // reports the proven exit, and reclaims the launch
                     // scratch — the same completion the poll path runs.
@@ -1996,8 +2041,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     // launch stopped by cancel/fail/pause reaches its
                     // exit fact only here; reporting it directly would
                     // leave `inv-*` scratch under `.isolation` forever.
-                    let exit_code = self.port.reap(identity.pid);
-                    self.finish_invocation(store, &invocation, now_unix_seconds, exit_code)?;
+                    self.finish_invocation(store, &invocation, now_unix_seconds, leader_exit)?;
+                    // The leader is our child: reap it so a stopped
+                    // writer does not linger as a zombie of this
+                    // supervisor — only after the exit fact committed.
+                    let _ = self.port.reap(identity.pid);
                 } else if any_unknown && execution.state == ExecutionState::Stopping {
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?
@@ -2326,15 +2374,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
         match ev {
-            ProcessEvidence::Stopped { .. } => {
+            ProcessEvidence::Stopped { exit_code, .. } => {
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
                 match self.prove_tree_stopped(store, invocation, intent.as_ref())? {
                     TreeProof::Proven => {
-                        let exit_code = invocation
-                            .process_identity
-                            .as_ref()
-                            .and_then(|id| self.port.reap(id.pid));
-                        self.finish_invocation(store, invocation, now_unix_seconds, exit_code)
+                        // Commit the non-destructively proven status
+                        // before reaping: a failed finish is retried
+                        // against the same zombie's status.
+                        self.finish_invocation(store, invocation, now_unix_seconds, exit_code)?;
+                        if let Some(id) = &invocation.process_identity {
+                            let _ = self.port.reap(id.pid);
+                        }
+                        Ok(())
                     }
                     TreeProof::Withheld => Ok(()),
                     TreeProof::Uncertain => {

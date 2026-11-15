@@ -2030,17 +2030,26 @@ fn failed_finish_reports_are_replayed_after_restart() {
                 ObservationFact::Artifact { required_artifact, state: ArtifactFact::Present { .. }, .. }
                     if required_artifact == required)));
         }
-        assert!(facts.iter().any(|obs| matches!(
-            &obs.fact,
-            ObservationFact::ProcessState {
-                state: ProcessStateFact::Exited,
-                ..
-            }
-        )));
         // The replayed exit drives the same reconciliation: the
         // invariant lane re-requests the pre-publication check under
         // the same reservation, so the Execution is `ready` for that
         // request and no publish intent exists yet.
+        //
+        // The exit fact must carry the proven status: the injected
+        // failure consumed the first finish attempt, and the status
+        // survived because `inspect` peeks it without reaping — a
+        // consumed-then-lost status would record `exit_code: None`.
+        assert!(facts.iter().any(|obs| matches!(
+            &obs.fact,
+            ObservationFact::ProcessState {
+                invocation_id,
+                process_identity,
+                state: ProcessStateFact::Exited,
+                exit_code: Some(0),
+            } if invocation_id == &invocation.id
+                && process_identity
+                    == &format!("{}@{}", identity.pid, identity.started_at)
+        )));
         let e = execution(&store, &eid);
         assert_eq!(e.state, ExecutionState::Ready);
         let pending = store.transact(|tx| tx.pending_requests()).unwrap();
