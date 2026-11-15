@@ -1,0 +1,40 @@
+{
+  "protocol_version": "1",
+  "capabilities": [
+    "grouped_sources_v1"
+  ],
+  "request_id": "scan-001",
+  "selector": "public-issue-selector",
+  "selector_version": 1,
+  "policy_revision": 7,
+  "repositories": [
+    {
+      "host": "public-host",
+      "repository": "repo-17"
+    }
+  ],
+  "excluded_sources": [
+    {
+      "repository": {
+        "host": "public-host",
+        "repository": "repo-17"
+      },
+      "issue": "issue-9",
+      "display_number": 9
+    }
+  ],
+  "max_candidates": 2,
+  "deadline_unix_ms": 1794787230000,
+  "task_constraints": [
+    "Keep the public API unchanged."
+  ],
+  "verification_argv": [
+    "cargo",
+    "test",
+    "-p",
+    "example-library"
+  ],
+  "required_permissions": [
+    "workspace_write"
+  ]
+}
