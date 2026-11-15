@@ -606,9 +606,48 @@ fn emit_fact(
     );
 }
 
+/// The invariant lane's own durable record: publication waits for a
+/// completed check Invocation recorded after the producing one, and
+/// the check's proven `Exited{0}` process evidence — `Done` alone is
+/// resolved-but-unproven and never opens the gate.
+fn satisfy_invariant_lane(
+    adapter: &dyn ReconcilePathAdapter,
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    work_id: &WorkId,
+    eid: &ExecutionId,
+    name: &str,
+) {
+    let mut check = recorded_invocation(eid, name);
+    check.request_id = format!("{}:inv:{}", eid.0, name);
+    check.role = InvocationRole::InvariantCheck;
+    check.state = InvocationState::Done;
+    check.required_artifacts = vec![];
+    apply_effects(
+        store,
+        &[Effect::InsertInvocation {
+            invocation: check.clone(),
+        }],
+    );
+    emit_fact(
+        adapter,
+        store,
+        config,
+        work_id,
+        eid,
+        ObservationFact::ProcessState {
+            invocation_id: check.id.clone(),
+            process_identity: String::new(),
+            state: ProcessStateFact::Exited,
+            exit_code: Some(0),
+        },
+    );
+}
+
 /// Arm the publish chain exactly as the runtime leaves it: a Waiting
 /// execution, a finished coding invocation carrying one required
-/// artifact, an authorized capability report, and the artifact's
+/// artifact, an authorized capability report, the completed
+/// invariant-check evidence the lane requires, and the artifact's
 /// `Present` fact — Core's `maybe_publish` records the stage intents
 /// itself.
 fn arm_publish_chain(
@@ -644,6 +683,7 @@ fn arm_publish_chain(
             capabilities: capability_entries(adapter.adapter_id(), false),
         },
     );
+    satisfy_invariant_lane(adapter, store, config, work_id, eid, "u36c-invariant-check");
     emit_fact(
         adapter,
         store,
@@ -1110,6 +1150,18 @@ fn permission_drift_denies_dependent_effects_and_keeps_read_only_reconciliation(
         &[Effect::InsertInvocation {
             invocation: fix.clone(),
         }],
+    );
+    // The fix is the new latest producing Invocation, so the lane
+    // needs its own completed check recorded after it — otherwise
+    // `maybe_publish` would re-queue the check and return before the
+    // capability gate this assertion exists to exercise.
+    satisfy_invariant_lane(
+        adapter,
+        &store,
+        &config,
+        &work_id,
+        &eid,
+        "u36c-invariant-check-fix",
     );
     let recorded = intents(&store).len();
     emit_fact(
