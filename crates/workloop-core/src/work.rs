@@ -3532,13 +3532,15 @@ fn maybe_publish(
     // Invariant lane: publication waits for the check's own durable
     // Invocation evidence — a `Done` invariant-check recorded after
     // the producing Invocation — never for an assessment fact alone.
-    // A missing or superseded check re-requests under the same
-    // Execution reservation (`waiting → ready`); the attempt is
-    // budget-bounded like every other Invocation.
+    // `Done` alone only records that the process resolved: the check
+    // must also carry a proven exit status of 0, so a failed or
+    // unverifiable check exit is resolved-but-not-conforming evidence
+    // and never opens the gate. A missing or superseded check
+    // re-requests under the same Execution reservation
+    // (`waiting → ready`); the attempt is budget-bounded like every
+    // other Invocation.
     if spec.payload.lanes.invariant_check {
-        let checked = invocations[producing + 1..]
-            .iter()
-            .any(|i| i.role == InvocationRole::InvariantCheck && i.state == InvocationState::Done);
+        let checked = satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?;
         if !checked {
             admit_queued_role(
                 tx,
@@ -3815,6 +3817,49 @@ fn artifact_digests(
     Ok(digests)
 }
 
+/// The check's positive process evidence: its Invocation resolved
+/// `Done` on a proven exit status of 0. `Done` alone records only
+/// that the process stopped — a failed, signaled, or status-unproven
+/// check exit is resolved-but-not-conforming and never counts.
+fn check_exited_zero(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    invocation: &Invocation,
+) -> Result<bool, StoreError> {
+    Ok(tx
+        .observations_for_execution(execution_id)?
+        .iter()
+        .any(|o| match &o.fact {
+            ObservationFact::ProcessState {
+                invocation_id,
+                state: ProcessStateFact::Exited,
+                exit_code,
+                ..
+            } => invocation_id == &invocation.id && exit_code == &Some(0),
+            _ => false,
+        }))
+}
+
+/// Whether `candidates` holds an invariant-check Invocation whose own
+/// evidence is positive — `Done` on a proven exit status of 0. This is
+/// the only check result publication and completion may count; both
+/// gates share it so they can never drift apart.
+fn satisfied_invariant_check(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    candidates: &[Invocation],
+) -> Result<bool, StoreError> {
+    for invocation in candidates {
+        if invocation.role == InvocationRole::InvariantCheck
+            && invocation.state == InvocationState::Done
+            && check_exited_zero(tx, execution_id, invocation)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// `succeeded` requires the required stage effects applied, the declared
 /// checks passing on the current target, the enabled lanes satisfied by
 /// their exact evidence, and no unresolved writer, gate, or outgoing
@@ -3965,17 +4010,15 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
                     })
             )
         });
-        let checked = invocations
-            .iter()
-            .rposition(|i| {
-                matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
-                    && i.state == InvocationState::Done
-            })
-            .is_some_and(|producing| {
-                invocations[producing + 1..].iter().any(|i| {
-                    i.role == InvocationRole::InvariantCheck && i.state == InvocationState::Done
-                })
-            });
+        let checked = match invocations.iter().rposition(|i| {
+            matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
+                && i.state == InvocationState::Done
+        }) {
+            Some(producing) => {
+                satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?
+            }
+            None => false,
+        };
         if !(ok && checked) {
             return Ok(());
         }

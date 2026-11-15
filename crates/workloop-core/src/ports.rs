@@ -134,8 +134,13 @@ pub trait ProcessControlPort {
     fn signal_group(&self, pgid: i32, signal: i32) -> SignalOutcome;
 
     /// Reap a child this supervisor spawned so inspection is not polluted
-    /// by zombies. No-op for pids that are not our children.
-    fn reap(&self, pid: i32);
+    /// by zombies, returning the proven exit status when the reap
+    /// collected one: `Some(code)` only for a normal exit the port can
+    /// prove, `None` when the pid is not our child, was already reaped,
+    /// or ended by a signal — an unproven status is never invented.
+    /// Callers record the exit fact with this value so a gate can
+    /// distinguish a clean exit from a failed or unverifiable one.
+    fn reap(&self, pid: i32) -> Option<i32>;
 
     /// Run a bounded effect-free probe (`<worker_argv...> describe`) under
     /// the same containment contract as a writer: the child starts in its

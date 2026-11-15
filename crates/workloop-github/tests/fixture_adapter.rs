@@ -223,7 +223,8 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
     // The invariant lane's own durable record: a completed read-only
     // check Invocation after the producing one. Completion and
     // publication gate on it — an assessment fact alone never
-    // substitutes.
+    // substitutes — and on its proven `Exited{0}` process evidence,
+    // since `Done` alone only records that the process resolved.
     tx.apply(&Effect::InsertInvocation {
         invocation: Invocation {
             id: InvocationId(format!("{}-invariant-check", eid.0)),
@@ -235,6 +236,20 @@ fn record_finished_coding(tx: &mut dyn TxView, eid: &ExecutionId) -> Result<(), 
             required_artifacts: vec![],
             evidence_refs: vec![],
             descendants: vec![],
+        },
+    })?;
+    tx.apply(&Effect::InsertObservation {
+        observation: Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: InvocationId(format!("{}-invariant-check", eid.0)),
+                process_identity: String::new(),
+                state: ProcessStateFact::Exited,
+                exit_code: Some(0),
+            },
+            observed_unix_seconds: NOW,
         },
     })?;
     tx.apply(&Effect::InsertObservation {
@@ -476,6 +491,7 @@ fn head_mismatch_aborts_the_write_and_surfaces_the_fresh_head() {
                 invocation_id: InvocationId("inv-head".into()),
                 process_identity: "1@1".into(),
                 state: ProcessStateFact::Exited,
+                exit_code: Some(0),
             },
             observed_unix_seconds: NOW,
         },
@@ -702,7 +718,8 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
             })?;
             // The invariant lane's completed check Invocation: the
             // publish gate requires its own durable record after the
-            // producing Invocation.
+            // producing Invocation, plus its proven `Exited{0}`
+            // process evidence.
             tx.apply(&Effect::InsertInvocation {
                 invocation: Invocation {
                     id: InvocationId("inv-1-check".into()),
@@ -714,6 +731,20 @@ fn repeated_artifact_evidence_does_not_queue_a_second_publish() {
                     required_artifacts: vec![],
                     evidence_refs: vec![],
                     descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(eid.clone()),
+                    fact: ObservationFact::ProcessState {
+                        invocation_id: InvocationId("inv-1-check".into()),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Exited,
+                        exit_code: Some(0),
+                    },
+                    observed_unix_seconds: NOW,
                 },
             })?;
             let mut e = tx.execution(&eid)?.unwrap();
@@ -1362,6 +1393,7 @@ fn cancel_defers_terminal_settlement_until_the_outbox_reconciles() {
                 invocation_id: InvocationId("inv-g9".into()),
                 process_identity: String::new(),
                 state: ProcessStateFact::Exited,
+                exit_code: Some(0),
             },
             observed_unix_seconds: NOW,
         },

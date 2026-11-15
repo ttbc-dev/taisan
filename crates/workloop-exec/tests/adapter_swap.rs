@@ -353,7 +353,7 @@ impl ProcessControlPort for CountingPosix {
     fn signal_group(&self, pgid: i32, signal: i32) -> SignalOutcome {
         PosixProcessControl.signal_group(pgid, signal)
     }
-    fn reap(&self, pid: i32) {
+    fn reap(&self, pid: i32) -> Option<i32> {
         PosixProcessControl.reap(pid)
     }
     fn run_probe(

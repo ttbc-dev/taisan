@@ -212,6 +212,7 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
         invocation_id: current.clone(),
         process_identity: "identity".into(),
         state: ProcessStateFact::Exited,
+        exit_code: Some(0),
     });
     assert_eq!(
         store.transact(|tx| tx.action_intents()).unwrap().len(),
@@ -237,6 +238,14 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
             })
         })
         .unwrap();
+    // The check's own proven `Exited{0}` evidence — `Done` alone is
+    // resolved-but-unproven and never opens the publish gate.
+    emit(ObservationFact::ProcessState {
+        invocation_id: InvocationId("current-check".into()),
+        process_identity: String::new(),
+        state: ProcessStateFact::Exited,
+        exit_code: Some(0),
+    });
     emit(ObservationFact::Artifact {
         invocation_id: current,
         required_artifact: "second.json".into(),

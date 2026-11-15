@@ -2824,6 +2824,24 @@ fn recorded_check_invocation(eid: &ExecutionId, id: &str) -> Invocation {
     }
 }
 
+/// The check Invocation's own process evidence: the publish and
+/// completion gates count only a proven `Exited{0}` — a `Done` record
+/// alone is resolved-but-unproven.
+fn check_exit_observation(eid: &ExecutionId, check_id: &str) -> Observation {
+    Observation {
+        delivery: None,
+        subject_work_id: None,
+        subject_execution_id: Some(eid.clone()),
+        fact: ObservationFact::ProcessState {
+            invocation_id: InvocationId(check_id.into()),
+            process_identity: String::new(),
+            state: ProcessStateFact::Exited,
+            exit_code: Some(0),
+        },
+        observed_unix_seconds: NOW,
+    }
+}
+
 fn launch_refused(store: &SqliteStore, eid: &ExecutionId, invocation_id: &InvocationId) {
     workloop_core::work::handle_observation(
         store,
@@ -2984,8 +3002,11 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             // The invariant lane also requires the check's own durable
             // Invocation: a completed `invariant_check` recorded after
             // the producing Invocation, declaring no workspace
-            // artifacts.
+            // artifacts — plus its proven `Exited{0}` process evidence.
             Effect::InsertInvocation { invocation: check },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "sc1-check"),
+            },
             // The artifact evidence for the required artifact.
             Effect::InsertObservation {
                 observation: Observation {
@@ -3140,6 +3161,99 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
 }
 
+/// S-3a (#149) review fix: `Done` records only that the check process
+/// resolved — the publish gate counts it solely on its own proven
+/// `Exited{0}` evidence. A failed, signaled, or status-unproven check
+/// exit is resolved-but-not-conforming: no publish intent is recorded
+/// and the lane re-requests the check under the same reservation.
+#[test]
+fn a_failed_or_unproven_check_exit_never_opens_the_publish_gate() {
+    // `emit_exit` = whether the check's own `Exited` observation is
+    // delivered; `exit_code` is the status the port proved — `None`
+    // models a reparented, signaled, or otherwise unproven exit.
+    for (label, emit_exit, exit_code) in [
+        ("check-nonzero", true, Some(1)),
+        ("check-unproven", true, None),
+        ("check-missing", false, None),
+    ] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let (_w, eid) = accepted_with_execution(
+            &handle_command(&store, &config(), &submit(label), NOW).unwrap(),
+        );
+        force_state(&store, &eid, ExecutionState::Waiting);
+        let mut coding = recorded_invocation(&eid, "coding");
+        coding.state = InvocationState::Done;
+        coding.required_artifacts = vec![RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        }];
+        let artifact = || Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(eid.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: InvocationId("coding".into()),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Present {
+                    digest: "artifact-digest".into(),
+                },
+            },
+            observed_unix_seconds: NOW,
+        };
+        apply_effects(
+            &store,
+            &[
+                Effect::InsertInvocation { invocation: coding },
+                Effect::InsertObservation {
+                    observation: artifact(),
+                },
+                Effect::InsertInvocation {
+                    invocation: recorded_check_invocation(&eid, "check"),
+                },
+            ],
+        );
+        // Drive `maybe_publish`: the check's own exit fact, or — when
+        // no exit evidence exists at all — a repeated artifact report.
+        let trigger = if emit_exit {
+            Observation {
+                delivery: None,
+                subject_work_id: None,
+                subject_execution_id: Some(eid.clone()),
+                fact: ObservationFact::ProcessState {
+                    invocation_id: InvocationId("check".into()),
+                    process_identity: String::new(),
+                    state: ProcessStateFact::Exited,
+                    exit_code,
+                },
+                observed_unix_seconds: NOW,
+            }
+        } else {
+            artifact()
+        };
+        workloop_core::work::handle_observation(&store, &config(), &trigger, NOW).unwrap();
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert!(
+            intents
+                .iter()
+                .all(|i| !matches!(i.action, HostAction::PushRef { .. })),
+            "{label}: a non-conforming check exit must never publish: {intents:?}"
+        );
+        let pending = store
+            .transact(|tx| tx.pending_requests())
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.execution_id == eid)
+            .collect::<Vec<_>>();
+        assert!(
+            pending
+                .iter()
+                .any(|r| r.role == InvocationRole::InvariantCheck),
+            "{label}: the unsatisfied lane re-requests the check"
+        );
+    }
+}
+
 #[test]
 fn completion_requires_artifacts_publication_and_resolved_writers() {
     for scenario in [
@@ -3173,12 +3287,16 @@ fn completion_requires_artifacts_publication_and_resolved_writers() {
                     if scenario == "complete" {
                         // Completion additionally requires the
                         // invariant-check Invocation's own durable
-                        // record after the producing Invocation.
+                        // record after the producing Invocation, plus
+                        // its proven `Exited{0}` process evidence.
                         let mut check = recorded_invocation(&eid, "check");
                         check.role = InvocationRole::InvariantCheck;
                         check.state = InvocationState::Done;
                         check.request_id = format!("{}:inv:1", eid.0);
                         tx.apply(&Effect::InsertInvocation { invocation: check })?;
+                        tx.apply(&Effect::InsertObservation {
+                            observation: check_exit_observation(&eid, "check"),
+                        })?;
                     }
                     if scenario != "missing" {
                         tx.apply(&Effect::InsertObservation {
@@ -3864,6 +3982,7 @@ fn source_gate_defers_admits_and_pauses_on_change() {
                 invocation_id: InvocationId("inv-gate".into()),
                 process_identity: "1@1".into(),
                 state: ProcessStateFact::Exited,
+                exit_code: Some(0),
             },
             observed_unix_seconds: NOW,
         },
@@ -4013,6 +4132,9 @@ fn an_applied_push_receipt_records_the_next_stage_intent() {
             },
             Effect::InsertInvocation {
                 invocation: recorded_check_invocation(&e1, "pc1-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "pc1-check"),
             },
         ],
     );
@@ -4165,6 +4287,7 @@ fn equivalent_failures_pause_on_the_failing_set() {
         invocation_id: InvocationId("ef1-coding".into()),
         process_identity: "1@1".into(),
         state: ProcessStateFact::Exited,
+        exit_code: Some(0),
     });
     let e = read_execution(&store, &e1);
     assert_eq!(e.state, ExecutionState::Paused);
@@ -4372,6 +4495,9 @@ fn an_applied_push_retry_advances_the_chain() {
             Effect::InsertInvocation {
                 invocation: recorded_check_invocation(&e1, "pr1-check"),
             },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "pr1-check"),
+            },
         ],
     );
     let emit = |fact: ObservationFact| {
@@ -4502,6 +4628,9 @@ fn a_delayed_older_branch_read_never_degrades_the_reissue_guard() {
             },
             Effect::InsertInvocation {
                 invocation: recorded_check_invocation(&e1, "dg1-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "dg1-check"),
             },
         ],
     );
@@ -4665,6 +4794,9 @@ fn a_denied_stage_effect_is_terminal_not_a_transport_retry() {
             },
             Effect::InsertInvocation {
                 invocation: recorded_check_invocation(&e1, "az1-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "az1-check"),
             },
         ],
     );

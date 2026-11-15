@@ -370,7 +370,9 @@ mod tests {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             unimplemented!()
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
