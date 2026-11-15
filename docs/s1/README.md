@@ -119,3 +119,16 @@ one pass/fail claim:
 
 A zero-finding run does not satisfy the review/fix leg — see the
 [zero-finding rule](evidence-checklist.md#zero-finding-rule).
+
+## Live execution (#113) — preparation only
+
+The following documents prepare the owner-authorized live run. They
+authorize nothing: every live step waits for the owner's recorded
+authorization on #113.
+
+| Document | Contents |
+| --- | --- |
+| [live-runbook.md](live-runbook.md) | Readiness audit of the #73 materials, the executable Profile R procedure (scenario bridge + Worker shims), per-variant steps with commands/expected envelopes/evidence, and the blocked target-profile delta |
+| [live-authorization.md](live-authorization.md) | Draft authorization text for the owner to review and record — scope, variants, profile, evidence retention, validity; never recorded by the agent |
+| [live-evidence-template.md](live-evidence-template.md) | Per-variant evidence record skeleton: identities, revisions, config identity, remote refs, criterion coverage, zero-finding check, owner approval block |
+| [live-acceptance-checklist.md](live-acceptance-checklist.md) | #113's acceptance criteria as an executable checklist — who acts, what is done, where it is recorded |
