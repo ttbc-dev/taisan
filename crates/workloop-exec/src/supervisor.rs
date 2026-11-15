@@ -727,7 +727,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(true);
         }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        self.sweep_isolation_scratch(store)?;
         Ok(deadline_reached(clock, deadline))
+    }
+
+    /// Bound `.isolation`: scratch trees are released with their
+    /// Invocation's lifecycle, but a crashed pass leaves orphans the
+    /// catalog-driven retention sweep cannot see — they are not
+    /// registered bodies. Once per pass, reclaim every scratch tree no
+    /// unresolved Invocation still owns; the keep-set is global, so a
+    /// live or unproven writer's `HOME`/`TMPDIR` is never touched.
+    pub fn sweep_isolation_scratch(&self, store: &impl Store) -> Result<(), ExecError> {
+        let keep: HashSet<PathBuf> = store
+            .transact(|tx| tx.unresolved_invocations())?
+            .iter()
+            .map(|invocation| self.launch_scratch(&invocation.id.0))
+            .collect();
+        isolation::sweep_orphans(&isolation::scratch_root(&self.workspace_root), &keep);
+        Ok(())
     }
 
     /// Durable artifact handoff: resume every incomplete row (the
@@ -1873,22 +1890,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 if all_stopped {
                     // The leader is our child: reap it so a killed writer
                     // does not linger as a zombie of this supervisor.
+                    // `finish_invocation` saves the artifact facts,
+                    // reports the proven exit, and reclaims the launch
+                    // scratch — the same completion the poll path runs.
+                    // The poll path skips `Stopping` Executions, so a
+                    // launch stopped by cancel/fail/pause reaches its
+                    // exit fact only here; reporting it directly would
+                    // leave `inv-*` scratch under `.isolation` forever.
                     self.port.reap(identity.pid);
-                    let request = store
-                        .transact(|tx| tx.request(&invocation.request_id))?
-                        .ok_or(ExecError::Store(StoreError::Internal {
-                            detail: "invocation without request".into(),
-                        }))?;
-                    self.report(
-                        store,
-                        &request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: format!("{}@{}", identity.pid, identity.started_at),
-                            state: ProcessStateFact::Exited,
-                        },
-                        now_unix_seconds,
-                    )?;
+                    self.finish_invocation(store, &invocation, now_unix_seconds)?;
                 } else if any_unknown && execution.state == ExecutionState::Stopping {
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?

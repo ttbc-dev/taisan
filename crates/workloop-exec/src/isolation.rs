@@ -27,6 +27,7 @@
 //! that fails refuses the launch; there is no degrade-to-inherited-env
 //! path.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use workloop_core::ports::WorkerEnv;
@@ -112,6 +113,34 @@ fn build(profile: &IsolationProfile, scratch: &Path) -> Result<WorkerEnv, String
 /// next time the same key is prepared.
 pub fn release(scratch: &Path) {
     let _ = std::fs::remove_dir_all(scratch);
+}
+
+/// Reclaim every scratch tree under `scratch_root` that `keep` does
+/// not name — the per-pass bound on `.isolation` growth. `keep`
+/// carries the scratch directories unresolved Invocations still own
+/// (a live or unproven writer's `HOME`/`TMPDIR` is never touched);
+/// every other `inv-*` entry is a leftover of a resolved or crashed
+/// launch, and every `probe-*` entry is a leftover of an interrupted
+/// declaration — a probe holds its tree only for the synchronous
+/// `describe` call, so one found on disk is already dead. Entries
+/// outside the two owned prefixes are foreign and never touched.
+pub fn sweep_orphans(scratch_root: &Path, keep: &HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(scratch_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("inv-") || name.starts_with("probe-")) {
+            continue;
+        }
+        if keep.contains(&entry.path()) {
+            continue;
+        }
+        release(&entry.path());
+    }
 }
 
 /// The scratch root every launch and probe builds its environment
@@ -236,5 +265,31 @@ mod tests {
         assert_eq!(sanitize_key("exec-1:inv:0"), "exec-1-inv-0");
         assert_eq!(sanitize_key("../escape"), "---escape");
         assert_eq!(sanitize_key(".."), "--");
+    }
+
+    #[test]
+    fn sweep_orphans_reclaims_only_unowned_scratch_prefixes() {
+        let root = tmp("sweep").join("env");
+        let keep = root.join("inv-inv-1");
+        prepare(&default_isolation_profile(), &keep).unwrap();
+        let orphan_inv = root.join("inv-inv-2");
+        let orphan_probe = root.join("probe-req-1");
+        for dir in [&orphan_inv, &orphan_probe] {
+            std::fs::create_dir_all(dir.join("home")).unwrap();
+        }
+        let foreign = root.join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+
+        let keep_set = std::collections::HashSet::from([keep.clone()]);
+        sweep_orphans(&root, &keep_set);
+
+        assert!(keep.exists(), "a kept scratch tree survives");
+        assert!(!orphan_inv.exists(), "an unowned inv-* tree is reclaimed");
+        assert!(
+            !orphan_probe.exists(),
+            "an unowned probe-* tree is reclaimed"
+        );
+        assert!(foreign.exists(), "entries outside the prefixes are kept");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }
