@@ -196,6 +196,14 @@ Success / recovery profile (`worker-shim.sh`):
   "worker_argv": ["<REPO>/scripts/s1/worker-shim.sh"],
   "workspace_root": "workspaces",
   "allowed_effects": { "workspace_write": true, "host_write": true, "network": false },
+  "budget": {
+    "max_invocations": 4,
+    "max_review_rounds": 3,
+    "runtime_limit_seconds": 14400,
+    "artifact_recovery_attempts": 3,
+    "artifact_recovery_seconds": 1800,
+    "uncertain_threshold_seconds": 900
+  },
   "policy": {
     "max_fix_invocations": 3,
     "equivalent_failure_limit": 2,
@@ -206,6 +214,16 @@ Success / recovery profile (`worker-shim.sh`):
   }
 }
 ```
+
+The `budget` block mirrors the values pinned in
+`fixtures/s1/installation-spec.json` `configuration_identity.budget`
+(`max_invocations 4`, `max_review_rounds 3`, `runtime_limit_seconds
+14400`); the three fields the spec does not pin
+(`artifact_recovery_*`, `uncertain_threshold_seconds`) carry the
+approved defaults. Matching them keeps the recorded configuration as
+close to the prepared spec as Profile R allows — the remaining
+configuration-identity deviation is `adapter: s1-bridge` vs the pinned
+`github`.
 
 Attention profile: identical except `worker_argv` is
 `["<REPO>/scripts/s1/worker-shim-nc.sh"]` and `policy.max_fix_invocations`
