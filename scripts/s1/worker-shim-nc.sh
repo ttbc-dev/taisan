@@ -14,7 +14,10 @@
 # Rounds are keyed to committed history on the work branch: the first
 # Invocation (Coding) produces round 1, each later Fix Invocation
 # produces the next numbered variant. The variant index is embedded in
-# the emitted code so every round commits distinct content.
+# the emitted code so every round commits distinct content. The
+# pre-publication invariant check re-runs this same argv against a
+# snapshot copy under a `check-*` name; like worker-shim.sh it adopts
+# the work branch HEAD already names and verifies read-only.
 set -euo pipefail
 
 ws="$PWD"
@@ -32,16 +35,34 @@ cd "$ws"
 git config user.name "s1-worker"
 git config user.email "s1-worker@localhost"
 
+verify_only=0
 if ! git rev-parse --verify -q "$branch" >/dev/null; then
-    git checkout -q -b "$branch" origin/main
+    # The derived work branch is absent. In the check snapshot the
+    # workspace copy still has HEAD on the producing work branch —
+    # adopt it and verify that exact state read-only. A fresh clone
+    # sits on the default branch instead, so this never misfires on
+    # a real first Invocation.
+    current="$(git branch --show-current)"
+    case "$current" in
+        work/*)
+            branch="$current"
+            verify_only=1
+            ;;
+        *)
+            git checkout -q -b "$branch" origin/main
+            ;;
+    esac
 else
     git checkout -q "$branch"
     git merge -q --ff-only "origin/main" 2>/dev/null || true
 fi
 
-round=$(( $(git rev-list --count origin/main..HEAD) + 1 ))
+if [ "$verify_only" = 1 ]; then
+    round=0
+else
+    round=$(( $(git rev-list --count origin/main..HEAD) + 1 ))
 
-python3 - "$round" <<'PY'
+    python3 - "$round" <<'PY'
 import pathlib, sys
 
 n = int(sys.argv[1])
@@ -65,8 +86,9 @@ else:
 p.write_text(head.rstrip() + "\n\n\n" + body)
 PY
 
-git add sample.py
-git commit -q -m "Add greet helper (s1-nc attempt $round)"
+    git add sample.py
+    git commit -q -m "Add greet helper (s1-nc attempt $round)"
+fi
 
 set +e
 python3 -m unittest discover -s tests -v >"$verify_log" 2>&1
