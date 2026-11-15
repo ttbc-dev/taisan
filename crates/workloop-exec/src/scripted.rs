@@ -16,9 +16,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use workloop_core::domain::ProcessIdentity;
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError};
+use workloop_core::ports::{
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+};
 
 /// What the next `spawn` produces.
 #[derive(Debug, Clone)]
@@ -84,6 +87,15 @@ struct State {
     /// Every accepted signal, in order — the write history a scenario
     /// audits without pattern-matching internals.
     signals: Vec<SignalRecord>,
+    /// Queued outcomes consumed FIFO by `run_probe`; the default applies
+    /// when the queue is empty.
+    probes: VecDeque<Result<ProbeOutcome, SpawnError>>,
+    default_probe: Option<Result<ProbeOutcome, SpawnError>>,
+    /// The environment each `spawn` was given, in call order — the
+    /// suite's audit of what the worker would have inherited.
+    spawn_envs: Vec<WorkerEnv>,
+    /// The environment each `run_probe` was given, in call order.
+    probe_envs: Vec<WorkerEnv>,
 }
 
 /// An in-memory `ProcessControlPort`. Clone the handle to steer the
@@ -192,12 +204,41 @@ impl ScriptedProcessControl {
             .snapshot_errors
             .push_back(reason.to_string());
     }
+
+    /// Queue the outcome of the next `run_probe` call — a scripted
+    /// `describe` answer (or its failure), consumed FIFO.
+    pub fn push_probe(&self, outcome: Result<ProbeOutcome, SpawnError>) {
+        self.state.lock().unwrap().probes.push_back(outcome);
+    }
+
+    /// The outcome `run_probe` produces when the queue is empty.
+    /// Replaces the built-in default declaration.
+    pub fn set_default_probe(&self, outcome: Result<ProbeOutcome, SpawnError>) {
+        self.state.lock().unwrap().default_probe = Some(outcome);
+    }
+
+    /// The environment every `spawn` was given, in call order — the
+    /// suite audits that no host credential name ever reaches a launch.
+    pub fn spawn_envs(&self) -> Vec<WorkerEnv> {
+        self.state.lock().unwrap().spawn_envs.clone()
+    }
+
+    /// The environment every `run_probe` was given, in call order.
+    pub fn probe_envs(&self) -> Vec<WorkerEnv> {
+        self.state.lock().unwrap().probe_envs.clone()
+    }
 }
 
 impl ProcessControlPort for ScriptedProcessControl {
-    fn spawn(&self, _argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        _argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         let mut s = self.state.lock().unwrap();
         s.spawn_calls += 1;
+        s.spawn_envs.push(env.clone());
         let plan = s
             .plans
             .pop_front()
@@ -411,6 +452,46 @@ impl ProcessControlPort for ScriptedProcessControl {
 
     fn reap(&self, pid: i32) {
         self.state.lock().unwrap().procs.remove(&pid);
+    }
+
+    fn run_probe(
+        &self,
+        argv: &[String],
+        _cwd: &Path,
+        env: &WorkerEnv,
+        _timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        let outcome = {
+            let mut s = self.state.lock().unwrap();
+            s.probe_envs.push(env.clone());
+            s.probes.pop_front().or_else(|| s.default_probe.clone())
+        };
+        match outcome {
+            Some(outcome) => outcome,
+            // Default: the scripted adapter does implement `describe`,
+            // declaring an argv-derived identity so a suite's requests
+            // bind deterministically.
+            None => {
+                let adapter = argv
+                    .first()
+                    .and_then(|program| Path::new(program).file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("scripted-worker");
+                Ok(ProbeOutcome::Exited {
+                    stdout: serde_json::json!({
+                        "adapter": adapter,
+                        "adapter_version": "1.0.0",
+                        "runtime_version": "scripted-1.0.0",
+                        "protocol_versions": ["taisan.worker/1"],
+                        "roles": ["coding", "fix", "review"],
+                        "capabilities": ["workspace_write", "artifact_json", "process_control"],
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    success: true,
+                })
+            }
+        }
     }
 }
 

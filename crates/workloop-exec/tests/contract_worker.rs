@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, CommandRequest};
 use workloop_core::domain::*;
 use workloop_core::identity::*;
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome};
+use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, WorkerEnv};
 use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
@@ -73,6 +73,7 @@ fn spawn(bin: &str, args: &[&str], cwd: &Path) -> ProcessIdentity {
                 .chain(args.iter().map(|s| s.to_string()))
                 .collect::<Vec<_>>(),
             cwd,
+            &WorkerEnv::default(),
         )
         .expect("spawn worker")
 }

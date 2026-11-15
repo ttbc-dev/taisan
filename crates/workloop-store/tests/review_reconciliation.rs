@@ -240,6 +240,7 @@ fn completion_is_independent_of_delivery_order() {
                                         HostAction::PushRef {
                                             branch: format!("work/{}", work.0),
                                             produced: produced.clone(),
+                                            expected_prior: None,
                                         },
                                         0,
                                     ),

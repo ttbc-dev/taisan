@@ -259,7 +259,10 @@ const IMPLEMENTED: &[(HostCapability, bool)] = &[
 
 /// The capabilities this bridge can honestly report after a real
 /// permission read: support is the bridge's implementation surface,
-/// authorization is the credential's real `permissions` answer.
+/// authorization is the credential's real `permissions` answer. An
+/// operation `attempt` reports `Unsupported` for is denied support
+/// here — declaring it supported would authorize intents the bridge
+/// can never execute.
 fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
     let perms = gh_json(&["api", &format!("repos/{}", ctx.repo_display)])?;
     let write = perms["permissions"]["push"].as_bool() == Some(true);
@@ -268,8 +271,8 @@ fn capability_report(ctx: &Ctx) -> Result<ObservationFact, String> {
         capability,
         // `support` is the bridge's implementation surface, not the
         // credential's: an operation `attempt` can only ever record
-        // `failed` is not supported here, whatever the credential may
-        // authorize.
+        // `unsupported` for is not supported here, whatever the
+        // credential may authorize.
         support: if implemented {
             CapabilityState::Supported
         } else {
@@ -458,7 +461,10 @@ fn reverify_applied_pushes(ctx: &Ctx) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     for intent in intents {
-        let HostAction::PushRef { branch, produced } = &intent.action else {
+        let HostAction::PushRef {
+            branch, produced, ..
+        } = &intent.action
+        else {
             continue;
         };
         let Ok(sha) = gh(&[
@@ -707,19 +713,24 @@ fn reconcile_one(ctx: &Ctx, intent: &HostActionIntent, bound: usize) -> Result<(
     // recording safely reuses the ordinal.
     let key = format!("act:{}:reconcile:{receipts}", intent.action_id);
     match &intent.action {
-        HostAction::PushRef { branch, produced } => {
-            reconcile_push(ctx, intent, branch, produced, &key)
-        }
+        HostAction::PushRef {
+            branch, produced, ..
+        } => reconcile_push(ctx, intent, branch, produced, &key),
         HostAction::OpenChangeRequest {
             source_branch,
             target_branch,
             ..
         } => reconcile_open(ctx, intent, source_branch, target_branch, &key),
-        // Head-bound writes the bridge does not implement reconcile
-        // straight to their explicit failure through `attempt`.
-        HostAction::UpdateChangeRequest { .. } | HostAction::PostComment { .. } => {
-            reattempt(ctx, intent, &key)
-        }
+        // Operations outside the bridge's implementation surface
+        // reconcile through `attempt`'s explicit `unsupported` receipt —
+        // terminal and never an applied receipt or a permission
+        // verdict.
+        HostAction::UpdateChangeRequest { .. }
+        | HostAction::PostComment { .. }
+        | HostAction::PublishReviewFeedback { .. }
+        | HostAction::ReplyToThread { .. }
+        | HostAction::ResolveThread { .. }
+        | HostAction::MarkReady { .. } => reattempt(ctx, intent, &key),
     }
 }
 
@@ -1067,10 +1078,13 @@ fn opened_change(
 /// One guarded write attempt. A `push_ref` that cannot run or cannot
 /// be verified records `unknown` in every mode: even `pending` does
 /// not prove the intent was never attempted — a crash after the push
-/// landed but before the receipt wrote leaves it `pending` — so no
-/// push failure ever proves a definite no-effect (R42). The only
-/// `failed` this path records is the scenario-injected definite
-/// refusal.
+/// landed but before the receipt wrote leaves it `pending` — so a
+/// push failure never proves a definite no-effect (R42). `failed` is
+/// recorded only where the no-effect is provable before any write:
+/// the `stale_head` expected-prior refusal and the scenario-injected
+/// definite refusal. Operations outside the bridge's implementation
+/// surface record `unsupported` — terminal in Core, never an applied
+/// receipt or a permission verdict.
 fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String> {
     let execution = ctx
         .store
@@ -1088,7 +1102,11 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
         return Ok(());
     }
     match &intent.action {
-        HostAction::PushRef { branch, produced } => {
+        HostAction::PushRef {
+            branch,
+            produced,
+            expected_prior,
+        } => {
             let repo_dir = ctx.workspace_of(&intent.work_id);
             if !repo_dir.join(".git").exists() {
                 emit_result_keyed(
@@ -1190,6 +1208,26 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                     state: prior_state,
                 },
             );
+            // The guard binds the write to the position recorded at
+            // intent time, not to whatever a fresh read happens to
+            // return: a remote ref that moved since the intent was
+            // persisted refuses the write before it is attempted.
+            let expected = expected_prior
+                .as_ref()
+                .map(|p| p.object.as_str())
+                .unwrap_or_default();
+            if prior_sha != expected {
+                emit_result_keyed(
+                    ctx,
+                    intent,
+                    key,
+                    HostActionStatus::Failed {
+                        reason: "stale_head".into(),
+                    },
+                    vec![],
+                );
+                return Ok(());
+            }
             let lease = format!("--force-with-lease=refs/heads/{branch}:{prior_sha}");
             let push = git(
                 &repo_dir,
@@ -1450,23 +1488,20 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
                 ),
             }
         }
-        // Head-bound writes the bridge does not implement stay explicit
-        // failures — an unsupported effect is never an applied receipt.
-        HostAction::UpdateChangeRequest { .. } => emit_result_keyed(
+        // Operations the bridge does not implement stay explicit — an
+        // `unsupported` receipt is terminal in Core, never an applied
+        // receipt or a permission verdict.
+        HostAction::UpdateChangeRequest { .. }
+        | HostAction::PostComment { .. }
+        | HostAction::PublishReviewFeedback { .. }
+        | HostAction::ReplyToThread { .. }
+        | HostAction::ResolveThread { .. }
+        | HostAction::MarkReady { .. } => emit_result_keyed(
             ctx,
             intent,
             key,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: update_change_request".into(),
-            },
-            vec![],
-        ),
-        HostAction::PostComment { .. } => emit_result_keyed(
-            ctx,
-            intent,
-            key,
-            HostActionStatus::Failed {
-                reason: "unsupported operation: post_comment".into(),
+            HostActionStatus::Unsupported {
+                reason: format!("unsupported operation: {}", intent.action.name()),
             },
             vec![],
         ),
@@ -1924,6 +1959,7 @@ mod tests {
             action: HostAction::PushRef {
                 branch: branch.into(),
                 produced,
+                expected_prior: None,
             },
             payload_digest: "digest".into(),
             status,

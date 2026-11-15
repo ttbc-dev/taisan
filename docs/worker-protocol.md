@@ -50,7 +50,7 @@ The supervisor starts one sandbox per Invocation. Inside it, `worker_argv` runs 
 <worker_argv...> describe
 ```
 
-`describe` is effect-free. It prints the adapter's `WorkerCapabilities` and runtime version, and is run at setup validation and before dispatch to bind the exact declaration into the Invocation request.
+`describe` is effect-free from the worker's perspective: it prints the adapter's `WorkerCapabilities` and runtime version, and is run at setup validation and before dispatch to bind the exact declaration into the Invocation request. It is still a spawned process, so it runs through the supervisor's process-control port in its own process group with a bounded wait; a wedged probe is killed with its group. `describe` is fail-closed: when the probe does not answer with a declaration — spawn refused, bound elapsed, non-zero exit, unparseable body, or no adapter identity — the adapter is not selectable and no synthetic declaration is compared or dispatched on. The request is refused as `adapter.declaration_unavailable`, a configuration repair that never masquerades as a version mismatch or an empty capability surface. A request whose Execution can no longer launch is never probed at all.
 
 | Path inside the sandbox | Owner and mode | Contents |
 | --- | --- | --- |
@@ -146,7 +146,9 @@ The shim runs `claude -p` with `--output-format stream-json`, a bounded `--max-t
 | `request_stop(invocation)` | Durable stop intent before signal; a receipt is not stop proof | Existing ordering: persist intent and descendant snapshot, SIGTERM the group, grace, SIGKILL. See [process descendants](#process-descendants-and-stop-proof) |
 | `resume` | Not supported in v0.1 | Core never requests it; an adapter declaring it unsupported cannot be selected for a Work that requires it |
 
-A replayed request with an existing launch intent never spawns again: the supervisor inspects the recorded identity or stays `uncertain`. A running Invocation is never moved to a different adapter. Swapping `worker_argv` in config affects only requests created after the change; each request stores the adapter ID, version, and capability digest it was dispatched with.
+A replayed request with an existing launch intent never spawns again: the supervisor inspects the recorded identity or stays `uncertain`. A running Invocation is never moved to a different adapter. Swapping `worker_argv` in config affects only requests not yet bound — a request still unbound at its first binding takes the declaration current then, whenever it was created. Each request stores the adapter ID, adapter version, runtime version, capability digest, and the exact argv it was bound with.
+
+The first binding recorded on the request — by the dispatch-admission probe, or at consume for a request no probe answered — is *the* stored declaration — immutable for the request's life. At launch the bound argv is probed again and must still declare the stored binding; a declaration that drifted under the same argv (for example a worker binary upgraded in place between binding and launch) is reported per differing field — `adapter.identity_mismatch`, `adapter.version_mismatch`, `runtime.version_mismatch`, or `capability.digest_mismatch` — as a configuration repair that authorizes no start. A request refused on that repair is **terminal for its binding**: it is abandoned and never resumed into the same repair. A legitimate runtime upgrade is accepted by issuing a **new** request, which binds the declaration current at its first binding; the operator abandons the refused request and re-issues the work — the stored declaration is never updated in place.
 
 ### Adapter-local retries
 
@@ -202,7 +204,7 @@ Each recovery attempt counts against the existing artifact-recovery bound (3 att
 | Export bundle | Absent: re-export within bounds | `bundle verify` passes and contains `produced` | Corrupt or contains unexpected refs: discard and re-export; repeated corruption becomes invalid |
 | Handoff ref / acknowledgement | Absent: no publication, no verification | Ref equals `produced`; manifest digest matches the row | Ref differs, digest differs, or connectivity fails: invalid, never published |
 | `VerificationResult` | Not yet run: requirement pending | Argv, environment profile, artifact, and commit exact; completed | Different artifact/argv/profile, or runner killed: incomplete or invalid, never passing |
-| Capability declaration | `describe` fails: adapter not selectable | Matches config and runtime version | Mismatch with the stored request: configuration repair, no start |
+| Capability declaration | `describe` fails: adapter not selectable (`adapter.declaration_unavailable`, fail-closed — no synthetic declaration is compared) | Fresh `describe` of the bound argv matches the request's stored binding field-for-field | Per-field mismatch with the stored request binding: configuration repair, no start, terminal for that binding (abandon and re-issue under a new request) |
 | Isolation preflight | Not run: dispatch refused | All probes pass for this profile | Any probe fails: dispatch refused with repair prerequisite |
 | Stop proof | Not established: `uncertain` | Every recorded identity stopped, namespace init gone | Contradictory inspection: `uncertain`, Attention after threshold |
 
@@ -243,7 +245,7 @@ The runner is a supervised effect of the CLI loop, not a Worker Invocation; it i
 ### Selected profile
 
 - **Filesystem.** Read-only binds of the system directories the runtime and toolchain need; tmpfs for `HOME`, `/tmp`, and `/run`; read-write binds only for `/workspace` (read-only for InvariantCheck and CodeReview) and `/taisan/out`; read-only bind of `/taisan/request.json` and, if needed, the single runtime credential file. The owner's home directory, other workspaces, the state store, the handoff repository, and installation config are not mounted.
-- **Credentials.** The environment is constructed from an allowlist, not inherited. Runtime credentials come from a credential reference resolved by the supervisor and passed as an environment variable or a read-only file; their values never appear in argv, request files, logs, or evidence. No repository-host credential, git credential helper, SSH agent socket, or keyring socket enters the sandbox. Git inside the sandbox uses `GIT_CONFIG_GLOBAL` pointing at a generated config with `credential.helper=` and `protocol.allow=never` except `file`.
+- **Credentials.** The environment is constructed from an allowlist, not inherited. Runtime credentials come from a credential reference resolved by the supervisor and passed as an environment variable or a read-only file; their values never appear in argv, request files, logs, or evidence. No repository-host credential, git credential helper, SSH agent socket, or keyring socket enters the sandbox. Git inside the sandbox pins its rules through the environment, because repository-local `.git/config` outranks `GIT_CONFIG_GLOBAL`: `GIT_ALLOW_PROTOCOL=file` denies every transport except the local one regardless of any `protocol.<name>` a workspace plants, and an empty `credential.helper` at `GIT_CONFIG_COUNT` command scope clears every helper a lower scope accumulated. The generated `GIT_CONFIG_GLOBAL` config carries the same rules (`credential.helper=` and `protocol.allow=never` except `file`) as a second layer.
 - **Network (N1, mandatory).** `--unshare-net` leaves only loopback. A taisan-owned CONNECT proxy outside the sandbox listens on a Unix socket bound into the sandbox and exposed to the runtime as `HTTPS_PROXY` through an in-sandbox relay. The proxy allows CONNECT only to the configured model-API host names and port 443, resolves DNS itself, logs allowed and denied destinations as bounded evidence, and denies everything else. TLS is not inspected. Coding, Fix, InvariantCheck, and CodeReview Invocations all get the same model-API-only proxy. Read-only assessment roles need model access too. The supervisor verification runner gets no proxy or runtime credentials.
 - **Process.** `--unshare-pid` makes bwrap's child the PID-namespace init; `--die-with-parent` and `--new-session` prevent survival after the supervisor-spawned leader and terminal injection.
 
@@ -294,7 +296,7 @@ A permanent refusal class (`provider_refused`) blocks the task immediately and c
 
 ## Shared Worker contract suite
 
-Both implementations run the same suite through the supervisor and the public Command/Query path. **Real**: the reference shim, run against a deterministic fake `claude` executable that replays scripted stream-json, plus a separate live smoke with the real runtime in U8. **Contract adapter**: an independently implemented deterministic Worker that shares no code with the shim and replays scripted results. The current fixture worker's process modes may be reused by the contract adapter's process cases.
+Both implementations run the same suite through the supervisor and the public Command/Query path. **Real**: the reference shim, run against a deterministic fake `claude` executable that replays scripted stream-json, plus a separate live smoke with the real runtime in U8. **Contract adapter**: an independently implemented deterministic Worker that shares no code with the shim and replays scripted results. The current fixture worker's process modes may be reused by the contract adapter's process cases. The U4.6b run executes the identical suite code twice — once with each adapter bound — and retains one [U4.6 record](#u46-evidence-record) per case per implementation; a named static check asserts the suite source contains no adapter-name branch.
 
 | ID | Case | Expected |
 | --- | --- | --- |
@@ -322,6 +324,27 @@ Both implementations run the same suite through the supervisor and the public Co
 | WS-22 | Verification runner timeout or source-mutation attempt | Timeout is `Incomplete`, not `Failed` or `Passed`. Source mutation is denied; every subsequent command starts from the exact original artifact with independent outputs |
 | WS-23 | Verification egress with Work-declared hosts | Declared and installation-default hosts reachable; undeclared destination denied; no runtime credential present; recorded environment digest reflects the effective allowlist |
 | WS-24 | Missing, stale, or undeliverable worker input snapshot (`review_source`, `invariant_set`, `goal`) | Dispatch refused as an invalid request; the Worker never fetches the input itself |
+
+### U4.6 evidence record
+
+Every U4.6 swap/recovery proof retains one record per exercised scenario. The record is JSON with these fields; values are evidence, never instructions:
+
+| Field | Required content |
+| --- | --- |
+| `schema_version` | `1` |
+| `tested_revision` | Exact commit SHA on the PR branch that contains the exercised slice tree. A base revision or patch digest alone never satisfies this field; a patch digest may be retained alongside it |
+| `base_revision` | The worktree fork point the slice was applied to |
+| `claim_class` | Closed set: `fixture_supported` (local fixture/contract evidence only) or `live_evidenced` (separately authorized live scenario). Fixture results never satisfy a live claim |
+| `configuration_identity` | The installation config identity, plus the adapter selection active when the request was bound: `adapter_id`, `adapter_version`, `runtime_version`, `capability_digest`, `worker_argv` (or its digest), and the request/invocation identity |
+| `command_scenario` | The named test/command and scenario row (for example `WS-20`, `WS-21`) |
+| `result` | `pass`, `fail`, `skipped`, or `inconclusive`, with the retained reason when not `pass` |
+| `evidence_refs` | Retained test output, store identities, or log locations that let the result be re-checked |
+
+A binding is recorded once per request; a later `worker_argv` change affects only requests not yet bound, and a running Invocation keeps its recorded adapter ID, adapter version, runtime version, capability digest, and argv. A declaration that drifted under the bound argv is reported per differing field (`runtime.version_mismatch`, `capability.digest_mismatch`, and so on) — a configuration repair with no start, never a silent upgrade, and terminal for that request's binding: the work is re-issued under a new request that binds the current declaration.
+
+The swap-window recovery scenarios retain one record each. A supervisor restart after a `worker_argv` change reconciles every in-flight Invocation against its recorded adapter ID, version and capability digest — the recorded binding and writer identity are unchanged, no running Invocation is migrated, and no second writer starts; only requests not yet bound select the new adapter. Interrupted export/import recovers per the [crash-recovery table](#crash-recovery) under the changed configuration, with exactly one artifact ID per Invocation across every window and across re-drives: recovery reads recorded identities, workspaces, and durable rows, never the current `worker_argv`. Real-runtime safe stop records a durable stop intent covering every recorded identity launched under the prior selection and inspects each stopped before terminal release, and artifact recollection reaches the durable acknowledgement (row plus ref plus the declared verification on the produced commit) with workspace and git objects retained through the verified handoff. Records are stamped fail-closed from the branch commit that contains the exercised slice: a checkout whose tree differs from `HEAD` runs the scenarios but retains no records, so a retained record can never cite a revision that does not contain it.
+
+The retained scenario records are consolidated for issue #102 in the [consolidated U4.6 evidence record](evidence/u4.6d.md): one row per #102 acceptance criterion with the columns `criterion`, `record_refs[]` (or the literal `absent{reason}`), `tested_revision`, `config_identity` and `result`, where every `record_refs[]` entry resolves to a retained per-scenario record whose index entry carries that record's tested revision, configuration, command/scenario and result. A named completeness check asserts every #102 criterion has a row — a missing row fails, an `absent{reason}` row is reported as a gap, never as a pass; a named schema check asserts every row and index entry conforms to the columns above.
 
 ## Requirement mapping
 

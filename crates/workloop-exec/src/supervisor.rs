@@ -9,20 +9,26 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use workloop_core::domain::*;
 use workloop_core::observation::{
     ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
 };
 use workloop_core::ports::{
-    ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
+    WorkerEnv,
 };
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::{
-    DEFAULT_ISOLATION_PROFILE_ID, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
+    IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
+    default_isolation_profile,
 };
+
+use crate::adapter;
+use crate::isolation;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -60,6 +66,42 @@ fn checked_ps_output(out: Output, allows_absence: bool) -> std::io::Result<Strin
 /// (spawn, snapshot, re-verify) must produce the same string.
 fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One `ps` table row: `N` integer prefix fields followed by the
+/// locale-dependent lstart text. The tail is never field-counted — a
+/// localized `ps` renders different field text (e.g. ja_JP prints a CJK
+/// weekday and an `M/D` date), and any non-empty tail is still the
+/// process start the row carries. Blank lines are skipped (`Ok(None)`);
+/// a missing prefix field or an empty lstart tail is an incomplete row
+/// and a non-numeric prefix is an invalid row — either aborts the table
+/// read so a partial snapshot can never authorize a signal.
+fn parse_table_row<const N: usize>(line: &str) -> Result<Option<([i32; N], String)>, String> {
+    let mut it = line.split_whitespace();
+    let mut tokens = Vec::with_capacity(N);
+    for _ in 0..N {
+        match it.next() {
+            Some(tok) => tokens.push(tok),
+            None => {
+                return if line.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    Err(format!("incomplete process-table row: {line}"))
+                };
+            }
+        }
+    }
+    let lstart = it.collect::<Vec<_>>().join(" ");
+    if lstart.is_empty() {
+        return Err(format!("incomplete process-table row: {line}"));
+    }
+    let mut fields = [0i32; N];
+    for (slot, tok) in fields.iter_mut().zip(tokens) {
+        *slot = tok
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+    }
+    Ok(Some((fields, normalize_lstart(&lstart))))
 }
 
 /// One `ps`-based lstart lookup, keeping "the process is gone" separate
@@ -103,6 +145,74 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
+/// What a timed-out probe may signal once the bound has elapsed. The
+/// waiter thread can already have reaped the leader between the bound
+/// expiring and the kill, freeing the pid for reuse, so the recorded
+/// `pid + lstart` is re-verified first — the same owner check
+/// `proof_identities` applies to a recorded group: pgid == the leader's
+/// pid (`process_group(0)`), a live process at that pid under a
+/// different start is a recycled owner and its group is foreign, while
+/// an absent owner leaves only this probe's own stragglers holding the
+/// group.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeSignalPlan {
+    /// The leader re-verified: it and the group this probe created are
+    /// still ours to signal.
+    LeaderAndGroup,
+    /// The pid is unallocated: a surviving group can only be held by
+    /// this probe's own stragglers — a group id is only minted by a
+    /// live process of that pid — so the group is still ours to signal.
+    GroupOnly,
+    /// A live process at the pid carries a different start (recycled,
+    /// foreign) or an occupied pid could not be verified: nothing is
+    /// signalled. A possibly-leaked straggler beats a signal to an
+    /// unrelated process.
+    Nothing,
+}
+
+fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
+    match lookup {
+        LstartLookup::Present(now) if now == recorded_lstart => ProbeSignalPlan::LeaderAndGroup,
+        LstartLookup::Absent => ProbeSignalPlan::GroupOnly,
+        LstartLookup::Failed(_) => {
+            // The process-table read failed, but a pid probe needs no
+            // table: `kill(pid, 0)` reporting ESRCH means the pid is
+            // unallocated and no foreign process can be heading a group
+            // under it — the group is still ours to signal. An
+            // occupied but unverifiable pid could be a recycled foreign
+            // owner, so it is left alone.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                ProbeSignalPlan::GroupOnly
+            } else {
+                ProbeSignalPlan::Nothing
+            }
+        }
+        _ => ProbeSignalPlan::Nothing,
+    }
+}
+
+/// Signal whatever of a bounded probe's leader and process group is
+/// still this probe's to stop. `recorded_lstart` is the leader identity
+/// captured while the pid was provably ours. Shared by the timeout and
+/// the wait-error paths so a wedged probe cannot outlive its bound on
+/// either one. Returns the plan applied so the caller can report an
+/// unsignalled bound as unknown fate rather than claiming `Bounded`.
+fn signal_probe_bound(pid: i32, recorded_lstart: &str) -> ProbeSignalPlan {
+    let plan = probe_signal_plan(pid, recorded_lstart, &lstart_of(pid));
+    match plan {
+        ProbeSignalPlan::LeaderAndGroup => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::GroupOnly => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        },
+        ProbeSignalPlan::Nothing => {}
+    }
+    plan
+}
+
 impl PosixProcessControl {
     /// Capture a reuse-resistant identity for an existing process —
     /// the caller's own pid when claiming the run lease. Returns an
@@ -124,8 +234,21 @@ impl PosixProcessControl {
     }
 }
 
+/// Apply the allowlisted worker environment: `env_clear` so nothing
+/// the supervisor inherited survives, then exactly the pairs the
+/// profile constructed.
+fn apply_worker_env(cmd: &mut Command, env: &WorkerEnv) {
+    cmd.env_clear();
+    cmd.envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+}
+
 impl ProcessControlPort for PosixProcessControl {
-    fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         let Some(program) = argv.first() else {
             return Err(SpawnError::Refused {
                 reason: "empty argv".into(),
@@ -135,6 +258,7 @@ impl ProcessControlPort for PosixProcessControl {
         // leader did not let escape.
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..]).current_dir(cwd).process_group(0);
+        apply_worker_env(&mut cmd, env);
         let child = cmd.spawn().map_err(|e| SpawnError::Refused {
             reason: format!("spawn {program}: {e}"),
         })?;
@@ -170,26 +294,9 @@ impl ProcessControlPort for PosixProcessControl {
             // Numeric prefix fields, then the locale-dependent lstart
             // string — its token count varies (e.g. ja_JP pads days
             // <10 with a space), so it is never field-counted.
-            let mut it = line.split_whitespace();
-            let (Some(pid_s), Some(ppid_s), Some(pgid_s)) = (it.next(), it.next(), it.next())
-            else {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                return Err(format!("incomplete process-table row: {line}"));
+            let Some(([pid, ppid, pgid], lstart)) = parse_table_row::<3>(line)? else {
+                continue;
             };
-            let lstart_raw = it.collect::<Vec<_>>().join(" ");
-            if lstart_raw.is_empty() {
-                return Err(format!("incomplete process-table row: {line}"));
-            }
-            let (Ok(pid), Ok(ppid), Ok(pgid)) = (
-                pid_s.parse::<i32>(),
-                ppid_s.parse::<i32>(),
-                pgid_s.parse::<i32>(),
-            ) else {
-                return Err(format!("invalid process-table row: {line}"));
-            };
-            let lstart = normalize_lstart(&lstart_raw);
             by_ppid
                 .entry(ppid)
                 .or_default()
@@ -228,24 +335,13 @@ impl ProcessControlPort for PosixProcessControl {
             // Same variable-width lstart handling as
             // `snapshot_descendants`: pid/pgid are numeric prefixes,
             // everything after is the start time.
-            let mut it = line.split_whitespace();
-            let (Some(pid_s), Some(g_s)) = (it.next(), it.next()) else {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                return Err(format!("incomplete process-table row: {line}"));
-            };
-            let lstart = it.collect::<Vec<_>>().join(" ");
-            if lstart.is_empty() {
-                return Err(format!("incomplete process-table row: {line}"));
-            }
-            let (Ok(pid), Ok(g)) = (pid_s.parse::<i32>(), g_s.parse::<i32>()) else {
-                return Err(format!("invalid process-table row: {line}"));
+            let Some(([pid, g], lstart)) = parse_table_row::<2>(line)? else {
+                continue;
             };
             if g == pgid {
                 out.push(ProcessIdentity {
                     pid,
-                    started_at: normalize_lstart(&lstart),
+                    started_at: lstart,
                     pgid: Some(g),
                 });
             }
@@ -339,6 +435,96 @@ impl ProcessControlPort for PosixProcessControl {
             libc::waitpid(pid, &mut status, libc::WNOHANG);
         }
     }
+
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        let Some(program) = argv.first() else {
+            return Err(SpawnError::Refused {
+                reason: "empty argv".into(),
+            });
+        };
+        // Same containment as `spawn`: own process group so a bound can
+        // reach the whole tree the leader did not let escape. stderr is
+        // dropped — only the declared stdout payload is evidence.
+        let mut cmd = Command::new(program);
+        cmd.args(&argv[1..])
+            .current_dir(cwd)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        apply_worker_env(&mut cmd, env);
+        let mut child = cmd.spawn().map_err(|e| SpawnError::Refused {
+            reason: format!("spawn {program}: {e}"),
+        })?;
+        let pid = child.id() as i32;
+        // Record the leader's `pid + lstart` while the pid is provably
+        // still ours — the handle is held, so it cannot have been
+        // recycled. The waiter below can reap the leader before the
+        // bound path signals, and only this identity separates our
+        // process from a reused pid there. When the identity cannot be
+        // captured no later signal is verifiable: the still-unreaped
+        // child is stopped now (signalling it is safe while the handle
+        // is held) and the probe's fate is reported unknown.
+        let started_at = match Self::identity_of(pid) {
+            Ok(identity) => identity.started_at,
+            Err(reason) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SpawnError::Unknown { reason });
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        });
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok(output)) => Ok(ProbeOutcome::Exited {
+                stdout: output.stdout,
+                success: output.status.success(),
+            }),
+            Ok(Err(e)) => {
+                // The wait itself failed and the child's fate is
+                // unknown — the bound still applies: signal whatever of
+                // the leader and its group is still this probe's before
+                // reporting the probe unknown, so a wedged group cannot
+                // outlive the bound on a wait-channel error either.
+                signal_probe_bound(pid, &started_at);
+                self.reap(pid);
+                Err(SpawnError::Unknown {
+                    reason: format!("wait {program}: {e}"),
+                })
+            }
+            Err(_) => {
+                // The bound elapsed: re-verify the recorded identity
+                // before signalling — the waiter may already have reaped
+                // the leader, freeing the pid for reuse (#152). The
+                // group id is the leader's pid by construction, so the
+                // plan decides exactly which of the leader and its
+                // group are still ours. A short drain then lets the
+                // waiter reap the direct child rather than leaving a
+                // zombie. When the plan signalled nothing the outcome
+                // is not `Bounded`: that variant promises the group and
+                // leader were stopped, so an unsignalled wedged probe
+                // reports unknown fate instead.
+                let plan = signal_probe_bound(pid, &started_at);
+                let _ = receiver.recv_timeout(Duration::from_secs(2));
+                match plan {
+                    ProbeSignalPlan::Nothing => Err(SpawnError::Unknown {
+                        reason: format!(
+                            "probe bound elapsed and the leader identity could not \
+                             be re-verified at {pid}; nothing was signalled"
+                        ),
+                    }),
+                    _ => Ok(ProbeOutcome::Bounded),
+                }
+            }
+        }
+    }
 }
 
 /// Anything `execution` can fail doing; store errors propagate verbatim so
@@ -418,9 +604,11 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// The installation config `work` decisions are made against.
     pub config: workloop_core::work::WorkloopConfig,
     /// The approved isolation profile the WorkerRequest export names and
-    /// the launch binds. Enforcement is a separate slice; the id is
-    /// recorded here so the export and the reconciliation binding agree.
-    pub isolation_profile_id: String,
+    /// every worker launch and `describe` probe is contained under —
+    /// the environment each spawned process runs in is built from this
+    /// profile, never inherited (U2.3). Namespace enforcement remains a
+    /// separate slice; the export still records the profile id.
+    pub isolation_profile: IsolationProfile,
     /// Durable artifact-handoff layout; `None` keeps the file-artifact
     /// path only (fixture harnesses without git workspaces).
     pub handoff: Option<crate::handoff::HandoffLayout>,
@@ -439,16 +627,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
             workspace_root,
             worker_argv,
             config,
-            isolation_profile_id: DEFAULT_ISOLATION_PROFILE_ID.to_string(),
+            isolation_profile: default_isolation_profile(),
             handoff: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Name the approved isolation profile the WorkerRequest export
-    /// carries and the launch binds (U4.2).
-    pub fn with_isolation_profile_id(mut self, isolation_profile_id: impl Into<String>) -> Self {
-        self.isolation_profile_id = isolation_profile_id.into();
+    /// Run launches under the approved isolation profile the
+    /// WorkerRequest export carries — the profile also builds the
+    /// environment every spawn and `describe` probe runs under (U2.3).
+    /// Callers resolve the id through `isolation_profile` so an
+    /// unapproved name can never reach a launch.
+    pub fn with_isolation_profile(mut self, profile: IsolationProfile) -> Self {
+        self.isolation_profile = profile;
         self
     }
 
@@ -475,6 +666,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
     pub fn workspace_of(&self, work_id: &WorkId) -> PathBuf {
         self.workspace_root.join(format!("ws-{}", work_id.0))
+    }
+
+    /// The scratch tree one Invocation's launch environment is built
+    /// under — its writer's `HOME`/`TMPDIR`, reclaimed when the
+    /// Invocation finishes or the launch is refused.
+    fn launch_scratch(&self, invocation_id: &str) -> PathBuf {
+        isolation::scratch_root(&self.workspace_root)
+            .join(format!("inv-{}", isolation::sanitize_key(invocation_id)))
     }
 
     /// One supervisor pass: consume approved requests, inspect live
@@ -528,7 +727,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(true);
         }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        self.sweep_isolation_scratch(store)?;
         Ok(deadline_reached(clock, deadline))
+    }
+
+    /// Bound `.isolation`: scratch trees are released with their
+    /// Invocation's lifecycle, but a crashed pass leaves orphans the
+    /// catalog-driven retention sweep cannot see — they are not
+    /// registered bodies. Once per pass, reclaim every scratch tree no
+    /// unresolved Invocation still owns; the keep-set is global, so a
+    /// live or unproven writer's `HOME`/`TMPDIR` is never touched.
+    pub fn sweep_isolation_scratch(&self, store: &impl Store) -> Result<(), ExecError> {
+        let keep: HashSet<PathBuf> = store
+            .transact(|tx| tx.unresolved_invocations())?
+            .iter()
+            .map(|invocation| self.launch_scratch(&invocation.id.0))
+            .collect();
+        isolation::sweep_orphans(&isolation::scratch_root(&self.workspace_root), &keep);
+        Ok(())
     }
 
     /// Durable artifact handoff: resume every incomplete row (the
@@ -774,11 +990,89 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         }
 
+        // The Execution state gates the describe probe too: a request
+        // that can never launch never starts the worker binary, not even
+        // the effect-free declaration probe.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+
+        // Resolve the request's adapter before any Invocation is
+        // recorded. A request that already carries a binding keeps it
+        // verbatim — a later `worker_argv` swap can only affect requests
+        // created after the change — but the bound argv is probed again
+        // and must still declare the stored binding; a mismatch is a
+        // configuration repair that authorizes no start. An unbound
+        // request selects now and records the binding in the consume
+        // commit. A failed `describe` is fail-closed: the adapter is not
+        // selectable and the request does not dispatch.
+        let (binding, repair_reason) = if exec_state != Some(ExecutionState::Ready) {
+            (None, None)
+        } else {
+            let workspace = self.workspace_of(&request.work_id);
+            std::fs::create_dir_all(&workspace)?;
+            // The probe runs under the profile's environment — an
+            // untrusted adapter binary sees no host credential even
+            // during the effect-free declaration. A preparation failure
+            // is fail-closed: the request does not dispatch under a
+            // degraded environment. The probe's scratch tree is
+            // reclaimed as soon as the probe process is gone.
+            let probe_scratch = isolation::scratch_root(&self.workspace_root).join(format!(
+                "probe-{}",
+                isolation::sanitize_key(&request.request_id)
+            ));
+            let probe_env = isolation::prepare(&self.isolation_profile, &probe_scratch);
+            match probe_env {
+                Err(why) => (
+                    None,
+                    Some(format!("isolation.environment_preparation_failed: {why}")),
+                ),
+                Ok(env) => {
+                    let selected = match &request.adapter_binding {
+                        Some(stored) => match adapter::observe_worker_declaration(
+                            &self.port,
+                            &stored.argv,
+                            &workspace,
+                            &env,
+                        ) {
+                            Ok(observed) => match adapter::select_adapter(&observed, stored) {
+                                adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
+                                adapter::AdapterSelection::ConfigurationRepair { reason } => {
+                                    (None, Some(reason))
+                                }
+                            },
+                            Err(why) => (
+                                None,
+                                Some(format!("adapter.declaration_unavailable: {why}")),
+                            ),
+                        },
+                        None => match adapter::observe_worker_declaration(
+                            &self.port,
+                            &self.worker_argv,
+                            &workspace,
+                            &env,
+                        ) {
+                            Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
+                            Err(why) => (
+                                None,
+                                Some(format!("adapter.declaration_unavailable: {why}")),
+                            ),
+                        },
+                    };
+                    isolation::release(&probe_scratch);
+                    selected
+                }
+            }
+        };
+
         // First consumption: persist the WorkerRequest export and the
         // Invocation inside the same commit that consumes the request —
         // crash order is export, then identity, then launch. The export
         // is durable before any process exists; a launch that fails or
-        // never returns leaves it behind for reconciliation.
+        // never returns leaves it behind for reconciliation. Recording
+        // the Invocation flips `consumed` itself; the explicit mark
+        // records the supervisor's handoff and is idempotent. The
+        // request's first adapter binding lands in the same commit.
         let invocation = Invocation {
             id: InvocationId(store.transact(|tx| tx.alloc_id("inv"))?),
             request_id: request.request_id.clone(),
@@ -793,7 +1087,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let export_workspace = self.workspace_of(&request.work_id);
         let export = WorkerRequest::start(
             invocation.id.clone(),
-            self.isolation_profile_id.clone(),
+            self.isolation_profile.id.to_string(),
             export_workspace.to_string_lossy().into_owned(),
         );
         let export_record = WorkerRequestExport {
@@ -806,6 +1100,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             process_identity: None,
         };
         store.transact(|tx| {
+            if request.adapter_binding.is_none()
+                && let Some(binding) = &binding
+            {
+                tx.apply(&Effect::BindRequestAdapter {
+                    request_id: request.request_id.clone(),
+                    binding: binding.clone(),
+                })?;
+            }
             tx.apply(&Effect::InsertInvocation {
                 invocation: invocation.clone(),
             })?;
@@ -818,15 +1120,46 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(())
         })?;
 
-        // Launch only for a freshly admitted Execution. A request consumed
-        // while the Execution wants stop (or is uncertain, waiting, or
-        // terminal) must not produce a writer — the invocation is
-        // abandoned so `drive_stops` can settle the Execution instead of
-        // leaving it blocked on a writer that never existed.
-        let exec_state = store
-            .transact(|tx| tx.execution(&request.execution_id))?
-            .map(|e| e.state);
-        if exec_state != Some(ExecutionState::Ready) {
+        if let Some(reason) = repair_reason {
+            // A declaration mismatch or an unanswered `describe` is a
+            // configuration repair: the attempt is recorded and abandoned,
+            // but no worker starts. The consumed request is terminal for
+            // its binding — a re-issued request binds a fresh declaration.
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchRefused {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+
+        // The pre-probe Execution-state read is stale by up to the full
+        // probe bound: re-read it after the consume commit so a stop or
+        // cancel committed while `describe` ran still blocks the spawn —
+        // the request is consumed, so blocking the launch abandons the
+        // recorded Invocation. The spawn also requires the recorded
+        // binding: when the pre-probe read skipped `describe` the bound
+        // argv was never re-verified, so a state that flipped back to
+        // Ready must not fall through to the configured `worker_argv`
+        // and launch with no recorded selection.
+        let launchable = binding.is_some()
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !launchable {
             store.transact(|tx| {
                 let mut next = invocation.clone();
                 next.state = InvocationState::Abandoned;
@@ -842,8 +1175,33 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let work_id = request.work_id.clone();
         let workspace = self.workspace_of(&work_id);
         std::fs::create_dir_all(&workspace)?;
-        let argv = self.worker_argv.clone();
-        match self.port.spawn(&argv, &workspace) {
+        // The bound argv is the recorded selection — a `worker_argv`
+        // change after binding never retargets this request, and the
+        // launchable gate above already proved a binding was recorded.
+        let argv = binding
+            .map(|binding| binding.argv)
+            .expect("a launch requires a recorded binding");
+        // The launch runs under the profile's environment — a
+        // preparation failure refuses the launch through the same path
+        // as a refused spawn; there is no degrade-to-inherited-env
+        // fallback.
+        let launch_env = match isolation::prepare(
+            &self.isolation_profile,
+            &self.launch_scratch(&invocation.id.0),
+        ) {
+            Ok(env) => env,
+            Err(why) => {
+                self.refuse_launch(
+                    store,
+                    request,
+                    &invocation,
+                    format!("isolation.environment_preparation_failed: {why}"),
+                    now_unix_seconds,
+                )?;
+                return Ok(());
+            }
+        };
+        match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 // Descendant coverage starts at launch: a writer that
                 // escapes its tree before the first poll is still a
@@ -888,24 +1246,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
-                store.transact(|tx| {
-                    let mut next = invocation.clone();
-                    next.state = InvocationState::Abandoned;
-                    tx.apply(&Effect::UpdateInvocation {
-                        invocation: next,
-                        expected_state: InvocationState::Prepared,
-                    })?;
-                    Ok(())
-                })?;
-                self.report(
-                    store,
-                    request,
-                    ObservationFact::LaunchRefused {
-                        invocation_id: invocation.id.clone(),
-                        reason,
-                    },
-                    now_unix_seconds,
-                )?;
+                self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
                 self.report(
@@ -920,6 +1261,42 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Record a launch refusal: the consumed request's Invocation is
+    /// abandoned and `LaunchRefused` is reported — the request is
+    /// terminal for its binding, never retried under a degraded setup.
+    /// No process exists for this Invocation, so its scratch tree
+    /// (fully built for a refused spawn, partial for a refused
+    /// preparation) is reclaimed with the refusal.
+    fn refuse_launch(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation: &Invocation,
+        reason: String,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        isolation::release(&self.launch_scratch(&invocation.id.0));
+        store.transact(|tx| {
+            let mut next = invocation.clone();
+            next.state = InvocationState::Abandoned;
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: next,
+                expected_state: InvocationState::Prepared,
+            })?;
+            Ok(())
+        })?;
+        self.report(
+            store,
+            request,
+            ObservationFact::LaunchRefused {
+                invocation_id: invocation.id.clone(),
+                reason,
+            },
+            now_unix_seconds,
+        )?;
         Ok(())
     }
 
@@ -1281,6 +1658,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
         invocation: &Invocation,
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
+        // The writer is proven stopped before this is called: its
+        // scratch tree (HOME/TMPDIR) can never be read again and is
+        // reclaimed with the Invocation instead of accumulating under
+        // `.isolation`.
+        isolation::release(&self.launch_scratch(&invocation.id.0));
         let request = store
             .transact(|tx| tx.request(&invocation.request_id))?
             .ok_or(ExecError::Store(StoreError::Internal {
@@ -1508,22 +1890,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 if all_stopped {
                     // The leader is our child: reap it so a killed writer
                     // does not linger as a zombie of this supervisor.
+                    // `finish_invocation` saves the artifact facts,
+                    // reports the proven exit, and reclaims the launch
+                    // scratch — the same completion the poll path runs.
+                    // The poll path skips `Stopping` Executions, so a
+                    // launch stopped by cancel/fail/pause reaches its
+                    // exit fact only here; reporting it directly would
+                    // leave `inv-*` scratch under `.isolation` forever.
                     self.port.reap(identity.pid);
-                    let request = store
-                        .transact(|tx| tx.request(&invocation.request_id))?
-                        .ok_or(ExecError::Store(StoreError::Internal {
-                            detail: "invocation without request".into(),
-                        }))?;
-                    self.report(
-                        store,
-                        &request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: format!("{}@{}", identity.pid, identity.started_at),
-                            state: ProcessStateFact::Exited,
-                        },
-                        now_unix_seconds,
-                    )?;
+                    self.finish_invocation(store, &invocation, now_unix_seconds)?;
                 } else if any_unknown && execution.state == ExecutionState::Stopping {
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?
@@ -2047,7 +2422,12 @@ mod tests {
     struct SnapshotFailure;
 
     impl ProcessControlPort for SnapshotFailure {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn expected")
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -2066,6 +2446,15 @@ mod tests {
             panic!("incomplete snapshot must not authorize signaling")
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     #[test]
@@ -2137,7 +2526,12 @@ mod tests {
     }
 
     impl ProcessControlPort for ScriptedGroup {
-        fn spawn(&self, _: &[String], _: &Path) -> Result<ProcessIdentity, SpawnError> {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+        ) -> Result<ProcessIdentity, SpawnError> {
             panic!("no spawn expected")
         }
         fn snapshot_descendants(&self, _: i32) -> Result<Vec<ProcessIdentity>, String> {
@@ -2169,6 +2563,15 @@ mod tests {
             SignalOutcome::Sent
         }
         fn reap(&self, _: i32) {}
+        fn run_probe(
+            &self,
+            _: &[String],
+            _: &Path,
+            _: &WorkerEnv,
+            _: Duration,
+        ) -> Result<ProbeOutcome, SpawnError> {
+            panic!("no probe expected")
+        }
     }
 
     fn scripted_config() -> workloop_core::work::WorkloopConfig {
@@ -2320,5 +2723,132 @@ mod tests {
             LstartLookup::Present(s) => assert_eq!(s, "Sat Oct 4 06:14:00 2026"),
             other => panic!("expected Present, got {other:?}"),
         }
+    }
+
+    /// `ps` renders `lstart` in the process locale — under ja_JP a CJK
+    /// weekday and an `M/D` date replace the ctime fields. The parser
+    /// takes the numeric prefix and treats the whole remaining tail as
+    /// the start string, so a localized row must never read back as an
+    /// incomplete table row (#158).
+    #[test]
+    fn a_localized_lstart_row_still_parses() {
+        // C-locale ctime row, including the space-padded day field.
+        let (fields, lstart) = parse_table_row::<3>("  247     1   247 Sat Oct  4 06:14:00 2026")
+            .unwrap()
+            .expect("a full row parses");
+        assert_eq!(fields, [247, 1, 247]);
+        assert_eq!(lstart, "Sat Oct 4 06:14:00 2026");
+
+        // The ja_JP row from the issue report: `水` (Wednesday) plus a
+        // numeric `M/D` date — the row that produced
+        // "incomplete process-table row" before the parse tolerated it.
+        let (fields, lstart) = parse_table_row::<3>("  247     1   247 水 11/11 14:15:57 2026")
+            .unwrap()
+            .expect("a localized row parses");
+        assert_eq!(fields, [247, 1, 247]);
+        assert_eq!(lstart, "水 11/11 14:15:57 2026");
+
+        // The two-prefix shape used by `group_members`, with the
+        // space-padded day ja_JP also emits (`木 11/ 5`).
+        let (fields, lstart) = parse_table_row::<2>("  247   247 木 11/ 5 06:14:00 2026")
+            .unwrap()
+            .expect("a localized group row parses");
+        assert_eq!(fields, [247, 247]);
+        assert_eq!(lstart, "木 11/ 5 06:14:00 2026");
+
+        // Blank lines are skipped; every other malformed row still
+        // aborts the table read.
+        assert_eq!(parse_table_row::<3>("   ").unwrap(), None);
+        assert_eq!(
+            parse_table_row::<3>("  247     1").unwrap_err(),
+            "incomplete process-table row:   247     1"
+        );
+        assert_eq!(
+            parse_table_row::<3>("  247     1   247").unwrap_err(),
+            "incomplete process-table row:   247     1   247"
+        );
+        assert_eq!(
+            parse_table_row::<3>("  abc     1   247 Sat Oct 4 06:14:00 2026").unwrap_err(),
+            "invalid process-table row:   abc     1   247 Sat Oct 4 06:14:00 2026"
+        );
+    }
+
+    /// The bounded-probe signal plan applies the recorded-group owner
+    /// check: a leader that re-verifies is ours to signal, an absent
+    /// owner pid leaves only our own stragglers holding the group, and
+    /// a pid that lives under a different start is recycled — signalling
+    /// it would hit an unrelated process (#152).
+    #[test]
+    fn a_probe_timeout_signals_only_verified_identities() {
+        let recorded = "Sat Oct 4 06:14:00 2026";
+        assert_eq!(
+            probe_signal_plan(1, recorded, &LstartLookup::Present(recorded.into())),
+            ProbeSignalPlan::LeaderAndGroup
+        );
+        assert_eq!(
+            probe_signal_plan(1, recorded, &LstartLookup::Absent),
+            ProbeSignalPlan::GroupOnly
+        );
+        assert_eq!(
+            probe_signal_plan(
+                1,
+                recorded,
+                &LstartLookup::Present("Sun Nov 1 00:00:00 2026".into())
+            ),
+            ProbeSignalPlan::Nothing
+        );
+        // A failed lookup over an unallocated pid still reaches the
+        // group — `kill(pid, 0)` is enough to prove no foreign owner is
+        // heading a group under it.
+        assert_eq!(
+            probe_signal_plan(
+                i32::MAX,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
+            ProbeSignalPlan::GroupOnly
+        );
+        // A failed lookup over an occupied pid stays unverifiable — the
+        // group is left alone rather than risk a recycled foreign owner.
+        assert_eq!(
+            probe_signal_plan(
+                std::process::id() as i32,
+                recorded,
+                &LstartLookup::Failed("ps unavailable".into())
+            ),
+            ProbeSignalPlan::Nothing
+        );
+    }
+
+    /// A probe that leaves a same-group straggler past the bound loses
+    /// the whole group: the leader's pid is the group id by
+    /// construction, so the straggler writes nothing after the bound.
+    #[test]
+    fn a_timed_out_probe_group_is_killed_with_its_leader() {
+        let marker =
+            std::env::temp_dir().join(format!("workloop-probe-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // The straggler writes the marker at ~1s if the group survives;
+        // the leader keeps the bound wedged well past that point.
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("(sleep 1; touch \"{}\") & sleep 30", marker.display()),
+        ];
+        let outcome = PosixProcessControl
+            .run_probe(
+                &argv,
+                Path::new("/tmp"),
+                &WorkerEnv::default(),
+                Duration::from_millis(50),
+            )
+            .expect("a spawned probe reports its outcome");
+        assert_eq!(outcome, ProbeOutcome::Bounded);
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(
+            !marker.exists(),
+            "a same-group straggler must be killed with the probe leader"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }

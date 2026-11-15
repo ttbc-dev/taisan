@@ -55,28 +55,25 @@ The suite parameterizes over two axes:
 | --- | --- | --- |
 | HC-PERM-01 | Denied mutation authorization leaves intents `pending` — it is not a capability verdict and must not produce a write or a fabricated failure. | `denied_permission_is_not_unsupported` (all three fixtures); `host_write_denied_leaves_the_outbox_pending`, `execution_denial_is_not_overridden_by_installation_permissions`. |
 | HC-CAP-01 | A required capability that is missing or undeclared rejects admission explicitly (`unsupported_capability`) before Worker start or remote writes — never deferred silently. | `unsupported_capability_stays_explicit` (all three fixtures). |
-| HC-CAP-02 | Unsupported operations stay explicit at the effect boundary: a fixture that does not implement an operation reports a `failed` receipt naming it — never `applied`. | `sparse_host_unsupported_operations_stay_explicit` (`SparseHost` refuses `update_change_request` and `post_comment`). |
-| HC-CAP-03 | `approve_change` / `mark_ready` / `resolve_thread` remain explicit-unsupported: they are not in the `HostAction` vocabulary, so no fixture can emit an `applied` receipt for them. The capability names `approve`, `request_changes`, `inline_comment`, `review_feedback`, `thread_reply`, `thread_resolve`, and `mark_ready`/`ready` are declarable in the closed `HostCapability` set, but none has an executable `HostAction`; a fixture that declared one could not cover its row. | `approval_and_ready_stay_explicitly_unsupported` (fixture-independent type-level check); the `HC-OPT-*` matrix rows below assert the absent operation explicitly on every fixture. |
+| HC-CAP-02 | Unsupported operations stay explicit at the effect boundary: a fixture that does not implement an operation reports an `unsupported` receipt naming it — a distinct class, never `applied` and never a permission verdict. | `sparse_host_unsupported_operations_stay_explicit` (`SparseHost` refuses `update_change_request` and `post_comment`); `assert_unsupported_capability` probes an executable operation on every fixture that does not declare it (all `HC-*` rows). |
+| HC-CAP-03 | `approve_change` / `request_changes` / `post_inline_comment` remain explicit-unsupported: they are not in the `HostAction` vocabulary, so no fixture can emit an `applied` receipt for them. The capability names `approve`, `request_changes`, and `inline_comment` are declarable in the closed `HostCapability` set, but none has an executable `HostAction`; a fixture that declared one could not cover its row. Head-bound discussion and ready writes (`publish_review_feedback`, `thread_reply`, `resolve_thread`, `mark_ready`) are executable operations covered by the `HC-OPT-*` rows below. | `decision_writes_stay_explicitly_unsupported` (fixture-independent type-level check); the `HC-OPT-*` matrix rows below assert the absent operation explicitly on every fixture that does not declare it. |
 
 ## Declared optional capabilities
 
-Optional capabilities are per-fixture declarations. The registered
-fixtures declare none of the optional review, thread, or readiness
-writes below, so every row is an explicit unsupported result on every
-fixture — never a silent skip and never an applied receipt. A fixture
-that declared one of these capabilities without adding its executable
-operation fails the suite rather than turning the row into an assumed
-success.
+Optional capabilities are per-fixture declarations. A fixture that
+declares one of the capabilities below runs the row's unchanged
+scenario; a fixture that does not declare it refuses the operation
+explicitly — never a silent skip and never an assumed success.
 
 | Row | Capability | Required semantics when declared | Result on registered fixtures |
 | --- | --- | --- | --- |
 | HC-OPT-01 | `approve` | Record an eligible actor's approval for the exact revision, with independent evidence; not a comment. | explicit unsupported — operation `approve_change` is absent from `HostAction`. |
-| HC-OPT-02 | `mark_ready` (`ready`) | Establish and observe non-draft state after prerequisites; already-ready may satisfy through a fresh observation. | explicit unsupported — operation `mark_ready` is absent from `HostAction`. |
+| HC-OPT-02 | `mark_ready` (`ready`) | Establish and observe non-draft state bound to an exact head; the applied receipt reports the ready state and head a fresh read observes. | covered on `FixtureGithub` (`ready_marking_applies_with_fresh_readback`); explicit unsupported on `GitlabFixture` and `SparseHost`. |
 | HC-OPT-03 | `request_changes` | Record the actor's host-native change-requesting decision with target revision and evidence; ordinary criticism is not an implementation. | explicit unsupported — operation `request_changes` is absent from `HostAction`. |
 | HC-OPT-04 | `inline_comment` | Post one comment at a validated position in the exact immutable diff snapshot; ambiguous positions are rejected, not moved. | explicit unsupported — operation `post_inline_comment` is absent from `HostAction`. |
-| HC-OPT-05 | `review_feedback` | Publish one head-bound review feedback record; not an approval or merge-policy decision. | explicit unsupported — operation `publish_review_feedback` is absent from `HostAction`. |
-| HC-OPT-06 | `thread_reply` | Post one marked reply preserving the exact thread identity and action receipt. | explicit unsupported — operation `thread_reply` is absent from `HostAction`. |
-| HC-OPT-07 | `thread_resolve` | Resolve the identified thread and observe the effect; a reply is not resolution. | explicit unsupported — operation `resolve_thread` is absent from `HostAction`. |
+| HC-OPT-05 | `review_feedback` | Publish one head-bound review feedback record; not an approval or merge-policy decision. | covered on `FixtureGithub` (`review_feedback_applies_with_readback`); explicit unsupported on `GitlabFixture` and `SparseHost`. |
+| HC-OPT-06 | `thread_reply` | Post one marked reply preserving the exact thread identity and action receipt. | covered on `FixtureGithub` (`thread_reply_applies_with_readback`); explicit unsupported on `GitlabFixture` and `SparseHost`. |
+| HC-OPT-07 | `thread_resolve` | Resolve the identified thread bound to the head its findings were examined at, and observe the effect; a reply is not resolution. | covered on `FixtureGithub` (`thread_resolve_applies_with_readback`); explicit unsupported on `GitlabFixture` and `SparseHost`. |
 
 ## Identity, snapshots, and binding
 

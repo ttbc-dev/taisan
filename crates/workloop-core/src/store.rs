@@ -69,6 +69,13 @@ pub enum Effect {
     InsertRequest {
         request: InvocationRequest,
     },
+    /// Bind a request to the exact Worker adapter selected before its
+    /// first launch. First binding is authoritative; a bound request is
+    /// never migrated to another adapter.
+    BindRequestAdapter {
+        request_id: String,
+        binding: WorkerAdapterBinding,
+    },
     InsertInvocation {
         invocation: Invocation,
     },
@@ -223,10 +230,17 @@ fn pending_status() -> HostActionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HostAction {
-    /// Publish `produced` on `branch`.
+    /// Publish `produced` on `branch` guarded by `expected_prior` —
+    /// the remote ref position recorded at intent time; `None` requires
+    /// the ref to be absent. The write is refused when the remote no
+    /// longer matches it.
     PushRef {
         branch: String,
         produced: CommitRevision,
+        /// The remote ref position the intent was recorded against;
+        /// `None` requires an absent ref (create).
+        #[serde(default)]
+        expected_prior: Option<CommitRevision>,
     },
     /// Open a change request from `source_branch` into `target_branch`.
     OpenChangeRequest {
@@ -252,6 +266,53 @@ pub enum HostAction {
         marker: String,
         body: String,
     },
+    /// Publish review feedback bound to the head it examined.
+    PublishReviewFeedback {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+        body: String,
+    },
+    /// Post one marked reply on the identified thread, preserving its
+    /// exact thread identity. The persisted tag is the contract
+    /// operation name, matching `HostAction::name()`.
+    #[serde(rename = "thread_reply")]
+    ReplyToThread {
+        change: ChangeRequestRef,
+        thread_id: String,
+        marker: String,
+        body: String,
+    },
+    /// Resolve the identified thread, bound to the head its findings
+    /// were examined at. A reply is not a resolution.
+    ResolveThread {
+        change: ChangeRequestRef,
+        thread_id: String,
+        head: CommitRevision,
+    },
+    /// Mark the change request ready (non-draft), bound to an exact
+    /// head.
+    MarkReady {
+        change: ChangeRequestRef,
+        expected_head: CommitRevision,
+    },
+}
+
+impl HostAction {
+    /// The operation name used for capability/eligibility bookkeeping
+    /// and failure receipts — the contract operation names, stable
+    /// across payload changes.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PushRef { .. } => "push_ref",
+            Self::OpenChangeRequest { .. } => "open_change_request",
+            Self::UpdateChangeRequest { .. } => "update_change_request",
+            Self::PostComment { .. } => "post_comment",
+            Self::PublishReviewFeedback { .. } => "publish_review_feedback",
+            Self::ReplyToThread { .. } => "thread_reply",
+            Self::ResolveThread { .. } => "resolve_thread",
+            Self::MarkReady { .. } => "mark_ready",
+        }
+    }
 }
 
 /// A dispatch deferral: why a queued Execution was not admitted.

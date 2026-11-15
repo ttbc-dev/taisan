@@ -336,16 +336,23 @@ fn insert_intent(
 }
 
 fn push_action() -> HostAction {
+    push_action_with_prior(Some("cccc3333"))
+}
+
+/// `expected_prior` is the remote ref position the intent was recorded
+/// against — the fixture's `prior_ref` default. `None` requires the
+/// ref absent, matching an empty `prior_ref`.
+fn push_action_with_prior(prior: Option<&str>) -> HostAction {
+    let repository = || {
+        RepositoryRef::new(
+            HostInstanceId::trusted("github.test"),
+            RepositoryId::trusted("owner/repo"),
+        )
+    };
     HostAction::PushRef {
         branch: BRANCH.into(),
-        produced: CommitRevision::new(
-            RepositoryRef::new(
-                HostInstanceId::trusted("github.test"),
-                RepositoryId::trusted("owner/repo"),
-            ),
-            "produced-digest",
-        )
-        .unwrap(),
+        produced: CommitRevision::new(repository(), "produced-digest").unwrap(),
+        expected_prior: prior.map(|p| CommitRevision::new(repository(), p).unwrap()),
     }
 }
 
@@ -777,7 +784,7 @@ fn unknown_push_reattempts_when_the_remote_branch_is_absent() {
     let action_id = insert_intent(
         &fx.store(),
         &work_id,
-        push_action(),
+        push_action_with_prior(None),
         HostActionStatus::Unknown {
             reason: "push response lost".into(),
         },

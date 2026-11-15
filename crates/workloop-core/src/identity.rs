@@ -442,6 +442,54 @@ pub struct DiffTarget {
     pub target_revision: Option<CommitRevision>,
 }
 
+/// An immutable diff snapshot: the snapshot is exactly its
+/// `(change, base, head)` triple. The identity is derived on demand
+/// rather than stored, and the fields are private — the record carries
+/// no mutation path, so two reads of the same pair always return the
+/// identical snapshot identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DiffSnapshot {
+    change: ChangeRequestRef,
+    base: CommitRevision,
+    head: CommitRevision,
+}
+
+impl DiffSnapshot {
+    pub fn new(change: ChangeRequestRef, base: CommitRevision, head: CommitRevision) -> Self {
+        Self { change, base, head }
+    }
+
+    pub fn change(&self) -> &ChangeRequestRef {
+        &self.change
+    }
+
+    pub fn base(&self) -> &CommitRevision {
+        &self.base
+    }
+
+    pub fn head(&self) -> &CommitRevision {
+        &self.head
+    }
+
+    /// The snapshot's stable identity: a digest over the exact triple,
+    /// computed from the immutable fields — never a stored, driftable
+    /// value. `display_number` is presentation metadata and takes no
+    /// part in the digest, matching the ref's identity semantics.
+    pub fn snapshot_id(&self) -> String {
+        crate::domain::sha256_hex(
+            "diff-snapshot-v1",
+            &crate::domain::canonical_json(&serde_json::json!({
+                "change": {
+                    "repository": self.change.repository,
+                    "change_request": self.change.change_request,
+                },
+                "base": self.base,
+                "head": self.head,
+            })),
+        )
+    }
+}
+
 /// The immutable snapshot of one source issue's authoritative read,
 /// recorded inside a spec revision. A `source_revision` is a
 /// host-supplied version token or content digest — never a timestamp.

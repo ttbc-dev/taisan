@@ -18,8 +18,11 @@ The suite parameterizes over two axes:
   `Supervisor<CountingPosix>` — an observational decorator that
   delegates spawn, inspect, and signal to `PosixProcessControl` and
   records every spawn call and spawned identity — which in turn spawns
-  the real `workloop-fixture-worker` binary: real process spawn, real
-  signals, real liveness reads. `ScriptedProvider` wraps
+  whichever worker binary the provider is bound to: `WorkerProvider::make`
+  binds the real `workloop-fixture-worker` binary by default, and
+  `PosixProvider::make_bound` binds an arbitrary worker binary (the
+  U4.6b rerun below binds the contract Worker) — real process spawn,
+  real signals, real liveness reads. `ScriptedProvider` wraps
   `Supervisor<ScriptedProcessControl>`, an independently implemented
   in-memory process table that can model start/liveness outcomes no
   argv can produce (a spawn whose identity capture was lost, an
@@ -35,10 +38,12 @@ The suite parameterizes over two axes:
   when the declared surface covers all of them, matching the rule that
   a required capability may be absent from a provider but, once
   declared, may not be weakened. `PosixProvider` does not declare
-  `spawn_unknown`, `liveness_unknown`, or `signal_audit` — a real
-  process cannot fake a lost identity capture or an uninspectable
-  liveness read, and the POSIX port keeps no signal log — so those
-  rows are reported skipped for it and covered by `ScriptedProvider`.
+  `spawn_unknown`, `liveness_unknown`, `signal_survived`, or
+  `signal_audit` — a real process cannot fake a lost identity
+  capture, an uninspectable liveness read, or a writer scripted to
+  survive its signal, and the POSIX port keeps no signal log — so
+  those rows are reported skipped for it and covered by
+  `ScriptedProvider`.
 
 ## Start semantics
 
@@ -84,3 +89,95 @@ The suite parameterizes over two axes:
   retention rule.
 - Skipped rows are reported per provider by the runner, not silently
   absorbed inside a scenario.
+
+## Adapter selection and swap
+
+| Row | Required semantics | Scenario / coverage |
+| --- | --- | --- |
+| WS-20 | A `worker_argv` swap between the reference adapter and the independent contract Worker changes the selection only for requests bound after the swap. Requests and running Invocations bound before the swap keep their recorded adapter ID, version, capability digest, and argv; no running Invocation is migrated. Command admission, queue order, budget and terminal cancel Outcome are identical under either adapter. | `adapter_swap.rs::ws_20_worker_argv_swap_binds_only_new_requests_in_each_direction` (both swap directions, fixture → contract → fixture). |
+| WS-21 | A runtime version that differs from the declaration stored on the request's own binding — the bound argv is probed again at launch — is a configuration repair: no worker start is attempted, the retained evidence records `runtime.version_mismatch`, and the request is terminal for its binding (abandon and re-issue under a new request, which binds the upgraded declaration). It is never a silent runtime upgrade and the stored declaration is never updated in place. | `adapter_swap.rs::ws_21_runtime_version_mismatch_is_configuration_repair_with_no_start` — drifted declaration refuses with no start, then a new request binds `fixture-2.0.0` and starts; unit cases `adapter::tests::a_same_adapter_runtime_change_is_a_configuration_repair`, `mismatch_reasons_name_the_differing_field`, `a_failed_describe_is_not_selectable`, and `a_wedged_describe_is_bounded_and_not_selectable`. |
+
+The durable binding is the request's `adapter_binding`: adapter ID,
+adapter version, runtime version, capability digest, and the exact argv
+selected. The first binding wins (`Effect::BindRequestAdapter` updates
+only an unbound request), so a later configuration edit cannot retarget
+it — and a refused request is terminal for it: the work is re-issued
+under a new request rather than resumed into the same repair.
+`describe` is effect-free but runs through the supervisor's
+process-control port (own process group, bounded wait, group signalled
+on timeout). It is fail-closed: an executable that does not implement
+it, or a probe that is refused, bounded, non-zero, unparseable, or
+missing the adapter identity, makes the adapter not selectable as
+`adapter.declaration_unavailable` — no synthetic declaration is ever
+compared or dispatched on. The capability digest sorts the declared
+protocol, role, and capability lists before hashing, so set-order
+changes do not masquerade as a capability change.
+
+## Shared suite rerun (U4.6b)
+
+`worker_contract.rs::u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality`
+executes the identical scenario table twice through the supervisor and
+the public Command/Query path — once bound to the reference worker,
+once to the independent contract Worker — and retains one
+[U4.6 record](worker-protocol.md#u46-evidence-record) per case per
+implementation, persisted by the run itself to
+`target/u4.6b-records.json` when the checkout yields a faithful
+revision stamp. The records differ only in adapter
+identity: every case's Outcome signature — execution states, waiting
+reasons, terminal codes, invocation states and roles, writer-identity
+presence, intent statuses, and spawn-attempt counts — is equal across
+the two runs, as are the paired records' `tested_revision`,
+`base_revision`, `evidence_refs`, and full `configuration_identity`
+once the bound-worker fields are projected out; the skip partition is
+identical (the POSIX model surface is binary-independent). Revision
+stamping is fail-closed: records are retained only when the run
+stamps a pristine tracked tree with both revisions as full commit ids
+(a CI run stamps the workflow event's real head/base commits — the
+depth-1 checkout keeps no base history to resolve — and a checkout
+with no resolvable base ref cites the deepest commit it retains), so
+no retained record can carry a placeholder or describe an uncommitted
+worktree. A checkout that cannot produce that stamp — uncommitted
+tracked changes, no git history — still runs the identical suite and
+every record-independent assertion, builds no records, and retains
+none, so the prescribed `cargo test --workspace` stays runnable
+mid-edit. `u46b_suite_source_has_no_adapter_name_branch`
+is the named static check: adapter-name literals may appear only
+inside the suite's marked identity boundary and never on a
+conditional, comparison, or assertion line, and the
+identity-revealing identifiers (the binary getters, the selection
+const, the bound-argv construction, the binding fields) appear outside
+that boundary only on branch-free data lines — the boundary holds the
+only identity comparison, so no case branches on which worker is
+bound. The scan is lexical: it catches branches that mention an
+identity token, while branches through renamed aliases remain outside
+what a token scan can see.
+
+## Swap-window recovery (U4.6c)
+
+`swap_recovery.rs` exercises crash, restart and recovery at the
+adapter-selection boundary, reusing the U4.6 record format and the
+fail-closed revision stamping of the rerun above. Three named
+scenarios each retain one [U4.6 record](worker-protocol.md#u46-evidence-record)
+to `target/u4.6c-<scenario>.json` when the checkout yields a faithful
+revision stamp — a dirty or non-git checkout runs every scenario and
+every record-independent assertion, builds no records, and retains
+none, so no retained record can cite a commit that does not contain
+the exercised slice:
+
+| Scenario | What it proves |
+| --- | --- |
+| `u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindings` | WS-20/WS-03: two Invocations are in flight under the prior selection when `worker_argv` changes and the supervisor restarts over the reopened durable store. Each in-flight Invocation reconciles against its recorded adapter ID, version and capability digest — the recorded binding and writer identity are unchanged, the recorded argv still re-verifies `Ready` against a fresh `describe`, and the changed argv selects a configuration repair (`adapter.identity_mismatch`, `capability.digest_mismatch`) for those stored bindings rather than a retarget. Spawn count proves no second writer; only a request created after the change binds the new adapter. The follow-up safe stop records a durable stop intent covering every recorded identity, inspects each stopped, and lands the terminal cancel with no further spawns. |
+| `u46c_interrupted_export_import_recovers_under_changed_config_without_duplicate_artifact_ids` | WS-11: two real fixture writers finish under the prior selection, the configuration changes, and the restarted supervisor walks the [crash-recovery table](worker-protocol.md#crash-recovery) — no export row, truncated bundle, interrupted import with leftover quarantine, `imported` row without a ref, ref present with the row still `imported` — each window recovering to `acknowledged` with exactly one artifact ID (the repository's `refs/taisan/artifacts/` set is asserted after every window and after a final full pass). A second artifact whose workspace was lost before acknowledgement converges on `recovery_exhausted` at exactly the configured bound, never acknowledged and never minting a ref. Recovery under the changed configuration launches no worker. |
+| `u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config` | WS-11/WS-01: a real fixture writer launched under the prior selection finishes in a git workspace and the Execution waits mid-Execution when `worker_argv` changes and the supervisor restarts. The restarted supervisor recollects the artifact to `acknowledged`, records the declared verification `Pass` on the exact handed-off commit, and leaves the workspace `.git`, the managed work branch, and the handoff repository's produced closure intact through the verified handoff — while the request binding never moves. |
+
+Three named checks guard the evidence machinery itself:
+`u46c_revision_stamp_is_fail_closed` (a stamp is either two full
+commit ids over a pristine checkout or no stamp at all — never a
+placeholder), `u46c_retained_record_carries_the_closed_field_set`
+(the record carries exactly the closed U4.6 field set, the closed
+claim class, and every binding field on each adapter-selection entry),
+and `u46c_evidence_record_cites_the_tested_revision` (the evidence
+record names full tested/base commit ids, transcribes every retained
+scenario record under that tested revision, and verifies the cited
+commit contains the exercised suite and is on the branch history to
+`HEAD`).

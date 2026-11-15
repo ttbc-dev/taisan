@@ -180,3 +180,33 @@ fn contract_version_zero_is_refused() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The installation's `worker_isolation_profile` resolves fail-closed
+/// against the approved registry (U2.3): absent names the reference
+/// profile, an approved name resolves, and an unknown name is an error
+/// at this boundary — never a silent downgrade to unprofiled launches.
+#[test]
+fn worker_isolation_profile_is_fail_closed() {
+    let dir = root("install-isolation");
+    let path = dir.join("config.json");
+    let installation = load_or_create(&path).unwrap();
+    let profile = installation.worker_isolation_profile().unwrap();
+    assert_eq!(profile.id, "taisan-reference-v0.1");
+
+    let mut named = installation.clone();
+    named.worker_isolation_profile = Some("fixture-worker-v0.1".into());
+    assert_eq!(
+        named.worker_isolation_profile().unwrap().id,
+        "fixture-worker-v0.1"
+    );
+
+    let mut invalid = installation;
+    invalid.worker_isolation_profile = Some("made-up".into());
+    let err = invalid.worker_isolation_profile().unwrap_err();
+    assert!(
+        err.contains("worker_isolation_profile") && err.contains("not an approved profile"),
+        "expected the registry refusal: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

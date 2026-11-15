@@ -20,8 +20,8 @@ against the real GitHub adapter, not these fixtures.
 | --- | --- | --- | --- |
 | Host IDs | Globally unique change-request IDs (`cr-N`); display numbers per repository | Per-project IID (`!N`) as both identity and display number — the same `!1` on two repositories names different change requests; only the scoped pair is stable | Globally unique change-request IDs; display numbers per repository |
 | Remote head model | Head snapshotted at open; moves only by direct remote edit | Head derived from the source branch — a push to the branch moves the change-request head (`push_to_an_open_merge_requests_source_branch_surfaces_the_new_head`) | Head snapshotted at open |
-| Declared capabilities | Full baseline (10) | Baseline minus `issue_read` (9) — a source-bound Work is rejected `unsupported_capability` | Reads + `push_ref` + `change_request_create` (7) |
-| Effect behavior | Absent source branch yields a synthesized head | Absent source branch is a `failed` receipt (`gitlab_fixture_open_without_source_branch_is_a_failed_receipt`) | Head-bound writes are `failed(unsupported)` receipts |
+| Declared capabilities | Full baseline + discussion/ready writes (14) | Baseline minus `issue_read` (9) — a source-bound Work is rejected `unsupported_capability` | Reads + `push_ref` + `change_request_create` (7) |
+| Effect behavior | Absent source branch yields a synthesized head | Absent source branch is a `failed` receipt (`gitlab_fixture_open_without_source_branch_is_a_failed_receipt`) | Head-bound and discussion writes are `unsupported` receipts |
 | Host binding | Optional per-instance binding (`for_host`) | Always bound to one host instance; drains only its own intents | Single-instance model |
 
 ## Coverage matrix
@@ -45,27 +45,29 @@ and no fixture is substituted. Suite runner: `run_suite` in
 | HC-SCOPE-01 scoped identities | covered | covered — plus `gitlab_fixture_reuses_iid_across_projects_without_aliasing` (real `!1` reuse across projects) | covered | incomplete — spike not run |
 | HC-SWAP-01 binding survives config | covered | covered | covered | incomplete — spike not run |
 | HC-CAP-01 admission gate | covered | covered — plus `gitlab_fixture_undeclared_issue_read_rejects_source_bound_work` | covered | incomplete — spike not run |
-| HC-CAP-02 explicit unsupported | not exercised — implements every declared operation | not exercised — implements every declared operation | covered (`failed` receipts) | incomplete — spike not run |
-| HC-CAP-03 approval/ready explicit | covered — `approval_and_ready_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
+| HC-CAP-02 explicit unsupported | not exercised — implements every declared operation | not exercised — implements every declared operation | covered (`unsupported` receipts) | incomplete — spike not run |
+| HC-CAP-03 decision writes explicit | covered — `decision_writes_stay_explicitly_unsupported` | covered — same fixture-independent, type-level check | covered — same fixture-independent, type-level check | incomplete — spike not run |
 | HC-DELIV-01 duplicate delivery | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-LIFE-01/02 deferred settlement | covered (fixture adapter suite) | not exercised | not exercised — the adapter suite instantiates `FixtureGithub` only | incomplete — spike not run |
 | HC-OPT-01 `approve` | explicit unsupported — `approve_change` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
-| HC-OPT-02 `mark_ready` | explicit unsupported — `mark_ready` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
+| HC-OPT-02 `mark_ready` | covered — `ready_marking_applies_with_fresh_readback` | explicit unsupported — `mark_ready` refused | explicit unsupported — `mark_ready` refused | incomplete — spike not run |
 | HC-OPT-03 `request_changes` | explicit unsupported — `request_changes` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
 | HC-OPT-04 `inline_comment` | explicit unsupported — `post_inline_comment` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
-| HC-OPT-05 `review_feedback` | explicit unsupported — `publish_review_feedback` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
-| HC-OPT-06 `thread_reply` | explicit unsupported — `thread_reply` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
-| HC-OPT-07 `thread_resolve` | explicit unsupported — `resolve_thread` absent from `HostAction` | explicit unsupported — same | explicit unsupported — same | incomplete — spike not run |
+| HC-OPT-05 `review_feedback` | covered — `review_feedback_applies_with_readback` | explicit unsupported — `publish_review_feedback` refused | explicit unsupported — `publish_review_feedback` refused | incomplete — spike not run |
+| HC-OPT-06 `thread_reply` | covered — `thread_reply_applies_with_readback` | explicit unsupported — `thread_reply` refused | explicit unsupported — `thread_reply` refused | incomplete — spike not run |
+| HC-OPT-07 `thread_resolve` | covered — `thread_resolve_applies_with_readback` | explicit unsupported — `resolve_thread` refused | explicit unsupported — `resolve_thread` refused | incomplete — spike not run |
 | HC-READ-01 typed reads | covered — issue read is repository-scoped and revision-bound | explicit unsupported (`issue_read` undeclared) | explicit unsupported (`issue_read` undeclared) | incomplete — spike not run |
 | HC-LIFE-03 rename/actor/restart | partial — restart via durable-store tests; rename and actor change uncovered | partial — same | partial — same | incomplete — spike not run |
 
 HC-CAP-02 measures a fixture's own explicit-unsupported behavior; a
 fixture implementing every declared operation has nothing to exercise
-there, so only `SparseHost` covers the row. HC-CAP-03 is a single
-fixture-independent, type-level check — `approve`/`mark_ready` exist as
-capability names but in no `HostAction` variant or deserialization
-path, so no applied receipt is constructible — one test covers all
-fixtures and any future host implementation.
+there, so only `SparseHost` covers the row — as `unsupported` receipts,
+a class distinct from `failed`. HC-CAP-03 is a single
+fixture-independent, type-level check — `approve`, `request_changes`,
+and `inline_comment` exist as capability names but in no `HostAction`
+variant or deserialization path, so no applied receipt is
+constructible — one test covers all fixtures and any future host
+implementation.
 
 Cross-fixture selection and non-migration under a configuration swap
 are exercised separately by
@@ -123,19 +125,24 @@ constitutes, or may be read as, live evidence.
   actor eligibility, denied-permission injection, and restart
   reconciliation on a real host remain unproven — every live cell in
   the coverage matrix is `incomplete — spike not run`, with this reason.
-- `approve_change` / `mark_ready` / thread operations are absent from
-  the `HostAction` vocabulary — structurally unsupported, not yet
-  implementable (HC-CAP-03, covered by a fixture-independent type-level
-  check on all fixtures).
+- `approve_change` / `request_changes` / `post_inline_comment` are
+  absent from the `HostAction` vocabulary — structurally unsupported,
+  not yet implementable (HC-CAP-03, covered by a fixture-independent
+  type-level check on all fixtures).
 - Issue content reads are typed and covered by fixtures declaring
   `issue_read` (HC-READ-01); comment and thread read-model operations
   are not in the contract vocabulary, so that part of the row remains
   uncovered.
-- The optional-capability rows `HC-OPT-01`, `HC-OPT-02`, `HC-OPT-03`,
-  `HC-OPT-04`, `HC-OPT-05`, `HC-OPT-06` and `HC-OPT-07` record an
-  explicit-unsupported result on every fixture — the capabilities are
-  declarable but the operations are absent from the `HostAction`
-  vocabulary in this contract version.
+- The optional-capability rows `HC-OPT-01`, `HC-OPT-03` and
+  `HC-OPT-04` record an explicit-unsupported result on every fixture —
+  the capabilities are declarable but the operations are absent from
+  the `HostAction` vocabulary in this contract version.
+- The optional-capability rows `HC-OPT-02`, `HC-OPT-05`, `HC-OPT-06`
+  and `HC-OPT-07` are covered only on `FixtureGithub` — `GitlabFixture`
+  and `SparseHost` do not declare `mark_ready`, `review_feedback`,
+  `thread_reply` or `thread_resolve`, so those cells are the
+  declared-set explicit-unsupported outcome and the rows carry no
+  `GitlabFixture`/`SparseHost` coverage.
 - Rename, mid-Work actor change, and cross-instance delivery-ID
   deduplication are unexercised (HC-LIFE-03).
 - `GitlabFixture` models IID scoping and branch-following heads; a real

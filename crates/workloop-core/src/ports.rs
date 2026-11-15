@@ -3,6 +3,7 @@
 //! GitHub-integration port (fixture in `workloop-github`).
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::domain::ProcessIdentity;
 
@@ -61,15 +62,50 @@ pub enum StopReceipt {
     Unknown { reason: String },
 }
 
+/// Result of one bounded effect-free probe (`<worker_argv...> describe`).
+/// The probe is a real supervised process start: it runs in its own
+/// process group like a writer, so the bound covers the whole tree —
+/// a probe that forks a same-group child does not leave an orphan the
+/// stop path cannot reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The probe exited inside the bound; `success` is the exit status
+    /// and `stdout` its captured output.
+    Exited { stdout: Vec<u8>, success: bool },
+    /// The bound elapsed: the probe's process group and leader were
+    /// signalled to stop and the leader was reaped. No partial output
+    /// is trusted.
+    Bounded,
+}
+
+/// The complete environment a spawned worker or probe runs under — an
+/// allowlist constructed by the isolation profile, never the
+/// supervisor's inherited environment. The port applies it verbatim:
+/// a variable not listed here does not exist for the child, so a host
+/// credential (`GH_TOKEN`, `SSH_AUTH_SOCK`, `HOME` pointing at the
+/// owner's home, a git credential helper config) cannot leak in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerEnv {
+    /// The child's whole environment as `name=value` pairs.
+    pub vars: Vec<(String, String)>,
+}
+
 /// How `execution` supervises real worker processes. Implementations must
 /// satisfy the crash rules in `docs/lifecycle.md`: record `pid + start
 /// time`, snapshot write-capable descendants with the stop intent, signal
 /// only re-verified identities, read state not presence, and reap spawned
 /// children.
 pub trait ProcessControlPort {
-    /// Spawn `argv` with `cwd` in its own process group. Returns the
-    /// leader's host-observable identity on success.
-    fn spawn(&self, argv: &[String], cwd: &Path) -> Result<ProcessIdentity, SpawnError>;
+    /// Spawn `argv` with `cwd` in its own process group under `env` — the
+    /// allowlisted environment the isolation profile built; the caller's
+    /// environment is never inherited. Returns the leader's
+    /// host-observable identity on success.
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError>;
 
     /// The leader plus every write-capable descendant, captured while the
     /// leader still exists. After the leader exits, orphans reparent and
@@ -100,4 +136,23 @@ pub trait ProcessControlPort {
     /// Reap a child this supervisor spawned so inspection is not polluted
     /// by zombies. No-op for pids that are not our children.
     fn reap(&self, pid: i32);
+
+    /// Run a bounded effect-free probe (`<worker_argv...> describe`) under
+    /// the same containment contract as a writer: the child starts in its
+    /// own process group, and when `timeout` elapses the whole group plus
+    /// the leader is signalled to stop and the leader reaped — a wedged
+    /// probe can never hold a dispatch pass open or leak a same-group
+    /// child past the bound. The probe runs under `env`, the same
+    /// allowlisted environment a writer launch gets — an untrusted
+    /// adapter binary must not see more during declaration than it does
+    /// during execution. `SpawnError` means no probe ran (`Refused`) or
+    /// its fate is unknown (`Unknown`); a caller must treat either as
+    /// "the adapter did not answer".
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        env: &WorkerEnv,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError>;
 }

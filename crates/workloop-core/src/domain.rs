@@ -533,6 +533,22 @@ pub struct ProcessIdentity {
     pub pgid: Option<i32>,
 }
 
+/// The exact Worker adapter selected for one durable request: the
+/// adapter identity, its version, the capability digest it declared, and
+/// the argv it was selected by. Recorded once before launch so a later
+/// `worker_argv` swap can never migrate this request to another adapter.
+/// The argv is retained because a request that was bound but not yet
+/// spawned must still launch through its recorded selection after a
+/// restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerAdapterBinding {
+    pub adapter: crate::identity::AdapterId,
+    pub adapter_version: String,
+    pub runtime_version: String,
+    pub capability_digest: String,
+    pub argv: Vec<String>,
+}
+
 /// The durable request `execution` consumes; survives a crash between the
 /// `ready` commit and the spawn. The bound spec revision makes the
 /// request replayable against immutable spec history.
@@ -546,6 +562,11 @@ pub struct InvocationRequest {
     /// The spec revision this request was recorded against.
     pub spec_revision: SpecRevision,
     pub payload: serde_json::Value,
+    /// The adapter selection bound before the first launch. `None` until
+    /// the supervisor captures the selection; once set it is immutable
+    /// and is the only selection that may spawn this request.
+    #[serde(default)]
+    pub adapter_binding: Option<WorkerAdapterBinding>,
 }
 
 /// A resource a writer may change.

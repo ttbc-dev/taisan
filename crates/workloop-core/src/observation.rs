@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{EventSequence, ExecutionId, InvocationId, WorkId};
 use crate::identity::{
-    ChangeRequestRef, CommitRevision, DiffTarget, EvidenceRef, HostActorRef, HostCapability,
-    HostInstanceId, IssueRef, RepositoryRef,
+    ChangeRequestRef, CommitRevision, DiffSnapshot, DiffTarget, EvidenceRef, HostActorRef,
+    HostCapability, HostInstanceId, IssueRef, RepositoryRef,
 };
 
 /// Delivery identity for transports that assign one (webhooks, worker
@@ -121,6 +121,15 @@ pub enum ObservationFact {
         complete: bool,
         items: Vec<AssessmentItem>,
     },
+    /// One durable stage-pipeline record. The loop writes an entry record
+    /// when it enters a stage and terminal records as evidence arrives;
+    /// the fact itself never authorizes a transition. Core persists these
+    /// records through its own transaction — `handle_observation` refuses
+    /// a delivered record, since ingest carries no authority to write
+    /// pipeline history.
+    StageEvidence {
+        evidence: crate::stage::StageEvidence,
+    },
     /// The normalized result for a recorded `HostActionIntent`. An
     /// `applied` result must carry at least one normalized effect fact
     /// matching the intent's immutable payload — an unsupported claim
@@ -134,6 +143,97 @@ pub enum ObservationFact {
         status: HostActionStatus,
         effects: Vec<NormalizedEffectFact>,
     },
+    /// One typed host read — the `observe` half of the host port. Binds
+    /// the subject, the exact revision it read, the actor the host
+    /// reports, and the read's completeness. `subject_version` is the
+    /// remote's version of that subject at read time: ordering is by
+    /// recorded revision, never delivery order, so a delayed older read
+    /// is retained as history and can never move the recorded revision
+    /// backward.
+    HostRead {
+        subject: ReadSubject,
+        /// `None` when the read could not produce its required revision
+        /// form — paired with `Partial`/`Unavailable` completeness and
+        /// never treated as current.
+        revision: Option<ReadRevision>,
+        subject_version: u64,
+        actor: HostActorRef,
+        completeness: Completeness,
+    },
+}
+
+/// A typed host read subject: the variant names the subject kind, the
+/// fields carry the scoped subject identity. Ordering and equality are
+/// over the full identity — the same display number or branch name on
+/// another repository is a different subject.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadSubject {
+    /// The repository itself: its recorded default-branch head.
+    Repository { repository: RepositoryRef },
+    /// One allowlisted issue's authoritative content read.
+    Issue { issue: IssueRef },
+    /// A change request's head-bound read.
+    Pr { change: ChangeRequestRef },
+    /// A branch/ref head inside one repository.
+    Head {
+        repository: RepositoryRef,
+        branch: String,
+    },
+    /// An immutable diff snapshot for one `(base, head)` pair — each
+    /// distinct pair is a distinct subject, so a snapshot is never
+    /// revised in place.
+    Diff { snapshot: DiffSnapshot },
+    /// One named check on one change request.
+    Check {
+        change: ChangeRequestRef,
+        check: String,
+    },
+    /// A change request's review stream.
+    Review { change: ChangeRequestRef },
+}
+
+impl ReadSubject {
+    /// A deterministic scoped key for adapter-side bookkeeping (remote
+    /// version maps, delivery identities). Repository-scoped identities
+    /// stay scoped — display metadata takes no part in it.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Repository { repository } => format!("repo:{repository}"),
+            Self::Issue { issue } => format!("issue:{issue}"),
+            Self::Pr { change } => format!("pr:{change}"),
+            Self::Head { repository, branch } => format!("head:{repository}:{branch}"),
+            Self::Diff { snapshot } => format!("diff:{}", snapshot.snapshot_id()),
+            Self::Check { change, check } => format!("check:{change}:{check}"),
+            Self::Review { change } => format!("review:{change}"),
+        }
+    }
+}
+
+/// The per-kind revision a host read observed. The form is fixed by the
+/// subject kind; a read that cannot produce its required form records a
+/// partial completeness instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadRevision {
+    /// `repository` (default-branch head), `head` (branch head) and
+    /// `pr` (change head): the exact commit revision observed.
+    Sha { revision: CommitRevision },
+    /// `issue`: the host's content revision token plus content digest.
+    Issue {
+        source_revision: String,
+        content_digest: String,
+    },
+    /// `check`: the check-run identity plus the exact head it examined.
+    Check {
+        check_run_id: String,
+        head: CommitRevision,
+    },
+    /// `review`: the newest review identity the stream reports.
+    Review { review_id: String },
+    /// `diff`: the immutable snapshot identity of the `(base, head)`
+    /// pair read.
+    DiffSnapshot { snapshot_id: String },
 }
 
 /// One reported capability: support is adapter capability,
@@ -273,6 +373,12 @@ pub enum HostActionStatus {
     Failed {
         reason: String,
     },
+    /// The host's capability map does not contain the operation:
+    /// terminal and explicit, never a permission verdict, and never
+    /// retried as a transport failure.
+    Unsupported {
+        reason: String,
+    },
     /// The action's effect cannot be determined; never treated as
     /// success and never silently re-attempted.
     Unknown {
@@ -325,14 +431,38 @@ pub enum NormalizedEffectFact {
         body_digest: String,
         target: Option<DiffTarget>,
     },
+    ReviewPublished {
+        change: ChangeRequestRef,
+        review_id: String,
+        head: CommitRevision,
+        body_digest: String,
+    },
+    ReplyPosted {
+        change: ChangeRequestRef,
+        thread_id: String,
+        reply_id: String,
+        marker: String,
+        body_digest: String,
+    },
+    /// `target` echoes the diff target the write was bound to;
+    /// `observed` is the head a fresh read reports after the write, and
+    /// `relation` records how it relates to `target.head` — a racing
+    /// actor may move the change across the write/read gap.
     ThreadResolved {
         change: ChangeRequestRef,
         thread_id: String,
         target: DiffTarget,
+        observed: CommitRevision,
+        relation: RefRelation,
     },
+    /// `head` echoes the head the write was bound to; `observed` is the
+    /// head a fresh read reports after the write, and `relation`
+    /// records how it relates to `head`.
     ReadyObserved {
         change: ChangeRequestRef,
         head: CommitRevision,
+        observed: CommitRevision,
+        relation: RefRelation,
     },
 }
 

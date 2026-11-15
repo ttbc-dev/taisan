@@ -79,6 +79,10 @@ fn action_capability(action: &HostAction) -> HostCapability {
         HostAction::OpenChangeRequest { .. } => HostCapability::ChangeRequestCreate,
         HostAction::UpdateChangeRequest { .. } => HostCapability::ChangeRequestUpdate,
         HostAction::PostComment { .. } => HostCapability::CommentWrite,
+        HostAction::PublishReviewFeedback { .. } => HostCapability::ReviewFeedback,
+        HostAction::ReplyToThread { .. } => HostCapability::ThreadReply,
+        HostAction::ResolveThread { .. } => HostCapability::ThreadResolve,
+        HostAction::MarkReady { .. } => HostCapability::MarkReady,
     }
 }
 
@@ -2153,6 +2157,13 @@ pub fn admit_queued_role(
         role: role.clone(),
         spec_revision: work.spec,
         payload: serde_json::to_value(&execution.input).unwrap_or_default(),
+        // Created unbound: the adapter binding is recorded later from a
+        // live `describe` declaration — either by the Phase-2
+        // dispatch-admission probe, which binds unbound pending
+        // requests to the current worker in a transaction following
+        // the admission scan, or by `execution` immediately before the
+        // first launch. It is never inferred from configuration.
+        adapter_binding: None,
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
@@ -2353,6 +2364,15 @@ pub fn handle_observation(
     obs: &Observation,
     now_unix_seconds: i64,
 ) -> Result<IngestReceipt, StoreError> {
+    // Stage records are authored by Core inside its own transaction; the
+    // ingest path — adapters, bridges, probes — carries no authority to
+    // write pipeline history, so a delivered `StageEvidence` fact is
+    // refused before it can enter the durable log.
+    if matches!(obs.fact, ObservationFact::StageEvidence { .. }) {
+        return Ok(IngestReceipt::Rejected(
+            "stage evidence is Core-authored; ingest cannot write pipeline records".into(),
+        ));
+    }
     store
         .transact(|tx| {
             tx.apply(&Effect::InsertObservation {
@@ -2532,29 +2552,67 @@ fn assess(
             if matches!(status, HostActionStatus::Failed { .. })
                 && execution.state == ExecutionState::Waiting
             {
-                // A definite no-effect failure is safe to retry, bounded
-                // by the Work's transport account.
-                let work = tx
-                    .work(&execution.work_id)?
-                    .ok_or_else(|| StoreError::Internal {
-                        detail: "execution without work".into(),
-                    })?;
-                let mut usage = tx
-                    .work_usage(&execution.work_id)?
-                    .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
-                usage.transport_retries_used += 1;
-                let over = usage.transport_retries_used > work.policy.transport_max_retries;
-                tx.apply(&Effect::UpdateWorkUsage { usage })?;
-                if over {
+                if let HostActionStatus::Failed { reason } = status
+                    && is_authorization_verdict(reason)
+                {
+                    // An authorization/eligibility verdict is terminal
+                    // for the intent: retrying cannot change the
+                    // outcome, so it never consumes the transport
+                    // account or re-issues. The verdict itself pauses
+                    // for an operator decision instead of degrading to
+                    // a generic transport exhaustion.
                     pause_for_repair(
                         tx,
                         &execution,
-                        "transport_exhausted",
-                        "transport retry bound reached; human action required",
+                        "effect_authorization_denied",
+                        "the stage effect was denied or the actor was ineligible; \
+                         human action required",
                         vec![RepairPrerequisite::OperatorDecision],
                         now_unix_seconds,
                     )?;
+                } else {
+                    // A definite no-effect failure is safe to retry,
+                    // bounded by the Work's transport account.
+                    let work =
+                        tx.work(&execution.work_id)?
+                            .ok_or_else(|| StoreError::Internal {
+                                detail: "execution without work".into(),
+                            })?;
+                    let mut usage = tx
+                        .work_usage(&execution.work_id)?
+                        .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+                    usage.transport_retries_used += 1;
+                    let over = usage.transport_retries_used > work.policy.transport_max_retries;
+                    tx.apply(&Effect::UpdateWorkUsage { usage })?;
+                    if over {
+                        pause_for_repair(
+                            tx,
+                            &execution,
+                            "transport_exhausted",
+                            "transport retry bound reached; human action required",
+                            vec![RepairPrerequisite::OperatorDecision],
+                            now_unix_seconds,
+                        )?;
+                    }
                 }
+            }
+            if matches!(status, HostActionStatus::Unsupported { .. })
+                && execution.state == ExecutionState::Waiting
+            {
+                // The operation is outside the host's capability map:
+                // terminal and explicit, never a transport failure and
+                // never retried. Pause for an operator decision instead
+                // of wedging on an effect that can never land or
+                // re-issuing the intent without bound.
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "unsupported_effect",
+                    "the stage effect is outside the host's capability map; \
+                     human action required",
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
             }
             // A terminal settle that deferred on this outstanding effect
             // may complete now — but only when every writer is already
@@ -2648,17 +2706,17 @@ fn reconcile_intent(
         return Ok(());
     };
     // Terminal reconciliation sticks: a late receipt cannot resurrect a
-    // failed intent or downgrade an applied one — with one drift
-    // exception. An `applied` intent whose remote fact later diverges
-    // is re-armable: an `unknown` receipt re-opens reconciliation, but
-    // only when authenticated by the intent's bound actor *and* the
-    // receipt's effects carry the drift fact itself. A stale or
-    // out-of-order transport-`unknown` without drift evidence is not a
-    // re-arm — it would demote a settled intent behind a receipt that
-    // proves nothing about the remote. An unauthenticated or unbound
-    // receipt is invalid evidence and can never re-open a reconciled
-    // intent. `unknown` stays reconcilable — a later receipt for the
-    // same action_id is what resolves it.
+    // failed or unsupported intent or downgrade an applied one — with
+    // one drift exception. An `applied` intent whose remote fact later
+    // diverges is re-armable: an `unknown` receipt re-opens
+    // reconciliation, but only when authenticated by the intent's bound
+    // actor *and* the receipt's effects carry the drift fact itself. A
+    // stale or out-of-order transport-`unknown` without drift evidence
+    // is not a re-arm — it would demote a settled intent behind a
+    // receipt that proves nothing about the remote. An unauthenticated
+    // or unbound receipt is invalid evidence and can never re-open a
+    // reconciled intent. `unknown` stays reconcilable — a later
+    // receipt for the same action_id is what resolves it.
     if intent.status == HostActionStatus::Applied {
         let drift_rearm = matches!(status, HostActionStatus::Unknown { .. })
             && authenticated_actor.as_ref() == Some(&intent.actor)
@@ -2673,8 +2731,28 @@ fn reconcile_intent(
             effects,
         });
     }
-    if matches!(intent.status, HostActionStatus::Failed { .. }) {
+    if matches!(
+        intent.status,
+        HostActionStatus::Failed { .. } | HostActionStatus::Unsupported { .. }
+    ) {
         return Ok(());
+    }
+    // A receipt authenticated as a different actor than the binding
+    // authorized is invalid evidence — whatever status it claims, it
+    // settles nothing. The intent stays outstanding as
+    // `unknown{actor_mismatch}`, never `applied` and never `failed`.
+    if authenticated_actor
+        .as_ref()
+        .is_some_and(|a| a != &intent.actor)
+    {
+        return tx.apply(&Effect::UpdateHostActionIntent {
+            action_id: action_id.to_string(),
+            status: HostActionStatus::Unknown {
+                reason: "actor_mismatch".into(),
+            },
+            authenticated_actor,
+            effects,
+        });
     }
     let recorded = match status {
         HostActionStatus::Applied if effect_matches(&intent, &effects) => HostActionStatus::Applied,
@@ -2682,19 +2760,6 @@ fn reconcile_intent(
             reason: "applied claim carried no matching effect fact".into(),
         },
         other => other,
-    };
-    // A receipt authenticated as a different actor than the binding
-    // authorized is invalid evidence — record it as unknown.
-    let recorded = if recorded == HostActionStatus::Applied
-        && authenticated_actor
-            .as_ref()
-            .is_some_and(|a| a != &intent.actor)
-    {
-        HostActionStatus::Unknown {
-            reason: "receipt authenticated a different actor than the binding".into(),
-        }
-    } else {
-        recorded
     };
     tx.apply(&Effect::UpdateHostActionIntent {
         action_id: action_id.to_string(),
@@ -2710,7 +2775,10 @@ fn reconcile_intent(
 /// other action an `unknown` receipt against an `applied` intent is a
 /// stale or out-of-order transport record, never re-arm evidence.
 fn is_drift_evidence(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -> bool {
-    let HostAction::PushRef { branch, produced } = &intent.action else {
+    let HostAction::PushRef {
+        branch, produced, ..
+    } = &intent.action
+    else {
         return false;
     };
     effects.iter().any(|e| {
@@ -2798,8 +2866,77 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
                 && comment_marker == marker
                 && target.as_ref().is_none_or(|t| &t.head == expected_head)
         }
+        (
+            HostAction::PublishReviewFeedback { change, head, .. },
+            NormalizedEffectFact::ReviewPublished {
+                change: reviewed,
+                head: reviewed_head,
+                ..
+            },
+        ) => reviewed == change && reviewed_head == head,
+        (
+            HostAction::ReplyToThread {
+                change,
+                thread_id,
+                marker,
+                ..
+            },
+            NormalizedEffectFact::ReplyPosted {
+                change: replied,
+                thread_id: replied_thread,
+                marker: reply_marker,
+                ..
+            },
+        ) => replied == change && replied_thread == thread_id && reply_marker == marker,
+        (
+            HostAction::ResolveThread {
+                change,
+                thread_id,
+                head,
+            },
+            NormalizedEffectFact::ThreadResolved {
+                change: resolved,
+                thread_id: resolved_thread,
+                target,
+                observed,
+                relation,
+            },
+        ) => {
+            resolved == change
+                && resolved_thread == thread_id
+                && &target.head == head
+                && observed.repository == head.repository
+                && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
+        }
+        (
+            HostAction::MarkReady {
+                change,
+                expected_head,
+            },
+            NormalizedEffectFact::ReadyObserved {
+                change: readied,
+                head,
+                observed,
+                relation,
+            },
+        ) => {
+            readied == change
+                && head == expected_head
+                && observed.repository == expected_head.repository
+                && matches!(relation, RefRelation::Equal | RefRelation::Ancestor)
+        }
         _ => false,
     })
+}
+
+/// Whether a failed host-action receipt reports an authorization or
+/// eligibility verdict — `denied` when the actor lacks the grant,
+/// `ineligible` when the actor's class cannot perform the operation.
+/// These are terminal for the intent and never transport failures:
+/// a retry cannot change the verdict, so it must not consume the
+/// transport retry account or re-issue the intent.
+fn is_authorization_verdict(reason: &str) -> bool {
+    reason == "denied" || reason == "ineligible"
 }
 
 /// Whether the fact marks material progress (a valid artifact, a
@@ -3417,22 +3554,101 @@ fn maybe_publish(
         // when spent). Pending/unknown pushes are already caught by the
         // outstanding check above; an applied push for a stale produced
         // revision is exactly the republish case — fall through and
-        // record a fresh intent.
+        // record a fresh intent. An unsupported push is terminal: its
+        // receipt pauses the execution for an operator decision, and the
+        // intent is never re-issued.
         if let Some(latest_push) = work_intents
             .iter()
             .rfind(|i| matches!(i.action, HostAction::PushRef { .. }))
-            && let HostActionStatus::Failed { .. } = latest_push.status
         {
-            let usage = tx
-                .work_usage(&work.id)?
-                .unwrap_or_else(|| WorkUsage::new(&work.id));
-            if usage.transport_retries_used > work.policy.transport_max_retries {
-                return Ok(());
+            match &latest_push.status {
+                HostActionStatus::Failed { reason } => {
+                    // An authorization/eligibility verdict is terminal:
+                    // its receipt already paused for an operator
+                    // decision, and a re-issued push would be refused
+                    // the same way.
+                    if is_authorization_verdict(reason) {
+                        return Ok(());
+                    }
+                    let usage = tx
+                        .work_usage(&work.id)?
+                        .unwrap_or_else(|| WorkUsage::new(&work.id));
+                    if usage.transport_retries_used > work.policy.transport_max_retries {
+                        return Ok(());
+                    }
+                }
+                HostActionStatus::Unsupported { .. } => return Ok(()),
+                _ => {}
             }
         }
         let produced =
             CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
+        // The guard's expected prior is the freshest remote position
+        // this installation observed for the branch, ordered by
+        // (observed_unix_seconds, index) — the same ordering
+        // `current_target` applies to the same facts. A delayed older
+        // `BranchState` delivered after a newer applied read-back never
+        // moves the position backward; an explicit absent re-arms
+        // create, and a first publish expects an absent ref.
+        enum BranchPosition {
+            Unknown,
+            Absent,
+            At(CommitRevision),
+        }
+        let applied_pushes: std::collections::BTreeSet<&str> = work_intents
+            .iter()
+            .filter(|i| i.status == HostActionStatus::Applied)
+            .map(|i| i.action_id.as_str())
+            .collect();
+        let mut latest: Option<(i64, usize, BranchPosition)> = None;
+        for (index, o) in tx.observations_for_work(&work.id)?.iter().enumerate() {
+            let candidate = match &o.fact {
+                ObservationFact::BranchState {
+                    repository,
+                    branch: state_branch,
+                    state,
+                } if state_branch == &branch && repository == &work.binding.repository => {
+                    Some(match state {
+                        BranchState::At { revision } => BranchPosition::At(revision.clone()),
+                        BranchState::Absent => BranchPosition::Absent,
+                    })
+                }
+                ObservationFact::HostActionResult {
+                    action_id,
+                    status: HostActionStatus::Applied,
+                    effects,
+                    ..
+                } if applied_pushes.contains(action_id.as_str()) => effects.iter().find_map(|e| {
+                    if let NormalizedEffectFact::RefPublished {
+                        repository,
+                        branch: ref_branch,
+                        observed,
+                        ..
+                    } = e
+                        && ref_branch == &branch
+                        && repository == &work.binding.repository
+                    {
+                        Some(BranchPosition::At(observed.clone()))
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(candidate) = candidate
+                && latest
+                    .as_ref()
+                    .is_none_or(|(t, i, _)| (*t, *i) < (o.observed_unix_seconds, index))
+            {
+                latest = Some((o.observed_unix_seconds, index, candidate));
+            }
+        }
+        let position = latest.map(|(_, _, p)| p).unwrap_or(BranchPosition::Unknown);
+        let expected_prior = match position {
+            BranchPosition::At(revision) => Some(revision),
+            BranchPosition::Absent | BranchPosition::Unknown => None,
+        };
         return record_intent(
             tx,
             &work,
@@ -3440,6 +3656,7 @@ fn maybe_publish(
             HostAction::PushRef {
                 branch: branch.clone(),
                 produced,
+                expected_prior,
             },
             execution,
         );
@@ -3454,9 +3671,20 @@ fn maybe_publish(
     }
     if work_intents.iter().any(|i| {
         matches!(i.action, HostAction::OpenChangeRequest { .. })
-            && !matches!(i.status, HostActionStatus::Failed { .. })
+            && !matches!(
+                i.status,
+                HostActionStatus::Failed { .. } | HostActionStatus::Unsupported { .. }
+            )
     }) {
         // A pending/unknown open intent is outstanding; wait for its receipt.
+        return Ok(());
+    }
+    if work_intents.iter().any(|i| {
+        matches!(i.action, HostAction::OpenChangeRequest { .. })
+            && matches!(i.status, HostActionStatus::Unsupported { .. })
+    }) {
+        // An unsupported open is terminal — its receipt pauses the
+        // execution for an operator decision; never re-issue it.
         return Ok(());
     }
     let spec = tx

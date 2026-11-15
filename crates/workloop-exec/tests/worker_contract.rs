@@ -9,12 +9,16 @@
 //! - `PosixProvider`: `Supervisor<CountingPosix>` — an observational
 //!   decorator that delegates spawn/inspect/signal to
 //!   `PosixProcessControl` and records every spawn call and spawned
-//!   identity — spawning the real `workloop-fixture-worker` binary —
+//!   identity — spawning whichever worker binary it is bound to —
 //!   real spawn, real signals.
 //! - `ScriptedProvider`: `Supervisor<ScriptedProcessControl>`, an
 //!   independently implemented in-memory port that models spawn
 //!   outcomes no argv can produce (lost/unknown starts, uninspectable
 //!   liveness).
+//!
+//! The U4.6b rerun at the bottom of this file executes the identical
+//! suite twice — once per bound worker adapter — and retains one U4.6
+//! record per case per implementation.
 //!
 //! Scenario assertions bind the durable store plus facts observable at
 //! the port boundary — spawn count, delivered signals, recorded writer
@@ -31,7 +35,9 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
-use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError};
+use workloop_core::ports::{
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation, sweep,
@@ -49,13 +55,6 @@ fn host() -> HostInstanceId {
 
 fn repo() -> RepositoryRef {
     RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
-}
-
-fn fixture_bin() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/workloop-fixture-worker")
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn tmp_root(tag: &str) -> PathBuf {
@@ -318,18 +317,32 @@ trait WorkerProvider {
 /// unknown attempts included — and records the identities the real port
 /// produced, so a scenario can assert both no second attempt and no
 /// second writer. It delegates every call to `PosixProcessControl` —
-/// spawn, inspect, and signal semantics are the real port's.
+/// spawn, inspect, and signal semantics are the real port's. The
+/// `fail_next` toggle injects a refusal at the spawn call itself: the
+/// describe probe still answers, so the scenario models a start attempt
+/// that fails after admission, not an adapter that cannot declare.
 struct CountingPosix {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
+    fail_next: Rc<Cell<bool>>,
 }
 
 impl ProcessControlPort for CountingPosix {
-    fn spawn(&self, argv: &[String], cwd: &std::path::Path) -> Result<ProcessIdentity, SpawnError> {
+    fn spawn(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &WorkerEnv,
+    ) -> Result<ProcessIdentity, SpawnError> {
         // Count the attempt before delegating: the counter observes
         // start calls, not only the ones that produced a writer.
         self.calls.set(self.calls.get() + 1);
-        let out = PosixProcessControl.spawn(argv, cwd);
+        if self.fail_next.replace(false) {
+            return Err(SpawnError::Refused {
+                reason: "adapter declined the request".into(),
+            });
+        }
+        let out = PosixProcessControl.spawn(argv, cwd, env);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
         }
@@ -353,12 +366,52 @@ impl ProcessControlPort for CountingPosix {
     fn reap(&self, pid: i32) {
         PosixProcessControl.reap(pid)
     }
+    fn run_probe(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &WorkerEnv,
+        timeout: Duration,
+    ) -> Result<ProbeOutcome, SpawnError> {
+        PosixProcessControl.run_probe(argv, cwd, env, timeout)
+    }
 }
 
 struct PosixProvider {
     sup: Supervisor<CountingPosix>,
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
+    fail_next: Rc<Cell<bool>>,
+}
+
+impl PosixProvider {
+    /// A Posix provider bound to one worker binary — the only variable
+    /// the recorded U4.6b rerun changes between implementations.
+    fn make_bound(shape: WorkerShape, tag: &str, config: &WorkloopConfig, bin: &str) -> Self {
+        let spawned = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let fail_next = Rc::new(Cell::new(false));
+        let mode = match shape {
+            WorkerShape::CleanExit => "clean-exit",
+            WorkerShape::NoArtifact => "exit-no-artifact",
+            WorkerShape::Resident => "hang",
+        };
+        PosixProvider {
+            sup: Supervisor::new(
+                CountingPosix {
+                    spawned: spawned.clone(),
+                    calls: calls.clone(),
+                    fail_next: fail_next.clone(),
+                },
+                tmp_root(tag),
+                vec![bin.to_string(), mode.into()],
+                config.clone(),
+            ),
+            spawned,
+            calls,
+            fail_next,
+        }
+    }
 }
 
 impl WorkerProvider for PosixProvider {
@@ -376,26 +429,7 @@ impl WorkerProvider for PosixProvider {
         ]
     }
     fn make(shape: WorkerShape, tag: &str, config: &WorkloopConfig) -> Self {
-        let spawned = Rc::new(RefCell::new(Vec::new()));
-        let calls = Rc::new(Cell::new(0));
-        let mode = match shape {
-            WorkerShape::CleanExit => vec![fixture_bin(), "clean-exit".into()],
-            WorkerShape::NoArtifact => vec![fixture_bin(), "exit-no-artifact".into()],
-            WorkerShape::Resident => vec![fixture_bin(), "hang".into()],
-        };
-        PosixProvider {
-            sup: Supervisor::new(
-                CountingPosix {
-                    spawned: spawned.clone(),
-                    calls: calls.clone(),
-                },
-                tmp_root(tag),
-                mode,
-                config.clone(),
-            ),
-            spawned,
-            calls,
-        }
+        Self::make_bound(shape, tag, config, &fixture_bin())
     }
     fn handle(&mut self) -> &mut dyn WorkerHandle {
         self
@@ -423,7 +457,7 @@ impl WorkerHandle for PosixProvider {
     fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
         self.sup
             .port
-            .spawn(&self.sup.worker_argv.clone(), cwd)
+            .spawn(&self.sup.worker_argv.clone(), cwd, &WorkerEnv::default())
             .expect("direct spawn")
     }
     fn writer_alive(&self) -> bool {
@@ -442,10 +476,11 @@ impl WorkerHandle for PosixProvider {
     }
     fn fail_next_spawn(&mut self, f: SpawnFail) {
         match f {
-            // A spawn that can never produce a process: the binary does
-            // not exist, so `spawn` returns Refused before any child.
+            // The describe probe still answers; the start attempt after
+            // admission is refused — the same refusal class Scripted
+            // injects on its spawn plan.
             SpawnFail::Refused => {
-                self.sup.worker_argv = vec!["/nonexistent/workloop-worker".into()];
+                self.fail_next.set(true);
             }
             SpawnFail::Unknown => {
                 unreachable!("PosixProvider does not declare spawn_unknown")
@@ -554,7 +589,7 @@ impl WorkerHandle for ScriptedProvider {
     }
     fn spawn_direct(&mut self, cwd: &std::path::Path) -> ProcessIdentity {
         self.port
-            .spawn(&["scripted".into()], cwd)
+            .spawn(&["scripted".into()], cwd, &WorkerEnv::default())
             .expect("direct spawn")
     }
     fn writer_alive(&self) -> bool {
@@ -1219,3 +1254,619 @@ fn scripted_provider_runs_the_same_suite() {
     assert!(skipped.is_empty());
     assert_eq!(covered.len(), scenarios().len(), "{covered:?}");
 }
+
+// ---- the recorded rerun (U4.6b) ---------------------------------------
+
+/// The adapter-neutral outcome a covered case leaves behind: durable
+/// store facts plus the port-boundary spawn count. Two implementations
+/// must produce identical signatures; only adapter identity differs.
+#[derive(Debug, PartialEq)]
+struct CaseSignature {
+    executions: Vec<String>,
+    invocations: Vec<String>,
+    intent_statuses: Vec<String>,
+    spawn_calls: usize,
+}
+
+/// The adapter selection a covered case's durable request recorded —
+/// the `configuration_identity` half of the U4.6 record. It is absent
+/// for cases that never consume their request.
+#[derive(Debug)]
+struct RecordedBinding {
+    request_id: String,
+    adapter_id: String,
+    adapter_version: String,
+    runtime_version: String,
+    capability_digest: String,
+    argv: Vec<String>,
+}
+
+/// One case row of a recorded run: the U4.6 record plus the typed
+/// pieces the comparison asserts on. The record is `None` when the
+/// run could not stamp a faithful revision — no stamp, no record.
+struct CaseRow {
+    id: &'static str,
+    result: String,
+    missing: Vec<&'static str>,
+    signature: Option<CaseSignature>,
+    bindings: Vec<RecordedBinding>,
+    record: Option<serde_json::Value>,
+}
+
+/// Read back the adapter-neutral Outcome signature and the recorded
+/// adapter bindings a finished scenario left in the store.
+fn collect_case(
+    store: &SqliteStore,
+    provider: &PosixProvider,
+) -> (CaseSignature, Vec<RecordedBinding>) {
+    let (mut executions, mut invocations, intents, bindings) = store
+        .transact(|tx| {
+            let mut executions = Vec::new();
+            let mut invocations = Vec::new();
+            let mut bindings = Vec::new();
+            for work in tx.works()? {
+                for e in tx.executions_for_work(&work.id)? {
+                    executions.push(format!(
+                        "state={:?} waiting={:?} terminal={:?} invocations_used={}",
+                        e.state, e.waiting_reason, e.terminal_code, e.invocations_used
+                    ));
+                    for i in tx.invocations_for_execution(&e.id)? {
+                        invocations.push(format!(
+                            "state={:?} role={:?} writer_identity={}",
+                            i.state,
+                            i.role,
+                            i.process_identity.is_some()
+                        ));
+                    }
+                    if let Some(req) = tx.request(&format!("{}:inv:0", e.id.0))?
+                        && let Some(b) = req.adapter_binding
+                    {
+                        bindings.push(RecordedBinding {
+                            request_id: req.request_id.clone(),
+                            adapter_id: b.adapter.as_str().to_string(),
+                            adapter_version: b.adapter_version,
+                            runtime_version: b.runtime_version,
+                            capability_digest: b.capability_digest,
+                            argv: b.argv,
+                        });
+                    }
+                }
+            }
+            let mut intents: Vec<String> = tx
+                .action_intents()?
+                .iter()
+                .map(|i| format!("{:?}", i.status))
+                .collect();
+            intents.sort();
+            Ok((executions, invocations, intents, bindings))
+        })
+        .unwrap();
+    executions.sort();
+    invocations.sort();
+    (
+        CaseSignature {
+            executions,
+            invocations,
+            intent_statuses: intents,
+            spawn_calls: provider.spawns(),
+        },
+        bindings,
+    )
+}
+
+/// The signature facts a retained record cites as evidence.
+fn signature_refs(sig: &CaseSignature) -> Vec<String> {
+    let mut refs: Vec<String> = sig
+        .executions
+        .iter()
+        .map(|e| format!("execution {e}"))
+        .chain(sig.invocations.iter().map(|i| format!("invocation {i}")))
+        .chain(sig.intent_statuses.iter().map(|s| format!("intent {s}")))
+        .collect();
+    refs.push(format!("spawn_attempts={}", sig.spawn_calls));
+    refs
+}
+
+/// One git query whose trimmed stdout. `None` on any failure — the
+/// revision stamping below never substitutes a placeholder for it.
+fn git_stdout(argv: &[&str]) -> Option<String> {
+    std::process::Command::new("git")
+        .args(argv)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A required revision field must be a full commit id: `unknown`, a
+/// truncated id, or any non-hex output fails the recorded run instead
+/// of being stamped into a record.
+fn assert_commit_id(sha: &str, what: &str) {
+    assert_eq!(sha.len(), 40, "{what} must be a full commit id: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "{what} must be a hex commit id: {sha}"
+    );
+}
+
+/// Whether a cited commit could describe this checkout: no tracked
+/// file differs from `HEAD`. A git failure — no repository, an
+/// unreadable status — answers `false` rather than panicking, so the
+/// question itself never fails a run: the answer only decides whether
+/// the run may stamp and retain records.
+fn tracked_tree_is_pristine() -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The base fork point of a normal checkout: the first merge-base
+/// against a base branch this clone keeps. A checkout that retains no
+/// base history at all — a depth-1 clone or a detached source tree —
+/// cites the deepest commit it does retain, the only fork point it
+/// can prove, rather than a placeholder. A checkout that retains no
+/// commit history at all (a non-git source tree) yields `None`: the
+/// run then retains no records instead of stamping a guess.
+fn base_revision() -> Option<String> {
+    for revs in [
+        ["merge-base", "HEAD", "origin/main"],
+        ["merge-base", "HEAD", "main"],
+        ["merge-base", "HEAD", "origin/HEAD"],
+    ] {
+        if let Some(sha) = git_stdout(&revs) {
+            return Some(sha);
+        }
+    }
+    git_stdout(&["rev-list", "--max-parents=0", "HEAD"])
+        .and_then(|roots| roots.lines().next().map(str::to_string))
+}
+
+/// The revision pair a CI run stamps, read from the workflow event
+/// payload: the Actions checkout is depth-1, so the clone keeps no
+/// reachable base history for a merge-base or a merge ref's parents
+/// to resolve, but the payload records the real commits — a
+/// pull_request run cites `head.sha` (the source-branch commit, not
+/// the synthetic merge ref) and `base.sha` (the base tip it merges
+/// onto); a push run cites `GITHUB_SHA` and `before`. `None` outside
+/// Actions or when the payload carries neither pair.
+fn ci_event_revisions() -> Option<(String, String)> {
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+        return None;
+    }
+    let event: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?,
+    )
+    .ok()?;
+    if let Some(pr) = event.get("pull_request") {
+        return Some((
+            pr.get("head")?.get("sha")?.as_str()?.to_string(),
+            pr.get("base")?.get("sha")?.as_str()?.to_string(),
+        ));
+    }
+    Some((
+        std::env::var("GITHUB_SHA").ok()?,
+        event.get("before")?.as_str()?.to_string(),
+    ))
+}
+
+/// The revision pair a recorded run stamps, validated fail-closed —
+/// `None` whenever no trustworthy stamp exists: a tracked tree that
+/// differs from `HEAD`, a checkout git cannot answer, or a missing
+/// base ref. A run without a stamp still executes the suite and every
+/// record-independent assertion, but it builds and retains no
+/// records: a retained record must cite a commit that describes the
+/// exercised tree, so an unstamped run degrades to *no evidence*
+/// rather than to a placeholder. Where a stamp exists: a CI run cites
+/// the workflow event's real head/base commits (its depth-1 checkout
+/// keeps no base history to resolve, but the payload records the
+/// real commits), a normal checkout stamps `HEAD` and its merge-base,
+/// and a checkout with no resolvable base ref cites the deepest
+/// commit it retains. Either way both values are asserted to be full
+/// commit ids over a pristine tracked tree.
+fn record_revisions() -> Option<(String, String)> {
+    if !tracked_tree_is_pristine() {
+        return None;
+    }
+    let (tested, base) = match ci_event_revisions() {
+        Some(pair) => pair,
+        None => (git_stdout(&["rev-parse", "HEAD"])?, base_revision()?),
+    };
+    assert_commit_id(&tested, "tested_revision");
+    assert_commit_id(&base, "base_revision");
+    Some((tested, base))
+}
+
+/// A retained record in the U4.6 evidence format — the closed field
+/// set of `docs/worker-protocol.md#u46-evidence-record`.
+fn case_record(
+    id: &str,
+    result: &str,
+    tested: &str,
+    base: &str,
+    bindings: &[RecordedBinding],
+    evidence_refs: Vec<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "tested_revision": tested,
+        "base_revision": base,
+        "claim_class": "fixture_supported",
+        "configuration_identity": {
+            "installation": {
+                "host_instance": "test-host",
+                "repository": "local-repo",
+                "adapter": "worker-contract",
+                "contract_version": 1,
+            },
+            "adapter_selection": bindings.iter().map(|b| serde_json::json!({
+                "adapter_id": b.adapter_id,
+                "adapter_version": b.adapter_version,
+                "runtime_version": b.runtime_version,
+                "capability_digest": b.capability_digest,
+                "argv": b.argv,
+                "request_id": b.request_id,
+            })).collect::<Vec<_>>(),
+        },
+        "command_scenario": format!("worker_contract::{id}"),
+        "result": result,
+        "evidence_refs": evidence_refs,
+    })
+}
+
+/// The record with the bound-worker identity fields removed from every
+/// adapter selection entry: paired records must be equal after this
+/// projection — "differ only in adapter identity" asserted as whole-record
+/// equality rather than a field-by-field spot check. The request id and
+/// the installation identity are kept, so they are compared too.
+fn record_without_adapter_fields(record: &serde_json::Value) -> serde_json::Value {
+    let mut out = record.clone();
+    let Some(selection) = out
+        .get_mut("configuration_identity")
+        .and_then(|c| c.get_mut("adapter_selection"))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return out;
+    };
+    for entry in selection {
+        if let Some(obj) = entry.as_object_mut() {
+            for field in [
+                "adapter_id",
+                "adapter_version",
+                "runtime_version",
+                "capability_digest",
+                "argv",
+            ] {
+                obj.remove(field);
+            }
+        }
+    }
+    out
+}
+
+/// Run the identical suite against one bound worker binary, retaining
+/// one U4.6-format record per case when the checkout yields a faithful
+/// revision stamp. The only variable between two calls is `bin` — the
+/// adapter selection the supervisor binds.
+fn run_recorded_suite(tag: &str, bin: &str) -> Vec<CaseRow> {
+    let declared: BTreeSet<&'static str> = PosixProvider::declares().iter().copied().collect();
+    let stamp = record_revisions();
+    scenarios()
+        .iter()
+        .enumerate()
+        .map(|(i, scenario)| {
+            let missing: Vec<&'static str> = scenario
+                .requires
+                .iter()
+                .copied()
+                .filter(|r| !declared.contains(r))
+                .collect();
+            if !missing.is_empty() {
+                return CaseRow {
+                    id: scenario.id,
+                    result: "skipped".into(),
+                    missing: missing.clone(),
+                    signature: None,
+                    bindings: vec![],
+                    record: stamp.as_ref().map(|(tested, base)| {
+                        case_record(
+                            scenario.id,
+                            "skipped",
+                            tested,
+                            base,
+                            &[],
+                            vec![format!(
+                                "provider model surface does not declare: {}",
+                                missing.join(", ")
+                            )],
+                        )
+                    }),
+                };
+            }
+            let store = SqliteStore::in_memory(2).unwrap();
+            let cfg = (scenario.config)();
+            let mut provider =
+                PosixProvider::make_bound(scenario.shape, &format!("{tag}-{i}"), &cfg, bin);
+            (scenario.run)(provider.handle(), &store);
+            let (signature, bindings) = collect_case(&store, &provider);
+            let record = stamp.as_ref().map(|(tested, base)| {
+                case_record(
+                    scenario.id,
+                    "pass",
+                    tested,
+                    base,
+                    &bindings,
+                    signature_refs(&signature),
+                )
+            });
+            CaseRow {
+                id: scenario.id,
+                result: "pass".into(),
+                missing: vec![],
+                signature: Some(signature),
+                bindings,
+                record,
+            }
+        })
+        .collect()
+}
+
+/// U4.6b named run: the identical suite executes twice through the
+/// supervisor and the public Command/Query path — once with the
+/// reference worker bound, once with the independent contract Worker —
+/// and produces per-case records that differ only in adapter identity:
+/// every other record field, including the full configuration identity
+/// modulo the bound-worker fields, is asserted equal. The twenty
+/// records are persisted under `target/` so the retained evidence can
+/// be re-derived from the run itself — but only when the checkout
+/// yields a faithful revision stamp: a dirty or non-git checkout runs
+/// the identical suite and every record-independent assertion below,
+/// builds no records, and retains none, so the prescribed
+/// `cargo test --workspace` stays runnable mid-edit without ever
+/// misstamping evidence.
+#[test]
+fn u46b_identical_suite_under_either_adapter_has_per_case_outcome_equality() {
+    let reference = run_recorded_suite("u46b-a", &fixture_bin());
+    let rerun = run_recorded_suite("u46b-b", &contract_bin());
+    let reference_records: Option<Vec<&serde_json::Value>> =
+        reference.iter().map(|r| r.record.as_ref()).collect();
+    let rerun_records: Option<Vec<&serde_json::Value>> =
+        rerun.iter().map(|r| r.record.as_ref()).collect();
+    match (reference_records, rerun_records) {
+        (Some(reference_records), Some(rerun_records)) => {
+            let retained = serde_json::json!({
+                "reference": reference_records,
+                "rerun": rerun_records,
+            });
+            let records =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/u4.6b-records.json");
+            std::fs::write(
+                &records,
+                format!("{}\n", serde_json::to_string_pretty(&retained).unwrap()),
+            )
+            .unwrap_or_else(|e| panic!("retain the U4.6 record set at {}: {e}", records.display()));
+        }
+        (None, None) => {
+            eprintln!(
+                "u4.6b: no faithful revision stamp (dirty or non-git checkout) — \
+                 the suite ran; no records were retained"
+            );
+        }
+        _ => panic!("record retention differs across the two runs"),
+    }
+    assert_eq!(reference.len(), rerun.len(), "the identical case table");
+    for (a, b) in reference.iter().zip(&rerun) {
+        assert_eq!(a.id, b.id, "the identical suite table");
+        assert_eq!(a.result, b.result, "{}: same result", a.id);
+        assert_eq!(a.missing, b.missing, "{}: same skip surface", a.id);
+        assert_eq!(
+            a.signature, b.signature,
+            "{}: identical Outcome under either adapter",
+            a.id
+        );
+        match (&a.record, &b.record) {
+            (Some(ra), Some(rb)) => {
+                for key in [
+                    "schema_version",
+                    "tested_revision",
+                    "base_revision",
+                    "claim_class",
+                    "configuration_identity",
+                    "command_scenario",
+                    "result",
+                    "evidence_refs",
+                ] {
+                    assert!(
+                        ra.get(key).is_some() && rb.get(key).is_some(),
+                        "{}: the record carries {key}",
+                        a.id
+                    );
+                }
+                assert_eq!(ra["claim_class"], "fixture_supported");
+                // Paired records are equal field by field — revisions, claim
+                // class, scenario, result, evidence — and the whole
+                // configuration identity too, once the bound-worker fields are
+                // projected out: adapter identity is the only difference.
+                for key in [
+                    "schema_version",
+                    "tested_revision",
+                    "base_revision",
+                    "claim_class",
+                    "command_scenario",
+                    "result",
+                    "evidence_refs",
+                ] {
+                    assert_eq!(
+                        ra[key], rb[key],
+                        "{}: record field {key} equal across runs",
+                        a.id
+                    );
+                }
+                assert_eq!(
+                    record_without_adapter_fields(ra),
+                    record_without_adapter_fields(rb),
+                    "{}: configuration identity equal modulo adapter identity",
+                    a.id
+                );
+            }
+            (None, None) => {
+                // No faithful stamp on either side: neither run built a
+                // record, so the record fields above have nothing to
+                // compare. The case-table, result, skip-surface and
+                // signature equality above still ran unconditionally.
+            }
+            _ => panic!("{}: record retention differs across runs", a.id),
+        }
+        match (&a.bindings[..], &b.bindings[..]) {
+            ([x], [y]) => assert_bound_adapters_differ(x, y, a.id),
+            ([], []) => {}
+            _ => panic!("{}: binding presence differs across runs", a.id),
+        }
+    }
+    assert!(
+        reference
+            .iter()
+            .zip(&rerun)
+            .any(|(a, b)| matches!((&a.bindings[..], &b.bindings[..]), ([_], [_]))),
+        "at least one case bound an adapter in both runs — the \
+         adapter difference is exercised, not vacuous"
+    );
+}
+
+/// U4.6b static check: no line branches on which worker is bound.
+/// Adapter-name literals may appear only inside the marked boundary
+/// below and never on a conditional, comparison, or assertion line.
+/// The identity-revealing identifiers — the binary getters, the
+/// boundary list, the bound construction, the binding fields, the
+/// supervisor's bound argv — appear outside the boundary only on
+/// branch-free data lines, so every identity comparison lives in the
+/// boundary itself. No case may branch on which worker is bound.
+#[test]
+fn u46b_suite_source_has_no_adapter_name_branch() {
+    const BEGIN: &str = "// ---- adapter identity boundary";
+    const END: &str = "// ---- end adapter identity boundary";
+    const BRANCH_TOKENS: &[&str] = &[
+        "if ",
+        "if(",
+        "match ",
+        "matches!",
+        "==",
+        "!=",
+        "=>",
+        "assert",
+        ".contains(",
+        "starts_with(",
+        "ends_with(",
+    ];
+    /// Beyond the adapter-name literals (scanned via
+    /// `SUITE_ADAPTER_NAMES`), these identifiers expose which worker is
+    /// bound — a branch on any of them decides adapter identity even
+    /// without naming an adapter.
+    const IDENTITY_TOKENS: &[&str] = &[
+        "fixture_bin",
+        "contract_bin",
+        "SUITE_ADAPTER_NAMES",
+        "make_bound",
+        "adapter_id",
+        "adapter_version",
+        "runtime_version",
+        "capability_digest",
+        "argv",
+        "worker_argv",
+    ];
+    let lines: Vec<&str> = include_str!("worker_contract.rs").lines().collect();
+    let markers = |marker: &str| {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with(marker))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    };
+    let begins = markers(BEGIN);
+    let ends = markers(END);
+    assert_eq!(begins.len(), 1, "exactly one boundary-begin marker");
+    assert_eq!(ends.len(), 1, "exactly one boundary-end marker");
+    let (begin, end) = (begins[0], ends[0]);
+    assert!(begin < end, "the boundary opens before it closes");
+    for (n, line) in lines.iter().enumerate() {
+        let inside_boundary = n > begin && n < end;
+        let branches = BRANCH_TOKENS.iter().any(|t| line.contains(t));
+        for name in SUITE_ADAPTER_NAMES {
+            if line.contains(name) {
+                assert!(
+                    inside_boundary,
+                    "adapter name outside the identity boundary (line {}): {line}",
+                    n + 1
+                );
+                assert!(
+                    !branches,
+                    "adapter-name conditional (line {}): {line}",
+                    n + 1
+                );
+            }
+        }
+        if !inside_boundary {
+            for token in IDENTITY_TOKENS {
+                if line.contains(token) {
+                    assert!(
+                        !branches,
+                        "adapter-identity branch outside the identity boundary (line {}): {line}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---- adapter identity boundary (U4.6b) ---------------------------------
+// The only place worker adapter identities live: the binaries the suite
+// binds, the name list the static check scans for, and the one
+// comparison of bound identities. Adapter names stay plain data even
+// here; outside this boundary no line may branch on an identity field.
+
+/// Adapter identities the suite may be bound to — the set the static
+/// check scans the whole file for.
+const SUITE_ADAPTER_NAMES: &[&str] = &["workloop-fixture-worker", "workloop-contract-worker"];
+
+/// The one designated comparison of bound adapter identities — the
+/// non-vacuity proof the named equality run delegates to this
+/// boundary, so no case outside it branches on which worker is bound.
+fn assert_bound_adapters_differ(x: &RecordedBinding, y: &RecordedBinding, id: &str) {
+    assert_ne!(
+        x.adapter_id, y.adapter_id,
+        "{id}: the bound adapter is the only variable that changed"
+    );
+    assert!(
+        SUITE_ADAPTER_NAMES.contains(&x.adapter_id.as_str()),
+        "{id}: reference adapter in the declared set"
+    );
+    assert!(
+        SUITE_ADAPTER_NAMES.contains(&y.adapter_id.as_str()),
+        "{id}: bound adapter in the declared set"
+    );
+}
+
+/// The reference worker binary — the suite's baseline implementation.
+fn fixture_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-worker")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The independent deterministic contract Worker binary.
+fn contract_bin() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-contract-worker")
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ---- end adapter identity boundary --------------------------------------

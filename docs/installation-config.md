@@ -70,6 +70,7 @@ credential_ref = "env:TAISAN_GH_TOKEN"
 
 [worker]
 argv = ["taisan-worker-shim", "--runtime", "claude-code-cli"]
+isolation_profile = "taisan-reference-v0.1"  # approved isolation profile; unknown names refuse at load
 runtime_version = ">=2.0.0"           # pinned to declared range, verified at preflight
 model = "claude-sonnet-4-6"           # pinned at load; re-checked after dispatch
 max_turns = 200

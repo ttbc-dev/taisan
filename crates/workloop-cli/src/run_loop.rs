@@ -25,14 +25,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
-use workloop_core::domain::WorkId;
+use workloop_core::domain::{ExecutionId, ExecutionState, WorkId};
 use workloop_core::identity::AdapterId;
+use workloop_core::observation::HostActionStatus;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
-use workloop_core::store::Store;
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
+use workloop_exec::adapter;
+use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::{SweepParams, SweepReport};
@@ -313,13 +316,139 @@ pub fn run_pass(
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
     // one store transaction and isolates each admission in its own
     // attempt savepoint, with deadline and scope supplied as facts).
+    // When the scan leaves unbound pending requests, the worker
+    // declaration is probed per distinct request workspace — the same
+    // cwd the consume-time re-verification uses, so a recorded binding
+    // always re-verifies at launch — and each in-scope unbound request
+    // records its binding in a following transaction. The same gate the
+    // consume path applies holds here: a request whose Execution can no
+    // longer launch is never probed at all. An idle pass probes
+    // nothing: no unbound request means no spawned worker. A probe that
+    // does not answer leaves the requests unbound; the supervisor's
+    // fail-closed selection handles them at consume.
     if gated!(1) {
         let store = pass.store;
         let config = pass.config;
-        let result =
-            store.transact(|tx| dispatch_scan(tx, config, &mut *clock, Some(deadline), scope));
+        let result = store.transact(|tx| {
+            let scan = dispatch_scan(tx, config, &mut *clock, Some(deadline), scope)?;
+            // The binding pass stays inside the pass scope: a scoped
+            // `--work` run never writes another Work's requests, and a
+            // request whose Execution is not Ready — paused, stopping,
+            // cancelled — is never probed since it can never launch.
+            let mut unbound = Vec::new();
+            for request in tx.pending_requests()? {
+                if request.adapter_binding.is_some()
+                    || !scope.is_none_or(|w| request.work_id == *w)
+                    || tx.execution(&request.execution_id)?.map(|e| e.state)
+                        != Some(ExecutionState::Ready)
+                {
+                    continue;
+                }
+                unbound.push(request);
+            }
+            Ok((scan, unbound))
+        });
+        let result = result.and_then(|(scan, unbound)| {
+            let mut binding_cut = false;
+            if let Some(supervisor) = pass.supervisor
+                && !unbound.is_empty()
+            {
+                let mut by_workspace: std::collections::BTreeMap<
+                    PathBuf,
+                    Vec<(String, ExecutionId)>,
+                > = std::collections::BTreeMap::new();
+                for request in &unbound {
+                    by_workspace
+                        .entry(supervisor.workspace_of(&request.work_id))
+                        .or_default()
+                        .push((request.request_id.clone(), request.execution_id.clone()));
+                }
+                for (workspace, request_ids) in by_workspace {
+                    // Each probe spawns a bounded `describe`, so like
+                    // every other item loop the tick deadline is
+                    // checked before starting new work — a cut leaves
+                    // the remaining requests unbound and durable; the
+                    // consume path's fail-closed selection binds them.
+                    if clock() >= deadline {
+                        binding_cut = true;
+                        break;
+                    }
+                    // The dispatch-transaction Ready read is stale by
+                    // now: a lease-free command (e.g. cancel) can move
+                    // an Execution between it and this probe. Re-read
+                    // before spawning — a request whose Execution can
+                    // no longer launch is never probed at all.
+                    let still_ready = store.transact(|tx| {
+                        let mut ready = Vec::new();
+                        for (request_id, execution_id) in &request_ids {
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                ready.push((request_id.clone(), execution_id.clone()));
+                            }
+                        }
+                        Ok(ready)
+                    })?;
+                    if still_ready.is_empty() {
+                        continue;
+                    }
+                    // The probe spawns inside the workspace the consume
+                    // path would create before launch; a fresh Work's
+                    // `ws-<work>` does not exist yet, so it is created
+                    // here first — a refused creation fails the phase
+                    // instead of silently skipping the binding.
+                    std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
+                        detail: format!("create workspace {}: {e}", workspace.display()),
+                    })?;
+                    // The probe runs under the profile's environment —
+                    // a prep failure skips the binding exactly like an
+                    // unanswered describe: the consume path's
+                    // fail-closed selection refuses the launch. The
+                    // shared prebind scratch is reclaimed as soon as
+                    // the probe process is gone, so a fixed key never
+                    // accumulates storage between passes.
+                    let prebind_scratch =
+                        isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind");
+                    let Ok(env) =
+                        isolation::prepare(&supervisor.isolation_profile, &prebind_scratch)
+                    else {
+                        continue;
+                    };
+                    let declared = adapter::observe_worker_declaration(
+                        &supervisor.port,
+                        &supervisor.worker_argv,
+                        &workspace,
+                        &env,
+                    );
+                    isolation::release(&prebind_scratch);
+                    let Ok(declaration) = declared else {
+                        continue;
+                    };
+                    let binding = declaration.binding(&supervisor.worker_argv);
+                    store.transact(|tx| {
+                        for (request_id, execution_id) in &still_ready {
+                            // The same gate once more inside the commit:
+                            // an Execution stopped between the pre-probe
+                            // read and this transaction is not bound.
+                            if tx
+                                .execution(execution_id)?
+                                .is_some_and(|e| e.state == ExecutionState::Ready)
+                            {
+                                tx.apply(&Effect::BindRequestAdapter {
+                                    request_id: request_id.clone(),
+                                    binding: binding.clone(),
+                                })?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            Ok((scan, binding_cut))
+        });
         push!(match result {
-            Ok(scan) => {
+            Ok((scan, binding_cut)) => {
                 let mut p = PhaseReport::completed(PHASES[1]);
                 p.processed = scan.admitted.len();
                 p.deferred = scan
@@ -327,6 +456,9 @@ pub fn run_pass(
                     .into_iter()
                     .map(|e| e.0)
                     .collect::<Vec<_>>();
+                if binding_cut {
+                    p.reason = Some("tick.deadline".into());
+                }
                 p
             }
             Err(e) => PhaseReport::failed(PHASES[1], e),
@@ -375,27 +507,84 @@ pub fn run_pass(
     // Phase 4 — host outbox (≤ 8 attempts per tick, then report the
     // untouched remainder; the tick deadline is checked before every
     // new item, so a late pass defers the drain instead of writing
-    // past the deadline).
+    // past the deadline). A read-only reconcile pass runs first so a
+    // receipt lost mid-flight settles from the remote's observed
+    // state before any new attempt — never by replaying the write.
     if gated!(3) {
         if !in_process_fixture {
             push!(PhaseReport::skipped(PHASES[3], "external_adapter"));
         } else {
-            let result = pass.host.apply_outbox_bounded(
-                pass.store,
-                pass.config,
-                clock,
-                Some(deadline),
-                scope,
-                OUTBOX_ITEMS_PER_TICK,
-            );
+            let result = pass
+                .host
+                .reconcile_outbox_bounded(
+                    pass.store,
+                    pass.config,
+                    clock,
+                    Some(deadline),
+                    scope,
+                    OUTBOX_ITEMS_PER_TICK,
+                )
+                .and_then(|reconciled| {
+                    pass.host
+                        .apply_outbox_bounded(
+                            pass.store,
+                            pass.config,
+                            clock,
+                            Some(deadline),
+                            scope,
+                            OUTBOX_ITEMS_PER_TICK,
+                        )
+                        .map(|applied| (reconciled, applied))
+                })
+                .and_then(|(reconciled, r)| {
+                    // The phase reports every item left untouched for
+                    // the next pass: the reconcile pass's unread
+                    // remainder joins the write drain's unattempted
+                    // remainder (the drain only reports `pending`
+                    // intents, so an `unknown` the read never reached
+                    // would otherwise vanish), deduplicated, and an
+                    // item the drain settled in between is dropped —
+                    // it is no longer untouched.
+                    let mut deferred = reconciled.deferred.clone();
+                    for id in &r.deferred {
+                        if !deferred.contains(id) {
+                            deferred.push(id.clone());
+                        }
+                    }
+                    if !deferred.is_empty() {
+                        let outstanding: std::collections::HashSet<String> =
+                            pass.store.transact(|tx| {
+                                Ok(tx
+                                    .action_intents()?
+                                    .into_iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.status,
+                                            HostActionStatus::Pending
+                                                | HostActionStatus::Unknown { .. }
+                                        )
+                                    })
+                                    .map(|i| i.action_id)
+                                    .collect())
+                            })?;
+                        deferred.retain(|id| outstanding.contains(id));
+                    }
+                    Ok((reconciled, r, deferred))
+                });
             push!(match result {
-                Ok(r) => {
+                Ok((reconciled, r, deferred)) => {
                     let mut p = PhaseReport::completed(PHASES[3]);
-                    p.processed = r.attempted;
-                    p.deferred = r.deferred;
+                    p.processed = reconciled.examined + r.attempted;
+                    p.deferred = deferred;
                     p.reason = Some(format!(
-                        "applied={} failed={} unknown={}",
-                        r.applied, r.failed, r.unknown
+                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={}",
+                        reconciled.applied,
+                        reconciled.failed,
+                        reconciled.still_unknown,
+                        r.applied,
+                        r.failed,
+                        r.unknown,
+                        r.unsupported
                     ));
                     p
                 }
@@ -1170,6 +1359,208 @@ mod tests {
             "later gated phases defer; sweep and Attention still run: {:?}",
             report.phases
         );
+    }
+
+    fn insert_outbox_intent(
+        store: &SqliteStore,
+        work_id: &WorkId,
+        action: HostAction,
+        status: HostActionStatus,
+    ) -> String {
+        let cfg = config();
+        store
+            .transact(|tx| {
+                let action_id = tx.alloc_id("act")?;
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
+                        action_id: action_id.clone(),
+                        work_id: work_id.clone(),
+                        host: cfg.host.repository.host.clone(),
+                        repository: cfg.host.repository.clone(),
+                        role: ActorRole::Publication,
+                        actor: cfg.host.actors[0].actor.clone(),
+                        action,
+                        payload_digest: "digest".into(),
+                        status,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
+                    },
+                })?;
+                Ok(action_id)
+            })
+            .unwrap()
+    }
+
+    fn push_intent(branch: &str, produced: &str) -> HostAction {
+        HostAction::PushRef {
+            branch: branch.into(),
+            produced: CommitRevision::new(config().host.repository.clone(), produced).unwrap(),
+            expected_prior: None,
+        }
+    }
+
+    /// The reconcile pass's untouched remainder reaches the phase
+    /// report: when the tick deadline stops the read-only pass before
+    /// it examines an outstanding `unknown` intent, the write drain —
+    /// which only ever reports `pending` intents — cannot surface it,
+    /// so the phase's deferred list must carry it for the next pass.
+    #[test]
+    fn the_outbox_phase_reports_the_reconcile_remand_at_the_tick_deadline() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-remand");
+        let unknown_id = insert_outbox_intent(&store, &w, push_intent("work/unread", "head-1"), {
+            HostActionStatus::Unknown {
+                reason: "response lost".into(),
+            }
+        });
+        let settings = settings();
+        // Same budget as the write-drain deadline test: calls 1-7
+        // (pass start, the phase gates, refresh, dispatch) stay inside
+        // the budget, so the deadline trips where the reconcile item
+        // loop first consults it — before any intent is examined.
+        let mut calls = 0u32;
+        let report = run(&store, &settings, None, &mut || {
+            calls += 1;
+            if calls <= 7 { NOW } else { NOW + TICK as i64 }
+        });
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.phase, "host_outbox");
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed, 0,
+            "the deadline stops the read before its first item"
+        );
+        assert_eq!(
+            outbox.deferred,
+            vec![unknown_id.clone()],
+            "the reconcile pass's unread remainder is reported for the next pass"
+        );
+        assert!(report.deadline_exceeded);
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(intents[0].status, HostActionStatus::Unknown { .. }),
+            "the unread intent stays outstanding: {:?}",
+            intents[0].status
+        );
+    }
+
+    /// The reconcile pass's per-tick item bound stops the read before
+    /// every outstanding intent: the `unknown` remainder the write
+    /// drain cannot report (it drains `pending` only) must still reach
+    /// the phase's deferred list, while the examined intents settle
+    /// from the read alone.
+    #[test]
+    fn the_outbox_phase_reports_unknown_intents_past_the_reconcile_bound() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-bound");
+        let mut ids = Vec::new();
+        for n in 0..=OUTBOX_ITEMS_PER_TICK {
+            ids.push(insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/bound-{n}"), "head-1"),
+                HostActionStatus::Unknown {
+                    reason: "response lost".into(),
+                },
+            ));
+        }
+        let settings = settings();
+        let report = run(&store, &settings, None, &mut || NOW);
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.phase, "host_outbox");
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed, OUTBOX_ITEMS_PER_TICK,
+            "the bound stops the read at eight items"
+        );
+        assert_eq!(
+            outbox.deferred,
+            vec![ids[OUTBOX_ITEMS_PER_TICK].clone()],
+            "the unexamined unknown intent is reported for the next pass"
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(intents.len(), OUTBOX_ITEMS_PER_TICK + 1);
+        let failed = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Failed { .. }))
+            .count();
+        assert_eq!(
+            failed, OUTBOX_ITEMS_PER_TICK,
+            "the examined intents settled failed on definitive absence"
+        );
+        let outstanding: Vec<&str> = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Unknown { .. }))
+            .map(|i| i.action_id.as_str())
+            .collect();
+        assert_eq!(
+            outstanding,
+            vec![ids[OUTBOX_ITEMS_PER_TICK].as_str()],
+            "only the unexamined intent stays unknown"
+        );
+    }
+
+    /// The merged remainder never reports an item the same pass
+    /// already settled: eight unread `unknown` intents exhaust the
+    /// reconcile bound and defer two `pending` pushes the write drain
+    /// then lands — nothing is untouched, so the phase reports nothing
+    /// deferred.
+    #[test]
+    fn the_outbox_phase_drops_from_the_remand_what_the_drain_settled() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-reconcile-merged");
+        for n in 0..OUTBOX_ITEMS_PER_TICK {
+            insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/unread-{n}"), "head-1"),
+                HostActionStatus::Unknown {
+                    reason: "response lost".into(),
+                },
+            );
+        }
+        let mut pending_ids = Vec::new();
+        for n in 0..2 {
+            pending_ids.push(insert_outbox_intent(
+                &store,
+                &w,
+                push_intent(&format!("work/pending-{n}"), "head-2"),
+                HostActionStatus::Pending,
+            ));
+        }
+        let settings = settings();
+        let report = run(&store, &settings, None, &mut || NOW);
+        let outbox = &report.phases[3];
+        assert_eq!(outbox.status, "completed");
+        assert_eq!(
+            outbox.processed,
+            OUTBOX_ITEMS_PER_TICK + 2,
+            "eight reads plus two writes"
+        );
+        assert!(
+            outbox.deferred.is_empty(),
+            "every item was handled this pass: {:?}",
+            outbox.deferred
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        let applied: Vec<&str> = intents
+            .iter()
+            .filter(|i| i.status == HostActionStatus::Applied)
+            .map(|i| i.action_id.as_str())
+            .collect();
+        assert_eq!(
+            applied,
+            pending_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the deferred-then-reached pending pushes were settled by the drain"
+        );
+        let failed = intents
+            .iter()
+            .filter(|i| matches!(i.status, HostActionStatus::Failed { .. }))
+            .count();
+        assert_eq!(failed, OUTBOX_ITEMS_PER_TICK);
     }
 
     #[test]
