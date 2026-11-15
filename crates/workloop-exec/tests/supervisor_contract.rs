@@ -788,14 +788,19 @@ fn exited_writer_on_a_ready_execution_enters_reconciliation() {
         });
     assert!(exited, "the proven exit is recorded as evidence");
     let e = execution(&store, &eid);
-    assert_eq!(e.state, ExecutionState::Waiting);
-    assert_eq!(
-        e.waiting_reason,
-        Some(WaitingReason::HostWrite),
-        "artifact evidence queued the publish intent"
+    // Reconciliation resolves straight into the next step: the
+    // invariant lane is enabled, so the publish gate re-requests the
+    // pre-publication check under the same Execution and reservation
+    // (`waiting → ready`) before any host-write intent exists.
+    assert_eq!(e.state, ExecutionState::Ready);
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(pending.len(), 1, "exactly the check request is pending");
+    assert_eq!(pending[0].role, InvocationRole::InvariantCheck);
+    assert!(
+        store.transact(|tx| tx.action_intents()).unwrap().is_empty(),
+        "publication waits for the check's own Invocation evidence"
     );
-    assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
-    port.reap(identity.pid);
+    let _ = port.reap(identity.pid);
 }
 
 #[test]
@@ -913,7 +918,9 @@ fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             SignalOutcome::Sent
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -1039,7 +1046,9 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             SignalOutcome::Sent
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -1172,7 +1181,9 @@ fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             SignalOutcome::Sent
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -1508,6 +1519,159 @@ fn clean_exit_records_artifact_and_publish_intent() {
     assert_eq!(intents.len(), 1);
 }
 
+/// S-3a (#149): pre-publication invariant conformance is its own
+/// durable Invocation — a separate `invariant_check` record with its
+/// own id, request, lifecycle, and receipts — admitted `waiting →
+/// ready` under the same Execution reservation after the producing
+/// Invocation completes, and publication waits for its `Done` record.
+/// The check is read-only: it declares no required artifacts.
+#[test]
+fn invariant_check_runs_as_its_own_invocation_before_publication() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("invcheck");
+    let (_w, eid) = submit_and_admit(&store, "k-ic1");
+    let sup = supervisor("clean-exit", root);
+    for _ in 0..60 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting && e.waiting_reason == Some(WaitingReason::HostWrite)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "publication proceeded only after the check completed"
+    );
+    let invocations = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap();
+    assert_eq!(invocations.len(), 2, "coding plus the check Invocation");
+    let coding = &invocations[0];
+    let check = &invocations[1];
+    assert_eq!(coding.role, InvocationRole::Coding);
+    assert_eq!(check.role, InvocationRole::InvariantCheck);
+    assert_ne!(coding.id, check.id, "distinct invocation_id");
+    assert_ne!(
+        coding.request_id, check.request_id,
+        "distinct durable request"
+    );
+    assert_eq!(check.state, InvocationState::Done);
+    assert!(
+        check.required_artifacts.is_empty(),
+        "the read-only check declares no workspace artifact"
+    );
+    assert!(
+        check.process_identity.is_some(),
+        "the check carries its own process receipts"
+    );
+    // The publish intent exists only because the check completed: the
+    // outbox holds exactly the one publication write.
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    assert_eq!(intents.len(), 1);
+    assert!(matches!(intents[0].action, HostAction::PushRef { .. }));
+}
+
+/// S-3a (#149) review fix: the invariant check never launches in the
+/// producing workspace. It runs against a per-Invocation snapshot copy,
+/// so a check leg that writes can never mutate the state the producing
+/// Invocation's artifact evidence describes. The worker below appends
+/// its cwd to `whoami.txt` on every launch: one line proves only the
+/// coding Invocation ran in `ws-<work>`; a second would mean the check
+/// leg reached the producing workspace.
+#[test]
+fn invariant_check_runs_against_a_snapshot_never_the_producing_workspace() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("invcheck-snap");
+    let script = root.join("cwd-writer.sh");
+    // `describe` is delegated to the fixture worker so the adapter
+    // declaration the probe records is the same one every other
+    // contract test binds; every other launch records its cwd.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"describe\" ]; then\n    exec \"{}\" describe\nfi\nprintf '%s\\n' \"$PWD\" >> whoami.txt\nprintf '{{\"status\":\"done\"}}\\n' > artifact.json\n",
+            fixture_bin()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (work, eid) = submit_and_admit(&store, "k-ic-snap");
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.clone(),
+        vec![script.to_string_lossy().into_owned()],
+        config(),
+    );
+    for _ in 0..60 {
+        sup.run_once(&store, NOW).unwrap();
+        let e = execution(&store, &eid);
+        if e.state == ExecutionState::Waiting && e.waiting_reason == Some(WaitingReason::HostWrite)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = execution(&store, &eid);
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "publication proceeded only after the check completed"
+    );
+    let invocations = store
+        .transact(|tx| tx.invocations_for_execution(&eid))
+        .unwrap();
+    assert_eq!(invocations.len(), 2, "coding plus the check Invocation");
+    let check = &invocations[1];
+    assert_eq!(check.role, InvocationRole::InvariantCheck);
+    // The durable export names the snapshot workspace — never the
+    // producing one the artifact digest was recorded against.
+    let export = store
+        .transact(|tx| {
+            tx.worker_request_export(&workloop_core::worker::export_request_id(&check.id))
+        })
+        .unwrap()
+        .expect("the check's durable export");
+    let ws = root.join(format!("ws-{}", work.0));
+    assert_ne!(
+        export.workspace_root,
+        ws.to_string_lossy(),
+        "the check never exports the producing workspace"
+    );
+    assert!(
+        export.workspace_root.contains(".isolation"),
+        "the check export names its snapshot workspace: {}",
+        export.workspace_root
+    );
+    // Exactly one launch wrote into the producing workspace — the
+    // coding Invocation's. The check's own write landed in the
+    // snapshot copy and was reclaimed with the Invocation.
+    let whoami = std::fs::read_to_string(ws.join("whoami.txt")).unwrap();
+    let lines: Vec<&str> = whoami.lines().collect();
+    // `$PWD` reports the physical path — canonicalize so a temp-dir
+    // symlink (`/var` → `/private/var`) cannot skew the comparison.
+    let ws_physical = ws.canonicalize().unwrap();
+    assert_eq!(
+        lines,
+        vec![ws_physical.to_string_lossy().as_ref()],
+        "only the producing writer ran in the workspace: {whoami}"
+    );
+    let snapshot = root.join(".isolation").join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&check.id.0)
+    ));
+    assert!(
+        !snapshot.exists(),
+        "the check snapshot is reclaimed when the Invocation finishes"
+    );
+}
+
 /// Inspection read and stop-request wiring (U5.3, #93): a stop request
 /// reaches the supervised writer, and an inspection read reports the
 /// recorded writer_state for the supervision record.
@@ -1759,6 +1923,7 @@ fn unknown_inspection_maps_to_uncertain() {
             invocation_id: inv.id.clone(),
             process_identity: String::new(),
             state: ProcessStateFact::Unknown,
+            exit_code: None,
         },
         observed_unix_seconds: NOW,
     };
@@ -1865,18 +2030,32 @@ fn failed_finish_reports_are_replayed_after_restart() {
                 ObservationFact::Artifact { required_artifact, state: ArtifactFact::Present { .. }, .. }
                     if required_artifact == required)));
         }
+        // The replayed exit drives the same reconciliation: the
+        // invariant lane re-requests the pre-publication check under
+        // the same reservation, so the Execution is `ready` for that
+        // request and no publish intent exists yet.
+        //
+        // The exit fact must carry the proven status: the injected
+        // failure consumed the first finish attempt, and the status
+        // survived because `inspect` peeks it without reaping — a
+        // consumed-then-lost status would record `exit_code: None`.
         assert!(facts.iter().any(|obs| matches!(
             &obs.fact,
             ObservationFact::ProcessState {
+                invocation_id,
+                process_identity,
                 state: ProcessStateFact::Exited,
-                ..
-            }
+                exit_code: Some(0),
+            } if invocation_id == &invocation.id
+                && process_identity
+                    == &format!("{}@{}", identity.pid, identity.started_at)
         )));
-        assert_eq!(
-            execution(&store, &eid).waiting_reason,
-            Some(WaitingReason::HostWrite)
-        );
-        assert_eq!(store.transact(|tx| tx.action_intents()).unwrap().len(), 1);
+        let e = execution(&store, &eid);
+        assert_eq!(e.state, ExecutionState::Ready);
+        let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].role, InvocationRole::InvariantCheck);
+        assert!(store.transact(|tx| tx.action_intents()).unwrap().is_empty());
     }
 }
 
@@ -1931,7 +2110,9 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             panic!("unverified group must not be signaled")
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -2020,7 +2201,9 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             self.0.clone()
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -2107,6 +2290,7 @@ fn repeated_liveness_transitions_recover_without_poll_observation_growth() {
                     invocation_id: invocation.id.clone(),
                     process_identity: "probe unavailable".into(),
                     state: ProcessStateFact::Unknown,
+                    exit_code: None,
                 },
                 observed_unix_seconds: NOW + offset,
             },
@@ -2242,7 +2426,7 @@ fn stop_intent_is_durable_before_the_first_signal() {
         || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
         "leader stopped after the intent was durable",
     );
-    port.reap(leader.pid);
+    let _ = port.reap(leader.pid);
 }
 
 /// A `setsid`-escaped child survives the process-group signal; only the
@@ -2557,6 +2741,7 @@ fn a_workers_done_claim_alone_releases_nothing() {
                 invocation_id: invocation.id.clone(),
                 process_identity: format!("{}@{}", leader.pid, leader.started_at),
                 state: ProcessStateFact::Exited,
+                exit_code: Some(0),
             },
             observed_unix_seconds: NOW,
         },
@@ -2653,7 +2838,7 @@ fn an_exited_report_settles_a_requested_stop() {
         || matches!(port.inspect(&leader), ProcessEvidence::Stopped { .. }),
         "writer stopped",
     );
-    port.reap(leader.pid);
+    let _ = port.reap(leader.pid);
     drop(sup);
 
     handle_observation(
@@ -2671,6 +2856,7 @@ fn an_exited_report_settles_a_requested_stop() {
                 invocation_id: invocation.id.clone(),
                 process_identity: format!("{}@{}", leader.pid, leader.started_at),
                 state: ProcessStateFact::Exited,
+                exit_code: Some(0),
             },
             observed_unix_seconds: NOW,
         },
@@ -2978,7 +3164,9 @@ fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             SignalOutcome::AlreadyGone
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],

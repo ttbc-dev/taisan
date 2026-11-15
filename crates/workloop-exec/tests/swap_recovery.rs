@@ -274,7 +274,7 @@ impl ProcessControlPort for CountingPosix {
     fn signal_group(&self, pgid: i32, signal: i32) -> SignalOutcome {
         PosixProcessControl.signal_group(pgid, signal)
     }
-    fn reap(&self, pid: i32) {
+    fn reap(&self, pid: i32) -> Option<i32> {
         PosixProcessControl.reap(pid)
     }
     fn run_probe(
@@ -913,11 +913,22 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         let (_base_2, _produced_2) =
             git_workspace(&ws_root.join(format!("ws-{}", work_2.0)), &work_2);
         sup.consume_requests(&store, NOW).unwrap();
-        drive_until(&sup, &store, "both fixture writers finish", || {
-            [&exec_1, &exec_2]
-                .iter()
-                .all(|e| invocations(&store, e)[0].state == InvocationState::Done)
-        });
+        // Each producing Invocation is followed by its own
+        // invariant-check Invocation under the enabled lane, so the
+        // Executions reach the host-write wait only after the check
+        // leg completes — never on the assessment alone.
+        drive_until(
+            &sup,
+            &store,
+            "both executions reach the publish wait",
+            || {
+                [&exec_1, &exec_2].iter().all(|e| {
+                    let ex = execution(&store, e);
+                    ex.state == ExecutionState::Waiting
+                        && ex.waiting_reason == Some(WaitingReason::HostWrite)
+                })
+            },
+        );
         assert_eq!(
             execution(&store, &exec_1).waiting_reason,
             Some(WaitingReason::HostWrite)
@@ -940,8 +951,8 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
     let [writer_1, writer_2] = phase_one;
     assert_eq!(
         spawns.get(),
-        2,
-        "one real writer per request under the prior selection"
+        4,
+        "one producing writer plus its invariant check per Execution"
     );
 
     // Config change + restart: a fresh supervisor over the reopened
@@ -956,7 +967,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         config(),
     )
     .with_handoff(layout.clone());
-    assert_eq!(spawns.get(), 2, "the restart itself spawns nothing");
+    assert_eq!(spawns.get(), 4, "the restart itself spawns nothing");
 
     let aid_1 = format!("{}/artifact.json", writer_1.inv.0);
     let aid_2 = format!("{}/artifact.json", writer_2.inv.0);
@@ -1193,7 +1204,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
     );
     assert_eq!(
         spawns.get(),
-        2,
+        4,
         "recovery under the changed configuration never launched a worker"
     );
     assert_eq!(
@@ -1281,9 +1292,19 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
         );
         let (_base, produced) = git_workspace(&ws_root.join(format!("ws-{}", work.0)), &work);
         sup.consume_requests(&store, NOW).unwrap();
-        drive_until(&sup, &store, "the fixture writer finishes", || {
-            invocations(&store, &exec)[0].state == InvocationState::Done
-        });
+        // The producing Invocation's own invariant-check Invocation
+        // runs before publication under the enabled lane; the
+        // Execution reaches the host-write wait only after it.
+        drive_until(
+            &sup,
+            &store,
+            "the execution reaches the publish wait",
+            || {
+                let ex = execution(&store, &exec);
+                ex.state == ExecutionState::Waiting
+                    && ex.waiting_reason == Some(WaitingReason::HostWrite)
+            },
+        );
         let settled = execution(&store, &exec);
         assert_eq!(settled.state, ExecutionState::Waiting);
         assert_eq!(settled.waiting_reason, Some(WaitingReason::HostWrite));
@@ -1295,7 +1316,11 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
         (work, exec, invocation, produced, binding)
     };
     let (work, exec, invocation, produced, binding) = phase_one;
-    assert_eq!(spawns.get(), 1);
+    assert_eq!(
+        spawns.get(),
+        2,
+        "one producing writer plus its invariant check"
+    );
 
     // Config changed mid-Execution: the Execution is still waiting when
     // the restarted supervisor runs under the new worker_argv.
@@ -1312,7 +1337,7 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
     sup.run_once(&store, NOW + 1).unwrap();
     assert_eq!(
         spawns.get(),
-        1,
+        2,
         "recollection under the changed configuration launches nothing"
     );
 

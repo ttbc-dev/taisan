@@ -157,6 +157,38 @@ fn setup(state: InvocationState) -> (SqliteStore, WorkId, ExecutionId, Invocatio
                     descendants: vec![],
                 },
             })?;
+            // The invariant lane's own durable Invocation: a completed
+            // read-only check recorded after the producing Invocation.
+            // Publication and completion gate on it, never on an
+            // assessment fact alone — and on its proven exit status,
+            // so the check's own `Exited{0}` evidence is recorded too.
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("invariant-check".into()),
+                    request_id: format!("{}:inv:1", execution_id.0),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(execution_id.clone()),
+                    fact: ObservationFact::ProcessState {
+                        invocation_id: InvocationId("invariant-check".into()),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Exited,
+                        exit_code: Some(0),
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            })?;
             let mut execution = tx.execution(&execution_id)?.unwrap();
             execution.state = ExecutionState::Waiting;
             execution.waiting_reason = Some(WaitingReason::Ci);
@@ -304,6 +336,7 @@ fn completion_is_independent_of_delivery_order() {
                                 invocation_id: invocation.clone(),
                                 process_identity: "identity".into(),
                                 state: ProcessStateFact::Exited,
+                                exit_code: Some(0),
                             },
                         ];
                         for (index, position) in order.iter().enumerate() {
@@ -383,6 +416,7 @@ fn exit_publishes_artifacts_recorded_before_the_exit() {
             invocation_id: invocation,
             process_identity: "identity".into(),
             state: ProcessStateFact::Exited,
+            exit_code: Some(0),
         },
     );
     assert_eq!(state(&store, &execution), ExecutionState::Waiting);
@@ -411,6 +445,7 @@ fn stop_settlement_preserves_a_never_started_invocation() {
             invocation_id: invocation,
             process_identity: String::new(),
             state: ProcessStateFact::Exited,
+            exit_code: Some(0),
         },
     );
     assert_eq!(state(&store, &execution), ExecutionState::Cancelled);

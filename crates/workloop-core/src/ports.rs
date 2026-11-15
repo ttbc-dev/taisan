@@ -16,6 +16,11 @@ pub enum ProcessEvidence {
     Alive {
         identity: ProcessIdentity,
     },
+    /// `exit_code` is the status proven without consuming it (e.g. a
+    /// `waitid(WNOWAIT)` peek): `Some(code)` only for a proven normal
+    /// exit, `None` when the status is unavailable, unproven, or the
+    /// process ended by a signal. It stays readable until `reap`, so a
+    /// failed durable write can be retried against the same status.
     Stopped {
         identity: ProcessIdentity,
         exit_code: Option<i32>,
@@ -134,8 +139,15 @@ pub trait ProcessControlPort {
     fn signal_group(&self, pgid: i32, signal: i32) -> SignalOutcome;
 
     /// Reap a child this supervisor spawned so inspection is not polluted
-    /// by zombies. No-op for pids that are not our children.
-    fn reap(&self, pid: i32);
+    /// by zombies, returning the proven exit status when the reap
+    /// collected one: `Some(code)` only for a normal exit the port can
+    /// prove, `None` when the pid is not our child, was already reaped,
+    /// or ended by a signal — an unproven status is never invented.
+    /// The reap consumes the status, so exit facts are recorded from
+    /// `ProcessEvidence::Stopped::exit_code` — which `inspect` proves
+    /// without consuming — and this call only runs after that record
+    /// commits; a retry then peeks the same zombie again.
+    fn reap(&self, pid: i32) -> Option<i32>;
 
     /// Run a bounded effect-free probe (`<worker_argv...> describe`) under
     /// the same containment contract as a writer: the child starts in its

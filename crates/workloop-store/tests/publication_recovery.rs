@@ -212,12 +212,40 @@ fn recovery_does_not_publish_from_an_earlier_invocations_artifacts() {
         invocation_id: current.clone(),
         process_identity: "identity".into(),
         state: ProcessStateFact::Exited,
+        exit_code: Some(0),
     });
     assert_eq!(
         store.transact(|tx| tx.action_intents()).unwrap().len(),
         0,
         "the current invocation still lacks its second required artifact after exit"
     );
+    // The invariant lane's own durable record: publication waits for a
+    // completed check Invocation recorded after the producing one.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    request_id: format!("{}:inv:check", execution_id.0),
+                    id: InvocationId("current-check".into()),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })
+        })
+        .unwrap();
+    // The check's own proven `Exited{0}` evidence — `Done` alone is
+    // resolved-but-unproven and never opens the publish gate.
+    emit(ObservationFact::ProcessState {
+        invocation_id: InvocationId("current-check".into()),
+        process_identity: String::new(),
+        state: ProcessStateFact::Exited,
+        exit_code: Some(0),
+    });
     emit(ObservationFact::Artifact {
         invocation_id: current,
         required_artifact: "second.json".into(),

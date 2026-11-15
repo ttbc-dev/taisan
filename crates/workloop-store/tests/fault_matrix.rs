@@ -314,6 +314,7 @@ fn lp_20_equivalent_failure_pauses_at_the_limit() {
             invocation_id: InvocationId("lp20-coding".into()),
             process_identity: "1@1".into(),
             state: ProcessStateFact::Exited,
+            exit_code: Some(0),
         },
     );
     let paused = execution(&store, &e1);
@@ -832,6 +833,7 @@ fn lp_27_timeout_recovery_sequence_orders_stop_reconcile_requeue() {
             invocation_id: InvocationId("lp27-coding".into()),
             process_identity: "1@1".into(),
             state: ProcessStateFact::Exited,
+            exit_code: Some(0),
         },
     );
     assert_eq!(execution(&store, &e1).state, ExecutionState::Paused);

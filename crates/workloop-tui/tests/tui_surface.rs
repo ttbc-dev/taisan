@@ -264,7 +264,7 @@ fn seal_review(
 /// round with one occurrence per source key.
 fn review_fixture(store: &SqliteStore, work_id: &WorkId, sha: &str, source_keys: &[&str]) {
     open_change_at(store, work_id, sha, NOW);
-    seal_review(store, work_id, sha, "reviewer", source_keys, NOW);
+    seal_review(store, work_id, sha, "review-bot", source_keys, NOW);
 }
 
 #[test]
@@ -434,7 +434,7 @@ fn new_round_on_same_head_invalidates_draft_and_staged() {
 
     // A second complete review on the same head seals a new round — the
     // occurrence ids change, and the Work version bumps.
-    seal_review(&store, &work_id, "h1", "reviewer", &["a", "c"], NOW + 5);
+    seal_review(&store, &work_id, "h1", "review-bot", &["a", "c"], NOW + 5);
 
     // Re-query (poll tick / next open) sees the new detail.
     s.open(&work_id, NOW + 6).unwrap();

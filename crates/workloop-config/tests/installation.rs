@@ -210,3 +210,70 @@ fn worker_isolation_profile_is_fail_closed() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Per-role credential slots live in `host_credentials`: a role listed
+/// there resolves its own provider reference (the reviewer App's
+/// dedicated credential), an unlisted role keeps the shared `default`
+/// slot, and an orphan role or a malformed reference is refused at the
+/// boundary — never silently bound to the wrong credential.
+#[test]
+fn host_credentials_bind_per_role_provider_refs() {
+    use workloop_core::identity::ActorRole;
+
+    let dir = root("install-creds");
+    let path = dir.join("config.json");
+    let installation = load_or_create(&path).unwrap();
+
+    let mut i = installation.clone();
+    i.host_actors
+        .insert("review".into(), "s1-reviewer[bot]".into());
+    i.host_credentials
+        .insert("review".into(), "env:TAISAN_REVIEW_APP_CREDENTIAL".into());
+    let cfg = i.workloop_config().unwrap();
+    let review = cfg
+        .host
+        .actors
+        .iter()
+        .find(|b| b.role == ActorRole::Review)
+        .expect("the review binding");
+    assert_eq!(review.actor.actor.as_str(), "s1-reviewer[bot]");
+    assert_eq!(
+        review.credential_ref.as_str(),
+        "env:TAISAN_REVIEW_APP_CREDENTIAL"
+    );
+    // The unlisted publication role keeps the shared default slot.
+    let publication = cfg
+        .host
+        .actors
+        .iter()
+        .find(|b| b.role == ActorRole::Publication)
+        .expect("the publication binding");
+    assert_eq!(publication.credential_ref.as_str(), "default");
+
+    // An orphan credential role is refused: it could never resolve.
+    let mut orphan = i.clone();
+    orphan
+        .host_credentials
+        .insert("discussion".into(), "env:TAISAN_DISCUSSION_CRED".into());
+    let err = orphan.workloop_config().unwrap_err();
+    assert!(
+        err.contains("host_credentials") && err.contains("discussion"),
+        "expected the orphan-role error: {err}"
+    );
+
+    // A malformed provider reference is refused without echoing it.
+    let mut bad = i.clone();
+    bad.host_credentials
+        .insert("review".into(), "not-a-provider".into());
+    let err = bad.workloop_config().unwrap_err();
+    assert!(
+        err.contains("host_credentials[review]"),
+        "expected the provider-shape error: {err}"
+    );
+    assert!(
+        !err.contains("not-a-provider"),
+        "the refusal must not echo the reference: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

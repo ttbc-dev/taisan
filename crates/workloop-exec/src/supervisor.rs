@@ -145,6 +145,32 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
+/// The exit status of `pid` without consuming it: `waitid` with
+/// `WNOWAIT` reports a terminated child's status while leaving the
+/// zombie for `reap`, so the durable exit fact can be committed first
+/// and a failed write retried against the same proven status. Only a
+/// normal exit counts — a signaled, still-running, already-reaped, or
+/// non-child pid proves nothing and reports `None`.
+fn peek_exit_status(pid: i32) -> Option<i32> {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        ) != 0
+        {
+            return None;
+        }
+        if info.si_pid() == pid && info.si_code == libc::CLD_EXITED {
+            Some(info.si_status())
+        } else {
+            None
+        }
+    }
+}
+
 /// What a timed-out probe may signal once the bound has elapsed. The
 /// waiter thread can already have reaped the leader between the bound
 /// expiring and the kill, freeing the pid for reuse, so the recorded
@@ -351,11 +377,14 @@ impl ProcessControlPort for PosixProcessControl {
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
         let lstart = match lstart_of(identity.pid) {
-            // The pid is gone; this identity no longer exists.
+            // The pid is gone from the process table. If this identity
+            // is still our unreaped child the table read raced its exit;
+            // `waitid(WNOWAIT)` either proves the status non-destructively
+            // or reports nothing — it can never invent one.
             LstartLookup::Absent => {
                 return ProcessEvidence::Stopped {
                     identity: identity.clone(),
-                    exit_code: None,
+                    exit_code: peek_exit_status(identity.pid),
                 };
             }
             // The lookup itself failed: an incomplete process-table read
@@ -364,7 +393,9 @@ impl ProcessControlPort for PosixProcessControl {
             LstartLookup::Present(lstart) => lstart,
         };
         if normalize_lstart(&lstart) != normalize_lstart(&identity.started_at) {
-            // Reused pid: the recorded process is gone.
+            // Reused pid: the recorded process is gone. Its status is
+            // never peeked — the pid may now name a different child of
+            // this supervisor, whose exit must not be attributed here.
             return ProcessEvidence::Stopped {
                 identity: identity.clone(),
                 exit_code: None,
@@ -374,9 +405,11 @@ impl ProcessControlPort for PosixProcessControl {
             None => ProcessEvidence::Unknown {
                 reason: format!("pid {} present at lstart but stat unread", identity.pid),
             },
+            // A zombie still carries the recorded start time, so the
+            // non-destructive peek reports this exact process's exit.
             Some(stat) if stat.contains('Z') => ProcessEvidence::Stopped {
                 identity: identity.clone(),
-                exit_code: None,
+                exit_code: peek_exit_status(identity.pid),
             },
             Some(_) => ProcessEvidence::Alive {
                 identity: identity.clone(),
@@ -429,10 +462,19 @@ impl ProcessControlPort for PosixProcessControl {
         }
     }
 
-    fn reap(&self, pid: i32) {
+    fn reap(&self, pid: i32) -> Option<i32> {
         let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, libc::WNOHANG);
+        // waitpid collects the exit status only when this process is
+        // still our unreaped child: `pid` on success, 0 while it runs
+        // (WNOHANG), -1 when it is not ours. A normal exit carries its
+        // code; a signal death or an unproven reap reports none — the
+        // caller records `Exited` with no status rather than inventing
+        // one.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid && libc::WIFEXITED(status) {
+            Some(libc::WEXITSTATUS(status))
+        } else {
+            None
         }
     }
 
@@ -494,7 +536,7 @@ impl ProcessControlPort for PosixProcessControl {
                 // reporting the probe unknown, so a wedged group cannot
                 // outlive the bound on a wait-channel error either.
                 signal_probe_bound(pid, &started_at);
-                self.reap(pid);
+                let _ = self.reap(pid);
                 Err(SpawnError::Unknown {
                     reason: format!("wait {program}: {e}"),
                 })
@@ -676,6 +718,37 @@ impl<P: ProcessControlPort> Supervisor<P> {
             .join(format!("inv-{}", isolation::sanitize_key(invocation_id)))
     }
 
+    /// The disposable workspace snapshot an InvariantCheck Invocation
+    /// runs against — a full copy of the producing workspace taken at
+    /// consume time, so the check leg reads the produced state but can
+    /// never mutate it: its writes land in the copy, reclaimed with
+    /// the Invocation's lifecycle like the launch scratch. The
+    /// mount-level read-only bind the worker protocol specifies is the
+    /// separate namespace slice; until it lands, the snapshot is the
+    /// enforcement that keeps the producing workspace — and the
+    /// artifact digest recorded against it — untouched.
+    fn check_workspace(&self, invocation_id: &str) -> PathBuf {
+        isolation::scratch_root(&self.workspace_root)
+            .join(format!("check-{}", isolation::sanitize_key(invocation_id)))
+    }
+
+    /// Copy the producing workspace into the check's scratch tree and
+    /// return the snapshot path. A source that cannot be read is a
+    /// launch refusal, never a degraded check against partial state.
+    fn snapshot_check_workspace(
+        &self,
+        invocation: &Invocation,
+        work_id: &WorkId,
+    ) -> Result<PathBuf, ExecError> {
+        let source = self.workspace_of(work_id);
+        let dest = self.check_workspace(&invocation.id.0);
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        copy_workspace_tree(&source, &dest)?;
+        Ok(dest)
+    }
+
     /// One supervisor pass: consume approved requests, inspect live
     /// invocations, drive stop intents and artifact handoffs, and run
     /// one recovery attempt for each Execution waiting on artifact
@@ -741,7 +814,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let keep: HashSet<PathBuf> = store
             .transact(|tx| tx.unresolved_invocations())?
             .iter()
-            .map(|invocation| self.launch_scratch(&invocation.id.0))
+            .flat_map(|invocation| {
+                [
+                    self.launch_scratch(&invocation.id.0),
+                    self.check_workspace(&invocation.id.0),
+                ]
+            })
             .collect();
         isolation::sweep_orphans(&isolation::scratch_root(&self.workspace_root), &keep);
         Ok(())
@@ -975,6 +1053,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             invocation_id: invocation.id.clone(),
                             process_identity: String::new(),
                             state: ProcessStateFact::Unknown,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -1084,7 +1163,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             required_artifacts: required_artifacts(request),
             evidence_refs: vec![],
         };
-        let export_workspace = self.workspace_of(&request.work_id);
+        // The export names the workspace the launch actually runs
+        // against: the producing workspace for a writer, the
+        // per-Invocation snapshot for the read-only check — never the
+        // live workspace a check must not mutate.
+        let export_workspace = match request.role {
+            InvocationRole::InvariantCheck => self.check_workspace(&invocation.id.0),
+            _ => self.workspace_of(&request.work_id),
+        };
         let export = WorkerRequest::start(
             invocation.id.clone(),
             self.isolation_profile.id.to_string(),
@@ -1173,7 +1259,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
         }
 
         let work_id = request.work_id.clone();
-        let workspace = self.workspace_of(&work_id);
+        // The invariant check never launches in the producing
+        // workspace: it runs against a per-Invocation snapshot copy, so
+        // the check leg cannot mutate the state the producing
+        // Invocation's artifact evidence describes. A snapshot that
+        // cannot be taken refuses the launch through the same path as
+        // a refused spawn — the check never degrades to the live
+        // workspace.
+        let workspace = match request.role {
+            InvocationRole::InvariantCheck => {
+                match self.snapshot_check_workspace(&invocation, &work_id) {
+                    Ok(path) => path,
+                    Err(why) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("invariant check workspace snapshot failed: {why}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => self.workspace_of(&work_id),
+        };
         std::fs::create_dir_all(&workspace)?;
         // The bound argv is the recorded selection — a `worker_argv`
         // change after binding never retargets this request, and the
@@ -1241,6 +1351,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation_id: invocation.id.clone(),
                         process_identity: format!("{}@{}", identity.pid, identity.started_at),
                         state: ProcessStateFact::Running,
+                        exit_code: None,
                     },
                     now_unix_seconds,
                 )?;
@@ -1256,6 +1367,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation_id: invocation.id.clone(),
                         process_identity: String::new(),
                         state: ProcessStateFact::Unknown,
+                        exit_code: None,
                     },
                     now_unix_seconds,
                 )?;
@@ -1269,7 +1381,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// terminal for its binding, never retried under a degraded setup.
     /// No process exists for this Invocation, so its scratch tree
     /// (fully built for a refused spawn, partial for a refused
-    /// preparation) is reclaimed with the refusal.
+    /// preparation) and any check-workspace snapshot are reclaimed
+    /// with the refusal.
     fn refuse_launch(
         &self,
         store: &impl Store,
@@ -1279,6 +1392,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
         isolation::release(&self.launch_scratch(&invocation.id.0));
+        isolation::release(&self.check_workspace(&invocation.id.0));
         store.transact(|tx| {
             let mut next = invocation.clone();
             next.state = InvocationState::Abandoned;
@@ -1383,6 +1497,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             invocation_id: invocation.id.clone(),
                             process_identity: String::new(),
                             state: ProcessStateFact::Unknown,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -1397,15 +1512,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 continue;
             }
             match self.port.inspect(&identity) {
-                ProcessEvidence::Stopped { .. } => {
+                ProcessEvidence::Stopped { exit_code, .. } => {
                     // A persisted intent may name an escapee absent
                     // from every live snapshot — it is part of the
                     // proof set here too, not only in drive_stops.
                     let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
                     match self.prove_tree_stopped(store, &invocation, intent.as_ref())? {
                         TreeProof::Proven => {
-                            self.port.reap(identity.pid);
-                            self.finish_invocation(store, &invocation, now_unix_seconds)?;
+                            // The status `inspect` proved non-destructively
+                            // is committed before the zombie is reaped:
+                            // a failed finish leaves the child for the
+                            // retry, which peeks the same status again.
+                            self.finish_invocation(
+                                store,
+                                &invocation,
+                                now_unix_seconds,
+                                exit_code,
+                            )?;
+                            let _ = self.port.reap(identity.pid);
                         }
                         // Live stragglers were re-signaled; the exit fact
                         // is withheld until the whole tree proves stopped.
@@ -1426,6 +1550,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                                         identity.pid, identity.started_at
                                     ),
                                     state: ProcessStateFact::Unknown,
+                                    exit_code: None,
                                 },
                                 now_unix_seconds,
                             )?;
@@ -1452,6 +1577,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             invocation_id: invocation.id.clone(),
                             process_identity: format!("{}@{}", identity.pid, identity.started_at),
                             state: ProcessStateFact::Running,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -1469,6 +1595,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             invocation_id: invocation.id.clone(),
                             process_identity: format!("{}@{}", identity.pid, identity.started_at),
                             state: ProcessStateFact::Unknown,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -1652,17 +1779,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
     /// Save every artifact fact before the exit fact resolves the writer.
     /// Interrupted reporting leaves the Invocation in the next scan.
+    /// `exit_code` is the status `inspect` proved for the writer's own
+    /// exit without consuming it — `None` when no normal exit status
+    /// could be proven, which the exit fact records honestly rather
+    /// than as a pass. Callers reap only after this commits, so a
+    /// failed report is retried against the same zombie's status.
     fn finish_invocation(
         &self,
         store: &impl Store,
         invocation: &Invocation,
         now_unix_seconds: i64,
+        exit_code: Option<i32>,
     ) -> Result<(), ExecError> {
         // The writer is proven stopped before this is called: its
-        // scratch tree (HOME/TMPDIR) can never be read again and is
-        // reclaimed with the Invocation instead of accumulating under
-        // `.isolation`.
+        // scratch tree (HOME/TMPDIR) and any check-workspace snapshot
+        // can never be read again and are reclaimed with the
+        // Invocation instead of accumulating under `.isolation`.
         isolation::release(&self.launch_scratch(&invocation.id.0));
+        isolation::release(&self.check_workspace(&invocation.id.0));
         let request = store
             .transact(|tx| tx.request(&invocation.request_id))?
             .ok_or(ExecError::Store(StoreError::Internal {
@@ -1709,6 +1843,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     .map(|i| format!("{}@{}", i.pid, i.started_at))
                     .unwrap_or_default(),
                 state: ProcessStateFact::Exited,
+                exit_code,
             },
             now_unix_seconds,
         )?;
@@ -1814,6 +1949,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                                 .map(|i| format!("{}@{}", i.pid, i.started_at))
                                 .unwrap_or_default(),
                             state: ProcessStateFact::Exited,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -1836,6 +1972,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                                 invocation_id: invocation.id.clone(),
                                 process_identity: String::new(),
                                 state: ProcessStateFact::Unknown,
+                                exit_code: None,
                             },
                             now_unix_seconds,
                         )?;
@@ -1865,6 +2002,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // enumeration is inconclusive — never proof.
                 let mut all_stopped = true;
                 let mut any_unknown = false;
+                // The leader's exit status as `inspect` proved it
+                // non-destructively — committed by `finish_invocation`
+                // before the zombie is reaped, so a failed write is
+                // retried against the same status.
+                let mut leader_exit = None;
                 let proof = match self.proof_identities(&invocation, intent.as_ref()) {
                     Ok(ids) => ids,
                     Err(_) => {
@@ -1875,7 +2017,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 };
                 for id in &proof {
                     match self.port.inspect(id) {
-                        ProcessEvidence::Stopped { .. } => {}
+                        ProcessEvidence::Stopped { exit_code, .. } => {
+                            if id.pid == identity.pid {
+                                leader_exit = exit_code;
+                            }
+                        }
                         ProcessEvidence::Alive { .. } => {
                             all_stopped = false;
                             // Still writing: re-signal under re-verification.
@@ -1888,8 +2034,6 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                 }
                 if all_stopped {
-                    // The leader is our child: reap it so a killed writer
-                    // does not linger as a zombie of this supervisor.
                     // `finish_invocation` saves the artifact facts,
                     // reports the proven exit, and reclaims the launch
                     // scratch — the same completion the poll path runs.
@@ -1897,8 +2041,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     // launch stopped by cancel/fail/pause reaches its
                     // exit fact only here; reporting it directly would
                     // leave `inv-*` scratch under `.isolation` forever.
-                    self.port.reap(identity.pid);
-                    self.finish_invocation(store, &invocation, now_unix_seconds)?;
+                    self.finish_invocation(store, &invocation, now_unix_seconds, leader_exit)?;
+                    // The leader is our child: reap it so a stopped
+                    // writer does not linger as a zombie of this
+                    // supervisor — only after the exit fact committed.
+                    let _ = self.port.reap(identity.pid);
                 } else if any_unknown && execution.state == ExecutionState::Stopping {
                     let request = store
                         .transact(|tx| tx.request(&invocation.request_id))?
@@ -1912,6 +2059,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             invocation_id: invocation.id.clone(),
                             process_identity: format!("{}@{}", identity.pid, identity.started_at),
                             state: ProcessStateFact::Unknown,
+                            exit_code: None,
                         },
                         now_unix_seconds,
                     )?;
@@ -2226,14 +2374,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
         now_unix_seconds: i64,
     ) -> Result<(), ExecError> {
         match ev {
-            ProcessEvidence::Stopped { .. } => {
+            ProcessEvidence::Stopped { exit_code, .. } => {
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
                 match self.prove_tree_stopped(store, invocation, intent.as_ref())? {
                     TreeProof::Proven => {
+                        // Commit the non-destructively proven status
+                        // before reaping: a failed finish is retried
+                        // against the same zombie's status.
+                        self.finish_invocation(store, invocation, now_unix_seconds, exit_code)?;
                         if let Some(id) = &invocation.process_identity {
-                            self.port.reap(id.pid);
+                            let _ = self.port.reap(id.pid);
                         }
-                        self.finish_invocation(store, invocation, now_unix_seconds)
+                        Ok(())
                     }
                     TreeProof::Withheld => Ok(()),
                     TreeProof::Uncertain => {
@@ -2252,6 +2404,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                                 invocation_id: invocation.id.clone(),
                                 process_identity: format!("{}@{}", id.pid, id.started_at),
                                 state: ProcessStateFact::Unknown,
+                                exit_code: None,
                             },
                             now_unix_seconds,
                         )
@@ -2273,6 +2426,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             .map(|i| format!("{}@{}", i.pid, i.started_at))
                             .unwrap_or_default(),
                         state: ProcessStateFact::Running,
+                        exit_code: None,
                     },
                     now_unix_seconds,
                 )
@@ -2293,6 +2447,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation_id: invocation.id.clone(),
                         process_identity: format!("{}@{}", id.pid, id.started_at),
                         state: ProcessStateFact::Unknown,
+                        exit_code: None,
                     },
                     now_unix_seconds,
                 )
@@ -2319,41 +2474,38 @@ fn persist_intent_row(
 }
 
 fn required_artifacts(request: &InvocationRequest) -> Vec<RequiredArtifact> {
-    request
-        .payload
-        .get("required_artifacts")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| {
-                    if let Some(name) = v.as_str() {
-                        return Some(RequiredArtifact {
-                            kind: name.to_string(),
-                            path: name.to_string(),
-                            expected_digest: None,
-                        });
-                    }
-                    let kind = v.get("kind").and_then(|k| k.as_str())?;
-                    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(kind);
-                    Some(RequiredArtifact {
-                        kind: kind.to_string(),
-                        path: path.to_string(),
-                        expected_digest: v
-                            .get("expected_digest")
-                            .and_then(|d| d.as_str())
-                            .map(str::to_string),
-                    })
+    match request.payload.get("required_artifacts") {
+        // An explicitly declared set is authoritative — including the
+        // empty set a read-only role records. Only an absent or
+        // non-array declaration falls back to the writer default.
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| {
+                if let Some(name) = v.as_str() {
+                    return Some(RequiredArtifact {
+                        kind: name.to_string(),
+                        path: name.to_string(),
+                        expected_digest: None,
+                    });
+                }
+                let kind = v.get("kind").and_then(|k| k.as_str())?;
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(kind);
+                Some(RequiredArtifact {
+                    kind: kind.to_string(),
+                    path: path.to_string(),
+                    expected_digest: v
+                        .get("expected_digest")
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string),
                 })
-                .collect()
-        })
-        .filter(|v: &Vec<RequiredArtifact>| !v.is_empty())
-        .unwrap_or_else(|| {
-            vec![RequiredArtifact {
-                kind: "artifact.json".to_string(),
-                path: "artifact.json".to_string(),
-                expected_digest: None,
-            }]
-        })
+            })
+            .collect(),
+        _ => vec![RequiredArtifact {
+            kind: "artifact.json".to_string(),
+            path: "artifact.json".to_string(),
+            expected_digest: None,
+        }],
+    }
 }
 
 /// Whether `name` exists in the workspace root, checkpoints, or the
@@ -2389,6 +2541,32 @@ fn artifact_digest(workspace: &Path, name: &str) -> Option<String> {
         return None;
     }
     Some(sha256_hex("artifact-v1", &bytes))
+}
+
+/// Recursively copy `source` into `dest` for the invariant check's
+/// snapshot workspace. Every entry is copied — the check must see the
+/// producing state exactly as the writer left it, including hidden
+/// stores like `.git` and `.artifact-store`. Symlinks are recreated as
+/// links rather than followed, so a link inside the workspace cannot
+/// pull outside content into the snapshot. Any unreadable entry fails
+/// the whole copy: a partial snapshot is never a check input.
+fn copy_workspace_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_workspace_tree(&from, &to)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(&target, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Test hook: write a line into a workspace artifact (used by harness
@@ -2445,7 +2623,9 @@ mod tests {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             panic!("incomplete snapshot must not authorize signaling")
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],
@@ -2562,7 +2742,9 @@ mod tests {
         fn signal_group(&self, _: i32, _: i32) -> SignalOutcome {
             SignalOutcome::Sent
         }
-        fn reap(&self, _: i32) {}
+        fn reap(&self, _: i32) -> Option<i32> {
+            None
+        }
         fn run_probe(
             &self,
             _: &[String],

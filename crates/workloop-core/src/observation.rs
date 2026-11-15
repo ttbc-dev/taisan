@@ -9,7 +9,13 @@ use crate::identity::{
 /// Delivery identity for transports that assign one (webhooks, worker
 /// reports). The scope disambiguates which authority issued the id, so a
 /// host event id never deduplicates a local one and vice versa. An
-/// observation without delivery identity never deduplicates.
+/// observation without delivery identity never deduplicates. The store
+/// dedupes per `(scope, source, event_id)` only — the subject is not
+/// part of the key — so `event_id` must be unique per distinct subject
+/// observation: two subjects reporting the same host state (for example
+/// Works polling a shared target branch) need different ids, or the
+/// second delivery is dropped as a duplicate and that subject never
+/// records the fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryId {
     pub scope: DeliveryScope,
@@ -51,6 +57,14 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         process_identity: String,
         state: ProcessStateFact,
+        /// The proven exit status the supervisor collected when it
+        /// reaped the writer's own exit — `Some(0)` is the only
+        /// positive completion evidence a gate may count. `None`
+        /// means the process resolved without a proven status
+        /// (reparented, ended by a signal, or reported by a path that
+        /// never held the child); it is never a pass.
+        #[serde(default)]
+        exit_code: Option<i32>,
     },
     Artifact {
         invocation_id: InvocationId,

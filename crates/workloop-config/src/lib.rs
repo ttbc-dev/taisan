@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use workloop_core::credential::CredentialProvider;
 use workloop_core::domain::{
     Actor, ActorKind, AllowedEffects, ExecutionBudget, LanePolicy, WorkPolicy,
 };
@@ -125,6 +126,14 @@ pub struct Installation {
     /// publishable Work.
     #[serde(default)]
     pub host_actors: std::collections::BTreeMap<String, String>,
+    /// Per-role credential slots (`env:`/`file:`/`command:` provider
+    /// references — never secret values). A role absent here resolves
+    /// through the shared `default` slot, preserving pre-existing
+    /// installations; a bound role may name its own slot so the
+    /// reviewer App authenticates under its own credential rather
+    /// than the publisher's.
+    #[serde(default)]
+    pub host_credentials: std::collections::BTreeMap<String, String>,
     /// Named host checks the completion gate requires.
     #[serde(default)]
     pub required_checks: Vec<String>,
@@ -449,6 +458,7 @@ fn load_or_create_with(
         host_actors: [("publication".into(), "fixture-agent".into())]
             .into_iter()
             .collect(),
+        host_credentials: std::collections::BTreeMap::new(),
         required_checks: vec![],
         capacity: default_capacity(),
         worker_argv: vec![],
@@ -542,11 +552,33 @@ impl Installation {
         let repository = RepositoryRef::new(host.clone(), repository_id);
         let adapter = AdapterId::new(self.adapter.clone())
             .map_err(|e| format!("installation adapter: {e}"))?;
+        // Per-role credential slots name bound roles only: an orphan
+        // entry could never resolve and a misspelled role must fail at
+        // load, not surface later as an unexplained credential error.
+        // Each value is shape-checked as a provider reference — the
+        // refusal names the rule, never the reference itself.
+        for (role_name, reference) in &self.host_credentials {
+            if !self.host_actors.contains_key(role_name) {
+                return Err(format!(
+                    "installation host_credentials: role '{role_name}' has no bound host actor"
+                ));
+            }
+            CredentialProvider::parse_str(reference)
+                .map_err(|rule| format!("installation host_credentials[{role_name}]: {rule}"))?;
+        }
         let mut actors = Vec::with_capacity(self.host_actors.len());
         for (role, actor) in &self.host_actors {
             let role_name = role.clone();
             let role = ActorRole::from_name(&role_name)
                 .ok_or_else(|| format!("installation host_actors: unknown role '{role_name}'"))?;
+            // The credential source is installation configuration;
+            // the record's value names it, never a secret value. A
+            // role without an explicit slot keeps the shared default.
+            let credential_ref = self
+                .host_credentials
+                .get(&role_name)
+                .cloned()
+                .unwrap_or_else(|| "default".into());
             actors.push(RoleBinding {
                 role,
                 actor: HostActorRef {
@@ -554,9 +586,7 @@ impl Installation {
                     actor: HostActorId::new(actor.clone())
                         .map_err(|e| format!("installation host_actors[{role_name}]: {e}"))?,
                 },
-                // The credential source is installation configuration;
-                // the record's value names it, never a secret value.
-                credential_ref: CredentialRef::new("default")
+                credential_ref: CredentialRef::new(credential_ref)
                     .map_err(|e| format!("installation credential_ref: {e}"))?,
             });
         }

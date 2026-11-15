@@ -698,6 +698,7 @@ fn uncertain_beyond_threshold_surfaces_attention() {
             invocation_id: InvocationId("inv-x".into()),
             process_identity: String::new(),
             state: ProcessStateFact::Unknown,
+            exit_code: None,
         },
         observed_unix_seconds: NOW,
     };
