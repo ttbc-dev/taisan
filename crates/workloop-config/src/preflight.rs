@@ -1390,7 +1390,12 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<WalScan, Str
     let mut frame_header = [0u8; WAL_FRAME_HEADER_LEN];
     let mut page = vec![0u8; page_len];
     let mut offset = WAL_HEADER_LEN as u64;
-    let mut pending_page1 = None;
+    // The open transaction's page-1 image: `None` = no page-1 frame
+    // yet, `Some(None)` = a page-1 frame that fails the database
+    // magic, `Some(Some(v))` = its `user_version`. Only a commit
+    // promotes it — an uncommitted tail frame stays invisible, exactly
+    // as a SQLite reader treats it.
+    let mut pending_page1: Option<Option<i64>> = None;
     let mut committed_page1_version = None;
     let mut committed_pages = None;
     while offset + frame_len as u64 <= len {
@@ -1411,13 +1416,20 @@ fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<WalScan, Str
         if wal_u32(&frame_header[0..4]) == 1 {
             // `user_version` sits at bytes 60-63 of the page-1 image —
             // read it now, while the frame is checksum-validated, so
-            // no later reread can observe recycled WAL content.
-            pending_page1 = Some(i64::from(wal_u32(&page[60..64])));
+            // no later reread can observe recycled WAL content. The
+            // database magic must open the image: bytes 60-63 of a
+            // non-database page are not a version.
+            pending_page1 =
+                Some((page[..16] == SQLITE_MAGIC[..]).then(|| i64::from(wal_u32(&page[60..64]))));
         }
         let n_truncate = wal_u32(&frame_header[4..8]);
         if n_truncate != 0 {
-            if let Some(version) = pending_page1.take() {
-                committed_page1_version = Some(version);
+            match pending_page1.take() {
+                Some(Some(version)) => committed_page1_version = Some(version),
+                Some(None) => {
+                    return Err(fail("a committed page-1 frame is not a database page"));
+                }
+                None => {}
             }
             committed_pages = Some(n_truncate);
         }
@@ -2420,6 +2432,27 @@ mod tests {
                 // Only the first transaction survives the bad tail.
                 assert_eq!(facts.committed_pages, Some(5));
                 assert_eq!(facts.page1_user_version, Some(6));
+            }
+            other => panic!("expected committed facts, got {}", wal_scan_name(&other)),
+        }
+
+        // A checksum-valid page-1 frame that does not open with the
+        // database magic is not a version source: committing it makes
+        // the inspection unavailable, never a pass.
+        let mut bad_page1 = vec![0u8; 4096];
+        bad_page1[60..64].copy_from_slice(&6u32.to_be_bytes());
+        let bad_wal = synthetic_wal(4096, &[(1, 3, bad_page1)]);
+        std::fs::write(dir.join("store.db-wal"), &bad_wal).unwrap();
+        assert!(wal_store_facts(&store, &wal_mode_header()).is_err());
+        // The same image uncommitted — no commit frame after it —
+        // stays invisible, exactly as a SQLite reader treats a tail.
+        let uncommitted_wal =
+            synthetic_wal(4096, &[(1, 0, vec![0u8; 4096]), (2, 0, vec![0u8; 4096])]);
+        std::fs::write(dir.join("store.db-wal"), &uncommitted_wal).unwrap();
+        match wal_store_facts(&store, &wal_mode_header()) {
+            Ok(WalScan::Facts(facts)) => {
+                assert_eq!(facts.committed_pages, None);
+                assert_eq!(facts.page1_user_version, None);
             }
             other => panic!("expected committed facts, got {}", wal_scan_name(&other)),
         }
