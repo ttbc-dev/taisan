@@ -11,6 +11,11 @@ use clap::{Args, Parser, Subcommand};
 use run_loop::{
     Pass, PassSettings, RunLeaseGuard, install_shutdown_handler, run_pass, shutdown_requested,
 };
+use workloop_config::preflight::{
+    CheckOptions, CheckReport, InitHost, InitObservation, InitRepository, InitRole, InitSpec,
+    ProbeMode, check as preflight_check, init as preflight_init,
+};
+use workloop_config::profile::resolve_paths_from_env;
 use workloop_config::{Installation, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
@@ -41,6 +46,10 @@ struct Cli {
     /// Created with a fresh stable actor id on first use.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// State root override for `check` (store, workspaces, bodies).
+    /// Absolute; resolved as flag → `TAISAN_STATE_DIR` → XDG default.
+    #[arg(long, global = true)]
+    state_dir: Option<PathBuf>,
     /// Idempotency key for the command; generated when omitted.
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
@@ -58,6 +67,50 @@ struct WorkTarget {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Scaffold the installation profile (`config.toml`) from observed
+    /// evidence: hosts, repositories, roles with credential references,
+    /// the egress allowlist, and one observed identity per bound role.
+    /// Never fabricates identity; never rewrites an existing config.
+    Init {
+        /// Host instance identity the adapter reported — the stable endpoint.
+        #[arg(long)]
+        endpoint: String,
+        /// Adapter id from the adapter registry.
+        #[arg(long, default_value = "github")]
+        adapter: String,
+        /// The host table alias to create.
+        #[arg(long, default_value = "h1")]
+        host: String,
+        /// The adapter contract version this installation speaks.
+        #[arg(long, default_value_t = 1)]
+        contract_version: u32,
+        /// `<repository-id>:<publication|source>`; repeatable, ≥ 1.
+        #[arg(long = "repo", value_name = "ID:USE")]
+        repo: Vec<String>,
+        /// `<role>:<actor>:<credential-ref>`; repeatable, ≥ 1.
+        #[arg(long = "role", value_name = "ROLE:ACTOR:CREDENTIAL_REF")]
+        role: Vec<String>,
+        /// Bare egress host name for `verification.egress.allowlist`; repeatable.
+        #[arg(long = "egress")]
+        egress: Vec<String>,
+        /// `<role>:<login>@<host-instance>/<repository-id>` — one
+        /// observed identity per bound role; `init` refuses to publish
+        /// without it (it never fabricates identity). Repeatable.
+        #[arg(long = "observe", value_name = "ROLE:LOGIN@HOST/REPO")]
+        observe: Vec<String>,
+    },
+    /// Ordered, offline, fail-closed preflight over the installation
+    /// profile: config parse → identity tuples → credential-reference
+    /// presence → paths → worker runtime → isolation primitives → store,
+    /// stopping at the first failing stage with a stage-scoped
+    /// diagnostic. Read-only; never a lasting grant.
+    Check {
+        /// Opt-in read-only adapter probe (stage 8): identity and
+        /// capability reads per bound actor, zero remote writes. A
+        /// plain `check` never touches remote state.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Submit new Work.
     Submit {
         #[arg(long)]
@@ -357,6 +410,14 @@ pub(crate) fn main() {
 }
 
 fn run(cli: Cli) -> i32 {
+    // Setup and preflight operate on the TOML installation profile via
+    // the fixed flag → env → XDG precedence. They must never touch the
+    // legacy JSON installation record (which would auto-create it) or
+    // the store — `check` is read-only and `init` publishes only the
+    // profile — so they dispatch before any store-backed setup.
+    if let Some(code) = preflight_dispatch(&cli) {
+        return code;
+    }
     let config_path = cli
         .config
         .clone()
@@ -1220,6 +1281,271 @@ fn run(cli: Cli) -> i32 {
                 }
             }
         }
+        // `init`/`check` returned at the preflight dispatch above —
+        // they never reach store-backed setup.
+        Commands::Init { .. } | Commands::Check { .. } => {
+            unreachable!("setup commands dispatch before store initialization")
+        }
+    }
+}
+
+/// The raw `init` flag values, after clap parsing, before semantic
+/// parsing into the preflight spec.
+struct InitArgs {
+    endpoint: String,
+    adapter: String,
+    host: String,
+    contract_version: u32,
+    repo: Vec<String>,
+    role: Vec<String>,
+    egress: Vec<String>,
+    observe: Vec<String>,
+}
+
+/// `<repository-id>:<publication|source>`. Shape errors are usage
+/// errors; the use value's domain is validated by `init` itself.
+fn parse_init_repo(spec: &str) -> Result<InitRepository, String> {
+    let error = || format!("--repo '{spec}': expected <repository-id>:<publication|source>");
+    let (id, use_) = spec.rsplit_once(':').ok_or_else(error)?;
+    if id.is_empty() || use_.is_empty() {
+        return Err(error());
+    }
+    Ok(InitRepository {
+        id: id.into(),
+        display: None,
+        use_: use_.into(),
+    })
+}
+
+/// `<role>:<actor>:<credential-ref>` — the credential reference keeps
+/// its own `:` separators (`env:NAME`, `file:/abs/path`). The refusal
+/// never echoes the argument: a malformed spec may carry a pasted
+/// secret, and usage errors land in captured logs.
+fn parse_init_role(spec: &str) -> Result<InitRole, String> {
+    let error = || {
+        "--role: expected <role>:<actor>:<credential-ref> \
+         (e.g. publication:my-bot:env:TAISAN_GH_TOKEN)"
+            .to_string()
+    };
+    let mut parts = spec.splitn(3, ':');
+    let role = parts.next().unwrap_or_default();
+    let actor = parts.next().unwrap_or_default();
+    let credential_ref = parts.next().unwrap_or_default();
+    if role.is_empty() || actor.is_empty() || credential_ref.is_empty() {
+        return Err(error());
+    }
+    Ok(InitRole {
+        role: role.into(),
+        // Single-host `init`: every role binds the host this run creates.
+        host: String::new(), // replaced by the caller with --host
+        actor: actor.into(),
+        credential_ref: credential_ref.into(),
+    })
+}
+
+/// `<role>:<login>@<host-instance>/<repository-id>` — the observed
+/// identity pointers an operator read from the adapter.
+fn parse_init_observe(spec: &str) -> Result<InitObservation, String> {
+    let error =
+        || format!("--observe '{spec}': expected <role>:<login>@<host-instance>/<repository-id>");
+    let (role, rest) = spec.split_once(':').ok_or_else(error)?;
+    let (login, context) = rest.rsplit_once('@').ok_or_else(error)?;
+    let (host_instance, repository) = context.rsplit_once('/').ok_or_else(error)?;
+    if role.is_empty() || login.is_empty() || host_instance.is_empty() || repository.is_empty() {
+        return Err(error());
+    }
+    Ok(InitObservation {
+        role: role.into(),
+        login: login.into(),
+        host_instance: host_instance.into(),
+        repository: repository.into(),
+    })
+}
+
+/// The one JSON envelope for a successful setup command.
+fn setup_envelope(kind: &'static str, mut result: serde_json::Value) -> (envelope::Envelope, i32) {
+    result["kind"] = serde_json::json!(kind);
+    (
+        envelope::Envelope {
+            schema_version: "1",
+            status: "accepted",
+            command: None,
+            work_id: None,
+            execution_id: None,
+            result: Some(result),
+            reason: None,
+            evidence_refs: vec![],
+            sources: None,
+            as_of: None,
+        },
+        envelope::EXIT_OK,
+    )
+}
+
+/// `check` failures are config-class (exit 3); the summary names the
+/// failed stage and its first stage-scoped diagnostic, and the whole
+/// per-stage report rides in `result`.
+fn check_failure(report: &CheckReport) -> (envelope::Envelope, i32) {
+    let summary = match report.failed_stage() {
+        Some(stage) => match stage.diagnostics.first() {
+            Some(diagnostic) => format!(
+                "check failed at {}: {} — {}",
+                stage.stage.id(),
+                diagnostic.code,
+                diagnostic.message
+            ),
+            None => format!("check failed at {}", stage.stage.id()),
+        },
+        None => "check failed".into(),
+    };
+    let (mut env, code) = envelope::error_envelope(None, envelope::ErrorClass::Config, &summary);
+    env.result = serde_json::to_value(report).ok();
+    if let Some(result) = &mut env.result {
+        result["kind"] = serde_json::json!("check");
+    }
+    (env, code)
+}
+
+/// Dispatch for the two profile-scope setup commands; every other
+/// command continues into the store-backed surface.
+fn preflight_dispatch(cli: &Cli) -> Option<i32> {
+    match &cli.command {
+        Commands::Init {
+            endpoint,
+            adapter,
+            host,
+            contract_version,
+            repo,
+            role,
+            egress,
+            observe,
+        } => Some(run_init(
+            cli,
+            InitArgs {
+                endpoint: endpoint.clone(),
+                adapter: adapter.clone(),
+                host: host.clone(),
+                contract_version: *contract_version,
+                repo: repo.clone(),
+                role: role.clone(),
+                egress: egress.clone(),
+                observe: observe.clone(),
+            },
+        )),
+        Commands::Check { probe } => Some(run_check(cli, *probe)),
+        _ => None,
+    }
+}
+
+fn run_init(cli: &Cli, args: InitArgs) -> i32 {
+    let paths = match resolve_paths_from_env(cli.config.as_deref(), cli.state_dir.as_deref()) {
+        Ok(paths) => paths,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
+    let usage = |message: String| {
+        emit(envelope::error_envelope(
+            None,
+            envelope::ErrorClass::Usage,
+            &message,
+        ))
+    };
+    let repositories = match args
+        .repo
+        .iter()
+        .map(|spec| parse_init_repo(spec))
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(repositories) => repositories,
+        Err(message) => return usage(message),
+    };
+    if repositories.is_empty() {
+        return usage("init needs at least one --repo <id:use>".into());
+    }
+    let roles = match args
+        .role
+        .iter()
+        .map(|spec| parse_init_role(spec))
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(roles) => roles,
+        Err(message) => return usage(message),
+    };
+    if roles.is_empty() {
+        return usage("init needs at least one --role <role:actor:credential-ref>".into());
+    }
+    let observations = match args
+        .observe
+        .iter()
+        .map(|spec| parse_init_observe(spec))
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(observations) => observations,
+        Err(message) => return usage(message),
+    };
+    let spec = InitSpec {
+        hosts: vec![InitHost {
+            name: args.host.clone(),
+            adapter: args.adapter,
+            endpoint: args.endpoint,
+            contract_version: args.contract_version,
+            repositories,
+        }],
+        roles: roles
+            .into_iter()
+            .map(|role| InitRole {
+                host: args.host.clone(),
+                ..role
+            })
+            .collect(),
+        egress_allowlist: args.egress,
+        observations,
+        observed_unix_seconds: now(),
+    };
+    match preflight_init(&paths.config_path, &spec) {
+        Ok(outcome) => emit(setup_envelope(
+            "init",
+            serde_json::to_value(outcome).unwrap_or_else(|_| serde_json::json!({})),
+        )),
+        Err(e) => emit(envelope::error_envelope(
+            None,
+            envelope::ErrorClass::Config,
+            &e,
+        )),
+    }
+}
+
+fn run_check(cli: &Cli, probe: bool) -> i32 {
+    let paths = match resolve_paths_from_env(cli.config.as_deref(), cli.state_dir.as_deref()) {
+        Ok(paths) => paths,
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
+    };
+    let mut options = CheckOptions::new(paths.state_root.clone());
+    if probe {
+        // No adapter probe backend is wired into this runtime yet, so
+        // the requested probe stage fails closed (`capability.unknown`)
+        // rather than fabricating a result or silently skipping the
+        // request. The stage runs after (1)–(7), performs no reads and
+        // no writes, and the report carries an empty operation log.
+        options.probe = ProbeMode::Unavailable;
+    }
+    let report = preflight_check(&paths.config_path, &mut options);
+    if report.success {
+        let value = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        emit(setup_envelope("check", value))
+    } else {
+        emit(check_failure(&report))
     }
 }
 

@@ -4,6 +4,7 @@
 //! TUI can never drift on the file they must agree on — whichever
 //! adapter creates it, the other adopts it.
 
+pub mod preflight;
 pub mod profile;
 
 use std::collections::BTreeSet;

@@ -8,3 +8,9 @@ workloop-selector = { path = "../workloop-selector" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+workloop-store = { path = "../workloop-store" }
