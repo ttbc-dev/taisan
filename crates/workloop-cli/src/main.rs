@@ -1273,13 +1273,14 @@ fn parse_init_repo(spec: &str) -> Result<InitRepository, String> {
 }
 
 /// `<role>:<actor>:<credential-ref>` — the credential reference keeps
-/// its own `:` separators (`env:NAME`, `file:/abs/path`).
+/// its own `:` separators (`env:NAME`, `file:/abs/path`). The refusal
+/// never echoes the argument: a malformed spec may carry a pasted
+/// secret, and usage errors land in captured logs.
 fn parse_init_role(spec: &str) -> Result<InitRole, String> {
     let error = || {
-        format!(
-            "--role '{spec}': expected <role>:<actor>:<credential-ref> \
-             (e.g. publication:my-bot:env:TAISAN_GH_TOKEN)"
-        )
+        "--role: expected <role>:<actor>:<credential-ref> \
+         (e.g. publication:my-bot:env:TAISAN_GH_TOKEN)"
+            .to_string()
     };
     let mut parts = spec.splitn(3, ':');
     let role = parts.next().unwrap_or_default();

@@ -313,51 +313,140 @@ enum BoundedRun {
     SpawnFailed(String),
 }
 
-/// Run `argv` with no shell, capturing stdout, bounded by
-/// [`PREFLIGHT_COMMAND_TIMEOUT`]. stdin and stderr are discarded — a
-/// credential provider's output never reaches the report; only its exit
-/// status (existence) or first version line is consumed.
-fn run_bounded(argv: &[String], timeout: Duration) -> BoundedRun {
+/// How much of a child's stdout is retained for the caller. The pipe
+/// is always drained to EOF — a verbose child must never block on a
+/// full pipe — but only this prefix is kept, so a runaway writer
+/// cannot grow the report without bound.
+const BOUNDED_STDOUT_CAP: usize = 1024 * 1024;
+
+/// Ambient variables a scrubbed preflight child may inherit: enough
+/// for the binary to exec and answer `--version`, nothing that can
+/// carry a host credential. `HOME`, token variables, and agent
+/// sockets all stay out — the same boundary the supervisor's
+/// `env_clear` launch applies. Windows process creation needs its
+/// system variables even under `env_clear`.
+const SCRUBBED_ENV_PASSTHROUGH: &[&str] =
+    &["PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "WINDIR"];
+
+/// The environment policy for one bounded run. A `command:` credential
+/// provider resolves under the ambient environment — the same
+/// environment dispatch gives it — while the worker `--version` probe
+/// runs scrubbed so a compromised runtime cannot read host credentials
+/// through a plain `check`.
+enum ChildEnv {
+    Inherited,
+    Scrubbed,
+}
+
+/// Run `argv` with no shell, bounded by `timeout` for the whole run —
+/// process completion and stdout collection share the one deadline.
+/// stdin and stderr are discarded; stdout is drained concurrently so
+/// output beyond pipe capacity cannot deadlock a healthy child, and
+/// only [`BOUNDED_STDOUT_CAP`] bytes are retained. The child leads its
+/// own process group, so the deadline's kill reaches every descendant
+/// still inside it — a helper inheriting stdout cannot stretch the
+/// run past the bound.
+fn run_bounded(argv: &[String], timeout: Duration, env: ChildEnv) -> BoundedRun {
     use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let mut child = match Command::new(&argv[0])
+    let mut command = Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    match env {
+        ChildEnv::Inherited => {}
+        ChildEnv::Scrubbed => {
+            command.env_clear();
+            for name in SCRUBBED_ENV_PASSTHROUGH {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return BoundedRun::SpawnFailed(e.to_string()),
     };
+    // Drain stdout on a helper thread: the parent only polls the
+    // process, so the pipe never fills while the child is running.
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match out.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = BOUNDED_STDOUT_CAP.saturating_sub(kept.len());
+                    if room > 0 {
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
+        }
+        let _ = tx.send(kept);
+    });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_bounded_child(&mut child);
                     return BoundedRun::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_bounded_child(&mut child);
                 return BoundedRun::SpawnFailed(e.to_string());
             }
         }
     };
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout);
+    // The leader exited inside the bound; EOF on its stdout is part of
+    // the same bound. A descendant still holding the pipe open must
+    // not stretch the run — at the deadline its group is killed and
+    // the run reports the timeout.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(stdout) => BoundedRun::Exited {
+            success: status.success(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        },
+        Err(_) => {
+            kill_bounded_child(&mut child);
+            BoundedRun::TimedOut
+        }
     }
-    BoundedRun::Exited {
-        success: status.success(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+}
+
+/// Kill a bounded run's whole process tree. The child was spawned with
+/// `process_group(0)`, so its pid is also its group id and the group
+/// signal reaches every descendant still inside it — the same
+/// containment the handoff runner applies. Non-unix platforms can only
+/// signal the immediate child.
+#[cfg(unix)]
+fn kill_bounded_child(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_bounded_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Classify a `parse_profile` refusal into a stage-1 failure code.
@@ -622,27 +711,29 @@ fn stage_credential_refs(profile: &Profile, options: &CheckOptions) -> Vec<Diagn
                     diagnostics.push(Diagnostic::new(&message.0, &key, message.1));
                 }
             }
-            CredentialProvider::Command { argv } => match run_bounded(&argv, PREFLIGHT_COMMAND_TIMEOUT) {
-                BoundedRun::Exited { success: true, .. } => {}
-                BoundedRun::Exited { success: false, .. } => diagnostics.push(Diagnostic::new(
-                    "credential.unresolvable",
-                    &key,
-                    format!("command: credential provider for role '{role_name}' exited with a non-zero status"),
-                )),
-                BoundedRun::TimedOut => diagnostics.push(Diagnostic::new(
-                    "credential.unresolvable",
-                    &key,
-                    format!(
-                        "command: credential provider for role '{role_name}' did not exit within the {}s preflight bound",
-                        PREFLIGHT_COMMAND_TIMEOUT.as_secs()
-                    ),
-                )),
-                BoundedRun::SpawnFailed(detail) => diagnostics.push(Diagnostic::new(
-                    "credential.unresolvable",
-                    &key,
-                    format!("command: credential provider for role '{role_name}' could not be started ({detail})"),
-                )),
-            },
+            CredentialProvider::Command { argv } => {
+                match run_bounded(&argv, PREFLIGHT_COMMAND_TIMEOUT, ChildEnv::Inherited) {
+                    BoundedRun::Exited { success: true, .. } => {}
+                    BoundedRun::Exited { success: false, .. } => diagnostics.push(Diagnostic::new(
+                        "credential.unresolvable",
+                        &key,
+                        format!("command: credential provider for role '{role_name}' exited with a non-zero status"),
+                    )),
+                    BoundedRun::TimedOut => diagnostics.push(Diagnostic::new(
+                        "credential.unresolvable",
+                        &key,
+                        format!(
+                            "command: credential provider for role '{role_name}' did not exit within the {}s preflight bound",
+                            PREFLIGHT_COMMAND_TIMEOUT.as_secs()
+                        ),
+                    )),
+                    BoundedRun::SpawnFailed(detail) => diagnostics.push(Diagnostic::new(
+                        "credential.unresolvable",
+                        &key,
+                        format!("command: credential provider for role '{role_name}' could not be started ({detail})"),
+                    )),
+                }
+            }
         }
     }
     diagnostics
@@ -654,7 +745,7 @@ fn stage_credential_refs(profile: &Profile, options: &CheckOptions) -> Vec<Diagn
 /// the exact rule are always named via the caller's key.
 #[cfg(unix)]
 fn file_slot_exists(path: &Path) -> Result<(), (String, String)> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -675,6 +766,15 @@ fn file_slot_exists(path: &Path) -> Result<(), (String, String)> {
         return Err((
             "credential.unresolvable".into(),
             "file: credential slot is not a regular file".into(),
+        ));
+    }
+    // The same ownership contract `read_credential_file` enforces at
+    // dispatch: a foreign-owned file can never resolve, so preflight
+    // must not pass it on permission bits alone.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err((
+            "credential.unresolvable".into(),
+            "file: credential slot is not owned by the current user — dispatch refuses foreign-owned files".into(),
         ));
     }
     let mode = metadata.permissions().mode();
@@ -770,8 +870,8 @@ fn stage_paths(config_path: &Path, state_root: &Path, workspace_root: &Path) -> 
 /// metadata only, so the inspection itself never writes.
 #[cfg(unix)]
 fn directory_usable(path: &Path) -> Result<(), (String, String)> {
-    use std::os::unix::fs::PermissionsExt;
-    let writable = |dir: &Path, code_on_failure: &'static str| -> Result<(), (String, String)> {
+    use std::os::unix::ffi::OsStrExt;
+    let usable = |dir: &Path, code_on_failure: &'static str| -> Result<(), (String, String)> {
         let metadata = match std::fs::metadata(dir) {
             Ok(metadata) => metadata,
             Err(e) => return Err((code_on_failure.into(), format!("{}: {e}", dir.display()))),
@@ -782,23 +882,37 @@ fn directory_usable(path: &Path) -> Result<(), (String, String)> {
                 format!("{} exists but is not a directory", dir.display()),
             ));
         }
-        if metadata.permissions().mode() & 0o200 == 0 {
+        // access(2) asks the kernel whether THIS process can write and
+        // search the directory — real uid/gid, supplementary groups,
+        // and ACLs included. Owner mode bits cannot answer that: a
+        // foreign-owned 0755 directory looks writable to its owner and
+        // a 0666 directory lacks the search permission creation needs.
+        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
             return Err((
                 code_on_failure.into(),
-                format!("{} is not owner-writable", dir.display()),
+                format!("{}: path cannot be checked", dir.display()),
+            ));
+        };
+        if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+            return Err((
+                code_on_failure.into(),
+                format!(
+                    "{} is not writable and searchable by the current process",
+                    dir.display()
+                ),
             ));
         }
         Ok(())
     };
     if path.exists() {
-        return writable(path, "paths.unwritable");
+        return usable(path, "paths.unwritable");
     }
     // Absent: creatable when the nearest existing ancestor is a usable
     // directory. The check itself creates nothing.
     let mut ancestor = path.parent();
     while let Some(dir) = ancestor {
         if dir.exists() {
-            return writable(dir, "paths.not_creatable").map_err(|(code, message)| {
+            return usable(dir, "paths.not_creatable").map_err(|(code, message)| {
                 (
                     code,
                     format!("{message} — the missing root below it is not creatable"),
@@ -957,8 +1071,18 @@ fn stage_worker_runtime(profile: &Profile, options: &CheckOptions) -> Vec<Diagno
     let mut version_argv = vec![resolved.to_string_lossy().into_owned()];
     version_argv.extend(profile.worker.argv.iter().skip(1).cloned());
     version_argv.push("--version".into());
-    let stdout = match run_bounded(&version_argv, PREFLIGHT_COMMAND_TIMEOUT) {
-        BoundedRun::Exited { stdout, .. } => stdout,
+    let stdout = match run_bounded(&version_argv, PREFLIGHT_COMMAND_TIMEOUT, ChildEnv::Scrubbed) {
+        BoundedRun::Exited {
+            success: true,
+            stdout,
+        } => stdout,
+        BoundedRun::Exited { success: false, .. } => {
+            return vec![Diagnostic::new(
+                "runtime.version_unknown",
+                "worker.runtime_version",
+                "the runtime's --version command exited with a non-zero status",
+            )];
+        }
         BoundedRun::TimedOut => {
             return vec![Diagnostic::new(
                 "runtime.version_unknown",
@@ -1086,6 +1210,22 @@ fn stage_store(store_path: &Path) -> Vec<Diagnostic> {
     let version = i64::from(u32::from_be_bytes([
         header[60], header[61], header[62], header[63],
     ]));
+    // A WAL-mode store keeps committed writes in `<store>-wal` until a
+    // checkpoint lands them in the main file, so the header's version
+    // and page count are stale exactly while committed frames are
+    // pending — a live initialized store would read as unversioned.
+    // Inspect the WAL's committed prefix instead: reads only, so the
+    // no-local-writes rule is unchanged.
+    let (page_count, version) = match wal_store_facts(store_path, &header) {
+        Ok(Some(facts)) => (
+            facts.committed_pages.unwrap_or(page_count),
+            facts.page1_user_version.unwrap_or(version),
+        ),
+        Ok(None) => (page_count, version),
+        Err(message) => {
+            return vec![Diagnostic::new("store.unreadable", &display, message)];
+        }
+    };
     if version == 0 {
         if page_count == 0 {
             return Vec::new(); // fresh header-only database
@@ -1110,6 +1250,176 @@ fn read_store_header(path: &Path, buffer: &mut [u8; 100]) -> std::io::Result<usi
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     file.read(buffer)
+}
+
+/// WAL on-disk constants (SQLite file format): the magic's low bit
+/// selects the checksum byte order, and every multi-byte field is
+/// stored big-endian.
+const WAL_MAGIC_LITTLE_ENDIAN: u32 = 0x377f_0682;
+const WAL_MAGIC_BIG_ENDIAN: u32 = 0x377f_0683;
+const WAL_FORMAT_VERSION: u32 = 3_007_000;
+const WAL_HEADER_LEN: usize = 32;
+const WAL_FRAME_HEADER_LEN: usize = 24;
+
+/// What the committed prefix of `<store>-wal` proves about the store.
+/// `None` fields leave the main-file header authoritative.
+struct WalFacts {
+    /// Database size in pages after the newest commit frame.
+    committed_pages: Option<u32>,
+    /// `user_version` recovered from the newest committed page-1
+    /// image — the stamp lives in page 1 alone, so only a committed
+    /// page-1 frame can make the main header's copy stale.
+    page1_user_version: Option<i64>,
+}
+
+fn wal_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes[..4].try_into().expect("4-byte field"))
+}
+
+/// The WAL cumulative checksum: each u32 pair folds as
+/// `s1 += x0 + s2; s2 += x1 + s1` (the second sum sees the updated
+/// `s1`), with words read big- or little-endian as the magic selects.
+fn wal_checksum(s1: &mut u32, s2: &mut u32, data: &[u8], big_endian: bool) {
+    for pair in data.as_chunks::<8>().0 {
+        let read = |bytes: &[u8]| {
+            if big_endian {
+                u32::from_be_bytes(bytes[..4].try_into().expect("4-byte word"))
+            } else {
+                u32::from_le_bytes(bytes[..4].try_into().expect("4-byte word"))
+            }
+        };
+        let (x0, x1) = (read(&pair[..4]), read(&pair[4..]));
+        *s1 = s1.wrapping_add(x0).wrapping_add(*s2);
+        *s2 = s2.wrapping_add(x1).wrapping_add(*s1);
+    }
+}
+
+/// Read the committed prefix of `<store>-wal` when `header` marks the
+/// database WAL-mode (format bytes 18/19). Returns `Ok(None)` when
+/// there is nothing committed in the WAL — the main header is then
+/// authoritative — and `Err` when the WAL cannot be inspected: the
+/// stage reports the check as unavailable rather than trusting a
+/// possibly stale header.
+fn wal_store_facts(store_path: &Path, header: &[u8; 100]) -> Result<Option<WalFacts>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if header[18] != 2 || header[19] != 2 {
+        return Ok(None);
+    }
+    let mut wal_name = store_path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = PathBuf::from(wal_name);
+    let fail = |reason: &str| format!("write-ahead log {}: {reason}", wal_path.display());
+    let mut file = match std::fs::File::open(&wal_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(fail(&e.to_string())),
+    };
+    let len = file.metadata().map_err(|e| fail(&e.to_string()))?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    if len < WAL_HEADER_LEN as u64 {
+        return Err(fail("the header is truncated"));
+    }
+    let mut wal_header = [0u8; WAL_HEADER_LEN];
+    file.read_exact(&mut wal_header)
+        .map_err(|e| fail(&e.to_string()))?;
+    let big_endian = match wal_u32(&wal_header[0..4]) {
+        WAL_MAGIC_LITTLE_ENDIAN => false,
+        WAL_MAGIC_BIG_ENDIAN => true,
+        _ => return Err(fail("unknown format")),
+    };
+    if wal_u32(&wal_header[4..8]) != WAL_FORMAT_VERSION {
+        return Err(fail("unknown format version"));
+    }
+    let page_size = wal_u32(&wal_header[8..12]);
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Err(fail("invalid page size"));
+    }
+    let (salt1, salt2) = (wal_u32(&wal_header[16..20]), wal_u32(&wal_header[20..24]));
+    let (mut s1, mut s2) = (0u32, 0u32);
+    wal_checksum(&mut s1, &mut s2, &wal_header[..24], big_endian);
+    if s1 != wal_u32(&wal_header[24..28]) || s2 != wal_u32(&wal_header[28..32]) {
+        return Err(fail("header checksum mismatch"));
+    }
+    let generation_header = wal_header;
+
+    // Walk the frames: salts identify the current WAL generation and
+    // the cumulative checksum marks the committed prefix — a torn
+    // tail or foreign generation simply ends the scan, exactly as a
+    // SQLite reader treats it.
+    let page_len = page_size as usize;
+    let frame_len = WAL_FRAME_HEADER_LEN + page_len;
+    let mut frame_header = [0u8; WAL_FRAME_HEADER_LEN];
+    let mut page = vec![0u8; page_len];
+    let mut offset = WAL_HEADER_LEN as u64;
+    let mut pending_page1 = None;
+    let mut committed_page1 = None;
+    let mut committed_pages = None;
+    while offset + frame_len as u64 <= len {
+        if file.read_exact(&mut frame_header).is_err() {
+            break;
+        }
+        if wal_u32(&frame_header[8..12]) != salt1 || wal_u32(&frame_header[12..16]) != salt2 {
+            break;
+        }
+        if file.read_exact(&mut page).is_err() {
+            break;
+        }
+        wal_checksum(&mut s1, &mut s2, &frame_header[..8], big_endian);
+        wal_checksum(&mut s1, &mut s2, &page, big_endian);
+        if s1 != wal_u32(&frame_header[16..20]) || s2 != wal_u32(&frame_header[20..24]) {
+            break;
+        }
+        if wal_u32(&frame_header[0..4]) == 1 {
+            pending_page1 = Some(offset + WAL_FRAME_HEADER_LEN as u64);
+        }
+        let n_truncate = wal_u32(&frame_header[4..8]);
+        if n_truncate != 0 {
+            if let Some(image) = pending_page1.take() {
+                committed_page1 = Some(image);
+            }
+            committed_pages = Some(n_truncate);
+        }
+        offset += frame_len as u64;
+    }
+
+    // The facts are only meaningful for the generation the scan
+    // started in: a checkpoint restarting the WAL mid-scan rewrote the
+    // header, and the checkpoint also means the main header is current
+    // again — discard and let it speak.
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut wal_header))
+        .map_err(|e| fail(&e.to_string()))?;
+    if wal_header != generation_header {
+        return Ok(None);
+    }
+
+    // Recover `user_version` from the newest committed page-1 image.
+    // A committed page always opens with the database magic; anything
+    // else means the WAL shifted under the scan after all.
+    let page1_user_version = match committed_page1 {
+        Some(image_offset) => {
+            let mut image_head = [0u8; 64];
+            file.seek(SeekFrom::Start(image_offset))
+                .and_then(|_| file.read_exact(&mut image_head))
+                .map_err(|e| fail(&e.to_string()))?;
+            if image_head[..16] != SQLITE_MAGIC[..] {
+                return Err(fail("a committed page-1 image is not a database page"));
+            }
+            Some(i64::from(u32::from_be_bytes([
+                image_head[60],
+                image_head[61],
+                image_head[62],
+                image_head[63],
+            ])))
+        }
+        None => None,
+    };
+    Ok(Some(WalFacts {
+        committed_pages,
+        page1_user_version,
+    }))
 }
 
 /// Stage (8), `--probe` only: read-only identity and capability reads
@@ -1917,5 +2227,81 @@ mod tests {
         assert_eq!(observed_version("v10.2.3rc1"), Some((10, 2, 3)));
         assert_eq!(observed_version("no version here"), None);
         assert_eq!(observed_version("3.14"), None);
+    }
+
+    /// A child writing far beyond pipe capacity still exits inside the
+    /// bound: stdout is drained while the process runs, never only
+    /// after it exits.
+    #[test]
+    fn bounded_runs_drain_output_beyond_pipe_capacity() {
+        let run = run_bounded(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "head -c 262144 /dev/zero | tr '\\0' 'a'".into(),
+            ],
+            Duration::from_secs(10),
+            ChildEnv::Inherited,
+        );
+        match run {
+            BoundedRun::Exited { success, stdout } => {
+                assert!(success);
+                assert_eq!(stdout.len(), 262_144);
+            }
+            other => panic!("expected a clean exit, got {}", run_name(&other)),
+        }
+    }
+
+    /// A leader that exits while a descendant keeps stdout open cannot
+    /// stretch the run past the deadline — the whole process group is
+    /// killed when the bound elapses.
+    #[test]
+    fn bounded_runs_reap_descendants_holding_stdout_at_the_deadline() {
+        let start = Instant::now();
+        let run = run_bounded(
+            &["sh".into(), "-c".into(), "sleep 30 & exit 0".into()],
+            Duration::from_millis(500),
+            ChildEnv::Inherited,
+        );
+        assert!(matches!(run, BoundedRun::TimedOut));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the run ended at its bound, not the descendant's"
+        );
+    }
+
+    /// The scrubbed environment carries only the passthrough names —
+    /// `HOME` and anything credential-bearing stays out — while an
+    /// inherited run sees the ambient environment, matching what
+    /// dispatch gives a `command:` provider.
+    #[test]
+    fn bounded_runs_scrub_the_probe_environment() {
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+        let Some(home) = home else {
+            return; // no ambient HOME to distinguish the policies
+        };
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf %s \"${HOME:-unset}\"".into(),
+        ];
+        match run_bounded(&argv, Duration::from_secs(5), ChildEnv::Scrubbed) {
+            BoundedRun::Exited { stdout, .. } => assert_eq!(stdout, "unset"),
+            other => panic!("expected a clean exit, got {}", run_name(&other)),
+        }
+        match run_bounded(&argv, Duration::from_secs(5), ChildEnv::Inherited) {
+            BoundedRun::Exited { stdout, .. } => {
+                assert_eq!(stdout, home.to_string_lossy())
+            }
+            other => panic!("expected a clean exit, got {}", run_name(&other)),
+        }
+    }
+
+    fn run_name(run: &BoundedRun) -> &'static str {
+        match run {
+            BoundedRun::Exited { .. } => "exited",
+            BoundedRun::TimedOut => "timed out",
+            BoundedRun::SpawnFailed(_) => "spawn failed",
+        }
     }
 }

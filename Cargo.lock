@@ -684,11 +684,13 @@ dependencies = [
 name = "workloop-config"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "toml",
  "workloop-core",
  "workloop-selector",
+ "workloop-store",
 ]
 
 [[package]]

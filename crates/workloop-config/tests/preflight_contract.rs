@@ -1768,3 +1768,123 @@ fn store_header_classification_covers_fresh_unversioned_and_newer_formats() {
     }
     let _ = std::fs::remove_dir_all(&setup.dir);
 }
+
+/// Stage (7): a live WAL-mode store — initialized but not yet
+/// checkpointed — is classified from its committed WAL prefix, never
+/// misread as an unversioned archive. `check` still writes nothing:
+/// the store connection stays open and no store file is created,
+/// journaled, or migrated by the inspection.
+#[test]
+fn a_live_wal_store_is_classified_from_its_committed_frames() {
+    let setup = clean_setup("store-wal", 1_763_000_000);
+    std::fs::create_dir_all(&setup.state).unwrap();
+    let store_path = setup.state.join("store.db");
+    // Open and initialize the real store, then keep the connection
+    // alive: the bootstrap commit sits in the WAL and the main-file
+    // header still reads version 0 until the first checkpoint.
+    let store =
+        workloop_store::sqlite::SqliteStore::open(&store_path, 1).expect("the store initializes");
+    let wal_path = setup.state.join("store.db-wal");
+    assert!(
+        wal_path.exists(),
+        "an open WAL store keeps its write-ahead log"
+    );
+
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        options.store_path = Some(store_path.clone());
+        check(&setup.config, &mut options)
+    };
+    assert!(
+        report.success,
+        "a live WAL store must not read as unversioned: {report:?}"
+    );
+
+    // The inspection itself wrote nothing: the WAL is still there and
+    // the main file was never checkpointed by `check`.
+    assert!(wal_path.exists(), "check never checkpoints the store");
+    drop(store);
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
+
+/// Stage (5): a `--version` command that prints a satisfying version
+/// but exits non-zero cannot satisfy the pin — the failed probe is
+/// `runtime.version_unknown`, never a pass.
+#[test]
+fn a_failed_version_command_cannot_satisfy_the_pin() {
+    use std::os::unix::fs::PermissionsExt;
+    let setup = clean_setup("runtime-exit-fail", 1_763_000_000);
+    let script = setup.dir.join("version-fail.sh");
+    std::fs::write(&script, "#!/bin/sh\necho 9.9.9\nexit 1\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut text = std::fs::read_to_string(&setup.config).unwrap();
+    text.push_str(&format!(
+        "\n[worker]\nargv = [\"{}\"]\nruntime_version = \">=9.0.0\"\n\
+         isolation_profile = \"fixture-worker-v0.1\"\n",
+        script.display()
+    ));
+    std::fs::write(&setup.config, &text).unwrap();
+
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        check(&setup.config, &mut options)
+    };
+    assert!(!report.success);
+    let diagnostics = failed(&report, CheckStage::WorkerRuntime);
+    assert_eq!(diagnostics[0].code, "runtime.version_unknown");
+    assert_eq!(diagnostics[0].key, "worker.runtime_version");
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
+
+/// Stage (4): writability and searchability are judged by the
+/// process's effective access, not the directory owner's mode bits —
+/// a directory this process cannot search and write fails even when
+/// its owner bits look permissive.
+#[test]
+fn directories_without_effective_access_fail_the_paths_stage() {
+    use std::os::unix::fs::PermissionsExt;
+    let setup = clean_setup("paths-effective", 1_763_000_000);
+
+    // An existing state root the process cannot search (0666: read and
+    // write for all, execute for none) is unwritable for our purposes.
+    std::fs::create_dir_all(&setup.state).unwrap();
+    std::fs::set_permissions(&setup.state, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        check(&setup.config, &mut options)
+    };
+    std::fs::set_permissions(&setup.state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!report.success);
+    let diagnostics = failed(&report, CheckStage::Paths);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "paths.unwritable"),
+        "a non-searchable root is unwritable: {diagnostics:?}"
+    );
+
+    // A missing state root beneath a non-searchable parent is not
+    // creatable — owner mode bits cannot grant what the kernel denies.
+    let parent = setup.dir.join("noexec");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let state = parent.join("state");
+    let report = {
+        let mut options = CheckOptions::new(&state);
+        options.env_lookup = &env_present;
+        check(&setup.config, &mut options)
+    };
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!report.success);
+    let diagnostics = failed(&report, CheckStage::Paths);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "paths.not_creatable"),
+        "a missing root under a non-searchable parent is not creatable: {diagnostics:?}"
+    );
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
