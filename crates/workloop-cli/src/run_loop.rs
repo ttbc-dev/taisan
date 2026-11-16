@@ -615,8 +615,8 @@ pub fn run_pass(
                         .map(|id| format!("{}:sweep_conflict", id.0))
                         .collect();
                     p.reason = Some(format!(
-                        "stops_recorded={} terminal_failures={}",
-                        r.stops_recorded, r.terminal_failures
+                        "stops_recorded={} terminal_failures={} completed={}",
+                        r.stops_recorded, r.terminal_failures, r.completed
                     ));
                     p
                 }
