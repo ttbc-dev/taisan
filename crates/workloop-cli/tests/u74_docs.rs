@@ -156,6 +156,12 @@ const STEP_TRANSCRIPT_PINS: &[(&str, &[&[&str]])] = &[
             &["$ ls -la", "SKILL.md"],
             &[
                 "--idempotency-key clean-install-1",
+                "--intent",
+                "--constraint",
+                "--verification",
+                "--issue 0123456789:42",
+                "--issue-revision",
+                "--issue-digest",
                 "\"kind\": \"submit\"",
                 "\"work_id\": \"w-1\"",
             ],
@@ -358,6 +364,53 @@ fn walkthrough_content_pins_reject_deleted_or_rewritten_recovery_transcripts() {
         assert_step_section_carries_its_transcripts("recovery", &heading, &rewritten)
     })
     .expect_err("a rewritten recovered work_id must fail the content pins");
+}
+
+/// The finding scenario: `run`'s terminal result is the unpaginated
+/// full work list, so at its capture position — before the fresh-key
+/// submit queues `w-3` — the envelope lists exactly `w-1` and `w-2`
+/// with the captured `as_of`. Displayed after the fresh-key submit it
+/// would be impossible (three Works, a later sequence), so the block
+/// must precede the fresh-key transcript and must not list `w-3`.
+#[test]
+fn walkthrough_run_transcript_lists_only_the_works_recorded_before_the_fresh_key_submit() {
+    let doc = include_str!("../../../docs/skill-walkthrough.md");
+    let secs = sections(doc);
+    let (_, body) = secs
+        .iter()
+        .find(|(h, _)| h.to_ascii_lowercase().contains("recovery"))
+        .expect("walkthrough has a recovery section");
+    let run_pos = body
+        .find("run --once")
+        .expect("the recovery section carries the run transcript");
+    let fresh_pos = body
+        .find("--idempotency-key walkthrough-recover-2")
+        .expect("the recovery section carries the fresh-key transcript");
+    assert!(
+        run_pos < fresh_pos,
+        "the run transcript must precede the fresh-key submit — its envelope is the \
+         full work list, captured while the store still holds only w-1 and w-2"
+    );
+    let run_block = fenced_blocks(body)
+        .iter()
+        .find(|b| b.contains("run --once"))
+        .expect("the run transcript sits in a fenced block")
+        .clone();
+    for marker in [
+        "\"work_id\": \"w-1\"",
+        "\"work_id\": \"w-2\"",
+        "\"as_of\": 16",
+    ] {
+        assert!(
+            run_block.contains(marker),
+            "the run envelope carries {marker}: {run_block}"
+        );
+    }
+    assert!(
+        !run_block.contains("\"work_id\": \"w-3\""),
+        "the run envelope must not list w-3 — the fresh-key submit queues it only \
+         after this pass: {run_block}"
+    );
 }
 
 // ---- Evidence label check ----
