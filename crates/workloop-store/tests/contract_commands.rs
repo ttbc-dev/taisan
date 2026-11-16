@@ -86,6 +86,14 @@ fn config_with_budget(budget: ExecutionBudget) -> WorkloopConfig {
     WorkloopConfig { budget, ..config() }
 }
 
+/// Run one recovery-scheduling pass at `at`: due intents fire, others
+/// stay pending.
+fn fire_due_recovery(store: &SqliteStore, at: i64) {
+    let mut clock = || at;
+    workloop_core::work::consume_due_recovery_intents(store, &config(), &mut clock, None, None, 16)
+        .unwrap();
+}
+
 fn actor() -> Actor {
     Actor {
         kind: ActorKind::Human,
@@ -3991,7 +3999,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6, "the upgrade lands on the current format");
+        assert_eq!(version, 7, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4803,7 +4811,9 @@ fn an_applied_push_retry_advances_the_chain() {
             .unwrap()
     };
     assert_eq!(pushes(&store).len(), 1);
-    // First push fails definitively: the receipt re-issues a retry.
+    // First push fails definitively: the receipt schedules a persisted
+    // retry intent on the transport backoff — never an immediate
+    // re-issue — and the due intent performs it.
     emit(ObservationFact::HostActionResult {
         action_id: pushes(&store)[0].action_id.clone(),
         authenticated_actor: Some(publisher()),
@@ -4812,8 +4822,18 @@ fn an_applied_push_retry_advances_the_chain() {
         },
         effects: vec![],
     });
+    assert_eq!(
+        pushes(&store).len(),
+        1,
+        "no re-issue before the persisted backoff elapses"
+    );
+    fire_due_recovery(&store, NOW + 10);
     let retry = pushes(&store);
-    assert_eq!(retry.len(), 2, "the failed push re-issues under the bound");
+    assert_eq!(
+        retry.len(),
+        2,
+        "the due retry intent re-issues the failed push"
+    );
     // The retry's applied receipt advances the chain — the old failed
     // intent must not pin stage 1 open forever.
     emit(ObservationFact::HostActionResult {
@@ -4966,8 +4986,13 @@ fn a_delayed_older_branch_read_never_degrades_the_reissue_guard() {
         },
         NOW,
     );
+    fire_due_recovery(&store, NOW + 10);
     let retry = pushes(&store);
-    assert_eq!(retry.len(), 2, "the failed push re-issues under the bound");
+    assert_eq!(
+        retry.len(),
+        2,
+        "the due retry intent re-issues the failed push"
+    );
     match &retry[1].action {
         HostAction::PushRef { expected_prior, .. } => {
             assert_eq!(
@@ -5001,8 +5026,13 @@ fn a_delayed_older_branch_read_never_degrades_the_reissue_guard() {
         },
         NOW,
     );
+    fire_due_recovery(&store, NOW + 30);
     let retry2 = pushes(&store);
-    assert_eq!(retry2.len(), 3, "the second failure also re-issues");
+    assert_eq!(
+        retry2.len(),
+        3,
+        "the second failure also re-issues on its due intent"
+    );
     match &retry2[2].action {
         HostAction::PushRef { expected_prior, .. } => {
             assert_eq!(
@@ -5343,7 +5373,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6, "the upgrade lands on the current format");
+        assert_eq!(version, 7, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

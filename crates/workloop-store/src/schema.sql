@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS work_usage (
     automatic_seconds_used INTEGER NOT NULL DEFAULT 0,
     first_dispatch_unix_seconds INTEGER,
     last_progress_unix_seconds INTEGER,
-    human_wait_seconds_total INTEGER NOT NULL DEFAULT 0
+    human_wait_seconds_total INTEGER NOT NULL DEFAULT 0,
+    last_progress_basis TEXT
 );
 
 CREATE TABLE IF NOT EXISTS executions (

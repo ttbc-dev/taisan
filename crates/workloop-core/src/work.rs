@@ -20,7 +20,10 @@ use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, Outcome, ProcessStateFact, RefRelation,
 };
-use crate::store::{Effect, HostAction, HostActionIntent, ReadView, Store, StoreError, TxView};
+use crate::store::{
+    Effect, HostAction, HostActionIntent, ReadView, RecoveryIntent, RecoveryIntentState, Store,
+    StoreError, TxView,
+};
 
 /// The resolved installation binding template: which host installation,
 /// repository, adapter contract, and role actors every accepted Work
@@ -2242,6 +2245,47 @@ pub fn admit_queued_role(
     Ok(Some(next))
 }
 
+/// The persisted wait for a transport retry attempt (1-indexed): the
+/// Work's configured schedule, the last entry repeating when attempts
+/// exceed the list.
+fn transport_backoff_seconds(policy: &WorkPolicy, attempt: u32) -> u64 {
+    let schedule = &policy.transport_backoff_seconds;
+    schedule
+        .get(attempt.saturating_sub(1) as usize)
+        .or_else(|| schedule.last())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Persist one `recovery_intents` row inside the deciding transaction —
+/// written before any pass can act on it, so a crash between the
+/// decision and the action can never lose or double-fire the schedule.
+fn schedule_recovery_intent(
+    tx: &mut dyn TxView,
+    work: &Work,
+    execution_id: Option<&ExecutionId>,
+    kind: &str,
+    due_at_unix_seconds: i64,
+    evidence_basis: &str,
+) -> Result<(), StoreError> {
+    let scheduled_seq = tx.alloc_seq()?;
+    let intent_id = tx.alloc_id("ri")?;
+    tx.apply(&Effect::InsertRecoveryIntent {
+        intent: RecoveryIntent {
+            intent_id,
+            work_id: work.id.clone(),
+            execution_id: execution_id.cloned(),
+            kind: kind.into(),
+            due_at_unix_seconds,
+            generation: work.version,
+            evidence_basis: evidence_basis.into(),
+            state: RecoveryIntentState::Pending,
+            retirement_reason: None,
+            scheduled_seq,
+        },
+    })
+}
+
 /// Pause an Execution for a repairable hold, recording the typed
 /// prerequisites and the immutable recovery decision.
 ///
@@ -2251,6 +2295,12 @@ pub fn admit_queued_role(
 /// to `paused` only after writer-stop proof releases the slot. The pause
 /// reason and prerequisites are persisted on the row now so the settle
 /// lands on the recorded continuation.
+///
+/// Every repair pause also schedules its potential `requeue` in the
+/// same deciding transaction — persisted before any recovery pass acts
+/// on it. The firing guards decide whether it ever runs: an explicit
+/// hold keeps it `pending`, unmet prerequisites hold it, terminal
+/// evidence retires it.
 fn pause_for_repair(
     tx: &mut dyn TxView,
     execution: &Execution,
@@ -2316,6 +2366,24 @@ fn pause_for_repair(
             seq,
         },
     })?;
+    // The pause's potential recovery is scheduled in the same deciding
+    // transaction — the requeue intent is persisted before any pass can
+    // act on it. It is due immediately; the firing guards decide
+    // whether it ever consumes — an explicit hold keeps it `pending`,
+    // unmet prerequisites hold it, terminal evidence retires it.
+    let work = tx
+        .work(&execution.work_id)?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "execution without work".into(),
+        })?;
+    schedule_recovery_intent(
+        tx,
+        &work,
+        Some(&execution.id),
+        "requeue",
+        now_unix_seconds,
+        classification,
+    )?;
     Ok(None)
 }
 
@@ -2484,14 +2552,15 @@ fn assess(
         seal_round(tx, obs, work_id, now_unix_seconds)?;
     }
     // Material progress resets the equivalent-failure streak and stamps
-    // the no-progress clock.
-    if is_material_progress(&obs.fact)
+    // the no-progress clock with its durable basis.
+    if let Some(basis) = material_progress_basis(&obs.fact)
         && let Some(work_id) = &obs.subject_work_id
     {
         let mut usage = tx
             .work_usage(work_id)?
             .unwrap_or_else(|| WorkUsage::new(work_id));
         usage.last_progress_unix_seconds = Some(now_unix_seconds);
+        usage.last_progress_basis = Some(basis);
         usage.equivalent_failure_streak = 0;
         usage.equivalent_signature = None;
         tx.apply(&Effect::UpdateWorkUsage { usage })?;
@@ -2601,7 +2670,8 @@ fn assess(
                         .work_usage(&execution.work_id)?
                         .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
                     usage.transport_retries_used += 1;
-                    let over = usage.transport_retries_used > work.policy.transport_max_retries;
+                    let attempt = usage.transport_retries_used;
+                    let over = attempt > work.policy.transport_max_retries;
                     tx.apply(&Effect::UpdateWorkUsage { usage })?;
                     if over {
                         pause_for_repair(
@@ -2612,6 +2682,25 @@ fn assess(
                             vec![RepairPrerequisite::OperatorDecision],
                             now_unix_seconds,
                         )?;
+                    } else {
+                        // Persisted backoff: the retry intent is written
+                        // in this deciding transaction, before any
+                        // re-issue acts on it — `maybe_publish` defers
+                        // to the scheduled wait instead of re-issuing
+                        // immediately. The observed failure classifies to
+                        // its `recovery.*` budget key, which the intent
+                        // records as its evidence basis.
+                        if let Some(class) = classify_failure(&obs.fact) {
+                            schedule_recovery_intent(
+                                tx,
+                                &work,
+                                Some(&execution.id),
+                                "retry",
+                                now_unix_seconds
+                                    + transport_backoff_seconds(&work.policy, attempt) as i64,
+                                class.budget_key(),
+                            )?;
+                        }
                     }
                 }
             }
@@ -2958,22 +3047,80 @@ fn is_authorization_verdict(reason: &str) -> bool {
     reason == "denied" || reason == "ineligible"
 }
 
-/// Whether the fact marks material progress (a valid artifact, a
-/// passing check, a landed effect).
-fn is_material_progress(fact: &ObservationFact) -> bool {
-    matches!(
-        fact,
+/// The durable basis an observed fact commits as material progress —
+/// the recovery-policy progress definition: an accepted artifact, a
+/// required check now passing, or an unknown effect resolved. Log
+/// volume and new commits alone never count.
+pub fn material_progress_basis(fact: &ObservationFact) -> Option<MaterialProgressBasis> {
+    match fact {
         ObservationFact::Artifact {
             state: ArtifactFact::Present { .. },
             ..
-        } | ObservationFact::Check {
+        } => Some(MaterialProgressBasis::AcceptedArtifact),
+        ObservationFact::Check {
             conclusion: CheckConclusion::Success,
             ..
-        } | ObservationFact::HostActionResult {
+        } => Some(MaterialProgressBasis::CheckNowPassing),
+        ObservationFact::HostActionResult {
             status: HostActionStatus::Applied,
             ..
+        } => Some(MaterialProgressBasis::UnknownEffectResolved),
+        _ => None,
+    }
+}
+
+/// The Work's material-progress clock, derived from the durable usage
+/// row. `last_progress_at` is the committed timestamp of the last
+/// material-progress record; a Work with no commit anchors at first
+/// dispatch. A stored signal that cannot be read — a timestamp
+/// without its recorded basis, or one preceding first dispatch — is
+/// `Unknown`: surfaced, never treated as progress or as death.
+pub fn material_progress(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<MaterialProgressSignal, StoreError> {
+    let Some(usage) = tx.work_usage(work_id)? else {
+        return Ok(MaterialProgressSignal::NotStarted);
+    };
+    let first = usage.first_dispatch_unix_seconds;
+    match usage.last_progress_unix_seconds {
+        None => match first {
+            Some(at) => Ok(MaterialProgressSignal::Reading(MaterialProgress {
+                work_id: work_id.clone(),
+                last_progress_at: at,
+                basis: None,
+            })),
+            None => Ok(MaterialProgressSignal::NotStarted),
+        },
+        Some(at) if usage.last_progress_basis.is_some() && first.is_none_or(|f| at >= f) => {
+            Ok(MaterialProgressSignal::Reading(MaterialProgress {
+                work_id: work_id.clone(),
+                last_progress_at: at,
+                basis: usage.last_progress_basis,
+            }))
         }
-    )
+        Some(_) => Ok(MaterialProgressSignal::Unknown),
+    }
+}
+
+/// The observed failure's class — which `recovery.*` budget key the
+/// Work's policy charges. `None` for facts that are not failures and
+/// for terminal verdicts a retry cannot change.
+pub fn classify_failure(fact: &ObservationFact) -> Option<FailureClass> {
+    match fact {
+        ObservationFact::HostActionResult { status, .. } => match status {
+            HostActionStatus::Failed { reason } if !is_authorization_verdict(reason) => {
+                Some(FailureClass::Transport)
+            }
+            HostActionStatus::Unknown { .. } => Some(FailureClass::UnknownEffect),
+            _ => None,
+        },
+        ObservationFact::Check {
+            conclusion: CheckConclusion::Failure,
+            ..
+        } => Some(FailureClass::Repair),
+        _ => None,
+    }
 }
 
 /// Recompute the source gate from the latest authoritative reads.
@@ -3565,6 +3712,19 @@ fn maybe_publish(
     }
     let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
     if !outstanding.is_empty() {
+        return Ok(());
+    }
+    // A pending transport-retry intent owns the next failed-effect
+    // re-issue: an unrelated drive of this chain can never outrun the
+    // persisted backoff. The scheduled intent exists only while some
+    // stage's latest effect is a definite failure, so the chain is
+    // already blocked at that stage.
+    let retry_pending = tx.recovery_intents()?.iter().any(|i| {
+        i.execution_id.as_ref() == Some(&execution.id)
+            && i.state == RecoveryIntentState::Pending
+            && i.kind == "retry"
+    });
+    if retry_pending {
         return Ok(());
     }
     let work = tx
@@ -4631,6 +4791,7 @@ pub struct RecoveryScan {
 /// `Err` and aborts the phase.
 pub fn consume_due_recovery_intents(
     store: &impl Store,
+    config: &WorkloopConfig,
     clock: &mut dyn FnMut() -> i64,
     deadline: Option<i64>,
     scope: Option<&WorkId>,
@@ -4669,15 +4830,15 @@ pub fn consume_due_recovery_intents(
             continue;
         }
         evaluated += 1;
-        if listed.kind != "requeue" {
-            // Only the documented kind fires automatically; anything
+        if !matches!(listed.kind.as_str(), "requeue" | "retry") {
+            // Only the documented kinds fire automatically; anything
             // else waits for its owning slice rather than being guessed.
             scan.held
                 .push((listed.intent_id.clone(), "unsupported_kind".into()));
             continue;
         }
         let intent_id = listed.intent_id.clone();
-        match store.transact(|tx| fire_due_intent(tx, &intent_id, now)) {
+        match store.transact(|tx| fire_due_intent(tx, config, &intent_id, now)) {
             Ok(FireOutcome::Ignored) => {}
             Ok(FireOutcome::Retired) => scan.retired += 1,
             Ok(FireOutcome::Suppressed(reason)) | Ok(FireOutcome::Held(reason)) => {
@@ -4741,10 +4902,11 @@ enum FireOutcome {
 /// happens in `fire_due_intent_inner`.
 fn fire_due_intent(
     tx: &mut dyn TxView,
+    config: &WorkloopConfig,
     intent_id: &str,
     now: i64,
 ) -> Result<FireOutcome, StoreError> {
-    let outcome = fire_due_intent_inner(tx, intent_id, now)?;
+    let outcome = fire_due_intent_inner(tx, config, intent_id, now)?;
     if !matches!(outcome, FireOutcome::Suppressed(_) | FireOutcome::Ignored)
         && let Some(execution_id) = tx
             .recovery_intents()?
@@ -4764,9 +4926,12 @@ fn fire_due_intent(
 /// Re-read one intent inside the firing transaction and apply the
 /// documented revalidation guards before any transition, so a stale
 /// list snapshot can never fire an intent twice or against a state
-/// that changed since the list was taken.
+/// that changed since the list was taken. `consumed` is recorded
+/// before the action the intent gates — within the same transaction —
+/// so a crash can never fire an intent twice.
 fn fire_due_intent_inner(
     tx: &mut dyn TxView,
+    config: &WorkloopConfig,
     intent_id: &str,
     now: i64,
 ) -> Result<FireOutcome, StoreError> {
@@ -4800,6 +4965,23 @@ fn fire_due_intent_inner(
         retire_intent(tx, &intent.intent_id, "execution_terminal")?;
         return Ok(FireOutcome::Retired);
     }
+    match intent.kind.as_str() {
+        "requeue" => fire_requeue_intent(tx, &intent, &execution, now),
+        "retry" => fire_retry_intent(tx, config, &intent, &execution, now),
+        // The outer filter already excluded undocumented kinds; a
+        // kind that arrives here anyway is held, never guessed.
+        _ => Ok(FireOutcome::Held("unsupported_kind".into())),
+    }
+}
+
+/// Fire a due `requeue` intent: re-enter the same `paused` Execution
+/// through the queue when every recorded hold still allows it.
+fn fire_requeue_intent(
+    tx: &mut dyn TxView,
+    intent: &RecoveryIntent,
+    execution: &Execution,
+    now: i64,
+) -> Result<FireOutcome, StoreError> {
     if execution.state != ExecutionState::Paused {
         // Already progressing (queued/ready/running/waiting/stopping/
         // uncertain): a manual resume or another path owns the next
@@ -4842,7 +5024,7 @@ fn fire_due_intent_inner(
         retire_intent(tx, &intent.intent_id, "work_missing")?;
         return Ok(FireOutcome::Retired);
     };
-    let unmet = prerequisites_satisfied(tx, &work, &execution, now)?;
+    let unmet = prerequisites_satisfied(tx, &work, execution, now)?;
     if !unmet.is_empty() {
         return Ok(FireOutcome::Held("prerequisites_unmet".into()));
     }
@@ -4864,49 +5046,108 @@ fn fire_due_intent_inner(
             .is_some_and(|a| a > work.policy.automatic_time_limit_seconds)
     });
     if automatic_exhausted {
+        consume_intent(tx, &intent.intent_id)?;
         fail_terminal(
             tx,
-            &execution,
+            execution,
             "automatic_time_exhausted",
             "Work-wide automatic time limit reached",
         )?;
-        tx.apply(&Effect::UpdateRecoveryIntent {
-            intent_id: intent.intent_id.clone(),
-            state: crate::store::RecoveryIntentState::Consumed,
-            retirement_reason: None,
-        })?;
         return Ok(FireOutcome::Consumed {
             requeued: false,
             failed_terminal: true,
         });
     }
-    if let Some((effects, _seq, _version)) = paused_exhaustion_effects(tx, &work, &execution, now)?
-    {
+    if let Some((effects, _seq, _version)) = paused_exhaustion_effects(tx, &work, execution, now)? {
+        consume_intent(tx, &intent.intent_id)?;
         for effect in &effects {
             tx.apply(effect)?;
         }
-        tx.apply(&Effect::UpdateRecoveryIntent {
-            intent_id: intent.intent_id.clone(),
-            state: crate::store::RecoveryIntentState::Consumed,
-            retirement_reason: None,
-        })?;
         return Ok(FireOutcome::Consumed {
             requeued: false,
             failed_terminal: true,
         });
     }
-    let (effects, _seq, _version) = paused_requeue_effects(tx, &work, &execution, now)?;
+    let (effects, _seq, _version) = paused_requeue_effects(tx, &work, execution, now)?;
+    consume_intent(tx, &intent.intent_id)?;
     for effect in &effects {
         tx.apply(effect)?;
     }
-    tx.apply(&Effect::UpdateRecoveryIntent {
-        intent_id: intent.intent_id.clone(),
-        state: crate::store::RecoveryIntentState::Consumed,
-        retirement_reason: None,
-    })?;
     Ok(FireOutcome::Consumed {
         requeued: true,
         failed_terminal: false,
+    })
+}
+
+/// Fire a due `retry` intent: re-drive the publication chain for a
+/// still-`waiting` Execution so the failed stage effect re-issues on
+/// the persisted backoff. Every guard a `requeue` applies that can
+/// block an automatic action applies here too — an explicit hold and
+/// an active Execution hold the intent, terminal evidence retires it,
+/// and the transport budget is re-checked against the durable counter.
+fn fire_retry_intent(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    intent: &RecoveryIntent,
+    execution: &Execution,
+    now: i64,
+) -> Result<FireOutcome, StoreError> {
+    if execution.state == ExecutionState::Paused {
+        if execution
+            .repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision))
+        {
+            // An explicit human hold: automatic recovery must not
+            // release it, only an operator Command may.
+            return Ok(FireOutcome::Held("operator_hold".into()));
+        }
+        // A repair pause owns the next move; the effect cannot be
+        // re-issued while the Execution is held.
+        return Ok(FireOutcome::Held("execution_paused".into()));
+    }
+    if execution.state != ExecutionState::Waiting {
+        // Progressing or settling elsewhere; the intent stays visible
+        // and pending, never forced.
+        return Ok(FireOutcome::Held("execution_active".into()));
+    }
+    let Some(work) = tx.work(&intent.work_id)? else {
+        retire_intent(tx, &intent.intent_id, "work_missing")?;
+        return Ok(FireOutcome::Retired);
+    };
+    // The transport account is re-checked against the durable counter:
+    // a budget spent after scheduling means the receipt path already
+    // paused for a human — the intent is refused, never consumed.
+    if let Some(usage) = tx.work_usage(&intent.work_id)?
+        && usage.transport_retries_used > work.policy.transport_max_retries
+    {
+        tx.apply(&Effect::RecordDeferral {
+            execution_id: execution.id.clone(),
+            reason: "transport_budget_exhausted".into(),
+            diagnostic: format!(
+                "automatic retry refused: transport retries {} exceed the policy limit {}",
+                usage.transport_retries_used, work.policy.transport_max_retries
+            ),
+        })?;
+        return Ok(FireOutcome::Suppressed("transport_budget_exhausted".into()));
+    }
+    // `consumed` is recorded before the re-issue acts: a crash between
+    // firing and the next receipt can never fire the intent twice.
+    consume_intent(tx, &intent.intent_id)?;
+    maybe_publish(tx, config, execution, now)?;
+    Ok(FireOutcome::Consumed {
+        requeued: false,
+        failed_terminal: false,
+    })
+}
+
+/// Record the intent consumed before the action it gates — the mark
+/// precedes the action inside the same transaction.
+fn consume_intent(tx: &mut dyn TxView, intent_id: &str) -> Result<(), StoreError> {
+    tx.apply(&Effect::UpdateRecoveryIntent {
+        intent_id: intent_id.to_string(),
+        state: crate::store::RecoveryIntentState::Consumed,
+        retirement_reason: None,
     })
 }
 

@@ -247,6 +247,13 @@ pub struct WorkPolicy {
     pub equivalent_failure_limit: u32,
     /// Transport retries for a failed (no-effect) host action.
     pub transport_max_retries: u32,
+    /// The persisted transport retry wait schedule in seconds, indexed
+    /// by retry attempt; the last entry repeats when attempts exceed
+    /// the list. `recovery.transport.backoff_seconds` in the recovery
+    /// policy; rows written before the schedule was tracked decode to
+    /// the documented default.
+    #[serde(default = "default_transport_backoff_seconds")]
+    pub transport_backoff_seconds: Vec<u64>,
     /// Unknown effect outcomes are reconciled for at most this long
     /// before the stage cannot proceed.
     pub effect_reconcile_seconds: u64,
@@ -258,17 +265,126 @@ pub struct WorkPolicy {
     pub automatic_time_limit_seconds: u64,
 }
 
+fn default_transport_backoff_seconds() -> Vec<u64> {
+    vec![10, 30, 90]
+}
+
 impl Default for WorkPolicy {
     fn default() -> Self {
         Self {
             max_fix_invocations: 3,
             equivalent_failure_limit: 2,
             transport_max_retries: 3,
+            transport_backoff_seconds: default_transport_backoff_seconds(),
             effect_reconcile_seconds: 600,
             no_progress_seconds: 1800,
             automatic_time_limit_seconds: 4 * 3600,
         }
     }
+}
+
+/// The failure classes the recovery policy budgets. Each maps an
+/// observed failure to the documented `recovery.*` budget key on the
+/// Work's frozen `WorkPolicy`; the class is fixed, the configured
+/// limits are per-Work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// A definite no-effect host transport failure — bounded retry
+    /// with persisted backoff under `recovery.transport.*`.
+    Transport,
+    /// A lost response or unverified host effect — reconciled under
+    /// `recovery.effect_reconcile_seconds`, never a retry.
+    UnknownEffect,
+    /// A failed required check or actionable review finding — bounded
+    /// fix Invocations under `recovery.max_fix_invocations`.
+    Repair,
+    /// The same normalized failure signature recurring — bounded under
+    /// `recovery.equivalent_failure_limit` (classifier key: stage,
+    /// stable check id, error category, normalized diagnostics).
+    EquivalentFailure,
+    /// No material progress inside the window — `Attention` only under
+    /// `recovery.no_progress_seconds`, never a stop or a retry.
+    NoProgress,
+    /// Cumulative automatic seconds reached the Work-wide ceiling —
+    /// `recovery.automatic_time_limit_seconds`.
+    AutomaticTime,
+}
+
+impl FailureClass {
+    /// The `recovery.*` configuration key whose WorkPolicy budget this
+    /// class consumes.
+    pub fn budget_key(&self) -> &'static str {
+        match self {
+            Self::Transport => "recovery.transport.max_retries",
+            Self::UnknownEffect => "recovery.effect_reconcile_seconds",
+            Self::Repair => "recovery.max_fix_invocations",
+            Self::EquivalentFailure => "recovery.equivalent_failure_limit",
+            Self::NoProgress => "recovery.no_progress_seconds",
+            Self::AutomaticTime => "recovery.automatic_time_limit_seconds",
+        }
+    }
+}
+
+/// The durable basis a material-progress commit was recorded under —
+/// the recovery-policy progress definition. Closed vocabulary: a
+/// stored value outside it is a corrupt signal, never progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialProgressBasis {
+    /// An accepted required artifact landed.
+    AcceptedArtifact,
+    /// A previously failing required check is valid and passing.
+    CheckNowPassing,
+    /// An unknown host effect reconciled to a verified result.
+    UnknownEffectResolved,
+}
+
+impl MaterialProgressBasis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AcceptedArtifact => "accepted_artifact",
+            Self::CheckNowPassing => "check_now_passing",
+            Self::UnknownEffectResolved => "unknown_effect_resolved",
+        }
+    }
+
+    /// Decode a stored basis value; anything outside the closed
+    /// vocabulary is `None` — a corrupt signal, never progress.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "accepted_artifact" => Some(Self::AcceptedArtifact),
+            "check_now_passing" => Some(Self::CheckNowPassing),
+            "unknown_effect_resolved" => Some(Self::UnknownEffectResolved),
+            _ => None,
+        }
+    }
+}
+
+/// The Work's material-progress clock, derived from durable records:
+/// `last_progress_at` is the committed timestamp of the last
+/// material-progress record, or the first dispatch when the Work has
+/// never progressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialProgress {
+    pub work_id: WorkId,
+    pub last_progress_at: i64,
+    /// The recorded progress basis; `None` when `last_progress_at`
+    /// anchors at first dispatch — no progress commit exists.
+    pub basis: Option<MaterialProgressBasis>,
+}
+
+/// The derived progress signal: a readable clock, an absent clock, or
+/// a corrupt record. `Unknown` is surfaced and never treated as
+/// progress or as death.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterialProgressSignal {
+    /// The durable records produce a readable clock.
+    Reading(MaterialProgress),
+    /// The Work never dispatched — no progress clock exists.
+    NotStarted,
+    /// The stored progress record is unreadable — a timestamp without
+    /// its basis, or one preceding first dispatch.
+    Unknown,
 }
 
 /// Durable Work-wide usage accounting. Survives restarts and successor
@@ -290,6 +406,12 @@ pub struct WorkUsage {
     pub first_dispatch_unix_seconds: Option<i64>,
     /// Wall clock of the last material-progress event.
     pub last_progress_unix_seconds: Option<i64>,
+    /// The basis recorded with the last material-progress commit.
+    /// `None` on rows written before basis tracking or carrying an
+    /// undecodable value — the derivation surfaces either as a corrupt
+    /// signal, never as progress.
+    #[serde(default)]
+    pub last_progress_basis: Option<MaterialProgressBasis>,
     /// Total recorded human-decision waiting, subtracted from elapsed
     /// wall time when computing automatic usage.
     pub human_wait_seconds_total: u64,
@@ -306,6 +428,7 @@ impl WorkUsage {
             automatic_seconds_used: 0,
             first_dispatch_unix_seconds: None,
             last_progress_unix_seconds: None,
+            last_progress_basis: None,
             human_wait_seconds_total: 0,
         }
     }

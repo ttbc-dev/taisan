@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `6` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, `3`, `4`, or `5`
+//! `PRAGMA user_version` is the format gate: `7` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, `3`, `4`, `5`, or `6`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -39,9 +39,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// verification tables; `3` adds the `worker_request_exports` table;
 /// `4` adds the body catalogue's explicit `pin_state`; `5` adds the
 /// `reclaim_plans` / `reclaim_plan_entries` tables; `6` adds the
-/// request's durable Worker adapter binding. Older files upgrade
-/// additively at open.
-const FORMAT_VERSION: i64 = 6;
+/// request's durable Worker adapter binding; `7` adds the usage row's
+/// durable `last_progress_basis`. Older files upgrade additively at
+/// open.
+const FORMAT_VERSION: i64 = 7;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -239,13 +240,13 @@ impl SqliteStore {
             // and the v3 and v5 additions — a v2 file everything
             // except the v3 and v5 additions, a v3 or v4 file
             // everything except the v5 additions (v4 adds a column,
-            // not a table), and a v5 file the complete set (v6 adds a
-            // column, not a table). A foreign or truncated stamped file
-            // fails this check untouched, and the accepted difference is
-            // a previous release's store: it holds every base table and
-            // none of the additions, so it is upgraded in place instead
-            // of being locked out with a misleading "not the recognized
-            // schema" refusal.
+            // not a table), and a v5 or v6 file the complete set (v6
+            // and v7 each add a column, not a table). A foreign or
+            // truncated stamped file fails this check untouched, and
+            // the accepted difference is a previous release's store: it
+            // holds every base table and none of the additions, so it
+            // is upgraded in place instead of being locked out with a
+            // misleading "not the recognized schema" refusal.
             let present = table_set(&conn)?;
             let required_complete = if version == 1 {
                 EXPECTED_TABLES
@@ -279,7 +280,8 @@ impl SqliteStore {
                 });
             }
             // invocations.descendants, body_catalog.pin_state,
-            // invocation_requests.adapter_binding, and the pin-ledger
+            // invocation_requests.adapter_binding,
+            // work_usage.last_progress_basis, and the pin-ledger
             // reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
@@ -334,6 +336,18 @@ impl SqliteStore {
                 .map_err(internal)?;
             if !has_adapter_binding {
                 tx.execute_batch("ALTER TABLE invocation_requests ADD COLUMN adapter_binding TEXT")
+                    .map_err(internal)?;
+            }
+            let has_progress_basis: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_usage') \
+                     WHERE name='last_progress_basis')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_progress_basis {
+                tx.execute_batch("ALTER TABLE work_usage ADD COLUMN last_progress_basis TEXT")
                     .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
@@ -993,13 +1007,16 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error>
         first_dispatch_unix_seconds: row.get(6)?,
         last_progress_unix_seconds: row.get(7)?,
         human_wait_seconds_total: row.get(8)?,
+        last_progress_basis: row
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| MaterialProgressBasis::parse(&s)),
     })
 }
 
 const USAGE_COLS: &str = "work_id, fix_invocations_used, transport_retries_used, \
     equivalent_failure_streak, equivalent_signature, automatic_seconds_used, \
     first_dispatch_unix_seconds, last_progress_unix_seconds, \
-    human_wait_seconds_total";
+    human_wait_seconds_total, last_progress_basis";
 
 fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     tx.exec(
@@ -1825,8 +1842,8 @@ impl TxView for Tx<'_> {
                      transport_retries_used, equivalent_failure_streak, \
                      equivalent_signature, automatic_seconds_used, \
                      first_dispatch_unix_seconds, last_progress_unix_seconds, \
-                     human_wait_seconds_total) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                     human_wait_seconds_total, last_progress_basis) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         usage.work_id.0,
                         usage.fix_invocations_used,
@@ -1837,6 +1854,7 @@ impl TxView for Tx<'_> {
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
+                        usage.last_progress_basis.map(|b| b.as_str()),
                     ],
                 )?;
             }
@@ -2179,7 +2197,8 @@ impl TxView for Tx<'_> {
                      equivalent_signature=?5, automatic_seconds_used=?6, \
                      first_dispatch_unix_seconds=?7, \
                      last_progress_unix_seconds=?8, \
-                     human_wait_seconds_total=?9 WHERE work_id=?1",
+                     human_wait_seconds_total=?9, last_progress_basis=?10 \
+                     WHERE work_id=?1",
                     params![
                         usage.work_id.0,
                         usage.fix_invocations_used,
@@ -2190,6 +2209,7 @@ impl TxView for Tx<'_> {
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
+                        usage.last_progress_basis.map(|b| b.as_str()),
                     ],
                 )?;
             }
