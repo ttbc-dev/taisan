@@ -259,42 +259,63 @@ fn default_branch(env: &LiveEnv) -> String {
 }
 
 /// Two distinct commit SHAs present on the isolated remote —
-/// `TAISAN_U36E_SHA`/`TAISAN_U36E_SHA_B` when set, else the two newest
-/// commits on the default branch.
+/// `TAISAN_U36E_SHA`/`TAISAN_U36E_SHA_B` when set, else two commits
+/// are minted through the git database API: `a` parents the default
+/// head, `b` parents `a`. Commits must NOT sit on the default branch
+/// — GitHub refuses a change request whose head has no commits ahead
+/// of its base — and `b` must descend from `a` so the stale-head
+/// scenario's `a`→`b` move is a fast-forward. The denied-permission
+/// scenario runs under a read-only credential that cannot mint
+/// commits, so its runbook requires the env vars instead.
 fn remote_commit_pair(env: &LiveEnv) -> (String, String) {
     if let (Some(a), Some(b)) = (env_flag("TAISAN_U36E_SHA"), env_flag("TAISAN_U36E_SHA_B")) {
         return (a, b);
     }
     let branch = default_branch(env);
-    let commits = gh_json(
+    let base = gh_json(
         env,
-        &[
-            &format!("repos/{}/commits", env.slug),
-            "-X",
-            "GET",
-            "-f",
-            &format!("sha={branch}"),
-            "-f",
-            "per_page=2",
-        ],
+        &[&format!("repos/{}/git/ref/heads/{branch}", env.slug)],
     )
-    .expect("list commits on the isolated remote");
-    let mut shas = commits
-        .as_array()
-        .expect("commit list")
-        .iter()
-        .filter_map(|c| {
-            c.pointer("/sha")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        });
-    let a = env_flag("TAISAN_U36E_SHA")
-        .or_else(|| shas.next())
-        .expect("a commit SHA present on the isolated remote");
-    let b = env_flag("TAISAN_U36E_SHA_B")
-        .or_else(|| shas.next())
-        .expect("a second distinct commit SHA (set TAISAN_U36E_SHA_B)");
+    .expect("read the default-branch ref")
+    .pointer("/object/sha")
+    .and_then(|s| s.as_str())
+    .map(str::to_string)
+    .expect("default-branch ref carries a sha");
+    let tree = gh_json(env, &[&format!("repos/{}/git/commits/{base}", env.slug)])
+        .expect("read the default head commit")
+        .pointer("/tree/sha")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .expect("head commit carries a tree");
+    let a = create_probe_commit(env, &tree, &[&base], "u36e probe a");
+    let b = create_probe_commit(env, &tree, &[&a], "u36e probe b");
     (a, b)
+}
+
+/// One commit object on the isolated remote via `POST
+/// /git/commits` — setup-only, like branch creation; the evidence
+/// path never sees it. Returns the new commit's SHA.
+fn create_probe_commit(env: &LiveEnv, tree: &str, parents: &[&str], message: &str) -> String {
+    let mut owned = vec![
+        format!("repos/{}/git/commits", env.slug),
+        "-X".to_string(),
+        "POST".to_string(),
+        "-f".to_string(),
+        format!("message={message}"),
+        "-f".to_string(),
+        format!("tree={tree}"),
+    ];
+    for parent in parents {
+        owned.push("-f".to_string());
+        owned.push(format!("parents[]={parent}"));
+    }
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    gh_json(env, &args)
+        .expect("create a probe commit on the isolated remote")
+        .pointer("/sha")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .expect("created commit carries a sha")
 }
 
 /// Delete a scratch ref — scenario cleanup. Best-effort: a leftover
