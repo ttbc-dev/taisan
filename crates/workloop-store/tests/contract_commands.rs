@@ -8,7 +8,7 @@ use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{
-    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command,
+    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command, sweep,
 };
 use workloop_store::sqlite::SqliteStore;
 
@@ -2978,25 +2978,85 @@ fn late_launch_refusal_never_resurrects_a_terminal_execution() {
     assert_eq!(e.terminal_code.as_deref(), Some("setup"));
     assert!(e.outcome.is_some(), "the recorded outcome survives");
 }
-#[test]
-fn work_scoped_check_and_review_evidence_completes_the_work() {
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (w, e1) =
-        accepted_with_execution(&handle_command(&store, &config(), &submit("sc1"), NOW).unwrap());
-    force_state(&store, &e1, ExecutionState::Waiting);
-    let mut invocation = recorded_invocation(&e1, "sc1-coding");
+/// Work-scoped observation delivery: the fact types that name only the
+/// Work still resolve the current Execution for assessment.
+fn emit_work_fact(store: &SqliteStore, w: &WorkId, fact: ObservationFact) {
+    workloop_core::work::handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact,
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// Record an observation as a durable fact WITHOUT running ingest
+/// assessment — the fixture equivalent of evidence that completed
+/// through a path that never triggered `assess` (a deduplicated or
+/// lost delivery, a command-side decision, a producer gap).
+fn record_unassessed_observation(store: &SqliteStore, w: &WorkId, fact: ObservationFact) {
+    apply_effects(
+        store,
+        &[Effect::InsertObservation {
+            observation: Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: None,
+                fact,
+                observed_unix_seconds: NOW,
+            },
+        }],
+    );
+}
+
+fn positive_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Positive,
+            refs: vec![],
+        }],
+    }
+}
+
+/// Durable state one positive `Assessment` short of completion: the
+/// applied publish intents, the Done coding Invocation with its
+/// artifact evidence, the invariant-check Invocation with proven
+/// `Exited{0}`, and the ingested head/check/review facts sealing the
+/// current-target round. `key` keeps Invocation and action ids unique
+/// per Work. The Execution is left `waiting` — the wedge state the
+/// sweep re-assessment tests build on.
+fn seed_completion_evidence_minus_assessment(
+    store: &SqliteStore,
+    w: &WorkId,
+    eid: &ExecutionId,
+    key: &str,
+) {
+    force_state(store, eid, ExecutionState::Waiting);
+    let coding_id = format!("{key}-coding");
+    let check_id = format!("{key}-check");
+    let mut invocation = recorded_invocation(eid, &coding_id);
     invocation.state = InvocationState::Done;
     invocation.required_artifacts = vec![RequiredArtifact {
         kind: "artifact.json".into(),
         path: "artifact.json".into(),
         expected_digest: Some("artifact-digest".into()),
     }];
-    let mut check = recorded_invocation(&e1, "sc1-check");
+    let mut check = recorded_invocation(eid, &check_id);
     check.role = InvocationRole::InvariantCheck;
     check.state = InvocationState::Done;
-    check.request_id = format!("{}:inv:1", e1.0);
+    check.request_id = format!("{}:inv:1", eid.0);
     apply_effects(
-        &store,
+        store,
         &[
             Effect::InsertInvocation { invocation },
             // The invariant lane also requires the check's own durable
@@ -3005,16 +3065,16 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             // artifacts — plus its proven `Exited{0}` process evidence.
             Effect::InsertInvocation { invocation: check },
             Effect::InsertObservation {
-                observation: check_exit_observation(&e1, "sc1-check"),
+                observation: check_exit_observation(eid, &check_id),
             },
             // The artifact evidence for the required artifact.
             Effect::InsertObservation {
                 observation: Observation {
                     delivery: None,
                     subject_work_id: None,
-                    subject_execution_id: Some(e1.clone()),
+                    subject_execution_id: Some(eid.clone()),
                     fact: ObservationFact::Artifact {
-                        invocation_id: InvocationId("sc1-coding".into()),
+                        invocation_id: InvocationId(coding_id),
                         required_artifact: "artifact.json".into(),
                         state: ArtifactFact::Present {
                             digest: "artifact-digest".into(),
@@ -3028,7 +3088,7 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
     // Completion requires the applied publish intents for the Work.
     for (action_id, action) in [
         (
-            "act-sc1-push",
+            format!("act-{key}-push"),
             HostAction::PushRef {
                 branch: format!("work/{}", w.0),
                 produced: rev("artifact-digest"),
@@ -3036,20 +3096,20 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             },
         ),
         (
-            "act-sc1-open",
+            format!("act-{key}-open"),
             HostAction::OpenChangeRequest {
                 source_branch: format!("work/{}", w.0),
                 target_branch: "main".into(),
-                title: "sc1".into(),
+                title: key.into(),
                 body: String::new(),
             },
         ),
     ] {
         apply_effects(
-            &store,
+            store,
             &[Effect::InsertHostActionIntent {
                 intent: HostActionIntent {
-                    action_id: action_id.into(),
+                    action_id,
                     work_id: w.clone(),
                     host: host(),
                     repository: repo(),
@@ -3065,72 +3125,73 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
             }],
         );
     }
-    // A delivery that names only the Work: the fact type makes the
-    // execution subject optional, and it must still be assessed.
-    let emit = |fact: ObservationFact| {
-        workloop_core::work::handle_observation(
-            &store,
-            &config(),
-            &Observation {
-                delivery: None,
-                subject_work_id: Some(w.clone()),
-                subject_execution_id: None,
-                fact,
-                observed_unix_seconds: NOW,
-            },
-            NOW,
-        )
-        .unwrap();
-    };
-    emit(ObservationFact::HostActionResult {
-        action_id: "act-sc1-open".into(),
-        authenticated_actor: Some(publisher()),
-        status: HostActionStatus::Applied,
-        effects: vec![NormalizedEffectFact::ChangeOpened {
+    // The opened-change receipt `current_target` derives from.
+    emit_work_fact(
+        store,
+        w,
+        ObservationFact::HostActionResult {
+            action_id: format!("act-{key}-open"),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: change(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", w.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit_work_fact(
+        store,
+        w,
+        ObservationFact::ChangeHead {
             change: change(),
             head: rev("sha-1"),
-            source_branch: format!("work/{}", w.0),
-            target_branch: "main".into(),
-        }],
-    });
-    emit(ObservationFact::ChangeHead {
-        change: change(),
-        head: rev("sha-1"),
-    });
-    emit(ObservationFact::Check {
-        change: change(),
-        head: rev("sha-1"),
-        check_id: "ci".into(),
-        producer: publisher(),
-        conclusion: CheckConclusion::Success,
-    });
+        },
+    );
+    emit_work_fact(
+        store,
+        w,
+        ObservationFact::Check {
+            change: change(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
     assert_eq!(
-        read_execution(&store, &e1).state,
+        read_execution(store, eid).state,
         ExecutionState::Waiting,
         "checks alone are not completion evidence"
     );
-    emit(ObservationFact::Review {
-        target: target("sha-1"),
-        source: "rev".into(),
-        source_revision: None,
-        completeness: Completeness::Complete,
-        occurrences: vec![],
-    });
+    emit_work_fact(
+        store,
+        w,
+        ObservationFact::Review {
+            target: target("sha-1"),
+            source: "rev".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
     assert_eq!(
-        read_execution(&store, &e1).state,
+        read_execution(store, eid).state,
         ExecutionState::Waiting,
         "the invariant lane still needs a positive assessment"
     );
-    emit(ObservationFact::Assessment {
-        target: target("sha-1"),
-        set_digest: "invariants".into(),
-        complete: true,
-        items: vec![AssessmentItem {
-            id: "inv-1".into(),
-            verdict: AssessmentVerdict::Positive,
-            refs: vec![],
-        }],
-    });
+}
+
+#[test]
+fn work_scoped_check_and_review_evidence_completes_the_work() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sc1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sc1");
+    // A delivery that names only the Work: the fact type makes the
+    // execution subject optional, and it must still be assessed.
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
     let e = read_execution(&store, &e1);
     assert_eq!(
         e.state,
@@ -3148,17 +3209,210 @@ fn work_scoped_check_and_review_evidence_completes_the_work() {
         outcome.detail
     );
     // Further work-scoped deliveries against the terminal Work are inert.
-    emit(ObservationFact::Assessment {
-        target: target("sha-1"),
-        set_digest: "invariants".into(),
-        complete: true,
-        items: vec![AssessmentItem {
-            id: "inv-1".into(),
-            verdict: AssessmentVerdict::Positive,
-            refs: vec![],
-        }],
-    });
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
     assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+}
+
+/// #187: completion is no longer edge-triggered on observation ingest.
+/// A Waiting Execution whose recorded evidence already satisfies every
+/// gate settles `succeeded` on the timed sweep — the level-triggered
+/// fallback for evidence that completed without a new observation (a
+/// deduplicated or lost delivery, a command-side decision, a producer
+/// gap).
+#[test]
+fn sweep_reassessment_settles_a_waiting_execution_whose_evidence_completed_off_path() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ra1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "ra1");
+    // The final gate fact lands as a durable record with no ingest
+    // assessment — the wedge state the issue describes.
+    record_unassessed_observation(&store, &w, positive_assessment("sha-1"));
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "no observation means no ingest assessment — the wedge"
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.completed, 1, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Succeeded);
+    assert_eq!(
+        e.outcome.as_ref().and_then(|o| o.code.as_deref()),
+        Some("succeeded")
+    );
+}
+
+/// Re-assessment re-applies the same gates: a superseded-target
+/// Assessment and a missing Assessment never succeed, no matter how
+/// often the sweep runs — and the same Execution completes on a later
+/// pass once its real evidence lands.
+#[test]
+fn sweep_reassessment_never_succeeds_on_stale_partial_or_superseded_evidence() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    // Superseded target: the Assessment binds an old head.
+    let (w1, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ra2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w1, &e1, "ra2");
+    record_unassessed_observation(&store, &w1, positive_assessment("sha-0"));
+    // Partial: the Assessment never landed at all.
+    let (w2, e2) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ra3"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w2, &e2, "ra3");
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.completed, 0, "{report:?}");
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Waiting);
+    assert_eq!(read_execution(&store, &e2).state, ExecutionState::Waiting);
+
+    // The real evidence lands off-path again; the next sweep — not a
+    // new observation — settles it. Level-triggered and repeatable.
+    record_unassessed_observation(&store, &w1, positive_assessment("sha-1"));
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.completed, 1, "{report:?}");
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+    assert_eq!(
+        read_execution(&store, &e2).state,
+        ExecutionState::Waiting,
+        "the partial Execution still lacks its Assessment"
+    );
+}
+
+/// Protective bounds keep precedence over re-assessment: a Waiting
+/// Execution past its runtime bound is stopped even when its recorded
+/// evidence already satisfies every completion gate.
+#[test]
+fn sweep_bounds_precede_completion_reassessment() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ra4"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "ra4");
+    record_unassessed_observation(&store, &w, positive_assessment("sha-1"));
+    let mut e = read_execution(&store, &e1);
+    e.started_unix_seconds = Some(NOW);
+    apply_effects(
+        &store,
+        &[Effect::UpdateExecution {
+            execution: e,
+            expected_state: ExecutionState::Waiting,
+        }],
+    );
+
+    let over = NOW + (6 * 3600) + 1;
+    let report = sweep(&store, &config(), over).unwrap();
+    assert_eq!(report.stops_recorded, 1, "{report:?}");
+    assert_eq!(report.completed, 0, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Stopping);
+    assert_eq!(e.desired_action, Some(DesiredAction::Fail));
+}
+
+/// A store wrapper that fails exactly ONE `transact` call — the Nth —
+/// so a test can inject a per-item store conflict at a precise sweep
+/// boundary (the same harness shape contract_queries.rs uses).
+struct FailNthTransact<'a> {
+    inner: &'a SqliteStore,
+    calls: std::cell::Cell<u32>,
+    fail_at: u32,
+}
+
+impl Store for FailNthTransact<'_> {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        if n == self.fail_at {
+            return Err(StoreError::ConstraintConflict {
+                detail: "injected per-item conflict".into(),
+            });
+        }
+        self.inner.transact(f)
+    }
+}
+
+/// A store conflict inside the re-assessment transaction takes the
+/// same `sweep_conflict` deferral path as any other sweep decision:
+/// recorded against the Execution, the phase continues, and the next
+/// pass re-runs the re-assessment and settles.
+#[test]
+fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ra5"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "ra5");
+    record_unassessed_observation(&store, &w, positive_assessment("sha-1"));
+
+    // transact call 1 lists the nonterminal Executions; call 2 is the
+    // Execution's own sweep transaction — the one carrying the
+    // re-assessment.
+    let injected = FailNthTransact {
+        inner: &store,
+        calls: std::cell::Cell::new(0),
+        fail_at: 2,
+    };
+    let report = sweep(&injected, &config(), NOW).expect("a per-item conflict is not a tick error");
+    assert_eq!(report.completed, 0, "{report:?}");
+    assert_eq!(report.conflicts, vec![e1.clone()]);
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Waiting);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e1 && d.reason == "sweep_conflict"),
+        "the conflict is recorded against the Execution"
+    );
+
+    // The next clean pass re-runs the same re-assessment; settlement
+    // clears the recorded conflict.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.completed, 1, "{report:?}");
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e1),
+        "settlement resolves the recorded conflict"
+    );
+}
+
+/// Settlement clears recorded deferrals on EVERY completion path: a
+/// `sweep_conflict` left against a `waiting` Execution must not
+/// survive when ingest assessment settles it. Terminal Executions are
+/// never revisited by the sweep listing, and the `capacity` Query
+/// surfaces every deferral row — a stale explanation would persist
+/// forever.
+#[test]
+fn ingest_completion_clears_a_recorded_deferral() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("df1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "df1");
+    // A prior sweep conflict left its explanation behind.
+    apply_effects(
+        &store,
+        &[Effect::RecordDeferral {
+            execution_id: e1.clone(),
+            reason: "sweep_conflict".into(),
+            diagnostic: "injected per-item conflict".into(),
+        }],
+    );
+    // Ingest assessment — not the sweep — settles the Execution.
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e1),
+        "a terminal Execution is never a deferred one"
+    );
 }
 
 /// S-3a (#149) review fix: `Done` records only that the check process

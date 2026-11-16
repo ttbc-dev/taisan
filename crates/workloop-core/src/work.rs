@@ -4098,6 +4098,13 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     tx.apply(&Effect::ReleaseIssueClaims {
         work_id: work.id.clone(),
     })?;
+    // A terminal Execution is never a deferred one: any stale stall
+    // explanation recorded against it would otherwise keep surfacing
+    // on the `capacity` Query after settlement — the same rule
+    // `fail_terminal` applies.
+    tx.apply(&Effect::ClearDeferral {
+        execution_id: execution.id.clone(),
+    })?;
     Ok(())
 }
 
@@ -4246,6 +4253,10 @@ pub struct SweepReport {
     pub stops_recorded: usize,
     /// Executions settled terminal by an exhausted bound.
     pub terminal_failures: usize,
+    /// Waiting Executions whose recorded evidence already satisfied
+    /// every completion gate and were settled `succeeded` by the
+    /// level-triggered re-assessment — no new observation required.
+    pub completed: usize,
     /// Executions whose own transaction hit a store conflict; recorded
     /// against them as a `sweep_conflict` deferral and left for the
     /// next pass — one Work's conflict never aborts the phase.
@@ -4316,6 +4327,7 @@ pub fn sweep_scoped(
             Ok(SweepOutcome::Absent | SweepOutcome::Unchanged) => {}
             Ok(SweepOutcome::StopRecorded) => report.stops_recorded += 1,
             Ok(SweepOutcome::TerminalFailure) => report.terminal_failures += 1,
+            Ok(SweepOutcome::Completed) => report.completed += 1,
             Err(e) if is_item_conflict(&e) => {
                 store.transact(|tx| {
                     tx.apply(&Effect::RecordDeferral {
@@ -4341,6 +4353,7 @@ enum SweepOutcome {
     Unchanged,
     StopRecorded,
     TerminalFailure,
+    Completed,
 }
 
 /// Drop any stall explanation recorded against an Execution that the
@@ -4494,6 +4507,26 @@ fn sweep_one(
                     return Ok(SweepOutcome::StopRecorded);
                 }
             }
+        }
+    }
+    // Level-triggered completion re-assessment: a Waiting Execution
+    // whose evidence set became complete through a path that produced
+    // no new observation — a deduplicated or lost delivery, a
+    // command-side decision like `judge-findings`, or any producer
+    // gap — would otherwise park forever, because `assess_completion`
+    // runs only inside observation ingest. Re-running it here
+    // re-derives every gate from the durable record under the same
+    // transaction; it can never succeed on stale, partial, or
+    // superseded-target evidence. Protective bounds above keep
+    // precedence: an Execution this sweep stops or fails never
+    // reaches re-assessment in the same pass.
+    if execution.state == ExecutionState::Waiting {
+        assess_completion(tx, &execution)?;
+        if tx
+            .execution(&execution.id)?
+            .is_some_and(|e| e.state == ExecutionState::Succeeded)
+        {
+            return Ok(SweepOutcome::Completed);
         }
     }
     clear_sweep_conflict(tx, execution_id)?;
