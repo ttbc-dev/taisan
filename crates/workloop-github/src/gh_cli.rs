@@ -43,6 +43,46 @@ use crate::api::{
 /// must not stall the adapter loop forever.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Ceiling on one subprocess's captured output. `--paginate --slurp`
+/// reads every page into one response; an unbounded read would let a
+/// pathological host exhaust memory. Excess is truncated, which fails
+/// JSON parsing as `Unknown` — never a fabricated success.
+const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
+
+/// Branch names interpolated into request paths or query fields:
+/// the conservative allowlist `[A-Za-z0-9._/-]` with git-ref shape
+/// rules. Anything else — whitespace, URL-significant characters,
+/// `..`, edge slashes — is refused before a subprocess is spawned;
+/// over-rejection is a definite `Refused`, never a mangled request.
+fn valid_branch(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('/')
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// Revision strings interpolated into request paths (check-run heads,
+/// compare endpoints, written ref targets): the same allowlist —
+/// SHAs are hex and branch-shaped refs fit, while `?`, `#`, `%`, `&`,
+/// `=` and whitespace can never reach the endpoint.
+fn valid_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 255
+        && revision
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// Comment markers embedded in `<!-- -->` envelopes: the marker must
+/// never be able to close the envelope early.
+fn valid_marker(marker: &str) -> bool {
+    !marker.is_empty() && !marker.contains("-->")
+}
+
 /// The raw result of one `gh` invocation, before trait-level
 /// classification. `http_status` is parsed from `gh`'s stderr
 /// diagnostic and is `None` for transport-level failures (spawn,
@@ -168,13 +208,13 @@ impl GhCliApi {
         };
         let mut stdout = String::new();
         let mut stderr = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
+        if let Some(pipe) = child.stdout.take() {
             use std::io::Read;
-            let _ = pipe.read_to_string(&mut stdout);
+            let _ = pipe.take(MAX_OUTPUT).read_to_string(&mut stdout);
         }
-        if let Some(mut pipe) = child.stderr.take() {
+        if let Some(pipe) = child.stderr.take() {
             use std::io::Read;
-            let _ = pipe.read_to_string(&mut stderr);
+            let _ = pipe.take(MAX_OUTPUT).read_to_string(&mut stderr);
         }
         Ok(GhOutput {
             success: status.success(),
@@ -235,13 +275,23 @@ impl GhCliApi {
     /// --slurp` wraps each page body in an array, so the payload is an
     /// array of page bodies; each page body is itself the list (or, for
     /// `check-runs`, an object whose `check_runs` member is the list —
-    /// callers unwrap that shape).
-    fn api_pages(&self, endpoint: &str) -> Result<Vec<serde_json::Value>, ApiError> {
-        let args = vec![
+    /// callers unwrap that shape). `fields` become `-f key=value`
+    /// arguments — `gh` encodes them into the query string, so values
+    /// never need hand-rolled escaping.
+    fn api_pages(
+        &self,
+        endpoint: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        let mut args = vec![
             endpoint.to_string(),
             "--paginate".to_string(),
             "--slurp".to_string(),
         ];
+        for (key, value) in fields {
+            args.push("-f".to_string());
+            args.push(format!("{key}={value}"));
+        }
         let output = self.run(&args, None)?;
         if !output.success {
             return Err(self.classify_err(endpoint, &output));
@@ -453,7 +503,7 @@ impl GitHubApi for GhCliApi {
         branch: &str,
     ) -> Result<Option<String>, ApiError> {
         let slug = Self::slug(repository)?;
-        if branch.is_empty() || branch.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        if !valid_branch(branch) {
             return Err(ApiError::Refused {
                 reason: format!("invalid branch name: {branch:?}"),
             });
@@ -479,9 +529,14 @@ impl GitHubApi for GhCliApi {
         expected_prior: Option<&str>,
     ) -> Result<String, ApiError> {
         let slug = Self::slug(repository)?;
-        if branch.is_empty() || branch.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        if !valid_branch(branch) {
             return Err(ApiError::Refused {
                 reason: format!("invalid branch name: {branch:?}"),
+            });
+        }
+        if !valid_revision(new_head) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid revision: {new_head:?}"),
             });
         }
         // The exact prior-ref guard: the current head must still equal
@@ -600,6 +655,11 @@ impl GitHubApi for GhCliApi {
         body: &str,
     ) -> Result<RemoteComment, ApiError> {
         let slug = Self::slug(repository)?;
+        if !valid_marker(marker) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid comment marker: {marker:?}"),
+            });
+        }
         let number = self.pull_number(repository, change_id)?;
         let value = self.api(
             "POST",
@@ -633,9 +693,14 @@ impl GitHubApi for GhCliApi {
         marker: &str,
     ) -> Result<Option<RemoteComment>, ApiError> {
         let slug = Self::slug(repository)?;
+        if !valid_marker(marker) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid comment marker: {marker:?}"),
+            });
+        }
         let number = self.pull_number(repository, change_id)?;
         let envelope = marker_envelope(marker);
-        let comments = self.api_pages(&format!("repos/{slug}/issues/{number}/comments"))?;
+        let comments = self.api_pages(&format!("repos/{slug}/issues/{number}/comments"), &[])?;
         Ok(comments
             .iter()
             .find(|comment| {
@@ -662,10 +727,28 @@ impl GitHubApi for GhCliApi {
         head_sha: &str,
     ) -> Result<Vec<RemotePull>, ApiError> {
         let slug = Self::slug(repository)?;
+        if !valid_branch(source_branch) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid branch name: {source_branch:?}"),
+            });
+        }
+        if !valid_revision(head_sha) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid revision: {head_sha:?}"),
+            });
+        }
         let owner = slug.split('/').next().unwrap_or_default();
-        let pulls = self.api_pages(&format!(
-            "repos/{slug}/pulls?head={owner}:{source_branch}&state=all&per_page=100"
-        ))?;
+        // Query fields ride `-f` so `gh` encodes them — the branch
+        // name never hand-joins a query string.
+        let head_filter = format!("{owner}:{source_branch}");
+        let pulls = self.api_pages(
+            &format!("repos/{slug}/pulls"),
+            &[
+                ("head", head_filter.as_str()),
+                ("state", "all"),
+                ("per_page", "100"),
+            ],
+        )?;
         pulls
             .iter()
             .filter(|pull| {
@@ -683,9 +766,15 @@ impl GitHubApi for GhCliApi {
         head_sha: &str,
     ) -> Result<Vec<RemoteCheckRun>, ApiError> {
         let slug = Self::slug(repository)?;
-        let pages = self.api_pages(&format!(
-            "repos/{slug}/commits/{head_sha}/check-runs?per_page=100"
-        ))?;
+        if !valid_revision(head_sha) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid revision: {head_sha:?}"),
+            });
+        }
+        let pages = self.api_pages(
+            &format!("repos/{slug}/commits/{head_sha}/check-runs?per_page=100"),
+            &[],
+        )?;
         // `check-runs` answers `{total_count, check_runs}` per page —
         // collect the member arrays.
         let mut runs = Vec::new();
@@ -733,7 +822,7 @@ impl GitHubApi for GhCliApi {
     ) -> Result<Vec<RemoteReview>, ApiError> {
         let slug = Self::slug(repository)?;
         let number = self.pull_number(repository, change_id)?;
-        let reviews = self.api_pages(&format!("repos/{slug}/pulls/{number}/reviews"))?;
+        let reviews = self.api_pages(&format!("repos/{slug}/pulls/{number}/reviews"), &[])?;
         reviews
             .iter()
             .map(|review| {
@@ -773,7 +862,7 @@ impl GitHubApi for GhCliApi {
         // The commit a finding examined is its review's `commit_id` —
         // join through `pull_request_review_id`, the same binding the
         // in-memory contract double records.
-        let reviews = self.api_pages(&format!("repos/{slug}/pulls/{number}/reviews"))?;
+        let reviews = self.api_pages(&format!("repos/{slug}/pulls/{number}/reviews"), &[])?;
         let review_commits: HashMap<String, String> = reviews
             .iter()
             .filter_map(|review| {
@@ -782,7 +871,7 @@ impl GitHubApi for GhCliApi {
                 Some((id, commit))
             })
             .collect();
-        let comments = self.api_pages(&format!("repos/{slug}/pulls/{number}/comments"))?;
+        let comments = self.api_pages(&format!("repos/{slug}/pulls/{number}/comments"), &[])?;
         comments
             .iter()
             .map(|comment| {
@@ -820,6 +909,16 @@ impl GitHubApi for GhCliApi {
         descendant: &str,
     ) -> Result<bool, ApiError> {
         let slug = Self::slug(repository)?;
+        if !valid_revision(ancestor) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid revision: {ancestor:?}"),
+            });
+        }
+        if !valid_revision(descendant) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid revision: {descendant:?}"),
+            });
+        }
         let value = self.api(
             "GET",
             &format!("repos/{slug}/compare/{ancestor}...{descendant}"),

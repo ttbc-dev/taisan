@@ -797,9 +797,10 @@ fn live_denied_permission_refused() {
     adapter.apply_outbox(&store, &config, NOW).unwrap();
     let (status, _) = intent_state(&store, &push_id);
     // The runbook requires a read-only credential for this scenario:
-    // GitHub's 403 refuses the ref write as a definite failure. The
-    // assertion pins the contract — the outcome is always definite,
-    // never unknown.
+    // GitHub's refusal must be definite `failed` — never `unknown`,
+    // and never `applied`. An `applied` outcome means the supplied
+    // credential had write scope and the scenario proved nothing, so
+    // the record reports `fail` rather than a live claim.
     assert!(
         matches!(
             status,
@@ -807,6 +808,11 @@ fn live_denied_permission_refused() {
         ),
         "a permission outcome is always definite: {status:?}"
     );
+    let result = if matches!(status, HostActionStatus::Failed { .. }) {
+        ScenarioResult::Pass
+    } else {
+        ScenarioResult::Fail
+    };
     let head = adapter
         .client_mut()
         .read_branch(&live_repo(&env), &branch)
@@ -821,7 +827,7 @@ fn live_denied_permission_refused() {
             target: format!("branch:{}/{}", env.slug, branch),
             observed: format!("head {head:?} after {status:?}"),
         }],
-        ScenarioResult::Pass,
+        result,
     );
     if head.is_some() {
         delete_branch(&env, &branch);

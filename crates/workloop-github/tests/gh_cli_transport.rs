@@ -338,6 +338,49 @@ fn a_non_slug_repository_is_refused_before_any_subprocess() {
 }
 
 #[test]
+fn unsafe_names_are_refused_before_any_subprocess() {
+    let dir = tempdir("bad-names");
+    let gh = stub_gh(&dir, "gh", "exit 0\n");
+    let mut api = GhCliApi::with_gh(gh);
+    let repo = repository();
+
+    // Branch names that could reach a request path or query.
+    for branch in ["a?b", "a&state=closed", "a#frag", "a%2e%2e", "a b", ""] {
+        for result in [
+            api.read_branch(&repo, branch).map(|_| ()),
+            api.write_ref(&repo, branch, "new000", None).map(|_| ()),
+            api.list_pulls_on_branch(&repo, branch, "want1").map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(ApiError::Refused { .. })),
+                "branch {branch:?} must refuse before any subprocess"
+            );
+        }
+    }
+    // Revisions interpolated into request paths.
+    for revision in ["a?b", "a/b?c", "a#x", "a&x=1", ""] {
+        assert!(matches!(
+            api.check_runs(&repo, revision),
+            Err(ApiError::Refused { .. })
+        ));
+        assert!(matches!(
+            api.contains_revision(&repo, revision, "ok1"),
+            Err(ApiError::Refused { .. })
+        ));
+        assert!(matches!(
+            api.write_ref(&repo, "b", revision, None),
+            Err(ApiError::Refused { .. })
+        ));
+    }
+    // Markers that could break out of the HTML-comment envelope.
+    assert!(matches!(
+        api.comment_on_pull(&repo, &change_id(), "x-->", "b"),
+        Err(ApiError::Refused { .. })
+    ));
+    assert!(calls(&dir).is_empty(), "no subprocess for unsafe input");
+}
+
+#[test]
 fn open_pull_maps_the_remote_pull_identity() {
     let dir = tempdir("open-pull");
     let gh = stub_gh(
@@ -522,7 +565,7 @@ fn list_pulls_on_branch_filters_by_head_sha() {
         "gh",
         r#"
 case "$2" in
-  repos/owner/repo/pulls?*)
+  repos/owner/repo/pulls)
     if echo "$@" | grep -q -- '--paginate'; then
       echo '[[{"node_id":"PR_a","number":1,"state":"open","merged":false,"title":"t","body":"b","head":{"sha":"want1","ref":"feature/x"},"base":{"ref":"main"}},{"node_id":"PR_b","number":2,"state":"open","merged":false,"title":"t","body":"b","head":{"sha":"other9","ref":"feature/x"},"base":{"ref":"main"}}]]'
     fi ;;
@@ -535,6 +578,12 @@ esac
         .unwrap();
     assert_eq!(pulls.len(), 1, "only the recorded head revision matches");
     assert_eq!(pulls[0].id, "PR_a");
+    // The branch filter rides `-f` fields, never a hand-joined query.
+    let log = calls(&dir);
+    assert!(
+        log.contains("-f head=owner:feature/x") && log.contains("-f state=all"),
+        "pull filters must be encoded fields: {log}"
+    );
 }
 
 #[test]
