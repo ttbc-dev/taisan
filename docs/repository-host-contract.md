@@ -123,3 +123,5 @@ Every U3.6 suite run retains one record per exercised scenario per adapter — t
 | `authorization_reference` | Required iff `claim_class` is `live_evidenced`: the separately authorized approval the live run cites. Absent — never null — on a `fixture_contract` record; its presence there invalidates the record, and its absence invalidates a `live_evidenced` record |
 
 The field-presence check is `workloop_github::evidence::validate_record_json`; `EvidenceRecord` serializes the same closed shape, so typed records and externally produced JSON answer the same contract. Runs stamp revisions fail-closed (`record_revisions`): a checkout that cannot prove a commit describing the exercised tree — a dirty tracked tree, a non-git source, missing base history — executes the suite but retains no records rather than stamping a guess.
+
+The consolidated fixture-class record indexing the U3.6a–c scenario records against the #107 failure modes is [u3.6d](evidence/u3.6d.md); the separately authorized isolated live cases are U3.6e (#119), whose live-class records append to it.
