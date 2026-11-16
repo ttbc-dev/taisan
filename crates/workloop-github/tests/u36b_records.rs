@@ -1302,6 +1302,7 @@ fn run_recorded(
                 result: ScenarioResult::Pass,
                 claim_class: ClaimClass::FixtureContract,
                 authorization_reference: None,
+                isolation_scope: None,
             });
             RecordRow {
                 scenario: id,
