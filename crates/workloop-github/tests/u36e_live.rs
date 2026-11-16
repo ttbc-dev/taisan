@@ -270,6 +270,8 @@ fn remote_commit_pair(env: &LiveEnv) -> (String, String) {
         env,
         &[
             &format!("repos/{}/commits", env.slug),
+            "-X",
+            "GET",
             "-f",
             &format!("sha={branch}"),
             "-f",

@@ -283,8 +283,13 @@ impl GhCliApi {
         endpoint: &str,
         fields: &[(&str, &str)],
     ) -> Result<Vec<serde_json::Value>, ApiError> {
+        // `--method GET` is mandatory once `-f` fields are present:
+        // `gh api` defaults to POST when parameters are added, which
+        // would turn a list read into a write.
         let mut args = vec![
             endpoint.to_string(),
+            "--method".to_string(),
+            "GET".to_string(),
             "--paginate".to_string(),
             "--slurp".to_string(),
         ];
