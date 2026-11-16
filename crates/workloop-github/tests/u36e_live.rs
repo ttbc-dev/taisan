@@ -481,8 +481,11 @@ fn live_lost_response_reconciles_by_marker() {
     std::fs::create_dir_all(&shim_dir).unwrap();
     let counter = shim_dir.join("dropped");
     let shim = shim_dir.join("gh");
+    // Write-then-rename: executing a just-written inode fails
+    // ETXTBUSY on Linux.
+    let shim_tmp = shim_dir.join("gh.tmp");
     std::fs::write(
-        &shim,
+        &shim_tmp,
         format!(
             "#!/bin/sh\nout=$(mktemp)\nerr=$(mktemp)\n{real} \"$@\" >\"$out\" 2>\"$err\"\ncode=$?\nif echo \"$@\" | grep -q 'issues/.*/comments' && [ ! -f \"{counter}\" ]; then\n  touch \"{counter}\"\n  echo 'simulated lost response' >&2\n  exit 1\nfi\ncat \"$out\"\ncat \"$err\" >&2\nexit $code\n",
             real = sh_quote(&real_gh),
@@ -493,10 +496,11 @@ fn live_lost_response_reconciles_by_marker() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        let mut perms = std::fs::metadata(&shim_tmp).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+        std::fs::set_permissions(&shim_tmp, perms).unwrap();
     }
+    std::fs::rename(&shim_tmp, &shim).unwrap();
 
     // Phase 1: push + open + comment under the response-dropping shim.
     let mut shim_env = env.clone();

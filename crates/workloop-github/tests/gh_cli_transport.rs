@@ -36,10 +36,14 @@ fn stub_gh(dir: &Path, name: &str, body: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\nlog=\"{dir_display}/calls.log\"\nstdin_file=\"{dir_display}/stdin.json\"\necho \"$@\" >> \"$log\"\ncat > \"$stdin_file\" 2>/dev/null || true\n{body}"
     );
-    fs::write(&path, script).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let tmp = dir.join(format!("{name}.tmp"));
+    fs::write(&tmp, script).unwrap();
+    let mut perms = fs::metadata(&tmp).unwrap().permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    fs::set_permissions(&tmp, perms).unwrap();
+    fs::rename(&tmp, &path).unwrap();
     path
 }
 
