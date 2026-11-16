@@ -4,7 +4,7 @@
 
 taisan is an adapter-based work orchestration loop for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; taisan coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
-**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations and agent skills are not yet implemented. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
+**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations are not yet implemented. The agent-agnostic skill ships at `skills/taisan/SKILL.md` with a [walkthrough](docs/skill-walkthrough.md) covering setup, install, submit, inspect, Attention/decision, and recovery against fixtures. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
@@ -64,7 +64,7 @@ To install the CLI from this checkout:
 cargo install --path crates/workloop-cli --bin taisan
 ```
 
-Agent skill installation and invocation guidance is a planned v0.1 deliverable, not available in this checkout. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
+Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add shimpeiws/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
 
 The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
@@ -76,6 +76,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
 - [Repository host contract](docs/repository-host-contract.md) — common semantics, required capabilities, host identity, and GitHub/GitLab validation scope.
 - [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
+- [Skill walkthrough](docs/skill-walkthrough.md) — clean setup, install, submit, inspect, Attention/decision, and recovery with captured CLI output.
 - [Module contracts](docs/module-contracts.md) — typed messages for every module connection and representative flows.
 - [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.

@@ -46,11 +46,39 @@ behavior, the same replay identity, and the same envelopes.
 
 ## Before you mutate
 
-1. Read the current recorded state: `work-list`, then `work-detail` for the
-   Work, `attention` for what needs an actor, `capacity` for headroom.
+1. Read the current recorded state: `work-list`, then `work-detail` for
+   the Work, `attention` for what needs an actor, `capacity` for headroom.
 2. Take identities and preconditions from that output — never from memory.
 3. Choose an idempotency key and keep it. Reuse the same key to replay the
    same Command.
+
+## Setup the installation (operator)
+
+Setup configures the installation profile; it runs before any workflow
+Operation and never touches queued Work. The same command lines run
+verbatim as direct CLI calls. Flags below are the minimal shapes; each
+takes repeatable forms documented by the CLI's own help output.
+
+```
+taisan init --endpoint <ENDPOINT> --repo <REPO_ID:USE> --role <ROLE:ACTOR:CREDENTIAL_REF> --observe <ROLE:LOGIN@HOST/REPO> --egress <EGRESS_HOST>
+```
+
+```
+taisan check
+```
+
+```
+taisan check --probe
+```
+
+`init` scaffolds the profile from observed evidence — it never
+fabricates identity and never rewrites an existing config. `check` is
+the ordered offline preflight: exit 0 when every stage passes, exit 3
+at the first failing stage. `check --probe` is opt-in and fails closed
+with `capability.unknown` (exit 3) while no probe backend is wired — a
+refusal, never a fabricated pass. Setup commands are not replayable
+mutations: their envelopes carry `command: null`, and they queue
+nothing.
 
 ## Operations
 
@@ -171,9 +199,9 @@ byte-identical command. If recovery is unavailable, preserve the
 Installation is implicit (`load_or_create` on first use) and the
 `run` driver, the `propose` selector batch, and resource
 claim/release are operator-facing surfaces invoked directly against an
-installation; this skill covers the workflow Operations listed above and
-adds nothing else, and it names no surface that does not ship in the CLI.
-TUI and MCP are not part of this skill.
+installation; this skill covers the Setup rows and the workflow
+Operations listed above and adds nothing else, and it names no surface
+that does not ship in the CLI. TUI and MCP are not part of this skill.
 
 ## What this skill never does
 

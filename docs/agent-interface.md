@@ -2,7 +2,7 @@
 
 ## Status and release scope
 
-This document specifies the v0.1 interface deliverables agreed in issue #47. It does not ship a skill, add a CLI option, change core behavior, or establish live E2E evidence. The CLI exists and emits JSON against fixtures. Agent skills, their installation guidance, and the complete agent-facing CLI verification are future delivery work planned through #36.
+This document specifies the v0.1 interface deliverables agreed in issue #47. It does not ship a skill, add a CLI option, change core behavior, or establish live E2E evidence. The CLI exists and emits JSON against fixtures. The shipped skill and its installation guidance are delivered in this checkout; the complete agent-facing CLI verification remains future delivery work planned through #36.
 
 v0.1 requires direct CLI operation and skills usable from the user's existing coding agent. TUI delivery is deferred without removing its crate, binaries, or tests. MCP is optional future work. A second independent control interface, GitHub comment command adapter, or Projects projection is not a release gate. Real GitHub integration for publication and observations remains required.
 
@@ -32,7 +32,7 @@ Before mutation, the caller retains the installation/actor identity, idempotency
 
 ## Installation and invocation deliverables
 
-The eventual release must include runnable instructions for installing the CLI from the checkout, configuring one isolated installation, installing and discovering the provided skill in a supported coding agent, and invoking it with a sample issue, intent, constraints, and verification command. The instructions must name the supported agent and actual skill location/invocation once implemented. This scope decision makes no unsupported portability claim and provides no placeholder installation command for a nonexistent skill.
+The eventual release must include runnable instructions for installing the CLI from the checkout, configuring one isolated installation, installing and discovering the provided skill in a supported coding agent, and invoking it with a sample issue, intent, constraints, and verification command. The instructions must name the supported agent and actual skill location/invocation once implemented. This scope decision makes no unsupported portability claim and provides no placeholder installation command for a nonexistent skill. The delivered instructions are the [skill walkthrough](skill-walkthrough.md), captured against OpenCode; the shipped skill is `skills/taisan/SKILL.md`.
 
 The walkthrough must explain which installation and actor the skill uses, how credentials are supplied through installation configuration, how the execution loop runs independently of the conversation, and how to inspect or stop work directly through the CLI. It must cover a rejected action and recovery after a lost response. TUI and MCP installation must not be prerequisites.
 
