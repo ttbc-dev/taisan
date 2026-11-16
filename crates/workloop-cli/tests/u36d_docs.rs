@@ -22,17 +22,22 @@
 //!   why they were not run and `requires_live` rows stay
 //!   `unexercised` until #119's separately authorized live cases.
 //! - `u36d_evidence_record_cites_the_tested_revision` — the record's
-//!   own tested-revision cell is a full commit id containing the
-//!   exercised slice tree on the branch history to `HEAD` (the same
-//!   citation rule the sibling U3.6 records follow); this resolves
-//!   non-head revisions, so CI needs a full-history checkout
-//!   (`fetch-depth: 0` in `.github/workflows/rust.yml`).
+//!   own tested-revision cell is a full commit id that contains the
+//!   exercised slice files (object presence) on the branch history
+//!   to `HEAD` — the presence-and-ancestry citation rule the
+//!   sibling doc checks follow; the check deliberately does not pin
+//!   the slice files to the cited commit's blobs, so a later
+//!   unrelated edit to a shared slice file cannot invalidate a
+//!   retained record. This resolves non-head revisions, so CI needs
+//!   a full-history checkout (`fetch-depth: 0` in
+//!   `.github/workflows/rust.yml`).
 //!
 //! Failure-path tests exercise the rejections: a missing cell, a
 //! duplicated cell, a foreign adapter, a row missing a column, an
 //! `unexercised` row without a reason, a `requires_live` row that
-//! claims a pass, and a fixture row citing a revision no cited record
-//! carries.
+//! claims a pass, a fixture row citing a revision no cited record
+//! carries, and a record-index config naming a host instance its
+//! cited record does not transcribe.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,11 +48,12 @@ const CONTRACT_PATH: &str = "docs/repository-host-contract.md";
 const WORKFLOW_PATH: &str = ".github/workflows/rust.yml";
 const SLICE_CHECK_PATH: &str = "crates/workloop-cli/tests/u36d_docs.rs";
 
-/// The exercised slice tree the tested-revision stamp must contain:
-/// the named checks, the owner-document link and the CI full-history
-/// checkout the revision resolution depends on. The consolidated
-/// record itself is excluded — it is stamped by the commit that cites
-/// the slice commit, so it cannot be part of the cited tree.
+/// The exercised slice tree the tested-revision stamp must contain
+/// at the cited commit (object presence): the named checks, the
+/// owner-document link and the CI full-history checkout the revision
+/// resolution depends on. The consolidated record itself is excluded
+/// — it is stamped by the commit that cites the slice commit, so it
+/// cannot be part of the cited tree.
 const EXERCISED_SLICE_PATHS: &[&str] = &[SLICE_CHECK_PATH, CONTRACT_PATH, WORKFLOW_PATH];
 
 /// #107's failure modes, verbatim.
@@ -235,7 +241,7 @@ fn own_tested_revision(record: &str) -> Result<String, String> {
         .lines()
         .find(|line| line.contains("Tested revision (slice commit"))
         .ok_or("the record carries no Tested revision (slice commit…) row")?;
-    let cell = first_backticked(row).ok_or("the tested revision cell is backticked")?;
+    let cell = first_backticked(row).ok_or("the Tested revision row carries no backticked cell")?;
     if !is_full_commit_id(cell) {
         return Err(format!(
             "the record's tested revision must be a full 40-hex commit id: {cell}"
@@ -454,9 +460,32 @@ fn index_text(root: &Path, record: &str) -> Result<(), String> {
                 "record-index config_identity must carry at least {MIN_CONFIG} characters: {config}"
             ));
         }
-        if !config.contains("test-host") || !text.contains("test-host") {
+        // The configuration names its installation host instance; the
+        // instance must be transcribed in the cited record. No single
+        // instance literal is hardcoded — fixture records name
+        // `test-host`, the documented live extension names the real
+        // host (`host_instance github.com` under #119) — so an index
+        // entry is accepted whenever its cited record carries the
+        // instance it claims.
+        let host = config
+            .split_once("host_instance")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| {
+                rest.split(|c: char| {
+                    !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+                })
+                .find(|token| !token.is_empty())
+            })
+            .unwrap_or("");
+        if host.is_empty() {
             return Err(format!(
-                "record-index config_identity must name the installation host instance test-host as transcribed in {file}"
+                "record-index config_identity must name the installation host instance \
+                 (host_instance <instance>): {config}"
+            ));
+        }
+        if !text.contains(host) {
+            return Err(format!(
+                "host_instance {host} of {reference} is not transcribed in {file}"
             ));
         }
         if let Some((_, digest)) = config.split_once("sha256:") {
@@ -544,19 +573,17 @@ fn git_succeeds(root: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// The exercised slice tree of `rev` matches the working tree — the
-/// tree the record's checks exercise.
-fn slice_content_matches_worktree(root: &Path, rev: &str) -> bool {
-    let mut args = vec!["diff", "--quiet", rev, "--"];
-    args.extend(EXERCISED_SLICE_PATHS.iter().copied());
-    git_succeeds(root, &args)
-}
-
 /// The record's own tested-revision citation: a full commit id that
-/// contains every exercised slice file byte-identical to the working
-/// tree and lies on the branch history to `HEAD`. Non-head revisions
-/// are resolved through the object database, so a depth-1 checkout
-/// cannot satisfy this — the workflow pins `fetch-depth: 0`.
+/// contains every exercised slice file and lies on the branch
+/// history to `HEAD` — the object-presence and ancestry rule the
+/// sibling doc checks follow. The check deliberately does not pin
+/// the slice files to the cited commit's blobs: a later unrelated
+/// edit to a shared slice file (the owner document, the workflow)
+/// must not invalidate a retained record, and the record's own
+/// stamp is a later commit that does not modify the slice tree.
+/// Non-head revisions are resolved through the object database, so
+/// a depth-1 checkout cannot satisfy this — the workflow pins
+/// `fetch-depth: 0`.
 fn slice_evidence(root: &Path, record: &str) -> Result<(), String> {
     let cell = own_tested_revision(record)?;
     let commit = format!("{cell}^{{commit}}");
@@ -572,12 +599,6 @@ fn slice_evidence(root: &Path, record: &str) -> Result<(), String> {
                 "tested revision {cell} must contain the exercised slice file {slice}"
             ));
         }
-    }
-    if !slice_content_matches_worktree(root, &cell) {
-        return Err(format!(
-            "tested revision {cell} does not contain the exercised slice tree: its slice files \
-             must be byte-identical to the exercised working tree"
-        ));
     }
     if !git_succeeds(root, &["merge-base", "--is-ancestor", &cell, "HEAD"]) {
         return Err(format!(
@@ -831,6 +852,39 @@ fn u36d_schema_rejects_a_revision_no_cited_record_carries() {
     assert!(
         err.contains("appears in no cited record"),
         "the failure names the untranscribed revision: {err}"
+    );
+}
+
+#[test]
+fn u36d_index_host_instance_is_transcribed_not_hardcoded() {
+    let root = repo_root();
+    // The record-index host instance binds to the cited record rather
+    // than to a hardcoded literal: any instance the cited record
+    // carries is accepted, so the documented live extension
+    // (`host_instance github.com` under #119) will not be rejected
+    // here, while an instance the record does not carry still fails.
+    let accepted = U36A_INDEX.replace("host_instance test-host,", "host_instance sparse-host,");
+    let record = synthetic_record(&[fixture_row("stale_head")], &accepted);
+    schema_text(&root, &record).expect("an instance transcribed by the cited record is accepted");
+
+    let untranscribed = U36A_INDEX.replace("host_instance test-host,", "host_instance ghost-host,");
+    let record = synthetic_record(&[fixture_row("stale_head")], &untranscribed);
+    let err = schema_text(&root, &record)
+        .expect_err("an instance the cited record does not carry must fail");
+    assert!(
+        err.contains("ghost-host") && err.contains("not transcribed"),
+        "the failure names the untranscribed host instance: {err}"
+    );
+
+    let unnamed = U36A_INDEX.replace(
+        "installation host_instance test-host,",
+        "installation of the",
+    );
+    let record = synthetic_record(&[fixture_row("stale_head")], &unnamed);
+    let err = schema_text(&root, &record).expect_err("a config naming no host instance must fail");
+    assert!(
+        err.contains("host instance"),
+        "the failure names the missing host instance: {err}"
     );
 }
 
