@@ -4098,6 +4098,13 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     tx.apply(&Effect::ReleaseIssueClaims {
         work_id: work.id.clone(),
     })?;
+    // A terminal Execution is never a deferred one: any stale stall
+    // explanation recorded against it would otherwise keep surfacing
+    // on the `capacity` Query after settlement — the same rule
+    // `fail_terminal` applies.
+    tx.apply(&Effect::ClearDeferral {
+        execution_id: execution.id.clone(),
+    })?;
     Ok(())
 }
 
@@ -4519,7 +4526,6 @@ fn sweep_one(
             .execution(&execution.id)?
             .is_some_and(|e| e.state == ExecutionState::Succeeded)
         {
-            clear_deferral(tx, &execution.id)?;
             return Ok(SweepOutcome::Completed);
         }
     }

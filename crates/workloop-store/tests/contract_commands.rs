@@ -3381,6 +3381,40 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
     );
 }
 
+/// Settlement clears recorded deferrals on EVERY completion path: a
+/// `sweep_conflict` left against a `waiting` Execution must not
+/// survive when ingest assessment settles it. Terminal Executions are
+/// never revisited by the sweep listing, and the `capacity` Query
+/// surfaces every deferral row — a stale explanation would persist
+/// forever.
+#[test]
+fn ingest_completion_clears_a_recorded_deferral() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("df1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "df1");
+    // A prior sweep conflict left its explanation behind.
+    apply_effects(
+        &store,
+        &[Effect::RecordDeferral {
+            execution_id: e1.clone(),
+            reason: "sweep_conflict".into(),
+            diagnostic: "injected per-item conflict".into(),
+        }],
+    );
+    // Ingest assessment — not the sweep — settles the Execution.
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Succeeded);
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e1),
+        "a terminal Execution is never a deferred one"
+    );
+}
+
 /// S-3a (#149) review fix: `Done` records only that the check process
 /// resolved — the publish gate counts it solely on its own proven
 /// `Exited{0}` evidence. A failed, signaled, or status-unproven check
