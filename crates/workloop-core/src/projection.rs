@@ -304,21 +304,40 @@ fn attention_views(
         _ => {}
     }
     // No-progress: durable usage says nothing material happened inside the
-    // policy window. Attention only — never proof of termination.
+    // policy window. Attention only — never proof of termination. A
+    // progress record that cannot be classified (no basis, or predating
+    // first dispatch) surfaces as `progress_unknown` — never counted as
+    // progress, never as death.
     if matches!(
         execution.state,
         ExecutionState::Ready | ExecutionState::Running | ExecutionState::Waiting
     ) && let (Some(work), Some(usage)) = (tx.work(work_id)?, tx.work_usage(work_id)?)
-        && let Some(first) = usage.first_dispatch_unix_seconds
     {
-        let last = usage.last_progress_unix_seconds.unwrap_or(first);
-        if now_unix_seconds - last >= work.policy.no_progress_seconds as i64 {
-            push(
-                "no_progress",
-                format!("{last}+{}", work.policy.no_progress_seconds),
-                Some(work.policy.no_progress_seconds),
-                "investigate progress; the Work has produced no material evidence",
-            );
+        match crate::work::material_progress(tx, work_id)? {
+            MaterialProgressSignal::Reading(progress) => {
+                if now_unix_seconds - progress.last_progress_at
+                    >= work.policy.no_progress_seconds as i64
+                {
+                    push(
+                        "no_progress",
+                        format!(
+                            "{}+{}",
+                            progress.last_progress_at, work.policy.no_progress_seconds
+                        ),
+                        Some(work.policy.no_progress_seconds),
+                        "investigate progress; the Work has produced no material evidence",
+                    );
+                }
+            }
+            MaterialProgressSignal::NotStarted => {}
+            MaterialProgressSignal::Unknown => {
+                push(
+                    "progress_unknown",
+                    format!("{}", usage.last_progress_unix_seconds.unwrap_or(0)),
+                    None,
+                    "inspect the progress evidence; it cannot be classified and proves neither progress nor termination",
+                );
+            }
         }
     }
     Ok(out)

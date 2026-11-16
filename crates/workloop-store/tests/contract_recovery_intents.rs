@@ -5,9 +5,12 @@
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
+use workloop_core::observation::*;
+use workloop_core::projection::{QueryResult, attention};
 use workloop_core::store::*;
 use workloop_core::work::{
     HostTemplate, RecoveryScan, WorkloopConfig, consume_due_recovery_intents, handle_command,
+    handle_observation,
 };
 use workloop_store::sqlite::SqliteStore;
 
@@ -170,7 +173,7 @@ fn consume(
     limit: usize,
 ) -> RecoveryScan {
     let mut clock = || now;
-    consume_due_recovery_intents(store, &mut clock, deadline, scope, limit).unwrap()
+    consume_due_recovery_intents(store, &config(), &mut clock, deadline, scope, limit).unwrap()
 }
 
 fn intent(store: &SqliteStore, intent_id: &str) -> RecoveryIntent {
@@ -714,7 +717,7 @@ fn one_intents_conflict_is_recorded_against_its_work_and_the_rest_still_fire() {
         internal: false,
     };
     let mut clock = || NOW;
-    let scan = consume_due_recovery_intents(&injected, &mut clock, None, None, 16)
+    let scan = consume_due_recovery_intents(&injected, &config(), &mut clock, None, None, 16)
         .expect("a per-intent conflict is not a phase error");
 
     assert_eq!(
@@ -766,11 +769,631 @@ fn an_infrastructure_failure_still_fails_the_phase() {
         internal: true,
     };
     let mut clock = || NOW;
-    let err = consume_due_recovery_intents(&injected, &mut clock, None, None, 16).unwrap_err();
+    let err =
+        consume_due_recovery_intents(&injected, &config(), &mut clock, None, None, 16).unwrap_err();
     assert!(matches!(err, StoreError::Internal { .. }), "{err}");
     assert_eq!(
         intent(&store, "ri-1").state,
         RecoveryIntentState::Pending,
         "nothing fired from the failed pass"
     );
+}
+
+// ---- U5.6: production-scheduled intents and durable transport retry ----
+
+/// The producing coding Invocation, done with its required artifact —
+/// the publish chain's gate input.
+fn recorded_invocation(eid: &ExecutionId, id: &str) -> Invocation {
+    Invocation {
+        id: InvocationId(id.into()),
+        request_id: format!("{}:inv:0", eid.0),
+        execution_id: eid.clone(),
+        role: InvocationRole::Coding,
+        state: InvocationState::Done,
+        process_identity: None,
+        required_artifacts: vec![RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: Some("artifact-digest".into()),
+        }],
+        evidence_refs: vec![],
+        descendants: vec![],
+    }
+}
+
+/// The invariant lane's completed read-only check Invocation — the
+/// publish gate requires it after the producing Invocation.
+fn recorded_check_invocation(eid: &ExecutionId, id: &str) -> Invocation {
+    Invocation {
+        id: InvocationId(id.into()),
+        request_id: format!("{}:inv:check", eid.0),
+        execution_id: eid.clone(),
+        role: InvocationRole::InvariantCheck,
+        state: InvocationState::Done,
+        process_identity: None,
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+        descendants: vec![],
+    }
+}
+
+/// The check Invocation's proven `Exited{0}` — a `Done` record alone
+/// is resolved-but-unproven.
+fn check_exit_observation(eid: &ExecutionId, check_id: &str) -> Observation {
+    Observation {
+        delivery: None,
+        subject_work_id: None,
+        subject_execution_id: Some(eid.clone()),
+        fact: ObservationFact::ProcessState {
+            invocation_id: InvocationId(check_id.into()),
+            process_identity: String::new(),
+            state: ProcessStateFact::Exited,
+            exit_code: Some(0),
+        },
+        observed_unix_seconds: NOW,
+    }
+}
+
+fn emit(store: &SqliteStore, work_id: &WorkId, execution_id: &ExecutionId, fact: ObservationFact) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: Some(execution_id.clone()),
+            fact,
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+fn pushes(store: &SqliteStore) -> Vec<HostActionIntent> {
+    store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
+}
+
+fn retry_intents(store: &SqliteStore) -> Vec<RecoveryIntent> {
+    store
+        .transact(|tx| {
+            Ok(tx
+                .recovery_intents()?
+                .into_iter()
+                .filter(|i| i.kind == "retry")
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
+}
+
+/// Drive an Execution's publish chain to a recorded first push, then
+/// fail it definitively — the production path that must persist a
+/// `retry` intent in the deciding transaction.
+fn drive_to_failed_push(store: &SqliteStore, work_id: &WorkId, execution_id: &ExecutionId) {
+    set_state(
+        store,
+        execution_id,
+        ExecutionState::Queued,
+        ExecutionState::Waiting,
+    );
+    let coding = format!("{}-coding", execution_id.0);
+    let check = format!("{}-check", execution_id.0);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: recorded_invocation(execution_id, &coding),
+            })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: recorded_check_invocation(execution_id, &check),
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: check_exit_observation(execution_id, &check),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    emit(
+        store,
+        work_id,
+        execution_id,
+        ObservationFact::CapabilityReport {
+            host: host(),
+            capabilities: vec![
+                CapabilityEntry {
+                    capability: HostCapability::PushRef,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                },
+                CapabilityEntry {
+                    capability: HostCapability::ChangeRequestCreate,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                },
+            ],
+        },
+    );
+    let before = pushes(store).len();
+    emit(
+        store,
+        work_id,
+        execution_id,
+        ObservationFact::Artifact {
+            invocation_id: InvocationId(coding.clone()),
+            required_artifact: "artifact.json".into(),
+            state: ArtifactFact::Present {
+                digest: "artifact-digest".into(),
+            },
+        },
+    );
+    assert_eq!(
+        pushes(store).len(),
+        before + 1,
+        "the artifact records this execution's push intent"
+    );
+    let latest = pushes(store).last().unwrap().action_id.clone();
+    emit(
+        store,
+        work_id,
+        execution_id,
+        ObservationFact::HostActionResult {
+            action_id: latest,
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Failed {
+                reason: "declined".into(),
+            },
+            effects: vec![],
+        },
+    );
+}
+
+fn failed_push(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    let (w, e1) = submit(store, key);
+    drive_to_failed_push(store, &w, &e1);
+    (w, e1)
+}
+
+/// Pause a `waiting` Execution with an explicit operator hold — the
+/// precondition automatic recovery must never release.
+fn hold(store: &SqliteStore, execution_id: &ExecutionId) {
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(execution_id)?.unwrap();
+            e.state = ExecutionState::Paused;
+            e.pause_reason = Some("operator hold".into());
+            e.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            e.paused_since_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Waiting,
+            })
+        })
+        .unwrap();
+}
+
+/// Fail a `waiting` Execution terminally — evidence that must retire
+/// any recovery intent scheduled for it.
+fn fail_execution(store: &SqliteStore, execution_id: &ExecutionId) {
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(execution_id)?.unwrap();
+            e.state = ExecutionState::Failed;
+            e.terminal_code = Some("setup".into());
+            e.outcome = Some(Outcome {
+                state: ExecutionState::Failed,
+                code: Some("setup".into()),
+                detail: None,
+                evidence_refs: vec![],
+                recorded_seq: 0,
+            });
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Waiting,
+            })
+        })
+        .unwrap();
+}
+
+/// A file-backed store path under a fresh temp dir — reopen simulates
+/// the restart between scheduling and firing.
+fn file_db(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let unique = format!(
+        "taisan-u56-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).unwrap();
+    (root.clone(), root.join("store.db"))
+}
+
+/// The receipt persists the retry intent in the deciding transaction —
+/// before any action can depend on it — and an unrelated drive of the
+/// publish chain can never outrun the persisted wait.
+#[test]
+fn a_failed_receipt_persists_the_retry_intent_before_any_action() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = failed_push(&store, "r56-persist");
+    let retries = retry_intents(&store);
+    assert_eq!(retries.len(), 1, "exactly one retry intent was persisted");
+    let retry = &retries[0];
+    assert_eq!(retry.state, RecoveryIntentState::Pending);
+    assert_eq!(
+        retry.due_at_unix_seconds,
+        NOW + 10,
+        "the persisted due time is the policy schedule's first entry"
+    );
+    assert_eq!(retry.evidence_basis, "recovery.transport.max_retries");
+    assert_eq!(retry.work_id, w);
+    assert_eq!(retry.execution_id.as_ref(), Some(&e1));
+    // Persisted before the action: the receipt itself recorded no
+    // re-issue, and a later unrelated drive cannot outrun the wait.
+    assert_eq!(pushes(&store).len(), 1);
+    emit(
+        &store,
+        &w,
+        &e1,
+        ObservationFact::BranchState {
+            repository: repo(),
+            branch: format!("work/{}", w.0),
+            state: BranchState::At {
+                revision: rev("head-fresh"),
+            },
+        },
+    );
+    assert_eq!(
+        pushes(&store).len(),
+        1,
+        "no re-issue while the retry intent is pending"
+    );
+}
+
+fn rev(object: &str) -> CommitRevision {
+    CommitRevision::new(repo(), object).unwrap()
+}
+
+/// The persisted backoff comes from the Work's configured schedule,
+/// indexed by attempt — not from elapsed wall time.
+#[test]
+fn the_retry_backoff_is_persisted_from_the_works_policy() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = submit(&store, "r56-backoff");
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_backoff_seconds = vec![7, 42];
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    drive_to_failed_push(&store, &w, &e1);
+    let first = &retry_intents(&store)[0];
+    assert_eq!(
+        first.due_at_unix_seconds,
+        NOW + 7,
+        "attempt 1 waits the first schedule entry"
+    );
+    // A second definite failure indexes the next schedule entry —
+    // measured from the deciding transaction's clock, not elapsed time.
+    let scan = consume(&store, NOW + 7, None, None, 16);
+    assert_eq!(scan.consumed, 1);
+    assert_eq!(pushes(&store).len(), 2);
+    emit(
+        &store,
+        &w,
+        &e1,
+        ObservationFact::HostActionResult {
+            action_id: pushes(&store)[1].action_id.clone(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Failed {
+                reason: "declined".into(),
+            },
+            effects: vec![],
+        },
+    );
+    let second = retry_intents(&store)
+        .into_iter()
+        .find(|i| i.state == RecoveryIntentState::Pending)
+        .expect("the second failure persisted its own intent");
+    assert_eq!(
+        second.due_at_unix_seconds,
+        NOW + 42,
+        "attempt 2 waits the second schedule entry"
+    );
+}
+
+/// A pending retry fires exactly once at `backoff_until`: not before,
+/// and never twice.
+#[test]
+fn a_due_retry_fires_once_and_reissues_the_failed_push() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) = failed_push(&store, "r56-once");
+    let intent_id = retry_intents(&store)[0].intent_id.clone();
+
+    // Not yet due: the intent stays pending, nothing re-issues.
+    let early = consume(&store, NOW + 9, None, None, 16);
+    assert_eq!(early.consumed, 0);
+    assert_eq!(pushes(&store).len(), 1);
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending
+    );
+
+    // Due: the intent is consumed first, then the failed push re-issues.
+    let scan = consume(&store, NOW + 10, None, None, 16);
+    assert_eq!(scan.consumed, 1);
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Consumed
+    );
+    assert_eq!(
+        pushes(&store).len(),
+        2,
+        "the consumed retry re-issued the push"
+    );
+    assert_eq!(
+        execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "the Execution keeps waiting on the retried effect"
+    );
+
+    // A second pass cannot fire a consumed intent again.
+    let again = consume(&store, NOW + 10, None, None, 16);
+    assert_eq!(again.consumed, 0, "consumed is closed to further firing");
+    assert_eq!(pushes(&store).len(), 2);
+}
+
+/// An explicit operator hold keeps a due retry intent pending — the
+/// automatic pass never consumes it and never re-issues.
+#[test]
+fn an_explicit_hold_never_consumes_a_due_retry() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) = failed_push(&store, "r56-hold");
+    let intent_id = retry_intents(&store)[0].intent_id.clone();
+    hold(&store, &e1);
+
+    let scan = consume(&store, NOW + 10, None, None, 16);
+    assert_eq!(scan.consumed, 0, "the hold is never released automatically");
+    assert!(
+        scan.held
+            .iter()
+            .any(|(id, reason)| id == &intent_id && reason == "operator_hold"),
+        "{:?}",
+        scan.held
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending
+    );
+    assert_eq!(pushes(&store).len(), 1, "no re-issue under the hold");
+}
+
+/// A pending retry intent survives a restart between scheduling and
+/// `backoff_until`, then fires exactly once.
+#[test]
+fn a_pending_retry_survives_restart_and_fires_once() {
+    let (root, db) = file_db("restart-pending");
+    let intent_id;
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let (_w, _e1) = failed_push(&store, "r56-restart");
+        intent_id = retry_intents(&store)[0].intent_id.clone();
+        assert_eq!(pushes(&store).len(), 1);
+    }
+    // The restart: a fresh handle sees the same durable pending intent.
+    let store = SqliteStore::open(&db, 1).unwrap();
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending,
+        "the pending intent survives the restart"
+    );
+    let scan = consume(&store, NOW + 10, None, None, 16);
+    assert_eq!(scan.consumed, 1);
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Consumed
+    );
+    assert_eq!(pushes(&store).len(), 2);
+    drop(store);
+    // And after another restart the consumed intent still cannot fire.
+    let again = SqliteStore::open(&db, 1).unwrap();
+    let rescan = consume(&again, NOW + 10, None, None, 16);
+    assert_eq!(rescan.consumed, 0, "consumed never re-fires after restart");
+    assert_eq!(pushes(&again).len(), 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A retired intent stays retired across a restart — terminal evidence
+/// that invalidated it is durable.
+#[test]
+fn a_retired_intent_stays_retired_across_restart() {
+    let (root, db) = file_db("restart-retired");
+    let intent_id;
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let (_w, e1) = failed_push(&store, "r56-retire");
+        intent_id = retry_intents(&store)[0].intent_id.clone();
+        fail_execution(&store, &e1);
+        let scan = consume(&store, NOW + 10, None, None, 16);
+        assert_eq!(scan.retired, 1);
+        assert_eq!(
+            intent(&store, &intent_id).state,
+            RecoveryIntentState::Retired
+        );
+    }
+    // Reopen: the retired state is durable and closed — the intent
+    // can never fire no matter how late the pass runs.
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let scan = consume(&store, NOW + 10_000, None, None, 16);
+    assert_eq!(scan.consumed, 0);
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Retired,
+        "retired survives the restart and never fires"
+    );
+    assert_eq!(pushes(&store).len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The transport account is Work-wide: retries a predecessor spent
+/// count against the successor Execution's budget — an attempt past
+/// the Work's limit pauses for a human instead of scheduling another
+/// automatic retry.
+#[test]
+fn transport_retries_span_successor_executions() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = failed_push(&store, "r56-span");
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&w)?.unwrap();
+            let expected = work.version;
+            work.policy.transport_max_retries = 1;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+    fail_execution(&store, &e1);
+    // The successor Execution on the same Work.
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "r56-span-e2".into(),
+            body: CommandBody::Retry {
+                work_id: w.clone(),
+                expected_work_version: 1,
+                expected_execution_id: e1.clone(),
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let CommandDecision::Accepted {
+        effect: CommandEffect::ExecutionCreated { execution_id: e2 },
+        ..
+    } = d
+    else {
+        panic!("successor execution: {d:?}")
+    };
+    drive_to_failed_push(&store, &w, &e2);
+    // The predecessor's retry counts: attempt 2 exceeds the limit of 1.
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.transport_retries_used, 2,
+        "the transport account is Work-wide across Executions"
+    );
+    assert_eq!(
+        execution(&store, &e2).state,
+        ExecutionState::Stopping,
+        "a spent budget pauses for a human, never retries"
+    );
+    assert_eq!(
+        execution(&store, &e2).desired_action,
+        Some(DesiredAction::Pause),
+        "the recorded desire is the pause"
+    );
+    assert!(
+        execution(&store, &e2)
+            .repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision)),
+        "exhaustion records the operator hold"
+    );
+    // The writer-stop proof settles the recorded pause (fixture
+    // equivalent), then the pause's scheduled requeue stays pending
+    // under the hold and the pause surfaces as Attention — never an
+    // automatic retry.
+    set_state(
+        &store,
+        &e2,
+        ExecutionState::Stopping,
+        ExecutionState::Paused,
+    );
+    let scan = consume(&store, NOW + 10, None, None, 16);
+    assert_eq!(scan.consumed, 0);
+    let items = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
+        QueryResult::Found { value, .. } => value,
+        other => panic!("expected found, got {other:?}"),
+    };
+    assert!(
+        items.iter().any(|a| a.reason == "paused_judgment"),
+        "budget exhaustion surfaces Attention"
+    );
+}
+
+/// No-progress is a signal only: it derives an Attention record and
+/// never schedules a recovery intent, never stops, never retries.
+#[test]
+fn no_progress_raises_attention_only_and_never_schedules_a_retry() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = submit(&store, "r56-noprogress");
+    set_state(&store, &e1, ExecutionState::Queued, ExecutionState::Ready);
+    store
+        .transact(|tx| {
+            let mut usage = tx.work_usage(&w)?.unwrap_or_else(|| WorkUsage::new(&w));
+            usage.first_dispatch_unix_seconds = Some(NOW - 3700);
+            tx.apply(&Effect::UpdateWorkUsage { usage })
+        })
+        .unwrap();
+    let items = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
+        QueryResult::Found { value, .. } => value,
+        other => panic!("expected found, got {other:?}"),
+    };
+    assert!(
+        items.iter().any(|a| a.reason == "no_progress"),
+        "a stale progress clock surfaces Attention"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.recovery_intents())
+            .unwrap()
+            .is_empty(),
+        "no-progress never conjures an automatic retry"
+    );
+    let e = execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Ready, "no-progress never stops");
+    assert_eq!(e.desired_action, None);
+}
+
+/// A progress record that cannot be classified — a timestamp without
+/// its basis — surfaces as unknown: never progress, never death.
+#[test]
+fn corrupt_progress_surfaces_as_unknown_never_as_progress() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = submit(&store, "r56-corrupt");
+    set_state(&store, &e1, ExecutionState::Queued, ExecutionState::Ready);
+    store
+        .transact(|tx| {
+            let mut usage = tx.work_usage(&w)?.unwrap_or_else(|| WorkUsage::new(&w));
+            usage.first_dispatch_unix_seconds = Some(NOW - 100);
+            // A timestamp without its recorded basis is unreadable.
+            usage.last_progress_unix_seconds = Some(NOW - 10);
+            tx.apply(&Effect::UpdateWorkUsage { usage })
+        })
+        .unwrap();
+    let items = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
+        QueryResult::Found { value, .. } => value,
+        other => panic!("expected found, got {other:?}"),
+    };
+    assert!(
+        items.iter().any(|a| a.reason == "progress_unknown"),
+        "an unclassifiable progress record surfaces as unknown"
+    );
+    assert!(
+        !items.iter().any(|a| a.reason == "no_progress"),
+        "corrupt progress is never treated as a progress reading"
+    );
+    let e = execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Ready, "never treated as death");
 }

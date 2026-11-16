@@ -223,7 +223,7 @@ fn intent(store: &SqliteStore, intent_id: &str) -> RecoveryIntent {
 
 fn consume(store: &SqliteStore, now: i64) -> workloop_core::work::RecoveryScan {
     let mut clock = || now;
-    consume_due_recovery_intents(store, &mut clock, None, None, 16).unwrap()
+    consume_due_recovery_intents(store, &config(), &mut clock, None, None, 16).unwrap()
 }
 
 fn observe(
@@ -474,6 +474,7 @@ fn lp_19_fake_liveness_does_not_reset_the_progress_clock() {
     seed_usage(&store, &w, &|u| {
         u.first_dispatch_unix_seconds = Some(NOW - 3700);
         u.last_progress_unix_seconds = Some(NOW - 3600);
+        u.last_progress_basis = Some(MaterialProgressBasis::AcceptedArtifact);
     });
     seed_change(&store, &w, "sha-1", NOW);
 
@@ -571,8 +572,9 @@ fn lp_24_no_progress_threshold_and_auto_clear() {
         None,
     );
     seed_usage(&store, &w, &|u| {
-        u.first_dispatch_unix_seconds = Some(NOW - 100);
+        u.first_dispatch_unix_seconds = Some(NOW - 2000);
         u.last_progress_unix_seconds = Some(NOW - 1799);
+        u.last_progress_basis = Some(MaterialProgressBasis::AcceptedArtifact);
     });
     let below = match store.transact(|tx| attention(tx, Some(&w), NOW)).unwrap() {
         QueryResult::Found { value, .. } => value,
@@ -939,6 +941,7 @@ fn attention_derivation_reflects_durable_record_mutations() {
     seed_usage(&store, &w, &|u| {
         u.first_dispatch_unix_seconds = Some(NOW - 3700);
         u.last_progress_unix_seconds = Some(NOW - 3600);
+        u.last_progress_basis = Some(MaterialProgressBasis::AcceptedArtifact);
     });
     store
         .transact(|tx| {

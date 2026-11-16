@@ -632,6 +632,7 @@ pub fn run_pass(
         let store = pass.store;
         let result = consume_due_recovery_intents(
             store,
+            pass.config,
             clock,
             Some(deadline),
             scope,
