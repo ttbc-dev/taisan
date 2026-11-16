@@ -618,3 +618,50 @@ esac
         "node→number resolves once: {log}"
     );
 }
+
+#[test]
+fn read_branch_maps_a_definite_4xx_to_refused() {
+    let dir = tempdir("read-branch-4xx");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+case "$2" in
+  repos/owner/repo/git/ref/heads/b) echo 'gh: Forbidden (HTTP 403)' >&2; exit 1 ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh);
+    let err = api.read_branch(&repository(), "b").unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "a permission-denied read is a definite refusal: {err:?}"
+    );
+}
+
+#[test]
+fn a_response_larger_than_the_pipe_buffer_still_completes() {
+    let dir = tempdir("large-output");
+    // ~300 KiB of JSON — far past the OS pipe buffer. A transport
+    // that only drains stdout after the child exits deadlocks here
+    // until the timeout; the reader threads must keep up.
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+case "$2" in
+  repos/owner/repo)
+    printf '{"default_branch":"main","pad":"'
+    awk 'BEGIN{for(i=0;i<30000;i++)printf "xxxxxxxxxx"}'
+    printf '"}'
+    ;;
+  repos/owner/repo/git/ref/heads/main) echo '{"object":{"sha":"abc123"}}' ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh).with_timeout(std::time::Duration::from_secs(30));
+    assert_eq!(
+        api.read_repository(&repository()).unwrap(),
+        Some("abc123".to_string())
+    );
+}

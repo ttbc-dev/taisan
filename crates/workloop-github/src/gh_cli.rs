@@ -26,7 +26,7 @@
 //! transport inherits the same constraint unless it adds one.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -185,6 +185,13 @@ impl GhCliApi {
             // the wait below reports the real outcome.
             let _ = stdin.write_all(&payload);
         }
+        // Drain both pipes on reader threads while the child runs: a
+        // response larger than the OS pipe buffer would otherwise
+        // block `gh` mid-write until the timeout kills it.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_reader = std::thread::spawn(move || drain_bounded(stdout_pipe, MAX_OUTPUT));
+        let stderr_reader = std::thread::spawn(move || drain_bounded(stderr_pipe, MAX_OUTPUT));
         let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
@@ -195,27 +202,27 @@ impl GhCliApi {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(ApiError::Unknown {
                         reason: format!("gh api {} timed out", args.join(" ")),
                     });
                 }
                 Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(ApiError::Unknown {
                         reason: format!("gh wait failed: {e}"),
                     });
                 }
             }
         };
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(pipe) = child.stdout.take() {
-            use std::io::Read;
-            let _ = pipe.take(MAX_OUTPUT).read_to_string(&mut stdout);
-        }
-        if let Some(pipe) = child.stderr.take() {
-            use std::io::Read;
-            let _ = pipe.take(MAX_OUTPUT).read_to_string(&mut stderr);
-        }
+        let stdout =
+            String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
+        let stderr =
+            String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
         Ok(GhOutput {
             success: status.success(),
             http_status: http_status(stderr.trim()),
@@ -466,6 +473,33 @@ impl Default for GhCliApi {
     }
 }
 
+/// Drain a pipe to EOF on a reader thread, keeping at most `cap`
+/// bytes. The reader never stops consuming — a child writing past
+/// the cap cannot block — while the retained prefix stays small
+/// enough that an oversized response fails JSON parsing as `Unknown`
+/// instead of exhausting memory.
+fn drain_bounded(pipe: Option<impl Read>, cap: u64) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let Some(mut pipe) = pipe else {
+        return kept;
+    };
+    let mut buf = [0u8; 16 * 1024];
+    let mut remaining = cap;
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if remaining > 0 {
+                    let take = (n as u64).min(remaining) as usize;
+                    kept.extend_from_slice(&buf[..take]);
+                    remaining -= take as u64;
+                }
+            }
+        }
+    }
+    kept
+}
+
 /// Extract `HTTP NNN` from `gh`'s stderr diagnostic (`gh: ... (HTTP
 /// 422)`). Absent for transport-level failures.
 fn http_status(detail: &str) -> Option<u16> {
@@ -520,6 +554,11 @@ impl GitHubApi for GhCliApi {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)),
             Err(404) => Ok(None),
+            // A definite 4xx is a refusal, same as `classify_err`
+            // applies everywhere else — only 404 means "absent".
+            Err(status) if (400..500).contains(&status) => Err(ApiError::Refused {
+                reason: format!("gh api {endpoint}: HTTP {status}"),
+            }),
             Err(status) => Err(ApiError::Unknown {
                 reason: format!("gh api {endpoint}: HTTP {status}"),
             }),

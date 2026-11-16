@@ -35,6 +35,20 @@ use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_800_000_000;
 
+/// A per-run nonce for names that outlive the process — scratch
+/// branches on the isolated remote and the lost-response shim's
+/// counter file. `NOW` is fixed for store timestamps, but a reused
+/// branch name would collide with a previous run's leftovers (the
+/// `expected_prior: None` push then refuses `stale_head`) and a
+/// reused counter would silently skip the response drop.
+fn run_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
 type LiveAdapter = GitHubAdapter<GhCliApi>;
 
 /// The environment a live run must carry. `auth` is the recorded
@@ -421,7 +435,7 @@ fn live_partial_push_then_create_failure() {
     let config = live_config(&env);
     let mut adapter = live_adapter(&env);
     let (work_id, _eid) = submit(&store, &env, "u36e-partial");
-    let branch = format!("u36e/partial-{NOW}");
+    let branch = format!("u36e/partial-{}", run_nonce());
     let push_id = insert_intent(
         &store,
         &env,
@@ -466,6 +480,10 @@ fn live_partial_push_then_create_failure() {
     } else {
         ScenarioResult::Fail
     };
+    // Remote cleanup runs before the record is retained: a panic in
+    // `retain` must never strand the scratch branch on the isolated
+    // repository.
+    delete_branch(&env, &branch);
     retain(
         &env,
         "partial_push_create",
@@ -478,7 +496,6 @@ fn live_partial_push_then_create_failure() {
         }],
         result,
     );
-    delete_branch(&env, &branch);
 }
 
 /// Scenario: a lost response reconciles by marker without replay. The
@@ -500,7 +517,7 @@ fn live_lost_response_reconciles_by_marker() {
     // runs every call, then drops the FIRST `issues/*/comments` call's
     // response — the effect lands, the answer never arrives.
     let real_gh = env.gh.clone().unwrap_or_else(|| PathBuf::from("gh"));
-    let shim_dir = std::env::temp_dir().join(format!("u36e-shim-{NOW}"));
+    let shim_dir = std::env::temp_dir().join(format!("u36e-shim-{}", run_nonce()));
     std::fs::create_dir_all(&shim_dir).unwrap();
     let counter = shim_dir.join("dropped");
     let shim = shim_dir.join("gh");
@@ -530,7 +547,7 @@ fn live_lost_response_reconciles_by_marker() {
     shim_env.gh = Some(shim);
     let mut adapter = live_adapter(&shim_env);
     let (work_id, _eid) = submit(&store, &env, "u36e-lost");
-    let branch = format!("u36e/lost-{NOW}");
+    let branch = format!("u36e/lost-{}", run_nonce());
     insert_intent(
         &store,
         &env,
@@ -602,19 +619,8 @@ fn live_lost_response_reconciles_by_marker() {
         .find_comment(&live_repo(&env), &change.change_request, &marker)
         .unwrap()
         .expect("the posted comment reconciles");
-    retain(
-        &env,
-        "lost_response",
-        &store,
-        &work_id,
-        &[comment_id],
-        vec![ReadBackReceipt {
-            target: format!("comment:{}", found.comment_id),
-            observed: format!("marker {marker} found once"),
-        }],
-        ScenarioResult::Pass,
-    );
-    // Close the scenario's pull request before cleanup — it is real.
+    // Remote cleanup runs before the record is retained: a panic in
+    // `retain` must never strand the pull request or scratch branch.
     if let Some(number) = change.display_number {
         let _ = gh_json(
             &env,
@@ -628,6 +634,18 @@ fn live_lost_response_reconciles_by_marker() {
         );
     }
     delete_branch(&env, &branch);
+    retain(
+        &env,
+        "lost_response",
+        &store,
+        &work_id,
+        &[comment_id],
+        vec![ReadBackReceipt {
+            target: format!("comment:{}", found.comment_id),
+            observed: format!("marker {marker} found once"),
+        }],
+        ScenarioResult::Pass,
+    );
 }
 
 /// Scenario: stale head. The branch moves under the recorded guard;
@@ -646,7 +664,7 @@ fn live_stale_head_refused() {
     let config = live_config(&env);
     let mut adapter = live_adapter(&env);
     let (work_id, _eid) = submit(&store, &env, "u36e-stale");
-    let branch = format!("u36e/stale-{NOW}");
+    let branch = format!("u36e/stale-{}", run_nonce());
 
     // Seed the branch at sha_a directly, then move it to sha_b — the
     // external actor the guard exists to catch.
@@ -685,6 +703,7 @@ fn live_stale_head_refused() {
         Some(sha_b.as_str()),
         "no rollback, no overwrite"
     );
+    delete_branch(&env, &branch);
     retain(
         &env,
         "stale_head",
@@ -697,7 +716,6 @@ fn live_stale_head_refused() {
         }],
         ScenarioResult::Pass,
     );
-    delete_branch(&env, &branch);
 }
 
 /// Scenario: duplicate delivery. The same webhook event delivered
@@ -714,7 +732,7 @@ fn live_duplicate_delivery_single_effect() {
     let config = live_config(&env);
     let mut adapter = live_adapter(&env);
     let (work_id, _eid) = submit(&store, &env, "u36e-dup");
-    let branch = format!("u36e/dup-{NOW}");
+    let branch = format!("u36e/dup-{}", run_nonce());
     insert_intent(
         &store,
         &env,
@@ -768,6 +786,19 @@ fn live_duplicate_delivery_single_effect() {
         .list_pulls_on_branch(&live_repo(&env), &branch, &sha)
         .unwrap();
     assert_eq!(pulls.len(), 1, "one change request, one recorded effect");
+    // Remote cleanup runs before the record is retained: a panic in
+    // `retain` must never strand the pull request or scratch branch.
+    let _ = gh_json(
+        &env,
+        &[
+            &format!("repos/{}/pulls/{}", env.slug, pulls[0].display_number),
+            "-X",
+            "PATCH",
+            "-f",
+            "state=closed",
+        ],
+    );
+    delete_branch(&env, &branch);
     retain(
         &env,
         "duplicate_delivery",
@@ -780,18 +811,6 @@ fn live_duplicate_delivery_single_effect() {
         }],
         ScenarioResult::Pass,
     );
-    // Close the scenario's pull request before cleanup — it is real.
-    let _ = gh_json(
-        &env,
-        &[
-            &format!("repos/{}/pulls/{}", env.slug, pulls[0].display_number),
-            "-X",
-            "PATCH",
-            "-f",
-            "state=closed",
-        ],
-    );
-    delete_branch(&env, &branch);
 }
 
 /// Scenario: denied permission. The credential the operator supplies
@@ -810,7 +829,7 @@ fn live_denied_permission_refused() {
     let config = live_config(&env);
     let mut adapter = live_adapter(&env);
     let (work_id, _eid) = submit(&store, &env, "u36e-denied");
-    let branch = format!("u36e/denied-{NOW}");
+    let branch = format!("u36e/denied-{}", run_nonce());
     let push_id = insert_intent(
         &store,
         &env,
@@ -844,6 +863,9 @@ fn live_denied_permission_refused() {
         .client_mut()
         .read_branch(&live_repo(&env), &branch)
         .unwrap();
+    if head.is_some() {
+        delete_branch(&env, &branch);
+    }
     retain(
         &env,
         "denied_permission",
@@ -856,7 +878,4 @@ fn live_denied_permission_refused() {
         }],
         result,
     );
-    if head.is_some() {
-        delete_branch(&env, &branch);
-    }
 }
