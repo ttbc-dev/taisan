@@ -300,12 +300,15 @@ drwxr-xr-x 3 worker worker    3 Nov 15 10:36 ..
 ```
 
 One end-to-end invocation from the installed skill: the installed
-document's own `submit` block, run against the pristine environment.
-The installation record and store are created implicitly on first use —
+document's own `submit` block, run against the pristine environment
+with the full sample payload the requirements name — a sample issue
+(`--issue` with its authoritative revision and digest, which the CLI
+never fabricates), intent, constraints, and verification. The
+installation record and store are created implicitly on first use —
 nothing existed in `$CLEAN` before this command:
 
 ```text
-$ taisan --db /runs/20261115T100027Z-3632335b/worker-root/workspaces/20261115T100046Z-5de1a607/target/u74-capture/clean/workloop.db submit --intent "Clean-install end-to-end invocation of the shipped skill" --idempotency-key clean-install-1
+$ taisan --db /runs/20261115T100027Z-3632335b/worker-root/workspaces/20261115T100046Z-5de1a607/target/u74-capture/clean/workloop.db submit --intent "Clean-install end-to-end invocation of the shipped skill" --constraint "Do not change the JSON envelope contract" --verification "cargo test --workspace" --issue 0123456789:42 --issue-revision 2026-11-15T10:36:12Z --issue-digest 6f1c9f94a1f9f0d42a97b21b81b1e47f08d68635673b26d852929e2b04b7d8c1 --idempotency-key clean-install-1
 {
   "schema_version": "1",
   "status": "accepted",
@@ -769,35 +772,6 @@ $ echo $?
 0
 ```
 
-A fresh key for the same payload is a **new** Command, not a recovery:
-it queued a second Work (`w-3`). This is exactly why an `unknown` or
-lost response must recover through `command-result` or byte-identical
-replay only:
-
-```text
-$ taisan --db /runs/20261115T100027Z-3632335b/worker-root/workspaces/20261115T100046Z-5de1a607/target/u74-capture/walk/state/store.db submit --intent "Walkthrough: recovery leg" --idempotency-key walkthrough-recover-2
-{
-  "schema_version": "1",
-  "status": "accepted",
-  "command": {
-    "id": "cmd-6",
-    "kind": "submit",
-    "actor": "human:actor-18e8319b045d1202-4465",
-    "idempotency_key": "walkthrough-recover-2"
-  },
-  "work_id": "w-3",
-  "execution_id": "e-3",
-  "result": {
-    "execution_id": "e-3",
-    "kind": "work_created"
-  },
-  "reason": null,
-  "evidence_refs": []
-}
-$ echo $?
-0
-```
-
 The recovery leg also exercises the `run` driver rows (outside the
 matrix): the loop runs independently of any agent conversation. One
 bounded pass emits exactly one envelope on stdout; per-pass progress is
@@ -852,6 +826,36 @@ $ taisan --db /runs/20261115T100027Z-3632335b/worker-root/workspaces/20261115T10
 }
 --- stderr ---
 taisan: pass 1: 8 phase(s)
+$ echo $?
+0
+```
+
+At this point the store holds the original Work plus the recovered one;
+a fresh key for the same payload is a **new** Command, not a recovery:
+it queued a second Work (`w-3`). This is exactly why an `unknown` or
+lost response must recover through `command-result` or byte-identical
+replay only:
+
+```text
+$ taisan --db /runs/20261115T100027Z-3632335b/worker-root/workspaces/20261115T100046Z-5de1a607/target/u74-capture/walk/state/store.db submit --intent "Walkthrough: recovery leg" --idempotency-key walkthrough-recover-2
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": "cmd-6",
+    "kind": "submit",
+    "actor": "human:actor-18e8319b045d1202-4465",
+    "idempotency_key": "walkthrough-recover-2"
+  },
+  "work_id": "w-3",
+  "execution_id": "e-3",
+  "result": {
+    "execution_id": "e-3",
+    "kind": "work_created"
+  },
+  "reason": null,
+  "evidence_refs": []
+}
 $ echo $?
 0
 ```

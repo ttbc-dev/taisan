@@ -2,7 +2,7 @@
 
 ## Status and release scope
 
-This document specifies the v0.1 interface deliverables agreed in issue #47. It does not ship a skill, add a CLI option, change core behavior, or establish live E2E evidence. The CLI exists and emits JSON against fixtures. Agent skills, their installation guidance, and the complete agent-facing CLI verification are future delivery work planned through #36.
+This document specifies the v0.1 interface deliverables agreed in issue #47. It does not ship a skill, add a CLI option, change core behavior, or establish live E2E evidence. The CLI exists and emits JSON against fixtures. The shipped skill and its installation guidance are delivered in this checkout; the complete agent-facing CLI verification remains future delivery work planned through #36.
 
 v0.1 requires direct CLI operation and skills usable from the user's existing coding agent. TUI delivery is deferred without removing its crate, binaries, or tests. MCP is optional future work. A second independent control interface, GitHub comment command adapter, or Projects projection is not a release gate. Real GitHub integration for publication and observations remains required.
 

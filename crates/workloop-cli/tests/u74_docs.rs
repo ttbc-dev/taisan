@@ -336,13 +336,14 @@ fn walkthrough_content_pins_reject_deleted_or_rewritten_recovery_transcripts() {
     .expect_err("deleted recovery transcripts must fail the content pins");
 
     // Rewrite the recovered `work_id` in the identical-replay
-    // transcript (the replay echo is the one followed by an envelope,
-    // unlike the lost-response echo) — every marker still exists
-    // somewhere in the section, but no single block carries the
-    // replay group any more.
+    // transcript — the `submit` echo that is directly followed by an
+    // envelope (the lost-response echo of the same key is redirected
+    // to /dev/null, and the command-result echo is a different
+    // command) — every marker still exists somewhere in the section,
+    // but no single block carries the replay group any more.
     let mut rewritten = intact.clone();
     let replay = rewritten
-        .find("walkthrough-recover-1\n{")
+        .find("submit --intent \"Walkthrough: recovery leg\" --idempotency-key walkthrough-recover-1\n{")
         .expect("the intact section carries the replay transcript");
     let work = rewritten[replay..]
         .find("\"work_id\": \"w-2\"")
