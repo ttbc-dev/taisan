@@ -13,7 +13,8 @@ use workloop_core::identity::{
 };
 use workloop_core::observation::Observation;
 use workloop_core::store::{
-    Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent, Store, StoreError, TxView,
+    Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus, IntakeRun,
+    ReadView, RecoveryIntent, Store, StoreError, TxView,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 
@@ -243,6 +244,36 @@ impl ReadView for FailingTx<'_> {
         unimplemented!()
     }
     fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_run(&self, _run_id: &str) -> Result<Option<IntakeRun>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_runs(&self) -> Result<Vec<IntakeRun>, StoreError> {
+        unimplemented!()
+    }
+    fn active_intake_run(&self) -> Result<Option<IntakeRun>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_candidates(&self, _run_id: &str) -> Result<Vec<IntakeCandidate>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_candidates_for_proposal(
+        &self,
+        _proposal_key: &str,
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_candidates_for_command(
+        &self,
+        _command_id: &CommandId,
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
+        unimplemented!()
+    }
+    fn intake_candidates_by_status(
+        &self,
+        _statuses: &[IntakeCandidateStatus],
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
         unimplemented!()
     }
     fn commands(&self) -> Result<Vec<workloop_core::store::CommandRecord>, StoreError> {

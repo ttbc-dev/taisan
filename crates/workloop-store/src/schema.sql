@@ -1,8 +1,10 @@
--- workloop v6 store: current-state tables enforcing structural
+-- workloop v8 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 6` marks the format; a stamped older file with
+-- `PRAGMA user_version = 8` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
+-- v7 added work_usage.last_progress_basis; v8 added the intake run and
+-- candidate tables specified in docs/intake-identity-storage.md.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -421,3 +423,68 @@ CREATE TABLE IF NOT EXISTS reclaim_plan_entries (
     outcome_unix_seconds INTEGER,
     PRIMARY KEY (plan_id, body_id)
 );
+
+-- Durable intake records (docs/intake-identity-storage.md). One row
+-- per invocation attempt — including attempts that never launch the
+-- adapter (`skipped`) or fail before a validated response (`failed`).
+-- Identity and ordering live in columns; the request bytes and digest
+-- keep the full exclusion snapshot auditable after the adapter is gone.
+CREATE TABLE IF NOT EXISTS intake_runs (
+    run_id TEXT PRIMARY KEY,
+    trigger TEXT NOT NULL CHECK (trigger IN
+        ('manual', 'scheduled_startup', 'scheduled_interval',
+         'scheduled_reenable')),
+    selector_id TEXT NOT NULL,
+    selector_version INTEGER NOT NULL CHECK (selector_version > 0),
+    policy_revision INTEGER NOT NULL CHECK (policy_revision >= 0),
+    settings_revision TEXT,
+    state TEXT NOT NULL CHECK (state IN
+        ('open', 'admitting', 'completed', 'failed', 'interrupted',
+         'skipped')),
+    detail_code TEXT,
+    request_payload BLOB NOT NULL,
+    request_digest TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_started_at TEXT NOT NULL,
+    owner_nonce TEXT NOT NULL,
+    created_unix_seconds INTEGER NOT NULL,
+    finished_unix_seconds INTEGER,
+    recorded_seq INTEGER NOT NULL
+);
+
+-- At most one live invocation per installation, structurally
+-- enforced in addition to the single-flight intake lease.
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_intake_run
+    ON intake_runs ((CASE WHEN state IN ('open', 'admitting') THEN 1 END));
+
+-- One row per validated candidate in the adapter's returned order.
+-- Identity fields are immutable after insert; status and the
+-- command/Work decision links are the only mutable surface. A
+-- capacity_deferred/unknown/pending/interrupted row never carries a
+-- command or Work link.
+CREATE TABLE IF NOT EXISTS intake_candidates (
+    run_id TEXT NOT NULL REFERENCES intake_runs(run_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    proposal_key TEXT NOT NULL,
+    replay_key TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    payload_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN
+        ('pending', 'accepted', 'replayed', 'rejected',
+         'capacity_deferred', 'unknown', 'interrupted')),
+    status_reason TEXT,
+    command_id TEXT REFERENCES commands(command_id),
+    work_id TEXT REFERENCES works(id),
+    committed_seq INTEGER,
+    recorded_seq INTEGER NOT NULL,
+    PRIMARY KEY (run_id, ordinal),
+    UNIQUE (run_id, proposal_key)
+);
+CREATE INDEX IF NOT EXISTS intake_candidates_proposal
+    ON intake_candidates (proposal_key);
+CREATE INDEX IF NOT EXISTS intake_candidates_replay
+    ON intake_candidates (replay_key);
+CREATE INDEX IF NOT EXISTS intake_candidates_command
+    ON intake_candidates (command_id) WHERE command_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS intake_candidates_unresolved
+    ON intake_candidates (status) WHERE status IN ('pending', 'unknown');
