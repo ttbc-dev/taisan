@@ -439,6 +439,102 @@ fn completeness(rows: &[Vec<String>]) -> Result<BTreeMap<(String, String), usize
     Ok(cells)
 }
 
+/// Parse the retained record JSON blocks inside the labelled
+/// section of a cited evidence file. Each scenario section carries
+/// one fenced `json` block — the retained `EvidenceRecord`.
+fn section_records(text: &str, label: &str) -> Result<Vec<serde_json::Value>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            let t = line.trim_start();
+            t.starts_with('#') && t.contains(label)
+        })
+        .ok_or_else(|| format!("no evidence section carries label {label:?}"))?;
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim_start().starts_with('#') {
+            end = i;
+            break;
+        }
+    }
+    let mut records = Vec::new();
+    let mut in_json = false;
+    let mut buf = String::new();
+    for line in &lines[start..end] {
+        let t = line.trim();
+        if t == "```json" {
+            in_json = true;
+            buf.clear();
+            continue;
+        }
+        if t == "```" && in_json {
+            in_json = false;
+            records
+                .push(serde_json::from_str(&buf).map_err(|e| {
+                    format!("record JSON in section {label:?} does not parse: {e}")
+                })?);
+            continue;
+        }
+        if in_json {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if records.is_empty() {
+        return Err(format!("section {label:?} carries no record JSON"));
+    }
+    Ok(records)
+}
+
+/// Every retained record in the cited section must declare the
+/// index entry's claim class — fixture evidence can never be indexed
+/// as `live_evidenced`, and a live record cannot be indexed as
+/// `fixture_contract`. A `live_evidenced` record must additionally
+/// carry the `authorization_reference` and `isolation_scope` the
+/// evidence schema mandates.
+fn check_record_claims(
+    records: &[serde_json::Value],
+    claim_class: &str,
+    reference: &str,
+) -> Result<(), String> {
+    for record in records {
+        let record_claim = record
+            .get("claim_class")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if record_claim != claim_class {
+            return Err(format!(
+                "record-index claim_class {claim_class} of {reference} does not match \
+                 the cited record's claim_class {record_claim}"
+            ));
+        }
+        if claim_class != "live_evidenced" {
+            continue;
+        }
+        let authorized = record
+            .get("authorization_reference")
+            .and_then(|a| a.as_str())
+            .is_some_and(|a| !a.trim().is_empty());
+        let scope = record.get("isolation_scope");
+        let scoped = scope
+            .and_then(|s| s.get("installation_id"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.trim().is_empty())
+            && scope
+                .and_then(|s| s.get("repository"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.trim().is_empty());
+        if !authorized || !scoped {
+            return Err(format!(
+                "live_evidenced record {reference} must carry authorization_reference \
+                 and isolation_scope"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The record index: every `scenario_record_ref` of the table
 /// resolves to exactly one index row carrying the retained record's
 /// tested revision, configuration, command/scenario, claim class and
@@ -538,6 +634,10 @@ fn index_text(root: &Path, record: &str) -> Result<(), String> {
                 "claim_class {claim_class} of {reference} is not transcribed in {file}"
             ));
         }
+        // The cited record's own claim_class must equal the index
+        // entry's — substring presence alone cannot keep fixture
+        // evidence out of a live_evidenced row.
+        check_record_claims(&section_records(&text, label)?, claim_class, reference)?;
         let result = row[5].trim();
         let first = result.split_whitespace().next().unwrap_or("");
         if !RESULTS.contains(&first) {
@@ -870,6 +970,58 @@ fn u36d_schema_rejects_a_live_evidenced_row_staying_unexercised() {
         err.contains("live_evidenced"),
         "the failure names the claim class: {err}"
     );
+}
+
+#[test]
+fn u36d_index_claim_class_must_match_the_cited_record() {
+    // A fixture_contract record can never satisfy a live_evidenced
+    // index entry — the boundary the substring check alone missed.
+    let fixture_record = serde_json::json!({"claim_class": "fixture_contract"});
+    let err = check_record_claims(
+        &[fixture_record],
+        "live_evidenced",
+        "docs/evidence/u3.6a.md#fixture-github — stale-head observation",
+    )
+    .expect_err("a fixture record cannot be indexed as live_evidenced");
+    assert!(
+        err.contains("does not match"),
+        "the failure names the claim-class mismatch: {err}"
+    );
+
+    // A live record cannot be indexed as fixture_contract either.
+    let live_record = serde_json::json!({
+        "claim_class": "live_evidenced",
+        "authorization_reference": "https://example.test/auth",
+        "isolation_scope": {"installation_id": "install-1", "repository": "o/r"},
+    });
+    let err = check_record_claims(
+        std::slice::from_ref(&live_record),
+        "fixture_contract",
+        "ref",
+    )
+    .expect_err("a live record cannot be indexed as fixture_contract");
+    assert!(
+        err.contains("does not match"),
+        "the failure names the claim-class mismatch: {err}"
+    );
+
+    // A live_evidenced record missing its authorization reference or
+    // isolation scope fails — the evidence schema's requirement is
+    // enforced at the index boundary too.
+    for missing in ["authorization_reference", "isolation_scope"] {
+        let mut record = live_record.clone();
+        record.as_object_mut().unwrap().remove(missing);
+        let err = check_record_claims(&[record], "live_evidenced", "ref")
+            .expect_err("a live_evidenced record without its authorization fields must fail");
+        assert!(
+            err.contains("authorization_reference") && err.contains("isolation_scope"),
+            "the failure names the missing authorization fields: {err}"
+        );
+    }
+
+    // A complete live_evidenced record passes.
+    check_record_claims(&[live_record], "live_evidenced", "ref")
+        .expect("a complete live_evidenced record passes the index check");
 }
 
 #[test]
