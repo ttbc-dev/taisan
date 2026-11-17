@@ -19,8 +19,13 @@
 //!   claim class and result.
 //! - `u36d_doc_check_no_entry_lacks_a_claim_class` — no consolidated
 //!   or index entry lacks a `claim_class`; `unexercised` rows cite
-//!   why they were not run and `requires_live` rows stay
-//!   `unexercised` until #119's separately authorized live cases.
+//!   why they were not run, `requires_live` rows stay `unexercised`
+//!   until their separately authorized live case runs, and
+//!   `live_evidenced` rows cite the retained authorized live record.
+//! - `u36d_github_cells_are_live_evidenced_or_pending_119` — every
+//!   `github` adapter cell is either `live_evidenced` (citing its
+//!   U3.6e record) or an explicit `requires_live`/`unexercised`
+//!   finding pending #119's remaining authorized case.
 //! - `u36d_evidence_record_cites_the_tested_revision` — the record's
 //!   own tested-revision cell is a full commit id that contains the
 //!   exercised slice files (object presence) on the branch history
@@ -35,9 +40,10 @@
 //! Failure-path tests exercise the rejections: a missing cell, a
 //! duplicated cell, a foreign adapter, a row missing a column, an
 //! `unexercised` row without a reason, a `requires_live` row that
-//! claims a pass, a fixture row citing a revision no cited record
-//! carries, and a record-index config naming a host instance its
-//! cited record does not transcribe.
+//! claims a pass, a `live_evidenced` row that stays unexercised, a
+//! fixture row citing a revision no cited record carries, and a
+//! record-index config naming a host instance its cited record does
+//! not transcribe.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -72,7 +78,7 @@ const FAILURE_MODES: [&str; 5] = [
 /// separately authorized isolated live cases of #119.
 const ADAPTERS: [&str; 2] = ["fixture", "github"];
 
-const CLAIM_CLASSES: [&str; 2] = ["fixture_contract", "requires_live"];
+const CLAIM_CLASSES: [&str; 3] = ["fixture_contract", "requires_live", "live_evidenced"];
 const INDEX_CLAIM_CLASSES: [&str; 2] = ["fixture_contract", "live_evidenced"];
 const RESULTS: [&str; 3] = ["pass", "fail", "unexercised"];
 
@@ -316,6 +322,11 @@ fn validate_rows(
                 ));
             }
         }
+        if claim_class == "live_evidenced" && (unexercised || result == "unexercised") {
+            return Err(format!(
+                "a live_evidenced row cites a retained authorized live record — it cannot stay unexercised: {failure_mode}/{adapter}"
+            ));
+        }
         if unexercised && !(shas.len() == 1 && shas[0] == own_sha) {
             return Err(format!(
                 "an unexercised row's tested_revision must be the consolidation slice commit {own_sha}: {failure_mode}/{adapter}"
@@ -330,7 +341,13 @@ fn validate_rows(
                 }
             }
             "fail" | "unexercised" => {
-                if !unexercised {
+                // A `live_evidenced` fail row legitimately cites its
+                // retained record — a failed authorized live run is
+                // exercised evidence of the failure, not a claim
+                // dressed as a pass.
+                let exercised_live_fail =
+                    result == "fail" && claim_class == "live_evidenced" && !refs.is_empty();
+                if !unexercised && !exercised_live_fail {
                     return Err(format!(
                         "a {result} row must not cite retained records as if exercised: {failure_mode}/{adapter}"
                     ));
@@ -830,6 +847,32 @@ fn u36d_schema_rejects_a_requires_live_row_claiming_a_pass() {
 }
 
 #[test]
+fn u36d_schema_rejects_a_live_evidenced_row_staying_unexercised() {
+    let mut rows = full_table();
+    let pos = rows
+        .iter()
+        .position(|r| r.contains("| stale_head | github |"))
+        .expect("the github stale_head row exists");
+    rows[pos] = row([
+        "stale_head",
+        "github",
+        "unexercised",
+        "live_evidenced",
+        OWN_SHA,
+        "unexercised — live claim without a retained record",
+        "unexercised",
+        "live GitHub evidence is #119's separately authorized scope",
+    ]);
+    let record = synthetic_record(&rows, U36A_INDEX);
+    let err = schema_text(&repo_root(), &record)
+        .expect_err("a live_evidenced row cannot stay unexercised");
+    assert!(
+        err.contains("live_evidenced"),
+        "the failure names the claim class: {err}"
+    );
+}
+
+#[test]
 fn u36d_schema_rejects_a_revision_no_cited_record_carries() {
     let mut rows = full_table();
     let pos = rows
@@ -926,7 +969,7 @@ fn u36d_doc_check_no_entry_lacks_a_claim_class() {
 }
 
 #[test]
-fn u36d_github_cells_stay_unexercised_until_119() {
+fn u36d_github_cells_are_live_evidenced_or_pending_119() {
     let root = repo_root();
     let record = read_repo(&root, RECORD_PATH).expect("the consolidated record is retained");
     let rows = parse_table(&record, &TABLE_HEADER).expect("the consolidated table exists");
@@ -936,29 +979,44 @@ fn u36d_github_cells_stay_unexercised_until_119() {
             continue;
         }
         github_rows += 1;
-        assert_eq!(
-            row[2].trim(),
-            "unexercised",
-            "the github adapter cell {} must stay unexercised until #119",
-            row[0]
-        );
-        assert_eq!(
-            row[3].trim(),
-            "requires_live",
-            "the github adapter cell {} is requires_live until the authorized live run",
-            row[0]
-        );
-        assert_eq!(
-            row[6].trim(),
-            "unexercised",
-            "the github adapter cell {} result stays unexercised",
-            row[0]
-        );
-        assert!(
-            row[7].contains("#119"),
-            "the github adapter cell {} must cite the pending authorized scope #119",
-            row[0]
-        );
+        match row[3].trim() {
+            "live_evidenced" => {
+                assert_ne!(
+                    row[2].trim(),
+                    "unexercised",
+                    "a live_evidenced github cell {} must cite its retained record",
+                    row[0]
+                );
+                assert!(
+                    matches!(row[6].trim(), "pass" | "fail"),
+                    "a live_evidenced github cell {} reports the live run's result",
+                    row[0]
+                );
+            }
+            "requires_live" => {
+                assert_eq!(
+                    row[2].trim(),
+                    "unexercised",
+                    "a pending github cell {} stays unexercised until its authorized live run",
+                    row[0]
+                );
+                assert_eq!(
+                    row[6].trim(),
+                    "unexercised",
+                    "a pending github cell {} result stays unexercised",
+                    row[0]
+                );
+                assert!(
+                    row[7].contains("#119"),
+                    "a pending github cell {} must cite the authorized scope #119",
+                    row[0]
+                );
+            }
+            other => panic!(
+                "github cell {} carries a foreign claim_class {other}",
+                row[0]
+            ),
+        }
     }
     assert_eq!(
         github_rows,
@@ -1020,8 +1078,13 @@ fn u36d_completeness_and_schema_pass_on_the_real_record() {
         .iter()
         .filter(|r| r.1 == "github" && r.2 && r.6 == "unexercised")
         .count();
+    let github_live = parsed
+        .iter()
+        .filter(|r| r.1 == "github" && r.4 == "live_evidenced")
+        .count();
     assert_eq!(
-        github_open, 5,
-        "every github cell is an explicit unexercised finding"
+        github_open + github_live,
+        5,
+        "every github cell is live-evidenced or an explicit unexercised finding"
     );
 }
