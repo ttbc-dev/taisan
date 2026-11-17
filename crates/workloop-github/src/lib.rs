@@ -9,6 +9,7 @@ pub mod api;
 pub mod credential;
 pub mod evidence;
 pub mod fixture;
+pub mod gh_cli;
 pub mod gitlab_fixture;
 pub mod gitlab_spike;
 pub mod port;

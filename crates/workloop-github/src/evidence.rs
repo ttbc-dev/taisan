@@ -35,15 +35,35 @@ pub const REQUIRED_FIELDS: &[&str] = &[
 
 /// What a retained record is allowed to claim. Fixture results support
 /// contract claims only; live claims require separately authorized live
-/// evidence under the implementation start gate.
+/// evidence under the implementation start gate; `not_authorized`
+/// records that a scenario's authorization was withheld — it claims
+/// nothing and carries no authorization reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimClass {
     /// Local fixture/contract evidence only — never a live claim.
     FixtureContract,
     /// A separately authorized live scenario — requires
-    /// `authorization_reference`.
+    /// `authorization_reference` and `isolation_scope`.
     LiveEvidenced,
+    /// The scenario was defined but its owner authorization was
+    /// withheld: the record documents the non-run explicitly and
+    /// claims nothing — no authorization reference, no result beyond
+    /// `skipped`, no evidence identities.
+    NotAuthorized,
+}
+
+/// The isolated installation and repository a live run executed
+/// under. A `live_evidenced` record binds its claim to exactly one
+/// isolated scope; a `not_authorized` record may carry the intended
+/// scope so the withheld authorization names what it would have
+/// covered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationScope {
+    /// The isolated installation identity the run executed under.
+    pub installation_id: String,
+    /// The isolated repository (`owner/name`) the run targeted.
+    pub repository: String,
 }
 
 /// The outcome a retained scenario row reports.
@@ -125,14 +145,24 @@ pub struct EvidenceRecord {
     pub result: ScenarioResult,
     pub claim_class: ClaimClass,
     /// The authorization a `live_evidenced` record cites. Required iff
-    /// `claim_class` is `live_evidenced`; absent — never null — on a
-    /// `fixture_contract` record.
+    /// `claim_class` is `live_evidenced`; absent — never null — on
+    /// `fixture_contract` and `not_authorized` records.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_authorization_reference"
     )]
     pub authorization_reference: Option<String>,
+    /// The isolated installation/repository scope the record binds.
+    /// Required iff `claim_class` is `live_evidenced`; absent — never
+    /// null — on a `fixture_contract` record; a `not_authorized` record
+    /// may carry the intended scope.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_isolation_scope"
+    )]
+    pub isolation_scope: Option<IsolationScope>,
 }
 
 /// Present-but-wrong-typed guard: an `authorization_reference` key may
@@ -148,6 +178,40 @@ where
         serde_json::Value::String(s) if !s.is_empty() => Ok(Some(s)),
         other => Err(serde::de::Error::custom(format!(
             "authorization_reference must be a non-empty string when present, got {other}"
+        ))),
+    }
+}
+
+/// Present-but-wrong-typed guard for `isolation_scope`: the key may
+/// only hold an object with non-empty `installation_id` and
+/// `repository` strings — a `null`, scalar, or malformed object fails
+/// deserialization rather than normalizing to `None`.
+fn deserialize_isolation_scope<'de, D>(deserializer: D) -> Result<Option<IsolationScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Object(map) => {
+            let installation_id = map
+                .get("installation_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let repository = map
+                .get("repository")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            match (installation_id, repository) {
+                (Some(installation_id), Some(repository)) => Ok(Some(IsolationScope {
+                    installation_id: installation_id.to_string(),
+                    repository: repository.to_string(),
+                })),
+                _ => Err(serde::de::Error::custom(
+                    "isolation_scope requires non-empty installation_id and repository strings",
+                )),
+            }
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "isolation_scope must be an object when present, got {other}"
         ))),
     }
 }
@@ -350,17 +414,39 @@ pub fn record_revisions(manifest_dir: &str) -> Option<(String, String)> {
     Some((tested, base))
 }
 
+/// The raw-JSON shape check for an `isolation_scope` value: an object
+/// carrying non-empty `installation_id` and `repository` strings.
+/// Returns the violation description, `None` when the shape conforms.
+fn isolation_scope_violation(scope: &serde_json::Value) -> Option<String> {
+    let Some(object) = scope.as_object() else {
+        return Some("isolation_scope is not an object".into());
+    };
+    for field in ["installation_id", "repository"] {
+        match object.get(field) {
+            Some(v) if v.as_str().is_some_and(|s| !s.is_empty()) => {}
+            _ => return Some(format!("isolation_scope missing {field}")),
+        }
+    }
+    None
+}
+
 /// The field-presence check every retained record must pass. Asserts:
 ///
 /// - every field of `REQUIRED_FIELDS` is present (non-null);
 /// - `schema_version` is exactly `SCHEMA_VERSION` — a record of an
 ///   unknown schema cannot be interpreted;
-/// - `claim_class` is the string `fixture_contract` or `live_evidenced`
-///   — a present-but-non-string value is a violation, never fail-open;
+/// - `claim_class` is the string `fixture_contract`, `live_evidenced`,
+///   or `not_authorized` — a present-but-non-string value is a
+///   violation, never fail-open;
 /// - a `live_evidenced` record additionally carries a non-empty
-///   `authorization_reference`, and a `fixture_contract` record does
-///   not carry the key at all — its absence invalidates a live record
-///   and its presence invalidates a fixture record;
+///   `authorization_reference` and a well-formed `isolation_scope`,
+///   and a `fixture_contract` record carries neither key — their
+///   absence invalidates a live record and their presence invalidates
+///   a fixture record;
+/// - a `not_authorized` record carries no `authorization_reference`,
+///   reports `result: skipped`, and keeps every evidence identity
+///   array empty — it documents a withheld authorization and claims
+///   nothing;
 /// - the revision/scenario fields and the `install_identity` strings
 ///   are strings, `contract_version` a non-negative integer — a
 ///   present-but-wrong-typed scalar is a violation, so a record the
@@ -453,13 +539,57 @@ pub fn validate_record_json(value: &serde_json::Value) -> Result<(), Vec<String>
                             .into(),
                     );
                 }
-            }
-            Some("live_evidenced") => match object.get("authorization_reference") {
-                Some(v) if v.as_str().is_some_and(|s| !s.is_empty()) => {}
-                _ => {
-                    violations.push("live_evidenced record missing authorization_reference".into())
+                if object.contains_key("isolation_scope") {
+                    violations
+                        .push("isolation_scope must be absent on a fixture_contract record".into());
                 }
-            },
+            }
+            Some("live_evidenced") => {
+                match object.get("authorization_reference") {
+                    Some(v) if v.as_str().is_some_and(|s| !s.is_empty()) => {}
+                    _ => violations
+                        .push("live_evidenced record missing authorization_reference".into()),
+                }
+                match object.get("isolation_scope") {
+                    Some(scope) => {
+                        if let Some(v) = isolation_scope_violation(scope) {
+                            violations.push(format!("live_evidenced {v}"));
+                        }
+                    }
+                    None => violations.push("live_evidenced record missing isolation_scope".into()),
+                }
+            }
+            Some("not_authorized") => {
+                if object.contains_key("authorization_reference") {
+                    violations.push(
+                        "authorization_reference must be absent on a not_authorized record".into(),
+                    );
+                }
+                if let Some(scope) = object.get("isolation_scope")
+                    && let Some(v) = isolation_scope_violation(scope)
+                {
+                    violations.push(format!("not_authorized {v}"));
+                }
+                // A not_authorized record claims nothing: the scenario
+                // never ran, so the result is `skipped` and every
+                // evidence identity array stays empty.
+                match object.get("result").and_then(|r| r.as_str()) {
+                    Some("skipped") => {}
+                    _ => violations.push("not_authorized record result must be skipped".into()),
+                }
+                for field in [
+                    "action_identities",
+                    "observation_identities",
+                    "read_back_receipts",
+                ] {
+                    match object.get(field).and_then(|v| v.as_array()) {
+                        Some(items) if items.is_empty() => {}
+                        _ => {
+                            violations.push(format!("not_authorized record {field} must be empty"))
+                        }
+                    }
+                }
+            }
             Some(other) => violations.push(format!("unknown claim_class: {other}")),
             None => violations.push("claim_class is not a string".into()),
         }
@@ -572,6 +702,7 @@ mod tests {
             result: ScenarioResult::Pass,
             claim_class: ClaimClass::FixtureContract,
             authorization_reference: None,
+            isolation_scope: None,
         }
     }
 
@@ -606,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_record_requires_authorization_reference() {
+    fn a_live_record_requires_authorization_reference_and_isolation_scope() {
         let mut value = serde_json::to_value(record()).unwrap();
         value.as_object_mut().unwrap().insert(
             "claim_class".into(),
@@ -623,7 +754,133 @@ mod tests {
             "authorization_reference".into(),
             serde_json::Value::String("owner approval 2026-11-09, issue #119".into()),
         );
+        let violations = validate_record_json(&value).unwrap_err();
+        assert!(
+            violations.iter().any(|v| v.contains("isolation_scope")),
+            "a live_evidenced record without isolation_scope is invalid: {violations:?}"
+        );
+        value.as_object_mut().unwrap().insert(
+            "isolation_scope".into(),
+            serde_json::json!({
+                "installation_id": "install-u36e-1",
+                "repository": "shimpeiws/coding-worker-smoke",
+            }),
+        );
         validate_record_json(&value).unwrap();
+    }
+
+    #[test]
+    fn a_fixture_record_with_isolation_scope_is_invalid() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "isolation_scope".into(),
+            serde_json::json!({
+                "installation_id": "install-u36e-1",
+                "repository": "shimpeiws/coding-worker-smoke",
+            }),
+        );
+        let violations = validate_record_json(&value).unwrap_err();
+        assert!(
+            violations.iter().any(|v| v.contains("isolation_scope")),
+            "a fixture_contract record carrying isolation_scope is invalid"
+        );
+    }
+
+    #[test]
+    fn a_not_authorized_record_claims_nothing() {
+        let mut record = record();
+        record.claim_class = ClaimClass::NotAuthorized;
+        record.result = ScenarioResult::Skipped;
+        record.action_identities = vec![];
+        record.observation_identities = vec![];
+        record.read_back_receipts = vec![];
+        record.validate().unwrap();
+
+        // The intended isolation scope may be recorded — it names what
+        // the withheld authorization would have covered.
+        let mut scoped = record.clone();
+        scoped.isolation_scope = Some(IsolationScope {
+            installation_id: "install-u36e-1".into(),
+            repository: "shimpeiws/coding-worker-smoke".into(),
+        });
+        scoped.validate().unwrap();
+    }
+
+    #[test]
+    fn a_not_authorized_record_with_any_claim_is_invalid() {
+        for mutate in [
+            |r: &mut EvidenceRecord| r.authorization_reference = Some("x".into()),
+            |r: &mut EvidenceRecord| r.result = ScenarioResult::Pass,
+            |r: &mut EvidenceRecord| {
+                r.observation_identities = vec!["delivery-1".into()];
+            },
+            |r: &mut EvidenceRecord| {
+                r.read_back_receipts = vec![ReadBackReceipt {
+                    target: "branch:x".into(),
+                    observed: "head y".into(),
+                }];
+            },
+        ] {
+            let mut record = record();
+            record.claim_class = ClaimClass::NotAuthorized;
+            record.result = ScenarioResult::Skipped;
+            record.action_identities = vec![];
+            record.observation_identities = vec![];
+            record.read_back_receipts = vec![];
+            mutate(&mut record);
+            let value = serde_json::to_value(&record).unwrap();
+            assert!(
+                validate_record_json(&value).is_err(),
+                "a not_authorized record carrying a claim is invalid: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_not_authorized_record_with_an_authorization_reference_key_is_invalid() {
+        // Even an empty-string key is a claim the class forbids — the
+        // raw check rejects the key's presence, not just its content.
+        let mut record = record();
+        record.claim_class = ClaimClass::NotAuthorized;
+        record.result = ScenarioResult::Skipped;
+        record.action_identities = vec![];
+        record.observation_identities = vec![];
+        record.read_back_receipts = vec![];
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "authorization_reference".into(),
+            serde_json::Value::String(String::new()),
+        );
+        assert!(validate_record_json(&value).is_err());
+    }
+
+    #[test]
+    fn a_malformed_isolation_scope_is_invalid() {
+        for scope in [
+            serde_json::json!(null),
+            serde_json::json!("scope"),
+            serde_json::json!({"installation_id": "i"}),
+            serde_json::json!({"installation_id": "", "repository": "o/r"}),
+            serde_json::json!({"installation_id": "i", "repository": 7}),
+        ] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value.as_object_mut().unwrap().insert(
+                "claim_class".into(),
+                serde_json::Value::String("live_evidenced".into()),
+            );
+            value.as_object_mut().unwrap().insert(
+                "authorization_reference".into(),
+                serde_json::Value::String("owner approval".into()),
+            );
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("isolation_scope".into(), scope.clone());
+            assert!(
+                validate_record_json(&value).is_err(),
+                "malformed isolation_scope {scope} must be invalid"
+            );
+        }
     }
 
     #[test]
