@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use workloop_core::identity::{ChangeRequestId, RepositoryRef};
@@ -178,20 +180,29 @@ impl GhCliApi {
             .map_err(|e| ApiError::Refused {
                 reason: format!("gh spawn failed: {e}"),
             })?;
-        if let (Some(body), Some(mut stdin)) = (body, child.stdin.take())
-            && let Ok(payload) = serde_json::to_vec(body)
-        {
-            // A broken pipe means `gh` exited before reading —
-            // the wait below reports the real outcome.
-            let _ = stdin.write_all(&payload);
-        }
-        // Drain both pipes on reader threads while the child runs: a
-        // response larger than the OS pipe buffer would otherwise
-        // block `gh` mid-write until the timeout kills it.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let stdout_reader = std::thread::spawn(move || drain_bounded(stdout_pipe, MAX_OUTPUT));
-        let stderr_reader = std::thread::spawn(move || drain_bounded(stderr_pipe, MAX_OUTPUT));
+        // The stdin payload write runs on its own thread: a child
+        // that never reads stdin cannot hold this call open — the
+        // timeout path kills it and the write fails with EPIPE.
+        let stdin_pipe = child.stdin.take();
+        let payload = body.and_then(|b| serde_json::to_vec(b).ok());
+        let _stdin_writer = stdin_pipe.map(|mut stdin| {
+            std::thread::spawn(move || {
+                if let Some(payload) = payload {
+                    // A broken pipe means `gh` exited before reading —
+                    // the wait below reports the real outcome.
+                    let _ = stdin.write_all(&payload);
+                }
+            })
+        });
+        // Drain both pipes on reader threads into shared buffers
+        // while the child runs: a response larger than the OS pipe
+        // buffer would otherwise block `gh` mid-write. The caller
+        // never blocks on join — a descendant surviving the kill can
+        // hold a pipe open, so readers get only a short flush grace.
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stdout_reader = spawn_drain(child.stdout.take(), MAX_OUTPUT, &stdout_buf);
+        let stderr_reader = spawn_drain(child.stderr.take(), MAX_OUTPUT, &stderr_buf);
         let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
@@ -202,8 +213,7 @@ impl GhCliApi {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    flush_readers(&[&stdout_reader, &stderr_reader]);
                     return Err(ApiError::Unknown {
                         reason: format!("gh api {} timed out", args.join(" ")),
                     });
@@ -211,18 +221,16 @@ impl GhCliApi {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    flush_readers(&[&stdout_reader, &stderr_reader]);
                     return Err(ApiError::Unknown {
                         reason: format!("gh wait failed: {e}"),
                     });
                 }
             }
         };
-        let stdout =
-            String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
-        let stderr =
-            String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+        flush_readers(&[&stdout_reader, &stderr_reader]);
+        let stdout = buffer_string(&stdout_buf);
+        let stderr = buffer_string(&stderr_buf);
         Ok(GhOutput {
             success: status.success(),
             http_status: http_status(stderr.trim()),
@@ -473,31 +481,53 @@ impl Default for GhCliApi {
     }
 }
 
-/// Drain a pipe to EOF on a reader thread, keeping at most `cap`
-/// bytes. The reader never stops consuming — a child writing past
-/// the cap cannot block — while the retained prefix stays small
-/// enough that an oversized response fails JSON parsing as `Unknown`
-/// instead of exhausting memory.
-fn drain_bounded(pipe: Option<impl Read>, cap: u64) -> Vec<u8> {
-    let mut kept = Vec::new();
-    let Some(mut pipe) = pipe else {
-        return kept;
-    };
-    let mut buf = [0u8; 16 * 1024];
-    let mut remaining = cap;
-    loop {
-        match pipe.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if remaining > 0 {
-                    let take = (n as u64).min(remaining) as usize;
-                    kept.extend_from_slice(&buf[..take]);
-                    remaining -= take as u64;
+/// Spawn a reader that drains `pipe` to EOF into `buf`, keeping at
+/// most `cap` bytes. The reader never stops consuming — a child
+/// writing past the cap cannot block — while the retained prefix
+/// stays small enough that an oversized response fails JSON parsing
+/// as `Unknown` instead of exhausting memory.
+fn spawn_drain(
+    pipe: Option<impl Read + Send + 'static>,
+    cap: u64,
+    buf: &Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    let buf = Arc::clone(buf);
+    std::thread::spawn(move || {
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 16 * 1024];
+        let mut kept = 0u64;
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if kept < cap {
+                        let take = ((cap - kept) as usize).min(n);
+                        if let Ok(mut guard) = buf.lock() {
+                            guard.extend_from_slice(&chunk[..take]);
+                        }
+                        kept += take as u64;
+                    }
                 }
             }
         }
+    })
+}
+
+/// Give pipe readers a short flush window after the child exits —
+/// long enough for the final bytes, short enough that a descendant
+/// holding a pipe open cannot stall the call past the deadline.
+/// Unfinished readers are detached; whatever they already drained
+/// stays in the shared buffer.
+fn flush_readers(readers: &[&JoinHandle<()>]) {
+    let grace = Instant::now() + Duration::from_secs(2);
+    while readers.iter().any(|r| !r.is_finished()) && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(10));
     }
-    kept
+}
+
+fn buffer_string(buf: &Mutex<Vec<u8>>) -> String {
+    let guard = buf.lock().unwrap_or_else(|e| e.into_inner());
+    String::from_utf8_lossy(&guard).into_owned()
 }
 
 /// Extract `HTTP NNN` from `gh`'s stderr diagnostic (`gh: ... (HTTP
@@ -549,10 +579,14 @@ impl GitHubApi for GhCliApi {
         }
         let endpoint = format!("repos/{slug}/git/ref/heads/{branch}");
         match self.api_status("GET", &endpoint)? {
-            Ok(value) => Ok(value
-                .pointer("/object/sha")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)),
+            Ok(value) => match value.pointer("/object/sha").and_then(|v| v.as_str()) {
+                Some(sha) => Ok(Some(sha.to_string())),
+                // A 200 without the ref object is a malformed
+                // success, never proof the branch is absent.
+                None => Err(ApiError::Unknown {
+                    reason: format!("gh api {endpoint}: response missing object.sha"),
+                }),
+            },
             Err(404) => Ok(None),
             // A definite 4xx is a refusal, same as `classify_err`
             // applies everywhere else — only 404 means "absent".
