@@ -398,3 +398,7 @@ The remaining detailed evidence/invariant approval schema is #51; credential/con
 ## Approved recovery and configuration policy
 
 Use the owner-approved [recovery and configuration policy](recovery-policy.md) for configurable defaults, Work-wide accounting, policy changes, and safe human-wait capacity release. The [post-v0.1 milestones](post-v0.1-milestones.md) retain the seven approved machinery deferrals without deferring v0.1 safety requirements. Both documents specify target behavior, not implemented runtime support.
+
+## v0.2 intake records
+
+The durable intake run/candidate records for v0.2 — identities, states, crash-point recovery, capacity deferral, store upgrade, and query shapes — are specified in [intake identity, persistence, and restart recovery](intake-identity-storage.md) (#206). They extend this document's command-ledger replay and overlap rules without changing the v0.1 admission contract; the external Selector wire contract remains [selector-protocol.md](selector-protocol.md).
