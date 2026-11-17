@@ -145,11 +145,15 @@ pub enum Effect {
     InsertIntakeRun {
         run: IntakeRun,
     },
-    /// Persists a whole-response-validated candidate batch in original
-    /// order. Applied in the same transaction as the run's transition
-    /// to `admitting`, so a crash can never split the batch from the
-    /// state that authorizes submitting it.
-    InsertIntakeCandidates {
+    /// Commit boundary B1 in one apply: persists a whole-response-
+    /// validated candidate batch in original order *and* moves the run
+    /// `open` → `admitting`. The store refuses the effect unless the run
+    /// is still `open`, every candidate is `pending` with no decision
+    /// links, and each `candidate.run_id` matches `run_id` — so a crash
+    /// can never leave candidates without their run state, an `open`
+    /// run holding candidates, or a run `admitting` with a partial
+    /// batch.
+    AdmitIntakeBatch {
         run_id: String,
         candidates: Vec<IntakeCandidate>,
     },
@@ -168,7 +172,12 @@ pub enum Effect {
     /// `payload_digest`, `recorded_seq`) are immutable; only the status
     /// and decision-link fields (`status`, `status_reason`,
     /// `command_id`, `work_id`, `committed_seq`) are written, and only
-    /// from `expected_status`.
+    /// from `expected_status`. The written status must also carry a
+    /// link set the spec's Links column allows: unresolved statuses
+    /// (`pending`, `capacity_deferred`, `unknown`, `interrupted`) keep
+    /// all links NULL, `rejected` never carries `work_id`, and the
+    /// decided statuses carry the command identity their outcome came
+    /// from.
     UpdateIntakeCandidate {
         candidate: IntakeCandidate,
         expected_status: IntakeCandidateStatus,

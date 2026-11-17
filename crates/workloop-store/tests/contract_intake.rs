@@ -90,16 +90,9 @@ fn insert_run(store: &SqliteStore, run: IntakeRun) {
 fn admit_batch(store: &SqliteStore, run_id: &str, candidates: Vec<IntakeCandidate>) {
     store
         .transact(|tx| {
-            tx.apply(&Effect::InsertIntakeCandidates {
+            tx.apply(&Effect::AdmitIntakeBatch {
                 run_id: run_id.into(),
                 candidates,
-            })?;
-            tx.apply(&Effect::UpdateIntakeRun {
-                run_id: run_id.into(),
-                state: IntakeRunState::Admitting,
-                detail_code: None,
-                finished_unix_seconds: None,
-                expected_state: IntakeRunState::Open,
             })
         })
         .unwrap();
@@ -210,11 +203,12 @@ fn candidate_batch_atomic_with_admitting() {
             .all(|c| c.status == IntakeCandidateStatus::Pending)
     );
 
-    // Once a run leaves `open` its batch is sealed: appending
-    // candidates under `admitting` (or any later state) conflicts.
+    // Once a run leaves `open` its batch is sealed: a second
+    // AdmitIntakeBatch under `admitting` (or any later state)
+    // conflicts — there is no way to append candidates after B1.
     let err = store
         .transact(|tx| {
-            tx.apply(&Effect::InsertIntakeCandidates {
+            tx.apply(&Effect::AdmitIntakeBatch {
                 run_id: "r-batch".into(),
                 candidates: vec![candidate("r-batch", 2, "prop-e")],
             })
@@ -243,7 +237,7 @@ fn candidate_batch_atomic_with_admitting() {
         })
         .unwrap();
 
-    // A failing batch rolls the whole transaction back: the duplicate
+    // A failing batch rolls the whole apply back: the duplicate
     // (run_id, ordinal) inside one batch violates the primary key, so
     // neither candidate nor the run's admitting transition may land.
     insert_run(
@@ -252,19 +246,12 @@ fn candidate_batch_atomic_with_admitting() {
     );
     let err = store
         .transact(|tx| {
-            tx.apply(&Effect::InsertIntakeCandidates {
+            tx.apply(&Effect::AdmitIntakeBatch {
                 run_id: "r-atomic".into(),
                 candidates: vec![
                     candidate("r-atomic", 0, "prop-c"),
                     candidate("r-atomic", 0, "prop-d"),
                 ],
-            })?;
-            tx.apply(&Effect::UpdateIntakeRun {
-                run_id: "r-atomic".into(),
-                state: IntakeRunState::Admitting,
-                detail_code: None,
-                finished_unix_seconds: None,
-                expected_state: IntakeRunState::Open,
             })
         })
         .unwrap_err();
@@ -278,7 +265,8 @@ fn candidate_batch_atomic_with_admitting() {
         "the rolled-back batch left no partial candidate rows"
     );
 
-    // A batch is persisted all-`pending`; a pre-decided status is a
+    // A batch is persisted all-`pending` with no decision links; a
+    // pre-decided status, a carried link, or a foreign run_id is a
     // transition-table violation, not an insert. `r-atomic` goes
     // terminal first so `r-pre` may open.
     store
@@ -300,9 +288,29 @@ fn candidate_batch_atomic_with_admitting() {
     decided.status = IntakeCandidateStatus::Accepted;
     let err = store
         .transact(|tx| {
-            tx.apply(&Effect::InsertIntakeCandidates {
+            tx.apply(&Effect::AdmitIntakeBatch {
                 run_id: "r-pre".into(),
                 candidates: vec![decided],
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    let mut linked = candidate("r-pre", 0, "prop-g");
+    linked.command_id = Some(CommandId("cmd-1".into()));
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::AdmitIntakeBatch {
+                run_id: "r-pre".into(),
+                candidates: vec![linked],
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::AdmitIntakeBatch {
+                run_id: "r-pre".into(),
+                candidates: vec![candidate("r-other", 0, "prop-h")],
             })
         })
         .unwrap_err();
@@ -311,7 +319,8 @@ fn candidate_batch_atomic_with_admitting() {
         store
             .transact(|tx| tx.intake_candidates("r-pre"))
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "no refused batch left candidate rows behind"
     );
 }
 
@@ -392,16 +401,23 @@ fn run_state_transition_guards() {
 
 #[test]
 fn candidate_identity_immutable_status_guarded() {
-    let store = SqliteStore::in_memory(1).unwrap();
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (command_id, committed_at) = {
+        let (cid, _wid, cat) = submit(&store, "proposal/ref-selector:prop-x");
+        (cid, cat)
+    };
     insert_run(
         &store,
         run("r-idem", IntakeRunState::Open, IntakeTrigger::Manual),
     );
     admit_batch(&store, "r-idem", vec![candidate("r-idem", 0, "prop-x")]);
 
+    // A rejection links its durable command decision but never a Work.
     let decided = IntakeCandidate {
         status: IntakeCandidateStatus::Rejected,
         status_reason: Some("source_overlap".into()),
+        command_id: Some(command_id),
+        committed_seq: Some(committed_at),
         ..candidate("r-idem", 0, "prop-x")
     };
     store
@@ -436,6 +452,121 @@ fn candidate_identity_immutable_status_guarded() {
     assert_eq!(c.proposal_key, "prop-x");
     assert_eq!(c.replay_key, "proposal/ref-selector:prop-x");
     assert_eq!(c.payload, br#"{"schema_version":1}"#.to_vec());
+}
+
+#[test]
+fn candidate_decision_links_follow_the_status_contract() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (command_id, work_id, committed_at) = submit(&store, "proposal/ref-selector:prop-links");
+    insert_run(
+        &store,
+        run("r-links", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    admit_batch(
+        &store,
+        "r-links",
+        vec![
+            candidate("r-links", 0, "prop-a"),
+            candidate("r-links", 1, "prop-b"),
+            candidate("r-links", 2, "prop-c"),
+            candidate("r-links", 3, "prop-d"),
+        ],
+    );
+    let decide = |candidate: IntakeCandidate| {
+        store
+            .transact(|tx| {
+                tx.apply(&Effect::UpdateIntakeCandidate {
+                    candidate,
+                    expected_status: IntakeCandidateStatus::Pending,
+                })
+            })
+            .unwrap();
+    };
+
+    // Unresolved statuses must keep every link NULL — a deferred
+    // candidate can never look decided.
+    for (ordinal, key, status) in [
+        (0u32, "prop-a", IntakeCandidateStatus::CapacityDeferred),
+        (1, "prop-b", IntakeCandidateStatus::Unknown),
+        (2, "prop-c", IntakeCandidateStatus::Interrupted),
+    ] {
+        let mut bad = candidate("r-links", ordinal, key);
+        bad.status = status;
+        bad.command_id = Some(command_id.clone());
+        let err = store
+            .transact(|tx| {
+                tx.apply(&Effect::UpdateIntakeCandidate {
+                    candidate: bad,
+                    expected_status: IntakeCandidateStatus::Pending,
+                })
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ConstraintConflict { .. }),
+            "{status:?} with a command link must conflict: {err:?}"
+        );
+    }
+
+    // A rejection never carries a Work id.
+    let mut bad_reject = IntakeCandidate {
+        status: IntakeCandidateStatus::Rejected,
+        status_reason: Some("invalid_request".into()),
+        command_id: Some(command_id.clone()),
+        committed_seq: Some(committed_at),
+        work_id: Some(work_id.clone()),
+        ..candidate("r-links", 0, "prop-a")
+    };
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: bad_reject.clone(),
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    bad_reject.work_id = None;
+    decide(bad_reject);
+
+    // Accepted requires the full link set.
+    let mut thin_accept = IntakeCandidate {
+        status: IntakeCandidateStatus::Accepted,
+        command_id: Some(command_id.clone()),
+        committed_seq: Some(committed_at),
+        ..candidate("r-links", 1, "prop-b")
+    };
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: thin_accept.clone(),
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    thin_accept.work_id = Some(work_id.clone());
+    decide(thin_accept);
+
+    // Replayed links the saved decision; work_id stays optional.
+    decide(IntakeCandidate {
+        status: IntakeCandidateStatus::Replayed,
+        command_id: Some(command_id.clone()),
+        committed_seq: Some(committed_at),
+        ..candidate("r-links", 2, "prop-c")
+    });
+
+    let rows = store
+        .transact(|tx| tx.intake_candidates("r-links"))
+        .unwrap();
+    assert_eq!(rows[0].status, IntakeCandidateStatus::Rejected);
+    assert_eq!(rows[0].work_id, None);
+    assert_eq!(rows[1].status, IntakeCandidateStatus::Accepted);
+    assert_eq!(rows[1].work_id, Some(work_id));
+    assert_eq!(rows[2].status, IntakeCandidateStatus::Replayed);
+    assert_eq!(rows[2].command_id.as_ref(), Some(&command_id));
+    // prop-d was never touched — still pending, still link-free.
+    assert_eq!(rows[3].status, IntakeCandidateStatus::Pending);
+    assert!(rows[3].command_id.is_none());
 }
 
 // --- decision links into the command ledger -------------------------
@@ -582,11 +713,13 @@ fn candidate_command_work_links_round_trip_and_fk_guard() {
 
     // Links to absent ledger rows are refused by the foreign keys. The
     // pending `prop-other` candidate (ordinal 1, admitted above) takes
-    // the bad-link updates — the FK rejects them inside the transaction.
+    // the bad-link updates — link-consistent shapes so the FK, not the
+    // status contract, is what rejects them.
     let bad_command = IntakeCandidate {
         status: IntakeCandidateStatus::Rejected,
         status_reason: Some("invalid_request".into()),
         command_id: Some(CommandId("cmd-absent".into())),
+        committed_seq: Some(committed_at),
         ..candidate("r-link", 1, "prop-other")
     };
     let err = store
@@ -600,7 +733,9 @@ fn candidate_command_work_links_round_trip_and_fk_guard() {
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     let bad_work = IntakeCandidate {
         status: IntakeCandidateStatus::Accepted,
+        command_id: Some(command_id.clone()),
         work_id: Some(WorkId("w-absent".into())),
+        committed_seq: Some(committed_at),
         ..candidate("r-link", 1, "prop-other")
     };
     let err = store

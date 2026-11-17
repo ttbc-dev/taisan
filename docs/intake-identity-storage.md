@@ -96,6 +96,8 @@ Run states:
 | `admitting` | `completed` | Every candidate reached a recorded terminal status |
 | terminal | — | `completed`, `failed`, `interrupted`, `skipped` never regress |
 
+Every transition into a terminal run state records `finished_unix_seconds`; `detail_code` carries the bounded diagnostic for `failed`, `interrupted`, and `skipped`. `open` and `admitting` runs keep both NULL — a live invocation has no finish time and no failure code.
+
 An empty successful scan is a `completed` run with zero candidates — "the selector ran and found nothing" is durable evidence, distinct from `skipped` (never ran) and `failed` (ran, failed).
 
 Candidate statuses:
@@ -110,9 +112,13 @@ Candidate statuses:
 | `unknown` | A submit's outcome is undetermined (store fault, lost response); reconcile via the saved command identity | none until reconciled |
 | `interrupted` | The run was interrupted before this candidate was attempted or resolved | none |
 
-Allowed transitions: `pending` → any terminal status or `unknown`; `unknown` → the resolved decision's status (`accepted`/`replayed`/`rejected`) or back to `pending` when the ledger proves no decision exists, or `interrupted`. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
+`capacity_deferred` is terminal *as a stored status*: the candidate row never transitions again, and run completion counts it among the terminal outcomes. "Not final" refers only to the command ledger — no decision was saved under the replay key, so a later run re-proposing the same semantic proposal submits fresh. Deferral is never retried by mutating this row.
 
-Insert rules mirror the tables: a run is recorded only as `open` or `skipped`; a candidate batch is recorded only as all-`pending` while its run is still `open`, in the same transaction that moves the run to `admitting`. No effect can append candidates to a run that already left `open`, and no effect can insert a candidate in a decided status — those are transition-table violations, not inserts.
+Allowed transitions: `pending` → `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `interrupted`, or to `unknown`; `unknown` → `accepted`, `replayed`, `rejected`, `pending` (the ledger proves no decision exists), or `interrupted`. `accepted`, `replayed`, `rejected`, `capacity_deferred`, and `interrupted` are the terminal candidate statuses — none has an outgoing transition. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
+
+The Links column is enforced by the store, not just documented: unresolved statuses (`pending`, `capacity_deferred`, `unknown`, `interrupted`) must keep `command_id`/`work_id`/`committed_seq` all NULL; `rejected` requires `command_id` and `committed_seq` and forbids `work_id`; `accepted` requires all three; `replayed` requires `command_id` and `committed_seq` with `work_id` present only when the saved decision created Work.
+
+Insert rules mirror the tables: a run is recorded only as `open` or `skipped`; a candidate batch is recorded by the single `AdmitIntakeBatch` effect — all-`pending`, link-free, each candidate naming the batch's run — which persists the batch and moves the run `open` → `admitting` atomically. No effect can append candidates to a run that already left `open`, and no effect can insert a candidate in a decided status or with decision links — those are transition-table violations, not inserts.
 
 ## Commit boundaries and crash matrix
 
@@ -120,7 +126,7 @@ The invocation has five durable boundaries. Each names what is recorded, what ma
 
 | # | Boundary | Durable state after commit | Crash before commit | Crash after commit |
 | --- | --- | --- | --- | --- |
-| B0 | Lease acquisition, then run insert (`open`) | Lease row + `open` run with owner identity | Lease held by dead owner → reclaimed via process evidence; no run → nothing to recover | Invocation proceeds normally |
+| B0 | Lease acquisition, then run insert (`open`) | Lease row + `open` run with owner identity | Lease held by dead owner → reclaimed via process evidence; no run → nothing to recover | Invocation proceeds normally. A `skipped` record (preflight found zero free pending positions) is written under the same held lease — it is an invocation attempt like any other |
 | B1 | Selector output persisted: candidate batch + run → `admitting`, one transaction | All validated candidates `pending`, original order, run `admitting` | Run stays `open`, zero candidates → recovery marks `interrupted` (`no_conforming_response`); no candidates are invented | Admission proceeds per candidate |
 | B2 | Per-candidate submit commit (inside `handle_command`) | Command decision in `commands` under the replay key; Work/claims if accepted | Candidate still `pending`; ledger may or may not hold the decision → recovery consults `stored_decision` by replay key before any resend | Candidate update (B3) may not have landed |
 | B3 | Candidate status/link update | Candidate records the decision outcome and links | As B2 — the candidate row is the only pending evidence; the ledger is authoritative | Next candidate proceeds |

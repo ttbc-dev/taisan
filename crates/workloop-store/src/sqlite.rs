@@ -2526,12 +2526,13 @@ impl TxView for Tx<'_> {
                     ],
                 )?;
             }
-            Effect::InsertIntakeCandidates { run_id, candidates } => {
-                // Commit boundary B1: a validated batch may only land
-                // while its run is still `open` — the same transaction
-                // moves the run to `admitting`, so candidates can never
-                // be appended after admission starts, and recovery can
-                // never invent rows under a terminal or interrupted run.
+            Effect::AdmitIntakeBatch { run_id, candidates } => {
+                // Commit boundary B1 in one apply: the validated batch
+                // and the run's `open` → `admitting` transition commit
+                // together, so a crash can never leave candidates
+                // without their run state, an `open` run holding
+                // candidates, or `admitting` with a partial batch
+                // (`docs/intake-identity-storage.md`).
                 let run_state: Option<String> = self
                     .tx
                     .query_row(
@@ -2553,17 +2554,28 @@ impl TxView for Tx<'_> {
                     });
                 }
                 for c in candidates {
-                    // A validated batch is persisted all-`pending`;
-                    // every other status is reached through the guarded
+                    // A validated batch is persisted all-`pending` with
+                    // no decision links; every other status and every
+                    // link is reached through the guarded
                     // UpdateIntakeCandidate transition after its submit
                     // resolves.
-                    if c.status != IntakeCandidateStatus::Pending {
+                    if c.run_id != run_id.as_str() {
                         return Err(StoreError::ConstraintConflict {
                             detail: format!(
-                                "intake candidate {}/{} cannot be inserted in status {}",
-                                c.run_id,
-                                c.ordinal,
-                                tag(&c.status)
+                                "intake candidate ordinal {} belongs to run {}, not {run_id}",
+                                c.ordinal, c.run_id
+                            ),
+                        });
+                    }
+                    if c.status != IntakeCandidateStatus::Pending
+                        || c.command_id.is_some()
+                        || c.work_id.is_some()
+                        || c.committed_seq.is_some()
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "intake candidate {}/{} must be pending with no decision links",
+                                c.run_id, c.ordinal
                             ),
                         });
                     }
@@ -2589,6 +2601,11 @@ impl TxView for Tx<'_> {
                         ],
                     )?;
                 }
+                self.exec(
+                    "UPDATE intake_runs SET state='admitting' \
+                     WHERE run_id=?1 AND state='open'",
+                    params![run_id],
+                )?;
             }
             Effect::UpdateIntakeRun {
                 run_id,
@@ -2706,6 +2723,44 @@ impl TxView for Tx<'_> {
                     return Err(StoreError::ConstraintConflict {
                         detail: format!(
                             "intake candidate {}/{} cannot move {current} -> {}",
+                            candidate.run_id,
+                            candidate.ordinal,
+                            tag(&candidate.status)
+                        ),
+                    });
+                }
+                // The spec's Links column is enforced, not just
+                // documented: unresolved statuses keep every decision
+                // link NULL (a deferred candidate must never look
+                // decided), a rejection never creates Work, and the
+                // decided statuses carry the command identity their
+                // outcome came from.
+                let links_clear = candidate.command_id.is_none()
+                    && candidate.work_id.is_none()
+                    && candidate.committed_seq.is_none();
+                let links_ok = match candidate.status {
+                    IntakeCandidateStatus::Pending
+                    | IntakeCandidateStatus::CapacityDeferred
+                    | IntakeCandidateStatus::Unknown
+                    | IntakeCandidateStatus::Interrupted => links_clear,
+                    IntakeCandidateStatus::Rejected => {
+                        candidate.work_id.is_none()
+                            && candidate.command_id.is_some()
+                            && candidate.committed_seq.is_some()
+                    }
+                    IntakeCandidateStatus::Accepted => {
+                        candidate.command_id.is_some()
+                            && candidate.work_id.is_some()
+                            && candidate.committed_seq.is_some()
+                    }
+                    IntakeCandidateStatus::Replayed => {
+                        candidate.command_id.is_some() && candidate.committed_seq.is_some()
+                    }
+                };
+                if !links_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake candidate {}/{} status {} carries an inconsistent decision-link set",
                             candidate.run_id,
                             candidate.ordinal,
                             tag(&candidate.status)
