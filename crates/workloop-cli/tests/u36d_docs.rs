@@ -41,9 +41,12 @@
 //! duplicated cell, a foreign adapter, a row missing a column, an
 //! `unexercised` row without a reason, a `requires_live` row that
 //! claims a pass, a `live_evidenced` row that stays unexercised, a
-//! fixture row citing a revision no cited record carries, and a
-//! record-index config naming a host instance its cited record does
-//! not transcribe.
+//! fixture row citing a revision no cited record carries, a
+//! record-index entry whose claim_class disagrees with the cited
+//! record's own, a `live_evidenced` index entry missing its
+//! authorization fields, a consolidated row whose claim_class
+//! disagrees with its cited index entries, and a record-index config
+//! naming a host instance its cited record does not transcribe.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -543,6 +546,7 @@ fn index_text(root: &Path, record: &str) -> Result<(), String> {
     let index = parse_table(record, &INDEX_HEADER)?;
     validate_shape(&index, INDEX_HEADER.len())?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut index_claims: BTreeMap<String, String> = BTreeMap::new();
     for row in &index {
         let reference = row[0].trim();
         if !seen.insert(reference.to_string()) {
@@ -638,6 +642,7 @@ fn index_text(root: &Path, record: &str) -> Result<(), String> {
         // entry's — substring presence alone cannot keep fixture
         // evidence out of a live_evidenced row.
         check_record_claims(&section_records(&text, label)?, claim_class, reference)?;
+        index_claims.insert(reference.to_string(), claim_class.to_string());
         let result = row[5].trim();
         let first = result.split_whitespace().next().unwrap_or("");
         if !RESULTS.contains(&first) {
@@ -668,6 +673,28 @@ fn index_text(root: &Path, record: &str) -> Result<(), String> {
         return Err(format!(
             "record-index entry {reference} is never referenced by the consolidated table"
         ));
+    }
+
+    // Claim agreement: every ref a row cites must carry the row's
+    // claim class in the index — ref-set agreement alone cannot keep
+    // a live_evidenced row backed by fixture_contract records.
+    for row in &table {
+        let table_claim = row[3].trim();
+        let (_, refs) = parse_ref_cell(root, &row[2])?;
+        for reference in refs {
+            let index_claim = index_claims
+                .get(&reference)
+                .map(String::as_str)
+                .unwrap_or("");
+            if index_claim != table_claim {
+                return Err(format!(
+                    "claim_class {table_claim} of {}×{} does not match the record-index \
+                     claim_class {index_claim} of {reference}",
+                    row[0].trim(),
+                    row[1].trim()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1022,6 +1049,35 @@ fn u36d_index_claim_class_must_match_the_cited_record() {
     // A complete live_evidenced record passes.
     check_record_claims(&[live_record], "live_evidenced", "ref")
         .expect("a complete live_evidenced record passes the index check");
+}
+
+#[test]
+fn u36d_table_claim_class_must_match_the_index() {
+    // The consolidated row's claim_class must equal the record-index
+    // entry's for every ref it cites — ref-set agreement alone let a
+    // live_evidenced row sit on fixture_contract records.
+    let mut rows = full_table();
+    let pos = rows
+        .iter()
+        .position(|r| r.contains("| stale_head | fixture |"))
+        .expect("the fixture stale_head row exists");
+    rows[pos] = row([
+        "stale_head",
+        "fixture",
+        &format!("[\"{U36A_REF}\"]"),
+        "live_evidenced",
+        SIBLING_U36A,
+        "installation test-host/local-repo contract version 1, adapters fixture-github and sparse-host",
+        "pass",
+        "retained fixture-class records only",
+    ]);
+    let record = synthetic_record(&rows, U36A_INDEX);
+    let err = schema_text(&repo_root(), &record)
+        .expect_err("a live_evidenced row backed by fixture_contract records must fail");
+    assert!(
+        err.contains("does not match the record-index"),
+        "the failure names the table/index claim-class mismatch: {err}"
+    );
 }
 
 #[test]
