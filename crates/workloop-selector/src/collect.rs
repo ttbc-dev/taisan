@@ -83,8 +83,9 @@ pub struct IssuePage {
 }
 
 /// A typed failure of one source read. The class decides the
-/// repository's [`ScanStatus`]; the reason is a bounded diagnostic that
-/// must never carry secret material.
+/// repository's [`ScanStatus`]; the reason is diagnostic text —
+/// [`collect`] bounds it before it enters the report, and it must
+/// never carry secret material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceReadError {
     /// The read was refused: the bound actor lacks the capability or
@@ -130,7 +131,8 @@ pub struct CollectionBounds {
     /// [`ScanStatus::Truncated`].
     pub max_issues_per_repository: usize,
     /// Total `list_issues` calls across the whole collection —
-    /// repositories not yet reached report [`ScanStatus::NotAttempted`].
+    /// repositories not yet reached report [`ScanStatus::NotAttempted`],
+    /// a scan already in flight reports [`ScanStatus::Truncated`].
     pub max_calls: usize,
     /// Unix-seconds deadline checked before every call; a scan still
     /// in flight reports [`ScanStatus::DeadlineExceeded`].
@@ -144,17 +146,22 @@ pub struct CollectionBounds {
 pub enum ScanStatus {
     /// Pagination exhausted and every listed fact validated.
     Complete,
-    /// A page, issue, or call bound stopped the scan before exhaustion.
+    /// A page, issue, or call bound stopped the scan before exhaustion —
+    /// including the shared call budget running out mid-scan.
     Truncated,
     /// The deadline passed before the scan completed.
     DeadlineExceeded,
-    /// The read was refused — denied capability or credential.
+    /// The read was refused — denied capability or credential. The
+    /// reason is bounded by [`collect`] before it enters the report.
     Denied { reason: String },
-    /// The read could not complete — transport or host failure.
+    /// The read could not complete — transport or host failure. The
+    /// reason is bounded by [`collect`] before it enters the report.
     Unavailable { reason: String },
     /// The host answered but its facts could not be trusted.
+    /// The reason is bounded by [`collect`] before it enters the report.
     Incomplete { reason: String },
-    /// The call budget was exhausted before this repository was read.
+    /// The call budget was exhausted before this repository's first
+    /// call — the repository was never read at all.
     NotAttempted,
 }
 
@@ -263,7 +270,14 @@ fn scan_repository<R: SourceReader + ?Sized>(
 
     loop {
         if *total_calls >= bounds.max_calls {
-            report.status = ScanStatus::NotAttempted;
+            // A repository that already spent calls is a partial scan
+            // — Truncated, not NotAttempted (which means the budget
+            // ran out before this repository's first call).
+            report.status = if report.calls == 0 {
+                ScanStatus::NotAttempted
+            } else {
+                ScanStatus::Truncated
+            };
             break;
         }
         if now() >= bounds.deadline_unix_seconds {
@@ -280,15 +294,38 @@ fn scan_repository<R: SourceReader + ?Sized>(
         match reader.list_issues(repository, cursor.as_deref(), bounds.page_size) {
             Err(error) => {
                 report.status = match error {
-                    SourceReadError::Denied { reason } => ScanStatus::Denied { reason },
-                    SourceReadError::Unavailable { reason } => ScanStatus::Unavailable { reason },
-                    SourceReadError::Malformed { reason } => ScanStatus::Incomplete { reason },
+                    SourceReadError::Denied { reason } => ScanStatus::Denied {
+                        reason: bounded_reason(reason),
+                    },
+                    SourceReadError::Unavailable { reason } => ScanStatus::Unavailable {
+                        reason: bounded_reason(reason),
+                    },
+                    SourceReadError::Malformed { reason } => ScanStatus::Incomplete {
+                        reason: bounded_reason(reason),
+                    },
                 };
                 break;
             }
             Ok(page) => {
+                // The reader contract is "at most page_size facts";
+                // a page that breaks it cannot be trusted — the same
+                // failure class as malformed source data. Enforcing
+                // it here also bounds what one reply can make the
+                // collector clone.
+                if page.issues.len() > bounds.page_size {
+                    report.status = ScanStatus::Incomplete {
+                        reason: bounded_reason(format!(
+                            "page carries {} facts, exceeding the requested page size {}",
+                            page.issues.len(),
+                            bounds.page_size
+                        )),
+                    };
+                    break;
+                }
                 if let Err(reason) = admit_page(repository, &page, &mut seen) {
-                    report.status = ScanStatus::Incomplete { reason };
+                    report.status = ScanStatus::Incomplete {
+                        reason: bounded_reason(reason),
+                    };
                     break;
                 }
                 if seen.len() > bounds.max_issues_per_repository {
@@ -390,3 +427,21 @@ fn bounded_token(value: &str) -> bool {
 /// unbounded fact.
 const MAX_TITLE_BYTES: usize = 16 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
+
+/// Diagnostic reasons entering [`ScanStatus`] are reader- or
+/// fact-supplied text; bound them so a hostile or broken reader
+/// cannot inflate the report.
+const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+
+fn bounded_reason(reason: String) -> String {
+    if reason.len() <= MAX_DIAGNOSTIC_BYTES {
+        return reason;
+    }
+    let mut end = MAX_DIAGNOSTIC_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = reason[..end].to_string();
+    truncated.push('…');
+    truncated
+}

@@ -202,7 +202,8 @@ fn bounds_stop_the_scan_with_typed_statuses() {
     assert_eq!(status_of(&c, &paged), &ScanStatus::Truncated);
     assert!(c.issues.is_empty());
 
-    // Issue bound.
+    // Issue bound: the page itself is within the requested page size,
+    // but the unique facts it carries exceed the repository budget.
     let many = repo("h", "repo-many");
     let mut reader = StubReader::new();
     reader.script_pages(
@@ -217,6 +218,7 @@ fn bounds_stop_the_scan_with_typed_statuses() {
         )],
     );
     let mut b = bounds();
+    b.page_size = 4;
     b.max_issues_per_repository = 2;
     let c = collect(
         &mut reader,
@@ -573,4 +575,138 @@ fn snapshot_projects_admitted_facts() {
     // The retained record keeps what the projection drops.
     assert_eq!(c.issues[0].labels.len(), 2);
     assert_eq!(c.issues[0].created_unix_seconds, 1_600_000_000);
+}
+
+/// The shared call budget running out *during* a repository's scan is
+/// a partial read — Truncated, not NotAttempted. NotAttempted is
+/// reserved for repositories whose first call never happened.
+#[test]
+fn call_budget_exhausted_mid_scan_is_truncated() {
+    let mid = repo("h", "repo-mid");
+    let never = repo("h", "repo-never");
+    let mut reader = StubReader::new();
+    reader.script_pages(
+        &mid,
+        vec![
+            page(vec![fact(&mid, "i1", None)], Some("c1")),
+            page(vec![fact(&mid, "i2", None)], None),
+        ],
+    );
+    let mut b = bounds();
+    b.max_calls = 1;
+    let c = collect(
+        &mut reader,
+        &scope(&[mid.clone(), never.clone()]),
+        &b,
+        &clock_at(1),
+    );
+    let mid_report = c
+        .report
+        .repositories
+        .iter()
+        .find(|r| r.repository == mid)
+        .unwrap();
+    assert_eq!(mid_report.status, ScanStatus::Truncated);
+    assert_eq!(
+        mid_report.calls, 1,
+        "one page was read before the budget ran out"
+    );
+    assert_eq!(status_of(&c, &never), &ScanStatus::NotAttempted);
+    assert!(c.issues.is_empty(), "a partial scan admits nothing");
+}
+
+/// Diagnostic reasons are reader- or fact-supplied text; whatever
+/// their size, what enters the report is bounded — a hostile or
+/// broken reader cannot inflate `CollectionReport`.
+#[test]
+fn diagnostic_reasons_are_bounded() {
+    let huge = "x".repeat(64 * 1024);
+
+    // A reader-supplied failure reason is truncated, not copied whole.
+    for error in [
+        SourceReadError::Denied {
+            reason: huge.clone(),
+        },
+        SourceReadError::Unavailable {
+            reason: huge.clone(),
+        },
+        SourceReadError::Malformed {
+            reason: huge.clone(),
+        },
+    ] {
+        let target = repo("h", "repo-huge-reason");
+        let mut reader = StubReader::new();
+        reader.script(&target, vec![Step::Fail(error)]);
+        let c = collect(
+            &mut reader,
+            &scope(std::slice::from_ref(&target)),
+            &bounds(),
+            &clock_at(1),
+        );
+        let reason = match status_of(&c, &target) {
+            ScanStatus::Denied { reason }
+            | ScanStatus::Unavailable { reason }
+            | ScanStatus::Incomplete { reason } => reason,
+            other => panic!("expected a reason-carrying status, got {other:?}"),
+        };
+        // MAX_DIAGNOSTIC_BYTES is 1024; the ellipsis marker adds 3.
+        assert!(
+            reason.len() <= 1027,
+            "reason must be bounded, got {} bytes",
+            reason.len()
+        );
+        assert!(reason.ends_with('…'), "truncation is marked");
+    }
+
+    // A fact-level failure embeds the fact's IssueRef in its message;
+    // an oversized opaque id cannot inflate the reason either.
+    let target = repo("h", "repo-huge-id");
+    let giant = "i".repeat(64 * 1024);
+    let bad = fact(&target, &giant, None);
+    let mut reader = StubReader::new();
+    reader.script_pages(&target, vec![page(vec![bad], None)]);
+    let c = collect(
+        &mut reader,
+        &scope(std::slice::from_ref(&target)),
+        &bounds(),
+        &clock_at(1),
+    );
+    match status_of(&c, &target) {
+        ScanStatus::Incomplete { reason } => {
+            assert!(reason.len() <= 1027, "reason must be bounded");
+        }
+        other => panic!("expected Incomplete, got {other:?}"),
+    }
+}
+
+/// A page carrying more facts than the requested page size violates
+/// the reader contract — the repository fails as Incomplete rather
+/// than trusting an unbounded reply.
+#[test]
+fn oversized_page_fails_the_repository() {
+    let target = repo("h", "repo-fat-page");
+    let mut reader = StubReader::new();
+    reader.script_pages(
+        &target,
+        vec![page(
+            vec![
+                fact(&target, "i1", None),
+                fact(&target, "i2", None),
+                fact(&target, "i3", None),
+            ],
+            None,
+        )],
+    );
+    // bounds().page_size is 2; the scripted page carries 3.
+    let c = collect(
+        &mut reader,
+        &scope(std::slice::from_ref(&target)),
+        &bounds(),
+        &clock_at(1),
+    );
+    assert!(matches!(
+        status_of(&c, &target),
+        ScanStatus::Incomplete { .. }
+    ));
+    assert!(c.issues.is_empty());
 }

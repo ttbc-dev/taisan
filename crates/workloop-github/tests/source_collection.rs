@@ -317,10 +317,11 @@ fn source_ids_stay_scoped_across_repositories() {
 
 /// Credential failures surface before any read: a missing credential
 /// environment, an unresolvable slot, a denied credential, and an
-/// actor mismatch each fail `source_reader` construction — and none
-/// of them ever reaches a listing.
+/// actor mismatch each fail `source_reader` construction with a typed
+/// `CredentialError` — no reader exists, so no listing can be
+/// bypassed or silently skipped.
 #[test]
-fn credential_failures_surface_as_denied_reads() {
+fn credential_failures_fail_before_any_read() {
     // No credential environment installed at all.
     let bare = FixtureGithub::new();
     let error = bare
