@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `7` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1`, `2`, `3`, `4`, `5`, or `6`
+//! `PRAGMA user_version` is the format gate: `8` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `7`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -23,12 +23,13 @@ use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::identity::{HostInstanceId, StoreId};
+use workloop_core::identity::{AdapterId, HostInstanceId, StoreId};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
-    CommandRecord, Deferral, Effect, HostActionIntent, ReadView, RecoveryIntent,
-    RecoveryIntentState, Store, StoreError, TxView,
+    CommandRecord, Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus,
+    IntakeRun, IntakeRunState, ReadView, RecoveryIntent, RecoveryIntentState, Store, StoreError,
+    TxView,
 };
 use workloop_core::worker::WorkerRequestExport;
 
@@ -40,9 +41,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `4` adds the body catalogue's explicit `pin_state`; `5` adds the
 /// `reclaim_plans` / `reclaim_plan_entries` tables; `6` adds the
 /// request's durable Worker adapter binding; `7` adds the usage row's
-/// durable `last_progress_basis`. Older files upgrade additively at
-/// open.
-const FORMAT_VERSION: i64 = 7;
+/// durable `last_progress_basis`; `8` adds the `intake_runs` /
+/// `intake_candidates` tables (`docs/intake-identity-storage.md`).
+/// Older files upgrade additively at open.
+const FORMAT_VERSION: i64 = 8;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -62,6 +64,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "finding_occurrences",
     "host_action_intents",
     "id_counters",
+    "intake_candidates",
+    "intake_runs",
     "invocations",
     "invocation_requests",
     "issue_claims",
@@ -86,9 +90,9 @@ const EXPECTED_TABLES: &[&str] = &[
 
 /// The tables the run-lease slice added on top of the previous
 /// release's v1 store while it was still stamped `1`. Together with
-/// [`V2_ADDED_TABLES`], [`V3_ADDED_TABLES`], and [`V5_ADDED_TABLES`]
-/// they are the set a stamped file may legitimately lack and still be
-/// upgraded in place by the additive migration.
+/// [`V2_ADDED_TABLES`], [`V3_ADDED_TABLES`], [`V5_ADDED_TABLES`], and
+/// [`V8_ADDED_TABLES`] they are the set a stamped file may legitimately
+/// lack and still be upgraded in place by the additive migration.
 const ADDITIVE_TABLES: &[&str] = &["body_catalog", "body_pins", "recovery_intents", "run_lease"];
 
 /// Tables the v1 → v2 migration adds. Everything else in
@@ -104,6 +108,11 @@ const V3_ADDED_TABLES: &[&str] = &["worker_request_exports"];
 /// format-4 store while it is still stamped `4`. Like the additive set
 /// they are installed by the same `SCHEMA` batch on upgrade.
 const V5_ADDED_TABLES: &[&str] = &["reclaim_plan_entries", "reclaim_plans"];
+
+/// Tables the v7 → v8 migration adds (the v0.2 intake records). Like
+/// the earlier additive sets, they are installed by the same `SCHEMA`
+/// batch on upgrade.
+const V8_ADDED_TABLES: &[&str] = &["intake_candidates", "intake_runs"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -236,12 +245,12 @@ impl SqliteStore {
             // An upgrade is legitimate only for a file that holds the
             // complete schema of its stamped version: a v1 file must
             // hold every expected table except the ones added since —
-            // the run-lease slice's additive set, the two v2 additions,
-            // and the v3 and v5 additions — a v2 file everything
-            // except the v3 and v5 additions, a v3 or v4 file
-            // everything except the v5 additions (v4 adds a column,
-            // not a table), and a v5 or v6 file the complete set (v6
-            // and v7 each add a column, not a table). A foreign or
+            // the run-lease slice's additive set, the v2, v3, v5, and
+            // v8 additions — a v2 file everything except the v3, v5,
+            // and v8 additions, a v3 or v4 file everything except the
+            // v5 and v8 additions (v4 adds a column, not a table), a
+            // v5–v7 file everything except the v8 additions (v6 and v7
+            // each add a column, not a table). A foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
             // holds every base table and none of the additions, so it
@@ -256,17 +265,27 @@ impl SqliteStore {
                             && !ADDITIVE_TABLES.contains(t)
                             && !V3_ADDED_TABLES.contains(t)
                             && !V5_ADDED_TABLES.contains(t)
+                            && !V8_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V3_ADDED_TABLES.contains(t) && !V5_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V3_ADDED_TABLES.contains(t)
+                            && !V5_ADDED_TABLES.contains(t)
+                            && !V8_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V5_ADDED_TABLES.contains(t))
+                    .filter(|t| !V5_ADDED_TABLES.contains(t) && !V8_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else if version < 8 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V8_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
                 EXPECTED_TABLES.iter().all(|t| present.contains(*t))
@@ -531,6 +550,27 @@ impl SqliteStore {
     /// never clear a lease that was reclaimed by another driver.
     pub fn release_run_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
         self.release_lease(owner, "default")
+    }
+
+    /// Claim the installation-wide intake invocation lease
+    /// (`docs/intake-identity-storage.md`): at most one automatic or
+    /// manual intake owner at a time. Same reclaim semantics as the
+    /// run lease — a recorded owner is displaced only on proof it is
+    /// gone; a live owner yields `Held`, an uninspectable one
+    /// `Unavailable`.
+    pub fn acquire_intake_lease(
+        &self,
+        owner: &RunLeaseOwner,
+        inspect: impl Fn(&ProcessIdentity) -> ProcessEvidence,
+        now_unix_seconds: i64,
+    ) -> Result<RunLeaseGrant, RunLeaseError> {
+        self.acquire_lease(owner, inspect, now_unix_seconds, "intake")
+    }
+
+    /// Release only this owner's intake lease. A stale holder's release
+    /// can never clear a lease reclaimed by another invocation.
+    pub fn release_intake_lease(&self, owner: &RunLeaseOwner) -> Result<(), StoreError> {
+        self.release_lease(owner, "intake")
     }
 
     fn release_lease(&self, owner: &RunLeaseOwner, lease_key: &str) -> Result<(), StoreError> {
@@ -1700,6 +1740,92 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn intake_run(&self, run_id: &str) -> Result<Option<IntakeRun>, StoreError> {
+        self.query_opt(
+            &format!("SELECT {INTAKE_RUN_COLS} FROM intake_runs WHERE run_id=?1"),
+            params![run_id],
+            intake_run_from_row,
+        )
+    }
+
+    fn intake_runs(&self) -> Result<Vec<IntakeRun>, StoreError> {
+        self.query_all(
+            &format!("SELECT {INTAKE_RUN_COLS} FROM intake_runs ORDER BY recorded_seq"),
+            [],
+            intake_run_from_row,
+        )
+    }
+
+    fn active_intake_run(&self) -> Result<Option<IntakeRun>, StoreError> {
+        self.query_opt(
+            &format!(
+                "SELECT {INTAKE_RUN_COLS} FROM intake_runs \
+                 WHERE state IN ('open', 'admitting')"
+            ),
+            [],
+            intake_run_from_row,
+        )
+    }
+
+    fn intake_candidates(&self, run_id: &str) -> Result<Vec<IntakeCandidate>, StoreError> {
+        self.query_all(
+            &format!(
+                "SELECT {INTAKE_CANDIDATE_COLS} FROM intake_candidates \
+                 WHERE run_id=?1 ORDER BY ordinal"
+            ),
+            params![run_id],
+            intake_candidate_from_row,
+        )
+    }
+
+    fn intake_candidates_for_proposal(
+        &self,
+        proposal_key: &str,
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
+        self.query_all(
+            &format!(
+                "SELECT {INTAKE_CANDIDATE_COLS} FROM intake_candidates \
+                 WHERE proposal_key=?1 ORDER BY recorded_seq, run_id, ordinal"
+            ),
+            params![proposal_key],
+            intake_candidate_from_row,
+        )
+    }
+
+    fn intake_candidates_for_command(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
+        self.query_all(
+            &format!(
+                "SELECT {INTAKE_CANDIDATE_COLS} FROM intake_candidates \
+                 WHERE command_id=?1 ORDER BY recorded_seq, run_id, ordinal"
+            ),
+            params![command_id.0],
+            intake_candidate_from_row,
+        )
+    }
+
+    fn intake_candidates_by_status(
+        &self,
+        statuses: &[IntakeCandidateStatus],
+    ) -> Result<Vec<IntakeCandidate>, StoreError> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT {INTAKE_CANDIDATE_COLS} FROM intake_candidates \
+             WHERE status IN ({placeholders}) ORDER BY recorded_seq, run_id, ordinal"
+        );
+        let tags: Vec<String> = statuses.iter().map(tag).collect();
+        self.query_all(
+            &sql,
+            rusqlite::params_from_iter(tags.iter()),
+            intake_candidate_from_row,
+        )
+    }
+
     fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
         self.query_all(
             "SELECT command_id, canonical_payload, decision, seq \
@@ -1728,6 +1854,53 @@ impl ReadView for Tx<'_> {
             },
         )
     }
+}
+
+const INTAKE_RUN_COLS: &str = "run_id, trigger, selector_id, selector_version, \
+    policy_revision, settings_revision, state, detail_code, request_payload, \
+    request_digest, owner_pid, owner_started_at, owner_nonce, \
+    created_unix_seconds, finished_unix_seconds, recorded_seq";
+
+const INTAKE_CANDIDATE_COLS: &str = "run_id, ordinal, proposal_key, replay_key, \
+    payload, payload_digest, status, status_reason, command_id, work_id, \
+    committed_seq, recorded_seq";
+
+fn intake_run_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeRun, rusqlite::Error> {
+    Ok(IntakeRun {
+        run_id: row.get(0)?,
+        trigger: untag(&row.get::<_, String>(1)?)?,
+        selector_id: AdapterId::trusted(row.get::<_, String>(2)?),
+        selector_version: row.get::<_, u32>(3)?,
+        policy_revision: row.get::<_, i64>(4)? as u64,
+        settings_revision: row.get(5)?,
+        state: untag(&row.get::<_, String>(6)?)?,
+        detail_code: row.get(7)?,
+        request_payload: row.get(8)?,
+        request_digest: row.get(9)?,
+        owner_pid: row.get(10)?,
+        owner_started_at: row.get(11)?,
+        owner_nonce: row.get(12)?,
+        created_unix_seconds: row.get(13)?,
+        finished_unix_seconds: row.get(14)?,
+        recorded_seq: row.get(15)?,
+    })
+}
+
+fn intake_candidate_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeCandidate, rusqlite::Error> {
+    Ok(IntakeCandidate {
+        run_id: row.get(0)?,
+        ordinal: row.get::<_, u32>(1)?,
+        proposal_key: row.get(2)?,
+        replay_key: row.get(3)?,
+        payload: row.get(4)?,
+        payload_digest: row.get(5)?,
+        status: untag(&row.get::<_, String>(6)?)?,
+        status_reason: row.get(7)?,
+        command_id: row.get::<_, Option<String>>(8)?.map(CommandId),
+        work_id: row.get::<_, Option<String>>(9)?.map(WorkId),
+        committed_seq: row.get(10)?,
+        recorded_seq: row.get(11)?,
+    })
 }
 
 /// Reduce a stored canonical command payload to the census fields: the
@@ -2286,6 +2459,329 @@ impl TxView for Tx<'_> {
                     "UPDATE recovery_intents SET state=?2, retirement_reason=?3 \
                      WHERE intent_id=?1 AND state='pending'",
                     params![intent_id, target, retirement_reason],
+                )?;
+            }
+            Effect::InsertIntakeRun { run } => {
+                // Runs are born `open` (invocation owned, adapter call
+                // in flight) or `skipped` (recorded without a launch,
+                // terminal at insert) — the only insert states the spec
+                // table allows. Every other state is reached through
+                // the guarded UpdateIntakeRun transition.
+                if !matches!(run.state, IntakeRunState::Open | IntakeRunState::Skipped) {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {} cannot be inserted in state {}",
+                            run.run_id,
+                            tag(&run.state)
+                        ),
+                    });
+                }
+                // Single-active backstop: the intake lease is the real
+                // mutex, but a second live run must conflict even if a
+                // caller bypassed it — the partial unique index makes
+                // the same guarantee structural. Terminal records
+                // (`skipped`, `failed`, …) never occupy the active slot
+                // and stay recordable while another run is live.
+                if matches!(run.state, IntakeRunState::Open | IntakeRunState::Admitting) {
+                    let active: i64 = self
+                        .tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM intake_runs \
+                             WHERE state IN ('open', 'admitting')",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_err)?;
+                    if active > 0 {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: "an intake run is already active".into(),
+                        });
+                    }
+                }
+                self.exec(
+                    "INSERT INTO intake_runs (run_id, trigger, selector_id, \
+                     selector_version, policy_revision, settings_revision, \
+                     state, detail_code, request_payload, request_digest, \
+                     owner_pid, owner_started_at, owner_nonce, \
+                     created_unix_seconds, finished_unix_seconds, \
+                     recorded_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    params![
+                        run.run_id,
+                        tag(&run.trigger),
+                        run.selector_id.as_str(),
+                        i64::from(run.selector_version),
+                        run.policy_revision as i64,
+                        run.settings_revision,
+                        tag(&run.state),
+                        run.detail_code,
+                        run.request_payload,
+                        run.request_digest,
+                        run.owner_pid,
+                        run.owner_started_at,
+                        run.owner_nonce,
+                        run.created_unix_seconds,
+                        run.finished_unix_seconds,
+                        run.recorded_seq,
+                    ],
+                )?;
+            }
+            Effect::AdmitIntakeBatch { run_id, candidates } => {
+                // Commit boundary B1 in one apply: the validated batch
+                // and the run's `open` → `admitting` transition commit
+                // together, so a crash can never leave candidates
+                // without their run state, an `open` run holding
+                // candidates, or `admitting` with a partial batch
+                // (`docs/intake-identity-storage.md`).
+                let run_state: Option<String> = self
+                    .tx
+                    .query_row(
+                        "SELECT state FROM intake_runs WHERE run_id=?1",
+                        params![run_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                let Some(state_tag) = run_state else {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("intake run {run_id} is absent"),
+                    });
+                };
+                let state: IntakeRunState = untag(&state_tag).map_err(map_err)?;
+                if state != IntakeRunState::Open {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("intake run {run_id} is {}, not open", tag(&state)),
+                    });
+                }
+                for c in candidates {
+                    // A validated batch is persisted all-`pending` with
+                    // no decision links; every other status and every
+                    // link is reached through the guarded
+                    // UpdateIntakeCandidate transition after its submit
+                    // resolves.
+                    if c.run_id != run_id.as_str() {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "intake candidate ordinal {} belongs to run {}, not {run_id}",
+                                c.ordinal, c.run_id
+                            ),
+                        });
+                    }
+                    if c.status != IntakeCandidateStatus::Pending
+                        || c.command_id.is_some()
+                        || c.work_id.is_some()
+                        || c.committed_seq.is_some()
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "intake candidate {}/{} must be pending with no decision links",
+                                c.run_id, c.ordinal
+                            ),
+                        });
+                    }
+                    self.exec(
+                        "INSERT INTO intake_candidates (run_id, ordinal, \
+                         proposal_key, replay_key, payload, payload_digest, \
+                         status, status_reason, command_id, work_id, \
+                         committed_seq, recorded_seq) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                        params![
+                            run_id,
+                            i64::from(c.ordinal),
+                            c.proposal_key,
+                            c.replay_key,
+                            c.payload,
+                            c.payload_digest,
+                            tag(&c.status),
+                            c.status_reason,
+                            c.command_id.as_ref().map(|id| id.0.clone()),
+                            c.work_id.as_ref().map(|id| id.0.clone()),
+                            c.committed_seq,
+                            c.recorded_seq,
+                        ],
+                    )?;
+                }
+                self.exec(
+                    "UPDATE intake_runs SET state='admitting' \
+                     WHERE run_id=?1 AND state='open'",
+                    params![run_id],
+                )?;
+            }
+            Effect::UpdateIntakeRun {
+                run_id,
+                state,
+                detail_code,
+                finished_unix_seconds,
+                expected_state,
+            } => {
+                // Closed lifecycle plus an expected-state guard: the
+                // store enforces both so a coordinator bug cannot
+                // regress a terminal run or skip the admitting phase.
+                // `docs/intake-identity-storage.md` is the table.
+                let current: Option<String> = self
+                    .tx
+                    .query_row(
+                        "SELECT state FROM intake_runs WHERE run_id=?1",
+                        params![run_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                let Some(current) = current else {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("intake run {run_id} is absent"),
+                    });
+                };
+                let current_state: IntakeRunState = untag(&current).map_err(map_err)?;
+                if current_state != *expected_state {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!("intake run {run_id} is {current}, not the expected state"),
+                    });
+                }
+                let legal = matches!(
+                    (current_state, *state),
+                    (IntakeRunState::Open, IntakeRunState::Admitting)
+                        | (IntakeRunState::Open, IntakeRunState::Failed)
+                        | (IntakeRunState::Open, IntakeRunState::Interrupted)
+                        | (IntakeRunState::Admitting, IntakeRunState::Completed)
+                        | (IntakeRunState::Admitting, IntakeRunState::Interrupted)
+                );
+                if !legal {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {run_id} cannot move {current} -> {}",
+                            tag(state)
+                        ),
+                    });
+                }
+                self.exec(
+                    "UPDATE intake_runs SET state=?2, detail_code=?3, \
+                     finished_unix_seconds=?4 \
+                     WHERE run_id=?1 AND state=?5",
+                    params![
+                        run_id,
+                        tag(state),
+                        detail_code,
+                        finished_unix_seconds,
+                        tag(expected_state),
+                    ],
+                )?;
+            }
+            Effect::UpdateIntakeCandidate {
+                candidate,
+                expected_status,
+            } => {
+                // Identity fields are immutable: the UPDATE names only
+                // the status and decision-link columns. The closed
+                // transition table plus the expected-status guard mean
+                // a stale or terminal writer conflicts instead of
+                // regressing the row
+                // (`docs/intake-identity-storage.md`).
+                let current: Option<String> = self
+                    .tx
+                    .query_row(
+                        "SELECT status FROM intake_candidates \
+                         WHERE run_id=?1 AND ordinal=?2",
+                        params![candidate.run_id, i64::from(candidate.ordinal)],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                let Some(current) = current else {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake candidate {}/{} is absent",
+                            candidate.run_id, candidate.ordinal
+                        ),
+                    });
+                };
+                let current_status: IntakeCandidateStatus = untag(&current).map_err(map_err)?;
+                if current_status != *expected_status {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake candidate {}/{} is {current}, not the expected status",
+                            candidate.run_id, candidate.ordinal
+                        ),
+                    });
+                }
+                use IntakeCandidateStatus as S;
+                let legal = matches!(
+                    (current_status, candidate.status),
+                    (S::Pending, S::Accepted)
+                        | (S::Pending, S::Replayed)
+                        | (S::Pending, S::Rejected)
+                        | (S::Pending, S::CapacityDeferred)
+                        | (S::Pending, S::Unknown)
+                        | (S::Pending, S::Interrupted)
+                        | (S::Unknown, S::Accepted)
+                        | (S::Unknown, S::Replayed)
+                        | (S::Unknown, S::Rejected)
+                        | (S::Unknown, S::Pending)
+                        | (S::Unknown, S::Interrupted)
+                );
+                if !legal {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake candidate {}/{} cannot move {current} -> {}",
+                            candidate.run_id,
+                            candidate.ordinal,
+                            tag(&candidate.status)
+                        ),
+                    });
+                }
+                // The spec's Links column is enforced, not just
+                // documented: unresolved statuses keep every decision
+                // link NULL (a deferred candidate must never look
+                // decided), a rejection never creates Work, and the
+                // decided statuses carry the command identity their
+                // outcome came from.
+                let links_clear = candidate.command_id.is_none()
+                    && candidate.work_id.is_none()
+                    && candidate.committed_seq.is_none();
+                let links_ok = match candidate.status {
+                    IntakeCandidateStatus::Pending
+                    | IntakeCandidateStatus::CapacityDeferred
+                    | IntakeCandidateStatus::Unknown
+                    | IntakeCandidateStatus::Interrupted => links_clear,
+                    IntakeCandidateStatus::Rejected => {
+                        candidate.work_id.is_none()
+                            && candidate.command_id.is_some()
+                            && candidate.committed_seq.is_some()
+                    }
+                    IntakeCandidateStatus::Accepted => {
+                        candidate.command_id.is_some()
+                            && candidate.work_id.is_some()
+                            && candidate.committed_seq.is_some()
+                    }
+                    IntakeCandidateStatus::Replayed => {
+                        candidate.command_id.is_some() && candidate.committed_seq.is_some()
+                    }
+                };
+                if !links_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake candidate {}/{} status {} carries an inconsistent decision-link set",
+                            candidate.run_id,
+                            candidate.ordinal,
+                            tag(&candidate.status)
+                        ),
+                    });
+                }
+                self.exec(
+                    "UPDATE intake_candidates SET status=?3, \
+                     status_reason=?4, command_id=?5, work_id=?6, \
+                     committed_seq=?7 \
+                     WHERE run_id=?1 AND ordinal=?2 AND status=?8",
+                    params![
+                        candidate.run_id,
+                        i64::from(candidate.ordinal),
+                        tag(&candidate.status),
+                        candidate.status_reason,
+                        candidate.command_id.as_ref().map(|id| id.0.clone()),
+                        candidate.work_id.as_ref().map(|id| id.0.clone()),
+                        candidate.committed_seq,
+                        tag(expected_status),
+                    ],
                 )?;
             }
             Effect::RecordDeferral {

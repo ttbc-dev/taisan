@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
 use crate::identity::{
-    ActorRole, ChangeRequestRef, CommitRevision, HostActorRef, HostInstanceId, IssueRef,
+    ActorRole, AdapterId, ChangeRequestRef, CommitRevision, HostActorRef, HostInstanceId, IssueRef,
     RepositoryRef, StoreId,
 };
 use crate::observation::{HostActionStatus, NormalizedEffectFact, Observation};
@@ -138,6 +138,49 @@ pub enum Effect {
         intent_id: String,
         state: RecoveryIntentState,
         retirement_reason: Option<String>,
+    },
+    /// Records one intake invocation (`docs/intake-identity-storage.md`).
+    /// At most one run may be `open`/`admitting` at a time; a second
+    /// live run is a `ConstraintConflict`.
+    InsertIntakeRun {
+        run: IntakeRun,
+    },
+    /// Commit boundary B1 in one apply: persists a whole-response-
+    /// validated candidate batch in original order *and* moves the run
+    /// `open` → `admitting`. The store refuses the effect unless the run
+    /// is still `open`, every candidate is `pending` with no decision
+    /// links, and each `candidate.run_id` matches `run_id` — so a crash
+    /// can never leave candidates without their run state, an `open`
+    /// run holding candidates, or a run `admitting` with a partial
+    /// batch.
+    AdmitIntakeBatch {
+        run_id: String,
+        candidates: Vec<IntakeCandidate>,
+    },
+    /// Guarded run-state transition: only `state`, `detail_code`, and
+    /// `finished_unix_seconds` may change, and only from
+    /// `expected_state`.
+    UpdateIntakeRun {
+        run_id: String,
+        state: IntakeRunState,
+        detail_code: Option<String>,
+        finished_unix_seconds: Option<i64>,
+        expected_state: IntakeRunState,
+    },
+    /// Guarded candidate-status transition. Identity fields
+    /// (`run_id`, `ordinal`, `proposal_key`, `replay_key`, `payload`,
+    /// `payload_digest`, `recorded_seq`) are immutable; only the status
+    /// and decision-link fields (`status`, `status_reason`,
+    /// `command_id`, `work_id`, `committed_seq`) are written, and only
+    /// from `expected_status`. The written status must also carry a
+    /// link set the spec's Links column allows: unresolved statuses
+    /// (`pending`, `capacity_deferred`, `unknown`, `interrupted`) keep
+    /// all links NULL, `rejected` never carries `work_id`, and the
+    /// decided statuses carry the command identity their outcome came
+    /// from.
+    UpdateIntakeCandidate {
+        candidate: IntakeCandidate,
+        expected_status: IntakeCandidateStatus,
     },
     /// Why a queued Execution was deferred at dispatch; surfaced by the
     /// `capacity` Query.
@@ -313,6 +356,129 @@ impl HostAction {
             Self::MarkReady { .. } => "mark_ready",
         }
     }
+}
+
+/// Which path requested one intake invocation. Closed vocabulary —
+/// persisted as snake_case tags and CHECK-constrained in SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeTrigger {
+    /// One-shot CLI invocation.
+    Manual,
+    /// Automatic intake enabled at driver start.
+    ScheduledStartup,
+    /// A periodic due tick.
+    ScheduledInterval,
+    /// Disabled→enabled transition invoking immediately.
+    ScheduledReenable,
+}
+
+/// Lifecycle of one durable intake run
+/// (`docs/intake-identity-storage.md`). `Open`/`Admitting` are the only
+/// nonterminal states; at most one run may hold either at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeRunState {
+    /// Invocation owned; the adapter call is in flight or its response
+    /// is being validated. No validated batch exists yet.
+    Open,
+    /// A whole-response-validated candidate batch committed; submits are
+    /// in progress.
+    Admitting,
+    /// Every candidate reached a recorded terminal status.
+    Completed,
+    /// Invocation-level failure before a validated batch; `detail_code`
+    /// carries the bounded failure code.
+    Failed,
+    /// Recovery determined the owning invocation cannot continue.
+    /// Never set by a live owner.
+    Interrupted,
+    /// Recorded without an adapter launch (e.g. zero free pending
+    /// positions at preflight). Terminal at insert.
+    Skipped,
+}
+
+/// Outcome recorded for one validated candidate. `Pending` and
+/// `Unknown` are the only non-final states; the rest are terminal and
+/// carry their decision links where one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeCandidateStatus {
+    /// Validated, not yet decided in this run.
+    Pending,
+    /// This run's submit freshly accepted; new Work created.
+    Accepted,
+    /// Submit returned the saved decision for this replay identity.
+    Replayed,
+    /// Ordinary final rejection; `status_reason` carries the code.
+    Rejected,
+    /// Refused for capacity before any decision was recorded;
+    /// deferrable, never a saved rejection.
+    CapacityDeferred,
+    /// A submit's outcome is undetermined; reconcile via the command
+    /// ledger under `replay_key`.
+    Unknown,
+    /// The run was interrupted before this candidate resolved.
+    Interrupted,
+}
+
+/// One durable intake invocation: who asked (trigger), which adapter
+/// and revisions ran, what was requested (`request_payload` +
+/// `request_digest`), who owned it, and where it ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeRun {
+    pub run_id: String,
+    pub trigger: IntakeTrigger,
+    pub selector_id: AdapterId,
+    pub selector_version: u32,
+    pub policy_revision: u64,
+    /// Opaque installation intake-settings revision; audit provenance
+    /// only, never part of proposal or replay identity.
+    pub settings_revision: Option<String>,
+    pub state: IntakeRunState,
+    /// Bounded diagnostic code for `failed`/`interrupted`/`skipped`.
+    pub detail_code: Option<String>,
+    /// Canonical JSON bytes of the complete request parameters,
+    /// including the full exclusion snapshot.
+    pub request_payload: Vec<u8>,
+    pub request_digest: String,
+    /// The lease owner identity this run was created under.
+    pub owner_pid: i32,
+    pub owner_started_at: String,
+    pub owner_nonce: String,
+    pub created_unix_seconds: i64,
+    pub finished_unix_seconds: Option<i64>,
+    pub recorded_seq: EventSequence,
+}
+
+/// One validated candidate inside an intake run, in the adapter's
+/// returned order (`ordinal`). Identity fields are immutable after
+/// insert; the status and decision-link fields are the only mutable
+/// surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeCandidate {
+    pub run_id: String,
+    pub ordinal: u32,
+    /// The proposal-v1 semantic digest; globally unique per semantic
+    /// proposal.
+    pub proposal_key: String,
+    /// `proposal/<selector_id>:<proposal_key>` — the submit command's
+    /// idempotency key.
+    pub replay_key: String,
+    /// Canonical proposal-v1 semantic JSON bytes.
+    pub payload: Vec<u8>,
+    pub payload_digest: String,
+    pub status: IntakeCandidateStatus,
+    /// Bounded reason: rejection code, deferral cause, or diagnostic.
+    pub status_reason: Option<String>,
+    /// The durable command decision this candidate resolved to, when
+    /// one exists. NULL for pending/deferred/unknown/interrupted.
+    pub command_id: Option<CommandId>,
+    /// The Work the decision created or replayed, when accepted.
+    pub work_id: Option<WorkId>,
+    /// The deciding command's `committed_at` sequence.
+    pub committed_seq: Option<EventSequence>,
+    pub recorded_seq: EventSequence,
 }
 
 /// A dispatch deferral: why a queued Execution was not admitted.
@@ -569,6 +735,34 @@ pub trait ReadView {
 
     /// All recorded recovery intents; Core filters by state/due time.
     fn recovery_intents(&self) -> Result<Vec<RecoveryIntent>, StoreError>;
+
+    /// One intake run by id.
+    fn intake_run(&self, run_id: &str) -> Result<Option<IntakeRun>, StoreError>;
+    /// All intake runs in recorded order.
+    fn intake_runs(&self) -> Result<Vec<IntakeRun>, StoreError>;
+    /// The single nonterminal (`open`/`admitting`) intake run, if any.
+    fn active_intake_run(&self) -> Result<Option<IntakeRun>, StoreError>;
+    /// One run's candidates in original ordinal order.
+    fn intake_candidates(&self, run_id: &str) -> Result<Vec<IntakeCandidate>, StoreError>;
+    /// Every candidate row for one proposal identity, across runs.
+    fn intake_candidates_for_proposal(
+        &self,
+        proposal_key: &str,
+    ) -> Result<Vec<IntakeCandidate>, StoreError>;
+    /// Every candidate that linked one command decision, oldest
+    /// first — a replayed proposal links the same saved decision, so
+    /// the original recorder is the first row. Recovers the original
+    /// outcome after a lost response.
+    fn intake_candidates_for_command(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Vec<IntakeCandidate>, StoreError>;
+    /// Candidates in any of the given statuses — the recovery sweep's
+    /// work list (`pending`/`unknown`).
+    fn intake_candidates_by_status(
+        &self,
+        statuses: &[IntakeCandidateStatus],
+    ) -> Result<Vec<IntakeCandidate>, StoreError>;
 
     /// Every durable command decision, oldest first, reduced to
     /// [`CommandRecord`]. Read-only evidence for queries that must know
