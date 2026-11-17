@@ -1,0 +1,39 @@
+{
+  "request": {
+    "protocol_version": "rui-evidence/1",
+    "artifact_id": "observations",
+    "sha256": "3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f"
+  },
+  "envelope": {
+    "schema_version": "1",
+    "status": "accepted",
+    "command": {
+      "id": null,
+      "kind": "evidence_artifact",
+      "actor": "local",
+      "idempotency_key": null
+    },
+    "work_id": null,
+    "execution_id": null,
+    "result": {
+      "protocol_version": "rui-evidence/1",
+      "descriptor": {
+        "artifact_id": "observations",
+        "identity": {
+          "installation_id": "installation-example",
+          "store_epoch": "epoch-example",
+          "source_id": "retained-observation-bundle",
+          "revision": "r1",
+          "revision_seq": 1
+        },
+        "sha256": "3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f",
+        "byte_length": 1947,
+        "media_type": "application/json",
+        "availability": "available"
+      },
+      "bytes_written": 1947
+    },
+    "reason": null,
+    "evidence_refs": []
+  }
+}

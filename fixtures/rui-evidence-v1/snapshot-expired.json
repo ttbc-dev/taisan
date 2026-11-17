@@ -1,0 +1,18 @@
+{
+  "schema_version": "1",
+  "status": "error",
+  "command": {
+    "id": null,
+    "kind": "evidence_export",
+    "actor": "local",
+    "idempotency_key": null
+  },
+  "work_id": null,
+  "execution_id": null,
+  "result": null,
+  "reason": {
+    "code": "snapshot_expired",
+    "message": "Snapshot expired."
+  },
+  "evidence_refs": []
+}

@@ -1,0 +1,17 @@
+{
+  "protocol_version": "rui-evidence/1",
+  "sha256": {
+    "artifact-success.json": "7d1409179f22d3faa9f34d5251cf3b0c607e092d4fd627113c57fbaeaaf3c4d6",
+    "artifact-too-large.json": "9d41cc39a6f2cce7dc739a1d1e42ea36f26489926f924966d099f2f5574c4c14",
+    "artifact-unavailable.json": "95953b936f4cea81c856a91cb6ec3fa3ba90c1629bdcfb7a0144ed42c8ed0a0b",
+    "checkpoint-expired.json": "5f3c60d452833e1efa4a2cdc431bf7d7c3682337b007a48dfb4f6b243de39b5d",
+    "delta.json": "381e6085c1ccd7b42050d0073ddde656bff31f20a3450b2ae79ef3d01966d3c0",
+    "digest-mismatch.json": "cb9e5c5c654026940b7b3525fa154a083c0d5255a622c9b665d2c4f4d059aef3",
+    "full-1.json": "3bdc9735457b9bb4d88bbd4d9ea184dcaef7b9b2d21a99d50c25d1610c058400",
+    "full-2.json": "22dffd29d9d15143dd612d029180f6c9ab9ed7be4702164f9fd636ac04d3e42c",
+    "observations.json": "3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f",
+    "schema.json": "fc9cabfb3a0bdbea384f9dc95c8e0102e481dec1ee7134d2e692af3cca2a7719",
+    "snapshot-expired.json": "5e33478efe8bcd1dac660e728f07e17310210f920ee7ac6707b0b621814de8c1",
+    "unknown-version.json": "a3108a8f7b28b4eca0b5f32513138bae40384525c75413ad59eddb0ca0d9c4c2"
+  }
+}

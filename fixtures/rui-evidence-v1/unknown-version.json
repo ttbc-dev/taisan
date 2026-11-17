@@ -1,0 +1,89 @@
+{
+  "protocol_version": "rui-evidence/9",
+  "installation_id": "installation-example",
+  "store_epoch": "epoch-example",
+  "snapshot_id": "snapshot-full",
+  "snapshot_seq": 10,
+  "retained_from_seq": 3,
+  "after_seq": null,
+  "entities": [
+    {
+      "source_id": "work",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 3,
+      "body_sha256": "4910a11334fb96a12a87f069686c8728c0d0167b009b250e72f63f6377327095",
+      "body_json": "{\"source_id\": \"work\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/work/r1\"}}], \"operation\": \"entity\", \"type\": \"work\", \"payload\": {\"work_id\": \"work-example\", \"version\": 1, \"intent\": \"Check a synthetic ledger.\", \"requirements\": [{\"source_id\": \"requirement\", \"revision\": \"r1\"}], \"constraints\": [{\"source_id\": \"invariant\", \"revision\": \"r1\"}], \"dispatch_source\": null}}\n"
+    },
+    {
+      "source_id": "exec-a",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 4,
+      "body_sha256": "6fed1b0bfcd4d4b83de2e8f04b5f679830ae3ec659ca9c359243afe0f7aa33d9",
+      "body_json": "{\"source_id\": \"exec-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/exec-a/r1\"}}], \"operation\": \"entity\", \"type\": \"execution\", \"payload\": {\"execution_id\": \"exec-a\", \"work\": {\"source_id\": \"work\", \"revision\": \"r1\"}, \"state\": \"failed\", \"outcome\": null, \"base_head\": \"head-a0\", \"result_head\": \"head-a1\", \"started_at\": null, \"finished_at\": null}}\n"
+    },
+    {
+      "source_id": "invoke-a",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 4,
+      "body_sha256": "0acbf3a3dd8c9b8dd52c95b49fd94b73adb14b2392f27ba25e3a5936d20f033b",
+      "body_json": "{\"source_id\": \"invoke-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/invoke-a/r1\"}}], \"operation\": \"entity\", \"type\": \"invocation\", \"payload\": {\"invocation_id\": \"invoke-a\", \"execution\": {\"source_id\": \"exec-a\", \"revision\": \"r1\"}, \"process_attempt_id\": \"process-a\", \"state\": \"failed\"}}\n"
+    },
+    {
+      "source_id": "round-a",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 5,
+      "body_sha256": "29a743968b875d420331433625b7fab3084549257de48ee18ef34c7db3c0e867",
+      "body_json": "{\"source_id\": \"round-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/round-a/r1\"}}], \"operation\": \"entity\", \"type\": \"review_round\", \"payload\": {\"round_id\": \"round-a\", \"execution\": {\"source_id\": \"exec-a\", \"revision\": \"r1\"}, \"change_id\": \"change-a\", \"reviewed_head\": \"head-a0\", \"completeness\": \"complete\", \"observation_id\": \"observation-a\"}}\n"
+    },
+    {
+      "source_id": "finding-a",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 6,
+      "body_sha256": "3aea980cba0d1f8a71a2ad685f1d08c796b9351a66261b34b33b3ba2b9d41a99",
+      "body_json": "{\"source_id\": \"finding-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-a/r1\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-a\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-a\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-a0\", \"body\": \"An earlier description.\", \"disposition\": \"open\", \"category\": null, \"invariants\": [{\"source_id\": \"invariant\", \"revision\": \"r1\"}]}}\n"
+    },
+    {
+      "source_id": "exec-b",
+      "revision": "r1",
+      "revision_seq": 1,
+      "change_seq": 7,
+      "body_sha256": "770d3b8bf09b40301d306113211f1acc5dead69f78098e4f911cda38ad0499c3",
+      "body_json": "{\"source_id\": \"exec-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/exec-b/r1\"}}], \"operation\": \"entity\", \"type\": \"execution\", \"payload\": {\"execution_id\": \"exec-b\", \"work\": {\"source_id\": \"work\", \"revision\": \"r1\"}, \"state\": \"passed\", \"outcome\": {\"source_id\": \"outcome\", \"revision\": \"r1\"}, \"base_head\": \"head-b0\", \"result_head\": \"head-b1\", \"started_at\": null, \"finished_at\": null}}\n"
+    }
+  ],
+  "links": [],
+  "artifacts": [
+    {
+      "artifact_id": "observations",
+      "identity": {
+        "installation_id": "installation-example",
+        "store_epoch": "epoch-example",
+        "source_id": "retained-observation-bundle",
+        "revision": "r1",
+        "revision_seq": 1
+      },
+      "sha256": "3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f",
+      "byte_length": 1947,
+      "media_type": "application/json",
+      "availability": "available"
+    }
+  ],
+  "gaps": [
+    {
+      "code": "retention_expired",
+      "scope": {
+        "kind": "history",
+        "before_seq": 3
+      },
+      "evidence_class": "history",
+      "reason": "Earlier synthetic history expired."
+    }
+  ],
+  "next_cursor": "cursor-example",
+  "checkpoint": null
+}
