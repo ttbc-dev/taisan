@@ -1224,7 +1224,10 @@ fn intake_rejects_every_invalid_setting_class() {
         ("interval_minutes = -5", "intake.interval_minutes"),
         ("interval_minutes = 1.5", "intake.interval_minutes"),
         ("interval_minutes = \"30\"", "intake.interval_minutes"),
-        ("interval_minutes = \"unlimited\"", "intake.interval_minutes"),
+        (
+            "interval_minutes = \"unlimited\"",
+            "intake.interval_minutes",
+        ),
         ("timeout_seconds = 0", "intake.timeout_seconds"),
         ("timeout_seconds = 301", "intake.timeout_seconds"),
         ("timeout_seconds = 1.5", "intake.timeout_seconds"),
@@ -1279,9 +1282,15 @@ fn intake_selector_binding_validation() {
         // Every case needs a complete-enough section to reach its own
         // validation: supply adapter and argv unless the case overrides.
         let text = if body.contains("argv =") {
-            format!("{}\n[intake.selector]\nadapter = \"issue-scan\"\n{body}\n", base_profile())
+            format!(
+                "{}\n[intake.selector]\nadapter = \"issue-scan\"\n{body}\n",
+                base_profile()
+            )
         } else if body.contains("adapter =") {
-            format!("{}\n[intake.selector]\nargv = [\"issue-scan\"]\n{body}\n", base_profile())
+            format!(
+                "{}\n[intake.selector]\nargv = [\"issue-scan\"]\n{body}\n",
+                base_profile()
+            )
         } else {
             format!(
                 "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n{body}\n",
@@ -1384,7 +1393,10 @@ fn intake_revision_is_content_derived() {
         ("interval_minutes = 31", "interval"),
         ("timeout_seconds = 60", "timeout"),
         ("pending_queue_limit = 11", "queue limit"),
-        ("enabled = true\n\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]", "enabled+selector"),
+        (
+            "enabled = true\n\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]",
+            "enabled+selector",
+        ),
     ] {
         let text = format!("{}\n[intake]\n{snippet}\n", base_profile());
         let revision = parse_profile(&text)

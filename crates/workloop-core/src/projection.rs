@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{CommandDecision, CommandId};
 use crate::domain::*;
-use crate::identity::{ChangeRequestRef, CommitRevision, HostActorRef};
+use crate::identity::{ChangeRequestRef, CommitRevision, HostActorRef, IssueRef};
 use crate::observation::{
     ArtifactFact, HostActionStatus, ObservationFact, Outcome, ProcessStateFact, ReadRevision,
     ReadSubject,
 };
-use crate::store::{Deferral, ReadView, StoreError};
+use crate::store::{Deferral, IntakeSourceOwner, ReadView, StoreError};
+use crate::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
 /// Whether a source's evidence could actually be read. An unavailable or
 /// unknown source is not evidence of a clean result — an empty finding
@@ -574,6 +575,102 @@ pub fn capacity(tx: &dyn ReadView) -> Result<QueryResult<CapacityView>, StoreErr
         },
         as_of: tx.last_seq()?,
         sources: vec![store_source()],
+    })
+}
+
+/// The selector protocol's exclusion bound: a request's scoped issue
+/// set is at most this many issues (`docs/selector-protocol.md` bounds
+/// table). The preflight reports an over-bound scope as an explicit
+/// failure — never a truncated owner set that would let the adapter
+/// re-select owned work.
+pub const MAX_PREFLIGHT_SCOPE_ISSUES: usize = 4096;
+
+/// Why an intake preflight was refused before the store was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntakePreflightError {
+    /// The scoped set exceeds [`MAX_PREFLIGHT_SCOPE_ISSUES`].
+    ScopeTooLarge {
+        issues: usize,
+        limit: usize,
+    },
+    Store(StoreError),
+}
+
+impl std::fmt::Display for IntakePreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ScopeTooLarge { issues, limit } => write!(
+                f,
+                "intake preflight scope of {issues} issues exceeds the \
+                 protocol bound of {limit}"
+            ),
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for IntakePreflightError {}
+
+impl From<StoreError> for IntakePreflightError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// The advisory preflight view for one bounded selector request
+/// (#213): free pending positions under the active settings revision
+/// plus the scoped source owners, all from one consistent snapshot.
+/// Read-only — it reserves nothing, and a later authoritative submit is
+/// still decided inside its own transaction, so capacity lost after
+/// preflight yields the ordinary capacity rejection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakePreflight {
+    /// The active record's content revision; `None` when no settings
+    /// record exists — the effective limit is then the documented
+    /// default shared with the profile loader.
+    pub settings_revision: Option<String>,
+    /// The pending-queue limit new submits are decided against.
+    pub pending_queue_limit: u32,
+    /// Works whose active Execution is `queued` in this snapshot.
+    pub pending_count: u64,
+    /// `pending_queue_limit - pending_count`, floored at zero.
+    pub free_positions: u64,
+    /// Scoped issues already owned by live Work (`queued`, `running`,
+    /// or `paused` active Execution), one row per `(issue, Work)`.
+    /// Distinct from `free_positions`: source claims and queue
+    /// positions are separate facts and never conflated.
+    pub source_owners: Vec<IntakeSourceOwner>,
+}
+
+/// Read-only intake preflight (#213). Runs inside the caller's
+/// transaction — `transact_deferred` for the advisory path — so every
+/// field comes from one consistent snapshot. The scope is the
+/// selector's exclusion candidate set: scoped issue identities the
+/// adapter must not re-select. An over-bound scope fails explicitly;
+/// the owner set is never silently truncated.
+pub fn intake_preflight(
+    tx: &dyn ReadView,
+    scope: &[IssueRef],
+) -> Result<IntakePreflight, IntakePreflightError> {
+    if scope.len() > MAX_PREFLIGHT_SCOPE_ISSUES {
+        return Err(IntakePreflightError::ScopeTooLarge {
+            issues: scope.len(),
+            limit: MAX_PREFLIGHT_SCOPE_ISSUES,
+        });
+    }
+    let settings = tx.intake_settings()?;
+    let pending_queue_limit = settings
+        .as_ref()
+        .map(|s| s.pending_queue_limit)
+        .unwrap_or(DEFAULT_PENDING_QUEUE_LIMIT);
+    let pending_count = tx.pending_queue_count()?;
+    let source_owners = tx.intake_source_owners(scope)?;
+    Ok(IntakePreflight {
+        settings_revision: settings.map(|s| s.settings_revision),
+        pending_queue_limit,
+        pending_count,
+        free_positions: u64::from(pending_queue_limit).saturating_sub(pending_count),
+        source_owners,
     })
 }
 

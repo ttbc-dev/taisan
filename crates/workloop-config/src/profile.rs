@@ -498,10 +498,7 @@ impl IntakeSettings {
     /// never part of proposal or replay identity.
     pub fn revision(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
-        sha256_hex(
-            "intake-settings-v1",
-            &canonical_json(&value),
-        )
+        sha256_hex("intake-settings-v1", &canonical_json(&value))
     }
 }
 
