@@ -612,13 +612,33 @@ fn live_lost_response_reconciles_by_marker() {
         )),
         "the receipt binds the marker: {effects:?}"
     );
-    // Exactly one remote comment carries the marker — the lost
-    // response never produced a duplicate.
+    // Exactly one remote comment carries the marker — count them on
+    // the change request through the same paginated transport read
+    // `find_comment` uses and match the same envelope; a single
+    // `find_comment` hit proves presence, never uniqueness.
     let found = adapter
         .client_mut()
         .find_comment(&live_repo(&env), &change.change_request, &marker)
         .unwrap()
         .expect("the posted comment reconciles");
+    let envelope = format!("<!-- {marker} -->");
+    let comments = adapter
+        .client_mut()
+        .issue_comments(&live_repo(&env), &change.change_request)
+        .unwrap();
+    let marker_count = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .get("body")
+                .and_then(|body| body.as_str())
+                .is_some_and(|body| body.contains(&envelope))
+        })
+        .count();
+    assert_eq!(
+        marker_count, 1,
+        "exactly one remote comment carries the marker: {marker_count}"
+    );
     // Remote cleanup runs before the record is retained: a panic in
     // `retain` must never strand the pull request or scratch branch.
     if let Some(number) = change.display_number {
@@ -642,7 +662,7 @@ fn live_lost_response_reconciles_by_marker() {
         &[comment_id],
         vec![ReadBackReceipt {
             target: format!("comment:{}", found.comment_id),
-            observed: format!("marker {marker} found once"),
+            observed: format!("marker {marker} found {marker_count} comment(s)"),
         }],
         ScenarioResult::Pass,
     );
