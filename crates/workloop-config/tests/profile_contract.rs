@@ -1439,4 +1439,47 @@ fn intake_refusals_redact_rejected_values() {
     .unwrap_err();
     assert!(err.contains("<redacted>"), "{err}");
     assert!(!err.contains("TOPSECRET"), "argv content leaked: {err}");
+
+    // An invalid adapter id names the grammar rule, never the pasted
+    // value — the same redaction discipline as every other scalar.
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"sk-live-ABC\"\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("intake.selector.adapter"), "{err}");
+    assert!(!err.contains("sk-live-ABC"), "adapter leaked: {err}");
+
+    // An oversized argv item reports its index and bound only; the
+    // item content — however secret-shaped — never reaches the error.
+    let oversized = format!("{}TOPSECRET", "x".repeat(5000));
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"{oversized}\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("argv[0]"), "{err}");
+    assert!(err.contains("4096"), "{err}");
+    assert!(!err.contains("TOPSECRET"), "argv content leaked: {err}");
+
+    // A serde-level type error goes through the same redaction: the
+    // literal is dropped, the key path stays.
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [12345]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("intake.selector.argv"), "{err}");
+    assert!(!err.contains("12345"), "serde literal leaked: {err}");
+
+    // Static-rule refusals carry no operator value at all.
+    let err =
+        parse_profile(&format!("{}\n[intake]\nenabled = true\n", base_profile())).unwrap_err();
+    assert!(err.contains("intake.enabled"), "{err}");
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nselector_version = 0\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("selector_version"), "{err}");
 }

@@ -152,6 +152,17 @@ fn reject_reason(d: &CommandDecision) -> RejectionCode {
     }
 }
 
+/// The structured capacity rejection: code plus the limit and
+/// occupancy evidence the issue requires, not a bare refusal.
+fn capacity_rejection(d: &CommandDecision) -> (RejectionCode, Vec<String>) {
+    match d {
+        CommandDecision::Rejected {
+            reason, evidence, ..
+        } => (reason.clone(), evidence.clone()),
+        other => panic!("expected rejected, got {other:?}"),
+    }
+}
+
 fn apply_effects(store: &SqliteStore, effects: &[Effect]) {
     store
         .transact(|tx| {
@@ -427,7 +438,16 @@ fn a_capacity_rejection_leaves_no_partial_rows() {
     assert!(claim_before.is_none());
 
     let d = decision(&store, &submit_with_sources("atom-2", vec![source(202)]));
-    assert_eq!(reject_reason(&d), RejectionCode::CapacityExhausted);
+    let (reason, evidence) = capacity_rejection(&d);
+    assert_eq!(reason, RejectionCode::CapacityExhausted);
+    assert!(
+        evidence.iter().any(|e| e.contains("pending queue limit 1")),
+        "evidence names the active limit: {evidence:?}"
+    );
+    assert!(
+        evidence.iter().any(|e| e.contains("1 queued Works")),
+        "evidence names the occupancy: {evidence:?}"
+    );
 
     // No Work, Execution, claim, spec, or usage row for the rejected
     // submission; the durable rejection itself is the only record.
