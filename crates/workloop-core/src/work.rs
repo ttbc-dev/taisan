@@ -39,6 +39,13 @@ pub struct HostTemplate {
     pub actors: Vec<RoleBinding>,
 }
 
+/// The pending-queue admission bound used when the store holds no
+/// active intake-settings record — the documented default from
+/// `docs/installation-config.md`. The profile loader defaults to the
+/// same value so a configured limit and an unconfigured store can
+/// never disagree about the floor.
+pub const DEFAULT_PENDING_QUEUE_LIMIT: u32 = 10;
+
 /// Installation-level configuration supplied by the composition root.
 #[derive(Debug, Clone)]
 pub struct WorkloopConfig {
