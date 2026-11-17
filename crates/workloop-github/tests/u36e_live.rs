@@ -613,41 +613,28 @@ fn live_lost_response_reconciles_by_marker() {
         "the receipt binds the marker: {effects:?}"
     );
     // Exactly one remote comment carries the marker — count them on
-    // the change request; a single `find_comment` hit proves
-    // presence, never uniqueness.
+    // the change request through the same paginated transport read
+    // `find_comment` uses and match the same envelope; a single
+    // `find_comment` hit proves presence, never uniqueness.
     let found = adapter
         .client_mut()
         .find_comment(&live_repo(&env), &change.change_request, &marker)
         .unwrap()
         .expect("the posted comment reconciles");
-    let marker_count = change
-        .display_number
-        .map(|number| {
-            gh_json(
-                &env,
-                &[&format!(
-                    "repos/{}/issues/{number}/comments?per_page=100",
-                    env.slug
-                )],
-            )
-            .map(|comments| {
-                comments
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter(|c| {
-                                c.get("body")
-                                    .and_then(|b| b.as_str())
-                                    .is_some_and(|b| b.contains(&marker))
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0)
+    let envelope = format!("<!-- {marker} -->");
+    let comments = adapter
+        .client_mut()
+        .issue_comments(&live_repo(&env), &change.change_request)
+        .unwrap();
+    let marker_count = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .get("body")
+                .and_then(|body| body.as_str())
+                .is_some_and(|body| body.contains(&envelope))
         })
-        .expect("the change request carries a display number");
+        .count();
     assert_eq!(
         marker_count, 1,
         "exactly one remote comment carries the marker: {marker_count}"

@@ -424,6 +424,21 @@ impl GhCliApi {
         Ok(number)
     }
 
+    /// Every issue comment on the pull request behind `change_id`,
+    /// paginated through the same read `find_comment` uses — a
+    /// uniqueness check needs the whole comment stream, not the
+    /// first marker hit. Returns the raw comment payloads; callers
+    /// read `body`/`id` themselves.
+    pub fn issue_comments(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        let slug = Self::slug(repository)?;
+        let number = self.pull_number(repository, change_id)?;
+        self.api_pages(&format!("repos/{slug}/issues/{number}/comments"), &[])
+    }
+
     fn remote_pull(value: &serde_json::Value) -> Result<RemotePull, ApiError> {
         let str_field = |key: &str| {
             value
