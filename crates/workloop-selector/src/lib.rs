@@ -25,6 +25,7 @@
 //! new one.
 
 pub mod admission;
+pub mod collect;
 
 use std::collections::{BTreeMap, BTreeSet};
 
