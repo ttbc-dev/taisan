@@ -12,8 +12,8 @@ use std::path::Path;
 
 use workloop_core::domain::{ExecutionId, WorkId};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorRef, IssueRef,
-    RepositoryRef, SourceSnapshot,
+    ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef, DiffTarget, HostActorRef,
+    IssueRef, RepositoryRef, SourceSnapshot,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
@@ -21,6 +21,7 @@ use workloop_core::observation::{
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
+use workloop_selector::collect::{CollectedIssue, IssuePage, SourceReadError, SourceReader};
 
 use crate::credential::{
     CredentialError, CredentialProviders, ResolvedCredential, bind_credential,
@@ -219,6 +220,18 @@ pub struct FixtureGithub {
     /// `repository` → next display number: numbering is a per-repository
     /// namespace, as on a real host.
     next_number: BTreeMap<String, u64>,
+    /// `repository` → the synthetic remote's issue listing for source
+    /// collection, keyed by scoped `IssueRef` so display-number
+    /// differences cannot fork identity. Separate from `issues`: the
+    /// collection read is a listing, the source-gate read is a
+    /// single-issue authoritative read.
+    source_issues: BTreeMap<RepositoryRef, BTreeMap<IssueRef, CollectedIssue>>,
+    /// `repository` keys whose source-list reads the remote denies —
+    /// the capability/authorization refusal class.
+    source_denied: std::collections::BTreeSet<String>,
+    /// `repository` keys whose source-list reads the remote cannot
+    /// complete — the transport/host failure class.
+    source_unavailable: std::collections::BTreeSet<String>,
     /// The write history, for test assertions.
     applied: Vec<String>,
     /// Test-armed kill switch: the next attempt that lands its remote
@@ -533,6 +546,53 @@ impl FixtureGithub {
     /// keyed by the scoped issue identity (repository + issue ID).
     pub fn issue_read(&self, issue: &IssueRef) -> Option<IssueRead> {
         self.issues.get(&issue.to_string()).cloned()
+    }
+
+    /// Test control: plant one fact in the synthetic remote's issue
+    /// listing for source collection (#202). The fact is stored
+    /// verbatim — including deliberately malformed fields a contract
+    /// test needs — keyed by scoped `IssueRef` so a renumbered plant
+    /// cannot fork identity.
+    pub fn plant_source_issue(&mut self, repository: &RepositoryRef, issue: CollectedIssue) {
+        debug_assert_eq!(issue.issue.repository, *repository);
+        self.source_issues
+            .entry(repository.clone())
+            .or_default()
+            .insert(issue.issue.clone(), issue);
+    }
+
+    /// Test control: the remote denies source-list reads for
+    /// `repository` — the capability/authorization refusal class.
+    pub fn deny_source_reads(&mut self, repository: &RepositoryRef) {
+        self.source_denied.insert(repository.to_string());
+    }
+
+    /// Test control: the remote cannot complete source-list reads for
+    /// `repository` — the transport/host failure class.
+    pub fn unavailable_source_reads(&mut self, repository: &RepositoryRef) {
+        self.source_unavailable.insert(repository.to_string());
+    }
+
+    /// The adapter-owned source reader for collection (#202): resolves
+    /// the configured source-read credential and authenticates it
+    /// against the bound actor before any listing. Publication
+    /// credentials and store access are never involved — the reader
+    /// borrows the fixture and collection is read-only.
+    pub fn source_reader(
+        &self,
+        credential_ref: Option<&CredentialRef>,
+        actor: &HostActorRef,
+    ) -> Result<FixtureSourceReader<'_>, CredentialError> {
+        let book = self.credentials.as_ref().ok_or_else(|| {
+            CredentialError::missing("no credential environment is installed for source reads")
+        })?;
+        bind_credential(credential_ref, actor, book, &|credential| {
+            book.authenticate(credential)
+        })?;
+        Ok(FixtureSourceReader {
+            fixture: self,
+            actor: actor.clone(),
+        })
     }
 
     pub fn applied(&self) -> &[String] {
@@ -3105,5 +3165,77 @@ impl crate::port::IntegrationPort for FixtureGithub {
             usize::MAX,
         )
         .map(|_| ())
+    }
+}
+
+/// The fixture's [`SourceReader`] (#202): a paged issue listing over
+/// the planted `source_issues` dataset. `cursor` is the decimal offset
+/// into the repository's `IssueRef`-sorted issue set — opaque to the
+/// collector, exactly as a host's page token would be. An
+/// unrecognized cursor or a non-positive `page_size` is a `Malformed`
+/// read, matching a real transport's unusable-page response. A
+/// repository with no planted issues and no failure knob is a
+/// complete empty listing.
+#[derive(Debug)]
+pub struct FixtureSourceReader<'a> {
+    fixture: &'a FixtureGithub,
+    /// The actor the resolved credential authenticated as — the
+    /// reader's identity for any attributed read.
+    #[allow(dead_code)]
+    actor: HostActorRef,
+}
+
+impl SourceReader for FixtureSourceReader<'_> {
+    fn list_issues(
+        &mut self,
+        repository: &RepositoryRef,
+        cursor: Option<&str>,
+        page_size: usize,
+    ) -> Result<IssuePage, SourceReadError> {
+        let key = repository.to_string();
+        if page_size == 0 {
+            return Err(SourceReadError::Malformed {
+                reason: format!("non-positive page size for {key}"),
+            });
+        }
+        if self.fixture.source_denied.contains(&key) {
+            return Err(SourceReadError::Denied {
+                reason: format!("source read denied for {key}"),
+            });
+        }
+        if self.fixture.source_unavailable.contains(&key) {
+            return Err(SourceReadError::Unavailable {
+                reason: format!("source read unavailable for {key}"),
+            });
+        }
+        let offset = match cursor {
+            None => 0usize,
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .map_err(|_| SourceReadError::Malformed {
+                    reason: format!("unrecognized page cursor for {key}"),
+                })?,
+        };
+        let issues: Vec<CollectedIssue> = self
+            .fixture
+            .source_issues
+            .get(repository)
+            .map(|issues| issues.values().cloned().collect())
+            .unwrap_or_default();
+        let page: Vec<CollectedIssue> = issues
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .cloned()
+            .collect();
+        let next_cursor = if !page.is_empty() && offset + page.len() < issues.len() {
+            Some((offset + page.len()).to_string())
+        } else {
+            None
+        };
+        Ok(IssuePage {
+            issues: page,
+            next_cursor,
+        })
     }
 }

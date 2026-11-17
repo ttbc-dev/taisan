@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 workloop-core = { path = "../workloop-core" }
+workloop-selector = { path = "../workloop-selector" }
 workloop-store = { path = "../workloop-store" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
