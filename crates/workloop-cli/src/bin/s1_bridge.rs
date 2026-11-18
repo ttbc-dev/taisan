@@ -2096,45 +2096,88 @@ mod tests {
     /// Work-subject `BranchState`. Two Works observing the same source
     /// branch at the same position must each record it; an unscoped id
     /// would leave the later Work's publish guard with no known prior.
-    /// The absent position and a different branch are distinct
+    /// This drives the production `attempt` push path — not a copy of
+    /// its emit — so restoring the unscoped delivery id there fails the
+    /// test. The absent position and a different branch are distinct
     /// identities, so a branch that moves is never mistaken for a
     /// duplicate of its own earlier position.
     #[test]
     fn publish_prior_state_records_each_work_at_the_same_branch_position() {
-        let ctx = test_ctx();
+        let root =
+            std::env::temp_dir().join(format!("workloop-s1-bridge-prior-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let remote = root.join("remote.git");
+        let remote_str = remote.to_str().unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            git(dir, args).unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")))
+        };
+        run(&root, &["init", "--bare", remote_str]);
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run(&seed, &["init"]);
+        run(
+            &seed,
+            &["config", "user.email", "bridge-test@example.invalid"],
+        );
+        run(&seed, &["config", "user.name", "bridge test"]);
+        std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+        run(&seed, &["add", "README.md"]);
+        run(&seed, &["commit", "-m", "seed"]);
+        let branch = "work/shared";
+        run(
+            &seed,
+            &["push", remote_str, &format!("HEAD:refs/heads/{branch}")],
+        );
+        let sha = run(&seed, &["rev-parse", "HEAD"]);
+
+        let mut ctx = test_ctx();
+        ctx.workspace_root = root.clone();
+        ctx.remote = remote_str.to_string();
         let w1 = submit_work(&ctx, "k-p1");
         let w2 = submit_work(&ctx, "k-p2");
         let repository = ctx.config.host.repository.clone();
-        let branch = "work/shared";
-        let sha = "1f639cef2f7b4a8d3c5e6f708192a3b4c5d6e7f8";
-        let fact = || ObservationFact::BranchState {
-            repository: repository.clone(),
-            branch: branch.into(),
-            state: BranchState::At {
-                revision: CommitRevision::new(repository.clone(), sha).unwrap(),
-            },
-        };
-        let observe = |work: &WorkId| {
-            ctx.emit(
-                Some((work, None)),
-                branch_event_id(work, branch, sha),
-                fact(),
-            )
-            .unwrap()
-        };
-        assert_eq!(observe(&w1), IngestReceipt::Recorded);
-        assert_eq!(
-            observe(&w2),
-            IngestReceipt::Recorded,
-            "a second Work's identical publish prior-ref fact must not dedupe \
-             against the first Work's delivery"
-        );
-        assert_eq!(
-            observe(&w1),
-            IngestReceipt::Duplicate,
-            "a single Work's unchanged re-read still dedupes"
-        );
         for work in [&w1, &w2] {
+            let workspace = ctx.workspace_of(work);
+            run(
+                &root,
+                &[
+                    "clone",
+                    "--branch",
+                    branch,
+                    remote_str,
+                    workspace.to_str().unwrap(),
+                ],
+            );
+            let mut intent = push_intent(&work.0, HostActionStatus::Pending, branch, false);
+            intent.action_id = format!("act-{}", work.0);
+            // The prior-ref observation is emitted before the
+            // expected-prior guard. A deliberately mismatched guard
+            // still exercises the real push attempt's read-back while
+            // refusing the write, so the test needs no live `gh`.
+            if let HostAction::PushRef { expected_prior, .. } = &mut intent.action {
+                *expected_prior =
+                    Some(CommitRevision::new(repository.clone(), "different-prior").unwrap());
+            }
+            attempt(&ctx, &intent, &format!("act:{}", work.0)).unwrap();
+        }
+        let all = ctx
+            .store
+            .transact_deferred(|tx| tx.all_observations())
+            .unwrap();
+        for work in [&w1, &w2] {
+            assert!(
+                all.iter().any(|o| o.subject_work_id.as_ref() == Some(work)
+                    && matches!(
+                        &o.fact,
+                        ObservationFact::HostActionResult {
+                            status: HostActionStatus::Failed { reason },
+                            ..
+                        } if reason == "stale_head"
+                    )),
+                "the mismatched guard must still refuse the write for work {}",
+                work.0
+            );
             let observations = ctx
                 .store
                 .transact_deferred(|tx| tx.observations_for_work(work))
@@ -2154,24 +2197,25 @@ mod tests {
         }
         assert_ne!(
             branch_event_id(&w1, branch, "absent"),
-            branch_event_id(&w1, branch, sha),
+            branch_event_id(&w1, branch, &sha),
             "absent and present positions of one branch are distinct facts"
         );
         assert_ne!(
             branch_event_id(&w1, branch, "1111111111111111111111111111111111111111"),
-            branch_event_id(&w1, branch, sha),
+            branch_event_id(&w1, branch, &sha),
             "a branch that moves to a new revision is a new fact"
         );
         assert_ne!(
-            branch_event_id(&w1, "work/other", sha),
-            branch_event_id(&w1, branch, sha),
+            branch_event_id(&w1, "work/other", &sha),
+            branch_event_id(&w1, branch, &sha),
             "the same position on another branch is a distinct fact"
         );
         assert_eq!(
-            branch_poll_event_id(&w1, "main", sha),
-            branch_event_id(&w1, "main", sha),
+            branch_poll_event_id(&w1, "main", &sha),
+            branch_event_id(&w1, "main", &sha),
             "the target-branch poll shares the Work-scoped identity rule"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn push_intent(
