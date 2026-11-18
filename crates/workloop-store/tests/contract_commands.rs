@@ -1512,6 +1512,135 @@ fn resume_fails_when_invocation_budget_exhausted() {
     );
 }
 
+/// Regression (#139): a manual `resume` of a paused Execution whose
+/// coding budget is spent must defer the terminal settlement while a
+/// host write is still outstanding — the same rule admission and
+/// recovery-intent firing apply. Recording failure first would let the
+/// outbox drain apply the pending write under it.
+#[test]
+fn resume_defers_terminal_settlement_while_a_host_write_is_outstanding() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(1, 5);
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("rbo1"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config, &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+    apply_effects(
+        &store,
+        &[Effect::InsertHostActionIntent {
+            intent: HostActionIntent {
+                action_id: "act-resume-outstanding".into(),
+                work_id: work_id.clone(),
+                host: host(),
+                repository: repo(),
+                role: ActorRole::Publication,
+                actor: publisher(),
+                action: HostAction::PushRef {
+                    branch: format!("work/{}", work_id.0),
+                    produced: rev("artifact-digest"),
+                    expected_prior: None,
+                },
+                payload_digest: "test".into(),
+                status: HostActionStatus::Pending,
+                authenticated_actor: None,
+                effects: vec![],
+                created_seq: 0,
+            },
+        }],
+    );
+
+    let resume = req(
+        "rbo2",
+        CommandBody::Resume {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: e1.clone(),
+        },
+    );
+    let d = handle_command(&store, &config, &resume, NOW).unwrap();
+    assert!(
+        matches!(
+            d,
+            CommandDecision::Rejected {
+                reason: RejectionCode::Ineligible,
+                ..
+            }
+        ),
+        "the terminal settlement is deferred, not applied: {d:?}"
+    );
+    assert!(
+        rejection_evidence(&d)
+            .iter()
+            .any(|e| e.contains("outstanding host writes")),
+        "the refusal names the reconciliation wait: {d:?}"
+    );
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "a paused Execution is not terminally settled under an outstanding host write"
+    );
+    assert!(e.terminal_code.is_none());
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e1 && d.reason == "outbox_reconciliation")
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.work(&work_id))
+            .unwrap()
+            .unwrap()
+            .version,
+        1,
+        "a deferred resume does not bump the Work version"
+    );
+
+    // Once the host write reconciles, a fresh resume records the spent
+    // budget terminally.
+    apply_effects(
+        &store,
+        &[Effect::UpdateHostActionIntent {
+            action_id: "act-resume-outstanding".into(),
+            status: HostActionStatus::Applied,
+            authenticated_actor: Some(publisher()),
+            effects: vec![],
+        }],
+    );
+    let resume_after = req(
+        "rbo3",
+        CommandBody::Resume {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: e1.clone(),
+        },
+    );
+    let d = handle_command(&store, &config, &resume_after, NOW).unwrap();
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "reconciled effect lets the terminal settlement land: {d:?}"
+    );
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+}
+
 #[test]
 fn review_admission_never_exceeds_max_review_rounds() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -4002,6 +4131,72 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         assert_eq!(version, 10, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+}
+
+/// Regression (#139): a v9 store's `recovery_intents` lacks the v10
+/// `retirement_generation` column; opening it adds the column inside
+/// the idempotent upgrade transaction and preserves existing rows.
+#[test]
+fn a_v9_store_gains_the_retirement_generation_column() {
+    let root = temp_root("upgrade-v9");
+    let db = root.join("store.db");
+    let (work_id, execution_id) = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let request = submit("k-upgrade-v9");
+        accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap())
+    };
+    let intent_id = "ri-v9-preserved";
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO recovery_intents (intent_id, work_id, execution_id, kind, \
+             due_at_unix_seconds, generation, evidence_basis, state, retirement_reason, \
+             scheduled_seq) VALUES (?1,?2,?3,'requeue',?4,1,'v9','pending',NULL,0)",
+            rusqlite::params![intent_id, work_id.0, execution_id.0, NOW],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE recovery_intents DROP COLUMN retirement_generation; \
+             PRAGMA user_version=9;",
+        )
+        .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recovery_intents') \
+                 WHERE name='retirement_generation')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real v9 table");
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v9 store upgrades in place");
+    let intent = store
+        .transact(|tx| tx.recovery_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| i.intent_id == intent_id)
+        .expect("the v9 intent row survives the upgrade");
+    assert_eq!(intent.retirement_generation, None);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recovery_intents') \
+                 WHERE name='retirement_generation')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has, "the v9->v10 migration adds retirement_generation");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 10, "the upgrade lands on the current format");
+    }
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
     let _ = SqliteStore::open(&db, 1).unwrap();
 }
 

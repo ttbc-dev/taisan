@@ -1293,6 +1293,27 @@ fn decide_resume(
     // the bound exhausted goes to `failed` with the limit recorded. The
     // shared predicate keeps this entry point on the same rule as
     // dispatch-time admission.
+    //
+    // Before that terminal settlement, an outstanding host write must
+    // reconcile: intents are delivery-bound and the outbox drain would
+    // still apply a pending write under a recorded failure. This is the
+    // same rule admission and recovery-intent firing apply.
+    if let Some(limit) = execution.budget_exhaustion(&InvocationRole::Coding)
+        && defer_terminal_while_outstanding(tx, &work.id, &execution.id, limit.terminal_code())?
+    {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec![format!(
+                    "terminal {} defers until outstanding host writes reconcile",
+                    limit.terminal_code()
+                )],
+            ),
+            vec![],
+        ));
+    }
     if let Some((effects, seq, next_version)) =
         paused_exhaustion_effects(tx, &work, &execution, now_unix_seconds)?
     {
