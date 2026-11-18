@@ -287,6 +287,30 @@ fn the_deadline_is_checked_between_calls() {
     assert!(c.issues.is_empty());
 }
 
+/// The deadline bounds scan completion, not just call initiation: a
+/// final page that lands at or past it reports DeadlineExceeded and
+/// admits zero facts — `next_cursor: None` cannot launder a late read
+/// into `Complete` (#234).
+#[test]
+fn a_final_page_landing_past_the_deadline_fails_the_scan() {
+    let target = repo("h", "repo-late-final");
+    let mut reader = StubReader::new();
+    reader.script_pages(&target, vec![page(vec![fact(&target, "i1", None)], None)]);
+    // The pre-call check sees 1 (< deadline 2); the post-call check
+    // sees 2 — the only page completed past the deadline.
+    let ticks = std::cell::Cell::new(0i64);
+    let now = || {
+        ticks.set(ticks.get() + 1);
+        ticks.get()
+    };
+    let mut b = bounds();
+    b.deadline_unix_seconds = 2;
+    let c = collect(&mut reader, &scope(std::slice::from_ref(&target)), &b, &now);
+    assert_eq!(status_of(&c, &target), &ScanStatus::DeadlineExceeded);
+    assert!(reader.calls.len() == 1, "exactly one page was read");
+    assert!(c.issues.is_empty(), "a late final page admits nothing");
+}
+
 /// Typed read failures map to their repository statuses; the reason is
 /// carried as bounded diagnostic data.
 #[test]
@@ -356,11 +380,18 @@ fn malformed_facts_fail_the_repository() {
     ));
     assert!(c.issues.is_empty());
 
-    // Empty revision / digest / title each fail independently.
+    // Empty/bounded-field violations each fail independently: the
+    // issue id carries the same opaque-token bound as revision and
+    // digest, and the title must be a control-free string with at
+    // least one non-whitespace character (#234).
     for mutate in [
-        (|f: &mut CollectedIssue| f.revision = String::new()) as fn(&mut CollectedIssue),
+        (|f: &mut CollectedIssue| f.issue.issue = IssueId::trusted("")) as fn(&mut CollectedIssue),
+        |f| f.issue.issue = IssueId::trusted("bad\u{7}id"),
+        |f| f.revision = String::new(),
         |f| f.content_digest = String::new(),
         |f| f.title = String::new(),
+        |f| f.title = "   ".into(),
+        |f| f.title = "bad\u{7}title".into(),
         |f| f.created_unix_seconds = -1,
         |f| {
             f.labels.insert(String::new());
@@ -658,11 +689,16 @@ fn diagnostic_reasons_are_bounded() {
         assert!(reason.ends_with('…'), "truncation is marked");
     }
 
-    // A fact-level failure embeds the fact's IssueRef in its message;
-    // an oversized opaque id cannot inflate the reason either.
+    // A fact-level failure embeds bounded context in its message;
+    // an oversized opaque id cannot inflate the reason either — and
+    // the id bound fires on its own, not masked by an oversized
+    // title or revision the helper derives from the same id (#234).
     let target = repo("h", "repo-huge-id");
     let giant = "i".repeat(64 * 1024);
-    let bad = fact(&target, &giant, None);
+    let mut bad = fact(&target, &giant, None);
+    bad.title = "ordinary title".into();
+    bad.revision = "rev-ok".into();
+    bad.content_digest = "digest-ok".into();
     let mut reader = StubReader::new();
     reader.script_pages(&target, vec![page(vec![bad], None)]);
     let c = collect(
@@ -674,6 +710,10 @@ fn diagnostic_reasons_are_bounded() {
     match status_of(&c, &target) {
         ScanStatus::Incomplete { reason } => {
             assert!(reason.len() <= 1027, "reason must be bounded");
+            assert!(
+                reason.contains("out-of-bounds issue id"),
+                "the id bound must be the failing check, got: {reason}"
+            );
         }
         other => panic!("expected Incomplete, got {other:?}"),
     }
