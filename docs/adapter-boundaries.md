@@ -48,12 +48,29 @@ A Worker Adapter receives a durable, uniquely identified **Invocation request** 
 - verification instructions, budget/deadline, evidence and continuation references;
 - explicit permissions and credential scope.
 
+The [v0.3 executable request and report contract](v0.3.md) fixes the
+provider-neutral wire form of those inputs and results for new
+Invocation requests: the exact `taisan.worker.request/2` and
+`taisan.worker.report/2` envelopes, ordered grouped Issue snapshots,
+immutable base/artifact/spec/head/finding references, identity and
+digest rules, deadline/output bounds, the `argv-v2` `describe`/`run`
+transport, role/capability/version negotiation, typed report
+classifications, and the v1-to-v2 cutover that preserves historical
+request digests, bindings, and evidence. It also records the open owner
+decisions that block dependent implementation. The v0.3 document is
+design only; it does not claim that transport or ingestion exists.
+
 It provides:
 
 - `start(request)`: acknowledge a stable request identity; distinguish known not-started, started, and **unknown** outcomes;
 - `observe(request_id)`: report process identity/liveness, checkpoint, artifacts, completion/failure and evidence provenance;
 - `request_stop(request_id)`: request cancellation; **not** proof that writers stopped;
 - optional `resume` capability declared by the adapter; absence means taisan cannot assume an internal session can be resumed.
+
+A completed `success` report is evidence only. It is never a passing
+mechanical check, a publication authorization, or Work completion; the
+durable handoff, supervisor verification, enabled gates, and host-effect
+reconciliation still decide what Core may conclude.
 
 Worker-internal mechanics stay inside the adapter: how a process is launched, how requests and results are translated to and from the worker's own formats, authentication to the worker runtime, internal session state, and any resume implementation. None of these may surface in Core types, state transitions, or Outcome decisions — the Core contract above is the whole boundary. Capabilities are either required by this contract or explicitly declared optional; an adapter must never silently emulate a capability it does not support, or compensate by altering Command, queue, budget, or Outcome semantics.
 
@@ -63,7 +80,7 @@ The core supervisor persists launch intent, owns resource reservations, and esta
 
 The Worker contract test suite below is shared: it runs unchanged against every adapter implementation, covering failure behavior (lost start response, duplicate request delivery, unobservable liveness, stop proof, missing artifacts, stale-head evidence) as well as the happy path. A second, independently implemented adapter that replays scripted results is sufficient to prove interchangeability — it does not need to be a real coding agent.
 
-**Reference worker:** a thin Claude Code CLI process adapter that launches one bounded request in an isolated workspace, captures exit/process identity and output artifacts, and exposes cancellation and observation. The [Worker protocol](worker-protocol.md) (#52) fixes its entry point (a taisan-owned shim running `claude -p` headless), request/report schemas, `resume: unsupported` declaration, supervisor-owned git-object handoff and verification, and the bubblewrap plus mandatory model-API egress-proxy isolation profile. No built-in planning pipeline, review framework or proprietary Claude Code-specific state in Core. Other worker adapters are valid implementations; their internal orchestration must not supersede core retry or settlement authority.
+**Reference worker:** a thin Claude Code CLI process adapter that launches one bounded request in an isolated workspace, captures exit/process identity and output artifacts, and exposes cancellation and observation. The [Worker protocol](worker-protocol.md) (#52) fixes its entry point (a taisan-owned shim running `claude -p` headless), request/report schemas, `resume: unsupported` declaration, supervisor-owned git-object handoff and verification, and the bubblewrap plus mandatory model-API egress-proxy isolation profile. No built-in planning pipeline, review framework or proprietary Claude Code-specific state in Core. Other worker adapters are valid implementations; their internal orchestration must not supersede core retry or settlement authority. The [v0.3 wire contract](v0.3.md) is provider-neutral: no adapter identity, runtime product, model API, session format, or private implementation name enters the request/report envelope. The reference runtime remains one adapter behind that transport, not the definition of the port.
 
 ## Separation of control surfaces and adapters
 
@@ -83,6 +100,9 @@ The repository host adapter implements a single `RepositoryHostPort`; [its contr
 8. Swap two conforming worker implementations: taisan command, queue, budget and outcome semantics remain unchanged.
 9. An adapter attempts to request retry or change a Work state directly: rejected; only Commands through Core may do so.
 10. The same Invocation request is delivered twice: reconciled by request identity; no duplicate start or duplicate effect.
+11. A request/report uses an unknown or mismatched format version: refused as `request.version_unknown`/`request.version_unsupported`; no fallback parse, dial-down, or in-flight upgrade.
+12. A required Issue snapshot, artifact, spec, head, finding, or review source is missing or stale: dispatch refused before any process, with the typed reason retained.
+13. A report is malformed, oversized, wrong-Invocation, wrong-role, or wrong-digest, and a separate report is absent: retained as distinct `invalid`/`absent` evidence; none becomes a success or an empty result.
 
 ## Non-goals
 
