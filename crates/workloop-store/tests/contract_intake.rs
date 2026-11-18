@@ -512,37 +512,45 @@ fn run_transition_field_invariants_follow_state_table() {
 
     // `failed` and `interrupted` both require a bounded diagnostic and
     // a finish time.
-    insert_run(
-        &store,
-        run("r-fields-fail", IntakeRunState::Open, IntakeTrigger::Manual),
-    );
-    for (detail_code, finished_unix_seconds) in
-        [(None, Some(NOW)), (Some("owner_lost".into()), None)]
-    {
-        let err = store
+    for (state, run_id) in [
+        (IntakeRunState::Failed, "r-fields-fail"),
+        (IntakeRunState::Interrupted, "r-fields-interrupt"),
+    ] {
+        insert_run(
+            &store,
+            run(run_id, IntakeRunState::Open, IntakeTrigger::Manual),
+        );
+        for (detail_code, finished_unix_seconds) in
+            [(None, Some(NOW)), (Some("owner_lost".into()), None)]
+        {
+            let err = store
+                .transact(|tx| {
+                    tx.apply(&Effect::UpdateIntakeRun {
+                        run_id: run_id.into(),
+                        state,
+                        detail_code,
+                        finished_unix_seconds,
+                        expected_state: IntakeRunState::Open,
+                    })
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::ConstraintConflict { .. }),
+                "transition to {state:?} without both detail and finish must conflict: {err:?}"
+            );
+        }
+        store
             .transact(|tx| {
                 tx.apply(&Effect::UpdateIntakeRun {
-                    run_id: "r-fields-fail".into(),
-                    state: IntakeRunState::Failed,
-                    detail_code,
-                    finished_unix_seconds,
+                    run_id: run_id.into(),
+                    state,
+                    detail_code: Some("transport_failure".into()),
+                    finished_unix_seconds: Some(NOW),
                     expected_state: IntakeRunState::Open,
                 })
             })
-            .unwrap_err();
-        assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+            .unwrap();
     }
-    store
-        .transact(|tx| {
-            tx.apply(&Effect::UpdateIntakeRun {
-                run_id: "r-fields-fail".into(),
-                state: IntakeRunState::Failed,
-                detail_code: Some("transport_failure".into()),
-                finished_unix_seconds: Some(NOW),
-                expected_state: IntakeRunState::Open,
-            })
-        })
-        .unwrap();
 }
 
 #[test]
