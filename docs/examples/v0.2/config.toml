@@ -1,0 +1,74 @@
+schema_version = 1
+
+[installation]
+capacity_slots = 1
+
+[hosts.h1]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "123456789"
+display = "owner/reference-repository"
+use = "publication"
+
+[roles.publication]
+host = "h1"
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[roles.review]
+host = "h1"
+actor = "example-reviewer"
+credential_ref = "file:/home/operator/.config/taisan/reviewer.token"
+
+[roles.discussion]
+host = "h1"
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[identity_evidence.publication]
+login = "example-publisher"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+[identity_evidence.review]
+login = "example-reviewer"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+[identity_evidence.discussion]
+login = "example-publisher"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+[worker]
+argv = ["taisan-worker-shim", "--runtime", "example-cli"]
+isolation_profile = "taisan-reference-v0.1"
+runtime_version = ">=2.0.0"
+model = "example-model"
+max_turns = 200
+
+[verification.egress]
+allowlist = ["api.github.com", "crates.io", "static.crates.io"]
+
+[capabilities.required]
+publication = ["repository_read", "branch_read", "push_ref", "change_request_read", "change_request_create", "change_request_update", "comment_write", "ready"]
+review = ["repository_read", "branch_read", "review_feedback", "inline_comment", "thread_reply", "thread_resolve"]
+discussion = ["comment_read", "comment_write"]
+
+[intake]
+enabled = false
+interval_minutes = 30
+timeout_seconds = 120
+pending_queue_limit = 10
+
+[intake.selector]
+adapter = "public-issue-selector"
+selector_version = 1
+policy_revision = 1
+argv = ["public-issue-selector", "select", "--github-endpoint", "https://api.github.com"]

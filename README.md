@@ -81,12 +81,19 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [Work lifecycle](docs/lifecycle.md) — queue admission, state transitions, retry/resume/cancel, and crash recovery.
 - [Glossary](docs/glossary.md) — Work, Execution, Invocation, commands, observations, and views.
 - [v0.1 validation](docs/v0.1.md) — the first vertical slice and its acceptance tests.
+- [v0.2 installation and operation](docs/v0.2.md) — clean install, one-shot and scheduled intake, configuration-only adapter swap, and the fixture/live evidence boundary.
+- [v0.2 owner-run checklist](docs/v0.2-owner-run-checklist.md) — real-Issue acceptance scenarios and expected results.
+- [v0.2 evidence template](docs/v0.2-evidence-template.md) — labeled fixture/contract versus owner-run live evidence with redaction.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 - [Provenance](docs/provenance.md) — source-system origins by role, implementation status, and the audit-record pointer.
 
 ## v0.1 direction
 
 The first release aims to run one Work item from the built-in queue through a pull request, review, a bounded fix cycle, and a verified outcome. Users must be able to operate it directly through the CLI and through skills in their existing coding agent. Skills call the same CLI contracts; a second independent control interface is not a release gate. TUI delivery and MCP support are deferred. Duplicate commands, stale views, process loss, and adapter outages must not create duplicate executions or false success.
+
+## v0.2 direction
+
+v0.2 adds one configuration-selected Selector adapter, an internal intake scheduler in `taisan run`, durable one-shot `taisan intake`, and intake history Queries. The [installation and operation guide](docs/v0.2.md) covers a clean install, the default 30-minute interval on a 60-second settings tick, the 120-second adapter timeout, the 10-pending-Work limit, and configuration-only adapter replacement without OS timers. The [owner-run checklist](docs/v0.2-owner-run-checklist.md) and [evidence template](docs/v0.2-evidence-template.md) keep automated fixture/contract evidence separate from owner-run live evidence; the implementing documentation task creates no live Issues, enables no normal-installation automation, and launches no real Workers.
 
 ## Proposals
 
