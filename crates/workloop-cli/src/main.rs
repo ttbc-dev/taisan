@@ -742,15 +742,20 @@ fn run(cli: Cli) -> i32 {
             // The TOML profile resolves through `TAISAN_CONFIG`/XDG
             // only: `--config` on a store-backed command is the JSON
             // installation record, never the profile path.
-            let mut intake_driver = intake::IntakeDriver::new(
-                None,
-                cli.state_dir.clone(),
-                actor.clone(),
-                config.clone(),
-                db_abs.clone(),
-                installation.capacity,
-                state_root.clone(),
-            );
+            // `run --work` is a diagnostic scope: it restricts the
+            // execution phases to one Work and does not evaluate
+            // intake scheduling — no driver exists for it at all.
+            let mut intake_driver = scope.is_none().then(|| {
+                intake::IntakeDriver::new(
+                    None,
+                    cli.state_dir.clone(),
+                    actor.clone(),
+                    config.clone(),
+                    db_abs.clone(),
+                    installation.capacity,
+                    state_root.clone(),
+                )
+            });
             let mut passes_done = 0u32;
             loop {
                 if shutdown_requested() {
@@ -796,12 +801,16 @@ fn run(cli: Cli) -> i32 {
                     "taisan: pass {passes_done}: {} phase(s)",
                     report.phases.len()
                 );
-                intake_driver.maybe_tick(&store, now());
+                if let Some(driver) = intake_driver.as_mut() {
+                    driver.maybe_tick(&store, now());
+                }
                 if let Some(reason) = report.abort_reason() {
                     // Join a still-running invocation before exiting —
                     // otherwise its selector child is orphaned past the
                     // process boundary.
-                    intake_driver.finish();
+                    if let Some(driver) = intake_driver.as_mut() {
+                        driver.finish();
+                    }
                     return emit(envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
@@ -826,13 +835,17 @@ fn run(cli: Cli) -> i32 {
                     // The settings-check tick is 60 seconds regardless
                     // of the pass interval — evaluate it inside the
                     // idle gap so a long interval cannot starve it.
-                    intake_driver.maybe_tick(&store, now());
+                    if let Some(driver) = intake_driver.as_mut() {
+                        driver.maybe_tick(&store, now());
+                    }
                 }
             }
             // No hidden child outlives the run: a still-running
             // invocation is joined here, bounded by the configured
             // adapter timeout.
-            intake_driver.finish();
+            if let Some(driver) = intake_driver.as_mut() {
+                driver.finish();
+            }
             // The run's terminal result is exactly one envelope — kind
             // `run`, carrying the final work-list — no matter how many
             // passes it drove.

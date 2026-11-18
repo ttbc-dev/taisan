@@ -307,6 +307,16 @@ impl IntakeDriver {
         self.next_check_unix_seconds = now_unix_seconds + SETTINGS_TICK_SECONDS;
         self.invocation_alive();
 
+        // A run orphaned mid-session — its recorded owner proven dead
+        // after this process started — would suppress every later Due
+        // forever: the active-run check below never distinguishes a
+        // live owner from a corpse. The sweep is idempotent and
+        // owner-proof-gated, so live or uninspectable owners are left
+        // untouched; a fault is reported and retried next tick.
+        if let Err(e) = workloop_intake::recover_intake(store, &self.actor, now_unix_seconds) {
+            eprintln!("taisan: intake recovery: {e}");
+        }
+
         let resolved = match resolve_intake(self.config_flag.as_deref(), self.state_flag.as_deref())
         {
             Ok(config) => {
@@ -416,5 +426,120 @@ fn run_owned(owned: OwnedInvocation) -> InvocationOutcome {
     match workloop_intake::run_intake(&store, &params, now_secs, now_ms) {
         Ok(report) => InvocationOutcome::from_report(report),
         Err(e) => InvocationOutcome::from_error(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use workloop_core::domain::{ActorKind, AllowedEffects, ExecutionBudget, WorkPolicy};
+    use workloop_core::identity::{
+        ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability,
+        HostInstanceId, RepositoryId, RoleBinding,
+    };
+    use workloop_core::store::{Effect, IntakeRun, IntakeRunState};
+    use workloop_core::work::HostTemplate;
+    use workloop_exec::supervisor::PosixProcessControl;
+    use workloop_store::sqlite::SqliteStore;
+
+    use super::*;
+
+    fn actor() -> Actor {
+        Actor {
+            kind: ActorKind::Human,
+            external_id: "op".into(),
+        }
+    }
+
+    fn workloop_config() -> WorkloopConfig {
+        WorkloopConfig {
+            host: HostTemplate {
+                adapter: AdapterId::trusted("fixture"),
+                repository: RepositoryRef::new(
+                    HostInstanceId::trusted("test-host"),
+                    RepositoryId::trusted("local-repo"),
+                ),
+                contract_version: 1,
+                actors: vec![RoleBinding {
+                    role: ActorRole::Publication,
+                    actor: HostActorRef {
+                        host: HostInstanceId::trusted("test-host"),
+                        actor: HostActorId::trusted("pub-agent"),
+                    },
+                    credential_ref: CredentialRef::trusted("default"),
+                }],
+            },
+            declared_capabilities: BTreeSet::from([HostCapability::RepositoryRead]),
+            lanes: Default::default(),
+            required_checks: vec![],
+            allowed_effects: AllowedEffects {
+                workspace_write: true,
+                host_write: true,
+                network: false,
+            },
+            budget: ExecutionBudget::default(),
+            policy: WorkPolicy::default(),
+        }
+    }
+
+    /// A run left `open` by an owner that died *after* this process
+    /// started would suppress every later Due forever — the driver
+    /// must reconcile it on a settings tick, not only at startup.
+    #[test]
+    fn maybe_tick_recovers_a_run_orphaned_after_process_start() {
+        let store = SqliteStore::in_memory(4).unwrap();
+        // A spawned-then-reaped child: provably absent from the
+        // process table, so owner inspection reports it stopped.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let identity = PosixProcessControl::identity_of(pid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let run = IntakeRun {
+            run_id: "intake-orphan".into(),
+            trigger: IntakeTrigger::ScheduledInterval,
+            selector_id: AdapterId::trusted("test-sel"),
+            selector_version: 1,
+            policy_revision: 7,
+            settings_revision: None,
+            state: IntakeRunState::Open,
+            detail_code: None,
+            request_payload: b"{}".to_vec(),
+            request_digest: "d".repeat(64),
+            owner_pid: identity.pid,
+            owner_started_at: identity.started_at,
+            owner_nonce: "n".into(),
+            created_unix_seconds: 1,
+            finished_unix_seconds: None,
+            recorded_seq: 1,
+        };
+        store
+            .transact(|tx| tx.apply(&Effect::InsertIntakeRun { run }))
+            .unwrap();
+
+        // The profile path cannot exist, so resolution fails closed
+        // and no selector invocation can spawn — only the recovery
+        // sweep is under test.
+        let missing = PathBuf::from("/nonexistent/taisan-intake-test/config.toml");
+        let mut driver = IntakeDriver::new(
+            Some(missing),
+            None,
+            actor(),
+            workloop_config(),
+            PathBuf::from("/nonexistent/workloop.db"),
+            4,
+            PathBuf::from("/tmp"),
+        );
+        driver.maybe_tick(&store, 1_700_000_000);
+
+        let state = store
+            .transact_deferred(|tx| Ok(tx.intake_run("intake-orphan")?.map(|r| r.state)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, IntakeRunState::Interrupted);
     }
 }

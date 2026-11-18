@@ -15,7 +15,12 @@
 //!
 //! - default — `gh api` against github.com using the ambient `gh`
 //!   authentication (the launcher passes `HOME` through, never token
-//!   environment variables). Repository ids must be `owner/name`.
+//!   environment variables). Repository ids must be `owner/name`,
+//!   and every requested repository's host instance must be declared
+//!   with `--github-endpoint <id>` — the installation profile's
+//!   `[hosts.*].endpoint` value for github.com. A repository scoped
+//!   to any other host instance fails closed rather than being
+//!   silently served from github.com.
 //! - `--sources <file>` — a JSON file describing scripted source
 //!   pages; the deterministic backend contract tests and offline
 //!   installations use. Format:
@@ -60,13 +65,17 @@ const MAX_CALLS: usize = 256;
 /// gh's `per_page` ceiling.
 const GH_MAX_PER_PAGE: usize = 100;
 
-const USAGE: &str =
-    "usage: public-issue-selector select [--sources <file.json>] [--label <name>]...";
+const USAGE: &str = "usage: public-issue-selector select [--sources <file.json>] [--label <name>]... [--github-endpoint <id>]...";
 
 #[derive(Debug)]
 struct Args {
     sources: Option<PathBuf>,
     labels: BTreeSet<String>,
+    /// Host-instance ids (profile `[hosts.*].endpoint` values) this
+    /// invocation's `gh` backend may serve. Empty means the `gh`
+    /// backend serves nothing — it cannot guess which scoped host
+    /// instance is github.com.
+    github_endpoints: BTreeSet<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -79,6 +88,7 @@ fn parse_args() -> Result<Args, String> {
     }
     let mut sources = None;
     let mut labels = BTreeSet::new();
+    let mut github_endpoints = BTreeSet::new();
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -97,10 +107,29 @@ fn parse_args() -> Result<Args, String> {
                 }
                 labels.insert(label);
             }
+            "--github-endpoint" => {
+                let Some(endpoint) = it.next() else {
+                    return Err("--github-endpoint requires an id".into());
+                };
+                if endpoint.is_empty()
+                    || endpoint.len() > protocol::MAX_ID_BYTES
+                    || endpoint.chars().any(char::is_control)
+                {
+                    return Err(
+                        "--github-endpoint is empty, oversized, or carries control characters"
+                            .into(),
+                    );
+                }
+                github_endpoints.insert(endpoint);
+            }
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
-    Ok(Args { sources, labels })
+    Ok(Args {
+        sources,
+        labels,
+        github_endpoints,
+    })
 }
 
 fn now_unix_seconds() -> i64 {
@@ -215,7 +244,7 @@ fn main() {
             Ok(reader) => Box::new(reader),
             Err(message) => fail(Some(&request_id), FailureCode::InternalError, &message),
         },
-        None => Box::new(GhSourceReader::new()),
+        None => Box::new(GhSourceReader::new(&args.github_endpoints)),
     };
 
     let repositories: BTreeSet<RepositoryRef> = request.repositories.iter().cloned().collect();
@@ -430,11 +459,20 @@ impl SourceReader for FileSourceReader {
 /// ids (`owner/name`). Authentication is the ambient `gh` login —
 /// the launcher passes `HOME` through and never token environment
 /// variables, so this backend holds no credential of its own.
-struct GhSourceReader;
+///
+/// `gh api` always resolves against github.com, so the backend can
+/// only serve repositories whose host instance the operator declared
+/// as the github.com endpoint — anything else fails closed instead of
+/// silently scanning github.com under a foreign scope.
+struct GhSourceReader {
+    endpoints: BTreeSet<String>,
+}
 
 impl GhSourceReader {
-    fn new() -> Self {
-        Self
+    fn new(endpoints: &BTreeSet<String>) -> Self {
+        Self {
+            endpoints: endpoints.clone(),
+        }
     }
 }
 
@@ -463,6 +501,11 @@ impl SourceReader for GhSourceReader {
         cursor: Option<&str>,
         page_size: usize,
     ) -> Result<IssuePage, SourceReadError> {
+        if !self.endpoints.contains(repository.host.as_str()) {
+            return Err(SourceReadError::Unavailable {
+                reason: "repository host is not a declared github.com endpoint".into(),
+            });
+        }
         let Some(path) = gh_repository_path(repository.repository.as_str()) else {
             return Err(SourceReadError::Unavailable {
                 reason: "repository id is not owner/name".into(),

@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use workloop_core::identity::{HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef};
 use workloop_selector::collect::CollectedIssue;
-use workloop_selector::protocol::{self, RequestSpec, SelectorReply};
+use workloop_selector::protocol::{self, FailureCode, RequestSpec, SelectorReply};
 use workloop_selector::{IssueState, SELECTOR_VERSION};
 
 const EXE: &str = env!("CARGO_BIN_EXE_public-issue-selector");
@@ -102,9 +102,20 @@ fn request_spec<'a>(
 /// Run the real executable: request bytes on stdin, argv tail given.
 /// Returns (stdout bytes, stderr text, exit code).
 fn run_exe(args: &[String], request: &[u8]) -> (Vec<u8>, String, Option<i32>) {
-    let mut child = Command::new(EXE)
-        .arg("select")
-        .args(args)
+    run_exe_env(args, request, &[])
+}
+
+fn run_exe_env(
+    args: &[String],
+    request: &[u8],
+    env: &[(&str, &str)],
+) -> (Vec<u8>, String, Option<i32>) {
+    let mut command = Command::new(EXE);
+    command.arg("select").args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -554,4 +565,80 @@ fn executable_rejects_out_of_scope_source_facts() {
     assert_eq!(code, Some(0));
     let reply = protocol::validate_response(&stdout, &request).unwrap();
     assert!(matches!(reply, SelectorReply::Failure { .. }));
+}
+
+#[test]
+fn executable_gh_backend_serves_only_declared_github_endpoints() {
+    let dir = tmp_dir("gh-host");
+    // A stub `gh` answering every api call with an empty page —
+    // isolates the endpoint gate from real authentication.
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\necho '[]'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let env = [("PATH", path.as_str())];
+
+    let repositories = vec![RepositoryRef::new(
+        HostInstanceId::trusted("https://api.github.com"),
+        RepositoryId::trusted("o/n"),
+    )];
+    let spec = request_spec("req-gh", &repositories, &[], 4, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+
+    // No --github-endpoint: the backend cannot know which scoped host
+    // instance is github.com, so it refuses rather than scanning
+    // github.com under a foreign scope.
+    let (stdout, _stderr, code) = run_exe_env(&[], &request.bytes, &env);
+    assert_eq!(code, Some(0));
+    let reply = protocol::validate_response(&stdout, &request).unwrap();
+    assert!(matches!(
+        reply,
+        SelectorReply::Failure {
+            code: FailureCode::SourceUnavailable,
+            ..
+        }
+    ));
+
+    // The declared endpoint serves; the empty page yields a conforming
+    // success with zero candidates.
+    let declared = [
+        "--github-endpoint".to_string(),
+        "https://api.github.com".to_string(),
+    ];
+    let (stdout, _stderr, code) = run_exe_env(&declared, &request.bytes, &env);
+    assert_eq!(code, Some(0));
+    let reply = protocol::validate_response(&stdout, &request).unwrap();
+    assert!(matches!(
+        reply,
+        SelectorReply::Success { candidates } if candidates.is_empty()
+    ));
+
+    // A repository scoped to a foreign host instance is refused even
+    // with an endpoint declared.
+    let foreign = vec![RepositoryRef::new(
+        HostInstanceId::trusted("ghe.example.com"),
+        RepositoryId::trusted("o/n"),
+    )];
+    let spec = request_spec("req-gh-foreign", &foreign, &[], 4, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+    let (stdout, _stderr, code) = run_exe_env(&declared, &request.bytes, &env);
+    assert_eq!(code, Some(0));
+    let reply = protocol::validate_response(&stdout, &request).unwrap();
+    assert!(matches!(
+        reply,
+        SelectorReply::Failure {
+            code: FailureCode::SourceUnavailable,
+            ..
+        }
+    ));
 }

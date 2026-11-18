@@ -1291,7 +1291,7 @@ fn check_verification_argv(argv: &[String]) -> Result<Vec<String>, String> {
                 "intake.selector.verification_argv[{index}]: <redacted> contains control characters"
             ));
         }
-        total += arg.len() + 1;
+        total += arg.len();
     }
     if total > MAX_ARGV_TOTAL_BYTES {
         return Err(format!(

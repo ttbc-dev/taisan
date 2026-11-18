@@ -124,6 +124,24 @@ fn validate(value: &serde_json::Value, req: &ValidatedRequest) -> Result<Selecto
     protocol::validate_response(value.to_string().as_bytes(), req)
 }
 
+/// Remove the leaf key at `path` (e.g. &["candidates", "0", ...])
+/// from a response/request JSON value — used to prove required
+/// nullable fields cannot simply be omitted.
+fn remove_key_at(value: &mut serde_json::Value, path: &[&str]) {
+    let (leaf, parents) = path.split_last().unwrap();
+    let mut cur = value;
+    for key in parents {
+        cur = match cur {
+            serde_json::Value::Array(items) => {
+                &mut items[key.parse::<usize>().expect("array index")]
+            }
+            serde_json::Value::Object(map) => map.get_mut(*key).expect("path exists"),
+            _ => panic!("path exists"),
+        };
+    }
+    cur.as_object_mut().unwrap().remove(*leaf);
+}
+
 fn contract_rule<T>(result: Result<T, Violation>) -> &'static str {
     match result {
         Err(Violation::Contract(rule)) => rule,
@@ -546,6 +564,54 @@ fn validate_response_accepts_an_empty_candidate_set() {
     let req = request();
     let reply = validate(&response_json("req-1", &[]), &req).unwrap();
     assert!(matches!(reply, SelectorReply::Success { candidates } if candidates.is_empty()));
+}
+
+#[test]
+fn validate_response_requires_nullable_keys_to_be_present() {
+    let req = request();
+    let proposals = vec![proposal_for(issue("issue-1"), "work")];
+    // docs/selector-protocol.md: "Every field in the schema's objects
+    // is required, including nullable fields" — omission is not the
+    // same as an explicit null.
+    for path in [
+        &["candidates", "0", "sources", "0", "issue", "display_number"][..],
+        &["candidates", "0", "provenance", "snapshot_cursor"][..],
+        &["candidates", "0", "provenance", "fetched_unix_seconds"][..],
+    ] {
+        let mut v = response_json("req-1", &proposals);
+        remove_key_at(&mut v, path);
+        assert_eq!(
+            contract_rule(validate(&v, &req)),
+            "success_shape",
+            "missing {path:?} must fail the response shape"
+        );
+    }
+    // The failure envelope's request_id is required-nullable too.
+    let mut v: serde_json::Value = serde_json::from_slice(&protocol::failure_response(
+        None,
+        FailureCode::InternalError,
+        "x",
+    ))
+    .unwrap();
+    v.as_object_mut().unwrap().remove("request_id");
+    assert_eq!(contract_rule(validate(&v, &req)), "failure_shape");
+}
+
+#[test]
+fn parse_request_requires_nullable_keys_to_be_present() {
+    // The request side mirrors the rule: an exclusion omitting
+    // display_number is a shape violation, not an implicit null.
+    let req = request();
+    let mut v: serde_json::Value = serde_json::from_slice(&req.bytes).unwrap();
+    v["excluded_sources"] = serde_json::json!([{
+        "repository": { "host": "test-host", "repository": "repo-a" },
+        "issue": "i-x",
+    }]);
+    let bytes = serde_json::to_vec(&v).unwrap();
+    assert_eq!(
+        contract_rule(protocol::parse_request(&bytes)),
+        "request_shape"
+    );
 }
 
 #[test]

@@ -415,6 +415,23 @@ struct WireProvenance {
     fetched_unix_seconds: Option<i64>,
 }
 
+/// The schema requires every declared field, including nullable
+/// ones — serde's `Option` handling would silently accept an omitted
+/// key as `None`. Presence is therefore checked on the JSON value
+/// before the typed parse; a missing key under an existing parent
+/// object is the same shape violation serde reports for absent
+/// non-nullable fields.
+fn require_present_key(
+    parent: Option<&serde_json::Value>,
+    key: &str,
+    rule: &'static str,
+) -> Result<(), Violation> {
+    match parent.and_then(|v| v.as_object()) {
+        Some(map) if !map.contains_key(key) => Err(Violation::Contract(rule)),
+        _ => Ok(()),
+    }
+}
+
 /// Validate one response payload against `req`. On success the
 /// returned reply carries every candidate — a single [`Violation`]
 /// means the whole response admitted zero candidates, including a
@@ -442,6 +459,22 @@ fn validate_success(
     value: serde_json::Value,
     req: &ValidatedRequest,
 ) -> Result<SelectorReply, Violation> {
+    // Required-nullable keys must be present (explicit null allowed);
+    // parents that are absent or mistyped are left for the typed
+    // parse to reject as `success_shape`.
+    if let Some(candidates) = value.get("candidates").and_then(|v| v.as_array()) {
+        for candidate in candidates {
+            if let Some(sources) = candidate.get("sources").and_then(|v| v.as_array()) {
+                for source in sources {
+                    require_present_key(source.get("issue"), "display_number", "success_shape")?;
+                }
+            }
+            if let Some(provenance) = candidate.get("provenance") {
+                require_present_key(Some(provenance), "snapshot_cursor", "success_shape")?;
+                require_present_key(Some(provenance), "fetched_unix_seconds", "success_shape")?;
+            }
+        }
+    }
     let wire: WireSuccess =
         serde_json::from_value(value).map_err(|_| Violation::Contract("success_shape"))?;
     if wire.protocol_version != PROTOCOL_VERSION {
@@ -662,6 +695,7 @@ fn validate_success(
 }
 
 fn validate_failure(value: serde_json::Value) -> Result<SelectorReply, Violation> {
+    require_present_key(Some(&value), "request_id", "failure_shape")?;
     let wire: WireFailure =
         serde_json::from_value(value).map_err(|_| Violation::Contract("failure_shape"))?;
     if wire.protocol_version != PROTOCOL_VERSION {
@@ -746,6 +780,11 @@ pub fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, Violation> {
         return Err(Violation::Contract("request_too_large"));
     }
     let value = strict_json::parse_strict(bytes).map_err(Violation::Parse)?;
+    if let Some(excluded) = value.get("excluded_sources").and_then(|v| v.as_array()) {
+        for entry in excluded {
+            require_present_key(Some(entry), "display_number", "request_shape")?;
+        }
+    }
     let wire: WireRequest =
         serde_json::from_value(value).map_err(|_| Violation::Contract("request_shape"))?;
     if wire.protocol_version != PROTOCOL_VERSION {

@@ -169,7 +169,8 @@ Before mutation the caller retains `(origin, actor, idempotency_key)`, the exact
 | `init`, `check`, `check --probe` | setup | none — per [installation config](installation-config.md) |
 | `work-list`, `work-detail`, `attention`, `capacity`, `command-result`, `retention report` | query | none |
 | `retention cleanup` | mutation | none — bounded two-phase pass per retention policy |
-| `run`, `run --once`, `run --work <id>` | driver | the loop itself, plus the intake scheduler's settings tick |
+| `run`, `run --once` | driver | the loop itself, plus the intake scheduler's settings tick |
+| `run --work <id>` | driver | the loop itself — diagnostic scope, no intake scheduling |
 | `intake` | driver | one invocation under the scheduler's single-flight lease |
 | `intake-runs`, `intake-detail` | query | none — durable intake records |
 

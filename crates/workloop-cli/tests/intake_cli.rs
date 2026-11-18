@@ -338,6 +338,37 @@ fn run_once_drives_a_scheduled_startup_intake_without_blocking() {
 }
 
 #[test]
+fn run_work_diagnostic_scope_never_evaluates_intake_scheduling() {
+    let dir = root("run-work-scope");
+    let argv = selector_fixture(&dir);
+    let profile = write_profile(&dir, &argv);
+
+    // docs/execution-loop.md: `run --work <id>` restricts the
+    // execution phases to one Work and does not evaluate intake
+    // scheduling — no driver exists for the scoped run, so the
+    // enabled-and-due profile cannot launch anything.
+    let out = intake_cli(
+        &dir,
+        Some(&profile),
+        &["run", "--work", "w_missing", "--once"],
+    );
+    assert!(
+        out.status.success(),
+        "run --work --once failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("intake invocation"),
+        "a work-scoped diagnostic run must not launch intake: {stderr}"
+    );
+
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert!(items.is_empty(), "no intake run may be recorded: {env}");
+}
+
+#[test]
 fn intake_profile_resolution_never_reads_the_json_install_config_flag() {
     // `--config` on a store-backed command names the JSON installation
     // record — the TOML profile resolves through `TAISAN_CONFIG`/XDG
