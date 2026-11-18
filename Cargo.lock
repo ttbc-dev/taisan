@@ -796,6 +796,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "workloop-fixture-selector"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "workloop-fixture-worker"
 version = "0.0.0"
 dependencies = [

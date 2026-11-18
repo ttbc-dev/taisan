@@ -489,6 +489,123 @@ fn intake_is_refused_while_a_run_is_active() {
     assert_eq!(env["reason"]["code"], "intake_active", "{env}");
 }
 
+/// #217 — configuration-only adapter replacement. The same store,
+/// the same sources file, the same profile shape: only
+/// `[intake.selector]`'s `adapter`/`argv` differ between runs. The
+/// durable run records prove which executable each invocation
+/// selected, and the second run admits nothing new because the
+/// first run's Work already owns the issue — existing Work and
+/// submit semantics are untouched by the swap.
+#[test]
+fn swapping_only_the_profile_selector_selects_the_fixture_adapter() {
+    let dir = root("swap");
+
+    // Scripted source for the profile's one in-scope repository —
+    // the file backend both selector executables read.
+    let sources = dir.join("sources.json");
+    std::fs::write(
+        &sources,
+        serde_json::to_string(&serde_json::json!({
+            "repositories": {
+                "https://api.github.com/0123456789": {
+                    "pages": [{
+                        "issues": [{
+                            "issue": {
+                                "repository": {
+                                    "host": "https://api.github.com",
+                                    "repository": "0123456789",
+                                },
+                                "issue": "issue-9",
+                                "display_number": 9,
+                            },
+                            "state": "open",
+                            "labels": [],
+                            "created_unix_seconds": 100,
+                            "title": "swapped adapter work",
+                            "revision": "rev-9",
+                            "content_digest": "digest-9",
+                        }]
+                    }]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let fixture_exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-selector")
+        .to_string_lossy()
+        .into_owned();
+    let reference_exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/public-issue-selector")
+        .to_string_lossy()
+        .into_owned();
+    let sources_arg = sources.to_string_lossy().into_owned();
+
+    // Run 1: the profile binds the independent fixture adapter.
+    let argv = vec![
+        fixture_exe.clone(),
+        "select".to_string(),
+        "--sources".to_string(),
+        sources_arg.clone(),
+    ];
+    let profile = write_profile(&dir, &argv);
+    // The profile's declared adapter id must match the binding.
+    let profile_text = std::fs::read_to_string(&profile).unwrap().replace(
+        "adapter = \"test-sel\"",
+        "adapter = \"workloop-fixture-selector\"",
+    );
+    std::fs::write(&profile, profile_text).unwrap();
+
+    let env = run_ok(&dir, Some(&profile), &["intake"]);
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    assert_eq!(
+        env["result"]["candidates"][0]["status"], "accepted",
+        "{env}"
+    );
+
+    // Run 2: rewrite ONLY the selector binding — same store, same
+    // sources file, same task defaults — to the packaged reference.
+    let argv = vec![
+        reference_exe,
+        "select".to_string(),
+        "--sources".to_string(),
+        sources_arg,
+    ];
+    let profile_text = profile_toml_enabled(&argv, true).replace(
+        "adapter = \"test-sel\"",
+        "adapter = \"public-issue-selector\"",
+    );
+    std::fs::write(&profile, profile_text).unwrap();
+
+    let env = run_ok(&dir, Some(&profile), &["intake"]);
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    // The issue is now source-owned: the swapped adapter runs,
+    // validates the same exclusions, and proposes nothing new.
+    assert_eq!(
+        env["result"]["candidates"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
+
+    // The durable run records name the adapter each invocation used
+    // (the list is newest-first).
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{env}");
+    assert_eq!(items[0]["selector_id"], "public-issue-selector");
+    assert_eq!(items[0]["candidates"]["accepted"], 0);
+    assert_eq!(items[1]["selector_id"], "workloop-fixture-selector");
+    assert_eq!(items[1]["candidates"]["accepted"], 1);
+
+    // Exactly one Work exists — the swap neither duplicated nor
+    // split the admitted work.
+    let store = SqliteStore::open(&dir.join("workloop.db"), 10).unwrap();
+    let works = store.transact_deferred(|tx| tx.works()).unwrap();
+    assert_eq!(works.len(), 1);
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
