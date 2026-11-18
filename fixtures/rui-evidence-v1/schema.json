@@ -288,8 +288,11 @@
         "artifact_unavailable",
         "artifact_too_large",
         "digest_mismatch",
-        "store_error",
-        "config_error"
+        "usage",
+        "config",
+        "store",
+        "forbidden",
+        "store_unavailable"
       ]
     },
     "EvidenceClass": {

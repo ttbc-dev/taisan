@@ -22,18 +22,19 @@ def gap(name, evidence_class, reason):
     return dict(code="not_recorded", scope=dict(kind="revision", record=ref(name)),
                 evidence_class=evidence_class, reason=reason)
 
-def record(name, seq, operation, revision="r1", revision_seq=1, **data):
+def record(name, seq, operation, revision="r1", revision_seq=1, assertion=None, **data):
     kind = "entity" if operation.startswith("entity") else "link"
     body = dict(**ref(name, revision), revision_seq=revision_seq, record_kind=kind,
-                work_id=WORK, assertion=dict(kind="observed"),
+                work_id=WORK, assertion=assertion or dict(kind="observed"),
                 source_refs=[dict(artifact_id="observations", sha256=artifact_sha,
                                   locator=dict(kind="json_pointer", pointer=f"/{name}/{revision}"))],
                 operation=operation, **data)
     records[name, revision] = body
     return body, seq
 
-def entity(source_id, seq, kind, rev="r1", number=1, **payload):
-    return record(source_id, seq, "entity", rev, number, type=kind, payload=payload)
+def entity(source_id, seq, kind, rev="r1", number=1, assertion=None, **payload):
+    return record(source_id, seq, "entity", rev, number, assertion=assertion,
+                  type=kind, payload=payload)
 
 def link(name, seq, relation, source, target, operation="link", **fields):
     return record(name, seq, operation, relation=relation, **{"from": ref(source), "to": ref(target)}, **fields)
@@ -99,17 +100,22 @@ second = [
     entity("round-b", 8, "review_round", round_id="round-b", execution=ref("exec-b"),
            change_id="change-b", reviewed_head="head-b0", completeness="partial", observation_id=None),
     entity("finding-b", 8, "finding_occurrence", occurrence_id="finding-b", source_finding_key="rule-example",
-           round=ref("round-b"), reviewed_head="head-b0", body=None, disposition="unknown", category=None, invariants=[]),
+           round=ref("round-b"), reviewed_head="head-b0", body=None, disposition="unknown", category=None,
+           invariants=[], assertion=dict(kind="source_claim")),
     entity("finding-a", 9, "finding_occurrence", "r2", 2, occurrence_id="finding-a", source_finding_key="rule-example",
            round=ref("round-a"), reviewed_head="head-a0", body="The ledger entry was duplicated.",
-           disposition="accepted", category="ledger", invariants=[ref("invariant")]),
+           disposition="accepted", category="ledger", invariants=[ref("invariant")],
+           assertion=dict(kind="human_inference", author="operator-a", tool="taisan-review",
+                          version="1.0.0", rationale="Operator reconciled duplicate ledger entries.")),
     record("finding-b", 10, "entity_tombstone", "r2", 2, entity_type="finding_occurrence", reason="Duplicate source entry."),
     entity("requirement", 8, "requirement", requirement_id="requirement", text="Keep a ledger.",
            category=None, provenance="dispatch", source_revision=None),
     entity("invariant", 8, "invariant", invariant_id="invariant", text="Keep one entry per event.",
            category="ledger", provenance="annotation", source_revision=None),
     entity("outcome", 10, "outcome", outcome_id="outcome", execution=ref("exec-b"), scope="execution",
-           state="passed", head="head-b1"),
+           state="passed", head="head-b1",
+           assertion=dict(kind="model_interpretation", author="operator-a", tool="taisan-export",
+                          version="1.0.0", rationale="Model summarized the recorded execution outcome.")),
     link("addresses-a", 10, "repair_addresses_finding", "repair-a", "finding-a",
          operation="link_tombstone", revision="r2", revision_seq=2, reason="Source withdrew the relation."),
     link("unsupported", 10, "repair_addresses_finding", "repair-b", "purged-finding"),
@@ -138,6 +144,13 @@ write("artifact-success.json", dict(request=dict(protocol_version=VERSION, artif
 for code in ["snapshot_expired", "checkpoint_expired", "artifact_unavailable", "artifact_too_large", "digest_mismatch"]:
     write(code.replace("_", "-") + ".json", envelope("evidence_export" if code.endswith("_expired") else "evidence_artifact",
           error=dict(code=code, message=code.replace("_", " ").capitalize() + ".")))
+for code in ["forbidden", "store_unavailable"]:
+    write(code.replace("_", "-") + ".json",
+          envelope("evidence_export", error=dict(code=code, message=code.replace("_", " ").capitalize() + ".")))
+for code in ["usage", "config", "store"]:
+    env = envelope("evidence_export", error=dict(code=code, message=code.capitalize() + " failure."))
+    env["command"] = None
+    write(code + ".json", env)
 unknown = json.loads((ROOT / "full-1.json").read_bytes())["envelope"]["result"]
 unknown["protocol_version"] = "rui-evidence/9"
 write("unknown-version.json", unknown)

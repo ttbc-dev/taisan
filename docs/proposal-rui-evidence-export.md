@@ -136,7 +136,7 @@ Limit one artifact to 8 MiB in the initial contract. Return `artifact_too_large`
 
 ## Compatibility and failures
 
-Map errors to the existing CLI exit classes; no new incompatible outer envelope is required. At least these reason codes are distinguishable: `unsupported_protocol`, `invalid_cursor`, `snapshot_expired`, `checkpoint_expired`, `installation_mismatch`, `epoch_mismatch`, `record_too_large`, `artifact_unavailable`, `artifact_too_large`, `digest_mismatch` and store/config errors.
+Map errors to the existing CLI exit classes; no new incompatible outer envelope is required. At least these reason codes are distinguishable: `unsupported_protocol`, `invalid_cursor`, `snapshot_expired`, `checkpoint_expired`, `installation_mismatch`, `epoch_mismatch`, `record_too_large`, `artifact_unavailable`, `artifact_too_large`, `digest_mismatch` and the envelope's `usage`/`config`/`store`/`forbidden`/`store_unavailable` failure classes.
 
 A structured unavailable response is not an empty successful export. Diagnostics contain codes, counts and safe identifiers, not retained private bodies, credentials or host paths. Process stdout remains bounded JSON. Consumers retain their last committed checkpoint after an error.
 

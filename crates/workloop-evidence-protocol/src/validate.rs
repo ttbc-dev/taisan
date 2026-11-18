@@ -703,7 +703,7 @@ pub fn validate_snapshot(
             }
             validate_locator(r, a, Some(bytes))?;
         }
-        if validate_endpoints(body, &records, &current_gaps)? {
+        if validate_endpoints(body, &records, &gaps)? {
             unresolved.insert(id.clone());
             if body.record_kind == RecordKind::Link {
                 unsupported.insert(id);
@@ -880,13 +880,14 @@ impl<T> QueryEnvelope<T> {
         kind: CommandKind,
         watermark: Option<u64>,
     ) -> Result<(), ValidationError> {
+        let identity = |c: &QueryCommand| {
+            c.kind == kind
+                && token(&c.actor)
+                && c.id.as_deref().is_none_or(token)
+                && c.idempotency_key.is_none()
+        };
         require(
-            self.command.as_ref().is_some_and(|c| {
-                c.kind == kind
-                    && token(&c.actor)
-                    && c.id.as_deref().is_none_or(token)
-                    && c.idempotency_key.is_none()
-            }) && self.work_id.is_none()
+            self.work_id.is_none()
                 && self.execution_id.is_none()
                 && self.evidence_refs.len() <= 16
                 && self.evidence_refs.iter().all(|s| s.chars().count() <= 240)
@@ -899,6 +900,7 @@ impl<T> QueryEnvelope<T> {
             QueryStatus::Accepted => require(
                 self.result.is_some()
                     && self.reason.is_none()
+                    && self.command.as_ref().is_some_and(identity)
                     && self.as_of == watermark
                     && self.sources.is_some() == watermark.is_some(),
                 InvalidField,
@@ -907,6 +909,7 @@ impl<T> QueryEnvelope<T> {
                 self.result.is_none()
                     && self.as_of.is_none()
                     && self.sources.is_none()
+                    && self.command.as_ref().is_none_or(identity)
                     && self.reason.as_ref().is_some_and(|r| {
                         !r.message.trim().is_empty() && r.message.chars().count() <= 240
                     }),

@@ -30,8 +30,8 @@
           "revision": "r1",
           "revision_seq": 1,
           "change_seq": 8,
-          "body_sha256": "08a67141ac8066653d6e25cb5852ad604a1aedaa5f7d23eeddcfe6a9313b34ac",
-          "body_json": "{\"source_id\": \"finding-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-b/r1\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-b\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-b\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-b0\", \"body\": null, \"disposition\": \"unknown\", \"category\": null, \"invariants\": []}}\n"
+          "body_sha256": "74aad73a87333ce599038dc8a32484b30960e1a59eb59a431b9c924528a534ce",
+          "body_json": "{\"source_id\": \"finding-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"source_claim\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-b/r1\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-b\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-b\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-b0\", \"body\": null, \"disposition\": \"unknown\", \"category\": null, \"invariants\": []}}\n"
         },
         {
           "source_id": "invariant",
@@ -62,8 +62,8 @@
           "revision": "r2",
           "revision_seq": 2,
           "change_seq": 9,
-          "body_sha256": "fc2985dacafec748916e2c925ccd5772d75ba50eba2c90649b4f204f37712530",
-          "body_json": "{\"source_id\": \"finding-a\", \"revision\": \"r2\", \"revision_seq\": 2, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-a/r2\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-a\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-a\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-a0\", \"body\": \"The ledger entry was duplicated.\", \"disposition\": \"accepted\", \"category\": \"ledger\", \"invariants\": [{\"source_id\": \"invariant\", \"revision\": \"r1\"}]}}\n"
+          "body_sha256": "9a1f5db6826affec3b757a2a3aca94c247777e84431941afe1bd75dcfa4ce678",
+          "body_json": "{\"source_id\": \"finding-a\", \"revision\": \"r2\", \"revision_seq\": 2, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"human_inference\", \"author\": \"operator-a\", \"tool\": \"taisan-review\", \"version\": \"1.0.0\", \"rationale\": \"Operator reconciled duplicate ledger entries.\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-a/r2\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-a\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-a\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-a0\", \"body\": \"The ledger entry was duplicated.\", \"disposition\": \"accepted\", \"category\": \"ledger\", \"invariants\": [{\"source_id\": \"invariant\", \"revision\": \"r1\"}]}}\n"
         },
         {
           "source_id": "repair-a",
@@ -110,8 +110,8 @@
           "revision": "r1",
           "revision_seq": 1,
           "change_seq": 10,
-          "body_sha256": "d2ca8d05e1737c2e8bbd19aad9ab610eae5f27a8b01e03a5f0e01f3cb2863dc1",
-          "body_json": "{\"source_id\": \"outcome\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/outcome/r1\"}}], \"operation\": \"entity\", \"type\": \"outcome\", \"payload\": {\"outcome_id\": \"outcome\", \"execution\": {\"source_id\": \"exec-b\", \"revision\": \"r1\"}, \"scope\": \"execution\", \"state\": \"passed\", \"head\": \"head-b1\"}}\n"
+          "body_sha256": "2b20a240b0320193b32cbd2c73da8706c9834efffd4df4f0b2a122427a6a81d5",
+          "body_json": "{\"source_id\": \"outcome\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"model_interpretation\", \"author\": \"operator-a\", \"tool\": \"taisan-export\", \"version\": \"1.0.0\", \"rationale\": \"Model summarized the recorded execution outcome.\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/outcome/r1\"}}], \"operation\": \"entity\", \"type\": \"outcome\", \"payload\": {\"outcome_id\": \"outcome\", \"execution\": {\"source_id\": \"exec-b\", \"revision\": \"r1\"}, \"scope\": \"execution\", \"state\": \"passed\", \"head\": \"head-b1\"}}\n"
         }
       ],
       "links": [

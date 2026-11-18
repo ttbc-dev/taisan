@@ -114,8 +114,11 @@ vocabulary!(ErrorCode {
     ArtifactUnavailable,
     ArtifactTooLarge,
     DigestMismatch,
-    StoreError,
-    ConfigError
+    Usage,
+    Config,
+    Store,
+    Forbidden,
+    StoreUnavailable
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]

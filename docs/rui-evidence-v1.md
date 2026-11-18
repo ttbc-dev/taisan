@@ -43,8 +43,9 @@ through typed objects does not discard unknown fields or change hashed text.
 The CLI reuses [result envelope v1](execution-loop.md#cli-contract).
 `schema_version` is the string `"1"`. Queries use `accepted` and `error`.
 `command` contains the query `kind` (`evidence_export` or `evidence_artifact`),
-`actor`, nullable `id`, and null `idempotency_key`. Envelope `work_id` and
-`execution_id` are null. `evidence_refs` holds up to 16 safe strings of up to
+`actor`, nullable `id`, and null `idempotency_key`; an error raised before
+the query identity is established may carry a null `command`. Envelope
+`work_id` and `execution_id` are null. `evidence_refs` holds up to 16 safe strings of up to
 240 characters. `sources` lists up to 2,000 source observations on accepted exports.
 Each source has a `source` label, `availability` (`known`, `unknown`,
 `unavailable`) and nullable `observed_unix_seconds`. Export `as_of` equals
@@ -221,7 +222,7 @@ exported and returned descriptors must be available. The command verifies the bo
 | `checkpoint_expired` | 5 | Reimport full retained history into a new consumer generation. |
 | `record_too_large` | 5 | The next indivisible record cannot fit in a page. |
 | `artifact_unavailable`, `artifact_too_large`, `digest_mismatch` | 5 | Retrieval cannot supply the requested exact bytes. |
-| `config_error`, `store_error` | 3, 4 | Configuration or store failure, respectively. |
+| `usage`, `config`, `store`, `store_unavailable`, `forbidden` | 2, 3, 4, 4, 1 | The reused envelope's failure classes: input/usage, configuration, store failure, an unreadable store, and a policy refusal, respectively. |
 
 Semantic validation errors in the Rust crate distinguish invalid version,
 JSON, request, limits, tokens, metadata, watermark, ordering, revision,

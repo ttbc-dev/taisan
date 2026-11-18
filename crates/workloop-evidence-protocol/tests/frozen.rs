@@ -1,5 +1,9 @@
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 use workloop_evidence_protocol::*;
 
 fn bytes(name: &str) -> Vec<u8> {
@@ -70,6 +74,11 @@ fn freeze_matches_generated_schema_and_actual_files() {
         "delta.json",
         "snapshot-expired.json",
         "checkpoint-expired.json",
+        "forbidden.json",
+        "store-unavailable.json",
+        "usage.json",
+        "config.json",
+        "store.json",
         "unknown-version.json",
     ];
     assert_eq!(manifest.sha256.len(), expected.len());
@@ -296,6 +305,23 @@ fn artifact_receipts_and_query_errors_use_literal_codes() {
             ErrorCode::DigestMismatch,
             CommandKind::EvidenceArtifact,
         ),
+        (
+            "forbidden.json",
+            ErrorCode::Forbidden,
+            CommandKind::EvidenceExport,
+        ),
+        (
+            "store-unavailable.json",
+            ErrorCode::StoreUnavailable,
+            CommandKind::EvidenceExport,
+        ),
+        ("usage.json", ErrorCode::Usage, CommandKind::EvidenceExport),
+        (
+            "config.json",
+            ErrorCode::Config,
+            CommandKind::EvidenceExport,
+        ),
+        ("store.json", ErrorCode::Store, CommandKind::EvidenceExport),
     ] {
         let reason = match kind {
             CommandKind::EvidenceExport => decode_export_envelope(&bytes(name)).unwrap().reason,
@@ -636,6 +662,83 @@ fn recovering_an_endpoint_rechecks_history_without_promoting_old_links() {
             .contains(&rf("binding-b", "r2"))
     );
     assert!(recovered.record(&rf("binding-b", "r2")).is_some());
+}
+
+#[test]
+fn a_delta_resolves_missing_endpoints_against_historical_gaps() {
+    let mut pages = full();
+    let entities = &mut pages[1].1.entities;
+    let index = entities
+        .iter()
+        .position(|r| r.source_id == "repair-b")
+        .unwrap();
+    entities.remove(index);
+    pages[1].1.gaps.push(Gap {
+        code: GapCode::NotRecorded,
+        evidence_class: EvidenceClass::Relation,
+        scope: GapScope::Revision {
+            record: rf("repair-b", "r1"),
+        },
+        reason: "Repair observation missing.".into(),
+    });
+    let history = validate_snapshot(&pages, None, &artifacts()).unwrap();
+    // The delta's new link references the endpoint still declared missing
+    // by the validated history's relation gap; the delta does not
+    // re-declare it, and the link is archived as unsupported.
+    let delta = [page("delta.json")];
+    let next = validate_snapshot(&delta, Some(&history), &artifacts()).unwrap();
+    assert!(
+        next.unsupported_links()
+            .contains(&rf("delta-addresses", "r1"))
+    );
+}
+
+#[test]
+fn assertion_kinds_and_required_fields_are_explicit() {
+    let mut kinds = BTreeSet::new();
+    for (.., page) in full().iter().chain(&[page("delta.json")]) {
+        for record in page.entities.iter().chain(page.links.iter()) {
+            let body: serde_json::Value = serde_json::from_str(&record.body_json).unwrap();
+            kinds.insert(body["assertion"]["kind"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        [
+            "human_inference",
+            "model_interpretation",
+            "observed",
+            "source_claim"
+        ]
+    );
+    // Interpretation assertions require author, tool, version and rationale:
+    // a missing field fails to parse; a blank one is an invalid value.
+    let mut pages = full();
+    let outcome = pages[1]
+        .1
+        .entities
+        .iter_mut()
+        .find(|r| r.source_id == "outcome")
+        .unwrap();
+    edit(outcome, |b| {
+        b["assertion"].as_object_mut().unwrap().remove("rationale");
+    });
+    assert_eq!(
+        validate_snapshot(&pages, None, &artifacts()).unwrap_err(),
+        ValidationError::InvalidJson
+    );
+    let mut pages = full();
+    let finding = pages[1]
+        .1
+        .entities
+        .iter_mut()
+        .find(|r| r.source_id == "finding-a" && r.revision == "r2")
+        .unwrap();
+    edit(finding, |b| b["assertion"]["author"] = " ".into());
+    assert_eq!(
+        validate_snapshot(&pages, None, &artifacts()).unwrap_err(),
+        ValidationError::InvalidField
+    );
 }
 
 #[test]
