@@ -152,12 +152,17 @@ fn fail(request_id: Option<&str>, code: FailureCode, message: &str) -> ! {
 }
 
 /// Map a request-side violation onto the protocol's failure codes:
-/// version/capability mismatches get their own codes; everything
-/// else is `invalid_request`.
+/// version/capability mismatches get their own codes, bound
+/// violations (oversized bytes, lists, or counts) report
+/// `input_limit`, and every other contract violation is an invalid
+/// request shape, scope, or identity.
 fn request_violation_code(violation: &protocol::Violation) -> FailureCode {
     match violation {
         protocol::Violation::Contract("protocol_version") => FailureCode::UnsupportedVersion,
         protocol::Violation::Contract("capabilities") => FailureCode::UnsupportedCapability,
+        protocol::Violation::Contract(
+            "repositories_bound" | "exclusions_bound" | "max_candidates" | "request_too_large",
+        ) => FailureCode::InputLimit,
         _ => FailureCode::InvalidRequest,
     }
 }

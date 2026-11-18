@@ -381,6 +381,29 @@ fn executable_rejects_malformed_and_wrong_version_requests() {
 }
 
 #[test]
+fn executable_reports_bound_violations_as_input_limit() {
+    let dir = tmp_dir("boundreq");
+    let sources = write_sources(&dir, serde_json::json!({}));
+    let repositories = vec![repo()];
+    let spec = request_spec("req-bound", &repositories, &[], 8, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&request.bytes).unwrap();
+    // 65 repository entries break the 1-64 wire bound; the bound is
+    // checked before uniqueness, so duplicates are fine here.
+    let entry = value["repositories"][0].clone();
+    let repos = value["repositories"].as_array_mut().unwrap();
+    for _ in 0..64 {
+        repos.push(entry.clone());
+    }
+    let bad_request = workloop_core::domain::canonical_json(&value);
+    let (stdout, _, code) = run_exe(&sources_arg(&sources), &bad_request);
+    assert_eq!(code, Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["error"]["code"], "input_limit");
+}
+
+#[test]
 fn executable_serves_paged_sources() {
     let dir = tmp_dir("paged");
     let r = repo();

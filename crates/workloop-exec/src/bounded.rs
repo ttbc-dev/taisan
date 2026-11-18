@@ -334,6 +334,13 @@ pub fn exchange(
         return Err(error);
     }
 
+    // The leader's status arrived — every path below is post-exit.
+    // Sweep the process group once before classifying: a same-group
+    // descendant that outlived the leader would otherwise keep the
+    // output pipes open on the failure paths just as on the success
+    // drain.
+    sweep_group_stragglers(pid, &started_at);
+
     // The leader's status arrived. A drain may have tripped its bound
     // in the same instant — the overflow still invalidates the whole
     // invocation, so check before classifying the exit.
@@ -371,10 +378,9 @@ pub fn exchange(
         }
     };
 
-    // Normal exit proven. EOF on both streams is still required: a
-    // surviving same-group descendant holds the pipes open, so first
-    // sweep the group once, then give the drains their grace.
-    sweep_group_stragglers(pid, &started_at);
+    // Normal exit proven. EOF on both streams is still required: the
+    // group sweep above already removed same-group stragglers, so the
+    // drains' grace now measures only escaped (`setsid`) members.
     let out = match stdout_rx.recv_timeout(DRAIN_GRACE) {
         Ok(r) => r,
         Err(_) => {
@@ -436,8 +442,10 @@ fn bound_terminate(pid: i32, recorded_lstart: &str, error: ExchangeError) -> Exc
     }
 }
 
-/// After the leader's exit is proven, kill any same-group stragglers
-/// still holding the output pipes so the drains can reach EOF. The
+/// Once the leader's status arrived — proven exit, or a `wait` error
+/// whose outcome is already `Unknown` — kill any same-group
+/// stragglers still holding the output pipes so the drains can reach
+/// EOF and no descendant outlives the bounded invocation. The
 /// sweep applies the supervisor's proven plan: an absent or
 /// unverifiable-but-unallocated pid leaves only this invocation's own
 /// stragglers holding the group, while a live process at the pid under

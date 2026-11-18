@@ -349,6 +349,49 @@ fn exchange_kills_same_group_descendants_holding_pipes() {
 }
 
 #[test]
+fn exchange_nonzero_exit_still_sweeps_same_group_stragglers() {
+    let dir = tmp_root("exit-straggler");
+    let pgid_file = dir.join("pgid");
+    // The leader exits nonzero while a same-group descendant keeps
+    // running: the failure path must sweep the group too, or the
+    // straggler survives the bounded invocation holding the pipes.
+    let script = fixture_script(
+        &dir,
+        "exit-child.sh",
+        &format!("echo $$ > {}\nsleep 30 &\nexit 3\n", pgid_file.display()),
+    );
+    let err = exchange(
+        &[script],
+        &dir,
+        &selector_env(),
+        b"",
+        &SELECTOR_EXCHANGE_BOUNDS,
+        Duration::from_secs(15),
+    )
+    .expect_err("nonzero exit must fail the exchange");
+    assert!(
+        matches!(err, ExchangeError::Exit { .. }),
+        "expected Exit, got {err:?}"
+    );
+    let pgid: i32 = std::fs::read_to_string(&pgid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if group_member_count(pgid) == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process group {pgid} survived a failed exchange"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn exchange_reports_uncertain_descendants_as_unknown() {
     let dir = tmp_root("escapee");
     if Command::new("python3").arg("--version").output().is_err() {
