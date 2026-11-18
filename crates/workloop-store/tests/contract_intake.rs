@@ -1021,6 +1021,24 @@ fn candidate_decision_links_follow_the_status_contract() {
         })
         .unwrap_err();
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    // A replay of an accepted decision carries no rejection reason, just
+    // like a fresh acceptance.
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Replayed,
+                    status_reason: Some("idempotency_conflict".into()),
+                    command_id: Some(replay_command_id.clone()),
+                    work_id: Some(replay_work_id.clone()),
+                    committed_seq: Some(replay_committed_at),
+                    ..candidate("r-links", 2, "prop-c")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     decide(IntakeCandidate {
         status: IntakeCandidateStatus::Replayed,
         command_id: Some(replay_command_id.clone()),
