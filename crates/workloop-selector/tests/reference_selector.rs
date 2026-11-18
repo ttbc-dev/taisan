@@ -472,6 +472,61 @@ fn executable_without_label_config_proposes_all_open_issues() {
 }
 
 #[test]
+fn executable_skips_facts_whose_title_cannot_form_an_intent() {
+    let dir = tmp_dir("intent");
+    let r = repo();
+    // Whitespace-only title: schema-valid string, invalid intent.
+    let blank = fact(
+        issue(1, "i-blank"),
+        IssueState::Open,
+        &["intake"],
+        100,
+        "   ",
+    );
+    // Control character in the title: the title reaches the selector
+    // (collect bounds it only by size), so the intent check must
+    // refuse it. Revision/digest stay clean tokens — a real source
+    // reports them independently of the title.
+    let mut ctrl = fact(
+        issue(2, "i-ctrl"),
+        IssueState::Open,
+        &["intake"],
+        200,
+        "bad\u{7}title",
+    );
+    ctrl.revision = "rev-ctrl".to_string();
+    ctrl.content_digest = "digest-ctrl".to_string();
+    let issues = vec![
+        blank,
+        ctrl,
+        fact(issue(3, "i-ok"), IssueState::Open, &["intake"], 300, "good"),
+    ];
+    let sources = write_sources(
+        &dir,
+        serde_json::json!({ repo_key(&r): { "pages": pages(issues) } }),
+    );
+    let repositories = vec![r];
+    let spec = request_spec("req-intent", &repositories, &[], 32, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+    let mut args = sources_arg(&sources);
+    args.extend(["--label".into(), "intake".into()]);
+    let (stdout, stderr, code) = run_exe(&args, &request.bytes);
+    assert_eq!(code, Some(0));
+    // The response must still conform — the bad facts are skipped,
+    // never emitted into a candidate the validator would reject.
+    let reply = protocol::validate_response(&stdout, &request).expect("conforming response");
+    let SelectorReply::Success { candidates } = reply else {
+        panic!("expected success, got {reply:?}");
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].task.intent, "good");
+    assert!(
+        stderr.contains("invalid_intent=2"),
+        "stderr must count both refused facts: {stderr}"
+    );
+}
+
+#[test]
 fn executable_rejects_out_of_scope_source_facts() {
     // A fact scoped outside the requested repository makes the whole
     // repository scan Incomplete — the executable must fail closed.

@@ -293,6 +293,7 @@ fn report_diagnostics(
             workloop_selector::SkipReason::ConflictingFacts => "conflicting_facts",
             workloop_selector::SkipReason::TruncatedByBound => "truncated_by_bound",
             workloop_selector::SkipReason::MissingLabels => "missing_labels",
+            workloop_selector::SkipReason::InvalidIntent => "invalid_intent",
         };
         *by_reason.entry(reason).or_default() += 1;
     }

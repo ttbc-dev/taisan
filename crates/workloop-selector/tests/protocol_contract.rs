@@ -335,6 +335,66 @@ fn prepare_request_enforces_repository_and_exclusion_bounds() {
 }
 
 #[test]
+fn prepare_request_refuses_out_of_scope_and_zero_display_exclusions() {
+    // docs/selector-protocol.md: "Exclusions outside `repositories`
+    // are invalid input" — the emitting side enforces it locally
+    // rather than shipping a request the adapter must reject.
+    let mut parts = Parts::new();
+    parts.excluded = vec![IssueRef {
+        repository: repo("repo-zzz"),
+        issue: IssueId::trusted("i-x"),
+        display_number: None,
+    }];
+    assert_eq!(
+        contract_rule(protocol::prepare_request(&parts.spec(1), NOW_MS)),
+        "exclusion_scope"
+    );
+    // display_number is positive-or-null on the wire; Some(0) fails
+    // locally on both ends.
+    let mut parts = Parts::new();
+    let mut bad = issue("i-zero");
+    bad.display_number = Some(0);
+    parts.excluded = vec![bad];
+    assert_eq!(
+        contract_rule(protocol::prepare_request(&parts.spec(1), NOW_MS)),
+        "display_number"
+    );
+}
+
+#[test]
+fn parse_request_refuses_out_of_scope_exclusions() {
+    // The receiving side mirrors the scope rule: an exclusion naming a
+    // repository outside `repositories` is invalid input.
+    let req = request();
+    let mut v: serde_json::Value = serde_json::from_slice(&req.bytes).unwrap();
+    v["excluded_sources"] = serde_json::json!([{
+        "repository": { "host": "test-host", "repository": "repo-zzz" },
+        "issue": "i-x",
+        "display_number": null,
+    }]);
+    let bytes = serde_json::to_vec(&v).unwrap();
+    assert_eq!(
+        contract_rule(protocol::parse_request(&bytes)),
+        "exclusion_scope"
+    );
+}
+
+#[test]
+fn request_argv_total_counts_string_bytes_not_item_count() {
+    // The bound table's "16,384 bytes total" is the sum of the argv
+    // strings' byte lengths: exactly at the bound passes, one byte
+    // over fails — a per-item +1 would reject conforming requests.
+    let mut parts = Parts::new();
+    parts.verification_argv = vec!["x".repeat(protocol::MAX_ARGV_ITEM_BYTES); 4];
+    assert!(protocol::prepare_request(&parts.spec(1), NOW_MS).is_ok());
+    parts.verification_argv.push("y".to_string());
+    assert_eq!(
+        contract_rule(protocol::prepare_request(&parts.spec(1), NOW_MS)),
+        "verification_argv"
+    );
+}
+
+#[test]
 fn prepare_request_enforces_candidate_and_deadline_bounds() {
     let parts = Parts::new();
     for bad in [0u32, protocol::MAX_CANDIDATES + 1] {
@@ -486,6 +546,33 @@ fn validate_response_accepts_an_empty_candidate_set() {
     let req = request();
     let reply = validate(&response_json("req-1", &[]), &req).unwrap();
     assert!(matches!(reply, SelectorReply::Success { candidates } if candidates.is_empty()));
+}
+
+#[test]
+fn success_response_round_trips_populated_provenance_fields() {
+    let req = request();
+    // `success_response` must emit every nullable field — populated
+    // provenance and display numbers — in the shape
+    // `validate_response` accepts, not just the all-null default the
+    // other fixtures happen to produce.
+    let mut proposal = proposal_for(issue("issue-1"), "work");
+    proposal.provenance = Provenance {
+        snapshot_cursor: Some("cursor-abc".to_string()),
+        fetched_unix_seconds: Some(1_700_000_000),
+    };
+    let reply = validate(&response_json("req-1", &[proposal]), &req).unwrap();
+    let SelectorReply::Success { candidates } = reply else {
+        panic!("expected success")
+    };
+    assert_eq!(
+        candidates[0].provenance.snapshot_cursor.as_deref(),
+        Some("cursor-abc")
+    );
+    assert_eq!(
+        candidates[0].provenance.fetched_unix_seconds,
+        Some(1_700_000_000)
+    );
+    assert_eq!(candidates[0].sources[0].issue.display_number, Some(7));
 }
 
 #[test]
@@ -830,6 +917,23 @@ fn validate_response_maps_adapter_failures() {
     .unwrap();
     v["error"]["message"] = serde_json::json!("m".repeat(protocol::MAX_MESSAGE_BYTES + 1));
     assert_eq!(contract_rule(validate(&v, &req)), "failure_message");
+}
+
+#[test]
+fn failure_response_truncates_by_bytes_not_chars() {
+    let req = request();
+    // 300 two-byte characters = 600 bytes: a char-count cut would
+    // emit 512 bytes and fail this module's own byte bound — the
+    // emitted failure must survive `validate_response`.
+    let bytes =
+        protocol::failure_response(Some("req-1"), FailureCode::InternalError, &"é".repeat(300));
+    let reply = protocol::validate_response(&bytes, &req).unwrap();
+    match reply {
+        SelectorReply::Failure { message, .. } => {
+            assert!(message.len() <= protocol::MAX_MESSAGE_BYTES);
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
 }
 
 #[test]

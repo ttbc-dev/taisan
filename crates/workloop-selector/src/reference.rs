@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use workloop_core::identity::AdapterId;
 
 use crate::collect::{CollectedIssue, Collection};
-use crate::protocol::ParsedRequest;
+use crate::protocol::{self, ParsedRequest};
 use crate::{
     IssueState, Proposal, Provenance, SkipReason, SkippedIssue, SourceBinding, TaskInput, excluded,
     proposal_key,
@@ -66,6 +66,11 @@ pub fn select_reference(
             Some(SkipReason::NotOpen)
         } else if !required_labels.is_subset(&fact.labels) {
             Some(SkipReason::MissingLabels)
+        } else if !conforming_intent(&fact.title) {
+            // The title becomes the candidate intent verbatim; a title
+            // that cannot satisfy the wire rule would make the whole
+            // response invalid, so the fact is refused instead.
+            Some(SkipReason::InvalidIntent)
         } else {
             None
         };
@@ -104,6 +109,14 @@ pub fn select_reference(
         skipped,
         truncated,
     }
+}
+
+/// Whether `title` can serve verbatim as a candidate `task.intent`
+/// under the wire contract: the schema's string shape plus the
+/// intent-specific non-whitespace rule `validate_response` enforces.
+fn conforming_intent(title: &str) -> bool {
+    protocol::is_wire_string(title, protocol::MAX_INTENT_BYTES)
+        && title.chars().any(|c| !c.is_whitespace())
 }
 
 fn proposal(

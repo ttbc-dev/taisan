@@ -174,6 +174,11 @@ pub enum SkipReason {
     /// The Issue is open and in scope but does not carry every label
     /// the adapter's configured label filter requires (#214).
     MissingLabels,
+    /// The fact's title cannot form a protocol-conforming intent —
+    /// empty, whitespace-only, control-bearing, or over the intent
+    /// byte bound — so emitting a candidate for it would produce a
+    /// response `validate_response` must reject wholesale.
+    InvalidIntent,
 }
 
 /// One snapshot fact that produced no proposal, with its reason.

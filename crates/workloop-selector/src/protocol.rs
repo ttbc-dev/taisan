@@ -174,7 +174,7 @@ fn is_id(value: &str) -> bool {
 /// Nonempty, byte-bounded, control-free — the schema's string shape.
 /// Whitespace-only content is schema-valid for every field except
 /// `intent`, which adds its own non-whitespace rule at the call site.
-fn is_wire_string(value: &str, max_bytes: usize) -> bool {
+pub(crate) fn is_wire_string(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
@@ -227,14 +227,21 @@ pub fn prepare_request(
         }
     }
     for issue in &excluded_sources {
+        if issue.display_number == Some(0) {
+            return Err(Violation::Contract("display_number"));
+        }
         if !is_id(issue.issue.as_str())
             || !is_id(issue.repository.host.as_str())
             || !is_id(issue.repository.repository.as_str())
         {
             return Err(Violation::Contract("exclusion_id"));
         }
-        // Exclusions may name issues outside the allowlist — they are
-        // simply inert there.
+        // Exclusions outside `repositories` are invalid input
+        // (docs/selector-protocol.md) — the sorted set makes the
+        // membership check a binary search.
+        if repositories.binary_search(&issue.repository).is_err() {
+            return Err(Violation::Contract("exclusion_scope"));
+        }
     }
 
     if !(1..=MAX_CANDIDATES).contains(&spec.max_candidates) {
@@ -242,7 +249,7 @@ pub fn prepare_request(
     }
     if spec.deadline_unix_ms < 1
         || spec.deadline_unix_ms <= now_unix_ms
-        || spec.deadline_unix_ms - now_unix_ms > MAX_DEADLINE_AHEAD_MS
+        || spec.deadline_unix_ms.saturating_sub(now_unix_ms) > MAX_DEADLINE_AHEAD_MS
     {
         return Err(Violation::Contract("deadline"));
     }
@@ -264,7 +271,7 @@ pub fn prepare_request(
         || spec
             .verification_argv
             .iter()
-            .map(|a| a.len() + 1)
+            .map(|a| a.len())
             .sum::<usize>()
             > MAX_ARGV_TOTAL_BYTES
     {
@@ -573,7 +580,7 @@ fn validate_success(
             || task
                 .verification_argv
                 .iter()
-                .map(|a| a.len() + 1)
+                .map(|a| a.len())
                 .sum::<usize>()
                 > MAX_ARGV_TOTAL_BYTES
             || task.verification_argv != req.verification_argv
@@ -802,6 +809,12 @@ pub fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, Violation> {
         {
             return Err(Violation::Contract("exclusion_id"));
         }
+        // Exclusions outside `repositories` are invalid input —
+        // mirrored from `prepare_request` so both ends of the
+        // contract refuse the same payloads.
+        if repositories.binary_search(&issue.repository).is_err() {
+            return Err(Violation::Contract("exclusion_scope"));
+        }
         excluded_sources.push(issue);
     }
     excluded_sources.sort_by(|a, b| (&a.repository, &a.issue).cmp(&(&b.repository, &b.issue)));
@@ -834,7 +847,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, Violation> {
         || wire
             .verification_argv
             .iter()
-            .map(|a| a.len() + 1)
+            .map(|a| a.len())
             .sum::<usize>()
             > MAX_ARGV_TOTAL_BYTES
     {
@@ -892,15 +905,23 @@ pub fn failure_response(request_id: Option<&str>, code: FailureCode, message: &s
         FailureCode::DeadlineExceeded => "deadline_exceeded",
         FailureCode::InternalError => "internal_error",
     };
-    let message: String = message
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(256)
-        .collect();
-    let message = if message.is_empty() {
+    // Control characters are stripped first, then the message is cut
+    // at a char boundary so the result never exceeds
+    // `MAX_MESSAGE_BYTES` *bytes* — `validate_failure` measures bytes,
+    // so a char-count cut could emit a response this module's own
+    // validator rejects.
+    let filtered: String = message.chars().filter(|c| !c.is_control()).collect();
+    let mut bounded = String::new();
+    for ch in filtered.chars() {
+        if bounded.len() + ch.len_utf8() > MAX_MESSAGE_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    let message = if bounded.is_empty() {
         "unspecified".to_string()
     } else {
-        message
+        bounded
     };
     canonical_json(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
