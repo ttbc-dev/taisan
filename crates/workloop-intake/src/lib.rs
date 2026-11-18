@@ -151,7 +151,7 @@ pub fn run_intake(
     now_unix_seconds: i64,
     now_unix_ms: i64,
 ) -> Result<IntakeReport, IntakeError> {
-    let _lease = IntakeLease::acquire(store, now_unix_seconds)?;
+    let lease = IntakeLease::acquire(store, now_unix_seconds)?;
 
     // Preflight in one deferred read: an already-active run refuses
     // the invocation outright (the lease makes this rare — it covers
@@ -192,7 +192,10 @@ pub fn run_intake(
     owned.dedup();
     let exclusions = owned;
 
-    let owner = lease_owner()?;
+    // The run record copies the *held* lease's owner identity — the
+    // storage contract's provenance for "who held this invocation" —
+    // not a second, unrelated acquisition identity.
+    let owner = lease.owner.clone();
     let request_id = new_id("intake-req");
     let deadline_unix_ms = now_unix_ms + params.timeout.as_millis() as i64;
 
@@ -208,17 +211,15 @@ pub fn run_intake(
         None
     };
     if let Some(detail) = skip_detail {
-        let recorded = if exclusions.len() > protocol::MAX_EXCLUSIONS {
-            &exclusions[..protocol::MAX_EXCLUSIONS]
-        } else {
-            &exclusions[..]
-        };
+        // The skipped run's request_payload still records the complete
+        // exclusion snapshot — audit evidence is never truncated to
+        // fit the wire bound the launch was refused for.
         return record_skipped(
             store,
             params,
             &owner,
             detail,
-            recorded,
+            &exclusions,
             deadline_unix_ms,
             now_unix_seconds,
         );
@@ -327,7 +328,10 @@ fn complete_intake(
                 Some(exchange_detail(&error).to_string()),
                 now_unix_seconds,
             )?;
-            return Ok(report(store, run_id, false)?);
+            // Only `Launch` means no process ever ran; every other
+            // exchange error happened after a successful spawn.
+            let launched = !matches!(error, ExchangeError::Launch { .. });
+            return Ok(report(store, run_id, launched)?);
         }
         Ok(output) => match protocol::validate_response(&output.stdout, request) {
             Err(violation) => {

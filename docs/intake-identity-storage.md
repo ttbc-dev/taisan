@@ -146,7 +146,7 @@ The same semantic proposal — same selector ID/version, policy revision, source
 
 A `policy_revision` change is different: it is inside the proposal identity, so a semantic policy change deliberately produces new keys — that is the protocol's rule, not an intake invention.
 
-A previously finished source is not special-cased. After safe terminal release the Issue claim is gone, so ordinary validation admits a new submission; a *new request identity* (changed source content producing a new proposal key, or an operator's fresh command key) goes through the normal submit path with no terminal-source approval gate. The intake layer keeps no finished-Issue blacklist and never rotates replay keys. Queued, running, and paused source owners still exclude a new Work through the existing `issue_claims` overlap rule — unchanged.
+A previously finished source is not special-cased. After safe terminal release the Issue claim is gone, so ordinary validation admits a new submission; a *new request identity* (changed source content producing a new proposal key, or an operator's fresh command key) goes through the normal submit path with no terminal-source approval gate. The intake layer keeps no finished-Issue blacklist and never rotates replay keys. Non-terminal source owners — `queued`, `ready`, `running`, `waiting`, `stopping`, `paused`, and `uncertain` — still exclude a new Work through the existing `issue_claims` overlap rule, which retains claims until safe terminal settlement — unchanged.
 
 ## Capacity deferral is not rejection
 

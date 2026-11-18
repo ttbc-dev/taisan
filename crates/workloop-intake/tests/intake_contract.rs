@@ -441,8 +441,9 @@ fn selector_nonzero_exit_fails_the_run_without_candidates() {
     let report = run(&f, Duration::from_secs(10));
     assert_eq!(report.state, IntakeRunState::Failed);
     assert_eq!(report.detail_code.as_deref(), Some("exchange_exit"));
-    // A transport-level failure never reaches response validation.
-    assert!(!report.launched);
+    // A transport-level failure never reaches response validation —
+    // but the adapter process did launch and exit nonzero.
+    assert!(report.launched);
     assert!(report.candidates.is_empty());
 }
 

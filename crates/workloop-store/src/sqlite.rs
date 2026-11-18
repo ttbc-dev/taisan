@@ -1889,7 +1889,10 @@ impl ReadView for Tx<'_> {
         // paused Work holds no claim yet still owns its issues for
         // exclusion purposes. The active Execution's state decides
         // whether the owner is live for the selector's scope —
-        // `queued`, `running`, and `paused` only.
+        // Every non-terminal state: `ready`, `waiting`, `stopping`,
+        // and `uncertain` own their issues exactly like `queued`,
+        // `running`, and `paused` — only the three terminal states
+        // release them.
         let keys: Vec<String> = issues.iter().map(issue_key).collect();
         let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -1897,7 +1900,7 @@ impl ReadView for Tx<'_> {
              FROM work_issue_refs wir \
              JOIN executions e ON e.work_id = wir.work_id \
              WHERE wir.issue_key IN ({placeholders}) \
-               AND e.state IN ('queued','running','paused') \
+               AND e.state NOT IN ('succeeded','failed','cancelled') \
              ORDER BY wir.issue_key, wir.work_id"
         );
         self.query_all(&sql, rusqlite::params_from_iter(keys.iter()), |row| {
@@ -1911,9 +1914,9 @@ impl ReadView for Tx<'_> {
 
     fn intake_owned_issues(&self) -> Result<Vec<workloop_core::identity::IssueRef>, StoreError> {
         // The unfiltered owner set: every issue whose immutable
-        // membership belongs to a Work holding a queued, running, or
-        // paused Execution — the same live-owner rule
-        // `intake_source_owners` applies, minus the candidate filter.
+        // membership belongs to a Work holding a non-terminal
+        // Execution — the same live-owner rule `intake_source_owners`
+        // applies, minus the candidate filter.
         // `issue_key` — not the full row — is the dedup unit: two
         // Works may record the same issue under different display
         // numbers, and exclusions must see each scoped identity once.
@@ -1922,7 +1925,7 @@ impl ReadView for Tx<'_> {
         self.query_all(
             "SELECT DISTINCT wir.issue_key FROM work_issue_refs wir \
              JOIN executions e ON e.work_id = wir.work_id \
-             WHERE e.state IN ('queued','running','paused') \
+             WHERE e.state NOT IN ('succeeded','failed','cancelled') \
              ORDER BY wir.issue_key",
             [],
             |row| {

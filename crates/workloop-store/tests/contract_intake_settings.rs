@@ -624,6 +624,21 @@ fn preflight_reports_positions_and_scoped_owners_from_one_snapshot() {
         &submit_with_sources("pf-3", vec![source(303)]),
     ));
     force_state(&store, &e3, ExecutionState::Paused);
+    // every remaining non-terminal state owns its issues too —
+    // ready, waiting, stopping, and uncertain are unfinished Work
+    // exactly like queued, running, and paused
+    for (key, number, state) in [
+        ("pf-5", 306, ExecutionState::Ready),
+        ("pf-6", 307, ExecutionState::Waiting),
+        ("pf-7", 308, ExecutionState::Stopping),
+        ("pf-8", 309, ExecutionState::Uncertain),
+    ] {
+        let (_w, e) = accepted(&decision(
+            &store,
+            &submit_with_sources(key, vec![source(number)]),
+        ));
+        force_state(&store, &e, state);
+    }
     // terminal owner — excluded entirely
     let (_w4, e4) = accepted(&decision(
         &store,
@@ -637,6 +652,10 @@ fn preflight_reports_positions_and_scoped_owners_from_one_snapshot() {
         issue(303),
         issue(304),
         issue(305), // unowned
+        issue(306),
+        issue(307),
+        issue(308),
+        issue(309),
     ];
     let view = preflight(&store, &scope).unwrap();
     assert_eq!(view.settings_revision.as_deref(), Some("rev-q"));
@@ -656,6 +675,32 @@ fn preflight_reports_positions_and_scoped_owners_from_one_snapshot() {
             (301, ExecutionState::Queued),
             (302, ExecutionState::Running),
             (303, ExecutionState::Paused),
+            (306, ExecutionState::Ready),
+            (307, ExecutionState::Waiting),
+            (308, ExecutionState::Stopping),
+            (309, ExecutionState::Uncertain),
+        ]
+    );
+    // The unfiltered owned-issue set the coordinator turns into
+    // request exclusions follows the same non-terminal rule.
+    // Owned refs carry no display number — identity is the scoped
+    // issue id, ordered by issue key.
+    let owned: Vec<String> = store
+        .transact(|tx| tx.intake_owned_issues())
+        .unwrap()
+        .iter()
+        .map(|i| i.issue.as_str().to_string())
+        .collect();
+    assert_eq!(
+        owned,
+        vec![
+            "issue-301",
+            "issue-302",
+            "issue-303",
+            "issue-306",
+            "issue-307",
+            "issue-308",
+            "issue-309"
         ]
     );
     // Source claims and queue positions stay separate facts: the

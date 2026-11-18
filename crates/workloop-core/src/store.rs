@@ -260,10 +260,10 @@ pub struct IntakeSettingsRecord {
 
 /// One scoped issue's live owner for the intake preflight: the Work
 /// whose immutable issue membership covers the issue and whose active
-/// Execution is `queued`, `running`, or `paused` — the owner set the
-/// preflight contract names. Issue claims are a separate record
-/// retained through holds, pauses, and uncertainty; this view reports
-/// queue-relevant owners, not the claim ledger.
+/// Execution is non-terminal — `queued`, `ready`, `running`,
+/// `waiting`, `stopping`, `paused`, or `uncertain`. Issue claims are a
+/// separate record retained through holds, pauses, and uncertainty;
+/// this view reports queue-relevant owners, not the claim ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntakeSourceOwner {
     pub issue: IssueRef,
@@ -813,15 +813,15 @@ pub trait ReadView {
 
     /// Live owners of the scoped issues for the intake preflight: one
     /// row per `(issue, Work)` whose immutable membership covers the
-    /// issue and whose active Execution is `queued`, `running`, or
-    /// `paused`, ordered by issue key then Work id.
+    /// issue and whose active Execution is non-terminal, ordered by
+    /// issue key then Work id.
     fn intake_source_owners(
         &self,
         issues: &[IssueRef],
     ) -> Result<Vec<IntakeSourceOwner>, StoreError>;
 
     /// Every scoped issue with a live owner — the same
-    /// queued/running/paused owner set [`Self::intake_source_owners`]
+    /// non-terminal owner set [`Self::intake_source_owners`]
     /// reports, unfiltered. The intake coordinator needs the complete
     /// owned set *before* it can scope a request's exclusions, so this
     /// read exists independently of any candidate issue list.
