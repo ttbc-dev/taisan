@@ -323,6 +323,7 @@ fn report_diagnostics(
             workloop_selector::SkipReason::TruncatedByBound => "truncated_by_bound",
             workloop_selector::SkipReason::MissingLabels => "missing_labels",
             workloop_selector::SkipReason::InvalidIntent => "invalid_intent",
+            workloop_selector::SkipReason::InvalidIssueRef => "invalid_issue_ref",
         };
         *by_reason.entry(reason).or_default() += 1;
     }

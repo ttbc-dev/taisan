@@ -426,8 +426,10 @@ pub enum IntakeRunState {
     /// Invocation-level failure before a validated batch; `detail_code`
     /// carries the bounded failure code.
     Failed,
-    /// Recovery determined the owning invocation cannot continue.
-    /// Never set by a live owner.
+    /// The owning invocation cannot continue: recovery proved the
+    /// owner gone, or the live owner itself aborted (a propagating
+    /// store fault or unresolved candidates). `detail_code` carries
+    /// which.
     Interrupted,
     /// Recorded without an adapter launch (e.g. zero free pending
     /// positions at preflight). Terminal at insert.

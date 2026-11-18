@@ -66,6 +66,11 @@ pub fn select_reference(
             Some(SkipReason::NotOpen)
         } else if !required_labels.is_subset(&fact.labels) {
             Some(SkipReason::MissingLabels)
+        } else if fact.issue.display_number == Some(0) {
+            // The schema requires a display number to be positive or
+            // absent; a zero would ride verbatim into the proposal's
+            // source and make the whole response invalid.
+            Some(SkipReason::InvalidIssueRef)
         } else if !conforming_intent(&fact.title) {
             // The title becomes the candidate intent verbatim; a title
             // that cannot satisfy the wire rule would make the whole

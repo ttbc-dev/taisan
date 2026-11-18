@@ -179,6 +179,12 @@ pub enum SkipReason {
     /// byte bound — so emitting a candidate for it would produce a
     /// response `validate_response` must reject wholesale.
     InvalidIntent,
+    /// The fact's issue ref cannot form a protocol-conforming wire
+    /// source — currently a `display_number` of `0`, which the schema
+    /// requires to be positive or absent — so emitting a candidate
+    /// for it would produce a response `validate_response` must
+    /// reject wholesale.
+    InvalidIssueRef,
 }
 
 /// One snapshot fact that produced no proposal, with its reason.

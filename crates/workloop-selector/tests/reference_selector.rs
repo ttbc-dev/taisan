@@ -538,6 +538,46 @@ fn executable_skips_facts_whose_title_cannot_form_an_intent() {
 }
 
 #[test]
+fn executable_skips_facts_with_a_zero_display_number() {
+    let dir = tmp_dir("display0");
+    let r = repo();
+    // display_number must be positive or absent on the wire; a source
+    // fact carrying 0 would make the whole response invalid, so the
+    // fact is refused with a typed reason instead.
+    let issues = vec![
+        fact(
+            issue(0, "i-zero"),
+            IssueState::Open,
+            &["intake"],
+            100,
+            "renumbered",
+        ),
+        fact(issue(7, "i-ok"), IssueState::Open, &["intake"], 200, "good"),
+    ];
+    let sources = write_sources(
+        &dir,
+        serde_json::json!({ repo_key(&r): { "pages": pages(issues) } }),
+    );
+    let repositories = vec![r];
+    let spec = request_spec("req-display0", &repositories, &[], 32, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+    let mut args = sources_arg(&sources);
+    args.extend(["--label".into(), "intake".into()]);
+    let (stdout, stderr, code) = run_exe(&args, &request.bytes);
+    assert_eq!(code, Some(0));
+    let reply = protocol::validate_response(&stdout, &request).expect("conforming response");
+    let SelectorReply::Success { candidates } = reply else {
+        panic!("expected success, got {reply:?}");
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].task.intent, "good");
+    assert!(
+        stderr.contains("invalid_issue_ref=1"),
+        "stderr must count the refused fact: {stderr}"
+    );
+}
+
+#[test]
 fn executable_rejects_out_of_scope_source_facts() {
     // A fact scoped outside the requested repository makes the whole
     // repository scan Incomplete — the executable must fail closed.
