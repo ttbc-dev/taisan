@@ -527,10 +527,14 @@ fn executable_without_label_config_proposes_all_open_issues() {
 }
 
 #[test]
-fn executable_skips_facts_whose_title_cannot_form_an_intent() {
+fn executable_fails_closed_on_titles_that_cannot_form_an_intent() {
     let dir = tmp_dir("intent");
     let r = repo();
-    // Whitespace-only title: schema-valid string, invalid intent.
+    // Whitespace-only and control-bearing titles cannot form a
+    // protocol intent, so collection refuses the fact — and a
+    // refused fact fails its whole repository rather than being
+    // skipped (#234). Revision/digest stay clean tokens — a real
+    // source reports them independently of the title.
     let blank = fact(
         issue(1, "i-blank"),
         IssueState::Open,
@@ -538,10 +542,6 @@ fn executable_skips_facts_whose_title_cannot_form_an_intent() {
         100,
         "   ",
     );
-    // Control character in the title: the title reaches the selector
-    // (collect bounds it only by size), so the intent check must
-    // refuse it. Revision/digest stay clean tokens — a real source
-    // reports them independently of the title.
     let mut ctrl = fact(
         issue(2, "i-ctrl"),
         IssueState::Open,
@@ -565,20 +565,15 @@ fn executable_skips_facts_whose_title_cannot_form_an_intent() {
     let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
     let mut args = sources_arg(&sources);
     args.extend(["--label".into(), "intake".into()]);
-    let (stdout, stderr, code) = run_exe(&args, &request.bytes);
+    let (stdout, _, code) = run_exe(&args, &request.bytes);
     assert_eq!(code, Some(0));
-    // The response must still conform — the bad facts are skipped,
-    // never emitted into a candidate the validator would reject.
+    // The response must still conform — the repository fails
+    // closed, so no partial candidate set is ever emitted.
     let reply = protocol::validate_response(&stdout, &request).expect("conforming response");
-    let SelectorReply::Success { candidates } = reply else {
-        panic!("expected success, got {reply:?}");
+    let SelectorReply::Failure { code: failure, .. } = reply else {
+        panic!("expected failure, got {reply:?}");
     };
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].task.intent, "good");
-    assert!(
-        stderr.contains("invalid_intent=2"),
-        "stderr must count both refused facts: {stderr}"
-    );
+    assert_eq!(failure, protocol::FailureCode::SourceUnavailable);
 }
 
 #[test]
