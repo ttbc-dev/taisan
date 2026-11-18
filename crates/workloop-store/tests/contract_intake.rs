@@ -692,9 +692,19 @@ fn candidate_identity_immutable_status_guarded() {
 #[test]
 fn candidate_decision_links_follow_the_status_contract() {
     let store = SqliteStore::in_memory(2).unwrap();
-    let (command_id, work_id, committed_at) = submit(&store, "proposal/ref-selector:prop-links");
+    // Each decided candidate links the decision saved under its own
+    // replay key. The negative cases below swap in a command from the
+    // same key family so the kind/Work/sequence checks are exercised
+    // independently of the replay-key binding.
+    let (command_id, work_id, committed_at) = submit(&store, "proposal/ref-selector:prop-b");
+    let (replay_command_id, replay_work_id, replay_committed_at) =
+        submit(&store, "proposal/ref-selector:prop-c");
     let (_, other_work_id, _) = submit(&store, "proposal/ref-selector:prop-other-work");
-    let (rejected_command_id, rejected_at) = reject(&store, "proposal/ref-selector:prop-rejected");
+    let (accepted_a_command, _accepted_a_work, accepted_a_at) =
+        submit(&store, "proposal/ref-selector:prop-a");
+    let (rejected_command_id, rejected_at) = reject(&store, "proposal/ref-selector:prop-a");
+    let (rejected_b_command, rejected_b_at) = reject(&store, "proposal/ref-selector:prop-b");
+    let (rejected_e_command, rejected_e_at) = reject(&store, "proposal/ref-selector:prop-e");
     insert_run(
         &store,
         run("r-links", IntakeRunState::Open, IntakeTrigger::Manual),
@@ -765,13 +775,14 @@ fn candidate_decision_links_follow_the_status_contract() {
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     bad_reject.work_id = None;
     // A rejection must point at the rejected decision, not merely any
-    // command: an accepted command cannot back a rejected candidate.
+    // command under this replay key: an accepted command cannot back a
+    // rejected candidate.
     let err = store
         .transact(|tx| {
             tx.apply(&Effect::UpdateIntakeCandidate {
                 candidate: IntakeCandidate {
-                    command_id: Some(command_id.clone()),
-                    committed_seq: Some(committed_at),
+                    command_id: Some(accepted_a_command.clone()),
+                    committed_seq: Some(accepted_a_at),
                     ..bad_reject.clone()
                 },
                 expected_status: IntakeCandidateStatus::Pending,
@@ -816,8 +827,8 @@ fn candidate_decision_links_follow_the_status_contract() {
         .transact(|tx| {
             tx.apply(&Effect::UpdateIntakeCandidate {
                 candidate: IntakeCandidate {
-                    command_id: Some(rejected_command_id.clone()),
-                    committed_seq: Some(rejected_at),
+                    command_id: Some(rejected_b_command.clone()),
+                    committed_seq: Some(rejected_b_at),
                     ..thin_accept.clone()
                 },
                 expected_status: IntakeCandidateStatus::Pending,
@@ -859,8 +870,8 @@ fn candidate_decision_links_follow_the_status_contract() {
     // reading as replayed.
     let replay_without_work = IntakeCandidate {
         status: IntakeCandidateStatus::Replayed,
-        command_id: Some(command_id.clone()),
-        committed_seq: Some(committed_at),
+        command_id: Some(replay_command_id.clone()),
+        committed_seq: Some(replay_committed_at),
         ..candidate("r-links", 2, "prop-c")
     };
     let err = store
@@ -878,9 +889,9 @@ fn candidate_decision_links_follow_the_status_contract() {
             tx.apply(&Effect::UpdateIntakeCandidate {
                 candidate: IntakeCandidate {
                     status: IntakeCandidateStatus::Replayed,
-                    command_id: Some(command_id.clone()),
+                    command_id: Some(replay_command_id.clone()),
                     work_id: Some(other_work_id),
-                    committed_seq: Some(committed_at),
+                    committed_seq: Some(replay_committed_at),
                     ..candidate("r-links", 2, "prop-c")
                 },
                 expected_status: IntakeCandidateStatus::Pending,
@@ -895,10 +906,45 @@ fn candidate_decision_links_follow_the_status_contract() {
             tx.apply(&Effect::UpdateIntakeCandidate {
                 candidate: IntakeCandidate {
                     status: IntakeCandidateStatus::Replayed,
+                    command_id: Some(replay_command_id.clone()),
+                    work_id: Some(replay_work_id.clone()),
+                    committed_seq: Some(replay_committed_at + 1),
+                    ..candidate("r-links", 2, "prop-c")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    // A shape-consistent link that borrows another proposal's accepted
+    // decision is refused: the command must be saved under this
+    // candidate's replay key.
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Replayed,
                     command_id: Some(command_id.clone()),
                     work_id: Some(work_id.clone()),
-                    committed_seq: Some(committed_at + 1),
+                    committed_seq: Some(committed_at),
                     ..candidate("r-links", 2, "prop-c")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    // The same replay-key binding applies to a fresh acceptance: the
+    // pending `prop-d` candidate cannot borrow the `prop-b` decision.
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Accepted,
+                    command_id: Some(command_id.clone()),
+                    work_id: Some(work_id.clone()),
+                    committed_seq: Some(committed_at),
+                    ..candidate("r-links", 3, "prop-d")
                 },
                 expected_status: IntakeCandidateStatus::Pending,
             })
@@ -907,9 +953,9 @@ fn candidate_decision_links_follow_the_status_contract() {
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     decide(IntakeCandidate {
         status: IntakeCandidateStatus::Replayed,
-        command_id: Some(command_id.clone()),
-        work_id: Some(work_id.clone()),
-        committed_seq: Some(committed_at),
+        command_id: Some(replay_command_id.clone()),
+        work_id: Some(replay_work_id.clone()),
+        committed_seq: Some(replay_committed_at),
         ..candidate("r-links", 2, "prop-c")
     });
 
@@ -917,9 +963,9 @@ fn candidate_decision_links_follow_the_status_contract() {
     // rejection's command identity and sequence, and carries no Work.
     decide(IntakeCandidate {
         status: IntakeCandidateStatus::Replayed,
-        command_id: Some(rejected_command_id.clone()),
+        command_id: Some(rejected_e_command.clone()),
         work_id: None,
-        committed_seq: Some(rejected_at),
+        committed_seq: Some(rejected_e_at),
         ..candidate("r-links", 4, "prop-e")
     });
 
@@ -931,17 +977,20 @@ fn candidate_decision_links_follow_the_status_contract() {
     assert_eq!(rows[0].work_id, None);
     assert_eq!(rows[0].committed_seq, Some(rejected_at));
     assert_eq!(rows[1].status, IntakeCandidateStatus::Accepted);
+    assert_eq!(rows[1].command_id.as_ref(), Some(&command_id));
     assert_eq!(rows[1].work_id, Some(work_id.clone()));
+    assert_eq!(rows[1].committed_seq, Some(committed_at));
     assert_eq!(rows[2].status, IntakeCandidateStatus::Replayed);
-    assert_eq!(rows[2].command_id.as_ref(), Some(&command_id));
-    assert_eq!(rows[2].work_id.as_ref(), Some(&work_id));
+    assert_eq!(rows[2].command_id.as_ref(), Some(&replay_command_id));
+    assert_eq!(rows[2].work_id.as_ref(), Some(&replay_work_id));
+    assert_eq!(rows[2].committed_seq, Some(replay_committed_at));
     // prop-d was never touched — still pending, still link-free.
     assert_eq!(rows[3].status, IntakeCandidateStatus::Pending);
     assert!(rows[3].command_id.is_none());
     assert_eq!(rows[4].status, IntakeCandidateStatus::Replayed);
-    assert_eq!(rows[4].command_id.as_ref(), Some(&rejected_command_id));
+    assert_eq!(rows[4].command_id.as_ref(), Some(&rejected_e_command));
     assert_eq!(rows[4].work_id, None);
-    assert_eq!(rows[4].committed_seq, Some(rejected_at));
+    assert_eq!(rows[4].committed_seq, Some(rejected_e_at));
 }
 
 // --- decision links into the command ledger -------------------------
@@ -1062,9 +1111,11 @@ fn reject(store: &SqliteStore, key: &str) -> (CommandId, EventSequence) {
 }
 
 #[test]
-fn candidate_command_work_links_round_trip_and_fk_guard() {
+fn candidate_command_work_links_round_trip_and_absent_link_guard() {
     let store = SqliteStore::in_memory(2).unwrap();
     let (command_id, work_id, committed_at) = submit(&store, "proposal/ref-selector:prop-linked");
+    let (other_command_id, _, other_committed_at) =
+        submit(&store, "proposal/ref-selector:prop-other");
     insert_run(
         &store,
         run("r-link", IntakeRunState::Open, IntakeTrigger::Manual),
@@ -1119,10 +1170,12 @@ fn candidate_command_work_links_round_trip_and_fk_guard() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].run_id, "r-link");
 
-    // Links to absent ledger rows are refused by the foreign keys. The
-    // pending `prop-other` candidate (ordinal 1, admitted above) takes
-    // the bad-link updates — link-consistent shapes so the FK, not the
-    // status contract, is what rejects them.
+    // Links to absent ledger rows are refused by the store's
+    // decision-link guard before the UPDATE reaches SQLite; the
+    // command_id/work_id foreign keys remain a structural backstop but
+    // this path fails the guard first. The pending `prop-other`
+    // candidate (ordinal 1, admitted above) takes both bad-link
+    // updates.
     let bad_command = IntakeCandidate {
         status: IntakeCandidateStatus::Rejected,
         status_reason: Some("invalid_request".into()),
@@ -1141,9 +1194,9 @@ fn candidate_command_work_links_round_trip_and_fk_guard() {
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     let bad_work = IntakeCandidate {
         status: IntakeCandidateStatus::Accepted,
-        command_id: Some(command_id.clone()),
+        command_id: Some(other_command_id.clone()),
         work_id: Some(WorkId("w-absent".into())),
-        committed_seq: Some(committed_at),
+        committed_seq: Some(other_committed_at),
         ..candidate("r-link", 1, "prop-other")
     };
     let err = store

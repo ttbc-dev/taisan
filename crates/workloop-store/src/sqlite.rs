@@ -744,6 +744,17 @@ fn opt_de_row<T: serde::de::DeserializeOwned>(
     s.map(|v| de_row(&v)).transpose()
 }
 
+/// A stored command's idempotency key belongs to `replay_key` when it
+/// is that key itself or its payload-derived idempotency-conflict
+/// suffix (`<replay_key>#<digest>`); neither form can belong to an
+/// unrelated proposal.
+fn command_key_matches_replay(stored_key: &str, replay_key: &str) -> bool {
+    stored_key == replay_key
+        || stored_key
+            .strip_prefix(replay_key)
+            .is_some_and(|suffix| suffix.starts_with('#'))
+}
+
 /// Issue identity key: repository + opaque issue id — never the display
 /// number, which is presentational and must not participate in claims.
 fn issue_key(issue: &workloop_core::identity::IssueRef) -> String {
@@ -821,6 +832,29 @@ impl Tx<'_> {
         let mut stmt = self.tx.prepare(sql).map_err(internal)?;
         let rows = stmt.query_map(p, f).map_err(map_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(map_err)
+    }
+
+    /// The decision a candidate may link: the command row must belong
+    /// to the candidate's own replay identity, so a candidate can never
+    /// borrow an unrelated proposal's accepted command or Work. An
+    /// idempotency conflict is durable under `<replay_key>#<digest>`,
+    /// which is the same identity with the payload-derived suffix.
+    fn command_decision_for_replay(
+        &self,
+        command_id: &CommandId,
+        replay_key: &str,
+    ) -> Result<Option<CommandDecision>, StoreError> {
+        let row: Option<(String, String)> = self.query_opt(
+            "SELECT idempotency_key, decision FROM commands WHERE command_id=?1",
+            params![command_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        match row {
+            Some((key, decision)) if command_key_matches_replay(&key, replay_key) => {
+                Ok(Some(de_row(&decision).map_err(map_err)?))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -2923,17 +2957,17 @@ impl TxView for Tx<'_> {
                 // a stale or terminal writer conflicts instead of
                 // regressing the row
                 // (`docs/intake-identity-storage.md`).
-                let current: Option<String> = self
+                let current: Option<(String, String)> = self
                     .tx
                     .query_row(
-                        "SELECT status FROM intake_candidates \
+                        "SELECT status, replay_key FROM intake_candidates \
                          WHERE run_id=?1 AND ordinal=?2",
                         params![candidate.run_id, i64::from(candidate.ordinal)],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()
                     .map_err(map_err)?;
-                let Some(current) = current else {
+                let Some((current, replay_key)) = current else {
                     return Err(StoreError::ConstraintConflict {
                         detail: format!(
                             "intake candidate {}/{} is absent",
@@ -2986,9 +3020,13 @@ impl TxView for Tx<'_> {
                 // A replay must mirror the saved decision: when that
                 // decision accepted and created a Work, the candidate
                 // links the original Work; when it rejected, the
-                // candidate links no Work.
+                // candidate links no Work. The linked ledger row is
+                // the decision stored under *this candidate's* replay
+                // key, not merely some command with the same shape — an
+                // accepted decision from another proposal's key cannot
+                // back this candidate.
                 let saved_decision = match candidate.command_id.as_ref() {
-                    Some(id) => self.command_decision(id)?,
+                    Some(id) => self.command_decision_for_replay(id, &replay_key)?,
                     None => None,
                 };
                 let links_clear = candidate.command_id.is_none()
