@@ -199,12 +199,16 @@ pub fn run_intake(
     let request_id = new_id("intake-req");
     let deadline_unix_ms = now_unix_ms + params.timeout.as_millis() as i64;
 
-    // Zero free positions or an exclusion set the wire cannot carry:
-    // record the attempt and never launch — "the queue was full" is
-    // durable evidence, distinct from a failed or completed
-    // invocation.
+    // Zero free positions, a repository list the wire cannot carry,
+    // or an exclusion set beyond the bound: record the attempt and
+    // never launch — "the queue was full" is durable evidence,
+    // distinct from a failed or completed invocation.
     let skip_detail = if free == 0 {
         Some("queue_full")
+    } else if params.repositories.is_empty()
+        || params.repositories.len() > protocol::MAX_REPOSITORIES
+    {
+        Some("repositories_bound")
     } else if exclusions.len() > protocol::MAX_EXCLUSIONS {
         Some("exclusions_overflow")
     } else {
@@ -1115,16 +1119,18 @@ pub fn recover_intake(
     // invented); `admitting` closes `completed` only when every
     // candidate reached a decided terminal outcome — an interrupted
     // candidate means the invocation itself was cut short.
+    // `detail_code` is a failure diagnostic: a run recovered to
+    // `completed` carries none, exactly like a live owner's close.
     let (final_state, detail) = match run.state {
-        IntakeRunState::Open => (IntakeRunState::Interrupted, "no_conforming_response"),
-        IntakeRunState::Admitting if !any_interrupted => (IntakeRunState::Completed, "owner_lost"),
-        _ => (IntakeRunState::Interrupted, "owner_lost"),
+        IntakeRunState::Open => (IntakeRunState::Interrupted, Some("no_conforming_response")),
+        IntakeRunState::Admitting if !any_interrupted => (IntakeRunState::Completed, None),
+        _ => (IntakeRunState::Interrupted, Some("owner_lost")),
     };
     store.transact(|tx| {
         tx.apply(&Effect::UpdateIntakeRun {
             run_id: run.run_id.clone(),
             state: final_state,
-            detail_code: Some(detail.to_string()),
+            detail_code: detail.map(str::to_string),
             finished_unix_seconds: Some(now_unix_seconds),
             expected_state: run.state,
         })

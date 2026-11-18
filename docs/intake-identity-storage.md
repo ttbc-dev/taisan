@@ -96,7 +96,9 @@ Run states:
 | `admitting` | `completed` | Every candidate reached a recorded terminal status |
 | terminal | — | `completed`, `failed`, `interrupted`, `skipped` never regress |
 
-Every transition into a terminal run state records `finished_unix_seconds`; `detail_code` carries the bounded diagnostic for `failed`, `interrupted`, and `skipped`. `open` and `admitting` runs keep both NULL — a live invocation has no finish time and no failure code.
+Every transition into a terminal run state records `finished_unix_seconds`; `detail_code` carries the bounded diagnostic for `failed`, `interrupted`, and `skipped`. `open` and `admitting` runs keep both NULL — a live invocation has no finish time and no failure code, and a run recovered to `completed` carries none either.
+
+The `detail_code` vocabulary is closed and bounded — never payload text. Skipped preflight refusals use `queue_full`, `repositories_bound` (the repository list is empty or beyond the wire's 1–64 bound), and `exclusions_overflow`. A failed invocation records one launcher code: `exchange_launch`, `exchange_exit`, `exchange_deadline`, `exchange_stdout_overflow`, `exchange_stderr_overflow`, or `exchange_unknown` for the bounded exchange; `malformed_response` or `contract_<rule>` when the response fails whole-response validation; `adapter_<code>` when the adapter itself returned a failure response. Interrupted runs use `owner_lost` / `no_conforming_response` from the recovery sweep and `store_error` / `unresolved_candidates` from a live owner.
 
 An empty successful scan is a `completed` run with zero candidates — "the selector ran and found nothing" is durable evidence, distinct from `skipped` (never ran) and `failed` (ran, failed).
 
@@ -201,8 +203,9 @@ Values are illustrative, not fetched identities or executed evidence.
 | Scheduled tick re-proposes an already-admitted semantic proposal | new run `scheduled_interval`; candidate `replayed` linking the original `command_id`/`work_id`; no second Work |
 | Queue full at preflight | run `skipped`/`queue_full`, zero candidates, no adapter launch recorded |
 | Exclusion set beyond the wire bound at preflight | run `skipped`/`exclusions_overflow`, zero candidates, no adapter launch recorded — exclusions are never truncated to fit |
+| Repository list empty or beyond the 1–64 wire bound at preflight | run `skipped`/`repositories_bound`, zero candidates, no adapter launch recorded — the request is never built and scope is never broadened to fit |
 | Store fault after the run record commits | run `interrupted` — `store_error` when the fault propagated out of the invocation, `unresolved_candidates` when a submit absorbed it and admission halted (best-effort either way); persisted candidates reconcile through the ledger — a live owner normally leaves no non-terminal run behind; a fault that also defeats the abort write leaves the close to the next recovery sweep |
-| Adapter exits nonzero | run `failed`/`transport_failure`, zero candidates |
+| Adapter exits nonzero | run `failed`/`exchange_exit`, zero candidates |
 | Owner dies after batch persisted, before first submit | run `admitting` + all candidates `pending` → recovery marks run `interrupted`, candidates reconciled via ledger |
 | Submit commits, candidate update crashes | candidate `pending`, ledger holds decision → recovery links it `accepted`/`replayed`/`rejected` |
 | Capacity refusal mid-batch | attempted candidates decided; remainder `capacity_deferred` with NULL links and no saved decisions |

@@ -430,6 +430,12 @@ fn an_admitting_run_with_all_candidates_decided_closes_completed() {
         }
         other => panic!("expected Recovered/Completed, got {other:?}"),
     }
+    // A run recovered to `completed` carries no failure diagnostic —
+    // `detail_code` is reserved for failed/interrupted/skipped runs.
+    let detail = store
+        .transact_deferred(|tx| Ok(tx.intake_run("r-done")?.and_then(|r| r.detail_code)))
+        .unwrap();
+    assert_eq!(detail, None);
     let c1 = candidate_row(&store, "r-done", 1);
     assert_eq!(c1.status, IntakeCandidateStatus::Replayed);
     assert_eq!(

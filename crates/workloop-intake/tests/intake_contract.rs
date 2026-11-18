@@ -408,6 +408,37 @@ fn run_intake_skips_without_launching_when_queue_is_full() {
 }
 
 #[test]
+fn run_intake_skips_without_launching_when_repositories_break_the_wire_bound() {
+    let dir = tmp_root("repos-bound");
+    let marker = dir.join("launched.marker");
+    let script = raw_script(&dir, "sel.sh", &format!("touch '{}'", marker.display()));
+    let mut f = fixture(dir.clone(), script);
+    // 65 repositories exceed the protocol's 1-64 bound — the request
+    // can never be built, so the attempt records `skipped` rather
+    // than surfacing a config error on every invocation.
+    f.repositories = (0..65)
+        .map(|i| RepositoryRef::new(host(), RepositoryId::trusted(format!("repo-{i}"))))
+        .collect();
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Skipped);
+    assert_eq!(report.detail_code.as_deref(), Some("repositories_bound"));
+    assert!(!report.launched);
+    assert!(report.candidates.is_empty());
+    assert!(
+        !marker.exists(),
+        "adapter must not launch for an unbuildable request"
+    );
+
+    // The empty list breaks the same bound the same way.
+    f.repositories = vec![];
+    let report = run(&f, Duration::from_secs(10));
+    assert_eq!(report.state, IntakeRunState::Skipped);
+    assert_eq!(report.detail_code.as_deref(), Some("repositories_bound"));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn run_intake_excludes_owned_issues_and_scopes_repositories() {
     let dir = tmp_root("exclude");
     let store = SqliteStore::in_memory(4).unwrap();
