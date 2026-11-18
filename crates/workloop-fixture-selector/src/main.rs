@@ -727,12 +727,26 @@ fn validate_fact(repository: &(String, String), fact: &Fact) -> Result<(), Strin
             fact.issue.issue
         ));
     }
-    if fact.issue.issue.is_empty() {
-        return Err("fact carries an empty issue id".to_string());
-    }
-    if fact.title.is_empty() || fact.title.len() > MAX_TITLE_BYTES {
+    // The issue id is an opaque identity token under the same bound
+    // as revisions and digests; the message names only the
+    // repository so a pathological id cannot inflate the diagnostic.
+    if !bounded_token(&fact.issue.issue) {
         return Err(format!(
-            "fact {} title is empty or exceeds {MAX_TITLE_BYTES} bytes",
+            "a fact in {}/{} carries an out-of-bounds issue id",
+            repository.0, repository.1
+        ));
+    }
+    // The title becomes the candidate intent verbatim: bounded,
+    // control-free, and carrying at least one non-whitespace
+    // character — the protocol's intent shape.
+    if fact.title.is_empty()
+        || fact.title.len() > MAX_TITLE_BYTES
+        || fact.title.chars().any(char::is_control)
+        || !fact.title.chars().any(|c| !c.is_whitespace())
+    {
+        return Err(format!(
+            "fact {} title is empty, whitespace-only, control-bearing, \
+             or exceeds {MAX_TITLE_BYTES} bytes",
             fact.issue.issue
         ));
     }
@@ -827,6 +841,15 @@ fn scan_repository(
                     break;
                 };
                 page_index += 1;
+                // The deadline bounds scan completion, not just
+                // call initiation: a page landing at or past it
+                // admits nothing — even a final page — so the
+                // repository reports DeadlineExceeded rather than
+                // Complete.
+                if now_unix_seconds() >= deadline_unix_seconds {
+                    report.status = ScanStatus::DeadlineExceeded;
+                    break;
+                }
                 if file_page.issues.len() > PAGE_SIZE {
                     report.status = ScanStatus::Incomplete;
                     break;
