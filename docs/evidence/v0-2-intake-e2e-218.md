@@ -215,7 +215,8 @@ durable run/proposal/command/Work links with credentials redacted.
 
 ## Residual risks and observed boundaries
 
-- **Store bootstrap race (observed, pre-existing, out of scope).**
+- **Store bootstrap race (observed, pre-existing, out of scope —
+  tracked as #276).**
   While building `concurrent_intake_invocations_are_single_flight`,
   two `taisan` processes opening a *fresh* store file within the same
   instant both passed the `user_version == 0` / empty-tables gate and
@@ -225,7 +226,7 @@ durable run/proposal/command/Work links with credentials redacted.
   is narrow (simultaneous first-open of a not-yet-created store) and
   unrelated to intake semantics — the intake lease itself serializes
   correctly once the store exists — but it is a real cross-process
-  edge worth a follow-up issue.
+  edge tracked as #276.
 - **Timing-sensitive exchange test.** `exchange_deadline_terminates_
   the_process_group` (`workloop-exec/tests/bounded_exchange.rs`)
   flaked once under full-workspace parallel load (its 1200 ms deadline

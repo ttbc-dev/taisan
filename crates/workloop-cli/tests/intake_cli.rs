@@ -681,7 +681,7 @@ fn concurrent_intake_invocations_are_single_flight() {
     // Let the first invocation take the lease and open its run
     // before the second arrives — the lease, not timing luck, is
     // what serializes them.
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    std::thread::sleep(std::time::Duration::from_millis(700));
     let second = intake_cli(&dir, Some(&profile), &["intake"]);
     assert!(
         !second.status.success(),
