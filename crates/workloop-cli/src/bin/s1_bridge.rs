@@ -1199,13 +1199,14 @@ fn attempt(ctx: &Ctx, intent: &HostActionIntent, key: &str) -> Result<(), String
             };
             let _ = ctx.emit(
                 Some((&intent.work_id, Some(&execution.id))),
-                format!(
-                    "branch:{branch}:{}",
+                branch_event_id(
+                    &intent.work_id,
+                    branch,
                     if prior_sha.is_empty() {
                         "absent"
                     } else {
                         prior_sha.as_str()
-                    }
+                    },
                 ),
                 ObservationFact::BranchState {
                     repository: intent.repository.clone(),
@@ -1654,14 +1655,26 @@ fn parse_findings(body: &str) -> Result<Vec<OccurrenceInput>, String> {
         .collect())
 }
 
-/// Delivery id for a polled target-branch observation. The store
-/// dedupes deliveries globally per `(scope, source, event_id)` — the
-/// subject Work is not part of the key — so the id must carry the Work
-/// identity. Two Works polling the same `(branch, sha)` are distinct
-/// subject observations; an unscoped id drops the second as `Duplicate`
-/// and that Work never records its own target revision (#186).
+/// Delivery id for a Work-subject branch observation. The store dedupes
+/// deliveries globally per `(scope, source, event_id)` — the subject
+/// Work is not part of the key — so the id must carry the Work identity.
+/// Two Works observing the same `(branch, position)` are distinct
+/// subject observations; an unscoped id drops the later one as
+/// `Duplicate`, starving its publish guard or target revision (#196).
+///
+/// Every `BranchState` the bridge emits goes through this helper: the
+/// target-branch poll that feeds `current_target`, and the push prior-ref
+/// read-back that feeds the next publish guard. Neither may reuse
+/// another Work's delivery identity.
+fn branch_event_id(work_id: &WorkId, branch: &str, position: &str) -> String {
+    format!("branch:{}:{branch}:{position}", work_id.0)
+}
+
+/// Delivery id for a polled target-branch observation — the branch-poll
+/// caller of [`branch_event_id`], kept named for the regression test
+/// that pins the target-revision path (#186, #196).
 fn branch_poll_event_id(work_id: &WorkId, target_branch: &str, sha: &str) -> String {
-    format!("branch:{}:{target_branch}:{sha}", work_id.0)
+    branch_event_id(work_id, target_branch, sha)
 }
 
 /// Poll the real remote facts for every Work that has an opened change:
@@ -2077,6 +2090,132 @@ mod tests {
                 work.0
             );
         }
+    }
+
+    /// Regression (#196): the push prior-ref read-back is also a
+    /// Work-subject `BranchState`. Two Works observing the same source
+    /// branch at the same position must each record it; an unscoped id
+    /// would leave the later Work's publish guard with no known prior.
+    /// This drives the production `attempt` push path — not a copy of
+    /// its emit — so restoring the unscoped delivery id there fails the
+    /// test. The absent position and a different branch are distinct
+    /// identities, so a branch that moves is never mistaken for a
+    /// duplicate of its own earlier position.
+    #[test]
+    fn publish_prior_state_records_each_work_at_the_same_branch_position() {
+        let root =
+            std::env::temp_dir().join(format!("workloop-s1-bridge-prior-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let remote = root.join("remote.git");
+        let remote_str = remote.to_str().unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            git(dir, args).unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")))
+        };
+        run(&root, &["init", "--bare", remote_str]);
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run(&seed, &["init"]);
+        run(
+            &seed,
+            &["config", "user.email", "bridge-test@example.invalid"],
+        );
+        run(&seed, &["config", "user.name", "bridge test"]);
+        std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+        run(&seed, &["add", "README.md"]);
+        run(&seed, &["commit", "-m", "seed"]);
+        let branch = "work/shared";
+        run(
+            &seed,
+            &["push", remote_str, &format!("HEAD:refs/heads/{branch}")],
+        );
+        let sha = run(&seed, &["rev-parse", "HEAD"]);
+
+        let mut ctx = test_ctx();
+        ctx.workspace_root = root.clone();
+        ctx.remote = remote_str.to_string();
+        let w1 = submit_work(&ctx, "k-p1");
+        let w2 = submit_work(&ctx, "k-p2");
+        let repository = ctx.config.host.repository.clone();
+        for work in [&w1, &w2] {
+            let workspace = ctx.workspace_of(work);
+            run(
+                &root,
+                &[
+                    "clone",
+                    "--branch",
+                    branch,
+                    remote_str,
+                    workspace.to_str().unwrap(),
+                ],
+            );
+            let mut intent = push_intent(&work.0, HostActionStatus::Pending, branch, false);
+            intent.action_id = format!("act-{}", work.0);
+            // The prior-ref observation is emitted before the
+            // expected-prior guard. A deliberately mismatched guard
+            // still exercises the real push attempt's read-back while
+            // refusing the write, so the test needs no live `gh`.
+            if let HostAction::PushRef { expected_prior, .. } = &mut intent.action {
+                *expected_prior =
+                    Some(CommitRevision::new(repository.clone(), "different-prior").unwrap());
+            }
+            attempt(&ctx, &intent, &format!("act:{}", work.0)).unwrap();
+        }
+        let all = ctx
+            .store
+            .transact_deferred(|tx| tx.all_observations())
+            .unwrap();
+        for work in [&w1, &w2] {
+            assert!(
+                all.iter().any(|o| o.subject_work_id.as_ref() == Some(work)
+                    && matches!(
+                        &o.fact,
+                        ObservationFact::HostActionResult {
+                            status: HostActionStatus::Failed { reason },
+                            ..
+                        } if reason == "stale_head"
+                    )),
+                "the mismatched guard must still refuse the write for work {}",
+                work.0
+            );
+            let observations = ctx
+                .store
+                .transact_deferred(|tx| tx.observations_for_work(work))
+                .unwrap();
+            assert!(
+                observations.iter().any(|o| matches!(
+                    &o.fact,
+                    ObservationFact::BranchState {
+                        branch: b,
+                        state: BranchState::At { revision },
+                        ..
+                    } if b == branch && revision.object.as_str() == sha
+                )),
+                "work {} is missing its own publish prior-ref observation",
+                work.0
+            );
+        }
+        assert_ne!(
+            branch_event_id(&w1, branch, "absent"),
+            branch_event_id(&w1, branch, &sha),
+            "absent and present positions of one branch are distinct facts"
+        );
+        assert_ne!(
+            branch_event_id(&w1, branch, "1111111111111111111111111111111111111111"),
+            branch_event_id(&w1, branch, &sha),
+            "a branch that moves to a new revision is a new fact"
+        );
+        assert_ne!(
+            branch_event_id(&w1, "work/other", &sha),
+            branch_event_id(&w1, branch, &sha),
+            "the same position on another branch is a distinct fact"
+        );
+        assert_eq!(
+            branch_poll_event_id(&w1, "main", &sha),
+            branch_event_id(&w1, "main", &sha),
+            "the target-branch poll shares the Work-scoped identity rule"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn push_intent(
