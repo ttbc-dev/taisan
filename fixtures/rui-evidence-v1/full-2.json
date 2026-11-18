@@ -1,0 +1,194 @@
+{
+  "request": {
+    "protocol_version": "rui-evidence/1",
+    "after": null,
+    "cursor": "cursor-example",
+    "limit": 100
+  },
+  "envelope": {
+    "schema_version": "1",
+    "status": "accepted",
+    "command": {
+      "id": null,
+      "kind": "evidence_export",
+      "actor": "local",
+      "idempotency_key": null
+    },
+    "work_id": null,
+    "execution_id": null,
+    "result": {
+      "protocol_version": "rui-evidence/1",
+      "installation_id": "installation-example",
+      "store_epoch": "epoch-example",
+      "snapshot_id": "snapshot-full",
+      "snapshot_seq": 10,
+      "retained_from_seq": 3,
+      "after_seq": null,
+      "entities": [
+        {
+          "source_id": "finding-b",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 8,
+          "body_sha256": "74aad73a87333ce599038dc8a32484b30960e1a59eb59a431b9c924528a534ce",
+          "body_json": "{\"source_id\": \"finding-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"source_claim\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-b/r1\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-b\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-b\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-b0\", \"body\": null, \"disposition\": \"unknown\", \"category\": null, \"invariants\": []}}\n"
+        },
+        {
+          "source_id": "invariant",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 8,
+          "body_sha256": "6b442fd6c9d3b3253d8c95f451485058eeeb149b7bbc82415b84fef32398ea7e",
+          "body_json": "{\"source_id\": \"invariant\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/invariant/r1\"}}], \"operation\": \"entity\", \"type\": \"invariant\", \"payload\": {\"invariant_id\": \"invariant\", \"text\": \"Keep one entry per event.\", \"category\": \"ledger\", \"provenance\": \"annotation\", \"source_revision\": null}}\n"
+        },
+        {
+          "source_id": "requirement",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 8,
+          "body_sha256": "80b43a35144bce00f900b37b1a3135183c818fb922a85dcd6cbd689d1460cd2f",
+          "body_json": "{\"source_id\": \"requirement\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/requirement/r1\"}}], \"operation\": \"entity\", \"type\": \"requirement\", \"payload\": {\"requirement_id\": \"requirement\", \"text\": \"Keep a ledger.\", \"category\": null, \"provenance\": \"dispatch\", \"source_revision\": null}}\n"
+        },
+        {
+          "source_id": "round-b",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 8,
+          "body_sha256": "4c510af3253887ce3e1a47bbe7019ca70fbf0cf888ca29467fe84501e810c50f",
+          "body_json": "{\"source_id\": \"round-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/round-b/r1\"}}], \"operation\": \"entity\", \"type\": \"review_round\", \"payload\": {\"round_id\": \"round-b\", \"execution\": {\"source_id\": \"exec-b\", \"revision\": \"r1\"}, \"change_id\": \"change-b\", \"reviewed_head\": \"head-b0\", \"completeness\": \"partial\", \"observation_id\": null}}\n"
+        },
+        {
+          "source_id": "finding-a",
+          "revision": "r2",
+          "revision_seq": 2,
+          "change_seq": 9,
+          "body_sha256": "9a1f5db6826affec3b757a2a3aca94c247777e84431941afe1bd75dcfa4ce678",
+          "body_json": "{\"source_id\": \"finding-a\", \"revision\": \"r2\", \"revision_seq\": 2, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"human_inference\", \"author\": \"operator-a\", \"tool\": \"taisan-review\", \"version\": \"1.0.0\", \"rationale\": \"Operator reconciled duplicate ledger entries.\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-a/r2\"}}], \"operation\": \"entity\", \"type\": \"finding_occurrence\", \"payload\": {\"occurrence_id\": \"finding-a\", \"source_finding_key\": \"rule-example\", \"round\": {\"source_id\": \"round-a\", \"revision\": \"r1\"}, \"reviewed_head\": \"head-a0\", \"body\": \"The ledger entry was duplicated.\", \"disposition\": \"accepted\", \"category\": \"ledger\", \"invariants\": [{\"source_id\": \"invariant\", \"revision\": \"r1\"}]}}\n"
+        },
+        {
+          "source_id": "repair-a",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 9,
+          "body_sha256": "f2944783f7ca69d01e470460d8451f25e7dd8ef310171be3b633ccf268b97cab",
+          "body_json": "{\"source_id\": \"repair-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/repair-a/r1\"}}], \"operation\": \"entity\", \"type\": \"repair_attempt\", \"payload\": {\"attempt_id\": \"repair-a\", \"execution\": {\"source_id\": \"exec-a\", \"revision\": \"r1\"}, \"round\": {\"source_id\": \"round-a\", \"revision\": \"r1\"}, \"target_head\": \"head-a0\", \"result_head\": \"head-a1\", \"state\": \"failed\", \"sequence\": 1}}\n"
+        },
+        {
+          "source_id": "repair-b",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 9,
+          "body_sha256": "4a99615739333678fcf530b67e3d41fec983a3298fc69b18870f37a8a1b54d69",
+          "body_json": "{\"source_id\": \"repair-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/repair-b/r1\"}}], \"operation\": \"entity\", \"type\": \"repair_attempt\", \"payload\": {\"attempt_id\": \"repair-b\", \"execution\": {\"source_id\": \"exec-b\", \"revision\": \"r1\"}, \"round\": {\"source_id\": \"round-b\", \"revision\": \"r1\"}, \"target_head\": \"head-b0\", \"result_head\": \"head-b1\", \"state\": \"passed\", \"sequence\": 1}}\n"
+        },
+        {
+          "source_id": "check-a",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "7be8096927194f385b4759102a95e5a652ac16a4cda1b385f50735243402ec20",
+          "body_json": "{\"source_id\": \"check-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"byte_range\", \"start\": 0, \"end\": 1}}], \"operation\": \"entity\", \"type\": \"verification\", \"payload\": {\"check_id\": \"check-a\", \"name\": \"ledger check\", \"tested_head\": \"head-a1\", \"state\": \"failed\", \"scope\": \"targeted\", \"exit_code\": 1}}\n"
+        },
+        {
+          "source_id": "check-b",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "3e43b7593976f27ac4cdbac527b42faf706d39ac218d571bce29bdf37c972215",
+          "body_json": "{\"source_id\": \"check-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/check-b/r1\"}}], \"operation\": \"entity\", \"type\": \"verification\", \"payload\": {\"check_id\": \"check-b\", \"name\": \"ledger check\", \"tested_head\": \"head-b1\", \"state\": \"passed\", \"scope\": \"targeted\", \"exit_code\": 0}}\n"
+        },
+        {
+          "source_id": "finding-b",
+          "revision": "r2",
+          "revision_seq": 2,
+          "change_seq": 10,
+          "body_sha256": "87807fc85f363bfac999b5218ea89079f04779bc3c379451437d3693a5a114ec",
+          "body_json": "{\"source_id\": \"finding-b\", \"revision\": \"r2\", \"revision_seq\": 2, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/finding-b/r2\"}}], \"operation\": \"entity_tombstone\", \"entity_type\": \"finding_occurrence\", \"reason\": \"Duplicate source entry.\"}\n"
+        },
+        {
+          "source_id": "outcome",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "2b20a240b0320193b32cbd2c73da8706c9834efffd4df4f0b2a122427a6a81d5",
+          "body_json": "{\"source_id\": \"outcome\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"entity\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"model_interpretation\", \"author\": \"operator-a\", \"tool\": \"taisan-export\", \"version\": \"1.0.0\", \"rationale\": \"Model summarized the recorded execution outcome.\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/outcome/r1\"}}], \"operation\": \"entity\", \"type\": \"outcome\", \"payload\": {\"outcome_id\": \"outcome\", \"execution\": {\"source_id\": \"exec-b\", \"revision\": \"r1\"}, \"scope\": \"execution\", \"state\": \"passed\", \"head\": \"head-b1\"}}\n"
+        }
+      ],
+      "links": [
+        {
+          "source_id": "addresses-a",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 7,
+          "body_sha256": "5720f6d1110799fb98623935516bf2119f181cc19bd3bf6170b9adc5df774d85",
+          "body_json": "{\"source_id\": \"addresses-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/addresses-a/r1\"}}], \"operation\": \"link\", \"relation\": \"repair_addresses_finding\", \"from\": {\"source_id\": \"repair-a\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"finding-a\", \"revision\": \"r1\"}}\n"
+        },
+        {
+          "source_id": "addresses-a",
+          "revision": "r2",
+          "revision_seq": 2,
+          "change_seq": 10,
+          "body_sha256": "9394fff1496a5e7b71e8880a3d60efc6142b206c1bd17b57908dba955ff6874e",
+          "body_json": "{\"source_id\": \"addresses-a\", \"revision\": \"r2\", \"revision_seq\": 2, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/addresses-a/r2\"}}], \"operation\": \"link_tombstone\", \"relation\": \"repair_addresses_finding\", \"from\": {\"source_id\": \"repair-a\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"finding-a\", \"revision\": \"r1\"}, \"reason\": \"Source withdrew the relation.\"}\n"
+        },
+        {
+          "source_id": "binding-a",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "f69619800ca253cea5b95f7ea5af57d03c4db87a386bdb48dadcf7c914b40a7c",
+          "body_json": "{\"source_id\": \"binding-a\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/binding-a/r1\"}}], \"operation\": \"link\", \"relation\": \"verification_tests_repair\", \"from\": {\"source_id\": \"check-a\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"repair-a\", \"revision\": \"r1\"}}\n"
+        },
+        {
+          "source_id": "binding-b",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "c71cde085648c35c05a93aff0873302c474a44610234829df71620f3d553c92c",
+          "body_json": "{\"source_id\": \"binding-b\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/binding-b/r1\"}}], \"operation\": \"link\", \"relation\": \"verification_tests_repair\", \"from\": {\"source_id\": \"check-b\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"repair-b\", \"revision\": \"r1\"}}\n"
+        },
+        {
+          "source_id": "unsupported",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 10,
+          "body_sha256": "e3fedd057dd5997d9faa32ebd7a4cbe0423629766f590a6e95b9d4d1d79ce102",
+          "body_json": "{\"source_id\": \"unsupported\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/unsupported/r1\"}}], \"operation\": \"link\", \"relation\": \"repair_addresses_finding\", \"from\": {\"source_id\": \"repair-b\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"purged-finding\", \"revision\": \"r1\"}}\n"
+        }
+      ],
+      "artifacts": [],
+      "gaps": [
+        {
+          "code": "not_recorded",
+          "scope": {
+            "kind": "revision",
+            "record": {
+              "source_id": "finding-b",
+              "revision": "r1"
+            }
+          },
+          "evidence_class": "body",
+          "reason": "Original finding body was not retained."
+        },
+        {
+          "code": "not_recorded",
+          "scope": {
+            "kind": "revision",
+            "record": {
+              "source_id": "purged-finding",
+              "revision": "r1"
+            }
+          },
+          "evidence_class": "relation",
+          "reason": "Endpoint revision was not retained."
+        }
+      ],
+      "next_cursor": null,
+      "checkpoint": "checkpoint-full"
+    },
+    "reason": null,
+    "evidence_refs": [],
+    "sources": [],
+    "as_of": 10
+  }
+}

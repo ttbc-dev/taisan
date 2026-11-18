@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "status": "error",
+  "command": null,
+  "work_id": null,
+  "execution_id": null,
+  "result": null,
+  "reason": {
+    "code": "store",
+    "message": "Store failure."
+  },
+  "evidence_refs": []
+}

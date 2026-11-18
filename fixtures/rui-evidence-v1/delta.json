@@ -1,0 +1,48 @@
+{
+  "request": {
+    "protocol_version": "rui-evidence/1",
+    "after": "checkpoint-full",
+    "cursor": null,
+    "limit": 100
+  },
+  "envelope": {
+    "schema_version": "1",
+    "status": "accepted",
+    "command": {
+      "id": null,
+      "kind": "evidence_export",
+      "actor": "local",
+      "idempotency_key": null
+    },
+    "work_id": null,
+    "execution_id": null,
+    "result": {
+      "protocol_version": "rui-evidence/1",
+      "installation_id": "installation-example",
+      "store_epoch": "epoch-example",
+      "snapshot_id": "snapshot-delta",
+      "snapshot_seq": 11,
+      "retained_from_seq": 3,
+      "after_seq": 10,
+      "entities": [],
+      "links": [
+        {
+          "source_id": "delta-addresses",
+          "revision": "r1",
+          "revision_seq": 1,
+          "change_seq": 11,
+          "body_sha256": "529f3e18db0182e957ad9ebe1188689521f1b6b0fbab97d98669d33c6a88ea4a",
+          "body_json": "{\"source_id\": \"delta-addresses\", \"revision\": \"r1\", \"revision_seq\": 1, \"record_kind\": \"link\", \"work_id\": \"work-example\", \"assertion\": {\"kind\": \"observed\"}, \"source_refs\": [{\"artifact_id\": \"observations\", \"sha256\": \"3d9745bed221d1d8c2449b02d7d46fe59f061b218e86ef014292baa2f1969e7f\", \"locator\": {\"kind\": \"json_pointer\", \"pointer\": \"/delta-addresses/r1\"}}], \"operation\": \"link\", \"relation\": \"repair_addresses_finding\", \"from\": {\"source_id\": \"repair-b\", \"revision\": \"r1\"}, \"to\": {\"source_id\": \"finding-a\", \"revision\": \"r1\"}}\n"
+        }
+      ],
+      "artifacts": [],
+      "gaps": [],
+      "next_cursor": null,
+      "checkpoint": "checkpoint-delta"
+    },
+    "reason": null,
+    "evidence_refs": [],
+    "sources": [],
+    "as_of": 11
+  }
+}

@@ -1,0 +1,1589 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WireContract",
+  "description": "Schema roots include the parsed body contract even though transport retains its exact string bytes.",
+  "type": "object",
+  "properties": {
+    "artifact_envelope": {
+      "$ref": "#/$defs/QueryEnvelope2"
+    },
+    "artifact_request": {
+      "$ref": "#/$defs/ArtifactRequest"
+    },
+    "artifact_result": {
+      "$ref": "#/$defs/ArtifactResult"
+    },
+    "error": {
+      "$ref": "#/$defs/ProtocolError"
+    },
+    "export_envelope": {
+      "$ref": "#/$defs/QueryEnvelope"
+    },
+    "export_page": {
+      "$ref": "#/$defs/ExportPage"
+    },
+    "export_request": {
+      "$ref": "#/$defs/ExportRequest"
+    },
+    "record_body": {
+      "$ref": "#/$defs/RecordBody"
+    }
+  },
+  "required": [
+    "export_envelope",
+    "artifact_envelope",
+    "export_request",
+    "export_page",
+    "record_body",
+    "artifact_request",
+    "artifact_result",
+    "error"
+  ],
+  "$defs": {
+    "ArtifactDescriptor": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "availability": {
+          "$ref": "#/$defs/Availability"
+        },
+        "byte_length": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "identity": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "identity",
+        "sha256",
+        "byte_length",
+        "media_type",
+        "availability"
+      ]
+    },
+    "ArtifactIdentity": {
+      "type": "object",
+      "properties": {
+        "installation_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "revision_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "store_epoch": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "installation_id",
+        "store_epoch",
+        "source_id",
+        "revision",
+        "revision_seq"
+      ]
+    },
+    "ArtifactRequest": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "artifact_id",
+        "sha256"
+      ]
+    },
+    "ArtifactResult": {
+      "type": "object",
+      "properties": {
+        "bytes_written": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "descriptor": {
+          "$ref": "#/$defs/ArtifactDescriptor"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "descriptor",
+        "bytes_written"
+      ]
+    },
+    "Assertion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "observed"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "source_claim"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "human_inference"
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "author",
+            "tool",
+            "version",
+            "rationale"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "model_interpretation"
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "author",
+            "tool",
+            "version",
+            "rationale"
+          ]
+        }
+      ]
+    },
+    "Availability": {
+      "type": "string",
+      "enum": [
+        "available",
+        "unavailable",
+        "retention_expired"
+      ]
+    },
+    "CommandKind": {
+      "type": "string",
+      "enum": [
+        "evidence_export",
+        "evidence_artifact"
+      ]
+    },
+    "Completeness": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "unknown"
+      ]
+    },
+    "Disposition": {
+      "type": "string",
+      "enum": [
+        "open",
+        "accepted",
+        "dismissed",
+        "resolved",
+        "unknown"
+      ]
+    },
+    "EntityType": {
+      "type": "string",
+      "enum": [
+        "work",
+        "execution",
+        "invocation",
+        "review_round",
+        "finding_occurrence",
+        "repair_attempt",
+        "verification",
+        "outcome",
+        "requirement",
+        "invariant"
+      ]
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "unsupported_protocol",
+        "invalid_request",
+        "invalid_cursor",
+        "snapshot_expired",
+        "checkpoint_expired",
+        "installation_mismatch",
+        "epoch_mismatch",
+        "record_too_large",
+        "artifact_unavailable",
+        "artifact_too_large",
+        "digest_mismatch",
+        "usage",
+        "config",
+        "store",
+        "forbidden",
+        "store_unavailable"
+      ]
+    },
+    "EvidenceClass": {
+      "type": "string",
+      "enum": [
+        "body",
+        "relation",
+        "artifact",
+        "history",
+        "intent"
+      ]
+    },
+    "ExportPage": {
+      "type": "object",
+      "properties": {
+        "after_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactDescriptor"
+          }
+        },
+        "checkpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Record"
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Gap"
+          }
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Record"
+          }
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "retained_from_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "snapshot_id": {
+          "type": "string"
+        },
+        "snapshot_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "store_epoch": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "installation_id",
+        "store_epoch",
+        "snapshot_id",
+        "snapshot_seq",
+        "retained_from_seq",
+        "entities",
+        "links",
+        "artifacts",
+        "gaps"
+      ]
+    },
+    "ExportRequest": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "limit"
+      ]
+    },
+    "Gap": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/GapCode"
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/EvidenceClass"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/GapScope"
+        }
+      },
+      "required": [
+        "code",
+        "scope",
+        "evidence_class",
+        "reason"
+      ]
+    },
+    "GapCode": {
+      "type": "string",
+      "enum": [
+        "not_recorded",
+        "not_yet_observed",
+        "retention_expired",
+        "source_unavailable"
+      ]
+    },
+    "GapScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "revision"
+            },
+            "record": {
+              "$ref": "#/$defs/RevisionRef"
+            }
+          },
+          "required": [
+            "kind",
+            "record"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact_id",
+            "sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "before_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "history"
+            }
+          },
+          "required": [
+            "kind",
+            "before_seq"
+          ]
+        }
+      ]
+    },
+    "Locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "json_pointer"
+            },
+            "pointer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pointer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "byte_range"
+            },
+            "start": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "start",
+            "end"
+          ]
+        }
+      ]
+    },
+    "OutcomeScope": {
+      "type": "string",
+      "enum": [
+        "execution",
+        "review",
+        "publication"
+      ]
+    },
+    "ProtocolError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "ProtocolVersion": {
+      "type": "string",
+      "enum": [
+        "rui-evidence/1"
+      ]
+    },
+    "Provenance": {
+      "type": "string",
+      "enum": [
+        "dispatch",
+        "annotation"
+      ]
+    },
+    "QueryCommand": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/CommandKind"
+        }
+      },
+      "required": [
+        "kind",
+        "actor"
+      ]
+    },
+    "QueryEnvelope": {
+      "type": "object",
+      "properties": {
+        "as_of": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryCommand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "execution_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExportPage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_version": {
+          "$ref": "#/$defs/SchemaVersion"
+        },
+        "sources": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/QuerySource"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/QueryStatus"
+        },
+        "work_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "status",
+        "evidence_refs"
+      ]
+    },
+    "QueryEnvelope2": {
+      "type": "object",
+      "properties": {
+        "as_of": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryCommand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "execution_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_version": {
+          "$ref": "#/$defs/SchemaVersion"
+        },
+        "sources": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/QuerySource"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/QueryStatus"
+        },
+        "work_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "status",
+        "evidence_refs"
+      ]
+    },
+    "QuerySource": {
+      "type": "object",
+      "properties": {
+        "availability": {
+          "$ref": "#/$defs/SourceAvailability"
+        },
+        "observed_unix_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "availability"
+      ]
+    },
+    "QueryStatus": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "error"
+      ]
+    },
+    "Record": {
+      "type": "object",
+      "properties": {
+        "body_json": {
+          "type": "string"
+        },
+        "body_sha256": {
+          "type": "string"
+        },
+        "change_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "revision": {
+          "type": "string"
+        },
+        "revision_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "revision",
+        "revision_seq",
+        "change_seq",
+        "body_sha256",
+        "body_json"
+      ]
+    },
+    "RecordBody": {
+      "type": "object",
+      "properties": {
+        "assertion": {
+          "$ref": "#/$defs/Assertion"
+        },
+        "record_kind": {
+          "$ref": "#/$defs/RecordKind"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "revision_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          }
+        },
+        "work_id": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "const": "entity"
+            }
+          },
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "constraints": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/RevisionRef"
+                      }
+                    },
+                    "dispatch_source": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/RevisionRef"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "intent": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "requirements": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/RevisionRef"
+                      }
+                    },
+                    "version": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "work_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "work_id",
+                    "version",
+                    "requirements",
+                    "constraints"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "work"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "base_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "execution_id": {
+                      "type": "string"
+                    },
+                    "finished_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "outcome": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/RevisionRef"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "result_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "started_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "state": {
+                      "$ref": "#/$defs/State"
+                    },
+                    "work": {
+                      "$ref": "#/$defs/RevisionRef"
+                    }
+                  },
+                  "required": [
+                    "execution_id",
+                    "work",
+                    "state"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "execution"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "execution": {
+                      "$ref": "#/$defs/RevisionRef"
+                    },
+                    "invocation_id": {
+                      "type": "string"
+                    },
+                    "process_attempt_id": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "$ref": "#/$defs/State"
+                    }
+                  },
+                  "required": [
+                    "invocation_id",
+                    "execution",
+                    "process_attempt_id",
+                    "state"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "invocation"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "change_id": {
+                      "type": "string"
+                    },
+                    "completeness": {
+                      "$ref": "#/$defs/Completeness"
+                    },
+                    "execution": {
+                      "$ref": "#/$defs/RevisionRef"
+                    },
+                    "observation_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reviewed_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "round_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "round_id",
+                    "execution",
+                    "change_id",
+                    "completeness"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "review_round"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "body": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "category": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "disposition": {
+                      "$ref": "#/$defs/Disposition"
+                    },
+                    "invariants": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/RevisionRef"
+                      }
+                    },
+                    "occurrence_id": {
+                      "type": "string"
+                    },
+                    "reviewed_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "round": {
+                      "$ref": "#/$defs/RevisionRef"
+                    },
+                    "source_finding_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "occurrence_id",
+                    "source_finding_key",
+                    "round",
+                    "disposition",
+                    "invariants"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "finding_occurrence"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "attempt_id": {
+                      "type": "string"
+                    },
+                    "execution": {
+                      "$ref": "#/$defs/RevisionRef"
+                    },
+                    "result_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "round": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/RevisionRef"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "sequence": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "state": {
+                      "$ref": "#/$defs/State"
+                    },
+                    "target_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "attempt_id",
+                    "execution",
+                    "state"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "repair_attempt"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "check_id": {
+                      "type": "string"
+                    },
+                    "exit_code": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "int32"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "$ref": "#/$defs/VerificationScope"
+                    },
+                    "state": {
+                      "$ref": "#/$defs/State"
+                    },
+                    "tested_head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "check_id",
+                    "name",
+                    "state",
+                    "scope"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "verification"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "execution": {
+                      "$ref": "#/$defs/RevisionRef"
+                    },
+                    "head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "outcome_id": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "$ref": "#/$defs/OutcomeScope"
+                    },
+                    "state": {
+                      "$ref": "#/$defs/State"
+                    }
+                  },
+                  "required": [
+                    "outcome_id",
+                    "execution",
+                    "scope",
+                    "state"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "outcome"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "category": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "provenance": {
+                      "$ref": "#/$defs/Provenance"
+                    },
+                    "requirement_id": {
+                      "type": "string"
+                    },
+                    "source_revision": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/RevisionRef"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "text": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "requirement_id",
+                    "provenance"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "requirement"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "category": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "invariant_id": {
+                      "type": "string"
+                    },
+                    "provenance": {
+                      "$ref": "#/$defs/Provenance"
+                    },
+                    "source_revision": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/RevisionRef"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "text": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "invariant_id",
+                    "provenance"
+                  ]
+                },
+                "type": {
+                  "type": "string",
+                  "const": "invariant"
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            }
+          ],
+          "required": [
+            "operation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/RevisionRef"
+            },
+            "operation": {
+              "type": "string",
+              "const": "link"
+            },
+            "relation": {
+              "$ref": "#/$defs/Relation"
+            },
+            "to": {
+              "$ref": "#/$defs/RevisionRef"
+            }
+          },
+          "required": [
+            "operation",
+            "relation",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "entity_type": {
+              "$ref": "#/$defs/EntityType"
+            },
+            "operation": {
+              "type": "string",
+              "const": "entity_tombstone"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "entity_type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/RevisionRef"
+            },
+            "operation": {
+              "type": "string",
+              "const": "link_tombstone"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "relation": {
+              "$ref": "#/$defs/Relation"
+            },
+            "to": {
+              "$ref": "#/$defs/RevisionRef"
+            }
+          },
+          "required": [
+            "operation",
+            "relation",
+            "from",
+            "to",
+            "reason"
+          ]
+        }
+      ],
+      "required": [
+        "record_kind",
+        "source_id",
+        "revision",
+        "revision_seq",
+        "work_id",
+        "assertion",
+        "source_refs"
+      ]
+    },
+    "RecordKind": {
+      "type": "string",
+      "enum": [
+        "entity",
+        "link"
+      ]
+    },
+    "Relation": {
+      "type": "string",
+      "enum": [
+        "work_has_execution",
+        "execution_has_invocation",
+        "execution_has_round",
+        "round_has_finding",
+        "work_has_requirement",
+        "work_has_invariant",
+        "execution_has_repair",
+        "finding_violates_invariant",
+        "repair_addresses_finding",
+        "verification_tests_repair",
+        "execution_has_outcome",
+        "round_has_repair"
+      ]
+    },
+    "RevisionRef": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "revision"
+      ]
+    },
+    "SchemaVersion": {
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "SourceAvailability": {
+      "type": "string",
+      "enum": [
+        "known",
+        "unknown",
+        "unavailable"
+      ]
+    },
+    "SourceRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "sha256",
+        "locator"
+      ]
+    },
+    "State": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "passed",
+        "failed",
+        "cancelled",
+        "unknown"
+      ]
+    },
+    "VerificationScope": {
+      "type": "string",
+      "enum": [
+        "targeted",
+        "workspace",
+        "integration",
+        "unknown"
+      ]
+    }
+  }
+}

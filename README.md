@@ -88,6 +88,11 @@ The Cargo package names retain their existing names for compatibility. See [name
 
 The first release aims to run one Work item from the built-in queue through a pull request, review, a bounded fix cycle, and a verified outcome. Users must be able to operate it directly through the CLI and through skills in their existing coding agent. Skills call the same CLI contracts; a second independent control interface is not a release gate. TUI delivery and MCP support are deferred. Duplicate commands, stale views, process loss, and adapter outages must not create duplicate executions or false success.
 
+## Proposals
+
+- [Read-only evidence history export for rui](docs/proposal-rui-evidence-export.md). Proposed snapshot, history, and artifact API for an external local search index.
+- [rui evidence protocol v1](docs/rui-evidence-v1.md). T1 wire types, generated schema, and synthetic fixtures. The runtime exporter and CLI remain future work.
+
 ## License
 
 No license has been selected. Choose and add an open source license before distribution.

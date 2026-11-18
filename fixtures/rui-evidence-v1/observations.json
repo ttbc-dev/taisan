@@ -1,0 +1,75 @@
+{
+  "work": {
+    "r1": "Synthetic retained observation for work r1."
+  },
+  "exec-a": {
+    "r1": "Synthetic retained observation for exec-a r1."
+  },
+  "exec-b": {
+    "r1": "Synthetic retained observation for exec-b r1."
+  },
+  "invoke-a": {
+    "r1": "Synthetic retained observation for invoke-a r1."
+  },
+  "round-a": {
+    "r1": "Synthetic retained observation for round-a r1."
+  },
+  "round-b": {
+    "r1": "Synthetic retained observation for round-b r1."
+  },
+  "finding-a": {
+    "r1": "Synthetic retained observation for finding-a r1.",
+    "r2": "Synthetic retained observation for finding-a r2."
+  },
+  "finding-b": {
+    "r1": "Synthetic retained observation for finding-b r1.",
+    "r2": "Synthetic retained observation for finding-b r2."
+  },
+  "repair-a": {
+    "r1": "Synthetic retained observation for repair-a r1."
+  },
+  "repair-b": {
+    "r1": "Synthetic retained observation for repair-b r1."
+  },
+  "check-a": {
+    "r1": "Synthetic retained observation for check-a r1."
+  },
+  "check-b": {
+    "r1": "Synthetic retained observation for check-b r1."
+  },
+  "binding-a": {
+    "r1": {
+      "check": "check-a",
+      "repair": "repair-a",
+      "head": "head-a1",
+      "state": "failed"
+    }
+  },
+  "binding-b": {
+    "r1": {
+      "check": "check-b",
+      "repair": "repair-b",
+      "head": "head-b1",
+      "state": "passed"
+    }
+  },
+  "addresses-a": {
+    "r1": "Synthetic retained observation for addresses-a r1.",
+    "r2": "Synthetic retained observation for addresses-a r2."
+  },
+  "unsupported": {
+    "r1": "Synthetic retained observation for unsupported r1."
+  },
+  "delta-addresses": {
+    "r1": "Synthetic retained observation for delta-addresses r1."
+  },
+  "requirement": {
+    "r1": "Synthetic retained observation for requirement r1."
+  },
+  "invariant": {
+    "r1": "Synthetic retained observation for invariant r1."
+  },
+  "outcome": {
+    "r1": "Synthetic retained observation for outcome r1."
+  }
+}
