@@ -141,14 +141,29 @@ pub fn handle_command(
 
         let decision = decide_attempts(tx, config, req, now_unix_seconds)?;
 
-        tx.save_decision(
-            &req.origin,
-            &req.actor,
-            &req.idempotency_key,
-            &digest,
-            &canonical,
-            &decision,
-        )?;
+        // A capacity refusal is transient, not a decision about facts:
+        // persisting it under the caller's idempotency key would replay
+        // the refusal forever — for a selector candidate the key is the
+        // proposal's replay key, and deferral requires the lookup to
+        // find nothing so a later proposal is decided fresh against
+        // then-current capacity (docs/intake-identity-storage.md). Every
+        // other outcome, accepted or rejected, keeps its durable record.
+        if !matches!(
+            decision,
+            CommandDecision::Rejected {
+                reason: RejectionCode::CapacityExhausted,
+                ..
+            }
+        ) {
+            tx.save_decision(
+                &req.origin,
+                &req.actor,
+                &req.idempotency_key,
+                &digest,
+                &canonical,
+                &decision,
+            )?;
+        }
         Ok(decision)
     })
 }

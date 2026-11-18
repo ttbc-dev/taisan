@@ -294,16 +294,17 @@ fn the_active_limit_is_what_submit_decides_against() {
 
     accepted(&decision(&store, &submit("cap-1")));
     accepted(&decision(&store, &submit("cap-2")));
+    let cap3 = submit("cap-3");
     assert_eq!(
-        reject_reason(&decision(&store, &submit("cap-3"))),
+        reject_reason(&decision(&store, &cap3)),
         RejectionCode::CapacityExhausted
     );
 
-    // Raising the limit through the guarded write admits again — fresh
-    // keys: a rejected command's decision is durable, so resubmitting
-    // the same key would replay the recorded rejection.
+    // Raising the limit through the guarded write admits again — and
+    // the refused request's own key is decided fresh, because a
+    // capacity refusal persists no replayable decision.
     set_intake_settings(&store, settings("rev-2", 4), Some("rev-1")).unwrap();
-    accepted(&decision(&store, &submit("cap-3b")));
+    accepted(&decision(&store, &cap3));
     accepted(&decision(&store, &submit("cap-4b")));
     assert_eq!(
         reject_reason(&decision(&store, &submit("cap-5b"))),
@@ -450,7 +451,8 @@ fn a_capacity_rejection_leaves_no_partial_rows() {
     );
 
     // No Work, Execution, claim, spec, or usage row for the rejected
-    // submission; the durable rejection itself is the only record.
+    // submission — and no saved decision either: a capacity refusal is
+    // transient, so the replay lookup must find nothing under the key.
     assert_eq!(store.transact(|tx| tx.works()).unwrap().len(), works_before);
     assert!(
         store
@@ -464,8 +466,50 @@ fn a_capacity_rejection_leaves_no_partial_rows() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        store
+            .transact(|tx| { tx.stored_decision(&Origin("cli".into()), &actor(), "atom-2",) })
+            .unwrap()
+            .is_none(),
+        "a capacity refusal persists no decision under the idempotency key"
+    );
     assert_eq!(pending_count(&store), 1);
     let _ = w1;
+}
+
+#[test]
+fn a_capacity_rejection_is_redecided_when_capacity_returns() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+    accepted(&decision(&store, &submit("free-1")));
+
+    // The queue is full: the identical request is refused, and nothing
+    // is recorded under its key.
+    let request = submit("free-2");
+    assert_eq!(
+        reject_reason(&decision(&store, &request)),
+        RejectionCode::CapacityExhausted
+    );
+    assert!(
+        store
+            .transact(|tx| { tx.stored_decision(&Origin("cli".into()), &actor(), "free-2") })
+            .unwrap()
+            .is_none()
+    );
+
+    // Capacity returns (here via a raised limit): the very same key and
+    // payload is decided fresh and accepted — the deferral contract a
+    // selector replay key depends on.
+    set_intake_settings(&store, settings("rev-2", 2), Some("rev-1")).unwrap();
+    let (work_id, _e) = accepted(&decision(&store, &request));
+    assert!(
+        store
+            .transact(|tx| tx.stored_decision(&Origin("cli".into()), &actor(), "free-2"))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(pending_count(&store), 2);
+    let _ = work_id;
 }
 
 #[test]
@@ -725,6 +769,31 @@ fn a_truncated_v8_store_is_still_refused() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch("DROP TABLE intake_settings; DROP TABLE works; PRAGMA user_version=8;")
             .unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { .. }) => {}
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("expected UnsupportedFormat, got Ok"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_current_stamp_missing_intake_settings_is_refused() {
+    let root = std::env::temp_dir().join(format!("workloop-intake-current-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+    }
+    // A file already stamped at the current format but missing the v9
+    // table is foreign — the post-upgrade completeness check refuses
+    // it rather than silently recreating schema under a current stamp.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE intake_settings;").unwrap();
     }
     match SqliteStore::open(&db, 1) {
         Err(StoreError::UnsupportedFormat { .. }) => {}

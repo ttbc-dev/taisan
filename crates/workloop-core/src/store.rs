@@ -260,9 +260,10 @@ pub struct IntakeSettingsRecord {
 
 /// One scoped issue's live owner for the intake preflight: the Work
 /// whose immutable issue membership covers the issue and whose active
-/// Execution is `queued`, `running`, or `paused`. Source claims and
-/// queue positions are separate facts — a paused Work holds no claim
-/// but still owns its membership here.
+/// Execution is `queued`, `running`, or `paused` — the owner set the
+/// preflight contract names. Issue claims are a separate record
+/// retained through holds, pauses, and uncertainty; this view reports
+/// queue-relevant owners, not the claim ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntakeSourceOwner {
     pub issue: IssueRef,
