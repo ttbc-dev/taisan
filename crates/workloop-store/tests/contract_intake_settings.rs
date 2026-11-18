@@ -682,25 +682,26 @@ fn preflight_reports_positions_and_scoped_owners_from_one_snapshot() {
         ]
     );
     // The unfiltered owned-issue set the coordinator turns into
-    // request exclusions follows the same non-terminal rule.
-    // Owned refs carry no display number — identity is the scoped
-    // issue id, ordered by issue key.
-    let owned: Vec<String> = store
+    // request exclusions follows the same non-terminal rule. Owned
+    // refs keep their stored display number — the protocol's
+    // exclusion rule matches on it within the same repository —
+    // ordered by scoped identity.
+    let owned: Vec<(String, Option<u64>)> = store
         .transact(|tx| tx.intake_owned_issues())
         .unwrap()
         .iter()
-        .map(|i| i.issue.as_str().to_string())
+        .map(|i| (i.issue.as_str().to_string(), i.display_number))
         .collect();
     assert_eq!(
         owned,
         vec![
-            "issue-301",
-            "issue-302",
-            "issue-303",
-            "issue-306",
-            "issue-307",
-            "issue-308",
-            "issue-309"
+            ("issue-301".to_string(), Some(301)),
+            ("issue-302".to_string(), Some(302)),
+            ("issue-303".to_string(), Some(303)),
+            ("issue-306".to_string(), Some(306)),
+            ("issue-307".to_string(), Some(307)),
+            ("issue-308".to_string(), Some(308)),
+            ("issue-309".to_string(), Some(309)),
         ]
     );
     // Source claims and queue positions stay separate facts: the
@@ -929,4 +930,20 @@ fn concurrent_settings_writers_cannot_clobber_each_other() {
 
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn owned_issues_normalize_a_zero_display_number_for_the_wire() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    // A stored ref may carry display_number 0 — the store accepts any
+    // u64 — but exclusions must never emit it: the wire requires a
+    // display number to be positive or absent.
+    let (_w, _e) = accepted(&decision(
+        &store,
+        &submit_with_sources("zero-display", vec![source(0)]),
+    ));
+    let owned = store.transact(|tx| tx.intake_owned_issues()).unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].issue.as_str(), "issue-0");
+    assert_eq!(owned[0].display_number, None);
 }

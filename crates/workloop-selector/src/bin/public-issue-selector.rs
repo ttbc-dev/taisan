@@ -590,16 +590,6 @@ fn gh_issue(
     let object = value
         .as_object()
         .ok_or_else(|| malformed("issue is not an object"))?;
-    // `node_id` is the stable global id; `id` (the database id) is the
-    // fallback when a response shape omits it.
-    let issue_key = match object.get("node_id").and_then(|v| v.as_str()) {
-        Some(node_id) => node_id.to_string(),
-        None => match object.get("id") {
-            Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
-            Some(v) if v.is_number() => v.to_string(),
-            _ => return Err(malformed("issue has no stable id")),
-        },
-    };
     let title = object
         .get("title")
         .and_then(|v| v.as_str())
@@ -615,7 +605,15 @@ fn gh_issue(
         .and_then(|v| v.as_str())
         .ok_or_else(|| malformed("issue has no updated_at"))?
         .to_string();
-    let display_number = object.get("number").and_then(|v| v.as_u64());
+    // The issue number is the repository-scoped identity — the same
+    // value the manual `submit --issue repo:number` path stores as the
+    // IssueId. Deriving identity from `node_id` or the database `id`
+    // would give one issue two scoped identities, letting selector
+    // intake bypass claims and exclusions held under the number.
+    let display_number = object
+        .get("number")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| malformed("issue has no number"))?;
     let mut labels = BTreeSet::new();
     if let Some(label_values) = object.get("labels").and_then(|v| v.as_array()) {
         for label in label_values {
@@ -626,8 +624,9 @@ fn gh_issue(
     }
     let issue = IssueRef {
         repository: repository.clone(),
-        issue: IssueId::new(issue_key).map_err(|_| malformed("issue id is invalid"))?,
-        display_number,
+        issue: IssueId::new(display_number.to_string())
+            .map_err(|_| malformed("issue id is invalid"))?,
+        display_number: Some(display_number),
     };
     Ok(CollectedIssue {
         issue,

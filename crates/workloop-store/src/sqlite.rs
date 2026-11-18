@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::identity::{AdapterId, HostInstanceId, RepositoryRef, StoreId};
+use workloop_core::identity::{AdapterId, HostInstanceId, StoreId};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
@@ -1917,28 +1917,34 @@ impl ReadView for Tx<'_> {
         // membership belongs to a Work holding a non-terminal
         // Execution — the same live-owner rule `intake_source_owners`
         // applies, minus the candidate filter.
-        // `issue_key` — not the full row — is the dedup unit: two
-        // Works may record the same issue under different display
-        // numbers, and exclusions must see each scoped identity once.
-        // Display numbers are presentational and carry no exclusion
-        // weight, so the reconstructed refs leave them absent.
-        self.query_all(
-            "SELECT DISTINCT wir.issue_key FROM work_issue_refs wir \
+        // Dedup is by scoped identity (`IssueRef` ordering ignores
+        // `display_number`): two Works may record the same issue under
+        // different display numbers, and exclusions must see each
+        // identity once. The stored `issue` document's display number
+        // is kept — the protocol's exclusion rule also matches a
+        // non-null display number within the same repository — but a
+        // zero is normalized away because the wire requires a display
+        // number to be positive or absent.
+        let rows: Vec<workloop_core::identity::IssueRef> = self.query_all(
+            "SELECT DISTINCT wir.issue FROM work_issue_refs wir \
              JOIN executions e ON e.work_id = wir.work_id \
              WHERE e.state NOT IN ('succeeded','failed','cancelled') \
-             ORDER BY wir.issue_key",
+             ORDER BY wir.issue_key, wir.issue",
             [],
             |row| {
-                let key: String = row.get(0)?;
-                let (repository, issue): (RepositoryRef, String) =
-                    serde_json::from_str(&key).map_err(conv)?;
-                Ok(workloop_core::identity::IssueRef {
-                    repository,
-                    issue: workloop_core::identity::IssueId::trusted(issue),
-                    display_number: None,
-                })
+                let mut issue: workloop_core::identity::IssueRef =
+                    de_row(&row.get::<_, String>(0)?)?;
+                if issue.display_number == Some(0) {
+                    issue.display_number = None;
+                }
+                Ok(issue)
             },
-        )
+        )?;
+        Ok(rows
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
     fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {

@@ -779,9 +779,18 @@ fn run(cli: Cli) -> i32 {
                 // stays single-object — per-pass progress is a stderr
                 // diagnostic and the run's one envelope is emitted once
                 // when the bounded run finishes.
+                // Every exit route joins a live invocation first — a
+                // store fault must not orphan the selector child past
+                // the process boundary either.
+                let join_invocation = |driver: &mut Option<intake::IntakeDriver>| {
+                    if let Some(driver) = driver.as_mut() {
+                        driver.finish();
+                    }
+                };
                 let payload = match serde_json::to_string(&report) {
                     Ok(p) => p,
                     Err(e) => {
+                        join_invocation(&mut intake_driver);
                         return emit(envelope::error_envelope(
                             Some(identity()),
                             envelope::ErrorClass::Store,
@@ -790,6 +799,7 @@ fn run(cli: Cli) -> i32 {
                     }
                 };
                 if let Err(e) = store.append_event("tick_report", &payload) {
+                    join_invocation(&mut intake_driver);
                     return emit(envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
