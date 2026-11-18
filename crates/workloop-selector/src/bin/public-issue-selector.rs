@@ -628,13 +628,21 @@ fn gh_issue(
             .map_err(|_| malformed("issue id is invalid"))?,
         display_number: Some(display_number),
     };
+    // Map only the two known lifecycle states. A missing or
+    // unrecognized value is a partial source fact, not a closed
+    // Issue: guessing would silently drop a still-open Issue from
+    // selection.
+    let issue_state = match object.get("state").and_then(|v| v.as_str()) {
+        Some("open") => IssueState::Open,
+        Some("closed") => IssueState::Closed,
+        Some(other) => {
+            return Err(malformed(&format!("issue has unknown state '{other}'")));
+        }
+        None => return Err(malformed("issue has no state")),
+    };
     Ok(CollectedIssue {
         issue,
-        state: if object.get("state").and_then(|v| v.as_str()) == Some("open") {
-            IssueState::Open
-        } else {
-            IssueState::Closed
-        },
+        state: issue_state,
         labels,
         created_unix_seconds: created_at,
         title,

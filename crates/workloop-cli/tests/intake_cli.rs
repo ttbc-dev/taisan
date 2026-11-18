@@ -253,6 +253,9 @@ fn intake_detail_for_an_unknown_run_is_a_completed_not_found() {
     assert_eq!(env["command"]["kind"], "intake_detail");
     // NotFound is a completed query: accepted envelope, null result.
     assert!(env["result"].is_null(), "{env}");
+    // The run id is not a Work identity: the envelope's work_id stays
+    // null for run-scoped queries.
+    assert!(env["work_id"].is_null(), "{env}");
 }
 
 #[test]
@@ -294,6 +297,9 @@ fn intake_runs_the_coordinator_and_projects_the_run() {
 
     // The detail projection resolves the candidate's links.
     let env = run_ok(&dir, Some(&profile), &["intake-detail", "--run", &run_id]);
+    // The run id is not a Work identity: the envelope's work_id stays
+    // null for run-scoped queries.
+    assert!(env["work_id"].is_null(), "{env}");
     let detail = &env["result"];
     assert_eq!(detail["run"]["run_id"], run_id);
     let candidates = detail["candidates"].as_array().unwrap();
@@ -303,6 +309,12 @@ fn intake_runs_the_coordinator_and_projects_the_run() {
     assert!(candidates[0]["command_id"].as_str().is_some());
     assert!(candidates[0]["committed_seq"].is_number());
     assert_eq!(candidates[0]["proposal_key"].as_str().unwrap().len(), 64);
+    // The candidate payload digest is exposed as the audit anchor; for
+    // a proposal-v1 candidate it is the semantic proposal key.
+    assert_eq!(
+        candidates[0]["payload_digest"], candidates[0]["proposal_key"],
+        "{detail}"
+    );
 }
 
 #[test]

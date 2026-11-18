@@ -157,3 +157,76 @@ fn gh_backend_serves_only_declared_github_endpoints() {
         }
     ));
 }
+
+#[test]
+fn gh_backend_maps_known_issue_states_and_fails_malformed_on_others() {
+    // `gh api` facts with no lifecycle state, or a value outside
+    // `open`/`closed`, are partial source facts. Collapsing them to
+    // `Closed` would silently drop a potentially open Issue, so the
+    // page must fail as Malformed (surfaced as SourceUnavailable).
+    // A genuine `closed` fact stays a non-open (skipped) Issue.
+    for (tag, state, expect_malformed) in [
+        ("gh-nostate", None, true),
+        ("gh-badstate", Some("merged"), true),
+        ("gh-closed", Some("closed"), false),
+    ] {
+        let dir = tmp_dir(&REFERENCE, tag);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        let mut issue = serde_json::json!({
+            "number": 42,
+            "title": "fix the thing",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "labels": [{ "name": "intake" }],
+        });
+        if let Some(state) = state {
+            issue["state"] = serde_json::Value::String(state.to_string());
+        }
+        let payload = serde_json::to_string(&vec![issue]).unwrap();
+        std::fs::write(&gh, format!("#!/bin/sh\necho '{payload}'\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let env = [("PATH", path.as_str())];
+
+        let repositories = vec![RepositoryRef::new(
+            HostInstanceId::trusted("https://api.github.com"),
+            RepositoryId::trusted("o/n"),
+        )];
+        let spec = request_spec(&REFERENCE, tag, &repositories, &[], 4, deadline_ms());
+        let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+        let declared = [
+            "--github-endpoint".to_string(),
+            "https://api.github.com".to_string(),
+        ];
+        let (stdout, _stderr, code) = run_exe_env(&REFERENCE, &declared, &request.bytes, &env);
+        assert_eq!(code, Some(0));
+        let reply = protocol::validate_response(&stdout, &request).unwrap();
+        if expect_malformed {
+            assert!(
+                matches!(
+                    reply,
+                    SelectorReply::Failure {
+                        code: FailureCode::SourceUnavailable,
+                        ..
+                    }
+                ),
+                "case {tag}: expected a malformed-source failure, got {reply:?}"
+            );
+        } else {
+            assert!(
+                matches!(reply, SelectorReply::Success { ref candidates } if candidates.is_empty()),
+                "case {tag}: a closed Issue is skipped, got {reply:?}"
+            );
+        }
+    }
+}
