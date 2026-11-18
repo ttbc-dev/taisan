@@ -18,7 +18,7 @@ use workloop_config::profile::{
 };
 use workloop_core::domain::Actor;
 use workloop_core::identity::RepositoryRef;
-use workloop_core::store::{IntakeTrigger, Store};
+use workloop_core::store::{Effect, IntakeSettingsRecord, IntakeTrigger, Store};
 use workloop_core::work::WorkloopConfig;
 use workloop_intake::scheduler::{IntakeScheduler, SETTINGS_TICK_SECONDS, TickDecision};
 use workloop_intake::{self, IntakeError, IntakeParams, IntakeReport, SelectorBinding};
@@ -221,6 +221,42 @@ impl InvocationOutcome {
     }
 }
 
+/// Persist the tick's resolved settings into the durable
+/// installation record (#216): the revision-guarded upsert keeps the
+/// single active `pending_queue_limit` every submit transaction
+/// reads, so a profile reload reaches manual and selector admission
+/// at the same tick boundary. An unchanged revision is a no-op; a
+/// `ConstraintConflict` means a concurrent writer landed first — the
+/// next tick re-reads and converges, so the error is reported here,
+/// never retried in place.
+fn persist_settings(store: &SqliteStore, settings: &IntakeSettings) -> Result<(), String> {
+    let revision = settings.revision();
+    let current = store
+        .transact_deferred(|tx| tx.intake_settings())
+        .map_err(|e| format!("settings read: {e}"))?;
+    if current
+        .as_ref()
+        .is_some_and(|s| s.settings_revision == revision)
+    {
+        return Ok(());
+    }
+    let expected_revision = current.map(|s| s.settings_revision);
+    let pending_queue_limit = settings.pending_queue_limit;
+    store
+        .transact(|tx| {
+            let recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::SetIntakeSettings {
+                settings: IntakeSettingsRecord {
+                    settings_revision: revision,
+                    pending_queue_limit,
+                    recorded_seq,
+                },
+                expected_revision,
+            })
+        })
+        .map_err(|e| format!("settings write: {e}"))
+}
+
 /// The `run` driver's intake half: a process-local scheduler ticked on
 /// the 60-second settings check, spawning at most one invocation
 /// thread at a time. The thread opens its own store connection — the
@@ -321,6 +357,15 @@ impl IntakeDriver {
         {
             Ok(config) => {
                 self.report_diagnostic(None);
+                // Persist before the due decision so an invocation
+                // launched this tick admits under the fresh limit.
+                // A write fault is reported and retried next tick —
+                // it never suppresses the schedule itself.
+                if let Some(cfg) = &config
+                    && let Err(e) = persist_settings(store, &cfg.settings)
+                {
+                    eprintln!("taisan: intake settings persist: {e}");
+                }
                 config
             }
             Err(e) => {
@@ -472,7 +517,14 @@ mod tests {
                     credential_ref: CredentialRef::trusted("default"),
                 }],
             },
-            declared_capabilities: BTreeSet::from([HostCapability::RepositoryRead]),
+            declared_capabilities: BTreeSet::from([
+                HostCapability::RepositoryRead,
+                HostCapability::PushRef,
+                HostCapability::ChangeRequestCreate,
+                HostCapability::ChangeRequestRead,
+                HostCapability::ChecksRead,
+                HostCapability::ReviewFindingsRead,
+            ]),
             lanes: Default::default(),
             required_checks: vec![],
             allowed_effects: AllowedEffects {
@@ -541,5 +593,221 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state, IntakeRunState::Interrupted);
+    }
+
+    /// A minimal valid profile whose `[intake]` section is disabled —
+    /// ticks resolve and persist settings but never spawn an
+    /// invocation thread.
+    fn profile_toml(limit: u32) -> String {
+        format!(
+            r#"schema_version = 1
+
+[hosts.h1]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "0123456789"
+use = "publication"
+
+[roles.publication]
+host = "h1"
+actor = "taisan-publisher"
+credential_ref = "env:TAISAN_TOKEN"
+
+[intake]
+enabled = false
+interval_minutes = 30
+timeout_seconds = 60
+pending_queue_limit = {limit}
+"#
+        )
+    }
+
+    fn root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "workloop-intake-driver-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_profile(dir: &Path, limit: u32) -> PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, profile_toml(limit)).unwrap();
+        path
+    }
+
+    fn driver_for(profile: &Path, dir: &Path) -> IntakeDriver {
+        IntakeDriver::new(
+            Some(profile.to_path_buf()),
+            None,
+            actor(),
+            workloop_config(),
+            dir.join("workloop.db"),
+            4,
+            dir.to_path_buf(),
+        )
+    }
+
+    fn settings_record(store: &SqliteStore) -> Option<IntakeSettingsRecord> {
+        store.transact_deferred(|tx| tx.intake_settings()).unwrap()
+    }
+
+    const TICK_NOW: i64 = 1_700_000_000;
+
+    /// The first valid tick persists the resolved revision and queue
+    /// limit into the durable settings record every submit reads.
+    #[test]
+    fn settings_tick_persists_revision_and_limit() {
+        let dir = root("persist");
+        let profile = write_profile(&dir, 3);
+        let store = SqliteStore::in_memory(4).unwrap();
+        let mut driver = driver_for(&profile, &dir);
+
+        driver.maybe_tick(&store, TICK_NOW);
+
+        let record = settings_record(&store).expect("settings record persisted");
+        let expected = load_profile(&profile)
+            .unwrap()
+            .intake_settings()
+            .unwrap()
+            .revision();
+        assert_eq!(record.settings_revision, expected);
+        assert_eq!(record.pending_queue_limit, 3);
+    }
+
+    /// Identical content keeps the revision — the record is not
+    /// rewritten, so `recorded_seq` stays put.
+    #[test]
+    fn unchanged_tick_does_not_rewrite_the_record() {
+        let dir = root("stable");
+        let profile = write_profile(&dir, 3);
+        let store = SqliteStore::in_memory(4).unwrap();
+        let mut driver = driver_for(&profile, &dir);
+
+        driver.maybe_tick(&store, TICK_NOW);
+        let first = settings_record(&store).unwrap();
+        driver.maybe_tick(&store, TICK_NOW + SETTINGS_TICK_SECONDS);
+        let second = settings_record(&store).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    /// An atomic file replacement takes effect at the next tick: the
+    /// record carries the new limit and a new revision.
+    #[test]
+    fn edited_limit_applies_at_the_next_tick() {
+        let dir = root("edited");
+        let profile = write_profile(&dir, 3);
+        let store = SqliteStore::in_memory(4).unwrap();
+        let mut driver = driver_for(&profile, &dir);
+
+        driver.maybe_tick(&store, TICK_NOW);
+        let before = settings_record(&store).unwrap();
+
+        write_profile(&dir, 7);
+        driver.maybe_tick(&store, TICK_NOW + SETTINGS_TICK_SECONDS);
+
+        let after = settings_record(&store).unwrap();
+        assert_eq!(after.pending_queue_limit, 7);
+        assert_ne!(after.settings_revision, before.settings_revision);
+    }
+
+    /// An invalid reload suppresses the write: the last valid record
+    /// stays active for admission and the next valid tick recovers.
+    #[test]
+    fn invalid_profile_keeps_the_last_valid_record() {
+        let dir = root("invalid");
+        let profile = write_profile(&dir, 3);
+        let store = SqliteStore::in_memory(4).unwrap();
+        let mut driver = driver_for(&profile, &dir);
+
+        driver.maybe_tick(&store, TICK_NOW);
+        let before = settings_record(&store).unwrap();
+
+        std::fs::write(&profile, "this is not toml = [").unwrap();
+        driver.maybe_tick(&store, TICK_NOW + SETTINGS_TICK_SECONDS);
+        assert_eq!(settings_record(&store).unwrap(), before);
+
+        write_profile(&dir, 5);
+        driver.maybe_tick(&store, TICK_NOW + 2 * SETTINGS_TICK_SECONDS);
+        assert_eq!(settings_record(&store).unwrap().pending_queue_limit, 5);
+    }
+
+    /// The persisted limit is what the authoritative submit
+    /// transaction enforces: lowering it refuses the next manual
+    /// submit, and raising it at a later tick admits again — a stale
+    /// caller cannot supply or overwrite the active revision.
+    #[test]
+    fn manual_submit_observes_the_reloaded_queue_limit() {
+        use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
+        use workloop_core::work::handle_command;
+
+        let dir = root("submit-limit");
+        let profile = write_profile(&dir, 1);
+        let store = SqliteStore::in_memory(8).unwrap();
+        let cfg = workloop_config();
+        let act = actor();
+        let mut driver = driver_for(&profile, &dir);
+        driver.maybe_tick(&store, TICK_NOW);
+
+        let submit = |key: &str| {
+            handle_command(
+                &store,
+                &cfg,
+                &CommandRequest {
+                    actor: act.clone(),
+                    origin: workloop_core::domain::Origin("test".into()),
+                    idempotency_key: key.into(),
+                    body: CommandBody::Submit {
+                        intent: format!("work-{key}"),
+                        sources: vec![],
+                        constraints: vec![],
+                        verification_argv: vec![],
+                    },
+                },
+                TICK_NOW,
+            )
+        };
+
+        // Limit 1: the first submit takes the only position.
+        let first = submit("first");
+        assert!(
+            matches!(first, Ok(CommandDecision::Accepted { .. })),
+            "first submit: {first:?}"
+        );
+        // The queue is full — the next submit is refused capacity.
+        assert!(matches!(
+            submit("second"),
+            Ok(CommandDecision::Rejected { .. })
+        ));
+
+        // Raising the bound at the next tick admits again without a
+        // restart — the durable record, not the caller's profile,
+        // decided.
+        write_profile(&dir, 3);
+        driver.maybe_tick(&store, TICK_NOW + SETTINGS_TICK_SECONDS);
+        assert!(matches!(
+            submit("third"),
+            Ok(CommandDecision::Accepted { .. })
+        ));
+    }
+
+    /// No profile file means intake is unconfigured — nothing is
+    /// persisted and the documented default keeps applying.
+    #[test]
+    fn absent_profile_writes_nothing() {
+        let dir = root("absent");
+        let missing = dir.join("config.toml");
+        let store = SqliteStore::in_memory(4).unwrap();
+        let mut driver = driver_for(&missing, &dir);
+
+        driver.maybe_tick(&store, TICK_NOW);
+
+        assert!(settings_record(&store).is_none());
     }
 }
