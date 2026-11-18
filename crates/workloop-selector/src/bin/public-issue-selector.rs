@@ -206,8 +206,9 @@ fn main() {
         Ok(request) => request,
         Err(violation) => {
             // The request id is untrusted until parsed; extract it
-            // best-effort for correlation, never validate past the
-            // failure envelope's own `is_id` rule.
+            // best-effort for correlation under the failure envelope's
+            // own `is_id` rule — echoing a control-bearing id would
+            // make the caller reject this failure as malformed.
             let request_id = serde_json::from_slice::<serde_json::Value>(&request_bytes)
                 .ok()
                 .and_then(|v| {
@@ -215,7 +216,7 @@ fn main() {
                         .and_then(|r| r.as_str())
                         .map(str::to_owned)
                 })
-                .filter(|id| !id.is_empty() && id.len() <= protocol::MAX_ID_BYTES);
+                .filter(|id| protocol::is_id(id));
             fail(
                 request_id.as_deref(),
                 request_violation_code(&violation),

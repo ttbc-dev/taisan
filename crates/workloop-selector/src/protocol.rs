@@ -167,7 +167,11 @@ fn is_adapter_id(value: &str) -> bool {
 /// rejected control characters in every string it produced, so this
 /// is a length check in practice — kept explicit because the bound is
 /// normative, not incidental.
-fn is_id(value: &str) -> bool {
+/// The wire identity shape: nonempty, byte-bounded, control-free.
+/// Shared by request parsing and by adapters echoing a best-effort
+/// `request_id` into a failure envelope — an echoed id that violates
+/// this rule would itself fail the caller's response validation.
+pub fn is_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
 }
 

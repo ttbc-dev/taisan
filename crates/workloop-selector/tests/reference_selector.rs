@@ -381,6 +381,27 @@ fn executable_rejects_malformed_and_wrong_version_requests() {
 }
 
 #[test]
+fn executable_omits_control_bearing_request_ids_from_failures() {
+    let dir = tmp_dir("ctlreq");
+    let sources = write_sources(&dir, serde_json::json!({}));
+    let repositories = vec![repo()];
+    let spec = request_spec("req-ctl", &repositories, &[], 8, deadline_ms());
+    let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&request.bytes).unwrap();
+    // A control character makes the id wire-invalid; echoing it into
+    // the failure envelope would itself fail the caller's response
+    // validation, so the adapter must emit `null` instead.
+    value["request_id"] = serde_json::json!("bad\u{1}id");
+    let bad_request = workloop_core::domain::canonical_json(&value);
+    let (stdout, _, code) = run_exe(&sources_arg(&sources), &bad_request);
+    assert_eq!(code, Some(0));
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["error"]["code"], "invalid_request");
+    assert!(value["request_id"].is_null(), "{value}");
+}
+
+#[test]
 fn executable_reports_bound_violations_as_input_limit() {
     let dir = tmp_dir("boundreq");
     let sources = write_sources(&dir, serde_json::json!({}));
