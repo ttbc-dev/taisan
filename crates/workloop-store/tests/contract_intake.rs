@@ -1391,7 +1391,7 @@ fn newer_format_is_refused() {
     }
     {
         let conn = Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 10i64).unwrap();
+        conn.pragma_update(None, "user_version", 11i64).unwrap();
     }
     match SqliteStore::open(&db, 1) {
         Err(StoreError::UnsupportedFormat { .. }) => {}

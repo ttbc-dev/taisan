@@ -1293,6 +1293,27 @@ fn decide_resume(
     // the bound exhausted goes to `failed` with the limit recorded. The
     // shared predicate keeps this entry point on the same rule as
     // dispatch-time admission.
+    //
+    // Before that terminal settlement, an outstanding host write must
+    // reconcile: intents are delivery-bound and the outbox drain would
+    // still apply a pending write under a recorded failure. This is the
+    // same rule admission and recovery-intent firing apply.
+    if let Some(limit) = execution.budget_exhaustion(&InvocationRole::Coding)
+        && defer_terminal_while_outstanding(tx, &work.id, &execution.id, limit.terminal_code())?
+    {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::Ineligible,
+                Some(work_id.clone()),
+                vec![format!(
+                    "terminal {} defers until outstanding host writes reconcile",
+                    limit.terminal_code()
+                )],
+            ),
+            vec![],
+        ));
+    }
     if let Some((effects, seq, next_version)) =
         paused_exhaustion_effects(tx, &work, &execution, now_unix_seconds)?
     {
@@ -2350,6 +2371,7 @@ fn schedule_recovery_intent(
             evidence_basis: evidence_basis.into(),
             state: RecoveryIntentState::Pending,
             retirement_reason: None,
+            retirement_generation: None,
             scheduled_seq,
         },
     })
@@ -5017,11 +5039,11 @@ fn fire_due_intent_inner(
         return Ok(FireOutcome::Ignored);
     }
     let Some(execution_id) = intent.execution_id.clone() else {
-        retire_intent(tx, &intent.intent_id, "no_execution")?;
+        retire_intent(tx, &intent, "no_execution")?;
         return Ok(FireOutcome::Retired);
     };
     let Some(execution) = tx.execution(&execution_id)? else {
-        retire_intent(tx, &intent.intent_id, "execution_missing")?;
+        retire_intent(tx, &intent, "execution_missing")?;
         return Ok(FireOutcome::Retired);
     };
     if matches!(
@@ -5031,7 +5053,7 @@ fn fire_due_intent_inner(
         // Terminal evidence invalidates the intent and any stall
         // explanation a prior conflict recorded against the Execution.
         clear_deferral(tx, &execution_id)?;
-        retire_intent(tx, &intent.intent_id, "execution_terminal")?;
+        retire_intent(tx, &intent, "execution_terminal")?;
         return Ok(FireOutcome::Retired);
     }
     match intent.kind.as_str() {
@@ -5090,7 +5112,7 @@ fn fire_requeue_intent(
         return Ok(FireOutcome::Held("operator_hold".into()));
     }
     let Some(work) = tx.work(&intent.work_id)? else {
-        retire_intent(tx, &intent.intent_id, "work_missing")?;
+        retire_intent(tx, intent, "work_missing")?;
         return Ok(FireOutcome::Retired);
     };
     let unmet = prerequisites_satisfied(tx, &work, execution, now)?;
@@ -5115,6 +5137,14 @@ fn fire_requeue_intent(
             .is_some_and(|a| a > work.policy.automatic_time_limit_seconds)
     });
     if automatic_exhausted {
+        if defer_terminal_while_outstanding(
+            tx,
+            &work.id,
+            &execution.id,
+            "automatic_time_exhausted",
+        )? {
+            return Ok(FireOutcome::Held("outbox_reconciliation".into()));
+        }
         consume_intent(tx, &intent.intent_id)?;
         fail_terminal(
             tx,
@@ -5126,6 +5156,11 @@ fn fire_requeue_intent(
             requeued: false,
             failed_terminal: true,
         });
+    }
+    if let Some(limit) = execution.budget_exhaustion(&InvocationRole::Coding)
+        && defer_terminal_while_outstanding(tx, &work.id, &execution.id, limit.terminal_code())?
+    {
+        return Ok(FireOutcome::Held("outbox_reconciliation".into()));
     }
     if let Some((effects, _seq, _version)) = paused_exhaustion_effects(tx, &work, execution, now)? {
         consume_intent(tx, &intent.intent_id)?;
@@ -5181,7 +5216,7 @@ fn fire_retry_intent(
         return Ok(FireOutcome::Held("execution_active".into()));
     }
     let Some(work) = tx.work(&intent.work_id)? else {
-        retire_intent(tx, &intent.intent_id, "work_missing")?;
+        retire_intent(tx, intent, "work_missing")?;
         return Ok(FireOutcome::Retired);
     };
     // The transport account is re-checked against the durable counter:
@@ -5217,13 +5252,36 @@ fn consume_intent(tx: &mut dyn TxView, intent_id: &str) -> Result<(), StoreError
         intent_id: intent_id.to_string(),
         state: crate::store::RecoveryIntentState::Consumed,
         retirement_reason: None,
+        evidence_generation: None,
     })
 }
 
-fn retire_intent(tx: &mut dyn TxView, intent_id: &str, reason: &str) -> Result<(), StoreError> {
+/// The evidence generation a retirement is decided from: the Work's
+/// current version when it is readable, otherwise the intent's own
+/// scheduling generation (the only evidence left when its Work is
+/// gone). Never older than the intent's generation in normal operation,
+/// so the store's stale-generation guard only refuses decisions built
+/// from an older snapshot.
+fn intent_retirement_generation(
+    tx: &mut dyn TxView,
+    intent: &RecoveryIntent,
+) -> Result<u64, StoreError> {
+    Ok(tx
+        .work(&intent.work_id)?
+        .map(|work| work.version)
+        .unwrap_or(intent.generation))
+}
+
+fn retire_intent(
+    tx: &mut dyn TxView,
+    intent: &RecoveryIntent,
+    reason: &str,
+) -> Result<(), StoreError> {
+    let evidence_generation = intent_retirement_generation(tx, intent)?;
     tx.apply(&Effect::UpdateRecoveryIntent {
-        intent_id: intent_id.to_string(),
+        intent_id: intent.intent_id.clone(),
         state: crate::store::RecoveryIntentState::Retired,
         retirement_reason: Some(reason.to_string()),
+        evidence_generation: Some(evidence_generation),
     })
 }

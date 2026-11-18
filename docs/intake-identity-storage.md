@@ -179,6 +179,8 @@ Intake storage arrives as store format v8: two new tables and their indexes, no 
 
 Store format v9 (#213) adds one more table and nothing else: the `intake_settings` singleton holding `settings_revision`, `pending_queue_limit`, and `recorded_seq`. Opening a v8 store installs it inside the same idempotent upgrade transaction and stamps `user_version = 9`; a v8 file lacking the v8 intake tables, a foreign stamped file, and a newer format are refused exactly as before. The record has exactly one writer — the revision-guarded settings effect: the first write requires an explicit absent-revision expectation, every later write must name the revision it observed, and a stale expectation is a constraint conflict, so a reload writer holding an older snapshot can never overwrite a newer active limit.
 
+Store format v10 (#139) adds one nullable column, `recovery_intents.retirement_generation`, and no tables. Opening a v9 store adds it inside the same idempotent upgrade transaction and stamps `user_version = 10`; the column records the evidence generation a retirement was decided from, so a stale retirement decision cannot overwrite a newer intent's ownership.
+
 Retention treats intake rows like the commands ledger: they are replay-critical identity and recovery evidence, never body-catalog entries, and no cleanup path deletes them. `request_payload` and candidate `payload` follow the same rule — they are retained because recovery and audit need them; if a future retention limit cannot preserve that, the tradeoff surfaces to the owner rather than silently deleting.
 
 ## Query results

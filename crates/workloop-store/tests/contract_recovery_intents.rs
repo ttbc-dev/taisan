@@ -142,6 +142,17 @@ fn schedule(
     kind: &str,
     due_at: i64,
 ) -> String {
+    schedule_at_generation(store, work_id, execution_id, kind, due_at, 1)
+}
+
+fn schedule_at_generation(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    execution_id: Option<&ExecutionId>,
+    kind: &str,
+    due_at: i64,
+    generation: u64,
+) -> String {
     store
         .transact(|tx| {
             let intent_id = tx.alloc_id("ri")?;
@@ -153,16 +164,59 @@ fn schedule(
                     execution_id: execution_id.cloned(),
                     kind: kind.into(),
                     due_at_unix_seconds: due_at,
-                    generation: 1,
+                    generation,
                     evidence_basis: "test".into(),
                     state: RecoveryIntentState::Pending,
                     retirement_reason: None,
+                    retirement_generation: None,
                     scheduled_seq,
                 },
             })?;
             Ok(intent_id)
         })
         .unwrap()
+}
+
+/// Record one pending outbox host write for the Work, making
+/// `projection::outstanding_actions` non-empty until it reconciles.
+fn outstanding_host_write(store: &SqliteStore, work_id: &WorkId) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertHostActionIntent {
+                intent: HostActionIntent {
+                    action_id: format!("act-outstanding-{}", work_id.0),
+                    work_id: work_id.clone(),
+                    host: host(),
+                    repository: repo(),
+                    role: ActorRole::Publication,
+                    actor: publisher(),
+                    action: HostAction::PushRef {
+                        branch: format!("work/{}", work_id.0),
+                        produced: CommitRevision::new(repo(), "artifact-digest").unwrap(),
+                        expected_prior: None,
+                    },
+                    payload_digest: "test".into(),
+                    status: HostActionStatus::Pending,
+                    authenticated_actor: None,
+                    effects: vec![],
+                    created_seq: 0,
+                },
+            })
+        })
+        .unwrap();
+}
+
+fn reconcile_host_write(store: &SqliteStore, work_id: &WorkId) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateHostActionIntent {
+                action_id: format!("act-outstanding-{}", work_id.0),
+                status: HostActionStatus::Applied,
+                authenticated_actor: Some(publisher()),
+                effects: vec![],
+            })
+        })
+        .unwrap();
 }
 
 fn consume(
@@ -266,6 +320,125 @@ fn terminal_execution_evidence_retires_the_intent() {
         Some("execution_terminal"),
         "retirement records why the intent can never fire"
     );
+    assert_eq!(
+        row.retirement_generation,
+        Some(row.generation),
+        "retirement records the evidence generation that invalidated it"
+    );
+}
+
+#[test]
+fn a_stale_retirement_generation_cannot_retire_a_newer_intent() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-stale-retire");
+    let intent_id =
+        schedule_at_generation(&store, &work_id, Some(&execution_id), "requeue", NOW, 5);
+
+    // A decision made from evidence older than the intent's scheduling
+    // generation cannot retire it: the newer intent stays pending for
+    // the pass that owns the current evidence.
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateRecoveryIntent {
+                intent_id: intent_id.clone(),
+                state: RecoveryIntentState::Retired,
+                retirement_reason: Some("execution_terminal".into()),
+                evidence_generation: Some(4),
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending,
+        "a stale decision never retires a newer intent"
+    );
+
+    // Evidence at or beyond the intent's generation retires it and the
+    // generation is recorded.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateRecoveryIntent {
+                intent_id: intent_id.clone(),
+                state: RecoveryIntentState::Retired,
+                retirement_reason: Some("execution_terminal".into()),
+                evidence_generation: Some(5),
+            })
+        })
+        .unwrap();
+    let row = intent(&store, &intent_id);
+    assert_eq!(row.state, RecoveryIntentState::Retired);
+    assert_eq!(row.retirement_generation, Some(5));
+
+    // Retirement stays idempotent: a repeated retire is a no-op and does
+    // not rewrite the recorded evidence generation.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateRecoveryIntent {
+                intent_id: intent_id.clone(),
+                state: RecoveryIntentState::Retired,
+                retirement_reason: Some("stale-repeat".into()),
+                evidence_generation: Some(3),
+            })
+        })
+        .unwrap();
+    let row = intent(&store, &intent_id);
+    assert_eq!(row.retirement_reason.as_deref(), Some("execution_terminal"));
+    assert_eq!(row.retirement_generation, Some(5));
+}
+
+#[test]
+fn a_retirement_older_than_the_current_work_generation_is_stale() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-stale-work");
+    let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    // Newer Work evidence supersedes the decision's generation.
+    store
+        .transact(|tx| {
+            let mut work = tx.work(&work_id)?.unwrap();
+            let expected = work.version;
+            work.version += 1;
+            tx.apply(&Effect::UpdateWork { work, expected })
+        })
+        .unwrap();
+
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateRecoveryIntent {
+                intent_id: intent_id.clone(),
+                state: RecoveryIntentState::Retired,
+                retirement_reason: Some("execution_terminal".into()),
+                evidence_generation: Some(1),
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending
+    );
+
+    // Evidence at the current Work generation retires it.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateRecoveryIntent {
+                intent_id: intent_id.clone(),
+                state: RecoveryIntentState::Retired,
+                retirement_reason: Some("execution_terminal".into()),
+                evidence_generation: Some(2),
+            })
+        })
+        .unwrap();
+    let row = intent(&store, &intent_id);
+    assert_eq!(row.state, RecoveryIntentState::Retired);
+    assert_eq!(row.retirement_generation, Some(2));
 }
 
 #[test]
@@ -564,6 +737,114 @@ fn the_work_wide_time_ceiling_blocks_a_requeue() {
 }
 
 #[test]
+fn an_exhausted_invocation_budget_defers_terminal_while_a_host_write_is_outstanding() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-budget-outstanding");
+    pause(&store, &execution_id, vec![]);
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&execution_id)?.unwrap();
+            e.budget.max_invocations = 0;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Paused,
+            })
+        })
+        .unwrap();
+    outstanding_host_write(&store, &work_id);
+    let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.consumed, 0);
+    assert_eq!(scan.failed_terminal, 0);
+    assert!(
+        scan.held
+            .iter()
+            .any(|(id, reason)| id == &intent_id && reason == "outbox_reconciliation"),
+        "the terminal settlement is held, not applied: {scan:?}"
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending,
+        "an intent that was not applied stays pending"
+    );
+    assert_eq!(
+        execution(&store, &execution_id).state,
+        ExecutionState::Paused,
+        "a paused Execution is not terminally settled under an outstanding host write"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == execution_id && d.reason == "outbox_reconciliation")
+    );
+
+    // Once the host write reconciles, the same intent settles terminal.
+    reconcile_host_write(&store, &work_id);
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.failed_terminal, 1);
+    assert_eq!(scan.requeued, 0);
+    assert_eq!(
+        execution(&store, &execution_id).state,
+        ExecutionState::Failed
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Consumed
+    );
+}
+
+#[test]
+fn the_work_wide_time_ceiling_defers_terminal_while_a_host_write_is_outstanding() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-time-outstanding");
+    pause(&store, &execution_id, vec![]);
+    let work = store.transact(|tx| tx.work(&work_id)).unwrap().unwrap();
+    let limit = work.policy.automatic_time_limit_seconds;
+    store
+        .transact(|tx| {
+            let mut usage = tx.work_usage(&work_id)?.unwrap();
+            usage.first_dispatch_unix_seconds = Some(NOW - limit as i64 - 100);
+            tx.apply(&Effect::UpdateWorkUsage { usage })
+        })
+        .unwrap();
+    outstanding_host_write(&store, &work_id);
+    let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.consumed, 0);
+    assert_eq!(scan.failed_terminal, 0);
+    assert!(
+        scan.held
+            .iter()
+            .any(|(id, reason)| id == &intent_id && reason == "outbox_reconciliation"),
+        "the terminal settlement is held, not applied: {scan:?}"
+    );
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending
+    );
+    assert_eq!(
+        execution(&store, &execution_id).state,
+        ExecutionState::Paused
+    );
+
+    // Reconciled: the ceiling now settles the Execution terminal.
+    reconcile_host_write(&store, &work_id);
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.failed_terminal, 1);
+    let e = execution(&store, &execution_id);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(e.terminal_code.as_deref(), Some("automatic_time_exhausted"));
+    assert_eq!(
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Consumed
+    );
+}
+
+#[test]
 fn a_long_human_pause_does_not_count_against_the_automatic_time_ceiling() {
     let store = SqliteStore::in_memory(2).unwrap();
     let (work_id, execution_id) = submit(&store, "k-time-pause");
@@ -616,6 +897,7 @@ fn intent_state_transitions_are_closed_and_idempotent() {
                 intent_id: intent_id.clone(),
                 state: RecoveryIntentState::Retired,
                 retirement_reason: Some("terminal".into()),
+                evidence_generation: Some(1),
             })
         })
         .unwrap();
@@ -625,6 +907,7 @@ fn intent_state_transitions_are_closed_and_idempotent() {
                 intent_id: intent_id.clone(),
                 state: RecoveryIntentState::Retired,
                 retirement_reason: Some("terminal".into()),
+                evidence_generation: Some(1),
             })
         })
         .unwrap();
@@ -637,6 +920,7 @@ fn intent_state_transitions_are_closed_and_idempotent() {
                 intent_id: intent_id.clone(),
                 state: RecoveryIntentState::Pending,
                 retirement_reason: None,
+                evidence_generation: None,
             })
         })
         .unwrap_err();
@@ -651,6 +935,7 @@ fn intent_state_transitions_are_closed_and_idempotent() {
                 intent_id: intent_id.clone(),
                 state: RecoveryIntentState::Consumed,
                 retirement_reason: None,
+                evidence_generation: None,
             })
         })
         .unwrap_err();

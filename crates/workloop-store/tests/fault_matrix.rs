@@ -204,6 +204,7 @@ fn seed_intent(
                     evidence_basis: "fault matrix fixture".into(),
                     state: RecoveryIntentState::Pending,
                     retirement_reason: None,
+                    retirement_generation: None,
                     scheduled_seq,
                 },
             })?;
@@ -371,6 +372,11 @@ fn lp_21_terminal_evidence_retires_the_intent() {
     assert_eq!(
         recorded.retirement_reason.as_deref(),
         Some("execution_terminal")
+    );
+    assert_eq!(
+        recorded.retirement_generation,
+        Some(recorded.generation),
+        "LP-21 retirement records the evidence generation"
     );
 
     // Restart cannot resurrect the retired intent.

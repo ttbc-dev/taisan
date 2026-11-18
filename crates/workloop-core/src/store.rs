@@ -133,11 +133,16 @@ pub enum Effect {
         intent: RecoveryIntent,
     },
     /// Moves one recovery intent through its closed lifecycle. The store
-    /// enforces the row exists; Core decides the transition.
+    /// enforces the row exists; Core decides the transition. A retirement
+    /// carries the evidence generation it was decided from: the store
+    /// refuses an evidence generation older than the intent's scheduling
+    /// generation or the Work's current generation (a stale decision
+    /// cannot retire against newer evidence) and records it on the row.
     UpdateRecoveryIntent {
         intent_id: String,
         state: RecoveryIntentState,
         retirement_reason: Option<String>,
+        evidence_generation: Option<u64>,
     },
     /// Records one intake invocation (`docs/intake-identity-storage.md`).
     /// At most one run may be `open`/`admitting` at a time; a second
@@ -541,7 +546,7 @@ pub enum RecoveryIntentState {
 /// A durable recovery intent persisted in the deciding transaction:
 /// `(kind, due_at, generation, evidence_basis)` under one Work, fired at
 /// most once by the recovery-scheduling phase, retired with a reason
-/// when terminal evidence invalidates it.
+/// and the evidence generation when terminal evidence invalidates it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryIntent {
     pub intent_id: String,
@@ -553,6 +558,9 @@ pub struct RecoveryIntent {
     pub evidence_basis: String,
     pub state: RecoveryIntentState,
     pub retirement_reason: Option<String>,
+    /// The evidence generation a retirement was decided from; `None`
+    /// while the intent is pending or consumed.
+    pub retirement_generation: Option<u64>,
     pub scheduled_seq: EventSequence,
 }
 

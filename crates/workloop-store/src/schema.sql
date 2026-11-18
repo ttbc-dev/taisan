@@ -1,11 +1,12 @@
--- workloop v9 store: current-state tables enforcing structural
+-- workloop v10 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 9` marks the format; a stamped older file with
+-- `PRAGMA user_version = 10` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
 -- candidate tables specified in docs/intake-identity-storage.md; v9
--- added the intake_settings admission record (#213).
+-- added the intake_settings admission record (#213); v10 added the
+-- recovery_intents.retirement_generation column (#139).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -325,7 +326,8 @@ CREATE TABLE IF NOT EXISTS run_lease (
 -- Durable recovery intents: (pending | consumed | retired), scheduled
 -- in the deciding transaction and fired exactly once by the loop's
 -- recovery-scheduling phase. `generation` pins retirement to the
--- evidence generation that invalidated the intent.
+-- evidence generation that invalidated the intent; the retirement
+-- records that generation and may never predate the row's own.
 CREATE TABLE IF NOT EXISTS recovery_intents (
     intent_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
@@ -337,6 +339,7 @@ CREATE TABLE IF NOT EXISTS recovery_intents (
     state TEXT NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'consumed', 'retired')),
     retirement_reason TEXT,
+    retirement_generation INTEGER,
     scheduled_seq INTEGER NOT NULL
 );
 

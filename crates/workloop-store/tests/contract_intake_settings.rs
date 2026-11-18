@@ -1,7 +1,7 @@
 //! Intake settings contract (#213): the installation-wide pending-queue
 //! limit enforced atomically inside the submit transaction, the
 //! revision-guarded settings record, the read-only bounded preflight
-//! view, retry/resume bypass, and the additive v8→v9 upgrade.
+//! view, retry/resume bypass, and the additive v8→current upgrade.
 
 use std::collections::BTreeSet;
 
@@ -748,10 +748,10 @@ fn an_over_bound_preflight_scope_fails_explicitly() {
     assert!(preflight(&store, &at_bound).is_ok());
 }
 
-// --- the v8 → v9 upgrade -------------------------------------------------
+// --- the v8 → current upgrade ---------------------------------------------
 
 #[test]
-fn a_v8_store_upgrades_to_v9_additively() {
+fn a_v8_store_upgrades_to_the_current_format_additively() {
     let root =
         std::env::temp_dir().join(format!("workloop-intake-settings-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -784,7 +784,7 @@ fn a_v8_store_upgrades_to_v9_additively() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     // The new table exists and reads empty — the documented default
     // applies until a guarded write lands.
