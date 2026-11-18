@@ -2979,10 +2979,14 @@ impl TxView for Tx<'_> {
                 // link NULL (a deferred candidate must never look
                 // decided), a rejection never creates Work, and the
                 // decided statuses carry the command identity their
-                // outcome came from. A replay must mirror the saved
-                // decision: when that decision accepted and created a
-                // Work, the candidate links the original Work; when it
-                // rejected, the candidate links no Work.
+                // outcome came from. The linked ledger row itself must
+                // agree: a status can never contradict the saved
+                // decision it points at, and `committed_seq` is that
+                // decision's `committed_at`, not an arbitrary value.
+                // A replay must mirror the saved decision: when that
+                // decision accepted and created a Work, the candidate
+                // links the original Work; when it rejected, the
+                // candidate links no Work.
                 let saved_decision = match candidate.command_id.as_ref() {
                     Some(id) => self.command_decision(id)?,
                     None => None,
@@ -2995,31 +2999,47 @@ impl TxView for Tx<'_> {
                     | IntakeCandidateStatus::CapacityDeferred
                     | IntakeCandidateStatus::Unknown
                     | IntakeCandidateStatus::Interrupted => links_clear,
-                    IntakeCandidateStatus::Rejected => {
-                        candidate.work_id.is_none()
-                            && candidate.command_id.is_some()
-                            && candidate.committed_seq.is_some()
-                    }
-                    IntakeCandidateStatus::Accepted => {
-                        candidate.command_id.is_some()
-                            && candidate.work_id.is_some()
-                            && candidate.committed_seq.is_some()
-                    }
-                    IntakeCandidateStatus::Replayed => {
-                        candidate.command_id.is_some()
-                            && candidate.committed_seq.is_some()
-                            && match &saved_decision {
-                                Some(CommandDecision::Accepted { work_id, .. }) => {
-                                    work_id.is_some() && candidate.work_id == *work_id
-                                }
-                                Some(CommandDecision::Rejected { .. }) => {
-                                    candidate.work_id.is_none()
-                                }
-                                // An absent ledger row is refused by the
-                                // command_id foreign key, not this rule.
-                                None => true,
-                            }
-                    }
+                    IntakeCandidateStatus::Rejected => match &saved_decision {
+                        Some(CommandDecision::Rejected { committed_at, .. }) => {
+                            candidate.command_id.is_some()
+                                && candidate.work_id.is_none()
+                                && candidate.committed_seq == Some(*committed_at)
+                        }
+                        _ => false,
+                    },
+                    IntakeCandidateStatus::Accepted => match &saved_decision {
+                        Some(CommandDecision::Accepted {
+                            work_id,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && work_id.is_some()
+                                && candidate.work_id == *work_id
+                                && candidate.committed_seq == Some(*committed_at)
+                        }
+                        _ => false,
+                    },
+                    IntakeCandidateStatus::Replayed => match &saved_decision {
+                        Some(CommandDecision::Accepted {
+                            work_id,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && work_id.is_some()
+                                && candidate.work_id == *work_id
+                                && candidate.committed_seq == Some(*committed_at)
+                        }
+                        Some(CommandDecision::Rejected { committed_at, .. }) => {
+                            candidate.command_id.is_some()
+                                && candidate.work_id.is_none()
+                                && candidate.committed_seq == Some(*committed_at)
+                        }
+                        // An absent ledger row is refused here as well as
+                        // by the command_id foreign key.
+                        None => false,
+                    },
                 };
                 if !links_ok {
                     return Err(StoreError::ConstraintConflict {
