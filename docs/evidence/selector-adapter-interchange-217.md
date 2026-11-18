@@ -56,12 +56,23 @@ added without extending the suite.
 | Out-of-scope source facts rejected | Passed | Passed |
 | Contradictory facts fail closed | Passed | Passed |
 | Duplicate facts across pages deduplicate | Passed | Passed |
+| Empty page list is a source failure | Passed | Passed |
+| Oversized response rejected identically | Passed | Passed |
 
 `contract_proposal_keys_match_across_adapters` recomputes the
 `proposal-v1` digest for every candidate on both executables and
 requires byte-identical keys — digest interoperability, not just
 shape compatibility. Every fixture response additionally passes the
 same `protocol::validate_response` the intake coordinator runs.
+
+`contract_oversized_response_is_rejected_identically` pins behavior
+at the response bound: an adversarial-but-valid request (maximum
+constraints echoed by 32 candidates) makes **both** executables emit
+the same over-limit `status:"ok"` envelope, which the launcher's
+`validate_response` rejects wholesale as `response_too_large`. The
+response bound is launcher-enforced by protocol design — neither
+adapter self-truncates — and the scenario proves the two
+implementations stay identical even there.
 
 ## Fixture-only grouping results
 
@@ -107,7 +118,7 @@ issue.
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo build --workspace` | Passed |
-| `cargo test --workspace` | Passed — 105 test targets, 1038 tests, 0 failures |
+| `cargo test --workspace` | Passed — 105 test targets, 1040 tests, 0 failures |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 
 ## Scope of the claim

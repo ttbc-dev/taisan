@@ -14,7 +14,7 @@ mod common;
 use common::*;
 use workloop_core::domain::canonical_json;
 use workloop_core::identity::{IssueId, IssueRef, RepositoryId, RepositoryRef};
-use workloop_selector::protocol::{self, FailureCode, SelectorReply};
+use workloop_selector::protocol::{self, FailureCode, RequestSpec, SelectorReply};
 use workloop_selector::{IssueState, SELECTOR_VERSION};
 
 /// Structural pin for the suite itself: it must exercise exactly the
@@ -870,5 +870,112 @@ fn contract_duplicate_facts_across_pages_dedup() {
             panic!("{}: expected success", adapter.name);
         };
         assert_eq!(candidates.len(), 1, "{}", adapter.name);
+    }
+}
+
+#[test]
+fn contract_empty_page_list_is_a_source_failure() {
+    for adapter in ADAPTERS {
+        let dir = tmp_dir(adapter, "emptypages");
+        let r = repo();
+        // A repository whose scripted source declares zero pages:
+        // there is no complete scan to admit, so both adapters must
+        // fail the invocation `source_unavailable` — never an empty
+        // "successful" scan.
+        let sources = write_sources(&dir, serde_json::json!({ repo_key(&r): { "pages": [] } }));
+        let repositories = vec![r];
+        let spec = request_spec(adapter, "req-empty", &repositories, &[], 8, deadline_ms());
+        let now = deadline_ms() - 30_000;
+        let request = protocol::prepare_request(&spec, now).unwrap();
+        let (stdout, _, code) = run_exe(adapter, &sources_arg(&sources), &request.bytes);
+        assert_eq!(code, Some(0), "{}", adapter.name);
+        let reply = protocol::validate_response(&stdout, &request)
+            .unwrap_or_else(|v| panic!("{}: non-conforming response: {v:?}", adapter.name));
+        let SelectorReply::Failure { code: failure, .. } = reply else {
+            panic!("{}: expected failure, got {reply:?}", adapter.name);
+        };
+        assert_eq!(failure, FailureCode::SourceUnavailable, "{}", adapter.name);
+    }
+}
+
+#[test]
+fn contract_oversized_response_is_rejected_identically() {
+    for adapter in ADAPTERS {
+        let dir = tmp_dir(adapter, "toobig");
+        let r = repo();
+        // An adversarial-but-valid request: 32 eligible facts and the
+        // maximum constraint payload every candidate must echo. The
+        // response bound is launcher-enforced — neither adapter
+        // self-truncates — so both must emit the same over-limit
+        // `status:"ok"` envelope that validate_response rejects
+        // wholesale. Identical observable behavior is the contract.
+        let issues: Vec<serde_json::Value> = (0..32)
+            .map(|i| {
+                fact_json(
+                    &issue(100 + i, &format!("i-{i:02}")),
+                    "open",
+                    &["intake"],
+                    100 + i as i64,
+                    &format!("work {i:02}"),
+                    &format!("rev-{i}"),
+                    &format!("digest-{i}"),
+                    None,
+                )
+            })
+            .collect();
+        let sources = write_sources(
+            &dir,
+            serde_json::json!({
+                repo_key(&r): { "pages": [{ "issues": issues }] }
+            }),
+        );
+        let repositories = vec![r];
+        let constraints: Vec<String> = (0..64)
+            .map(|i| format!("constraint-{i:02}-{}", "x".repeat(4000)))
+            .collect();
+        let spec = RequestSpec {
+            request_id: "req-toobig",
+            selector: adapter.selector,
+            selector_version: SELECTOR_VERSION,
+            policy_revision: 3,
+            repositories: &repositories,
+            excluded_sources: &[],
+            max_candidates: 32,
+            deadline_unix_ms: deadline_ms(),
+            task_constraints: Box::leak(constraints.into_boxed_slice()),
+            verification_argv: Box::leak(vec!["true".to_string()].into_boxed_slice()),
+            required_permissions: Box::leak(vec!["source:read".to_string()].into_boxed_slice()),
+        };
+        let now = deadline_ms() - 30_000;
+        let request = protocol::prepare_request(&spec, now).unwrap();
+        let (stdout, _, code) = run_exe(adapter, &sources_arg(&sources), &request.bytes);
+        assert_eq!(code, Some(0), "{}", adapter.name);
+        assert!(
+            stdout.len() > protocol::MAX_RESPONSE_BYTES,
+            "{}: expected an over-limit response, got {} bytes",
+            adapter.name,
+            stdout.len()
+        );
+        let value: serde_json::Value = serde_json::from_slice(&stdout)
+            .unwrap_or_else(|e| panic!("{}: oversized stdout is not JSON: {e}", adapter.name));
+        assert_eq!(value["status"], "ok", "{}", adapter.name);
+        assert_eq!(
+            value["candidates"].as_array().unwrap().len(),
+            32,
+            "{}",
+            adapter.name
+        );
+        // The launcher's whole-response bound rejects it — for both
+        // adapters identically.
+        let violation = protocol::validate_response(&stdout, &request)
+            .expect_err("oversized response must not validate");
+        assert!(
+            matches!(
+                violation,
+                protocol::Violation::Contract("response_too_large")
+            ),
+            "{}: unexpected violation {violation:?}",
+            adapter.name
+        );
     }
 }
