@@ -2879,7 +2879,6 @@ impl TxView for Tx<'_> {
                         | (S::Unknown, S::Accepted)
                         | (S::Unknown, S::Replayed)
                         | (S::Unknown, S::Rejected)
-                        | (S::Unknown, S::Pending)
                         | (S::Unknown, S::Interrupted)
                 );
                 if !legal {

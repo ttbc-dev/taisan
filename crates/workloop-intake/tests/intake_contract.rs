@@ -846,7 +846,7 @@ fn mid_batch_capacity_loss_defers_the_unattempted_remainder() {
 /// submit leaves no partial rows.
 #[test]
 fn a_submit_store_fault_halts_and_reconciles_the_candidate() {
-    let dir = tmp_root("unknown-candidate");
+    let dir = tmp_root("interrupted-candidate");
     let db = dir.join("workloop.db");
     let proposals = vec![
         proposal("issue-1", "first work"),
@@ -917,6 +917,25 @@ fn a_submit_store_fault_halts_and_reconciles_the_candidate() {
         })
         .unwrap();
     assert!(decision.is_none(), "aborted submit must leave no decision");
+
+    // The wedge this guards against: a second invocation must not be
+    // refused as `ActiveRun` — the interrupted run freed the active
+    // slot, so a fresh run records and reaches a terminal state (the
+    // fixed script's replayed proposals now collide with exclusions,
+    // so `failed` is the expected honest outcome here).
+    let second = run(&f, Duration::from_secs(10));
+    assert_ne!(second.run_id, report.run_id);
+    assert!(
+        matches!(
+            second.state,
+            IntakeRunState::Completed
+                | IntakeRunState::Failed
+                | IntakeRunState::Interrupted
+                | IntakeRunState::Skipped
+        ),
+        "second invocation must reach a terminal state, got {:?}",
+        second.state
+    );
 }
 
 /// A store fault that propagates out of the batch insert must not

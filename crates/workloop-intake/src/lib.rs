@@ -282,11 +282,11 @@ pub fn run_intake(
     match complete_intake(store, params, &run_id, &request, now_unix_seconds) {
         Ok(report) => Ok(report),
         Err(error) => {
-            abort_run(
+            interrupt_invocation(
                 store,
                 params.actor,
                 &run_id,
-                "store_error",
+                InterruptDetail::StoreError,
                 now_unix_seconds,
             );
             Err(error)
@@ -409,11 +409,11 @@ fn complete_intake(
         }))
     })?;
     if unresolved {
-        abort_run(
+        interrupt_invocation(
             store,
             params.actor,
             run_id,
-            "unresolved_candidates",
+            InterruptDetail::UnresolvedCandidates,
             now_unix_seconds,
         );
     } else {
@@ -845,18 +845,45 @@ fn finish_run(
     })
 }
 
+/// The bounded `detail_code` values a live owner records when it
+/// closes its own run `interrupted` — distinct from the
+/// recovery-origin codes (`owner_lost`, `no_conforming_response`)
+/// a dead owner's sweep writes.
+#[derive(Clone, Copy)]
+enum InterruptDetail {
+    /// A store fault propagated out of the invocation.
+    StoreError,
+    /// Admission halted with candidates still unresolved.
+    UnresolvedCandidates,
+}
+
+impl InterruptDetail {
+    fn code(self) -> &'static str {
+        match self {
+            Self::StoreError => "store_error",
+            Self::UnresolvedCandidates => "unresolved_candidates",
+        }
+    }
+}
+
 /// Best-effort close of a run whose live-owner invocation ended
 /// without reaching a terminal state — either a propagating store
-/// fault (`store_error`) or unresolved candidates after admission
-/// halted (`unresolved_candidates`). Without this, the run would stay
-/// `open`/`admitting` owned by *this live process*: every later
-/// invocation reads it as the active run and refuses, and recovery
-/// sees a live owner — intake wedges until process restart.
-/// The guarded write only fires while the run is still non-terminal,
-/// so an already-`completed`/`failed` run is untouched; the recovery
-/// sweep then reconciles any persisted candidates against the ledger
-/// instead of leaving them for the next restart.
-fn abort_run(store: &SqliteStore, actor: &Actor, run_id: &str, detail: &str, now: i64) {
+/// fault or unresolved candidates after admission halted. Without
+/// this, the run would stay `open`/`admitting` owned by *this live
+/// process*: every later invocation reads it as the active run and
+/// refuses, and recovery sees a live owner — intake wedges until
+/// process restart. The guarded write only fires while the run is
+/// still non-terminal, so an already-`completed`/`failed` run is
+/// untouched; the recovery sweep then reconciles any persisted
+/// candidates against the ledger instead of leaving them for the
+/// next restart.
+fn interrupt_invocation(
+    store: &SqliteStore,
+    actor: &Actor,
+    run_id: &str,
+    detail: InterruptDetail,
+    now: i64,
+) {
     let state = store
         .transact_deferred(|tx| Ok(tx.intake_run(run_id)?.map(|r| r.state)))
         .ok()
@@ -866,7 +893,7 @@ fn abort_run(store: &SqliteStore, actor: &Actor, run_id: &str, detail: &str, now
             tx.apply(&Effect::UpdateIntakeRun {
                 run_id: run_id.to_string(),
                 state: IntakeRunState::Interrupted,
-                detail_code: Some(detail.to_string()),
+                detail_code: Some(detail.code().to_string()),
                 finished_unix_seconds: Some(now),
                 expected_state: state,
             })

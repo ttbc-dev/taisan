@@ -110,11 +110,11 @@ Candidate statuses:
 | `rejected` | Ordinary final rejection (overlap, ineligible, invalid, unsupported capability, …) with `status_reason` = rejection code | `command_id`, `committed_seq`; `work_id` stays NULL — a rejection never creates Work |
 | `capacity_deferred` | Admission was refused for capacity before any decision was recorded; deferrable, not final | none — see below |
 | `unknown` | A submit's outcome is undetermined (store fault, lost response); reconcile via the saved command identity | none until reconciled |
-| `interrupted` | The run was interrupted before this candidate was attempted or resolved | none |
+| `interrupted` | The run ended before this candidate's outcome was resolved — never attempted, or attempted with an undetermined outcome that reconciliation proved had no saved decision | none |
 
 `capacity_deferred` is terminal *as a stored status*: the candidate row never transitions again, and run completion counts it among the terminal outcomes. "Not final" refers only to the command ledger — no decision was saved under the replay key, so a later run re-proposing the same semantic proposal submits fresh. Deferral is never retried by mutating this row.
 
-Allowed transitions: `pending` → `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `interrupted`, or to `unknown`; `unknown` → `accepted`, `replayed`, `rejected`, `pending` (the ledger proves no decision exists), or `interrupted`. `accepted`, `replayed`, `rejected`, `capacity_deferred`, and `interrupted` are the terminal candidate statuses — none has an outgoing transition. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
+Allowed transitions: `pending` → `accepted`, `replayed`, `rejected`, `capacity_deferred`, `interrupted`, or `unknown`; `unknown` → `accepted`, `replayed`, `rejected`, or `interrupted` (reconciliation either finds the saved decision and fixes the terminal status, or proves none exists and interrupts the candidate — it never returns a candidate to `pending`, because an interrupted run has no admission pass left to re-drive it). `accepted`, `replayed`, `rejected`, `capacity_deferred`, and `interrupted` are the terminal candidate statuses — none has an outgoing transition. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
 
 The Links column is enforced by the store, not just documented: unresolved statuses (`pending`, `capacity_deferred`, `unknown`, `interrupted`) must keep `command_id`/`work_id`/`committed_seq` all NULL; `rejected` requires `command_id` and `committed_seq` and forbids `work_id`; `accepted` requires all three; `replayed` requires `command_id` and `committed_seq` with `work_id` present only when the saved decision created Work.
 
@@ -165,7 +165,7 @@ The pending-queue limit itself, its atomic enforcement inside submit, and the pr
 
 Recovery (#208) consumes these records; this section fixes the contract it relies on.
 
-- A run in `open` or `admitting` whose owner is proven gone is marked `interrupted` with a bounded `detail_code` (`owner_lost`, `no_conforming_response`, or `unresolved_candidates`). Unknown liveness retains exclusion — the run is not touched.
+- A run in `open` or `admitting` whose owner is proven gone is marked `interrupted` with a bounded recovery-origin `detail_code` (`owner_lost`, `no_conforming_response`). Unknown liveness retains exclusion — the run is not touched. Live-owner closes use the separate codes `store_error` / `unresolved_candidates` (next bullet).
 - A live owner never leaves its own run `admitting`. When admission halts with `pending`/`unknown` candidates, or a propagating store fault ends the invocation, the owner closes the run `interrupted` (`unresolved_candidates` / `store_error`) and runs the same ledger reconciliation sweep recovery uses — the next invocation is not wedged behind the active-run guard, and no candidate is silently acknowledged. `admitting` therefore only ever belongs to a live in-flight invocation or a dead owner awaiting the sweep.
 - Candidates still `pending` or `unknown` under an interrupted run are reconciled against the command ledger by `replay_key` before any further admission: found decisions fix terminal status and links; absent decisions mark the candidate `interrupted` — never silently acknowledged as accepted. An interrupted candidate is terminal; a later run re-proposing the same semantic proposal creates a fresh candidate and submits fresh, because no decision exists under its replay key.
 - A run left `admitting` whose candidates are all terminal is closed `completed`.
@@ -201,7 +201,7 @@ Values are illustrative, not fetched identities or executed evidence.
 | Scheduled tick re-proposes an already-admitted semantic proposal | new run `scheduled_interval`; candidate `replayed` linking the original `command_id`/`work_id`; no second Work |
 | Queue full at preflight | run `skipped`/`queue_full`, zero candidates, no adapter launch recorded |
 | Exclusion set beyond the wire bound at preflight | run `skipped`/`exclusions_overflow`, zero candidates, no adapter launch recorded — exclusions are never truncated to fit |
-| Store fault after the run record commits | run `interrupted`/`store_error` (best-effort); persisted candidates reconcile through the ledger — a live owner never leaves a non-terminal run behind |
+| Store fault after the run record commits | run `interrupted` — `store_error` when the fault propagated out of the invocation, `unresolved_candidates` when a submit absorbed it and admission halted (best-effort either way); persisted candidates reconcile through the ledger — a live owner never leaves a non-terminal run behind |
 | Adapter exits nonzero | run `failed`/`transport_failure`, zero candidates |
 | Owner dies after batch persisted, before first submit | run `admitting` + all candidates `pending` → recovery marks run `interrupted`, candidates reconciled via ledger |
 | Submit commits, candidate update crashes | candidate `pending`, ledger holds decision → recovery links it `accepted`/`replayed`/`rejected` |
