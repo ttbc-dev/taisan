@@ -760,6 +760,21 @@ fn opt_de_row<T: serde::de::DeserializeOwned>(
     s.map(|v| de_row(&v)).transpose()
 }
 
+/// A stored command's idempotency key belongs to `replay_key` when it
+/// is that key itself or its idempotency-conflict key
+/// (`<replay_key>#<digest>`), where the suffix is exactly that
+/// command's own payload digest — the form `handle_command` derives
+/// from the same origin/actor/key payload. A key that merely shares
+/// the prefix (an operator-chosen key, or a key whose selector itself
+/// contains `#`) is not this identity and cannot back the candidate.
+fn command_key_matches_replay(stored_key: &str, stored_digest: &str, replay_key: &str) -> bool {
+    stored_key == replay_key
+        || stored_key
+            .strip_prefix(replay_key)
+            .and_then(|suffix| suffix.strip_prefix('#'))
+            .is_some_and(|suffix| suffix == stored_digest)
+}
+
 /// Issue identity key: repository + opaque issue id — never the display
 /// number, which is presentational and must not participate in claims.
 fn issue_key(issue: &workloop_core::identity::IssueRef) -> String {
@@ -837,6 +852,34 @@ impl Tx<'_> {
         let mut stmt = self.tx.prepare(sql).map_err(internal)?;
         let rows = stmt.query_map(p, f).map_err(map_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(map_err)
+    }
+
+    /// The decision a candidate may link: the command row must belong
+    /// to the candidate's own replay identity, so a candidate can never
+    /// borrow an unrelated proposal's accepted command or Work. An
+    /// idempotency conflict is durable under
+    /// `<replay_key>#<payload_digest>`, which is the same identity with
+    /// the payload-derived suffix; a prefix-sharing key whose suffix is
+    /// not the command's own digest is not that identity.
+    fn command_decision_for_replay(
+        &self,
+        command_id: &CommandId,
+        replay_key: &str,
+    ) -> Result<Option<CommandDecision>, StoreError> {
+        let row: Option<(String, String, String)> = self.query_opt(
+            "SELECT idempotency_key, payload_digest, decision FROM commands \
+             WHERE command_id=?1",
+            params![command_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        match row {
+            Some((key, digest, decision))
+                if command_key_matches_replay(&key, &digest, replay_key) =>
+            {
+                Ok(Some(de_row(&decision).map_err(map_err)?))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -2704,28 +2747,32 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
-                // Field invariants (`docs/intake-identity-storage.md`):
-                // a live `open` run has no finish time and no failure
-                // code; `skipped` is terminal at insert, so it must
-                // already carry both. Malformed combinations conflict
-                // rather than being silently normalized.
-                let fields_ok = match run.state {
-                    IntakeRunState::Open => {
-                        run.detail_code.is_none() && run.finished_unix_seconds.is_none()
+                // Field invariants match the state table: a live run
+                // keeps `detail_code`/`finished_unix_seconds` NULL; a
+                // terminal insert (`skipped`) records both its bounded
+                // diagnostic and its finish time.
+                match run.state {
+                    IntakeRunState::Open
+                        if run.detail_code.is_some() || run.finished_unix_seconds.is_some() =>
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "live intake run {} must keep detail_code and finished_unix_seconds NULL",
+                                run.run_id
+                            ),
+                        });
                     }
-                    IntakeRunState::Skipped => {
-                        run.detail_code.is_some() && run.finished_unix_seconds.is_some()
+                    IntakeRunState::Skipped
+                        if run.detail_code.is_none() || run.finished_unix_seconds.is_none() =>
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "terminal intake run {} must record detail_code and finished_unix_seconds",
+                                run.run_id
+                            ),
+                        });
                     }
-                    _ => unreachable!("insert states are open or skipped"),
-                };
-                if !fields_ok {
-                    return Err(StoreError::ConstraintConflict {
-                        detail: format!(
-                            "intake run {} in state {} carries inconsistent run fields",
-                            run.run_id,
-                            tag(&run.state)
-                        ),
-                    });
+                    _ => {}
                 }
                 // Single-active backstop: the intake lease is the real
                 // mutex, but a second live run must conflict even if a
@@ -2905,13 +2952,12 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
-                // Field invariants (`docs/intake-identity-storage.md`):
-                // a live `admitting` transition keeps both diagnostic
-                // fields NULL; every terminal transition records a
-                // finish time — `completed` carries no detail code,
-                // `failed`/`interrupted` carry the bounded diagnostic.
+                // Field invariants match the state table: live runs
+                // keep both columns NULL, every terminal transition
+                // records a finish time, and only `failed`/`interrupted`
+                // carry a failure diagnostic.
                 let fields_ok = match state {
-                    IntakeRunState::Admitting => {
+                    IntakeRunState::Open | IntakeRunState::Admitting => {
                         detail_code.is_none() && finished_unix_seconds.is_none()
                     }
                     IntakeRunState::Completed => {
@@ -2920,29 +2966,29 @@ impl TxView for Tx<'_> {
                     IntakeRunState::Failed | IntakeRunState::Interrupted => {
                         detail_code.is_some() && finished_unix_seconds.is_some()
                     }
-                    _ => false,
+                    IntakeRunState::Skipped => false,
                 };
                 if !fields_ok {
                     return Err(StoreError::ConstraintConflict {
                         detail: format!(
-                            "intake run {run_id} -> {} carries inconsistent run fields",
+                            "intake run {run_id} transition to {} carries an inconsistent detail/finish field set",
                             tag(state)
                         ),
                     });
                 }
-                // `completed` means every candidate reached a
-                // recorded terminal status: `pending` and `unknown`
-                // still owe the ledger a decision, so the close
-                // conflicts rather than acknowledging them.
-                if matches!(
-                    (current_state, *state),
-                    (IntakeRunState::Admitting, IntakeRunState::Completed)
-                ) {
+                // `completed` means every candidate reached a resolved
+                // terminal status; a coordinator that still holds a
+                // `pending`/`unknown` candidate must close the run
+                // `interrupted` instead. An `interrupted` candidate is
+                // terminal but unresolved: recovery never closes such a
+                // run `completed`, so the store refuses it too.
+                if *state == IntakeRunState::Completed {
                     let unresolved: i64 = self
                         .tx
                         .query_row(
-                            "SELECT COUNT(*) FROM intake_candidates \
-                             WHERE run_id=?1 AND status IN ('pending','unknown')",
+                            "SELECT COUNT(*) FROM intake_candidates WHERE run_id=?1 \
+                             AND status NOT IN ('accepted', 'replayed', 'rejected', \
+                             'capacity_deferred')",
                             params![run_id],
                             |r| r.get(0),
                         )
@@ -2950,8 +2996,7 @@ impl TxView for Tx<'_> {
                     if unresolved > 0 {
                         return Err(StoreError::ConstraintConflict {
                             detail: format!(
-                                "intake run {run_id} cannot complete with \
-                                 {unresolved} non-terminal candidate(s)"
+                                "intake run {run_id} cannot complete with {unresolved} unresolved or interrupted candidates"
                             ),
                         });
                     }
@@ -2979,17 +3024,17 @@ impl TxView for Tx<'_> {
                 // a stale or terminal writer conflicts instead of
                 // regressing the row
                 // (`docs/intake-identity-storage.md`).
-                let current: Option<String> = self
+                let current: Option<(String, String)> = self
                     .tx
                     .query_row(
-                        "SELECT status FROM intake_candidates \
+                        "SELECT status, replay_key FROM intake_candidates \
                          WHERE run_id=?1 AND ordinal=?2",
                         params![candidate.run_id, i64::from(candidate.ordinal)],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()
                     .map_err(map_err)?;
-                let Some(current) = current else {
+                let Some((current, replay_key)) = current else {
                     return Err(StoreError::ConstraintConflict {
                         detail: format!(
                             "intake candidate {}/{} is absent",
@@ -3035,7 +3080,22 @@ impl TxView for Tx<'_> {
                 // link NULL (a deferred candidate must never look
                 // decided), a rejection never creates Work, and the
                 // decided statuses carry the command identity their
-                // outcome came from.
+                // outcome came from. The linked ledger row itself must
+                // agree: a status can never contradict the saved
+                // decision it points at, and `committed_seq` is that
+                // decision's `committed_at`, not an arbitrary value.
+                // A replay must mirror the saved decision: when that
+                // decision accepted and created a Work, the candidate
+                // links the original Work; when it rejected, the
+                // candidate links no Work. The linked ledger row is
+                // the decision stored under *this candidate's* replay
+                // key, not merely some command with the same shape — an
+                // accepted decision from another proposal's key cannot
+                // back this candidate.
+                let saved_decision = match candidate.command_id.as_ref() {
+                    Some(id) => self.command_decision_for_replay(id, &replay_key)?,
+                    None => None,
+                };
                 let links_clear = candidate.command_id.is_none()
                     && candidate.work_id.is_none()
                     && candidate.committed_seq.is_none();
@@ -3044,19 +3104,59 @@ impl TxView for Tx<'_> {
                     | IntakeCandidateStatus::CapacityDeferred
                     | IntakeCandidateStatus::Unknown
                     | IntakeCandidateStatus::Interrupted => links_clear,
-                    IntakeCandidateStatus::Rejected => {
-                        candidate.work_id.is_none()
-                            && candidate.command_id.is_some()
-                            && candidate.committed_seq.is_some()
-                    }
-                    IntakeCandidateStatus::Accepted => {
-                        candidate.command_id.is_some()
-                            && candidate.work_id.is_some()
-                            && candidate.committed_seq.is_some()
-                    }
-                    IntakeCandidateStatus::Replayed => {
-                        candidate.command_id.is_some() && candidate.committed_seq.is_some()
-                    }
+                    IntakeCandidateStatus::Rejected => match &saved_decision {
+                        Some(CommandDecision::Rejected {
+                            reason,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && candidate.work_id.is_none()
+                                && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.as_deref() == Some(tag(reason).as_str())
+                        }
+                        _ => false,
+                    },
+                    IntakeCandidateStatus::Accepted => match &saved_decision {
+                        Some(CommandDecision::Accepted {
+                            work_id,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && work_id.is_some()
+                                && candidate.work_id == *work_id
+                                && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.is_none()
+                        }
+                        _ => false,
+                    },
+                    IntakeCandidateStatus::Replayed => match &saved_decision {
+                        Some(CommandDecision::Accepted {
+                            work_id,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && work_id.is_some()
+                                && candidate.work_id == *work_id
+                                && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.is_none()
+                        }
+                        Some(CommandDecision::Rejected {
+                            reason,
+                            committed_at,
+                            ..
+                        }) => {
+                            candidate.command_id.is_some()
+                                && candidate.work_id.is_none()
+                                && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.as_deref() == Some(tag(reason).as_str())
+                        }
+                        // An absent ledger row is refused here as well as
+                        // by the command_id foreign key.
+                        None => false,
+                    },
                 };
                 if !links_ok {
                     return Err(StoreError::ConstraintConflict {
