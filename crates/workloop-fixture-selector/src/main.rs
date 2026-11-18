@@ -42,6 +42,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod strict;
+
 // --- Protocol constants -----------------------------------------------------
 //
 // Duplicated from docs/selector-protocol.md by necessity: an
@@ -413,6 +415,11 @@ fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, RequestViolation> {
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(RequestViolation::RequestTooLarge);
     }
+    // The wire contract's framing rules — duplicate keys, the depth
+    // bound, the control-free string alphabet, and single-value
+    // trailing — are stricter than serde_json's grammar; scan for
+    // them before the typed parse, as the reference does.
+    strict::scan(bytes).map_err(|_| RequestViolation::Other)?;
     let value: Value = serde_json::from_slice(bytes).map_err(|_| RequestViolation::Other)?;
     // Required-nullable keys must be present before the typed parse —
     // serde would silently accept an omitted `display_number`.

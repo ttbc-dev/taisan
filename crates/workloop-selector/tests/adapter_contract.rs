@@ -419,6 +419,44 @@ fn contract_rejects_malformed_and_wrong_version_requests() {
     }
 }
 
+/// The wire contract forbids duplicate object keys; `serde_json`
+/// alone would silently keep the last one and let an otherwise
+/// valid request through. Both adapters must refuse the payload
+/// with `invalid_request` — this is the framing rule the fixture's
+/// strict scan exists for.
+#[test]
+fn contract_rejects_duplicate_object_keys() {
+    for adapter in ADAPTERS {
+        let dir = tmp_dir(adapter, "dupkey");
+        let sources = write_sources(&dir, serde_json::json!({}));
+        let repositories = vec![repo()];
+        let spec = request_spec(adapter, "req-dup", &repositories, &[], 8, deadline_ms());
+        let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
+        let text = String::from_utf8(request.bytes.to_vec()).unwrap();
+        // Duplicate the request_id member verbatim: same key twice in
+        // one object, both values identical and valid.
+        let key = "\"request_id\":";
+        let start = text.find(key).unwrap();
+        let value_start = start + key.len();
+        let close = text[value_start + 1..].find('"').unwrap() + value_start + 1;
+        let member_end = close + 1;
+        let mut dup = String::with_capacity(text.len() + member_end - start + 1);
+        dup.push_str(&text[..member_end]);
+        dup.push(',');
+        dup.push_str(&text[start..member_end]);
+        dup.push_str(&text[member_end..]);
+        let (stdout, _, code) = run_exe(adapter, &sources_arg(&sources), dup.as_bytes());
+        assert_eq!(code, Some(0), "{}", adapter.name);
+        let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["status"], "error", "{}: {value}", adapter.name);
+        assert_eq!(
+            value["error"]["code"], "invalid_request",
+            "{}: {value}",
+            adapter.name
+        );
+    }
+}
+
 #[test]
 fn contract_omits_control_bearing_request_ids_from_failures() {
     for adapter in ADAPTERS {
