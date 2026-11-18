@@ -766,6 +766,71 @@ fn batch_evidence_refs_stay_within_the_envelope_bounds() {
     );
 }
 
+/// A full pending queue defers proposals instead of rejecting them:
+/// `capacity_deferred` carries the proposal's replay key but no
+/// command_id, the key resolves to no recorded decision, and the batch
+/// keeps admitting what fits.
+#[test]
+fn a_full_queue_defers_proposals_without_recording_rejections() {
+    let root = root("propose-capacity");
+    configure(
+        &root,
+        serde_json::json!({
+            "adapter": "issue-scan",
+            "allowlist": ["ops"],
+            "max_proposals": 20,
+        }),
+    );
+    // The default pending limit of 10 stands: proposals 11+ must defer.
+    let issues: Vec<serde_json::Value> = (1u64..=12)
+        .map(|n| issue("ops", n, "open", "Issue"))
+        .collect();
+    let snapshot = write_snapshot(&root, "snapshot.json", serde_json::json!(issues));
+    let result = run_at(
+        &root,
+        &["propose", "--snapshot", &snapshot.to_string_lossy()],
+    );
+    let proposals = result["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 12, "{result}");
+    let deferred: Vec<_> = proposals
+        .iter()
+        .filter(|p| p["status"] == "capacity_deferred")
+        .collect();
+    assert_eq!(
+        proposals
+            .iter()
+            .filter(|p| p["status"] == "accepted")
+            .count(),
+        10,
+        "{result}"
+    );
+    assert_eq!(deferred.len(), 2, "{result}");
+    for p in &deferred {
+        assert!(p["command_id"].is_null(), "{p}");
+        assert_eq!(p["reason_code"], "capacity_exhausted", "{p}");
+        assert!(p["replay_key"].is_string(), "{p}");
+    }
+
+    // The deferred key is proposal identity, not a recorded decision:
+    // command-result finds nothing under it.
+    let deferred_key = deferred[0]["replay_key"].as_str().unwrap().to_string();
+    let lookup = run_at(
+        &root,
+        &[
+            "command-result",
+            "--origin",
+            "selector",
+            "--replay-key",
+            &deferred_key,
+        ],
+    );
+    assert!(lookup["result"].is_null(), "{lookup}");
+
+    // Ten Works queued — the deferred proposals consumed no position.
+    let list = run_at(&root, &["work-list"]);
+    assert_eq!(list["result"]["items"].as_array().unwrap().len(), 10);
+}
+
 #[test]
 fn switching_admission_configuration_preserves_existing_work() {
     let root = root("propose-swap");

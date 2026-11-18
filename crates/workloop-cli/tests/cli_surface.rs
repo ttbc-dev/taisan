@@ -374,3 +374,56 @@ fn source_unavailable_rejection_exits_5() {
     assert_eq!(env["status"], "rejected");
     assert_eq!(env["reason"]["code"], "source_unavailable");
 }
+
+/// The pending-queue limit refuses the eleventh queued submit with a
+/// structured `capacity_exhausted` rejection — transient, so the
+/// envelope carries no recorded command id and `command-result` under
+/// the same key finds nothing; an identical resubmit is decided fresh.
+#[test]
+fn a_full_pending_queue_rejects_without_a_recorded_decision() {
+    let root = root("capacity");
+    for i in 0..10 {
+        run_at(
+            &root,
+            &[
+                "submit",
+                "--intent",
+                &format!("fill-{i}"),
+                "--idempotency-key",
+                &format!("fill-k{i}"),
+            ],
+        );
+    }
+
+    let (code, env) = fail_at(
+        &root,
+        &[
+            "submit",
+            "--intent",
+            "one too many",
+            "--idempotency-key",
+            "overflow-k",
+        ],
+    );
+    assert_eq!(code, 1, "{env}");
+    assert_eq!(env["status"], "rejected", "{env}");
+    assert_eq!(env["reason"]["code"], "capacity_exhausted", "{env}");
+    assert!(
+        env["command"]["id"].is_null(),
+        "no phantom command id for an unpersisted refusal: {env}"
+    );
+    assert_eq!(env["command"]["idempotency_key"], "overflow-k");
+
+    // Nothing was recorded under the refused key.
+    let lookup = run_at(
+        &root,
+        &[
+            "command-result",
+            "--origin",
+            "cli",
+            "--replay-key",
+            "overflow-k",
+        ],
+    );
+    assert!(lookup["result"].is_null(), "{lookup}");
+}

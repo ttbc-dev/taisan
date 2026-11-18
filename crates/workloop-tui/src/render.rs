@@ -2,7 +2,7 @@
 //! draft, and Command results. Pure functions over the Query snapshots
 //! — rendering is the only layer that knows about screen layout.
 
-use workloop_core::command::CommandDecision;
+use workloop_core::command::{CommandDecision, RejectionCode};
 use workloop_core::domain::WorkId;
 use workloop_core::identity::CommitRevision;
 use workloop_core::projection::{Availability, SourceStatus, WorkDetailView, WorkPhase};
@@ -220,10 +220,20 @@ pub fn decision_frame(decision: &CommandDecision) -> String {
             current_version,
             evidence,
             ..
-        } => format!(
-            "rejected {} reason={reason:?} current_version={current_version:?} evidence={evidence:?}\n",
-            command_id.0
-        ),
+        } => {
+            // A capacity refusal persisted no decision: its allocated
+            // command id names no ledger row, so the frame reports the
+            // deferral without it — the same omission the CLI envelope
+            // and the propose batch apply.
+            let head = if *reason == RejectionCode::CapacityExhausted {
+                "deferred".to_string()
+            } else {
+                format!("rejected {}", command_id.0)
+            };
+            format!(
+                "{head} reason={reason:?} current_version={current_version:?} evidence={evidence:?}\n"
+            )
+        }
     }
 }
 

@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use workloop_core::command::{CommandDecision, CommandRequest, FindingChoice, RejectionCode};
+use workloop_core::command::{
+    CommandDecision, CommandId, CommandRequest, FindingChoice, RejectionCode,
+};
 use workloop_core::domain::{
     Actor, ActorKind, ExecutionBudget, LanePolicy, Origin, WorkId, WorkPolicy,
 };
@@ -19,8 +21,8 @@ use workloop_core::observation::{
     Completeness, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
     OccurrenceInput,
 };
-use workloop_core::projection::FindingView;
-use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
+use workloop_core::projection::{self, CommandResultLookup, FindingView, QueryResult};
+use workloop_core::store::{Effect, HostAction, HostActionIntent, IntakeSettingsRecord, Store};
 use workloop_core::work::{self, HostTemplate, WorkloopConfig};
 use workloop_store::sqlite::SqliteStore;
 
@@ -519,6 +521,86 @@ fn incomplete_draft_cannot_stage() {
     s.begin_judgment().unwrap();
     let err = s.stage_judgment().unwrap_err();
     assert!(err.contains("no decision yet"), "err: {err}");
+}
+
+#[test]
+fn capacity_refusal_frame_names_no_recorded_command_id() {
+    // A submit refused for capacity persists no decision — the
+    // decision frame must not print the allocated command id, which
+    // names no ledger row, matching the CLI envelope and the
+    // `propose` batch's `capacity_deferred`.
+    let root = temp_root();
+    let _c = Cleanup(root.clone());
+    let store = SqliteStore::open(&root.join("t.db"), 4).unwrap();
+    work::set_intake_settings(
+        &store,
+        IntakeSettingsRecord {
+            settings_revision: "rev-1".into(),
+            pending_queue_limit: 1,
+            recorded_seq: 1,
+        },
+        None,
+    )
+    .unwrap();
+    submit_work(&store);
+
+    // The single pending position is occupied, so a submit under the
+    // TUI's own origin and actor is refused for capacity — the
+    // decision still carries an allocated command id.
+    let mut s = TuiSession::new(&store, config(), operator());
+    let req = s.compose(workloop_core::command::CommandBody::Submit {
+        intent: "over the limit".into(),
+        sources: vec![],
+        constraints: vec![],
+        verification_argv: vec![],
+    });
+    let decision = work::handle_command(&store, &config(), &req, NOW).unwrap();
+    let CommandDecision::Rejected {
+        command_id, reason, ..
+    } = &decision
+    else {
+        panic!("expected capacity refusal, got {decision:?}");
+    };
+    assert_eq!(*reason, RejectionCode::CapacityExhausted);
+
+    // The id names no ledger row: the caller's replay key resolves to
+    // no recorded decision, so an identical resubmit decides fresh.
+    let recorded = store
+        .transact_deferred(|tx| {
+            projection::command_result(
+                tx,
+                &CommandResultLookup::ReplayKey {
+                    origin: req.origin.clone(),
+                    actor: req.actor.clone(),
+                    idempotency_key: req.idempotency_key.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(recorded, QueryResult::NotFound),
+        "refusal persisted a decision: {recorded:?}"
+    );
+
+    // The frame reports the deferral, never the phantom id — while a
+    // durable rejection still prints its recorded command id.
+    let frame = render::decision_frame(&decision);
+    assert!(frame.contains("deferred"), "frame: {frame}");
+    assert!(frame.contains("CapacityExhausted"), "frame: {frame}");
+    assert!(
+        !frame.contains(&command_id.0),
+        "phantom command id in frame: {frame}"
+    );
+    let durable = CommandDecision::Rejected {
+        command_id: CommandId("cmd-recorded".into()),
+        reason: RejectionCode::InvalidRequest,
+        current_work_id: None,
+        current_version: None,
+        evidence: vec![],
+        committed_at: 0,
+    };
+    let frame = render::decision_frame(&durable);
+    assert!(frame.contains("rejected cmd-recorded"), "frame: {frame}");
 }
 
 #[test]

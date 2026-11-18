@@ -850,9 +850,12 @@ fn run(cli: Cli) -> i32 {
             // Replay keys of the proposals decided so far, in batch
             // order — what a faulted or truncated run must still
             // surface so every recorded decision stays recoverable.
+            // A capacity-deferred proposal recorded nothing, so its
+            // key is not a recorded decision and stays out.
             let recorded_keys = |decided: &[serde_json::Value]| -> Vec<String> {
                 decided
                     .iter()
+                    .filter(|i| i["status"] != "capacity_deferred")
                     .filter_map(|i| i["replay_key"].as_str().map(str::to_string))
                     .collect()
             };
@@ -946,6 +949,21 @@ fn run(cli: Cli) -> i32 {
                         "command_id": command_id.0,
                         "status": "accepted",
                         "work_id": work_id.as_ref().map(|w| w.0.clone()),
+                    }),
+                    CommandDecision::Rejected {
+                        reason: RejectionCode::CapacityExhausted,
+                        evidence,
+                        ..
+                    } => serde_json::json!({
+                        // Transient capacity refusal: deferrable, not a
+                        // recorded rejection — no command_id exists and
+                        // the replay key resolves to nothing until a
+                        // later proposal is decided fresh.
+                        "key": proposal.key,
+                        "replay_key": req.idempotency_key,
+                        "status": "capacity_deferred",
+                        "reason_code": serde_json::to_value(RejectionCode::CapacityExhausted).ok(),
+                        "evidence": evidence,
                     }),
                     CommandDecision::Rejected {
                         command_id,
