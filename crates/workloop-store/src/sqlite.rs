@@ -2911,25 +2911,27 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
-                // `completed` means every candidate reached a recorded
+                // `completed` means every candidate reached a resolved
                 // terminal status; a coordinator that still holds a
                 // `pending`/`unknown` candidate must close the run
-                // `interrupted` instead.
+                // `interrupted` instead. An `interrupted` candidate is
+                // terminal but unresolved: recovery never closes such a
+                // run `completed`, so the store refuses it too.
                 if *state == IntakeRunState::Completed {
-                    let nonterminal: i64 = self
+                    let unresolved: i64 = self
                         .tx
                         .query_row(
                             "SELECT COUNT(*) FROM intake_candidates WHERE run_id=?1 \
                              AND status NOT IN ('accepted', 'replayed', 'rejected', \
-                             'capacity_deferred', 'interrupted')",
+                             'capacity_deferred')",
                             params![run_id],
                             |r| r.get(0),
                         )
                         .map_err(map_err)?;
-                    if nonterminal > 0 {
+                    if unresolved > 0 {
                         return Err(StoreError::ConstraintConflict {
                             detail: format!(
-                                "intake run {run_id} cannot complete with {nonterminal} non-terminal candidates"
+                                "intake run {run_id} cannot complete with {unresolved} unresolved or interrupted candidates"
                             ),
                         });
                     }
@@ -3038,10 +3040,15 @@ impl TxView for Tx<'_> {
                     | IntakeCandidateStatus::Unknown
                     | IntakeCandidateStatus::Interrupted => links_clear,
                     IntakeCandidateStatus::Rejected => match &saved_decision {
-                        Some(CommandDecision::Rejected { committed_at, .. }) => {
+                        Some(CommandDecision::Rejected {
+                            reason,
+                            committed_at,
+                            ..
+                        }) => {
                             candidate.command_id.is_some()
                                 && candidate.work_id.is_none()
                                 && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.as_deref() == Some(tag(reason).as_str())
                         }
                         _ => false,
                     },
@@ -3055,6 +3062,7 @@ impl TxView for Tx<'_> {
                                 && work_id.is_some()
                                 && candidate.work_id == *work_id
                                 && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.is_none()
                         }
                         _ => false,
                     },
@@ -3068,11 +3076,17 @@ impl TxView for Tx<'_> {
                                 && work_id.is_some()
                                 && candidate.work_id == *work_id
                                 && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.is_none()
                         }
-                        Some(CommandDecision::Rejected { committed_at, .. }) => {
+                        Some(CommandDecision::Rejected {
+                            reason,
+                            committed_at,
+                            ..
+                        }) => {
                             candidate.command_id.is_some()
                                 && candidate.work_id.is_none()
                                 && candidate.committed_seq == Some(*committed_at)
+                                && candidate.status_reason.as_deref() == Some(tag(reason).as_str())
                         }
                         // An absent ledger row is refused here as well as
                         // by the command_id foreign key.

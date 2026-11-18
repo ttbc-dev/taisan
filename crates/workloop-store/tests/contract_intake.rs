@@ -610,13 +610,14 @@ fn completed_requires_every_candidate_terminal() {
         .unwrap_err();
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
 
-    // Once the last candidate is terminal the run may complete.
+    // Once the last candidate reaches a resolved terminal status the
+    // run may complete.
     store
         .transact(|tx| {
             tx.apply(&Effect::UpdateIntakeCandidate {
                 candidate: IntakeCandidate {
-                    status: IntakeCandidateStatus::Interrupted,
-                    status_reason: Some("no_saved_decision".into()),
+                    status: IntakeCandidateStatus::CapacityDeferred,
+                    status_reason: Some("capacity_exhausted".into()),
                     ..candidate("r-comp", 1, "prop-c1")
                 },
                 expected_status: IntakeCandidateStatus::Pending,
@@ -638,6 +639,48 @@ fn completed_requires_every_candidate_terminal() {
 }
 
 #[test]
+fn completed_refuses_an_interrupted_candidate() {
+    // `interrupted` is terminal but unresolved: recovery never closes
+    // a run `completed` over it, so the store backstop must refuse the
+    // same transition instead of permitting a state recovery forbids.
+    let store = SqliteStore::in_memory(1).unwrap();
+    insert_run(
+        &store,
+        run("r-comp-int", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    admit_batch(
+        &store,
+        "r-comp-int",
+        vec![candidate("r-comp-int", 0, "prop-int")],
+    );
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Interrupted,
+                    status_reason: Some("no_saved_decision".into()),
+                    ..candidate("r-comp-int", 0, "prop-int")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap();
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-comp-int".into(),
+                state: IntakeRunState::Completed,
+                detail_code: None,
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Admitting,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    assert_eq!(run_state(&store, "r-comp-int"), IntakeRunState::Admitting);
+}
+
+#[test]
 fn candidate_identity_immutable_status_guarded() {
     let store = SqliteStore::in_memory(2).unwrap();
     let (command_id, committed_at) = reject(&store, "proposal/ref-selector:prop-x");
@@ -650,7 +693,7 @@ fn candidate_identity_immutable_status_guarded() {
     // A rejection links its durable command decision but never a Work.
     let decided = IntakeCandidate {
         status: IntakeCandidateStatus::Rejected,
-        status_reason: Some("source_overlap".into()),
+        status_reason: Some("idempotency_conflict".into()),
         command_id: Some(command_id),
         committed_seq: Some(committed_at),
         ..candidate("r-idem", 0, "prop-x")
@@ -683,7 +726,7 @@ fn candidate_identity_immutable_status_guarded() {
     let rows = store.transact(|tx| tx.intake_candidates("r-idem")).unwrap();
     let c = &rows[0];
     assert_eq!(c.status, IntakeCandidateStatus::Rejected);
-    assert_eq!(c.status_reason.as_deref(), Some("source_overlap"));
+    assert_eq!(c.status_reason.as_deref(), Some("idempotency_conflict"));
     assert_eq!(c.proposal_key, "prop-x");
     assert_eq!(c.replay_key, "proposal/ref-selector:prop-x");
     assert_eq!(c.payload, br#"{"schema_version":1}"#.to_vec());
@@ -758,7 +801,7 @@ fn candidate_decision_links_follow_the_status_contract() {
     // A rejection never carries a Work id.
     let mut bad_reject = IntakeCandidate {
         status: IntakeCandidateStatus::Rejected,
-        status_reason: Some("invalid_request".into()),
+        status_reason: Some("idempotency_conflict".into()),
         command_id: Some(rejected_command_id.clone()),
         committed_seq: Some(rejected_at),
         work_id: Some(work_id.clone()),
@@ -774,6 +817,20 @@ fn candidate_decision_links_follow_the_status_contract() {
         .unwrap_err();
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     bad_reject.work_id = None;
+    // The reason must be the linked decision's rejection code: a
+    // candidate cannot record an unrelated rejection reason beside a
+    // decision that says something else.
+    let mut bad_reject_reason = bad_reject.clone();
+    bad_reject_reason.status_reason = Some("source_overlap".into());
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: bad_reject_reason,
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     // A rejection must point at the rejected decision, not merely any
     // command under this replay key: an accepted command cannot back a
     // rejected candidate.
@@ -822,6 +879,19 @@ fn candidate_decision_links_follow_the_status_contract() {
         .unwrap_err();
     assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     thin_accept.work_id = Some(work_id.clone());
+    // An accepted candidate carries no rejection reason: the linked
+    // decision accepted, so a reason would contradict it.
+    let mut accept_with_reason = thin_accept.clone();
+    accept_with_reason.status_reason = Some("idempotency_conflict".into());
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: accept_with_reason,
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     // A rejected command cannot back an accepted candidate.
     let err = store
         .transact(|tx| {
@@ -960,9 +1030,28 @@ fn candidate_decision_links_follow_the_status_contract() {
     });
 
     // A replay of a saved rejection keeps `replayed`, links the
-    // rejection's command identity and sequence, and carries no Work.
+    // rejection's command identity and sequence, carries no Work, and
+    // preserves the decision's rejection code as its reason. A reason
+    // unrelated to the linked decision is refused.
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Replayed,
+                    status_reason: Some("invalid_request".into()),
+                    command_id: Some(rejected_e_command.clone()),
+                    work_id: None,
+                    committed_seq: Some(rejected_e_at),
+                    ..candidate("r-links", 4, "prop-e")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
     decide(IntakeCandidate {
         status: IntakeCandidateStatus::Replayed,
+        status_reason: Some("idempotency_conflict".into()),
         command_id: Some(rejected_e_command.clone()),
         work_id: None,
         committed_seq: Some(rejected_e_at),
@@ -976,6 +1065,10 @@ fn candidate_decision_links_follow_the_status_contract() {
     assert_eq!(rows[0].command_id.as_ref(), Some(&rejected_command_id));
     assert_eq!(rows[0].work_id, None);
     assert_eq!(rows[0].committed_seq, Some(rejected_at));
+    assert_eq!(
+        rows[0].status_reason.as_deref(),
+        Some("idempotency_conflict")
+    );
     assert_eq!(rows[1].status, IntakeCandidateStatus::Accepted);
     assert_eq!(rows[1].command_id.as_ref(), Some(&command_id));
     assert_eq!(rows[1].work_id, Some(work_id.clone()));
@@ -991,6 +1084,10 @@ fn candidate_decision_links_follow_the_status_contract() {
     assert_eq!(rows[4].command_id.as_ref(), Some(&rejected_e_command));
     assert_eq!(rows[4].work_id, None);
     assert_eq!(rows[4].committed_seq, Some(rejected_e_at));
+    assert_eq!(
+        rows[4].status_reason.as_deref(),
+        Some("idempotency_conflict")
+    );
 }
 
 // --- decision links into the command ledger -------------------------
