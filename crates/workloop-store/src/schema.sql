@@ -325,7 +325,8 @@ CREATE TABLE IF NOT EXISTS run_lease (
 -- Durable recovery intents: (pending | consumed | retired), scheduled
 -- in the deciding transaction and fired exactly once by the loop's
 -- recovery-scheduling phase. `generation` pins retirement to the
--- evidence generation that invalidated the intent.
+-- evidence generation that invalidated the intent; the retirement
+-- records that generation and may never predate the row's own.
 CREATE TABLE IF NOT EXISTS recovery_intents (
     intent_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
@@ -337,6 +338,7 @@ CREATE TABLE IF NOT EXISTS recovery_intents (
     state TEXT NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'consumed', 'retired')),
     retirement_reason TEXT,
+    retirement_generation INTEGER,
     scheduled_seq INTEGER NOT NULL
 );
 
