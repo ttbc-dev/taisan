@@ -2648,6 +2648,29 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
+                // Field invariants (`docs/intake-identity-storage.md`):
+                // a live `open` run has no finish time and no failure
+                // code; `skipped` is terminal at insert, so it must
+                // already carry both. Malformed combinations conflict
+                // rather than being silently normalized.
+                let fields_ok = match run.state {
+                    IntakeRunState::Open => {
+                        run.detail_code.is_none() && run.finished_unix_seconds.is_none()
+                    }
+                    IntakeRunState::Skipped => {
+                        run.detail_code.is_some() && run.finished_unix_seconds.is_some()
+                    }
+                    _ => unreachable!("insert states are open or skipped"),
+                };
+                if !fields_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {} in state {} carries inconsistent run fields",
+                            run.run_id,
+                            tag(&run.state)
+                        ),
+                    });
+                }
                 // Single-active backstop: the intake lease is the real
                 // mutex, but a second live run must conflict even if a
                 // caller bypassed it — the partial unique index makes
@@ -2826,6 +2849,57 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
+                // Field invariants (`docs/intake-identity-storage.md`):
+                // a live `admitting` transition keeps both diagnostic
+                // fields NULL; every terminal transition records a
+                // finish time — `completed` carries no detail code,
+                // `failed`/`interrupted` carry the bounded diagnostic.
+                let fields_ok = match state {
+                    IntakeRunState::Admitting => {
+                        detail_code.is_none() && finished_unix_seconds.is_none()
+                    }
+                    IntakeRunState::Completed => {
+                        detail_code.is_none() && finished_unix_seconds.is_some()
+                    }
+                    IntakeRunState::Failed | IntakeRunState::Interrupted => {
+                        detail_code.is_some() && finished_unix_seconds.is_some()
+                    }
+                    _ => false,
+                };
+                if !fields_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {run_id} -> {} carries inconsistent run fields",
+                            tag(state)
+                        ),
+                    });
+                }
+                // `completed` means every candidate reached a
+                // recorded terminal status: `pending` and `unknown`
+                // still owe the ledger a decision, so the close
+                // conflicts rather than acknowledging them.
+                if matches!(
+                    (current_state, *state),
+                    (IntakeRunState::Admitting, IntakeRunState::Completed)
+                ) {
+                    let unresolved: i64 = self
+                        .tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM intake_candidates \
+                             WHERE run_id=?1 AND status IN ('pending','unknown')",
+                            params![run_id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_err)?;
+                    if unresolved > 0 {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "intake run {run_id} cannot complete with \
+                                 {unresolved} non-terminal candidate(s)"
+                            ),
+                        });
+                    }
+                }
                 self.exec(
                     "UPDATE intake_runs SET state=?2, detail_code=?3, \
                      finished_unix_seconds=?4 \
@@ -2937,6 +3011,51 @@ impl TxView for Tx<'_> {
                             tag(&candidate.status)
                         ),
                     });
+                }
+                // `replayed` reports the saved decision's outcome, so
+                // the Work link is whatever that decision recorded:
+                // an accepted decision that created Work must surface
+                // the same `work_id` here — the link can never be
+                // silently dropped — and a rejected decision never
+                // carries one. The command ledger is the authority.
+                if candidate.status == IntakeCandidateStatus::Replayed {
+                    let command_id = candidate
+                        .command_id
+                        .as_ref()
+                        .expect("links_ok guarantees a replayed command_id");
+                    match self.command_decision(command_id)? {
+                        Some(CommandDecision::Accepted { work_id, .. }) => {
+                            if candidate.work_id != work_id {
+                                return Err(StoreError::ConstraintConflict {
+                                    detail: format!(
+                                        "intake candidate {}/{} replayed link does not \
+                                         match the saved decision's work",
+                                        candidate.run_id, candidate.ordinal
+                                    ),
+                                });
+                            }
+                        }
+                        Some(CommandDecision::Rejected { .. }) => {
+                            if candidate.work_id.is_some() {
+                                return Err(StoreError::ConstraintConflict {
+                                    detail: format!(
+                                        "intake candidate {}/{} replayed a rejection \
+                                         but carries a work link",
+                                        candidate.run_id, candidate.ordinal
+                                    ),
+                                });
+                            }
+                        }
+                        None => {
+                            return Err(StoreError::ConstraintConflict {
+                                detail: format!(
+                                    "intake candidate {}/{} replays an absent command \
+                                     decision",
+                                    candidate.run_id, candidate.ordinal
+                                ),
+                            });
+                        }
+                    }
                 }
                 self.exec(
                     "UPDATE intake_candidates SET status=?3, \

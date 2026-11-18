@@ -45,7 +45,7 @@ Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-fin
 
 ## Intake scheduling
 
-Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, and the intake CLI verbs are implemented; persisting each tick's reloaded settings revision into the durable settings record remains a later v0.2 unit. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
+Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, the intake CLI verbs, and the per-tick persistence of the reloaded settings revision into the durable settings record are implemented. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
 
 ### Scheduler model
 
@@ -59,7 +59,7 @@ The scheduler is internal to `run`: there is no separate intake daemon, cron ent
 On every settings tick the scheduler:
 
 1. Re-reads and re-validates `config.toml` through the versioned profile loader.
-2. Computes the intake settings revision — a digest of the complete validated `[intake]` content.
+2. Computes the intake settings revision — a digest of the complete validated `[intake]` content — and persists it, with the section's `pending_queue_limit`, into the durable settings record under the revision guard when it differs; an unchanged revision rewrites nothing, and a lost compare-and-set is retried on the next tick.
 3. Applies the reload transition table below.
 4. Evaluates whether intake is due and, when due and no run is active, records an `open` intake run and launches the configured selector argv. The invocation is nonblocking: the pass continues, the adapter runs under its configured timeout, and the run's candidates admit through the normal submit path across later ticks.
 
@@ -89,6 +89,7 @@ The pending-queue limit is installation-wide and enforced inside the authoritati
 - A grouped proposal consumes exactly one position: one candidate produces one Work with one queued Execution.
 - At `pending == limit` a submit is rejected `capacity_exhausted` with the occupancy evidence, and no partial Work, Execution, claims, usage, or spec rows commit — and no decision is saved under the caller's key either: the refusal is transient, so an identical resubmit is decided fresh against then-current capacity. For an intake candidate the coordinator maps this to `capacity_deferred` — deferrable, never a saved rejection ([intake identity and storage](intake-identity-storage.md)).
 - The limit applies to manual `submit` and Selector intake alike. `retry` and `resume` are recovery of already-accepted Work and are never gated — a full queue cannot strand them.
+- The bound comes from the persisted `[intake]` settings record regardless of `intake.enabled`: disabling automatic scheduling stops new scheduled invocations but does not release the installation-wide queue bound the profile declares — an operator who disables intake while keeping a low `pending_queue_limit` still has manual submits capped by it.
 - Replaying a decided submit returns the stored decision even when the queue has since filled; the idempotency lookup precedes the capacity check.
 - Lowering the limit below current occupancy refuses new submissions only; existing Work drains naturally and is never cancelled.
 - With no active settings record the limit resolves to the documented default of 10 Work — the same constant the profile loader defaults to — and every caller observes the single active revision; stale callers can neither supply nor overwrite it.
