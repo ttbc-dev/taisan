@@ -43,6 +43,68 @@ Completion assessment is level-triggered, not only edge-triggered on observation
 
 Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-findings`, `release-judgment`, `acknowledge`, `check`, and `retention` transact directly against the store and succeed whether or not `run` is live. The loop only progresses already-accepted Work. If the loop is down, Work holds in its recorded state and resumes progress on the next pass — a stopped loop is backpressure, not failure.
 
+## Intake scheduling
+
+Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. It changes no runtime behavior by itself — the scheduler and CLI land in later v0.2 units — but the admission rule it names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
+
+### Scheduler model
+
+`taisan run` hosts one intake scheduler next to the eight-phase execution loop. The two cadences are independent:
+
+- The execution loop repeats bounded passes on `loop.interval_seconds` (30 s default).
+- The intake scheduler evaluates intake state on a fixed 60-second settings tick — separate from the pass cadence, never blocking a pass, and never itself a pass phase.
+
+The scheduler is internal to `run`: there is no separate intake daemon, cron entry, or second run lock. Single-flight is durable, not a process-local flag: an intake invocation holds the installation intake lease and at most one `intake_runs` row may be `open`/`admitting` at a time ([intake identity and storage](intake-identity-storage.md)).
+
+On every settings tick the scheduler:
+
+1. Re-reads and re-validates `config.toml` through the versioned profile loader.
+2. Computes the intake settings revision — a digest of the complete validated `[intake]` content.
+3. Applies the reload transition table below.
+4. Evaluates whether intake is due and, when due and no run is active, records an `open` intake run and launches the configured selector argv. The invocation is nonblocking: the pass continues, the adapter runs under its configured timeout, and the run's candidates admit through the normal submit path across later ticks.
+
+A due time that arrives while a run is active is skipped, not queued: there is no catch-up burst, no replacement fetch inside the same run, and no invocation retry. After a launch or a skip, `next_due` advances by whole intervals until it lies in the future, preserving the interval phase across downtime and restarts.
+
+### Reload transitions
+
+| Event | Effect on scheduling and admission |
+| --- | --- |
+| Process start with intake enabled | Immediately due — the startup transition |
+| Disabled → enabled on a settings tick | Immediately due |
+| Enabled → disabled | The pending due is cancelled; an in-flight run is unaffected and completes normally |
+| `intake.interval_minutes` changed | `next_due` resets to the reload tick plus the new interval |
+| Selector binding changed (argv, adapter id, selector version, policy revision) | `next_due` preserved — adapter identity never moves the schedule |
+| Intake content otherwise unchanged | Identical revision; `next_due` untouched — identical content never resets the schedule |
+| Settings tick finds the config invalid | New intake is suppressed for that tick only, the error is reported, the last valid settings stay active for admission, and the next tick retries the reload; existing Work is never stopped |
+
+Restart recovery is derived, not stored: on start the scheduler reads the durable intake records — a live `open`/`admitting` run resumes through the lease and owner-evidence path, and with no active run plus intake enabled the startup rule makes intake immediately due. `next_due` itself is process-local; the schedule re-anchors deterministically from the startup rule rather than replaying missed slots.
+
+An accepted Work's saved profile, repository/credential binding, usage budgets, and unresolved effects are immutable across reload: only Work admitted after a settings revision takes effect binds the new revision, and `intake_runs.settings_revision` records that provenance. The pending-queue limit is the deliberate exception that proves the rule — it is an installation-wide admission policy read from the active settings record inside every submit transaction, so a lowered limit applies to the next submit without touching existing Work.
+
+### Queue admission
+
+The pending-queue limit is installation-wide and enforced inside the authoritative submit transaction — the same `handle_command` path manual `submit` and per-candidate selector submits share. It is not advisory: the read-only preflight may report free positions, but only the transaction decides.
+
+- The pending count is the number of distinct Works whose active Execution is `queued`. Executing Work — `ready`, `running`, `waiting`, `stopping`, `uncertain` — and `paused` Work are excluded; a paused Work holds no queue position, though its issue claims are retained through the pause exactly as [identity storage](identity-storage.md) requires.
+- A grouped proposal consumes exactly one position: one candidate produces one Work with one queued Execution.
+- At `pending == limit` a submit is rejected `capacity_exhausted` with the occupancy evidence, and no partial Work, Execution, claims, usage, or spec rows commit — and no decision is saved under the caller's key either: the refusal is transient, so an identical resubmit is decided fresh against then-current capacity. For an intake candidate the coordinator maps this to `capacity_deferred` — deferrable, never a saved rejection ([intake identity and storage](intake-identity-storage.md)).
+- The limit applies to manual `submit` and Selector intake alike. `retry` and `resume` are recovery of already-accepted Work and are never gated — a full queue cannot strand them.
+- Replaying a decided submit returns the stored decision even when the queue has since filled; the idempotency lookup precedes the capacity check.
+- Lowering the limit below current occupancy refuses new submissions only; existing Work drains naturally and is never cancelled.
+- With no active settings record the limit resolves to the documented default of 10 Work — the same constant the profile loader defaults to — and every caller observes the single active revision; stale callers can neither supply nor overwrite it.
+
+### One-shot intake CLI
+
+| Command | Kind | Contract |
+| --- | --- | --- |
+| `taisan intake` | driver | Runs one intake invocation: acquires the intake lease, launches the configured argv once, validates the response, admits candidates through the normal submit path, and reports the recorded run outcome |
+| `taisan intake-runs` | query | Lists durable intake runs newest-first (bounded) with trigger, state, detail code, and candidate counts |
+| `taisan intake-detail --run <id>` | query | One run plus its candidates in ordinal order: status, bounded reason, and command/work decision links |
+
+`intake` shares the scheduler's single-flight lease: while a scheduled run is active the verb is refused `intake_active` — status `rejected`, exit 1 — and never launches a second adapter or waits indefinitely. Automatic intake being disabled does not disable the verb; it requires only a configured selector binding. Per-candidate outcomes are data inside the run record, mirroring the `propose` batch envelope: each candidate reports `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `unknown` with its replay key so `command-result` can recover any decision. A lost response resolves through the recorded run and the command ledger — `unknown` at exit 6 when the fate cannot be determined, never a fresh run identity.
+
+`run --once` performs exactly one pass of the whole driver — one settings-tick evaluation plus the eight execution phases — and may launch a due intake without waiting for it, since the invocation is nonblocking. `run --work <id>` is a diagnostic scope: it restricts the execution phases to one Work and does not evaluate intake scheduling. SIGINT/SIGTERM ends the scheduler and finishes the current phase boundary; an in-flight intake invocation is not killed by the loop — its durable run record and lease ownership carry it through restart recovery exactly like worker invocations.
+
 ## CLI contract
 
 ### Envelope
@@ -107,7 +169,9 @@ Before mutation the caller retains `(origin, actor, idempotency_key)`, the exact
 | `init`, `check`, `check --probe` | setup | none — per [installation config](installation-config.md) |
 | `work-list`, `work-detail`, `attention`, `capacity`, `command-result`, `retention report` | query | none |
 | `retention cleanup` | mutation | none — bounded two-phase pass per retention policy |
-| `run`, `run --once`, `run --work <id>` | driver | the loop itself |
+| `run`, `run --once`, `run --work <id>` | driver | the loop itself, plus the intake scheduler's settings tick |
+| `intake` | driver | one invocation under the scheduler's single-flight lease |
+| `intake-runs`, `intake-detail` | query | none — durable intake records |
 
 `cancel` acceptance records a stop intent; it is never stop proof — the Execution settles through the uncertain-stop path until writer safety is established. `acknowledge` applies to the current Attention version only and releases nothing.
 

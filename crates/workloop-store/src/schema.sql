@@ -1,10 +1,11 @@
--- workloop v8 store: current-state tables enforcing structural
+-- workloop v9 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 8` marks the format; a stamped older file with
+-- `PRAGMA user_version = 9` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
--- candidate tables specified in docs/intake-identity-storage.md.
+-- candidate tables specified in docs/intake-identity-storage.md; v9
+-- added the intake_settings admission record (#213).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -488,3 +489,17 @@ CREATE INDEX IF NOT EXISTS intake_candidates_command
     ON intake_candidates (command_id) WHERE command_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS intake_candidates_unresolved
     ON intake_candidates (status) WHERE status IN ('pending', 'unknown');
+
+-- The active installation intake-settings record (#213): at most one
+-- row, written only through the revision-guarded SetIntakeSettings
+-- effect so a stale reload writer can never overwrite a newer active
+-- limit. `settings_revision` is the profile loader's content digest —
+-- opaque provenance; `pending_queue_limit` is the admission bound
+-- every submit transaction enforces. An absent row resolves to the
+-- documented default.
+CREATE TABLE IF NOT EXISTS intake_settings (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    settings_revision TEXT NOT NULL CHECK (length(settings_revision) > 0),
+    pending_queue_limit INTEGER NOT NULL CHECK (pending_queue_limit > 0),
+    recorded_seq INTEGER NOT NULL
+);

@@ -99,6 +99,18 @@ max_proposals = 10                     # bound on proposals per selector run
 task_constraints = []                  # carried into every proposal's task input
 verification_argv = []                 # carried into every proposal's task input
 required_permissions = []              # declared on proposals, never expanded
+
+[intake]                               # optional: v0.2 scheduled and one-shot intake
+enabled = false                        # automatic intake; disabled by default
+interval_minutes = 30                  # positive whole minutes between due runs
+timeout_seconds = 120                  # adapter invocation deadline, at most 300
+pending_queue_limit = 10               # installation-wide pending Work admission bound
+
+[intake.selector]                      # required when enabled = true or `taisan intake` is invoked
+adapter = "public-issue-selector"      # selector adapter identity bound into every request
+selector_version = 1                   # selection-semantics version, part of request identity
+policy_revision = 1                    # policy document revision, part of proposal identity
+argv = ["public-issue-selector", "select"]  # direct exec vector; never through a shell
 ```
 
 Validation rules:
@@ -111,6 +123,7 @@ Validation rules:
 - Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op. Capability names come from the contract's capability set (`ready`, `thread_resolve`, ...), which deliberately differs from operation names (`mark_ready`, `resolve_thread`) — a capability selects an effect class, an operation names a concrete host action.
 - `recovery.transport.backoff_seconds` is the per-attempt wait schedule between transient-failure retries. `recovery.transport.backoff_jitter_ratio` (default `0.0`, range `0.0`–`1.0`) applies symmetric jitter: each scheduled wait is scaled by a per-attempt random factor in `1 ± ratio`. A `recovery.transport.max_retries` beyond the schedule length repeats the final element; a shorter retry count truncates the schedule. A `0` schedule entry is a valid immediate retry; `0` is still never silently "unlimited" for limit keys.
 - The `[selector]` section selects the alternate admission path. Its absence means manual submission only — the selector holds no default authority — and its unavailability must not block manual submission or existing Work. Every identity string inside it (adapter id, repository ids, issue references) is validated when the policy is resolved for a selector run, and unknown keys are refused rather than defaulted past, so a misspelled key surfaces as the bounded error instead of a silently degraded policy. An unparseable or unknown-keyed section is a bounded config error for that path only — validation deliberately does not gate config loading, so a malformed section cannot take manual submission down with it. An `excluded` `repo:number` entry matches a fact's opaque IssueId or its repository-scoped display number.
+- The `[intake]` section (v0.2, #211) configures scheduled and one-shot selector intake through the argv adapter protocol of [selector protocol](selector-protocol.md). Its absence means automatic intake disabled with the documented defaults — interval 30 minutes, timeout 120 seconds, pending-queue limit 10 Work — and a pre-v0.2 profile loads unchanged. `enabled = true` requires a complete `[intake.selector]` binding; the reverse is not required, because `pending_queue_limit` is an installation-wide admission bound that applies to manual `submit` whether or not any selector is configured. Exactly one selector binding exists per installation: duplicate keys, unknown fields, and multiple selector declarations are refused structurally. `argv` follows the protocol bounds — 1–64 nonempty strings, at most 4,096 bytes each and 16,384 bytes total, no NUL or control characters — and launches directly without shell expansion. `interval_minutes` is a positive whole number of minutes; `timeout_seconds` is a positive integer at most 300 so the request deadline stays inside the protocol's 300,000 ms bound; `pending_queue_limit` is a positive integer. Zero, negative, fractional, and unit-suffixed values are load errors — never silently "unlimited". The section carries no credential references: the selector inherits source-read authority from `use = "source"`/`publication` repositories and resolves credentials only at the adapter boundary. Changed intake content yields a new settings revision — a digest of the complete validated section — while identical content keeps the revision; reload and due-time semantics are owned by the [execution loop](execution-loop.md#intake-scheduling). Intake settings govern new admission only: an accepted Work keeps its recorded binding, budgets, and unresolved effects across every reload.
 - Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects. Switching the `[selector]` section in or out changes only which admission path new submissions take — it never rebinds existing Work.
 
 ## Credential references and secret hygiene

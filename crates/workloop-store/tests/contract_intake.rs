@@ -919,7 +919,7 @@ fn db_root(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn v7_store_upgrades_to_v8_additively() {
+fn v7_store_upgrades_additively() {
     let root = db_root("upgrade");
     let db = root.join("store.db");
     let (command_id, work_id, _) = {
@@ -929,12 +929,14 @@ fn v7_store_upgrades_to_v8_additively() {
         ids
     };
 
-    // Downgrade the fixture to a v7 file: no intake tables, stamp 7.
+    // Downgrade the fixture to a faithful v7 file: none of the intake
+    // tables a v7 store could not have, stamp 7.
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
             "DROP TABLE intake_candidates; \
              DROP TABLE intake_runs; \
+             DROP TABLE intake_settings; \
              PRAGMA user_version=7;",
         )
         .unwrap();
@@ -963,6 +965,9 @@ fn v7_store_upgrades_to_v8_additively() {
         ),
     );
     assert_eq!(run_state(&store, "r-post-upgrade"), IntakeRunState::Open);
+    // The v9 settings table arrived empty — absent record, documented
+    // default limit.
+    assert!(store.transact(|tx| tx.intake_settings()).unwrap().is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -974,13 +979,17 @@ fn v8_stamp_without_intake_tables_is_refused() {
         let store = SqliteStore::open(&db, 1).unwrap();
         drop(store);
     }
-    // A file stamped v8 but missing the intake tables is foreign —
-    // never silently reshaped.
+    // A file stamped v8 but missing the intake tables a v8 store must
+    // hold is foreign — never silently reshaped. (A faithful v8 file
+    // also lacks intake_settings; dropping it keeps the fixture honest,
+    // though the version gate refuses on the missing v8 tables first.)
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
             "DROP TABLE intake_candidates; \
-             DROP TABLE intake_runs;",
+             DROP TABLE intake_runs; \
+             DROP TABLE intake_settings; \
+             PRAGMA user_version=8;",
         )
         .unwrap();
     }
@@ -1002,7 +1011,7 @@ fn newer_format_is_refused() {
     }
     {
         let conn = Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 9i64).unwrap();
+        conn.pragma_update(None, "user_version", 10i64).unwrap();
     }
     match SqliteStore::open(&db, 1) {
         Err(StoreError::UnsupportedFormat { .. }) => {}

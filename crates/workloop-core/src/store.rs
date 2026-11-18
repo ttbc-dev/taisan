@@ -233,6 +233,42 @@ pub enum Effect {
         request_id: String,
         process_identity: String,
     },
+    /// Replaces the singleton intake-settings record, guarded by the
+    /// caller-observed revision: `expected_revision` must equal the
+    /// currently recorded `settings_revision`, and `None` requires the
+    /// record to be absent. A stale or absent-row mismatch is a
+    /// `ConstraintConflict` — a reload writer can never overwrite a
+    /// newer active limit (`docs/execution-loop.md` queue admission).
+    SetIntakeSettings {
+        settings: IntakeSettingsRecord,
+        expected_revision: Option<String>,
+    },
+}
+
+/// The active installation intake-settings record: the content
+/// revision the profile loader derived over the complete validated
+/// `[intake]` section and the admission bound every submit transaction
+/// enforces. Written only through the revision-guarded
+/// [`Effect::SetIntakeSettings`]; an absent record resolves to
+/// [`crate::work::DEFAULT_PENDING_QUEUE_LIMIT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeSettingsRecord {
+    pub settings_revision: String,
+    pub pending_queue_limit: u32,
+    pub recorded_seq: EventSequence,
+}
+
+/// One scoped issue's live owner for the intake preflight: the Work
+/// whose immutable issue membership covers the issue and whose active
+/// Execution is `queued`, `running`, or `paused` — the owner set the
+/// preflight contract names. Issue claims are a separate record
+/// retained through holds, pauses, and uncertainty; this view reports
+/// queue-relevant owners, not the claim ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeSourceOwner {
+    pub issue: IssueRef,
+    pub work_id: WorkId,
+    pub execution_state: ExecutionState,
 }
 
 /// Reconciliation state of a recorded outbox action.
@@ -763,6 +799,24 @@ pub trait ReadView {
         &self,
         statuses: &[IntakeCandidateStatus],
     ) -> Result<Vec<IntakeCandidate>, StoreError>;
+
+    /// The active intake-settings record, if one was ever written.
+    /// Absent resolves to the documented default pending-queue limit.
+    fn intake_settings(&self) -> Result<Option<IntakeSettingsRecord>, StoreError>;
+
+    /// Distinct Works whose active Execution is `queued` — the pending
+    /// queue occupancy the install-wide admission limit counts.
+    /// Executing and paused states hold no queue position.
+    fn pending_queue_count(&self) -> Result<u64, StoreError>;
+
+    /// Live owners of the scoped issues for the intake preflight: one
+    /// row per `(issue, Work)` whose immutable membership covers the
+    /// issue and whose active Execution is `queued`, `running`, or
+    /// `paused`, ordered by issue key then Work id.
+    fn intake_source_owners(
+        &self,
+        issues: &[IssueRef],
+    ) -> Result<Vec<IntakeSourceOwner>, StoreError>;
 
     /// Every durable command decision, oldest first, reduced to
     /// [`CommandRecord`]. Read-only evidence for queries that must know

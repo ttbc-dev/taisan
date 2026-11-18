@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `8` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `7`
+//! `PRAGMA user_version` is the format gate: `9` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `8`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -28,8 +28,8 @@ use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
     CommandRecord, Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus,
-    IntakeRun, IntakeRunState, ReadView, RecoveryIntent, RecoveryIntentState, Store, StoreError,
-    TxView,
+    IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeSourceOwner, ReadView, RecoveryIntent,
+    RecoveryIntentState, Store, StoreError, TxView,
 };
 use workloop_core::worker::WorkerRequestExport;
 
@@ -42,9 +42,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `reclaim_plans` / `reclaim_plan_entries` tables; `6` adds the
 /// request's durable Worker adapter binding; `7` adds the usage row's
 /// durable `last_progress_basis`; `8` adds the `intake_runs` /
-/// `intake_candidates` tables (`docs/intake-identity-storage.md`).
+/// `intake_candidates` tables (`docs/intake-identity-storage.md`);
+/// `9` adds the `intake_settings` admission record (#213).
 /// Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 8;
+const FORMAT_VERSION: i64 = 9;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -66,6 +67,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "id_counters",
     "intake_candidates",
     "intake_runs",
+    "intake_settings",
     "invocations",
     "invocation_requests",
     "issue_claims",
@@ -113,6 +115,10 @@ const V5_ADDED_TABLES: &[&str] = &["reclaim_plan_entries", "reclaim_plans"];
 /// the earlier additive sets, they are installed by the same `SCHEMA`
 /// batch on upgrade.
 const V8_ADDED_TABLES: &[&str] = &["intake_candidates", "intake_runs"];
+
+/// The table the v8 → v9 migration adds (the intake-settings admission
+/// record). Installed by the same `SCHEMA` batch on upgrade.
+const V9_ADDED_TABLES: &[&str] = &["intake_settings"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -245,12 +251,14 @@ impl SqliteStore {
             // An upgrade is legitimate only for a file that holds the
             // complete schema of its stamped version: a v1 file must
             // hold every expected table except the ones added since —
-            // the run-lease slice's additive set, the v2, v3, v5, and
-            // v8 additions — a v2 file everything except the v3, v5,
-            // and v8 additions, a v3 or v4 file everything except the
-            // v5 and v8 additions (v4 adds a column, not a table), a
-            // v5–v7 file everything except the v8 additions (v6 and v7
-            // each add a column, not a table). A foreign or
+            // the run-lease slice's additive set, the v2, v3, v5, v8,
+            // and v9 additions — a v2 file everything except the v3,
+            // v5, v8, and v9 additions, a v3 or v4 file everything
+            // except the v5, v8, and v9 additions (v4 adds a column,
+            // not a table), a v5–v7 file everything except the v8 and
+            // v9 additions (v6 and v7 each add a column, not a table),
+            // and a v8 file everything except the v9 addition. A
+            // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
             // holds every base table and none of the additions, so it
@@ -266,6 +274,7 @@ impl SqliteStore {
                             && !V3_ADDED_TABLES.contains(t)
                             && !V5_ADDED_TABLES.contains(t)
                             && !V8_ADDED_TABLES.contains(t)
+                            && !V9_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -275,17 +284,27 @@ impl SqliteStore {
                         !V3_ADDED_TABLES.contains(t)
                             && !V5_ADDED_TABLES.contains(t)
                             && !V8_ADDED_TABLES.contains(t)
+                            && !V9_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V5_ADDED_TABLES.contains(t) && !V8_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V5_ADDED_TABLES.contains(t)
+                            && !V8_ADDED_TABLES.contains(t)
+                            && !V9_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V8_ADDED_TABLES.contains(t))
+                    .filter(|t| !V8_ADDED_TABLES.contains(t) && !V9_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else if version < 9 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V9_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
                 EXPECTED_TABLES.iter().all(|t| present.contains(*t))
@@ -1826,6 +1845,70 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn intake_settings(&self) -> Result<Option<IntakeSettingsRecord>, StoreError> {
+        self.query_opt(
+            "SELECT settings_revision, pending_queue_limit, recorded_seq \
+             FROM intake_settings WHERE singleton=1",
+            [],
+            |row| {
+                Ok(IntakeSettingsRecord {
+                    settings_revision: row.get(0)?,
+                    pending_queue_limit: row.get::<_, i64>(1)? as u32,
+                    recorded_seq: row.get(2)?,
+                })
+            },
+        )
+    }
+
+    fn pending_queue_count(&self) -> Result<u64, StoreError> {
+        // The pending queue is the set of distinct Works whose active
+        // (nonterminal) Execution is `queued`; executing states and
+        // `paused` hold no position. At most one nonterminal Execution
+        // exists per Work, so the DISTINCT guard is belt-and-braces
+        // over the documented semantics.
+        let n: i64 = self
+            .tx
+            .query_row(
+                "SELECT COUNT(DISTINCT work_id) FROM executions \
+                 WHERE state='queued'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n as u64)
+    }
+
+    fn intake_source_owners(
+        &self,
+        issues: &[workloop_core::identity::IssueRef],
+    ) -> Result<Vec<IntakeSourceOwner>, StoreError> {
+        if issues.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Immutable membership (work_issue_refs), not live claims: a
+        // paused Work holds no claim yet still owns its issues for
+        // exclusion purposes. The active Execution's state decides
+        // whether the owner is live for the selector's scope —
+        // `queued`, `running`, and `paused` only.
+        let keys: Vec<String> = issues.iter().map(issue_key).collect();
+        let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT wir.issue, wir.work_id, e.state \
+             FROM work_issue_refs wir \
+             JOIN executions e ON e.work_id = wir.work_id \
+             WHERE wir.issue_key IN ({placeholders}) \
+               AND e.state IN ('queued','running','paused') \
+             ORDER BY wir.issue_key, wir.work_id"
+        );
+        self.query_all(&sql, rusqlite::params_from_iter(keys.iter()), |row| {
+            Ok(IntakeSourceOwner {
+                issue: de_row(&row.get::<_, String>(0)?)?,
+                work_id: WorkId(row.get::<_, String>(1)?),
+                execution_state: untag(&row.get::<_, String>(2)?)?,
+            })
+        })
+    }
+
     fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
         self.query_all(
             "SELECT command_id, canonical_payload, decision, seq \
@@ -2179,6 +2262,57 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
+            }
+            Effect::SetIntakeSettings {
+                settings,
+                expected_revision,
+            } => {
+                // The singleton row is compare-and-set on the
+                // caller-observed revision: the first write requires an
+                // explicit absent expectation (`None`), every later
+                // write the exact revision it read. Anything else —
+                // a stale reload snapshot, a missing row, a forged
+                // expectation — conflicts instead of overwriting the
+                // active limit (#213).
+                let current: Option<String> = self
+                    .tx
+                    .query_row(
+                        "SELECT settings_revision FROM intake_settings \
+                         WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                let guard_ok = match (current.as_deref(), expected_revision.as_deref()) {
+                    (None, None) => true,
+                    (Some(c), Some(e)) => c == e,
+                    _ => false,
+                };
+                if !guard_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake settings revision guard failed: record is {}, \
+                             caller expected {}",
+                            current.as_deref().unwrap_or("<absent>"),
+                            expected_revision.as_deref().unwrap_or("<absent>")
+                        ),
+                    });
+                }
+                self.exec(
+                    "INSERT INTO intake_settings (singleton, settings_revision, \
+                     pending_queue_limit, recorded_seq) \
+                     VALUES (1, ?1, ?2, ?3) \
+                     ON CONFLICT(singleton) DO UPDATE SET \
+                     settings_revision=excluded.settings_revision, \
+                     pending_queue_limit=excluded.pending_queue_limit, \
+                     recorded_seq=excluded.recorded_seq",
+                    params![
+                        settings.settings_revision,
+                        i64::from(settings.pending_queue_limit),
+                        settings.recorded_seq,
+                    ],
+                )?;
             }
             Effect::UpdateInvocation {
                 invocation,

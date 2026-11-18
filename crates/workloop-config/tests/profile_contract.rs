@@ -1135,3 +1135,351 @@ fn worker_isolation_profile_resolves_against_the_approved_registry() {
     let profile = parse_profile(&base_profile()).unwrap();
     assert!(profile.worker.isolation_profile.is_none());
 }
+
+// ---------------------------------------------------------------------
+// v0.2 intake settings (#211/#212): the [intake] section resolves to a
+// validated snapshot with a deterministic content revision; every
+// invalid class is a named, redacted load refusal.
+// ---------------------------------------------------------------------
+
+/// A pre-v0.2 profile — no `[intake]` at all — loads unchanged and
+/// resolves to automatic intake disabled with the documented defaults.
+#[test]
+fn intake_absent_section_yields_documented_defaults() {
+    let profile = parse_profile(&base_profile()).unwrap();
+    let settings = profile.intake_settings().unwrap();
+    assert!(!settings.enabled);
+    assert_eq!(settings.interval_minutes, 30);
+    assert_eq!(settings.timeout_seconds, 120);
+    assert_eq!(settings.pending_queue_limit, 10);
+    assert_eq!(settings.selector, None);
+}
+
+/// A present `[intake]` section resolves every key; an empty table is
+/// semantically identical to an absent one.
+#[test]
+fn intake_section_resolves_values_and_empty_table_matches_absent() {
+    let text = format!(
+        "{}\n[intake]\nenabled = true\ninterval_minutes = 45\ntimeout_seconds = 60\n\
+         pending_queue_limit = 3\n\n[intake.selector]\nadapter = \"public-issue-selector\"\n\
+         selector_version = 2\npolicy_revision = 7\nargv = [\"public-issue-selector\", \"select\"]\n",
+        base_profile()
+    );
+    let settings = parse_profile(&text).unwrap().intake_settings().unwrap();
+    assert!(settings.enabled);
+    assert_eq!(settings.interval_minutes, 45);
+    assert_eq!(settings.timeout_seconds, 60);
+    assert_eq!(settings.pending_queue_limit, 3);
+    let selector = settings.selector.expect("selector binding resolves");
+    assert_eq!(selector.adapter, "public-issue-selector");
+    assert_eq!(selector.selector_version, 2);
+    assert_eq!(selector.policy_revision, 7);
+    assert_eq!(selector.argv, ["public-issue-selector", "select"]);
+
+    // `[intake]` with no keys resolves identically to no section.
+    let empty = parse_profile(&format!("{}\n[intake]\n", base_profile()))
+        .unwrap()
+        .intake_settings()
+        .unwrap();
+    let absent = parse_profile(&base_profile())
+        .unwrap()
+        .intake_settings()
+        .unwrap();
+    assert_eq!(empty, absent);
+    assert_eq!(empty.revision(), absent.revision());
+}
+
+/// `enabled = true` requires a selector binding; a selector without
+/// `enabled` is valid for the one-shot verb.
+#[test]
+fn intake_enabled_requires_selector_but_selector_does_not_require_enabled() {
+    let enabled_only = format!("{}\n[intake]\nenabled = true\n", base_profile());
+    let err = parse_profile(&enabled_only).unwrap_err();
+    assert!(
+        err.contains("intake.enabled") && err.contains("intake.selector"),
+        "expected the missing-binding refusal: {err}"
+    );
+
+    // Selector present, enabled absent: valid, disabled, binding kept.
+    let selector_only = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\", \"run\"]\n",
+        base_profile()
+    );
+    let settings = parse_profile(&selector_only)
+        .unwrap()
+        .intake_settings()
+        .unwrap();
+    assert!(!settings.enabled);
+    let selector = settings.selector.expect("selector resolves");
+    assert_eq!(selector.adapter, "issue-scan");
+    assert_eq!(selector.selector_version, 1);
+    assert_eq!(selector.policy_revision, 0);
+}
+
+/// Every invalid setting class is refused with its key named.
+#[test]
+fn intake_rejects_every_invalid_setting_class() {
+    let cases: &[(&str, &str)] = &[
+        ("interval_minutes = 0", "intake.interval_minutes"),
+        ("interval_minutes = -5", "intake.interval_minutes"),
+        ("interval_minutes = 1.5", "intake.interval_minutes"),
+        ("interval_minutes = \"30\"", "intake.interval_minutes"),
+        (
+            "interval_minutes = \"unlimited\"",
+            "intake.interval_minutes",
+        ),
+        ("timeout_seconds = 0", "intake.timeout_seconds"),
+        ("timeout_seconds = 301", "intake.timeout_seconds"),
+        ("timeout_seconds = 1.5", "intake.timeout_seconds"),
+        ("pending_queue_limit = 0", "intake.pending_queue_limit"),
+        ("pending_queue_limit = -2", "intake.pending_queue_limit"),
+        ("pending_queue_limit = 2.5", "intake.pending_queue_limit"),
+        ("enabled = \"yes\"", "enabled"),
+        ("bogus_key = 1", "unknown field"),
+    ];
+    for (key, expected) in cases {
+        let text = format!("{}\n[intake]\n{key}\n", base_profile());
+        let err = match parse_profile(&text) {
+            Ok(_) => panic!("intake key '{key}' must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(expected),
+            "key '{key}': expected '{expected}' in refusal: {err}"
+        );
+    }
+
+    // A second selector table is a TOML duplicate key — the single
+    // binding is structural, never a validation choice.
+    let duplicate = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n\
+         [intake.selector]\nadapter = \"other-scan\"\nargv = [\"other-scan\"]\n",
+        base_profile()
+    );
+    assert!(
+        parse_profile(&duplicate).is_err(),
+        "a second [intake.selector] table must be refused"
+    );
+}
+
+/// The selector binding is validated when the section resolves:
+/// adapter grammar, positive selector_version, and the protocol argv
+/// bounds — count, per-item bytes, total bytes, emptiness, control
+/// characters — each with its key named.
+#[test]
+fn intake_selector_binding_validation() {
+    let selector_cases: &[(&str, &str)] = &[
+        ("adapter = \"Bad_Adapter\"", "intake.selector.adapter"),
+        ("adapter = \"-leading\"", "intake.selector.adapter"),
+        ("adapter = \"has space\"", "intake.selector.adapter"),
+        ("selector_version = 0", "intake.selector.selector_version"),
+        ("argv = []", "intake.selector.argv"),
+        ("argv = [\"ok\", \"\"]", "intake.selector.argv[1]"),
+        ("argv = [\"ok\", \"bad\\narg\"]", "intake.selector.argv[1]"),
+        ("argv = [\"ok\", \"bogus_key\"]\nbogus = 1", "unknown field"),
+    ];
+    for (body, expected) in selector_cases {
+        // Every case needs a complete-enough section to reach its own
+        // validation: supply adapter and argv unless the case overrides.
+        let text = if body.contains("argv =") {
+            format!(
+                "{}\n[intake.selector]\nadapter = \"issue-scan\"\n{body}\n",
+                base_profile()
+            )
+        } else if body.contains("adapter =") {
+            format!(
+                "{}\n[intake.selector]\nargv = [\"issue-scan\"]\n{body}\n",
+                base_profile()
+            )
+        } else {
+            format!(
+                "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n{body}\n",
+                base_profile()
+            )
+        };
+        let err = match parse_profile(&text) {
+            Ok(_) => panic!("selector case '{body}' must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(expected),
+            "case '{body}': expected '{expected}' in refusal: {err}"
+        );
+    }
+
+    // Missing required keys name themselves.
+    let missing_adapter = format!(
+        "{}\n[intake.selector]\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    );
+    let err = parse_profile(&missing_adapter).unwrap_err();
+    assert!(err.contains("intake.selector.adapter"), "{err}");
+    let missing_argv = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\n",
+        base_profile()
+    );
+    let err = parse_profile(&missing_argv).unwrap_err();
+    assert!(err.contains("intake.selector.argv"), "{err}");
+
+    // argv count and byte bounds.
+    let too_many = (0..65)
+        .map(|i| format!("\"a{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [{too_many}]\n",
+        base_profile()
+    );
+    let err = parse_profile(&text).unwrap_err();
+    assert!(err.contains("intake.selector.argv"), "{err}");
+
+    let big_item = "x".repeat(4097);
+    let text = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"{big_item}\"]\n",
+        base_profile()
+    );
+    let err = parse_profile(&text).unwrap_err();
+    assert!(err.contains("intake.selector.argv[0]"), "{err}");
+
+    // Five 4,000-byte items stay under the per-item bound but exceed
+    // the 16,384-byte total.
+    let items = (0..5)
+        .map(|_| format!("\"{}\"", "y".repeat(4000)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [{items}]\n",
+        base_profile()
+    );
+    let err = parse_profile(&text).unwrap_err();
+    assert!(err.contains("total exceeds"), "{err}");
+
+    // Boundary values pass: 64 items, a 4,096-byte item, 1–300s timeout.
+    let exact = (0..64)
+        .map(|i| format!("\"a{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[intake]\ntimeout_seconds = 300\n\n[intake.selector]\n\
+         adapter = \"issue-scan\"\nargv = [{exact}]\n",
+        base_profile()
+    );
+    parse_profile(&text).expect("boundary argv and timeout must load");
+}
+
+/// The settings revision is a deterministic digest of the complete
+/// validated content: identical content — including an empty `[intake]`
+/// versus an absent one — yields the identical revision, and every
+/// changed field yields a different one.
+#[test]
+fn intake_revision_is_content_derived() {
+    let base = parse_profile(&base_profile())
+        .unwrap()
+        .intake_settings()
+        .unwrap()
+        .revision();
+    assert_eq!(base.len(), 64);
+    assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Re-parse: deterministic across loads.
+    let again = parse_profile(&base_profile())
+        .unwrap()
+        .intake_settings()
+        .unwrap()
+        .revision();
+    assert_eq!(base, again);
+
+    for (snippet, what) in [
+        ("interval_minutes = 31", "interval"),
+        ("timeout_seconds = 60", "timeout"),
+        ("pending_queue_limit = 11", "queue limit"),
+        (
+            "enabled = true\n\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]",
+            "enabled+selector",
+        ),
+    ] {
+        let text = format!("{}\n[intake]\n{snippet}\n", base_profile());
+        let revision = parse_profile(&text)
+            .unwrap()
+            .intake_settings()
+            .unwrap()
+            .revision();
+        assert_ne!(base, revision, "changed {what} must change the revision");
+    }
+
+    // Selector-only content changes the revision too.
+    let with_selector = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    );
+    let revision = parse_profile(&with_selector)
+        .unwrap()
+        .intake_settings()
+        .unwrap()
+        .revision();
+    assert_ne!(base, revision, "selector content is part of the revision");
+}
+
+/// Load refusals name the key and rule but never echo a rejected
+/// scalar — an operator may have pasted anything into the file.
+#[test]
+fn intake_refusals_redact_rejected_values() {
+    let err = parse_profile(&format!(
+        "{}\n[intake]\ninterval_minutes = \"sk-live-abc123\"\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("intake.interval_minutes"), "{err}");
+    assert!(!err.contains("sk-live-abc123"), "value leaked: {err}");
+
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"zz\\u0007TOPSECRET\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("<redacted>"), "{err}");
+    assert!(!err.contains("TOPSECRET"), "argv content leaked: {err}");
+
+    // An invalid adapter id names the grammar rule, never the pasted
+    // value — the same redaction discipline as every other scalar.
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"sk-live-ABC\"\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("intake.selector.adapter"), "{err}");
+    assert!(!err.contains("sk-live-ABC"), "adapter leaked: {err}");
+
+    // An oversized argv item reports its index and bound only; the
+    // item content — however secret-shaped — never reaches the error.
+    let oversized = format!("{}TOPSECRET", "x".repeat(5000));
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"{oversized}\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("argv[0]"), "{err}");
+    assert!(err.contains("4096"), "{err}");
+    assert!(!err.contains("TOPSECRET"), "argv content leaked: {err}");
+
+    // A serde-level type error goes through the same redaction: the
+    // literal is dropped, the key path stays.
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [12345]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("intake.selector.argv"), "{err}");
+    assert!(!err.contains("12345"), "serde literal leaked: {err}");
+
+    // Static-rule refusals carry no operator value at all.
+    let err =
+        parse_profile(&format!("{}\n[intake]\nenabled = true\n", base_profile())).unwrap_err();
+    assert!(err.contains("intake.enabled"), "{err}");
+    let err = parse_profile(&format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nselector_version = 0\nargv = [\"issue-scan\"]\n",
+        base_profile()
+    ))
+    .unwrap_err();
+    assert!(err.contains("selector_version"), "{err}");
+}

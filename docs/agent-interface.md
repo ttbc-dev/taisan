@@ -19,8 +19,9 @@ The skill exposes these operator workflows through the CLI:
 | Intervene | `retry`, `resume`, `cancel`, `acknowledge` | Use observed versions and eligible target identities. Retry creates a new Execution after confirmed failure; resume continues a paused one; cancel acceptance is not stop proof; acknowledgement applies only to the current Attention version. |
 | Judge review findings | `judge-findings`, `release-judgment` | Preserve head and finding identities; require current finding-set coverage and core acceptance, not conversational approval alone. The #24 coverage gap is unresolved. |
 | Recover a lost command response | `command-result`, or identical command replay | Reuse the original identity and payload. An unknown result never justifies a fresh key or duplicate effect. |
+| Run or inspect selector intake | `intake`, `intake-runs`, `intake-detail` | `intake` performs one selector invocation under the same single-flight lease as the scheduler — automatic intake being disabled never blocks it. Run and candidate records are durable; per-candidate outcomes carry replay keys for `command-result` recovery, and a full pending queue defers rather than rejects intake candidates. The contract is specified in the [execution loop](execution-loop.md#intake-scheduling). |
 
-These command names exist today; the table defines target workflow coverage, not a claim that the skill or every required safeguard is implemented. Direct CLI operation remains available for diagnosis.
+These command names exist today except the intake verbs, which are the v0.2 contract specified in the [execution loop](execution-loop.md#intake-scheduling); the table defines target workflow coverage, not a claim that the skill or every required safeguard is implemented. Direct CLI operation remains available for diagnosis.
 
 ## CLI result and failure requirements
 

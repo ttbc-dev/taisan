@@ -159,7 +159,7 @@ A deferred candidate has `command_id`/`work_id`/`committed_seq` all NULL and —
 
 `rejected` is the opposite: a durable, final decision recorded in the command ledger and linked on the candidate. Ordinary rejections (source overlap, ineligible, invalid request, unsupported capability) are final for that proposal identity — replaying them returns the same rejection, which is correct because the refusal was about facts, not transient capacity.
 
-The pending-queue limit itself, its atomic enforcement inside submit, and the preflight view are #213's scope; this document fixes only the record semantics that make deferral distinguishable from rejection.
+The pending-queue limit itself, its atomic enforcement inside submit, and the preflight view are #213's scope; this document fixes only the record semantics that make deferral distinguishable from rejection. As implemented, the submit transaction answers a full queue with `CapacityExhausted` and persists no decision under the caller's key — the refusal is transient, so the replay lookup finds nothing and the next identical proposal is decided fresh against then-current capacity, for manual and selector submits alike.
 
 ## Recovery
 
@@ -173,6 +173,8 @@ Recovery (#208) consumes these records; this section fixes the contract it relie
 ## Store upgrade, formats, and retention
 
 Intake storage arrives as store format v8: two new tables and their indexes, no column changes to existing tables. Opening a v7 store installs the intake schema inside the same bootstrap transaction that stamps `user_version = 8`; a crash mid-upgrade rolls the whole transaction back and the next open retries idempotently (`CREATE … IF NOT EXISTS`). Existing Works, commands, claims, specs, and evidence are not read, rewritten, or re-keyed. A file stamped v8 that lacks the intake tables, a foreign stamped file, an unversioned slice-0 file, and a newer format are all refused at open exactly as before.
+
+Store format v9 (#213) adds one more table and nothing else: the `intake_settings` singleton holding `settings_revision`, `pending_queue_limit`, and `recorded_seq`. Opening a v8 store installs it inside the same idempotent upgrade transaction and stamps `user_version = 9`; a v8 file lacking the v8 intake tables, a foreign stamped file, and a newer format are refused exactly as before. The record has exactly one writer — the revision-guarded settings effect: the first write requires an explicit absent-revision expectation, every later write must name the revision it observed, and a stale expectation is a constraint conflict, so a reload writer holding an older snapshot can never overwrite a newer active limit.
 
 Retention treats intake rows like the commands ledger: they are replay-critical identity and recovery evidence, never body-catalog entries, and no cleanup path deletes them. `request_payload` and candidate `payload` follow the same rule — they are retained because recovery and audit need them; if a future retention limit cannot preserve that, the tradeoff surfaces to the owner rather than silently deleting.
 

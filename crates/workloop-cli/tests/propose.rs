@@ -592,6 +592,21 @@ fn clear_mid_batch_fault(root: &Path) {
     .expect("fault trigger clears");
 }
 
+/// Raise the installation's pending-queue limit directly in the store:
+/// the envelope-bound test needs more admitted Works than the default
+/// limit of 10, and the guarded settings writer is core API the CLI
+/// surface does not expose yet.
+fn raise_pending_limit(root: &Path, limit: i64) {
+    let conn = rusqlite::Connection::open(root.join("workloop.db")).expect("store opens");
+    conn.execute(
+        "INSERT OR REPLACE INTO intake_settings \
+         (singleton, settings_revision, pending_queue_limit, recorded_seq) \
+         VALUES (1, 'test-limit', ?1, 0)",
+        [limit],
+    )
+    .expect("pending limit writes");
+}
+
 /// Overwrite a recorded decision's payload so every later read of that
 /// replay key fails to deserialize: both `handle_command`'s idempotency
 /// read and the recovery lookup then error, which is an *undetermined*
@@ -710,6 +725,10 @@ fn batch_evidence_refs_stay_within_the_envelope_bounds() {
             "max_proposals": 32,
         }),
     );
+    // Twenty admitted Works exceed the default pending limit of 10;
+    // capacity-deferred proposals record no decision and cannot fill
+    // the recoverable-key list this test bounds.
+    raise_pending_limit(&root, 64);
     let issues: Vec<serde_json::Value> = (1u64..=20)
         .map(|n| issue("ops", n, "open", "Issue"))
         .collect();

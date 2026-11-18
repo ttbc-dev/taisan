@@ -28,10 +28,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use workloop_core::credential::CredentialProvider;
+use workloop_core::domain::{canonical_json, sha256_hex};
 use workloop_core::identity::{ActorRole, AdapterId, HostActorId, HostCapability, RepositoryId};
+use workloop_core::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
 /// The single schema version this runtime understands. A missing,
 /// older, newer, or corrupt version is refused without migration —
@@ -147,6 +149,13 @@ pub struct Profile {
     pub recovery: RecoverySection,
     #[serde(default)]
     pub retention: RetentionSection,
+    /// v0.2 scheduled and one-shot selector intake
+    /// (`docs/installation-config.md`, `docs/execution-loop.md`
+    /// intake scheduling). Absent means automatic intake disabled with
+    /// the documented defaults; the resolved snapshot and its content
+    /// revision come from [`Profile::intake_settings`].
+    #[serde(default)]
+    pub intake: Option<IntakeSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -392,6 +401,156 @@ impl Default for SweepSection {
     }
 }
 
+/// The `[intake]` table: v0.2 scheduled and one-shot selector intake.
+/// Every key carries its documented default when omitted; the section
+/// itself may be absent entirely, which resolves to automatic intake
+/// disabled with the same defaults. Numeric keys keep the raw
+/// [`LimitInput`] so validation can name the exact key that carried an
+/// invalid unit, sign, or zero.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeSection {
+    /// Automatic intake on the scheduler's due times. Disabled by
+    /// default; the one-shot `taisan intake` verb does not consult it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whole minutes between scheduled intake runs.
+    #[serde(default = "default_intake_interval_minutes")]
+    pub interval_minutes: LimitInput,
+    /// Adapter invocation deadline in seconds; at most 300 so the
+    /// request deadline stays inside the selector protocol's
+    /// 300,000 ms bound.
+    #[serde(default = "default_intake_timeout_seconds")]
+    pub timeout_seconds: LimitInput,
+    /// Installation-wide pending-Work admission bound, applied inside
+    /// the submit transaction to manual and selector submissions
+    /// alike.
+    #[serde(default = "default_intake_pending_queue_limit")]
+    pub pending_queue_limit: LimitInput,
+    /// The single argv selector binding. Optional: `pending_queue_limit`
+    /// applies without one, and `enabled = true` is what makes it
+    /// required.
+    #[serde(default)]
+    pub selector: Option<IntakeSelectorSection>,
+}
+
+impl Default for IntakeSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: default_intake_interval_minutes(),
+            timeout_seconds: default_intake_timeout_seconds(),
+            pending_queue_limit: default_intake_pending_queue_limit(),
+            selector: None,
+        }
+    }
+}
+
+/// The `[intake.selector]` table: exactly one adapter binding per
+/// installation, launched as a direct argv vector — never through a
+/// shell. `selector_version` and `policy_revision` are bound into every
+/// request and candidate exactly as the selector protocol requires.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeSelectorSection {
+    /// Selector adapter identity (`[a-z][a-z0-9-]*`, the protocol's
+    /// adapter-id grammar — stricter than the opaque id rules).
+    pub adapter: Option<String>,
+    /// Selection-semantics version, part of request identity.
+    #[serde(default = "default_selector_version")]
+    pub selector_version: u32,
+    /// Policy document revision, part of proposal identity.
+    #[serde(default)]
+    pub policy_revision: u64,
+    /// The direct exec vector: 1–64 nonempty strings, at most 4,096
+    /// bytes each and 16,384 bytes total, no NUL or control characters
+    /// (docs/selector-protocol.md framing bounds).
+    pub argv: Option<Vec<String>>,
+}
+
+/// The resolved selector binding inside an [`IntakeSettings`] snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntakeSelectorBinding {
+    pub adapter: String,
+    pub selector_version: u32,
+    pub policy_revision: u64,
+    pub argv: Vec<String>,
+}
+
+/// The validated intake-settings snapshot: concrete values resolved
+/// from the `[intake]` section (or the documented defaults when the
+/// section is absent). `revision()` is the content digest the
+/// scheduler and the store's active-settings record share — identical
+/// content yields the identical revision, any change yields a new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntakeSettings {
+    pub enabled: bool,
+    pub interval_minutes: u64,
+    pub timeout_seconds: u64,
+    pub pending_queue_limit: u32,
+    pub selector: Option<IntakeSelectorBinding>,
+}
+
+impl IntakeSettings {
+    /// The settings content revision: SHA-256 over the canonical JSON
+    /// of the complete validated snapshot. It is opaque provenance —
+    /// recorded on intake runs and the store's active-settings row,
+    /// never part of proposal or replay identity.
+    pub fn revision(&self) -> String {
+        let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        sha256_hex("intake-settings-v1", &canonical_json(&value))
+    }
+}
+
+fn default_intake_interval_minutes() -> LimitInput {
+    LimitInput::Int(30)
+}
+fn default_intake_timeout_seconds() -> LimitInput {
+    LimitInput::Int(120)
+}
+fn default_intake_pending_queue_limit() -> LimitInput {
+    LimitInput::Int(i64::from(DEFAULT_PENDING_QUEUE_LIMIT))
+}
+fn default_selector_version() -> u32 {
+    1
+}
+
+/// The selector protocol's selection-deadline bound: the request's
+/// `deadline_unix_ms` may be at most 300,000 ms after construction, so
+/// a configured timeout above 300 seconds could never be honored.
+const MAX_INTAKE_TIMEOUT_SECONDS: i64 = 300;
+/// The protocol's argv bounds (docs/selector-protocol.md).
+const MAX_ARGV_ITEMS: usize = 64;
+const MAX_ARGV_ITEM_BYTES: usize = 4096;
+const MAX_ARGV_TOTAL_BYTES: usize = 16_384;
+/// The protocol's adapter-id grammar: `[a-z][a-z0-9-]*`, 1–64 ASCII
+/// bytes — stricter than the generic opaque-id rules.
+fn check_selector_adapter_id(adapter: &str) -> Result<(), String> {
+    let valid = !adapter.is_empty()
+        && adapter.len() <= 64
+        && adapter.is_ascii()
+        && adapter
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && adapter
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase());
+    if valid {
+        Ok(())
+    } else {
+        Err("must match [a-z][a-z0-9-]* and fit 64 ASCII bytes".into())
+    }
+}
+
+fn positive_int(key: &str, value: &LimitInput) -> Result<i64, String> {
+    checked_limit(key, value, Unlimited::Forbidden, Zero::Refused)?;
+    match value {
+        LimitInput::Int(n) => Ok(*n),
+        _ => unreachable!("checked_limit admits only Int"),
+    }
+}
+
 fn default_max_retries() -> LimitInput {
     LimitInput::Int(3)
 }
@@ -500,6 +659,7 @@ impl Profile {
         self.validate_capabilities()?;
         self.validate_recovery()?;
         self.validate_retention()?;
+        self.validate_intake()?;
         Ok(())
     }
 
@@ -810,6 +970,62 @@ impl Profile {
         Ok(())
     }
 
+    /// The `[intake]` section resolves through the same fail-closed
+    /// rules as every other table: unknown keys already failed
+    /// deserialization, and every value is checked here so a load
+    /// refusal names the exact key. An absent section is not an error —
+    /// it resolves to automatic intake disabled with the documented
+    /// defaults.
+    fn validate_intake(&self) -> Result<(), String> {
+        self.intake_settings().map(|_| ())
+    }
+
+    /// The validated intake-settings snapshot for this profile. Absent
+    /// `[intake]` yields the documented defaults with automatic intake
+    /// disabled; a present section resolves every key, and
+    /// `enabled = true` requires a complete `[intake.selector]` binding
+    /// while the reverse is not required — `pending_queue_limit` is an
+    /// installation-wide admission bound that applies with or without
+    /// a selector. The snapshot's [`IntakeSettings::revision`] is the
+    /// single content revision every intake consumer shares.
+    pub fn intake_settings(&self) -> Result<IntakeSettings, String> {
+        let section = self.intake.clone().unwrap_or_default();
+        let interval_minutes = positive_int("intake.interval_minutes", &section.interval_minutes)?;
+        let timeout_seconds = positive_int("intake.timeout_seconds", &section.timeout_seconds)?;
+        if timeout_seconds > MAX_INTAKE_TIMEOUT_SECONDS {
+            return Err(format!(
+                "intake.timeout_seconds: {timeout_seconds} exceeds the selector protocol's \
+                 {MAX_INTAKE_TIMEOUT_SECONDS}-second deadline bound"
+            ));
+        }
+        let pending_queue_limit =
+            positive_int("intake.pending_queue_limit", &section.pending_queue_limit)?;
+        if pending_queue_limit > i64::from(u32::MAX) {
+            return Err(format!(
+                "intake.pending_queue_limit: {pending_queue_limit} exceeds the supported range"
+            ));
+        }
+        let selector = section
+            .selector
+            .as_ref()
+            .map(resolve_intake_selector)
+            .transpose()?;
+        if section.enabled && selector.is_none() {
+            return Err(
+                "intake.enabled: true requires a complete [intake.selector] binding — \
+                 adapter and argv at minimum"
+                    .into(),
+            );
+        }
+        Ok(IntakeSettings {
+            enabled: section.enabled,
+            interval_minutes: interval_minutes as u64,
+            timeout_seconds: timeout_seconds as u64,
+            pending_queue_limit: pending_queue_limit as u32,
+            selector,
+        })
+    }
+
     /// Repositories usable as a publication target. `use = "source"`
     /// repositories never appear: source reads never authorize
     /// publication, so a publication intent aimed at one is refused
@@ -858,6 +1074,69 @@ fn is_bare_host_name(entry: &str) -> bool {
             && !label.starts_with('-')
             && !label.ends_with('-')
             && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Resolve `[intake.selector]` into the binding every intake request
+/// carries. The section is optional as a whole, but a present section
+/// must be complete: `adapter` and `argv` are required, and the argv
+/// vector is checked against the selector protocol's framing bounds —
+/// count, per-item and total bytes, emptiness, and control characters.
+/// Rejected argv entries are redacted like every other scalar: an
+/// operator may have pasted anything here.
+fn resolve_intake_selector(
+    section: &IntakeSelectorSection,
+) -> Result<IntakeSelectorBinding, String> {
+    let adapter = section
+        .adapter
+        .as_deref()
+        .ok_or("intake.selector.adapter: missing 'adapter'")?;
+    check_selector_adapter_id(adapter)
+        .map_err(|rule| format!("intake.selector.adapter: {rule}"))?;
+    if section.selector_version == 0 {
+        return Err(
+            "intake.selector.selector_version: 0 is not a valid selector version — \
+             the protocol requires a positive integer"
+                .into(),
+        );
+    }
+    let argv = section
+        .argv
+        .as_ref()
+        .ok_or("intake.selector.argv: missing 'argv'")?;
+    if argv.is_empty() || argv.len() > MAX_ARGV_ITEMS {
+        return Err(format!(
+            "intake.selector.argv: expected 1–{MAX_ARGV_ITEMS} entries, got {}",
+            argv.len()
+        ));
+    }
+    let mut total = 0usize;
+    for (index, arg) in argv.iter().enumerate() {
+        if arg.is_empty() {
+            return Err(format!("intake.selector.argv[{index}]: must not be empty"));
+        }
+        if arg.len() > MAX_ARGV_ITEM_BYTES {
+            return Err(format!(
+                "intake.selector.argv[{index}]: exceeds {MAX_ARGV_ITEM_BYTES} bytes"
+            ));
+        }
+        if arg.chars().any(char::is_control) {
+            return Err(format!(
+                "intake.selector.argv[{index}]: <redacted> contains control characters"
+            ));
+        }
+        total += arg.len();
+    }
+    if total > MAX_ARGV_TOTAL_BYTES {
+        return Err(format!(
+            "intake.selector.argv: total exceeds {MAX_ARGV_TOTAL_BYTES} bytes"
+        ));
+    }
+    Ok(IntakeSelectorBinding {
+        adapter: adapter.to_string(),
+        selector_version: section.selector_version,
+        policy_revision: section.policy_revision,
+        argv: argv.clone(),
     })
 }
 

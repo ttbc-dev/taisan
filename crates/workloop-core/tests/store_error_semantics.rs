@@ -279,6 +279,20 @@ impl ReadView for FailingTx<'_> {
     fn commands(&self) -> Result<Vec<workloop_core::store::CommandRecord>, StoreError> {
         unimplemented!()
     }
+    fn intake_settings(
+        &self,
+    ) -> Result<Option<workloop_core::store::IntakeSettingsRecord>, StoreError> {
+        Ok(None)
+    }
+    fn pending_queue_count(&self) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+    fn intake_source_owners(
+        &self,
+        _issues: &[IssueRef],
+    ) -> Result<Vec<workloop_core::store::IntakeSourceOwner>, StoreError> {
+        unimplemented!()
+    }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
         Ok(0)
     }

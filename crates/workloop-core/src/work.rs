@@ -21,8 +21,8 @@ use crate::observation::{
     NormalizedEffectFact, Observation, ObservationFact, Outcome, ProcessStateFact, RefRelation,
 };
 use crate::store::{
-    Effect, HostAction, HostActionIntent, ReadView, RecoveryIntent, RecoveryIntentState, Store,
-    StoreError, TxView,
+    Effect, HostAction, HostActionIntent, IntakeSettingsRecord, ReadView, RecoveryIntent,
+    RecoveryIntentState, Store, StoreError, TxView,
 };
 
 /// The resolved installation binding template: which host installation,
@@ -38,6 +38,13 @@ pub struct HostTemplate {
     /// that may publish.
     pub actors: Vec<RoleBinding>,
 }
+
+/// The pending-queue admission bound used when the store holds no
+/// active intake-settings record — the documented default from
+/// `docs/installation-config.md`. The profile loader defaults to the
+/// same value so a configured limit and an unconfigured store can
+/// never disagree about the floor.
+pub const DEFAULT_PENDING_QUEUE_LIMIT: u32 = 10;
 
 /// Installation-level configuration supplied by the composition root.
 #[derive(Debug, Clone)]
@@ -134,15 +141,50 @@ pub fn handle_command(
 
         let decision = decide_attempts(tx, config, req, now_unix_seconds)?;
 
-        tx.save_decision(
-            &req.origin,
-            &req.actor,
-            &req.idempotency_key,
-            &digest,
-            &canonical,
-            &decision,
-        )?;
+        // A capacity refusal is transient, not a decision about facts:
+        // persisting it under the caller's idempotency key would replay
+        // the refusal forever — for a selector candidate the key is the
+        // proposal's replay key, and deferral requires the lookup to
+        // find nothing so a later proposal is decided fresh against
+        // then-current capacity (docs/intake-identity-storage.md). Every
+        // other outcome, accepted or rejected, keeps its durable record.
+        if !matches!(
+            decision,
+            CommandDecision::Rejected {
+                reason: RejectionCode::CapacityExhausted,
+                ..
+            }
+        ) {
+            tx.save_decision(
+                &req.origin,
+                &req.actor,
+                &req.idempotency_key,
+                &digest,
+                &canonical,
+                &decision,
+            )?;
+        }
         Ok(decision)
+    })
+}
+
+/// Persist a new active intake-settings record under the revision
+/// guard (#213). `expected_revision` is the revision the caller last
+/// observed — `None` asserts the record is absent, `Some(rev)` asserts
+/// it still carries `rev`. A stale expectation is a
+/// `ConstraintConflict`, so a reload writer holding an older snapshot
+/// can never overwrite a newer active limit. This is the only writer
+/// of the record submit transactions read.
+pub fn set_intake_settings(
+    store: &impl Store,
+    settings: IntakeSettingsRecord,
+    expected_revision: Option<&str>,
+) -> Result<(), StoreError> {
+    store.transact(|tx| {
+        tx.apply(&Effect::SetIntakeSettings {
+            settings,
+            expected_revision: expected_revision.map(str::to_string),
+        })
     })
 }
 
@@ -699,6 +741,33 @@ fn decide_submit(
                 None,
                 vec!["duplicate source issue".into()],
             )?,
+            vec![],
+        ));
+    }
+
+    // The installation-wide pending-queue limit is enforced here, inside
+    // the same transaction that inserts the Work, its queued Execution,
+    // and the issue claims — never as a pre-check two concurrent
+    // submitters could both pass. Manual and selector submits share
+    // this path; the effective limit is the active settings record's,
+    // or the documented default when no record exists. A grouped
+    // proposal is one submit and so consumes exactly one position.
+    let pending_limit = tx
+        .intake_settings()?
+        .map(|s| s.pending_queue_limit)
+        .unwrap_or(DEFAULT_PENDING_QUEUE_LIMIT);
+    let pending = tx.pending_queue_count()?;
+    if pending >= u64::from(pending_limit) {
+        return Ok((
+            rejected_now(
+                tx,
+                RejectionCode::CapacityExhausted,
+                None,
+                vec![format!(
+                    "pending queue limit {pending_limit} reached: \
+                     {pending} queued Works hold every position"
+                )],
+            ),
             vec![],
         ));
     }
