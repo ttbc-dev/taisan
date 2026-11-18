@@ -512,20 +512,30 @@ fn selector_timeout_is_bounded() {
 #[test]
 fn selector_environment_carries_no_inherited_secrets() {
     let dir = tmp_root("env");
-    unsafe { std::env::set_var("WORKLOOP_TEST_LEAKED_SECRET", "s3cr3t-value") };
+    // The child environment is the bounded allowlist plus the few
+    // variables `/bin/sh` itself exports (PWD, SHLVL, _) — every name
+    // the adapter sees must come from that closed set, so nothing the
+    // test process (or an operator's shell) carries can leak through.
+    // Asserting on names avoids mutating the shared process env,
+    // which is unsound under parallel tests.
     let capture = dir.join("env.txt");
     let script = raw_script(&dir, "sel.sh", &format!("env > '{}'", capture.display()));
     let f = fixture(dir.clone(), script);
     let _ = run(&f, Duration::from_secs(10));
-    unsafe { std::env::remove_var("WORKLOOP_TEST_LEAKED_SECRET") };
     let env = std::fs::read_to_string(&capture).expect("env captured");
+    let allowed = [
+        "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "PWD", "SHLVL", "_",
+    ];
+    for line in env.lines() {
+        let name = line.split('=').next().unwrap_or("");
+        assert!(
+            allowed.contains(&name),
+            "non-allowlisted variable reached the selector: {name}"
+        );
+    }
     assert!(
-        !env.contains("WORKLOOP_TEST_LEAKED_SECRET"),
-        "inherited environment leaked into the selector:\n{env}"
-    );
-    assert!(
-        !env.lines().any(|l| l.starts_with("CARGO")),
-        "cargo vars leaked:\n{env}"
+        env.lines().any(|l| l.starts_with("PATH=")),
+        "allowlisted PATH missing:\n{env}"
     );
 }
 
@@ -718,7 +728,11 @@ fn an_active_run_refuses_a_second_invocation() {
 #[test]
 fn mid_batch_capacity_loss_defers_the_unattempted_remainder() {
     let dir = tmp_root("capacity");
-    let store = SqliteStore::in_memory(4).unwrap();
+    // File-backed store: the mid-batch capacity loss is injected by a
+    // trigger inside the first selector decision's own transaction —
+    // deterministic, no polling thread.
+    let db = dir.join("workloop.db");
+    let store = SqliteStore::open(&db, 4).unwrap();
     // Start with a generous limit so preflight asks for a full batch.
     set_intake_settings(&store, settings("rev-a", 40), None).unwrap();
 
@@ -734,42 +748,25 @@ fn mid_batch_capacity_loss_defers_the_unattempted_remainder() {
     let mut f = fixture(dir.clone(), script);
     f.store = store;
 
-    // Drive the run on a thread; shrink the limit the moment the
-    // validated batch lands — the deterministic mid-admission capacity
-    // loss the atomic check exists for.
-    let report = std::thread::scope(|s| {
-        let runner = s.spawn(|| {
-            let p = params(&f, &f.binding, Duration::from_secs(10));
-            run_intake(&f.store, &p, NOW, NOW_MS).expect("run_intake succeeds")
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let active = f
-                .store
-                .transact_deferred(|tx| tx.active_intake_run())
-                .unwrap();
-            if active
-                .as_ref()
-                .is_some_and(|r| r.state == IntakeRunState::Admitting)
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "run never reached admitting");
-            std::thread::sleep(Duration::from_micros(200));
-        }
-        let current = f
-            .store
-            .transact_deferred(|tx| tx.intake_settings())
-            .unwrap()
-            .unwrap();
-        set_intake_settings(
-            &f.store,
-            settings("rev-b", 2),
-            Some(&current.settings_revision),
-        )
-        .unwrap();
-        runner.join().unwrap()
-    });
+    // The first selector-origin command decision shrinks the pending
+    // limit to 2 inside its own commit: the first two candidates
+    // admit, the third onward sees a full queue and defers.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE fault_counter (n INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO fault_counter (n) VALUES (0);
+         CREATE TRIGGER shrink_pending_limit AFTER INSERT ON commands
+         WHEN NEW.origin = 'selector'
+         BEGIN
+           UPDATE fault_counter SET n = n + 1;
+           UPDATE intake_settings SET pending_queue_limit = 2
+           WHERE (SELECT n FROM fault_counter) = 1;
+         END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = run(&f, Duration::from_secs(10));
 
     assert_eq!(report.state, IntakeRunState::Completed);
     let deferred = report
@@ -815,6 +812,12 @@ fn mid_batch_capacity_loss_defers_the_unattempted_remainder() {
             "deferred candidate must hold no ledger decision"
         );
     }
+    // The fault trigger has done its work — remove it before the
+    // capacity-restore submit so it cannot fire a second time.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER shrink_pending_limit; DROP TABLE fault_counter;")
+        .unwrap();
+    drop(conn);
     let current = f
         .store
         .transact_deferred(|tx| tx.intake_settings())
@@ -909,4 +912,140 @@ fn a_submit_store_fault_marks_the_candidate_unknown_and_halts() {
         })
         .unwrap();
     assert!(decision.is_none(), "aborted submit must leave no decision");
+}
+
+/// A store fault that propagates out of the batch insert must not
+/// leave the run non-terminal under this live process: the invocation
+/// aborts it `interrupted` and the next invocation is not wedged
+/// behind `ActiveRun`.
+#[test]
+fn a_batch_store_fault_aborts_the_run_instead_of_wedging() {
+    let dir = tmp_root("abort-wedge");
+    let db = dir.join("workloop.db");
+    let proposals = vec![
+        proposal("issue-1", "first work"),
+        proposal("issue-2", "second work"),
+    ];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = SqliteStore::open(&db, 4).unwrap();
+    // Abort the validated batch insert: the run record exists (`open`)
+    // but no candidate ever lands — the propagating store error path.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fault_candidate_batch BEFORE INSERT ON intake_candidates
+         BEGIN SELECT RAISE(ABORT, 'injected batch fault'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let err = run_result(&f, Duration::from_secs(10)).unwrap_err();
+    assert!(
+        matches!(err, IntakeError::Store(_)),
+        "expected a store error, got {err:?}"
+    );
+
+    // The run is closed `interrupted`, not left `open` under a live
+    // owner — and no active run remains to block the next call.
+    let runs = f.store.transact_deferred(|tx| tx.intake_runs()).unwrap();
+    assert_eq!(runs.len(), 1);
+    let aborted = &runs[0];
+    assert_eq!(aborted.state, IntakeRunState::Interrupted);
+    assert_eq!(aborted.detail_code.as_deref(), Some("store_error"));
+    assert!(
+        f.store
+            .transact_deferred(|tx| tx.active_intake_run())
+            .unwrap()
+            .is_none(),
+        "aborted run must not stay active"
+    );
+    assert!(
+        f.store
+            .transact_deferred(|tx| tx.intake_candidates(&aborted.run_id))
+            .unwrap()
+            .is_empty(),
+        "aborted batch must leave no candidate rows"
+    );
+
+    // And the wedge is gone: once the fault clears, the same
+    // invocation completes normally end to end.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER fault_candidate_batch;")
+        .unwrap();
+    drop(conn);
+    let second = run(&f, Duration::from_secs(10));
+    assert_eq!(second.state, IntakeRunState::Completed);
+    assert_eq!(second.candidates.len(), 2);
+}
+
+/// The same guard on the `admitting` side: a propagating store error
+/// after every candidate reached a decided status still closes the
+/// run `interrupted` — the accepted Work and ledger decisions are
+/// untouched, and the next invocation is not wedged.
+#[test]
+fn an_admission_store_fault_aborts_and_reconciles_candidates() {
+    let dir = tmp_root("abort-admitting");
+    let db = dir.join("workloop.db");
+    let proposals = vec![
+        proposal("issue-1", "first work"),
+        proposal("issue-2", "second work"),
+    ];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = SqliteStore::open(&db, 4).unwrap();
+    // Admit the whole batch, then fault only the run's terminal
+    // transition: candidates reach decided statuses, but the
+    // `admitting` → `completed` write fails and propagates.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fault_run_completion BEFORE UPDATE ON intake_runs
+         WHEN NEW.state = 'completed'
+         BEGIN SELECT RAISE(ABORT, 'injected completion fault'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let err = run_result(&f, Duration::from_secs(10)).unwrap_err();
+    assert!(
+        matches!(err, IntakeError::Store(_)),
+        "expected a store error, got {err:?}"
+    );
+
+    let runs = f.store.transact_deferred(|tx| tx.intake_runs()).unwrap();
+    assert_eq!(runs.len(), 1);
+    let aborted = &runs[0];
+    assert_eq!(aborted.state, IntakeRunState::Interrupted);
+    assert_eq!(aborted.detail_code.as_deref(), Some("store_error"));
+    assert!(
+        f.store
+            .transact_deferred(|tx| tx.active_intake_run())
+            .unwrap()
+            .is_none(),
+        "aborted run must not stay active"
+    );
+
+    // Every candidate had already reached a decided status before the
+    // fault, so the sweep finds nothing unresolved — the accepted
+    // Work and its ledger decision are untouched.
+    let candidates = f
+        .store
+        .transact_deferred(|tx| tx.intake_candidates(&aborted.run_id))
+        .unwrap();
+    assert!(
+        candidates
+            .iter()
+            .all(|c| c.status == IntakeCandidateStatus::Accepted),
+        "{candidates:?}"
+    );
+
+    // The next invocation is not wedged: it fails later on the
+    // now-excluded sources — a normal failed run, never ActiveRun.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER fault_run_completion;")
+        .unwrap();
+    drop(conn);
+    let second = run(&f, Duration::from_secs(10));
+    assert_eq!(second.state, IntakeRunState::Failed);
 }

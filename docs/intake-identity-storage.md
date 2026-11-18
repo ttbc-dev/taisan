@@ -92,7 +92,7 @@ Run states:
 | — | `skipped` | Recorded without adapter launch (e.g. preflight found zero free pending positions). Terminal at insert |
 | `open` | `admitting` | A whole-response-validated candidate batch (possibly empty) committed atomically with this transition |
 | `open` | `failed` | Invocation-level failure before a validated batch: transport, deadline, contract violation, adapter failure. `detail_code` carries the bounded protocol/launcher code |
-| `open`, `admitting` | `interrupted` | Recovery determined the owning invocation cannot continue. Never set by a live owner |
+| `open`, `admitting` | `interrupted` | The owning invocation cannot continue: recovery proved the owner gone, or the live owner aborted on a propagating store fault (`store_error`). Candidates stay for ledger reconciliation |
 | `admitting` | `completed` | Every candidate reached a recorded terminal status |
 | terminal | — | `completed`, `failed`, `interrupted`, `skipped` never regress |
 
@@ -198,7 +198,9 @@ Values are illustrative, not fetched identities or executed evidence.
 | --- | --- |
 | Manual one-shot, adapter returns 2 candidates, both accepted | run `manual`/`completed`; candidates ordinal 0,1 `accepted` with distinct `work_id`s and `command_id`s |
 | Scheduled tick re-proposes an already-admitted semantic proposal | new run `scheduled_interval`; candidate `replayed` linking the original `command_id`/`work_id`; no second Work |
-| Queue full at preflight | run `skipped`/`capacity_full`, zero candidates, no adapter launch recorded |
+| Queue full at preflight | run `skipped`/`queue_full`, zero candidates, no adapter launch recorded |
+| Exclusion set beyond the wire bound at preflight | run `skipped`/`exclusions_overflow`, zero candidates, no adapter launch recorded — exclusions are never truncated to fit |
+| Store fault after the run record commits | run `interrupted`/`store_error` (best-effort); persisted candidates reconcile through the ledger — a live owner never leaves a non-terminal run behind |
 | Adapter exits nonzero | run `failed`/`transport_failure`, zero candidates |
 | Owner dies after batch persisted, before first submit | run `admitting` + all candidates `pending` → recovery marks run `interrupted`, candidates reconciled via ledger |
 | Submit commits, candidate update crashes | candidate `pending`, ledger holds decision → recovery links it `accepted`/`replayed`/`rejected` |

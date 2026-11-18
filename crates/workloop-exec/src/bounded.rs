@@ -195,6 +195,9 @@ pub fn exchange(
     bounds: &ExchangeBounds,
     timeout: Duration,
 ) -> Result<ExchangeOutput, ExchangeError> {
+    // The deadline is anchored at call time — spawn, identity capture,
+    // and thread setup all spend the same budget.
+    let deadline = std::time::Instant::now() + timeout;
     if argv.is_empty() {
         return Err(ExchangeError::Launch {
             reason: "empty argv".into(),
@@ -276,7 +279,6 @@ pub fn exchange(
         let _ = exit_tx.send(status);
     });
 
-    let deadline = std::time::Instant::now() + timeout;
     let mut terminated: Option<ExchangeError> = None;
     let mut exit_status = None;
     loop {

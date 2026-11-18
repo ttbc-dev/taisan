@@ -275,6 +275,31 @@ pub fn run_intake(
         Ok(run_id)
     })?;
 
+    // Everything after the `open` record runs under one guard: a
+    // store fault must never return with a non-terminal run still
+    // owned by this live process — the next invocation would read it
+    // as active forever and intake would wedge until restart.
+    match complete_intake(store, params, &run_id, &request, now_unix_seconds) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            abort_run(store, params.actor, &run_id, now_unix_seconds);
+            Err(error)
+        }
+    }
+}
+
+/// The post-launch half of [`run_intake`]: the single bounded
+/// exchange, whole-response validation, the atomic candidate batch,
+/// and ordered admission. Any error propagates to the caller, which
+/// aborts the still-open run — this function never leaves the run
+/// non-terminal on its own error paths.
+fn complete_intake(
+    store: &SqliteStore,
+    params: &IntakeParams<'_>,
+    run_id: &str,
+    request: &protocol::ValidatedRequest,
+    now_unix_seconds: i64,
+) -> Result<IntakeReport, IntakeError> {
     // The single Selector call. Transport-level outcomes map onto
     // bounded `detail_code`s; payload semantics belong to the
     // protocol layer, which already classified them.
@@ -291,33 +316,33 @@ pub fn run_intake(
         Err(error) => {
             finish_run(
                 store,
-                &run_id,
+                run_id,
                 IntakeRunState::Failed,
                 Some(exchange_detail(&error).to_string()),
                 now_unix_seconds,
             )?;
-            return Ok(report(store, &run_id, false)?);
+            return Ok(report(store, run_id, false)?);
         }
-        Ok(output) => match protocol::validate_response(&output.stdout, &request) {
+        Ok(output) => match protocol::validate_response(&output.stdout, request) {
             Err(violation) => {
                 finish_run(
                     store,
-                    &run_id,
+                    run_id,
                     IntakeRunState::Failed,
                     Some(violation_detail(&violation)),
                     now_unix_seconds,
                 )?;
-                return Ok(report(store, &run_id, true)?);
+                return Ok(report(store, run_id, true)?);
             }
             Ok(SelectorReply::Failure { code, .. }) => {
                 finish_run(
                     store,
-                    &run_id,
+                    run_id,
                     IntakeRunState::Failed,
                     Some(failure_detail(code).to_string()),
                     now_unix_seconds,
                 )?;
-                return Ok(report(store, &run_id, true)?);
+                return Ok(report(store, run_id, true)?);
             }
             Ok(SelectorReply::Success { candidates }) => candidates,
         },
@@ -325,7 +350,7 @@ pub fn run_intake(
 
     // B1: the whole validated batch and the `open` → `admitting`
     // transition commit atomically — original order, all `pending`.
-    admit_batch(store, &run_id, params, &outcome)?;
+    admit_batch(store, run_id, params, &outcome)?;
 
     // Per-candidate admission in returned order. Ordinary refusals
     // are recorded and later candidates continue; capacity exhaustion
@@ -336,7 +361,7 @@ pub fn run_intake(
         if defer_rest {
             if !mark_candidate(
                 store,
-                &run_id,
+                run_id,
                 index as u32,
                 IntakeCandidateStatus::CapacityDeferred,
                 Some("capacity_exhausted".into()),
@@ -351,7 +376,7 @@ pub fn run_intake(
         match admit_one(
             store,
             params,
-            &run_id,
+            run_id,
             index as u32,
             proposal,
             now_unix_seconds,
@@ -365,7 +390,7 @@ pub fn run_intake(
     // Terminal only when every candidate resolved — a halted run
     // stays `admitting` for #208's recovery pass.
     let unresolved = store.transact_deferred(|tx| {
-        Ok(tx.intake_candidates(&run_id)?.iter().any(|c| {
+        Ok(tx.intake_candidates(run_id)?.iter().any(|c| {
             matches!(
                 c.status,
                 IntakeCandidateStatus::Pending | IntakeCandidateStatus::Unknown
@@ -375,13 +400,13 @@ pub fn run_intake(
     if !unresolved {
         finish_run(
             store,
-            &run_id,
+            run_id,
             IntakeRunState::Completed,
             None,
             now_unix_seconds,
         )?;
     }
-    Ok(report(store, &run_id, true)?)
+    Ok(report(store, run_id, true)?)
 }
 
 enum Preflight {
@@ -801,6 +826,34 @@ fn finish_run(
     })
 }
 
+/// Best-effort close of a run whose invocation failed with a store
+/// error after the `open` record committed. Without this, the run
+/// would stay `open`/`admitting` owned by *this live process*: every
+/// later invocation reads it as the active run and refuses, and
+/// recovery sees a live owner — intake wedges until process restart.
+/// The guarded write only fires while the run is still non-terminal,
+/// so an already-`completed`/`failed` run is untouched; the recovery
+/// sweep then reconciles any persisted candidates against the ledger
+/// instead of leaving them for the next restart.
+fn abort_run(store: &SqliteStore, actor: &Actor, run_id: &str, now: i64) {
+    let state = store
+        .transact_deferred(|tx| Ok(tx.intake_run(run_id)?.map(|r| r.state)))
+        .ok()
+        .flatten();
+    if let Some(state @ (IntakeRunState::Open | IntakeRunState::Admitting)) = state {
+        let _ = store.transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: run_id.to_string(),
+                state: IntakeRunState::Interrupted,
+                detail_code: Some("store_error".to_string()),
+                finished_unix_seconds: Some(now),
+                expected_state: state,
+            })
+        });
+    }
+    let _ = recover_intake(store, actor, now);
+}
+
 fn report(store: &SqliteStore, run_id: &str, launched: bool) -> Result<IntakeReport, StoreError> {
     store.transact_deferred(|tx| {
         let run = tx.intake_run(run_id)?.ok_or_else(|| StoreError::Internal {
@@ -919,7 +972,10 @@ pub enum RecoveryOutcome {
 ///
 /// `actor` is the installation actor selector submits replay under —
 /// the same value the coordinator used, needed to address ledger
-/// lookups.
+/// lookups. The run record does not persist it: the installation
+/// actor id is stable by design, and changing it re-keys the entire
+/// command ledger system-wide — an operator identity change that is
+/// outside intake's scope, not a per-run drift recovery must absorb.
 pub fn recover_intake(
     store: &SqliteStore,
     actor: &Actor,

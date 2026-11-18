@@ -115,6 +115,33 @@ fn a_due_slot_observed_while_active_is_skipped_not_queued() {
 }
 
 #[test]
+fn startup_and_reenable_dues_observed_while_active_are_skipped() {
+    // First sight with an already-active run: the startup due is
+    // skipped like any other due — the grid still anchors so the
+    // next firing is one interval out, never a retry burst.
+    let mut sched = IntakeScheduler::new();
+    assert_eq!(
+        sched.tick(NOW, Some(&settings(true, 30)), true),
+        TickDecision::Idle
+    );
+    assert_eq!(
+        sched.next_due_unix_seconds(),
+        Some(NOW + 1800),
+        "the skipped startup due still anchors the interval grid"
+    );
+
+    // Disabled -> enabled while a run is active: the re-enable due is
+    // skipped the same way.
+    let mut sched = IntakeScheduler::new();
+    sched.tick(NOW, Some(&settings(false, 30)), false);
+    assert_eq!(
+        sched.tick(NOW + 60, Some(&settings(true, 30)), true),
+        TickDecision::Idle
+    );
+    assert_eq!(sched.next_due_unix_seconds(), Some(NOW + 60 + 1800));
+}
+
+#[test]
 fn missed_periods_collapse_to_the_next_future_grid_point() {
     let mut sched = IntakeScheduler::new();
     sched.tick(NOW, Some(&settings(true, 30)), false);

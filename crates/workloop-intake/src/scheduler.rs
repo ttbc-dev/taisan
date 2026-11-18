@@ -152,20 +152,28 @@ impl IntakeScheduler {
         // Startup and re-enable are immediately due; an interval change
         // re-anchors the grid to this tick plus the new interval (the
         // pending old-grid slot is replaced, never fired); every other
-        // transition preserves `next_due`.
+        // transition preserves `next_due`. A due observed while intake
+        // is active is skipped like any other due — the schedule still
+        // anchors, it just does not fire this tick.
         if first_sight {
             self.next_due_unix_seconds = Some(now_unix_seconds.saturating_add(interval_seconds));
             self.applied = Some(current);
-            return TickDecision::Due {
-                trigger: IntakeTrigger::ScheduledStartup,
-            };
+            return due_or_idle(
+                TickDecision::Due {
+                    trigger: IntakeTrigger::ScheduledStartup,
+                },
+                intake_active,
+            );
         }
         if !was_enabled {
             self.next_due_unix_seconds = Some(now_unix_seconds.saturating_add(interval_seconds));
             self.applied = Some(current);
-            return TickDecision::Due {
-                trigger: IntakeTrigger::ScheduledReenable,
-            };
+            return due_or_idle(
+                TickDecision::Due {
+                    trigger: IntakeTrigger::ScheduledReenable,
+                },
+                intake_active,
+            );
         }
         if interval_changed {
             self.next_due_unix_seconds = Some(now_unix_seconds.saturating_add(interval_seconds));
@@ -179,9 +187,12 @@ impl IntakeScheduler {
             // transitions above, but fail toward the startup rule
             // rather than scheduling nothing forever.
             self.next_due_unix_seconds = Some(now_unix_seconds.saturating_add(interval_seconds));
-            return TickDecision::Due {
-                trigger: IntakeTrigger::ScheduledStartup,
-            };
+            return due_or_idle(
+                TickDecision::Due {
+                    trigger: IntakeTrigger::ScheduledStartup,
+                },
+                intake_active,
+            );
         };
         if next_due > now_unix_seconds {
             return TickDecision::Idle;
@@ -192,12 +203,22 @@ impl IntakeScheduler {
         // run, the consumed slot never produces a catch-up event.
         self.next_due_unix_seconds =
             Some(advance_past(next_due, now_unix_seconds, interval_seconds));
-        if intake_active {
-            return TickDecision::Idle;
-        }
-        TickDecision::Due {
-            trigger: IntakeTrigger::ScheduledInterval,
-        }
+        due_or_idle(
+            TickDecision::Due {
+                trigger: IntakeTrigger::ScheduledInterval,
+            },
+            intake_active,
+        )
+    }
+}
+
+/// A due observed while intake is active is skipped, not queued —
+/// every due path funnels through here so the rule holds uniformly.
+fn due_or_idle(decision: TickDecision, intake_active: bool) -> TickDecision {
+    if intake_active {
+        TickDecision::Idle
+    } else {
+        decision
     }
 }
 
