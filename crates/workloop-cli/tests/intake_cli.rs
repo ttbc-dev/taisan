@@ -194,9 +194,13 @@ fn slow_selector_fixture(root: &Path, delay_secs: u64) -> Vec<String> {
     std::fs::write(&template_path, template).unwrap();
     let capture = root.join("request.json");
     let script_path = root.join("slow-sel.sh");
+    // Each launch appends one line — the durable count of adapter
+    // exchanges the test can assert on afterwards.
+    let exchanges = root.join("exchanges.log");
     let script = format!(
-        "#!/bin/sh\nreq=$(cat)\nprintf '%s' \"$req\" > '{}'\nsleep {delay_secs}\nrid=$(printf '%s' \"$req\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\nsed \"s/__RID__/$rid/g\" '{}'\n",
+        "#!/bin/sh\nreq=$(cat)\nprintf '%s' \"$req\" > '{}'\necho x >> '{}'\nsleep {delay_secs}\nrid=$(printf '%s' \"$req\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\nsed \"s/__RID__/$rid/g\" '{}'\n",
         capture.display(),
+        exchanges.display(),
         template_path.display(),
     );
     std::fs::write(&script_path, script).unwrap();
@@ -678,10 +682,10 @@ fn concurrent_intake_invocations_are_single_flight() {
     let mut first = intake_command(&dir, Some(&profile), &["intake"])
         .spawn()
         .expect("first intake spawns");
-    // Let the first invocation take the lease and open its run
-    // before the second arrives — the lease, not timing luck, is
-    // what serializes them.
-    std::thread::sleep(std::time::Duration::from_millis(700));
+    // Deterministic sync: the selector's request capture proves the
+    // first invocation holds the lease, has opened its run record,
+    // and is mid-exchange — the second cannot beat it to the lease.
+    wait_for_file(&dir.join("request.json"), "first selector request");
     let second = intake_cli(&dir, Some(&profile), &["intake"]);
     assert!(
         !second.status.success(),
@@ -703,6 +707,10 @@ fn concurrent_intake_invocations_are_single_flight() {
     assert_eq!(items[0]["state"], "completed");
     assert_eq!(items[0]["trigger"], "manual");
     assert_eq!(items[0]["candidates"]["accepted"], 1);
+    // Exactly one adapter exchange happened — the refused invocation
+    // never reached process launch.
+    let exchanges = std::fs::read_to_string(dir.join("exchanges.log")).unwrap();
+    assert_eq!(exchanges.lines().count(), 1, "{exchanges}");
 }
 
 /// While a manual `taisan intake` holds its lease and the selector
@@ -749,6 +757,14 @@ fn an_in_flight_intake_leaves_submit_run_and_queries_free() {
         out.status.success(),
         "run --once failed during in-flight intake: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    // The scheduler observed the durable active run and skipped the
+    // due slot: no invocation thread was spawned, so the driver never
+    // prints its finish diagnostic.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("intake invocation finished"),
+        "run --once must not launch a second invocation: {stderr}"
     );
 
     // The projection shows the live run, not a phantom or a wedge.
