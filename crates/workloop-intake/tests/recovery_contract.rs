@@ -545,3 +545,113 @@ fn the_sweep_finishes_candidates_under_an_interrupted_run() {
     );
     assert_eq!(c.work_id.as_ref().map(|w| w.0.as_str()), work_id.as_deref());
 }
+
+#[test]
+fn an_admitting_run_with_a_preexisting_interrupted_candidate_stays_interrupted() {
+    // An earlier recovery can die between reconciling candidates and
+    // closing the run, leaving an `interrupted` candidate under an
+    // `admitting` run. A later pass must not close that run
+    // `completed` just because this pass interrupted nothing itself.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let cfg = config();
+    let act = actor();
+    let (pid, started) = dead_owner();
+
+    let key1 = replay_key("linked");
+    let (command1, work1) = seed_decision(&store, &cfg, &act, &key1);
+    insert_run(
+        &store,
+        run_record("r-partial", IntakeRunState::Open, pid, &started),
+    );
+    let c0 = candidate_with_key(
+        "r-partial",
+        0,
+        &replay_key("gone"),
+        IntakeCandidateStatus::Pending,
+    );
+    let c1 = candidate_with_key("r-partial", 1, &key1, IntakeCandidateStatus::Pending);
+    admit_batch(&store, "r-partial", vec![c0, c1]);
+    // The earlier partial recovery already marked candidate 0
+    // interrupted; candidate 1 still waits for this pass.
+    let c0_row = candidate_row(&store, "r-partial", 0);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Interrupted,
+                    status_reason: Some("no_saved_decision".into()),
+                    ..c0_row
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap();
+
+    let report = recover_intake(&store, &act, NOW).unwrap();
+    match report.outcome {
+        RecoveryOutcome::Recovered { final_state } => {
+            assert_eq!(final_state, IntakeRunState::Interrupted)
+        }
+        other => panic!("expected Recovered/Interrupted, got {other:?}"),
+    }
+    let detail = store
+        .transact_deferred(|tx| Ok(tx.intake_run("r-partial")?.and_then(|r| r.detail_code)))
+        .unwrap();
+    assert_eq!(detail.as_deref(), Some("owner_lost"));
+    // The decided candidate still reconciles normally.
+    let c1 = candidate_row(&store, "r-partial", 1);
+    assert_eq!(c1.status, IntakeCandidateStatus::Replayed);
+    assert_eq!(
+        c1.command_id.as_ref().map(|c| c.0.as_str()),
+        Some(command1.as_str())
+    );
+    assert_eq!(c1.work_id.as_ref().map(|w| w.0.as_str()), work1.as_deref());
+    // The pre-existing interrupted candidate is untouched.
+    let c0 = candidate_row(&store, "r-partial", 0);
+    assert_eq!(c0.status, IntakeCandidateStatus::Interrupted);
+}
+
+#[test]
+fn concurrent_recovery_passes_do_not_report_a_store_fault() {
+    // Two recovery passes (e.g. the run driver's tick and a manual
+    // `taisan intake`) can observe the same dead-owner run. The
+    // loser's guarded close conflicts — recovery is idempotent, so
+    // both callers must see success, never a store error.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let cfg = config();
+    let act = actor();
+    let (pid, started) = dead_owner();
+
+    let key = replay_key("raced");
+    seed_decision(&store, &cfg, &act, &key);
+    insert_run(
+        &store,
+        run_record("r-raced", IntakeRunState::Open, pid, &started),
+    );
+    admit_batch(
+        &store,
+        "r-raced",
+        vec![candidate_with_key(
+            "r-raced",
+            0,
+            &key,
+            IntakeCandidateStatus::Pending,
+        )],
+    );
+
+    let store_ref = &store;
+    let act_ref = &act;
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let a = scope.spawn(|| recover_intake(store_ref, act_ref, NOW));
+        let b = scope.spawn(|| recover_intake(store_ref, act_ref, NOW));
+        vec![a.join().unwrap(), b.join().unwrap()]
+    });
+    for result in results {
+        assert!(result.is_ok(), "concurrent recovery failed: {result:?}");
+    }
+    // The run reached a terminal state exactly once.
+    assert_eq!(
+        run_state(&store, "r-raced"),
+        Some(IntakeRunState::Completed)
+    );
+}

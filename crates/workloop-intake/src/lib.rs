@@ -1091,7 +1091,12 @@ pub fn recover_intake(
     // links; absent decisions become `interrupted`.
     let mut reconciled = 0usize;
     let candidates = store.transact_deferred(|tx| tx.intake_candidates(&run.run_id))?;
-    let mut any_interrupted = false;
+    // An `interrupted` candidate — whether this pass marks it now or
+    // an earlier partial recovery already did — means the invocation
+    // was cut short; the run can never close `completed` over one.
+    let mut any_interrupted = candidates
+        .iter()
+        .any(|c| c.status == IntakeCandidateStatus::Interrupted);
     for candidate in candidates {
         if !matches!(
             candidate.status,
@@ -1126,7 +1131,7 @@ pub fn recover_intake(
         IntakeRunState::Admitting if !any_interrupted => (IntakeRunState::Completed, None),
         _ => (IntakeRunState::Interrupted, Some("owner_lost")),
     };
-    store.transact(|tx| {
+    let close = store.transact(|tx| {
         tx.apply(&Effect::UpdateIntakeRun {
             run_id: run.run_id.clone(),
             state: final_state,
@@ -1134,7 +1139,34 @@ pub fn recover_intake(
             finished_unix_seconds: Some(now_unix_seconds),
             expected_state: run.state,
         })
-    })?;
+    });
+    // A concurrent recovery pass may win the guarded transition —
+    // recovery is idempotent, so a conflict is verified against the
+    // run's actual state rather than reported as a store fault.
+    let final_state = match close {
+        Ok(()) => final_state,
+        Err(StoreError::ConstraintConflict { .. } | StoreError::StateConflict { .. }) => {
+            let current =
+                store.transact_deferred(|tx| Ok(tx.intake_run(&run.run_id)?.map(|r| r.state)))?;
+            match current {
+                Some(
+                    state @ (IntakeRunState::Completed
+                    | IntakeRunState::Failed
+                    | IntakeRunState::Interrupted
+                    | IntakeRunState::Skipped),
+                ) => state,
+                _ => {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {} changed under a concurrent recovery",
+                            run.run_id
+                        ),
+                    });
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(RecoveryReport {
         active_run: Some(run.run_id),
