@@ -185,7 +185,12 @@ fn decision_envelope(req: &CommandRequest, decision: &CommandDecision) -> (Envel
             evidence,
             ..
         } => {
-            command.id = Some(command_id.0.clone());
+            // A capacity refusal persisted no decision: its allocated
+            // command id names no ledger row, so the envelope must not
+            // present it as a recorded command identity.
+            if *reason != RejectionCode::CapacityExhausted {
+                command.id = Some(command_id.0.clone());
+            }
             let mut e = base("rejected");
             e.command = Some(command);
             e.work_id = current_work_id.as_ref().map(|w| w.0.clone());
