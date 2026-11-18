@@ -39,6 +39,8 @@ Core owns repository scope, source freshness, idempotency, source overlap, queue
 
 The [identity/storage contract](identity-storage.md) settles same-scoped-Issue overlap. A new Work cannot claim a source Issue owned by unfinished Work, for both manual and Selector admission. Stable proposal keys replay their original decision. Safe terminal release permits a new explicit submission. Manual `submit` remains supported without a selector. The reference Selector continues to propose one Issue per Work; the external protocol permits adapter-owned grouping.
 
+Selector interchange is exercised, not just specified: one shared contract suite runs the same scenarios against the packaged reference executable and an independently implemented fixture adapter, including grouped candidates, identical proposal keys, and a configuration-only argv swap through the real intake path. The fixture is test infrastructure — its evidence claims contract interchange only. See [the #217 interchange record](evidence/selector-adapter-interchange-217.md).
+
 ### Worker contract
 
 A Worker Adapter receives a durable, uniquely identified **Invocation request** with:
