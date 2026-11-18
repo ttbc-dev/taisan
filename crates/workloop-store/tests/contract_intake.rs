@@ -733,6 +733,69 @@ fn candidate_identity_immutable_status_guarded() {
 }
 
 #[test]
+fn candidate_refuses_a_key_that_only_shares_the_replay_prefix() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let replay_key = "proposal/ref-selector:prop-forged";
+    let command_id = CommandId("cmd-forged".into());
+    let committed_at = 41_i64;
+    // A key that begins with the replay key but whose suffix is not
+    // this command's payload digest is not the payload-derived
+    // idempotency-conflict key, so it cannot back the candidate even
+    // though it shares the prefix.
+    store
+        .transact(|tx| {
+            tx.save_decision(
+                &Origin("selector".into()),
+                &Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                &format!("{replay_key}#forged"),
+                "not-the-suffix",
+                b"{}",
+                &CommandDecision::Rejected {
+                    command_id: command_id.clone(),
+                    reason: RejectionCode::IdempotencyConflict,
+                    current_work_id: None,
+                    current_version: None,
+                    evidence: vec![],
+                    committed_at,
+                },
+            )
+        })
+        .unwrap();
+    insert_run(
+        &store,
+        run("r-forged", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    admit_batch(
+        &store,
+        "r-forged",
+        vec![candidate("r-forged", 0, "prop-forged")],
+    );
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Rejected,
+                    status_reason: Some("idempotency_conflict".into()),
+                    command_id: Some(command_id),
+                    committed_seq: Some(committed_at),
+                    ..candidate("r-forged", 0, "prop-forged")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    let rows = store
+        .transact(|tx| tx.intake_candidates("r-forged"))
+        .unwrap();
+    assert_eq!(rows[0].status, IntakeCandidateStatus::Pending);
+    assert!(rows[0].command_id.is_none());
+}
+
+#[test]
 fn candidate_decision_links_follow_the_status_contract() {
     let store = SqliteStore::in_memory(2).unwrap();
     // Each decided candidate links the decision saved under its own

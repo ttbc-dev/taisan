@@ -745,14 +745,18 @@ fn opt_de_row<T: serde::de::DeserializeOwned>(
 }
 
 /// A stored command's idempotency key belongs to `replay_key` when it
-/// is that key itself or its payload-derived idempotency-conflict
-/// suffix (`<replay_key>#<digest>`); neither form can belong to an
-/// unrelated proposal.
-fn command_key_matches_replay(stored_key: &str, replay_key: &str) -> bool {
+/// is that key itself or its idempotency-conflict key
+/// (`<replay_key>#<digest>`), where the suffix is exactly that
+/// command's own payload digest — the form `handle_command` derives
+/// from the same origin/actor/key payload. A key that merely shares
+/// the prefix (an operator-chosen key, or a key whose selector itself
+/// contains `#`) is not this identity and cannot back the candidate.
+fn command_key_matches_replay(stored_key: &str, stored_digest: &str, replay_key: &str) -> bool {
     stored_key == replay_key
         || stored_key
             .strip_prefix(replay_key)
-            .is_some_and(|suffix| suffix.starts_with('#'))
+            .and_then(|suffix| suffix.strip_prefix('#'))
+            .is_some_and(|suffix| suffix == stored_digest)
 }
 
 /// Issue identity key: repository + opaque issue id — never the display
@@ -837,20 +841,25 @@ impl Tx<'_> {
     /// The decision a candidate may link: the command row must belong
     /// to the candidate's own replay identity, so a candidate can never
     /// borrow an unrelated proposal's accepted command or Work. An
-    /// idempotency conflict is durable under `<replay_key>#<digest>`,
-    /// which is the same identity with the payload-derived suffix.
+    /// idempotency conflict is durable under
+    /// `<replay_key>#<payload_digest>`, which is the same identity with
+    /// the payload-derived suffix; a prefix-sharing key whose suffix is
+    /// not the command's own digest is not that identity.
     fn command_decision_for_replay(
         &self,
         command_id: &CommandId,
         replay_key: &str,
     ) -> Result<Option<CommandDecision>, StoreError> {
-        let row: Option<(String, String)> = self.query_opt(
-            "SELECT idempotency_key, decision FROM commands WHERE command_id=?1",
+        let row: Option<(String, String, String)> = self.query_opt(
+            "SELECT idempotency_key, payload_digest, decision FROM commands \
+             WHERE command_id=?1",
             params![command_id.0],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         match row {
-            Some((key, decision)) if command_key_matches_replay(&key, replay_key) => {
+            Some((key, digest, decision))
+                if command_key_matches_replay(&key, &digest, replay_key) =>
+            {
                 Ok(Some(de_row(&decision).map_err(map_err)?))
             }
             _ => Ok(None),
