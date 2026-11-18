@@ -2648,6 +2648,33 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
+                // Field invariants match the state table: a live run
+                // keeps `detail_code`/`finished_unix_seconds` NULL; a
+                // terminal insert (`skipped`) records both its bounded
+                // diagnostic and its finish time.
+                match run.state {
+                    IntakeRunState::Open
+                        if run.detail_code.is_some() || run.finished_unix_seconds.is_some() =>
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "live intake run {} must keep detail_code and finished_unix_seconds NULL",
+                                run.run_id
+                            ),
+                        });
+                    }
+                    IntakeRunState::Skipped
+                        if run.detail_code.is_none() || run.finished_unix_seconds.is_none() =>
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "terminal intake run {} must record detail_code and finished_unix_seconds",
+                                run.run_id
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
                 // Single-active backstop: the intake lease is the real
                 // mutex, but a second live run must conflict even if a
                 // caller bypassed it — the partial unique index makes
@@ -2826,6 +2853,53 @@ impl TxView for Tx<'_> {
                         ),
                     });
                 }
+                // Field invariants match the state table: live runs
+                // keep both columns NULL, every terminal transition
+                // records a finish time, and only `failed`/`interrupted`
+                // carry a failure diagnostic.
+                let fields_ok = match state {
+                    IntakeRunState::Open | IntakeRunState::Admitting => {
+                        detail_code.is_none() && finished_unix_seconds.is_none()
+                    }
+                    IntakeRunState::Completed => {
+                        detail_code.is_none() && finished_unix_seconds.is_some()
+                    }
+                    IntakeRunState::Failed | IntakeRunState::Interrupted => {
+                        detail_code.is_some() && finished_unix_seconds.is_some()
+                    }
+                    IntakeRunState::Skipped => false,
+                };
+                if !fields_ok {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "intake run {run_id} transition to {} carries an inconsistent detail/finish field set",
+                            tag(state)
+                        ),
+                    });
+                }
+                // `completed` means every candidate reached a recorded
+                // terminal status; a coordinator that still holds a
+                // `pending`/`unknown` candidate must close the run
+                // `interrupted` instead.
+                if *state == IntakeRunState::Completed {
+                    let nonterminal: i64 = self
+                        .tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM intake_candidates WHERE run_id=?1 \
+                             AND status NOT IN ('accepted', 'replayed', 'rejected', \
+                             'capacity_deferred', 'interrupted')",
+                            params![run_id],
+                            |r| r.get(0),
+                        )
+                        .map_err(map_err)?;
+                    if nonterminal > 0 {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "intake run {run_id} cannot complete with {nonterminal} non-terminal candidates"
+                            ),
+                        });
+                    }
+                }
                 self.exec(
                     "UPDATE intake_runs SET state=?2, detail_code=?3, \
                      finished_unix_seconds=?4 \
@@ -2905,7 +2979,14 @@ impl TxView for Tx<'_> {
                 // link NULL (a deferred candidate must never look
                 // decided), a rejection never creates Work, and the
                 // decided statuses carry the command identity their
-                // outcome came from.
+                // outcome came from. A replay must mirror the saved
+                // decision: when that decision accepted and created a
+                // Work, the candidate links the original Work; when it
+                // rejected, the candidate links no Work.
+                let saved_decision = match candidate.command_id.as_ref() {
+                    Some(id) => self.command_decision(id)?,
+                    None => None,
+                };
                 let links_clear = candidate.command_id.is_none()
                     && candidate.work_id.is_none()
                     && candidate.committed_seq.is_none();
@@ -2925,7 +3006,19 @@ impl TxView for Tx<'_> {
                             && candidate.committed_seq.is_some()
                     }
                     IntakeCandidateStatus::Replayed => {
-                        candidate.command_id.is_some() && candidate.committed_seq.is_some()
+                        candidate.command_id.is_some()
+                            && candidate.committed_seq.is_some()
+                            && match &saved_decision {
+                                Some(CommandDecision::Accepted { work_id, .. }) => {
+                                    work_id.is_some() && candidate.work_id == *work_id
+                                }
+                                Some(CommandDecision::Rejected { .. }) => {
+                                    candidate.work_id.is_none()
+                                }
+                                // An absent ledger row is refused by the
+                                // command_id foreign key, not this rule.
+                                None => true,
+                            }
                     }
                 };
                 if !links_ok {
