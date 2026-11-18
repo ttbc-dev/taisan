@@ -168,7 +168,17 @@ pub fn run_exe_env(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn selector executable");
-    child.stdin.take().unwrap().write_all(request).unwrap();
+    // A usage-error child can exit before reading stdin, closing the
+    // pipe: the write then fails with EPIPE. That is a legitimate
+    // outcome for this harness — the exit code and streams are the
+    // contract — so only non-EPIPE write failures are harness bugs.
+    if let Err(error) = child.stdin.take().unwrap().write_all(request) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "selector stdin write failed: {error}"
+        );
+    }
     let output = child.wait_with_output().unwrap();
     (
         output.stdout,
