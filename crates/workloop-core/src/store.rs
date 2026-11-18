@@ -260,10 +260,10 @@ pub struct IntakeSettingsRecord {
 
 /// One scoped issue's live owner for the intake preflight: the Work
 /// whose immutable issue membership covers the issue and whose active
-/// Execution is `queued`, `running`, or `paused` — the owner set the
-/// preflight contract names. Issue claims are a separate record
-/// retained through holds, pauses, and uncertainty; this view reports
-/// queue-relevant owners, not the claim ledger.
+/// Execution is non-terminal — `queued`, `ready`, `running`,
+/// `waiting`, `stopping`, `paused`, or `uncertain`. Issue claims are a
+/// separate record retained through holds, pauses, and uncertainty;
+/// this view reports queue-relevant owners, not the claim ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntakeSourceOwner {
     pub issue: IssueRef,
@@ -426,8 +426,10 @@ pub enum IntakeRunState {
     /// Invocation-level failure before a validated batch; `detail_code`
     /// carries the bounded failure code.
     Failed,
-    /// Recovery determined the owning invocation cannot continue.
-    /// Never set by a live owner.
+    /// The owning invocation cannot continue: recovery proved the
+    /// owner gone, or the live owner itself aborted (a propagating
+    /// store fault or unresolved candidates). `detail_code` carries
+    /// which.
     Interrupted,
     /// Recorded without an adapter launch (e.g. zero free pending
     /// positions at preflight). Terminal at insert.
@@ -811,12 +813,19 @@ pub trait ReadView {
 
     /// Live owners of the scoped issues for the intake preflight: one
     /// row per `(issue, Work)` whose immutable membership covers the
-    /// issue and whose active Execution is `queued`, `running`, or
-    /// `paused`, ordered by issue key then Work id.
+    /// issue and whose active Execution is non-terminal, ordered by
+    /// issue key then Work id.
     fn intake_source_owners(
         &self,
         issues: &[IssueRef],
     ) -> Result<Vec<IntakeSourceOwner>, StoreError>;
+
+    /// Every scoped issue with a live owner — the same
+    /// non-terminal owner set [`Self::intake_source_owners`]
+    /// reports, unfiltered. The intake coordinator needs the complete
+    /// owned set *before* it can scope a request's exclusions, so this
+    /// read exists independently of any candidate issue list.
+    fn intake_owned_issues(&self) -> Result<Vec<IssueRef>, StoreError>;
 
     /// Every durable command decision, oldest first, reduced to
     /// [`CommandRecord`]. Read-only evidence for queries that must know

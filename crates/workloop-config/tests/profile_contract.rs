@@ -1367,6 +1367,41 @@ fn intake_selector_binding_validation() {
     parse_profile(&text).expect("boundary argv and timeout must load");
 }
 
+/// `verification_argv` shares the wire contract's total-byte accounting:
+/// the sum of string byte lengths, with no per-item overhead. Four
+/// 4,096-byte items total exactly 16,384 bytes and must load; one more
+/// byte must fail.
+#[test]
+fn intake_verification_argv_total_counts_string_bytes() {
+    let items = (0..4)
+        .map(|_| format!("\"{}\"", "v".repeat(4096)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n\
+         verification_argv = [{items}]\n",
+        base_profile()
+    );
+    let profile = parse_profile(&text).expect("exactly 16,384 total bytes must load");
+    let settings = profile.intake_settings().unwrap();
+    let binding = settings.selector.as_ref().unwrap();
+    assert_eq!(binding.verification_argv.len(), 4);
+    assert_eq!(binding.verification_argv[0].len(), 4096);
+
+    // Five 4,096-byte items total 20,480 bytes — over the bound.
+    let items = (0..5)
+        .map(|_| format!("\"{}\"", "w".repeat(4096)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[intake.selector]\nadapter = \"issue-scan\"\nargv = [\"issue-scan\"]\n\
+         verification_argv = [{items}]\n",
+        base_profile()
+    );
+    let err = parse_profile(&text).unwrap_err();
+    assert!(err.contains("total exceeds"), "{err}");
+}
+
 /// The settings revision is a deterministic digest of the complete
 /// validated content: identical content — including an empty `[intake]`
 /// versus an absent one — yields the identical revision, and every

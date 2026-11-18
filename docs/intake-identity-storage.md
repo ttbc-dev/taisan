@@ -1,6 +1,6 @@
 # Intake identity, persistence, and restart recovery
 
-Status: normative design for #206, implemented together with the #207 store changes as store format v8 against runtime revision `a175376`. This document specifies the durable records, states, and recovery rules for v0.2 intake. It changes no runtime API by itself; the coordinator is #203, recovery #208, and the CLI/scheduler contracts #209–#211. The [selector protocol](selector-protocol.md) (#200) remains authoritative for the wire contract, and [identity and admission](identity-storage.md) remains authoritative for command replay, overlap, and Work identity. Evidence distinctions follow the same rule as everywhere else: fixture results and owner-run live results are never conflated.
+Status: normative design for #206, implemented together with the #207 store changes as store format v8 against runtime revision `a175376`; the coordinator (#203), recovery (#208), CLI verbs and projections (#209–#210), scheduler (#215), `run` integration (#204), bounded exchange (#201), and the packaged reference Selector (#214) are implemented against this contract. This document specifies the durable records, states, and recovery rules for v0.2 intake. The [selector protocol](selector-protocol.md) (#200) remains authoritative for the wire contract, and [identity and admission](identity-storage.md) remains authoritative for command replay, overlap, and Work identity. Evidence distinctions follow the same rule as everywhere else: fixture results and owner-run live results are never conflated.
 
 ## Usage and authority
 
@@ -92,11 +92,13 @@ Run states:
 | — | `skipped` | Recorded without adapter launch (e.g. preflight found zero free pending positions). Terminal at insert |
 | `open` | `admitting` | A whole-response-validated candidate batch (possibly empty) committed atomically with this transition |
 | `open` | `failed` | Invocation-level failure before a validated batch: transport, deadline, contract violation, adapter failure. `detail_code` carries the bounded protocol/launcher code |
-| `open`, `admitting` | `interrupted` | Recovery determined the owning invocation cannot continue. Never set by a live owner |
+| `open`, `admitting` | `interrupted` | The owning invocation cannot continue: recovery proved the owner gone, or the live owner itself aborted — a propagating store fault (`store_error`) or admission halted with candidates still unresolved (`unresolved_candidates`). Candidates stay for ledger reconciliation |
 | `admitting` | `completed` | Every candidate reached a recorded terminal status |
 | terminal | — | `completed`, `failed`, `interrupted`, `skipped` never regress |
 
-Every transition into a terminal run state records `finished_unix_seconds`; `detail_code` carries the bounded diagnostic for `failed`, `interrupted`, and `skipped`. `open` and `admitting` runs keep both NULL — a live invocation has no finish time and no failure code.
+Every transition into a terminal run state records `finished_unix_seconds`; `detail_code` carries the bounded diagnostic for `failed`, `interrupted`, and `skipped`. `open` and `admitting` runs keep both NULL — a live invocation has no finish time and no failure code, and a run recovered to `completed` carries none either.
+
+The `detail_code` vocabulary is closed and bounded — never payload text. Skipped preflight refusals use `queue_full`, `repositories_bound` (the repository list is empty or beyond the wire's 1–64 bound), and `exclusions_overflow`. A failed invocation records one launcher code: `exchange_launch`, `exchange_exit`, `exchange_deadline`, `exchange_stdout_overflow`, `exchange_stderr_overflow`, or `exchange_unknown` for the bounded exchange; `malformed_response` or `contract_<rule>` when the response fails whole-response validation; `adapter_<code>` when the adapter itself returned a failure response. Interrupted runs use `owner_lost` / `no_conforming_response` from the recovery sweep and `store_error` / `unresolved_candidates` from a live owner.
 
 An empty successful scan is a `completed` run with zero candidates — "the selector ran and found nothing" is durable evidence, distinct from `skipped` (never ran) and `failed` (ran, failed).
 
@@ -110,11 +112,11 @@ Candidate statuses:
 | `rejected` | Ordinary final rejection (overlap, ineligible, invalid, unsupported capability, …) with `status_reason` = rejection code | `command_id`, `committed_seq`; `work_id` stays NULL — a rejection never creates Work |
 | `capacity_deferred` | Admission was refused for capacity before any decision was recorded; deferrable, not final | none — see below |
 | `unknown` | A submit's outcome is undetermined (store fault, lost response); reconcile via the saved command identity | none until reconciled |
-| `interrupted` | The run was interrupted before this candidate was attempted or resolved | none |
+| `interrupted` | The run ended before this candidate's outcome was resolved — never attempted, or attempted with an undetermined outcome that reconciliation proved had no saved decision | none |
 
-`capacity_deferred` is terminal *as a stored status*: the candidate row never transitions again, and run completion counts it among the terminal outcomes. "Not final" refers only to the command ledger — no decision was saved under the replay key, so a later run re-proposing the same semantic proposal submits fresh. Deferral is never retried by mutating this row.
+`capacity_deferred` is terminal *as a stored status*: the candidate row never transitions again, and run completion counts it among the terminal outcomes. "Not final" refers only to the command ledger — no decision was saved under the replay key, so a later run re-proposing the same semantic proposal submits fresh. Deferral is never retried by mutating this row. When capacity is found exhausted — at preflight or inside a submit transaction — the refused candidate *and every candidate after it in the original order* is marked `capacity_deferred`: the unattempted remainder is deferred with it, never left `pending`.
 
-Allowed transitions: `pending` → `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `interrupted`, or to `unknown`; `unknown` → `accepted`, `replayed`, `rejected`, `pending` (the ledger proves no decision exists), or `interrupted`. `accepted`, `replayed`, `rejected`, `capacity_deferred`, and `interrupted` are the terminal candidate statuses — none has an outgoing transition. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
+Allowed transitions: `pending` → `accepted`, `replayed`, `rejected`, `capacity_deferred`, `interrupted`, or `unknown`; `unknown` → `accepted`, `replayed`, `rejected`, or `interrupted` (reconciliation either finds the saved decision and fixes the terminal status, or proves none exists and interrupts the candidate — it never returns a candidate to `pending`, because an interrupted run has no admission pass left to re-drive it). `accepted`, `replayed`, `rejected`, `capacity_deferred`, and `interrupted` are the terminal candidate statuses — none has an outgoing transition. Every transition is guarded by the expected prior status inside the store transaction; a stale writer conflicts instead of regressing a row.
 
 The Links column is enforced by the store, not just documented: unresolved statuses (`pending`, `capacity_deferred`, `unknown`, `interrupted`) must keep `command_id`/`work_id`/`committed_seq` all NULL; `rejected` requires `command_id` and `committed_seq` and forbids `work_id`; `accepted` requires all three; `replayed` requires `command_id` and `committed_seq` with `work_id` present only when the saved decision created Work.
 
@@ -137,7 +139,7 @@ Rules that fall out of the matrix:
 - **Committed admissions survive later failure.** Once B2 commits, the Work and its decision are durable regardless of what happens to the run row or the adapter.
 - **At most one Work per request identity.** Every candidate submit travels the ordinary command path under its deterministic replay key; replay returns the saved decision instead of creating Work. This holds across ticks, response loss, order changes, and restart because the key never depends on run-local state.
 - **A recovery cursor never acknowledges or discards an uncommitted candidate.** There is no adapter cursor in this design: candidate rows are the recovery state. The adapter's `provenance.snapshot_cursor` remains audit metadata and is never used to skip or confirm admission.
-- **Unknown outcomes reconcile by saved command identity.** A candidate in `unknown` is resolved by looking up the command ledger under its `replay_key` (origin `selector`, installation actor): a found decision fixes the candidate's terminal status and links; no decision returns it to `pending` for a safe re-drive. Reconciliation never resends blindly and never treats "no row found" as proof of non-commit without the lookup.
+- **Unknown outcomes reconcile by saved command identity.** A candidate in `unknown` is resolved by looking up the command ledger under its `replay_key` (origin `selector`, installation actor): a found decision fixes the candidate's terminal status and links; no decision interrupts the candidate — the run has no admission pass left to re-drive it, and `unknown` never transitions back to `pending`. Reconciliation never resends blindly and never treats "no row found" as proof of non-commit without the lookup.
 - **Interruption before output persistence invents nothing.** If the owner dies while the run is `open`, recovery marks the run `interrupted` and leaves zero candidates; a fresh scheduled selection may run only after ownership is proven safe.
 
 ## Replay identity and finished sources
@@ -146,7 +148,7 @@ The same semantic proposal — same selector ID/version, policy revision, source
 
 A `policy_revision` change is different: it is inside the proposal identity, so a semantic policy change deliberately produces new keys — that is the protocol's rule, not an intake invention.
 
-A previously finished source is not special-cased. After safe terminal release the Issue claim is gone, so ordinary validation admits a new submission; a *new request identity* (changed source content producing a new proposal key, or an operator's fresh command key) goes through the normal submit path with no terminal-source approval gate. The intake layer keeps no finished-Issue blacklist and never rotates replay keys. Queued, running, and paused source owners still exclude a new Work through the existing `issue_claims` overlap rule — unchanged.
+A previously finished source is not special-cased. After safe terminal release the Issue claim is gone, so ordinary validation admits a new submission; a *new request identity* (changed source content producing a new proposal key, or an operator's fresh command key) goes through the normal submit path with no terminal-source approval gate. The intake layer keeps no finished-Issue blacklist and never rotates replay keys. Non-terminal source owners — `queued`, `ready`, `running`, `waiting`, `stopping`, `paused`, and `uncertain` — still exclude a new Work through the existing `issue_claims` overlap rule, which retains claims until safe terminal settlement — unchanged.
 
 ## Capacity deferral is not rejection
 
@@ -165,8 +167,9 @@ The pending-queue limit itself, its atomic enforcement inside submit, and the pr
 
 Recovery (#208) consumes these records; this section fixes the contract it relies on.
 
-- A run in `open` or `admitting` whose owner is proven gone is marked `interrupted` with a bounded `detail_code` (`owner_lost`, `no_conforming_response`, or `unresolved_candidates`). Unknown liveness retains exclusion — the run is not touched.
-- Candidates still `pending` or `unknown` under an interrupted run are reconciled against the command ledger by `replay_key` before any further admission: found decisions fix terminal status and links; absent decisions return candidates to `pending` (re-drivable) or `interrupted` per the documented policy — never silently acknowledged as accepted.
+- A run in `open` or `admitting` whose owner is proven gone is marked `interrupted` with a bounded recovery-origin `detail_code` (`owner_lost`, `no_conforming_response`). Unknown liveness retains exclusion — the run is not touched. Live-owner closes use the separate codes `store_error` / `unresolved_candidates` (next bullet).
+- A live owner closes its own run `interrupted` rather than leaving it `admitting` — best-effort, not guaranteed: when admission halts with `pending`/`unknown` candidates, or a propagating store fault ends the invocation, the owner attempts the guarded close (`unresolved_candidates` / `store_error`) and runs the same ledger reconciliation sweep recovery uses — the next invocation is normally not wedged behind the active-run guard, and no candidate is silently acknowledged. If the store fault persists through the abort write itself, the run stays non-terminal until the next recovery sweep proves the owner state — a documented residual risk, never a silent acceptance. `admitting` therefore only ever belongs to a live in-flight invocation or a dead/abandoned owner awaiting the sweep.
+- Candidates still `pending` or `unknown` under an interrupted run are reconciled against the command ledger by `replay_key` before any further admission: found decisions fix terminal status and links; absent decisions mark the candidate `interrupted` — never silently acknowledged as accepted. An interrupted candidate is terminal; a later run re-proposing the same semantic proposal creates a fresh candidate and submits fresh, because no decision exists under its replay key.
 - A run left `admitting` whose candidates are all terminal is closed `completed`.
 - A `skipped` or terminal run is never reopened; adapter swaps, configuration reloads, and restarts cannot rewrite run provenance or relabel a new candidate as a replay.
 
@@ -198,8 +201,11 @@ Values are illustrative, not fetched identities or executed evidence.
 | --- | --- |
 | Manual one-shot, adapter returns 2 candidates, both accepted | run `manual`/`completed`; candidates ordinal 0,1 `accepted` with distinct `work_id`s and `command_id`s |
 | Scheduled tick re-proposes an already-admitted semantic proposal | new run `scheduled_interval`; candidate `replayed` linking the original `command_id`/`work_id`; no second Work |
-| Queue full at preflight | run `skipped`/`capacity_full`, zero candidates, no adapter launch recorded |
-| Adapter exits nonzero | run `failed`/`transport_failure`, zero candidates |
+| Queue full at preflight | run `skipped`/`queue_full`, zero candidates, no adapter launch recorded |
+| Exclusion set beyond the wire bound at preflight | run `skipped`/`exclusions_overflow`, zero candidates, no adapter launch recorded — exclusions are never truncated to fit |
+| Repository list empty or beyond the 1–64 wire bound at preflight | run `skipped`/`repositories_bound`, zero candidates, no adapter launch recorded — the request is never built and scope is never broadened to fit |
+| Store fault after the run record commits | run `interrupted` — `store_error` when the fault propagated out of the invocation, `unresolved_candidates` when a submit absorbed it and admission halted (best-effort either way); persisted candidates reconcile through the ledger — a live owner normally leaves no non-terminal run behind; a fault that also defeats the abort write leaves the close to the next recovery sweep |
+| Adapter exits nonzero | run `failed`/`exchange_exit`, zero candidates |
 | Owner dies after batch persisted, before first submit | run `admitting` + all candidates `pending` → recovery marks run `interrupted`, candidates reconciled via ledger |
 | Submit commits, candidate update crashes | candidate `pending`, ledger holds decision → recovery links it `accepted`/`replayed`/`rejected` |
 | Capacity refusal mid-batch | attempted candidates decided; remainder `capacity_deferred` with NULL links and no saved decisions |

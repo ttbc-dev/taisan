@@ -4,6 +4,7 @@
 //! that stays in `work`.
 
 pub mod adapter;
+pub mod bounded;
 pub mod handoff;
 pub mod isolation;
 pub mod scripted;

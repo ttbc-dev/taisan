@@ -307,6 +307,23 @@ pub fn error_envelope(
     (e, class.exit())
 }
 
+/// A refused invocation that is not a `CommandDecision` — the intake
+/// surface's busy/active-run refusals. Same `rejected` status and exit
+/// class a domain rejection carries, with a bounded machine code.
+pub fn rejected_envelope(
+    identity: Option<CommandIdentity>,
+    code: &str,
+    message: &str,
+) -> (Envelope, i32) {
+    let mut e = base("rejected");
+    e.command = identity;
+    e.reason = Some(Reason {
+        code: bounded(code, MESSAGE_BOUND),
+        message: bounded(message, MESSAGE_BOUND),
+    });
+    (e, EXIT_REJECTED)
+}
+
 /// The mutation's fate cannot be determined. Recovery is `command-result`
 /// by the original `(origin, actor, idempotency_key)` or an identical
 /// replay — never a fresh key or a rewritten payload.

@@ -10,6 +10,7 @@ workloop-core = { path = "../workloop-core" }
 workloop-store = { path = "../workloop-store" }
 workloop-exec = { path = "../workloop-exec" }
 workloop-github = { path = "../workloop-github" }
+workloop-intake = { path = "../workloop-intake" }
 workloop-selector = { path = "../workloop-selector" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"

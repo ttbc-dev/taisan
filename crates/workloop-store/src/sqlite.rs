@@ -1889,7 +1889,10 @@ impl ReadView for Tx<'_> {
         // paused Work holds no claim yet still owns its issues for
         // exclusion purposes. The active Execution's state decides
         // whether the owner is live for the selector's scope —
-        // `queued`, `running`, and `paused` only.
+        // Every non-terminal state: `ready`, `waiting`, `stopping`,
+        // and `uncertain` own their issues exactly like `queued`,
+        // `running`, and `paused` — only the three terminal states
+        // release them.
         let keys: Vec<String> = issues.iter().map(issue_key).collect();
         let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -1897,7 +1900,7 @@ impl ReadView for Tx<'_> {
              FROM work_issue_refs wir \
              JOIN executions e ON e.work_id = wir.work_id \
              WHERE wir.issue_key IN ({placeholders}) \
-               AND e.state IN ('queued','running','paused') \
+               AND e.state NOT IN ('succeeded','failed','cancelled') \
              ORDER BY wir.issue_key, wir.work_id"
         );
         self.query_all(&sql, rusqlite::params_from_iter(keys.iter()), |row| {
@@ -1907,6 +1910,41 @@ impl ReadView for Tx<'_> {
                 execution_state: untag(&row.get::<_, String>(2)?)?,
             })
         })
+    }
+
+    fn intake_owned_issues(&self) -> Result<Vec<workloop_core::identity::IssueRef>, StoreError> {
+        // The unfiltered owner set: every issue whose immutable
+        // membership belongs to a Work holding a non-terminal
+        // Execution — the same live-owner rule `intake_source_owners`
+        // applies, minus the candidate filter.
+        // Dedup is by scoped identity (`IssueRef` ordering ignores
+        // `display_number`): two Works may record the same issue under
+        // different display numbers, and exclusions must see each
+        // identity once. The stored `issue` document's display number
+        // is kept — the protocol's exclusion rule also matches a
+        // non-null display number within the same repository — but a
+        // zero is normalized away because the wire requires a display
+        // number to be positive or absent.
+        let rows: Vec<workloop_core::identity::IssueRef> = self.query_all(
+            "SELECT DISTINCT wir.issue FROM work_issue_refs wir \
+             JOIN executions e ON e.work_id = wir.work_id \
+             WHERE e.state NOT IN ('succeeded','failed','cancelled') \
+             ORDER BY wir.issue_key, wir.issue",
+            [],
+            |row| {
+                let mut issue: workloop_core::identity::IssueRef =
+                    de_row(&row.get::<_, String>(0)?)?;
+                if issue.display_number == Some(0) {
+                    issue.display_number = None;
+                }
+                Ok(issue)
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
     fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {
@@ -2850,7 +2888,6 @@ impl TxView for Tx<'_> {
                         | (S::Unknown, S::Accepted)
                         | (S::Unknown, S::Replayed)
                         | (S::Unknown, S::Rejected)
-                        | (S::Unknown, S::Pending)
                         | (S::Unknown, S::Interrupted)
                 );
                 if !legal {

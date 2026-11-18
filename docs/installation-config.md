@@ -110,7 +110,7 @@ pending_queue_limit = 10               # installation-wide pending Work admissio
 adapter = "public-issue-selector"      # selector adapter identity bound into every request
 selector_version = 1                   # selection-semantics version, part of request identity
 policy_revision = 1                    # policy document revision, part of proposal identity
-argv = ["public-issue-selector", "select"]  # direct exec vector; never through a shell
+argv = ["public-issue-selector", "select", "--github-endpoint", "https://api.github.com"]  # direct exec vector; never through a shell
 ```
 
 Validation rules:
@@ -120,6 +120,7 @@ Validation rules:
 - Every `credential_ref` must parse as a known provider (`env:`, `file:`, `command:`); file providers require an absolute path. Validation checks the reference's shape, never its value.
 - Role actors resolve against the declared host; an actor on a different host than its role declares is a load error. Two roles may share an actor only when policy permits; the recommended configuration keeps `review` on a distinct identity.
 - `use = "source"` repositories grant read authority for admission sources only — never publication. `use = "publication"` implies source reads too.
+- The packaged `public-issue-selector` `gh` backend serves only repositories whose host instance was declared with `--github-endpoint` (the matching `[hosts.*].endpoint` value); a request scoped to any other host fails closed instead of being silently served from github.com.
 - Required-capability names are validated against the closed `HostCapability` set; an unknown capability name fails loading, not a silent no-op. Capability names come from the contract's capability set (`ready`, `thread_resolve`, ...), which deliberately differs from operation names (`mark_ready`, `resolve_thread`) — a capability selects an effect class, an operation names a concrete host action.
 - `recovery.transport.backoff_seconds` is the per-attempt wait schedule between transient-failure retries. `recovery.transport.backoff_jitter_ratio` (default `0.0`, range `0.0`–`1.0`) applies symmetric jitter: each scheduled wait is scaled by a per-attempt random factor in `1 ± ratio`. A `recovery.transport.max_retries` beyond the schedule length repeats the final element; a shorter retry count truncates the schedule. A `0` schedule entry is a valid immediate retry; `0` is still never silently "unlimited" for limit keys.
 - The `[selector]` section selects the alternate admission path. Its absence means manual submission only — the selector holds no default authority — and its unavailability must not block manual submission or existing Work. Every identity string inside it (adapter id, repository ids, issue references) is validated when the policy is resolved for a selector run, and unknown keys are refused rather than defaulted past, so a misspelled key surfaces as the bounded error instead of a silently degraded policy. An unparseable or unknown-keyed section is a bounded config error for that path only — validation deliberately does not gate config loading, so a malformed section cannot take manual submission down with it. An `excluded` `repo:number` entry matches a fact's opaque IssueId or its repository-scoped display number.

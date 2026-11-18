@@ -4,6 +4,8 @@
 //! Queries — the CLI is a replaceable interface, not an authority.
 
 mod envelope;
+mod intake;
+mod run_loop;
 
 use std::path::{Path, PathBuf};
 
@@ -29,8 +31,6 @@ use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::PlanBounds;
 use workloop_store::sqlite::SqliteStore;
-
-mod run_loop;
 
 #[derive(Parser)]
 #[command(
@@ -213,6 +213,28 @@ enum Commands {
         /// output shape.
         #[arg(long)]
         snapshot: PathBuf,
+    },
+    /// Run one intake invocation against the configured
+    /// `[intake.selector]` binding — the same coordinator path the
+    /// scheduler drives, under the `manual` trigger. Requires the
+    /// TOML installation profile; a missing profile or selector
+    /// binding is a bounded config refusal.
+    Intake,
+    /// Bounded intake run history, newest-first: per-run trigger,
+    /// state, bounded detail code, and per-status candidate counts,
+    /// plus the durable status facts (active run, last completed,
+    /// last failed) and the profile's enabled/revision state.
+    IntakeRuns {
+        /// Maximum runs returned; clamped to the query bound.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// One intake run with its candidates in returned order:
+    /// proposal/replay identity, recorded status and bounded reason,
+    /// and the command/Work decision links.
+    IntakeDetail {
+        #[arg(long)]
+        run: String,
     },
     WorkDetail {
         #[arg(long)]
@@ -706,6 +728,34 @@ fn run(cli: Cli) -> i32 {
                     ));
                 }
             };
+            // Intake recovery before the scheduler starts: close runs
+            // whose recorded owner is proven gone. Idempotent — a live
+            // or uninspectable owner leaves its run untouched.
+            if let Err(e) = workloop_intake::recover_intake(&store, &actor, now()) {
+                eprintln!("taisan: intake recovery: {e}");
+            }
+            // The intake driver ticks its own 60-second settings check
+            // inside the pass loop and idle sleep — profile reloads,
+            // due decisions, and skip-while-active all live there.
+            // Invocations run on their own thread with their own store
+            // connection, so a pending selector never blocks a phase.
+            // The TOML profile resolves through `TAISAN_CONFIG`/XDG
+            // only: `--config` on a store-backed command is the JSON
+            // installation record, never the profile path.
+            // `run --work` is a diagnostic scope: it restricts the
+            // execution phases to one Work and does not evaluate
+            // intake scheduling — no driver exists for it at all.
+            let mut intake_driver = scope.is_none().then(|| {
+                intake::IntakeDriver::new(
+                    None,
+                    cli.state_dir.clone(),
+                    actor.clone(),
+                    config.clone(),
+                    db_abs.clone(),
+                    installation.capacity,
+                    state_root.clone(),
+                )
+            });
             let mut passes_done = 0u32;
             loop {
                 if shutdown_requested() {
@@ -729,9 +779,18 @@ fn run(cli: Cli) -> i32 {
                 // stays single-object — per-pass progress is a stderr
                 // diagnostic and the run's one envelope is emitted once
                 // when the bounded run finishes.
+                // Every exit route joins a live invocation first — a
+                // store fault must not orphan the selector child past
+                // the process boundary either.
+                let join_invocation = |driver: &mut Option<intake::IntakeDriver>| {
+                    if let Some(driver) = driver.as_mut() {
+                        driver.finish();
+                    }
+                };
                 let payload = match serde_json::to_string(&report) {
                     Ok(p) => p,
                     Err(e) => {
+                        join_invocation(&mut intake_driver);
                         return emit(envelope::error_envelope(
                             Some(identity()),
                             envelope::ErrorClass::Store,
@@ -740,6 +799,7 @@ fn run(cli: Cli) -> i32 {
                     }
                 };
                 if let Err(e) = store.append_event("tick_report", &payload) {
+                    join_invocation(&mut intake_driver);
                     return emit(envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
@@ -751,7 +811,16 @@ fn run(cli: Cli) -> i32 {
                     "taisan: pass {passes_done}: {} phase(s)",
                     report.phases.len()
                 );
+                if let Some(driver) = intake_driver.as_mut() {
+                    driver.maybe_tick(&store, now());
+                }
                 if let Some(reason) = report.abort_reason() {
+                    // Join a still-running invocation before exiting —
+                    // otherwise its selector child is orphaned past the
+                    // process boundary.
+                    if let Some(driver) = intake_driver.as_mut() {
+                        driver.finish();
+                    }
                     return emit(envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
@@ -773,7 +842,19 @@ fn run(cli: Cli) -> i32 {
                     let slice = remaining_ms.min(100);
                     std::thread::sleep(std::time::Duration::from_millis(slice));
                     remaining_ms -= slice;
+                    // The settings-check tick is 60 seconds regardless
+                    // of the pass interval — evaluate it inside the
+                    // idle gap so a long interval cannot starve it.
+                    if let Some(driver) = intake_driver.as_mut() {
+                        driver.maybe_tick(&store, now());
+                    }
                 }
+            }
+            // No hidden child outlives the run: a still-running
+            // invocation is joined here, bounded by the configured
+            // adapter timeout.
+            if let Some(driver) = intake_driver.as_mut() {
+                driver.finish();
             }
             // The run's terminal result is exactly one envelope — kind
             // `run`, carrying the final work-list — no matter how many
@@ -1025,6 +1106,202 @@ fn run(cli: Cli) -> i32 {
                 identity(),
                 None,
             ))
+        }
+        Commands::Intake => {
+            // `intake` reports through the query envelope deliberately:
+            // its durable result is the intake run itself (projectable
+            // via `intake-runs`/`intake-detail`), duplicate submission
+            // is refused structurally by the intake lease and the
+            // active-run guard rather than by a command-ledger replay
+            // key, and candidate-level idempotency lives in each
+            // proposal's replay key inside the coordinator. The run's
+            // `state`/`detail_code` — not the envelope status — carries
+            // per-run outcome, so a converged `interrupted` run still
+            // exits accepted: the invocation did its job.
+            let identity =
+                || envelope::query_identity("intake", &actor, cli.idempotency_key.as_deref());
+            // Close runs a proven-dead owner left behind before the
+            // coordinator can refuse on an active run — idempotent and
+            // owner-proof-gated inside `recover_intake`.
+            if let Err(e) = workloop_intake::recover_intake(&store, &actor, now()) {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                ));
+            }
+            // The TOML profile resolves through `TAISAN_CONFIG`/XDG
+            // only — `cli.config` is the JSON installation record on
+            // store-backed commands, never the profile path.
+            let resolved = match intake::resolve_intake(None, cli.state_dir.as_deref()) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        "no installation profile — intake is not configured",
+                    ));
+                }
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
+            let Some(selector) = resolved.selector.clone() else {
+                return emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Config,
+                    "intake.selector binding is required for a manual intake",
+                ));
+            };
+            let revision = resolved.settings.revision();
+            let params = workloop_intake::IntakeParams {
+                trigger: workloop_core::store::IntakeTrigger::Manual,
+                binding: &selector.binding,
+                actor: &actor,
+                work_config: &config,
+                repositories: &resolved.repositories,
+                task_constraints: &selector.task_constraints,
+                verification_argv: &selector.verification_argv,
+                required_permissions: &selector.required_permissions,
+                settings_revision: Some(revision.as_str()),
+                cwd: &state_root,
+                timeout: std::time::Duration::from_secs(resolved.settings.timeout_seconds),
+            };
+            let epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            match workloop_intake::run_intake(&store, &params, now(), epoch_ms) {
+                Ok(report) => {
+                    let as_of = store
+                        .transact_deferred(|tx| tx.last_seq())
+                        .unwrap_or_default();
+                    let value = serde_json::json!({
+                        "run_id": report.run_id,
+                        "state": report.state,
+                        "detail_code": report.detail_code,
+                        "launched": report.launched,
+                        "candidates": report
+                            .candidates
+                            .iter()
+                            .map(|c| serde_json::json!({
+                                "ordinal": c.ordinal,
+                                "proposal_key": c.proposal_key,
+                                "replay_key": c.replay_key,
+                                "status": c.status,
+                                "status_reason": c.status_reason,
+                                "command_id": c.command_id.as_ref().map(|id| id.0.clone()),
+                                "work_id": c.work_id.as_ref().map(|w| w.0.clone()),
+                            }))
+                            .collect::<Vec<_>>(),
+                    });
+                    emit(envelope::query_envelope(
+                        &workloop_core::projection::QueryResult::Found {
+                            value,
+                            as_of,
+                            sources: vec![],
+                        },
+                        identity(),
+                        None,
+                    ))
+                }
+                Err(workloop_intake::IntakeError::Busy { owner_pid }) => {
+                    emit(envelope::rejected_envelope(
+                        Some(identity()),
+                        "intake_busy",
+                        &format!("another intake invocation holds the lease (pid {owner_pid})"),
+                    ))
+                }
+                Err(workloop_intake::IntakeError::ActiveRun { run_id }) => {
+                    emit(envelope::rejected_envelope(
+                        Some(identity()),
+                        "intake_active",
+                        &format!("an intake run is already active: {run_id}"),
+                    ))
+                }
+                Err(workloop_intake::IntakeError::Request { rule }) => {
+                    emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &format!("intake request could not be built: {rule}"),
+                    ))
+                }
+                Err(workloop_intake::IntakeError::Lease { reason }) => {
+                    emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Store,
+                        &format!("intake lease: {reason}"),
+                    ))
+                }
+                Err(workloop_intake::IntakeError::Store(e)) => emit(envelope::error_envelope(
+                    Some(identity()),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
+        }
+        Commands::IntakeRuns { limit } => {
+            let identity =
+                envelope::query_identity("intake_runs", &actor, cli.idempotency_key.as_deref());
+            let status = intake_status_value(None, cli.state_dir.as_deref());
+            match store.transact_deferred(|tx| projection::intake_runs(tx, limit)) {
+                Ok(workloop_core::projection::QueryResult::Found {
+                    value,
+                    as_of,
+                    sources,
+                }) => {
+                    let mut value = serde_json::to_value(&value).unwrap_or(serde_json::json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("status".into(), status);
+                    }
+                    emit(envelope::query_envelope(
+                        &workloop_core::projection::QueryResult::Found {
+                            value,
+                            as_of,
+                            sources,
+                        },
+                        identity,
+                        None,
+                    ))
+                }
+                Ok(other) => {
+                    type V = serde_json::Value;
+                    let mapped: workloop_core::projection::QueryResult<V> = match other {
+                        workloop_core::projection::QueryResult::NotFound => {
+                            workloop_core::projection::QueryResult::NotFound
+                        }
+                        workloop_core::projection::QueryResult::Forbidden => {
+                            workloop_core::projection::QueryResult::Forbidden
+                        }
+                        workloop_core::projection::QueryResult::StoreUnavailable => {
+                            workloop_core::projection::QueryResult::StoreUnavailable
+                        }
+                        workloop_core::projection::QueryResult::Found { .. } => unreachable!(),
+                    };
+                    emit(envelope::query_envelope(&mapped, identity, None))
+                }
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
+        }
+        Commands::IntakeDetail { run } => {
+            let identity =
+                envelope::query_identity("intake_detail", &actor, cli.idempotency_key.as_deref());
+            match store.transact_deferred(|tx| projection::intake_run_detail(tx, &run)) {
+                Ok(r) => emit(envelope::query_envelope(&r, identity, Some(run))),
+                Err(e) => emit(envelope::error_envelope(
+                    Some(identity),
+                    envelope::ErrorClass::Store,
+                    &e.to_string(),
+                )),
+            }
         }
         Commands::WorkDetail { work } => {
             let identity =
@@ -1304,6 +1581,38 @@ fn run(cli: Cli) -> i32 {
         Commands::Init { .. } | Commands::Check { .. } => {
             unreachable!("setup commands dispatch before store initialization")
         }
+    }
+}
+
+/// The profile-side intake status the `intake-runs` query reports
+/// alongside the durable run facts: whether intake is configured,
+/// enabled, under which settings revision, and the bounded loader
+/// diagnostic when the profile cannot be resolved this read.
+/// `next_due` is scheduler-process state and is never fabricated
+/// here — it stays absent from a one-shot query.
+fn intake_status_value(config_flag: Option<&Path>, state_flag: Option<&Path>) -> serde_json::Value {
+    match intake::profile_state(config_flag, state_flag) {
+        intake::ProfileState::Absent => serde_json::json!({ "configured": false }),
+        intake::ProfileState::Failed(e) => serde_json::json!({
+            "configured": true,
+            "enabled": null,
+            "diagnostic": e,
+        }),
+        intake::ProfileState::Loaded(profile) => match profile.intake_settings() {
+            Ok(settings) => serde_json::json!({
+                "configured": true,
+                "enabled": settings.enabled,
+                "settings_revision": settings.revision(),
+                "interval_minutes": settings.interval_minutes,
+                "timeout_seconds": settings.timeout_seconds,
+                "pending_queue_limit": settings.pending_queue_limit,
+            }),
+            Err(e) => serde_json::json!({
+                "configured": true,
+                "enabled": null,
+                "diagnostic": e,
+            }),
+        },
     }
 }
 

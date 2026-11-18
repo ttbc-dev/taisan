@@ -45,7 +45,7 @@ Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-fin
 
 ## Intake scheduling
 
-Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. It changes no runtime behavior by itself — the scheduler and CLI land in later v0.2 units — but the admission rule it names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
+Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, and the intake CLI verbs are implemented; persisting each tick's reloaded settings revision into the durable settings record remains a later v0.2 unit. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
 
 ### Scheduler model
 
@@ -101,9 +101,9 @@ The pending-queue limit is installation-wide and enforced inside the authoritati
 | `taisan intake-runs` | query | Lists durable intake runs newest-first (bounded) with trigger, state, detail code, and candidate counts |
 | `taisan intake-detail --run <id>` | query | One run plus its candidates in ordinal order: status, bounded reason, and command/work decision links |
 
-`intake` shares the scheduler's single-flight lease: while a scheduled run is active the verb is refused `intake_active` — status `rejected`, exit 1 — and never launches a second adapter or waits indefinitely. Automatic intake being disabled does not disable the verb; it requires only a configured selector binding. Per-candidate outcomes are data inside the run record, mirroring the `propose` batch envelope: each candidate reports `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `unknown` with its replay key so `command-result` can recover any decision. A lost response resolves through the recorded run and the command ledger — `unknown` at exit 6 when the fate cannot be determined, never a fresh run identity.
+`intake` shares the scheduler's single-flight lease: while another invocation holds it the verb is refused `intake_busy`, and a durable run record recovery could not close is refused `intake_active` — both status `rejected`, exit 1 — and it never launches a second adapter or waits indefinitely. Automatic intake being disabled does not disable the verb; it requires only a configured selector binding. The verb is synchronous: it always reports the recorded run's state, so there is no lost-response window and no `unknown` envelope — an invocation interrupted mid-flight leaves its durable run for the recovery sweep instead. Per-candidate outcomes are data inside the run record, mirroring the `propose` batch envelope: each candidate reports `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `unknown` with its replay key so `command-result` can recover any decision.
 
-`run --once` performs exactly one pass of the whole driver — one settings-tick evaluation plus the eight execution phases — and may launch a due intake without waiting for it, since the invocation is nonblocking. `run --work <id>` is a diagnostic scope: it restricts the execution phases to one Work and does not evaluate intake scheduling. SIGINT/SIGTERM ends the scheduler and finishes the current phase boundary; an in-flight intake invocation is not killed by the loop — its durable run record and lease ownership carry it through restart recovery exactly like worker invocations.
+`run --once` performs exactly one pass of the whole driver — one settings-tick evaluation plus the eight execution phases — and may launch a due intake on the invocation thread without serializing the pass. Every exit path — `--once`, `--ticks`, shutdown, abort — joins that thread before returning, so no hidden selector child can outlive the process; the wait is bounded by the invocation's own work, since the selector exchange is capped by the configured adapter timeout. `run --work <id>` is a diagnostic scope: it restricts the execution phases to one Work and does not evaluate intake scheduling. SIGINT/SIGTERM ends the scheduler and finishes the current phase boundary; an in-flight intake invocation is not killed by the loop — its durable run record and lease ownership carry it through restart recovery exactly like worker invocations.
 
 ## CLI contract
 
@@ -169,7 +169,8 @@ Before mutation the caller retains `(origin, actor, idempotency_key)`, the exact
 | `init`, `check`, `check --probe` | setup | none — per [installation config](installation-config.md) |
 | `work-list`, `work-detail`, `attention`, `capacity`, `command-result`, `retention report` | query | none |
 | `retention cleanup` | mutation | none — bounded two-phase pass per retention policy |
-| `run`, `run --once`, `run --work <id>` | driver | the loop itself, plus the intake scheduler's settings tick |
+| `run`, `run --once` | driver | the loop itself, plus the intake scheduler's settings tick |
+| `run --work <id>` | driver | the loop itself — diagnostic scope, no intake scheduling |
 | `intake` | driver | one invocation under the scheduler's single-flight lease |
 | `intake-runs`, `intake-detail` | query | none — durable intake records |
 

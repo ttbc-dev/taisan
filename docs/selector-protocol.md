@@ -1,6 +1,6 @@
 # Stateless external Selector protocol
 
-Status: normative design for #200, protocol version `1` for v0.2. This document specifies a future external command boundary. It does not implement a process launcher, change installation configuration, or authorize live execution. The existing snapshot-based reference Selector remains available.
+Status: normative design for #200, protocol version `1` for v0.2. This document specifies the external command boundary. The wire contract is implemented by `workloop-selector` (request construction, whole-response validation, and the packaged reference executable) and `workloop-exec`'s bounded exchange (direct argv launch, stream caps, deadline, and process-group cleanup); it authorizes no live execution by itself. The snapshot-based reference Selector remains available for in-process use.
 
 The [JSON Schema](selector-protocol.schema.json) defines the complete structural request and response shapes. The byte limits, cross-field rules, identity calculation, and admission rules below are equally normative. A schema pass alone is insufficient. This contract reuses [adapter boundaries](adapter-boundaries.md), [identity and admission](identity-storage.md), and the implemented `Proposal` and Proposal-to-submit translation in `workloop-selector`.
 
@@ -171,7 +171,7 @@ A failure response is `#/$defs/failure`. It has version `1`, an echoed `request_
 | `deadline_exceeded` | Deadline already expired or reached during selection |
 | `internal_error` | Other adapter failure, with no source or credential details |
 
-Launcher-local failures use the same bounded code and message discipline. Invalid responses produce local `response_contract_violation`; process failures produce local `transport_failure`; timeout produces local `deadline_exceeded`. These local outcomes are not additional adapter response variants. If an oversized request reaches an adapter through another caller, that adapter also returns bounded `input_limit` without selecting work. An adapter need not echo an unparseable or overlong request ID.
+Launcher-local failures use the same bounded code and message discipline. An invalid response, a process failure, and a deadline expiry each produce a bounded local diagnostic — the recorded vocabulary is defined by the launcher's run contract, not the wire protocol. These local outcomes are not additional adapter response variants. If an oversized request reaches an adapter through another caller, that adapter also returns bounded `input_limit` without selecting work. An adapter need not echo an unparseable or overlong request ID.
 
 Diagnostics contain fixed redacted explanations and bounded field paths or indexes only. They must not contain secret values, raw source bodies, environment dumps, authentication headers, token-bearing URLs, or raw child-process errors. stderr is diagnostic only, never JSON continuation or candidate data. The adapter redacts before writing either stream. taisan never forwards or persists raw stderr or invalid stdout; it records a fixed local error code and byte counts. Valid retained requests, responses, and evidence must also contain no secret values.
 

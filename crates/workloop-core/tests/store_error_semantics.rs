@@ -293,6 +293,9 @@ impl ReadView for FailingTx<'_> {
     ) -> Result<Vec<workloop_core::store::IntakeSourceOwner>, StoreError> {
         unimplemented!()
     }
+    fn intake_owned_issues(&self) -> Result<Vec<IssueRef>, StoreError> {
+        unimplemented!()
+    }
     fn last_seq(&self) -> Result<EventSequence, StoreError> {
         Ok(0)
     }
