@@ -8,14 +8,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
+use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, CommandRequest};
 use workloop_core::domain::{
-    Actor, ActorKind, AllowedEffects, ExecutionBudget, Origin, WorkPolicy,
+    Actor, ActorKind, AllowedEffects, ExecutionBudget, ExecutionId, ExecutionState, Origin, WorkId,
+    WorkPolicy,
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability, HostInstanceId,
     IssueId, IssueRef, RepositoryId, RepositoryRef, RoleBinding, SourceSnapshot,
 };
+use workloop_core::observation::Outcome;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::store::{
     Effect, IntakeCandidateStatus, IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeTrigger,
@@ -264,6 +266,121 @@ fn settings(revision: &str, limit: u32) -> IntakeSettingsRecord {
         settings_revision: revision.into(),
         pending_queue_limit: limit,
         recorded_seq: 1,
+    }
+}
+
+/// A manual submit returning the created `(WorkId, ExecutionId)` —
+/// the identities the finished-source and owner-state scenarios
+/// settle or inspect.
+fn submit_ids(
+    store: &SqliteStore,
+    cfg: &WorkloopConfig,
+    key: &str,
+    sources: Vec<IssueRef>,
+) -> (WorkId, ExecutionId) {
+    let d = handle_command(
+        store,
+        cfg,
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: key.into(),
+            body: CommandBody::Submit {
+                intent: format!("manual-{key}"),
+                sources: sources
+                    .into_iter()
+                    .map(|issue| SourceSnapshot {
+                        issue,
+                        source_revision: "rev-0".into(),
+                        content_digest: "digest-0".into(),
+                    })
+                    .collect(),
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    match d {
+        CommandDecision::Accepted {
+            work_id,
+            effect:
+                CommandEffect::WorkCreated { execution_id }
+                | CommandEffect::ExecutionCreated { execution_id },
+            ..
+        } => (work_id.unwrap(), execution_id),
+        other => panic!("manual submit {key}: {other:?}"),
+    }
+}
+
+/// Force an Execution into `state` — the same durable shape the
+/// supervisor's own transitions write, including the terminal
+/// code/outcome a terminal state requires.
+fn force_execution(store: &SqliteStore, id: &ExecutionId, to: ExecutionState) {
+    store
+        .transact(|tx| {
+            let from = tx.execution(id)?.expect("execution exists").state.clone();
+            let mut e = tx.execution(id)?.expect("execution exists");
+            e.state = to.clone();
+            if to.is_terminal() {
+                e.terminal_code = Some("setup".into());
+                e.outcome = Some(Outcome {
+                    state: to.clone(),
+                    code: Some("setup".into()),
+                    detail: None,
+                    evidence_refs: vec![],
+                    recorded_seq: 0,
+                });
+            }
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: from,
+            })
+        })
+        .unwrap();
+}
+
+/// Release a Work's issue claims — the durable half of safe terminal
+/// settlement that lets a finished source be submitted again.
+fn release_claims(store: &SqliteStore, work_id: &WorkId) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::ReleaseIssueClaims {
+                work_id: work_id.clone(),
+            })
+        })
+        .unwrap();
+}
+
+fn works_count(store: &SqliteStore) -> usize {
+    store.transact_deferred(|tx| tx.works()).unwrap().len()
+}
+
+/// An adapter script that captures the request, announces launch,
+/// then blocks until `release` exists before emitting `template` —
+/// a deterministic mid-exchange interleave point for race scenarios.
+fn gated_adapter_script(dir: &Path, template: &str, launched: &Path, release: &Path) -> String {
+    let template_path = dir.join("gated.template");
+    std::fs::write(&template_path, template).unwrap();
+    let capture = dir.join("gated-request.json");
+    let script = format!(
+        "req=$(cat)\nprintf '%s' \"$req\" > '{}'\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nrid=$(printf '%s' \"$req\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\nsed \"s/__RID__/$rid/g\" '{}'\n",
+        capture.display(),
+        launched.display(),
+        release.display(),
+        template_path.display()
+    );
+    raw_script(dir, "gated.sh", &script)
+}
+
+/// Wait (bounded) for `path` to appear — the launch marker a gated
+/// adapter writes once it holds the exchange open.
+fn wait_for(path: &Path, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{what} never appeared");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1104,4 +1221,190 @@ fn an_admission_store_fault_aborts_and_reconciles_candidates() {
     drop(conn);
     let second = run(&f, Duration::from_secs(10));
     assert_eq!(second.state, IntakeRunState::Failed);
+}
+
+// --- #218 cross-component acceptance ---------------------------------------
+//
+// The scenarios below exercise the races the unit suites cannot reach:
+// a manual submit interleaved inside a live exchange, finished sources
+// re-presented under new and replayed identities, non-terminal owners
+// beyond `queued`, and store availability while the selector blocks.
+
+/// A manual submit that lands while the selector exchange is still
+/// open takes the last pending position: preflight sized the ask for
+/// one free slot, but admission re-decides against the live queue —
+/// the candidate defers as `capacity_deferred` and no Work is created
+/// for it. The manual Work stands; intake never overshoots the limit.
+#[test]
+fn a_manual_submit_taking_the_last_position_defers_the_intake_candidate() {
+    let dir = tmp_root("lastpos");
+    let store = SqliteStore::in_memory(4).unwrap();
+    let cfg = config(true);
+    // Occupy 9 of the default 10 pending positions: preflight sees
+    // exactly one free slot and asks for at most one candidate.
+    for i in 0..9 {
+        manual_submit(&store, &cfg, &format!("fill-{i}"), vec![]);
+    }
+    let proposals = vec![proposal("issue-last", "last slot work")];
+    let launched = dir.join("launched.marker");
+    let release = dir.join("release.marker");
+    let script = gated_adapter_script(&dir, &success_template(&proposals), &launched, &release);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+
+    let report = std::thread::scope(|s| {
+        let intake = s.spawn(|| run(&f, Duration::from_secs(30)));
+        // The selector holds the exchange open; the manual submit
+        // takes the position the candidate was sized for.
+        wait_for(&launched, "selector launch");
+        manual_submit(&f.store, &f.config, "race-winner", vec![]);
+        std::fs::write(&release, "").unwrap();
+        intake.join().unwrap()
+    });
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    assert_eq!(report.candidates.len(), 1);
+    let c = &report.candidates[0];
+    assert_eq!(c.status, IntakeCandidateStatus::CapacityDeferred);
+    assert_eq!(c.status_reason.as_deref(), Some("capacity_exhausted"));
+    assert!(c.command_id.is_none() && c.work_id.is_none());
+    // The ask was sized to the one free position preflight saw.
+    let request = captured_request(&dir.join("gated-request.json"));
+    assert_eq!(request["max_candidates"], 1, "{request}");
+    // Nine fillers plus the racing manual submit — the deferred
+    // candidate created no Work of its own.
+    assert_eq!(works_count(&f.store), 10);
+}
+
+/// Once a Work's Execution settles terminally and its issue claims
+/// are released, the source is ordinary again: intake re-proposing it
+/// under a *new* proposal identity (different task, new key) submits
+/// fresh and admits a new Work — there is no finished-source gate and
+/// no finished-Issue blacklist.
+#[test]
+fn a_finished_source_is_readmitted_under_a_new_proposal_key() {
+    let dir = tmp_root("finished-src");
+    let store = SqliteStore::in_memory(4).unwrap();
+    let cfg = config(true);
+    let (w1, e1) = submit_ids(&store, &cfg, "src-1", vec![issue("issue-1")]);
+    force_execution(&store, &e1, ExecutionState::Succeeded);
+    release_claims(&store, &w1);
+
+    let proposals = vec![proposal("issue-1", "reworked issue-1")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    assert_eq!(report.candidates.len(), 1);
+    let c = &report.candidates[0];
+    assert_eq!(c.status, IntakeCandidateStatus::Accepted, "{c:?}");
+    let w2 = c.work_id.clone().expect("accepted candidate links a Work");
+    assert_ne!(w2, w1, "readmission creates a new Work, not a rewrite");
+    assert_eq!(works_count(&f.store), 2);
+}
+
+/// The same proposal identity against a finished source replays the
+/// recorded decision instead of admitting again: the candidate lands
+/// `replayed` with the original Work link and the Work count does not
+/// grow — no duplicate Work, no lost committed decision.
+#[test]
+fn the_same_proposal_key_replays_the_recorded_decision_for_a_finished_source() {
+    let dir = tmp_root("finished-replay");
+    let proposals = vec![proposal("issue-1", "first work")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let f = fixture(dir.clone(), script);
+
+    let first = run(&f, Duration::from_secs(10));
+    assert_eq!(first.state, IntakeRunState::Completed);
+    assert_eq!(first.candidates[0].status, IntakeCandidateStatus::Accepted);
+    let w1 = first.candidates[0].work_id.clone().unwrap();
+
+    // Settle the admitted Work terminally and release its claims —
+    // the durable state safe terminal settlement leaves behind.
+    let executions = f
+        .store
+        .transact_deferred(|tx| tx.executions_for_work(&w1))
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    force_execution(&f.store, &executions[0].id, ExecutionState::Succeeded);
+    release_claims(&f.store, &w1);
+
+    // A second invocation re-proposing the identical proposal finds
+    // no live owner to exclude, submits under the same replay key,
+    // and lands on the recorded decision.
+    let second = run(&f, Duration::from_secs(10));
+    assert_eq!(second.state, IntakeRunState::Completed);
+    assert_eq!(second.candidates.len(), 1);
+    let c = &second.candidates[0];
+    assert_eq!(c.status, IntakeCandidateStatus::Replayed, "{c:?}");
+    assert_eq!(c.work_id.as_ref(), Some(&w1));
+    assert_eq!(works_count(&f.store), 1, "replay never duplicates Work");
+}
+
+/// `queued` is not the only owning state: Works forced into `running`
+/// and `paused` still hold their issues, so the request's
+/// `excluded_sources` carries both — the wire-level half of the
+/// overlap rule the admission path re-checks.
+#[test]
+fn running_and_paused_owners_still_exclude_their_sources() {
+    let dir = tmp_root("owner-states");
+    let store = SqliteStore::in_memory(4).unwrap();
+    let cfg = config(true);
+    let (_w_run, e_run) = submit_ids(&store, &cfg, "own-run", vec![issue("issue-run")]);
+    force_execution(&store, &e_run, ExecutionState::Running);
+    let (_w_pause, e_pause) = submit_ids(&store, &cfg, "own-pause", vec![issue("issue-pause")]);
+    force_execution(&store, &e_pause, ExecutionState::Paused);
+
+    let proposals = vec![proposal("issue-free", "unowned work")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    let request = captured_request(&capture);
+    let excluded: Vec<&str> = request["excluded_sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["issue"].as_str().unwrap())
+        .collect();
+    assert!(excluded.contains(&"issue-run"), "{excluded:?}");
+    assert!(excluded.contains(&"issue-pause"), "{excluded:?}");
+    assert_eq!(excluded.len(), 2, "{excluded:?}");
+    assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
+}
+
+/// A selector that blocks inside the exchange holds only the intake
+/// lease — the store's ordinary submission path stays fully
+/// available, so manual Work keeps flowing while the adapter is
+/// still deciding.
+#[test]
+fn a_blocked_exchange_leaves_manual_submit_free() {
+    let dir = tmp_root("blocked-exchange");
+    let proposals = vec![proposal("issue-1", "slow work")];
+    let launched = dir.join("launched.marker");
+    let release = dir.join("release.marker");
+    let script = gated_adapter_script(&dir, &success_template(&proposals), &launched, &release);
+    let f = fixture(dir.clone(), script);
+
+    let report = std::thread::scope(|s| {
+        let intake = s.spawn(|| run(&f, Duration::from_secs(30)));
+        wait_for(&launched, "selector launch");
+        // The exchange is open and the selector is still deciding;
+        // a manual submit through the ordinary command path is
+        // unaffected.
+        manual_submit(&f.store, &f.config, "during-exchange", vec![]);
+        std::fs::write(&release, "").unwrap();
+        intake.join().unwrap()
+    });
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
+    assert_eq!(works_count(&f.store), 2, "manual + intake Work both exist");
 }

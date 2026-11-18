@@ -34,10 +34,11 @@ fn root(tag: &str) -> PathBuf {
     dir
 }
 
-/// Run `taisan` against `root`'s store with the TOML profile supplied
-/// through `TAISAN_CONFIG` (or deliberately absent). `--config` is
-/// never passed: it would be read as the JSON installation record.
-fn intake_cli(root: &Path, profile: Option<&Path>, args: &[&str]) -> Output {
+/// Build `taisan` against `root`'s store with the TOML profile
+/// supplied through `TAISAN_CONFIG` (or deliberately absent).
+/// `--config` is never passed: it would be read as the JSON
+/// installation record.
+fn intake_command(root: &Path, profile: Option<&Path>, args: &[&str]) -> Command {
     let mut full = vec![
         "--db".to_string(),
         root.join("workloop.db").to_string_lossy().into_owned(),
@@ -59,7 +60,14 @@ fn intake_cli(root: &Path, profile: Option<&Path>, args: &[&str]) -> Output {
             command.env_remove("TAISAN_CONFIG");
         }
     }
-    command.output().expect("taisan runs")
+    command
+}
+
+/// Run `taisan` to completion and return its output.
+fn intake_cli(root: &Path, profile: Option<&Path>, args: &[&str]) -> Output {
+    intake_command(root, profile, args)
+        .output()
+        .expect("taisan runs")
 }
 
 fn envelope(output: &Output) -> serde_json::Value {
@@ -175,6 +183,34 @@ fn selector_fixture(root: &Path) -> Vec<String> {
     ]
 }
 
+/// The same scripted selector as [`selector_fixture`], but the
+/// script holds the exchange open for `delay_secs` after capturing
+/// the request — a deterministic "selector still deciding" window
+/// for concurrency scenarios.
+fn slow_selector_fixture(root: &Path, delay_secs: u64) -> Vec<String> {
+    let template = String::from_utf8(protocol::success_response("__RID__", &[proposal()]))
+        .expect("template is UTF-8");
+    let template_path = root.join("response.template");
+    std::fs::write(&template_path, template).unwrap();
+    let capture = root.join("request.json");
+    let script_path = root.join("slow-sel.sh");
+    // Each launch appends one line — the durable count of adapter
+    // exchanges the test can assert on afterwards.
+    let exchanges = root.join("exchanges.log");
+    let script = format!(
+        "#!/bin/sh\nreq=$(cat)\nprintf '%s' \"$req\" > '{}'\necho x >> '{}'\nsleep {delay_secs}\nrid=$(printf '%s' \"$req\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\nsed \"s/__RID__/$rid/g\" '{}'\n",
+        capture.display(),
+        exchanges.display(),
+        template_path.display(),
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vec![
+        "/bin/sh".to_string(),
+        script_path.to_string_lossy().into_owned(),
+    ]
+}
+
 fn write_profile(root: &Path, argv: &[String]) -> PathBuf {
     write_profile_enabled(root, argv, true)
 }
@@ -253,6 +289,9 @@ fn intake_detail_for_an_unknown_run_is_a_completed_not_found() {
     assert_eq!(env["command"]["kind"], "intake_detail");
     // NotFound is a completed query: accepted envelope, null result.
     assert!(env["result"].is_null(), "{env}");
+    // The run id is not a Work identity: the envelope's work_id stays
+    // null for run-scoped queries.
+    assert!(env["work_id"].is_null(), "{env}");
 }
 
 #[test]
@@ -294,6 +333,9 @@ fn intake_runs_the_coordinator_and_projects_the_run() {
 
     // The detail projection resolves the candidate's links.
     let env = run_ok(&dir, Some(&profile), &["intake-detail", "--run", &run_id]);
+    // The run id is not a Work identity: the envelope's work_id stays
+    // null for run-scoped queries.
+    assert!(env["work_id"].is_null(), "{env}");
     let detail = &env["result"];
     assert_eq!(detail["run"]["run_id"], run_id);
     let candidates = detail["candidates"].as_array().unwrap();
@@ -303,6 +345,12 @@ fn intake_runs_the_coordinator_and_projects_the_run() {
     assert!(candidates[0]["command_id"].as_str().is_some());
     assert!(candidates[0]["committed_seq"].is_number());
     assert_eq!(candidates[0]["proposal_key"].as_str().unwrap().len(), 64);
+    // The candidate payload digest is exposed as the audit anchor; for
+    // a proposal-v1 candidate it is the semantic proposal key.
+    assert_eq!(
+        candidates[0]["payload_digest"], candidates[0]["proposal_key"],
+        "{detail}"
+    );
 }
 
 #[test]
@@ -477,9 +525,262 @@ fn intake_is_refused_while_a_run_is_active() {
     assert_eq!(env["reason"]["code"], "intake_active", "{env}");
 }
 
+/// #217 — configuration-only adapter replacement. The same store,
+/// the same sources file, the same profile shape: only
+/// `[intake.selector]`'s `adapter`/`argv` differ between runs. The
+/// durable run records prove which executable each invocation
+/// selected, and the second run admits nothing new because the
+/// first run's Work already owns the issue — existing Work and
+/// submit semantics are untouched by the swap.
+#[test]
+fn swapping_only_the_profile_selector_selects_the_fixture_adapter() {
+    let dir = root("swap");
+
+    // Scripted source for the profile's one in-scope repository —
+    // the file backend both selector executables read.
+    let sources = dir.join("sources.json");
+    std::fs::write(
+        &sources,
+        serde_json::to_string(&serde_json::json!({
+            "repositories": {
+                "https://api.github.com/0123456789": {
+                    "pages": [{
+                        "issues": [{
+                            "issue": {
+                                "repository": {
+                                    "host": "https://api.github.com",
+                                    "repository": "0123456789",
+                                },
+                                "issue": "issue-9",
+                                "display_number": 9,
+                            },
+                            "state": "open",
+                            "labels": [],
+                            "created_unix_seconds": 100,
+                            "title": "swapped adapter work",
+                            "revision": "rev-9",
+                            "content_digest": "digest-9",
+                        }]
+                    }]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let fixture_exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-selector")
+        .to_string_lossy()
+        .into_owned();
+    let reference_exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/public-issue-selector")
+        .to_string_lossy()
+        .into_owned();
+    let sources_arg = sources.to_string_lossy().into_owned();
+
+    // Run 1: the profile binds the independent fixture adapter.
+    let argv = vec![
+        fixture_exe.clone(),
+        "select".to_string(),
+        "--sources".to_string(),
+        sources_arg.clone(),
+    ];
+    let profile = write_profile(&dir, &argv);
+    // The profile's declared adapter id must match the binding.
+    let profile_text = std::fs::read_to_string(&profile).unwrap().replace(
+        "adapter = \"test-sel\"",
+        "adapter = \"workloop-fixture-selector\"",
+    );
+    std::fs::write(&profile, profile_text).unwrap();
+
+    let env = run_ok(&dir, Some(&profile), &["intake"]);
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    assert_eq!(
+        env["result"]["candidates"][0]["status"], "accepted",
+        "{env}"
+    );
+
+    // Run 2: rewrite ONLY the selector binding — same store, same
+    // sources file, same task defaults — to the packaged reference.
+    let argv = vec![
+        reference_exe,
+        "select".to_string(),
+        "--sources".to_string(),
+        sources_arg,
+    ];
+    let profile_text = profile_toml_enabled(&argv, true).replace(
+        "adapter = \"test-sel\"",
+        "adapter = \"public-issue-selector\"",
+    );
+    std::fs::write(&profile, profile_text).unwrap();
+
+    let env = run_ok(&dir, Some(&profile), &["intake"]);
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    // The issue is now source-owned: the swapped adapter runs,
+    // validates the same exclusions, and proposes nothing new.
+    assert_eq!(
+        env["result"]["candidates"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
+
+    // The durable run records name the adapter each invocation used
+    // (the list is newest-first).
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{env}");
+    assert_eq!(items[0]["selector_id"], "public-issue-selector");
+    assert_eq!(items[0]["candidates"]["accepted"], 0);
+    assert_eq!(items[1]["selector_id"], "workloop-fixture-selector");
+    assert_eq!(items[1]["candidates"]["accepted"], 1);
+
+    // Exactly one Work exists — the swap neither duplicated nor
+    // split the admitted work.
+    let store = SqliteStore::open(&dir.join("workloop.db"), 10).unwrap();
+    let works = store.transact_deferred(|tx| tx.works()).unwrap();
+    assert_eq!(works.len(), 1);
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+// --- #218 cross-component acceptance ---------------------------------------
+
+/// Wait (bounded) for `path` to appear — the request capture the
+/// slow selector writes once the exchange is open.
+fn wait_for_file(path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never appeared"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Two `taisan intake` processes racing the same store: the durable
+/// intake lease admits exactly one invocation. The loser is refused
+/// `intake_busy` before any run record exists, and `intake-runs`
+/// shows the single winner's completed run — never two exchanges,
+/// never a duplicate admission pass.
+#[test]
+fn concurrent_intake_invocations_are_single_flight() {
+    let dir = root("concurrent");
+    let argv = slow_selector_fixture(&dir, 2);
+    let profile = write_profile(&dir, &argv);
+    // Materialize the store first: two processes racing the *store
+    // bootstrap* is a different (pre-existing) concern — this
+    // scenario isolates the intake lease.
+    run_ok(&dir, Some(&profile), &["intake-runs"]);
+
+    let mut first = intake_command(&dir, Some(&profile), &["intake"])
+        .spawn()
+        .expect("first intake spawns");
+    // Deterministic sync: the selector's request capture proves the
+    // first invocation holds the lease, has opened its run record,
+    // and is mid-exchange — the second cannot beat it to the lease.
+    wait_for_file(&dir.join("request.json"), "first selector request");
+    let second = intake_cli(&dir, Some(&profile), &["intake"]);
+    assert!(
+        !second.status.success(),
+        "second intake must be refused: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let env = envelope(&second);
+    assert_eq!(env["status"], "rejected", "{env}");
+    assert_eq!(env["reason"]["code"], "intake_busy", "{env}");
+
+    let status = first.wait().expect("first intake exits");
+    assert!(status.success(), "winner intake failed: {status}");
+
+    // Exactly one durable run exists — the refused invocation never
+    // reached run-record creation.
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{env}");
+    assert_eq!(items[0]["state"], "completed");
+    assert_eq!(items[0]["trigger"], "manual");
+    assert_eq!(items[0]["candidates"]["accepted"], 1);
+    // Exactly one adapter exchange happened — the refused invocation
+    // never reached process launch.
+    let exchanges = std::fs::read_to_string(dir.join("exchanges.log")).unwrap();
+    assert_eq!(exchanges.lines().count(), 1, "{exchanges}");
+}
+
+/// While a manual `taisan intake` holds its lease and the selector
+/// is still deciding, the rest of the installation keeps working:
+/// a manual `submit` is accepted, `run --once` drives its pass
+/// (the scheduler observes the active run and skips the due slot
+/// rather than launching a second invocation), and `intake-runs`
+/// projects the in-flight run. When the selector answers, the
+/// invocation completes normally.
+#[test]
+fn an_in_flight_intake_leaves_submit_run_and_queries_free() {
+    let dir = root("inflight");
+    let argv = slow_selector_fixture(&dir, 3);
+    let profile = write_profile(&dir, &argv);
+    run_ok(&dir, Some(&profile), &["intake-runs"]);
+
+    let mut intake = intake_command(&dir, Some(&profile), &["intake"])
+        .spawn()
+        .expect("intake spawns");
+    // The exchange is open once the selector has captured the
+    // request — everything below runs inside that window.
+    wait_for_file(&dir.join("request.json"), "selector request capture");
+
+    // Manual submit through the ordinary command path.
+    let env = run_ok(
+        &dir,
+        Some(&profile),
+        &[
+            "submit",
+            "--intent",
+            "manual work during intake",
+            "--idempotency-key",
+            "during-intake-1",
+        ],
+    );
+    assert_eq!(env["status"], "accepted", "{env}");
+    assert!(env["work_id"].as_str().is_some(), "{env}");
+
+    // The run driver completes a full pass while intake is in
+    // flight; its scheduler tick sees the durable active run and
+    // skips the due slot instead of double-invoking.
+    let out = intake_cli(&dir, Some(&profile), &["run", "--once"]);
+    assert!(
+        out.status.success(),
+        "run --once failed during in-flight intake: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The scheduler observed the durable active run and skipped the
+    // due slot: no invocation thread was spawned, so the driver never
+    // prints its finish diagnostic.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("intake invocation finished"),
+        "run --once must not launch a second invocation: {stderr}"
+    );
+
+    // The projection shows the live run, not a phantom or a wedge.
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{env}");
+    assert!(
+        matches!(items[0]["state"].as_str().unwrap(), "open" | "admitting"),
+        "in-flight run must project live: {env}"
+    );
+
+    let status = intake.wait().expect("intake exits");
+    assert!(status.success(), "intake failed: {status}");
+    let env = run_ok(&dir, Some(&profile), &["intake-runs"]);
+    let items = env["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{env}");
+    assert_eq!(items[0]["state"], "completed");
+    assert_eq!(items[0]["candidates"]["accepted"], 1);
 }

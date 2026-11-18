@@ -45,7 +45,7 @@ Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-fin
 
 ## Intake scheduling
 
-Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, and the intake CLI verbs are implemented; persisting each tick's reloaded settings revision into the durable settings record remains a later v0.2 unit. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
+Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, the intake CLI verbs, and the per-tick persistence of the reloaded settings revision into the durable settings record are implemented. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
 
 ### Scheduler model
 
@@ -59,7 +59,7 @@ The scheduler is internal to `run`: there is no separate intake daemon, cron ent
 On every settings tick the scheduler:
 
 1. Re-reads and re-validates `config.toml` through the versioned profile loader.
-2. Computes the intake settings revision — a digest of the complete validated `[intake]` content.
+2. Computes the intake settings revision — a digest of the complete validated `[intake]` content — and persists it, with the section's `pending_queue_limit`, into the durable settings record under the revision guard when it differs; an unchanged revision rewrites nothing, and a lost compare-and-set is retried on the next tick.
 3. Applies the reload transition table below.
 4. Evaluates whether intake is due and, when due and no run is active, records an `open` intake run and launches the configured selector argv. The invocation is nonblocking: the pass continues, the adapter runs under its configured timeout, and the run's candidates admit through the normal submit path across later ticks.
 
@@ -89,6 +89,7 @@ The pending-queue limit is installation-wide and enforced inside the authoritati
 - A grouped proposal consumes exactly one position: one candidate produces one Work with one queued Execution.
 - At `pending == limit` a submit is rejected `capacity_exhausted` with the occupancy evidence, and no partial Work, Execution, claims, usage, or spec rows commit — and no decision is saved under the caller's key either: the refusal is transient, so an identical resubmit is decided fresh against then-current capacity. For an intake candidate the coordinator maps this to `capacity_deferred` — deferrable, never a saved rejection ([intake identity and storage](intake-identity-storage.md)).
 - The limit applies to manual `submit` and Selector intake alike. `retry` and `resume` are recovery of already-accepted Work and are never gated — a full queue cannot strand them.
+- The bound comes from the persisted `[intake]` settings record regardless of `intake.enabled`: disabling automatic scheduling stops new scheduled invocations but does not release the installation-wide queue bound the profile declares — an operator who disables intake while keeping a low `pending_queue_limit` still has manual submits capped by it.
 - Replaying a decided submit returns the stored decision even when the queue has since filled; the idempotency lookup precedes the capacity check.
 - Lowering the limit below current occupancy refuses new submissions only; existing Work drains naturally and is never cancelled.
 - With no active settings record the limit resolves to the documented default of 10 Work — the same constant the profile loader defaults to — and every caller observes the single active revision; stale callers can neither supply nor overwrite it.
@@ -99,7 +100,7 @@ The pending-queue limit is installation-wide and enforced inside the authoritati
 | --- | --- | --- |
 | `taisan intake` | driver | Runs one intake invocation: acquires the intake lease, launches the configured argv once, validates the response, admits candidates through the normal submit path, and reports the recorded run outcome |
 | `taisan intake-runs` | query | Lists durable intake runs newest-first (bounded) with trigger, state, detail code, and candidate counts |
-| `taisan intake-detail --run <id>` | query | One run plus its candidates in ordinal order: status, bounded reason, and command/work decision links |
+| `taisan intake-detail --run <id>` | query | One run plus its candidates in ordinal order: status, bounded reason, candidate payload digest, and command/work decision links |
 
 `intake` shares the scheduler's single-flight lease: while another invocation holds it the verb is refused `intake_busy`, and a durable run record recovery could not close is refused `intake_active` — both status `rejected`, exit 1 — and it never launches a second adapter or waits indefinitely. Automatic intake being disabled does not disable the verb; it requires only a configured selector binding. The verb is synchronous: it always reports the recorded run's state, so there is no lost-response window and no `unknown` envelope — an invocation interrupted mid-flight leaves its durable run for the recovery sweep instead. Per-candidate outcomes are data inside the run record, mirroring the `propose` batch envelope: each candidate reports `accepted`, `replayed`, `rejected`, `capacity_deferred`, or `unknown` with its replay key so `command-result` can recover any decision.
 
@@ -136,7 +137,7 @@ Every command prints exactly one JSON object on stdout. `schema_version` is a st
 - `unknown` — the mutation's fate cannot be determined (lost response, uncertain stop). Recovery is `command-result` by the original `(origin, actor, idempotency_key)` or an identical replay. An unknown result never justifies a fresh key or a rewritten payload. A batch mutation (`propose`) reports `unknown` under the interrupted proposal's own submit identity, not the batch run's query identity.
 - `error` — input/usage, configuration, store, or source failure. Nothing was recorded as accepted; the class is in `reason.code`. A multi-proposal batch is the documented exception to the second sentence: `propose` is not atomic, so an `error` can end a run after earlier proposals committed. There, `error` means the *batch run* stopped and nothing was recorded for the interrupted proposal — the envelope's `evidence_refs` (bounded) name the recorded decisions' replay keys, and re-running the batch replays them instead of admitting them again. A consumer must never read a partial batch's `error` as "no decision exists"; `unknown` stays reserved for a fate that cannot be determined either way.
 
-Queries use the same envelope with `status` ∈ `accepted | error` (`unknown` cannot occur — queries mutate nothing); a not-found item is `accepted` with `result: null`, distinct from an unreadable store (`error` / exit 4) or unavailable source (`error` / exit 5).
+Queries use the same envelope with `status` ∈ `accepted | error` (`unknown` cannot occur — queries mutate nothing); a not-found item is `accepted` with `result: null`, distinct from an unreadable store (`error` / exit 4) or unavailable source (`error` / exit 5). The envelope's `work_id` always names a Work identity and is set only by Work-targeted queries; run-scoped intake queries leave it `null` and carry the run id inside `result`.
 
 ### Exit codes
 
@@ -222,7 +223,7 @@ Same versus new Execution identity: a requeue re-enters the *same paused/failed-
 
 ### Persisted scheduling and retirement
 
-`recovery_intents(intent_id, work_id, execution_id, kind, due_at, generation, evidence_basis, state, retirement_reason)` with `state` ∈ `pending | consumed | retired`. Scheduling writes the row in the deciding transaction — a crash before scheduling leaves no intent (safe: next evaluation re-derives it), a crash after scheduling fires exactly once (`consumed` before dispatch). Concurrent manual `retry`/`resume` version-conflicts or consumes the same intent idempotently. Terminal evidence (merged PR, deleted branch, terminal Work) retires the intent with `retirement_reason` and the evidence generation; retirement is idempotent and a restart cannot resurrect an obsolete intent or reset its bounds.
+`recovery_intents(intent_id, work_id, execution_id, kind, due_at, generation, evidence_basis, state, retirement_reason, retirement_generation)` with `state` ∈ `pending | consumed | retired`. Scheduling writes the row in the deciding transaction — a crash before scheduling leaves no intent (safe: next evaluation re-derives it), a crash after scheduling fires exactly once (`consumed` before dispatch). Concurrent manual `retry`/`resume` version-conflicts or consumes the same intent idempotently. Terminal evidence (merged PR, deleted branch, terminal Work) retires the intent with `retirement_reason` and the evidence generation; the store records that generation and refuses a retirement whose evidence predates the intent's own scheduling generation or the Work's current generation, so a stale decision cannot retire an intent newer evidence owns. Retirement is idempotent and a restart cannot resurrect an obsolete intent or reset its bounds.
 
 Equivalent-failure suppression: the failure classifier `(stage, stable_check_id, error_category, normalized_diagnostics)` from recovery policy. A requeue whose new failure records an identical classifier key under the same Work increments the equivalent counter; at the limit, automatic requeues hold and escalate. A suppressed intent is recorded as suppressed — it is not silently consumed.
 

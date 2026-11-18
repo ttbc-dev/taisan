@@ -747,9 +747,16 @@ pub fn run_pass(
         }
     }
 
+    // A phase that started before the deadline can still cross it: the
+    // retention sweep and Attention derivation always run and have no
+    // per-item deadline gate. The deferred-phase markers cover the
+    // earlier gated phases; the closing clock read makes an overrun
+    // inside phases 7-8 visible instead of reporting a deadline that
+    // the pass actually passed as unmet.
     let deadline_exceeded = phases
         .iter()
-        .any(|p| p.status == "deferred" && p.reason.as_deref() == Some("tick.deadline"));
+        .any(|p| p.status == "deferred" && p.reason.as_deref() == Some("tick.deadline"))
+        || clock() >= deadline;
     TickReport {
         schema_version: "1".into(),
         kind: "tick_report".into(),
@@ -1445,6 +1452,62 @@ mod tests {
             matches!(intents[0].status, HostActionStatus::Unknown { .. }),
             "the unread intent stays outstanding: {:?}",
             intents[0].status
+        );
+    }
+
+    /// The retention sweep starts inside the deadline but has no
+    /// per-item deadline check. A pass that crosses the deadline while
+    /// sweeping must still say so, even though no phase reports
+    /// `tick.deadline` (the gated phases all started inside the budget).
+    #[test]
+    fn a_deadline_crossed_during_the_retention_sweep_is_reported() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let settings = settings();
+        // Calls 1-14 (through the retention gate) are inside the
+        // budget; the clock reaches the deadline before Attention
+        // derivation, so the sweep itself overran the tick.
+        let mut calls = 0u32;
+        let report = run(&store, &settings, None, &mut || {
+            calls += 1;
+            if calls <= 14 { NOW } else { NOW + TICK as i64 }
+        });
+        assert!(
+            report.phases.iter().all(|p| p.status != "deferred"),
+            "no gated phase deferred: {:?}",
+            report.phases
+        );
+        assert_eq!(report.phases[6].status, "completed");
+        assert!(
+            report.deadline_exceeded,
+            "the retention sweep crossed the deadline: {:?}",
+            report.phases
+        );
+    }
+
+    /// Attention derivation always runs and never consults the deadline
+    /// itself. The closing clock read must surface a pass that crossed
+    /// the deadline while deriving Attention.
+    #[test]
+    fn a_deadline_crossed_during_attention_derivation_is_reported() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let settings = settings();
+        // Calls 1-15 (through the Attention gate) are inside the
+        // budget; the deadline is first observed after derivation.
+        let mut calls = 0u32;
+        let report = run(&store, &settings, None, &mut || {
+            calls += 1;
+            if calls <= 15 { NOW } else { NOW + TICK as i64 }
+        });
+        assert!(
+            report.phases.iter().all(|p| p.status != "deferred"),
+            "no gated phase deferred: {:?}",
+            report.phases
+        );
+        assert_eq!(report.phases[7].status, "completed");
+        assert!(
+            report.deadline_exceeded,
+            "Attention derivation crossed the deadline: {:?}",
+            report.phases
         );
     }
 

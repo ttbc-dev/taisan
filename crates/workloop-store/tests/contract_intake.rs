@@ -1171,6 +1171,342 @@ fn candidate_decision_links_follow_the_status_contract() {
     );
 }
 
+/// Run-field invariants (`docs/intake-identity-storage.md`): a live
+/// run keeps `detail_code`/`finished_unix_seconds` NULL, a terminal
+/// transition records a finish time — `completed` none, `failed` /
+/// `interrupted` the bounded diagnostic — and `skipped` is terminal
+/// at insert, so it must already carry both (#233).
+#[test]
+fn run_record_field_invariants_are_enforced() {
+    let store = SqliteStore::in_memory(1).unwrap();
+
+    // A live `open` insert carrying either diagnostic field conflicts.
+    for (index, mutate) in [
+        (|r: &mut IntakeRun| r.detail_code = Some("early".into())) as fn(&mut IntakeRun),
+        |r| r.finished_unix_seconds = Some(NOW),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut bad = run(
+            &format!("r-live-{index}"),
+            IntakeRunState::Open,
+            IntakeTrigger::Manual,
+        );
+        mutate(&mut bad);
+        let err = store
+            .transact(|tx| tx.apply(&Effect::InsertIntakeRun { run: bad }))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ConstraintConflict { .. }),
+            "open insert with run fields must conflict: {err:?}"
+        );
+    }
+
+    // `skipped` is terminal at insert: the bounded diagnostic and the
+    // finish time must already be recorded.
+    for (index, mutate) in [
+        (|r: &mut IntakeRun| r.detail_code = None) as fn(&mut IntakeRun),
+        |r| r.finished_unix_seconds = None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut bad = IntakeRun {
+            state: IntakeRunState::Skipped,
+            detail_code: Some("queue_full".into()),
+            finished_unix_seconds: Some(NOW),
+            ..run(
+                &format!("r-skip-{index}"),
+                IntakeRunState::Skipped,
+                IntakeTrigger::ScheduledInterval,
+            )
+        };
+        mutate(&mut bad);
+        let err = store
+            .transact(|tx| tx.apply(&Effect::InsertIntakeRun { run: bad }))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ConstraintConflict { .. }),
+            "skipped insert missing terminal fields must conflict: {err:?}"
+        );
+    }
+
+    insert_run(
+        &store,
+        run("r-up", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    // A live `admitting` transition keeps both fields NULL.
+    for (detail, finished) in [
+        (Some("early".to_string()), None),
+        (None, Some(NOW)),
+        (Some("early".to_string()), Some(NOW)),
+    ] {
+        let err = store
+            .transact(|tx| {
+                tx.apply(&Effect::UpdateIntakeRun {
+                    run_id: "r-up".into(),
+                    state: IntakeRunState::Admitting,
+                    detail_code: detail,
+                    finished_unix_seconds: finished,
+                    expected_state: IntakeRunState::Open,
+                })
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ConstraintConflict { .. }),
+            "admitting with run fields must conflict: {err:?}"
+        );
+    }
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-up".into(),
+                state: IntakeRunState::Admitting,
+                detail_code: None,
+                finished_unix_seconds: None,
+                expected_state: IntakeRunState::Open,
+            })
+        })
+        .unwrap();
+
+    // `completed` records the finish time and no diagnostic.
+    for (detail, finished) in [(Some("stray".to_string()), Some(NOW)), (None, None)] {
+        let err = store
+            .transact(|tx| {
+                tx.apply(&Effect::UpdateIntakeRun {
+                    run_id: "r-up".into(),
+                    state: IntakeRunState::Completed,
+                    detail_code: detail,
+                    finished_unix_seconds: finished,
+                    expected_state: IntakeRunState::Admitting,
+                })
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ConstraintConflict { .. }),
+            "completed with inconsistent fields must conflict: {err:?}"
+        );
+    }
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-up".into(),
+                state: IntakeRunState::Completed,
+                detail_code: None,
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Admitting,
+            })
+        })
+        .unwrap();
+
+    // `failed` and `interrupted` require both the finish time and the
+    // bounded diagnostic.
+    insert_run(
+        &store,
+        run("r-fail", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    for (detail, finished) in [(None, Some(NOW)), (Some("x".into()), None)] {
+        let err = store
+            .transact(|tx| {
+                tx.apply(&Effect::UpdateIntakeRun {
+                    run_id: "r-fail".into(),
+                    state: IntakeRunState::Failed,
+                    detail_code: detail,
+                    finished_unix_seconds: finished,
+                    expected_state: IntakeRunState::Open,
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+    }
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-fail".into(),
+                state: IntakeRunState::Failed,
+                detail_code: Some("transport_failure".into()),
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Open,
+            })
+        })
+        .unwrap();
+
+    insert_run(
+        &store,
+        run("r-int", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-int".into(),
+                state: IntakeRunState::Interrupted,
+                detail_code: None,
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Open,
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ConstraintConflict { .. }));
+}
+
+/// `admitting` → `completed` requires every candidate to have
+/// reached a recorded terminal status: `pending` and `unknown` still
+/// owe the ledger a decision, so the close conflicts until they
+/// resolve (#233).
+#[test]
+fn admitting_to_completed_requires_terminal_candidates() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    insert_run(
+        &store,
+        run("r-term", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    admit_batch(
+        &store,
+        "r-term",
+        vec![
+            candidate("r-term", 0, "prop-term-a"),
+            candidate("r-term", 1, "prop-term-b"),
+        ],
+    );
+    let complete = |store: &SqliteStore| {
+        store.transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-term".into(),
+                state: IntakeRunState::Completed,
+                detail_code: None,
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Admitting,
+            })
+        })
+    };
+
+    // Both candidates pending: the close conflicts.
+    let err = complete(&store).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "completed with pending candidates must conflict: {err:?}"
+    );
+
+    // One decided, one still `unknown`: still non-terminal. The
+    // rejection links the durable rejected decision saved under this
+    // candidate's own replay key.
+    let (command_id, committed_at) = reject(&store, "proposal/ref-selector:prop-term-a");
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Rejected,
+                    status_reason: Some("idempotency_conflict".into()),
+                    command_id: Some(command_id),
+                    committed_seq: Some(committed_at),
+                    ..candidate("r-term", 0, "prop-term-a")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Unknown,
+                    status_reason: Some("submit_outcome_lost".into()),
+                    ..candidate("r-term", 1, "prop-term-b")
+                },
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap();
+    let err = complete(&store).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "completed with an unknown candidate must conflict: {err:?}"
+    );
+
+    // The unknown candidate reconciles to `interrupted`: terminal as a
+    // row, but unresolved — the run can no longer close `completed`.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: IntakeCandidate {
+                    status: IntakeCandidateStatus::Interrupted,
+                    status_reason: Some("no_saved_decision".into()),
+                    ..candidate("r-term", 1, "prop-term-b")
+                },
+                expected_status: IntakeCandidateStatus::Unknown,
+            })
+        })
+        .unwrap();
+    let err = complete(&store).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "completed with an interrupted candidate must conflict: {err:?}"
+    );
+    // The run closes `interrupted` instead, with its diagnostic.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeRun {
+                run_id: "r-term".into(),
+                state: IntakeRunState::Interrupted,
+                detail_code: Some("candidate_interrupted".into()),
+                finished_unix_seconds: Some(NOW),
+                expected_state: IntakeRunState::Admitting,
+            })
+        })
+        .unwrap();
+    assert_eq!(run_state(&store, "r-term"), IntakeRunState::Interrupted);
+}
+
+/// A replayed candidate reports the saved decision's outcome: a
+/// rejected decision replays with no Work link, and carrying one
+/// conflicts — the ledger, not the caller's claim, is the authority
+/// (#233).
+#[test]
+fn replayed_rejection_never_carries_a_work_link() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    // The rejected decision must live under the candidate's own replay
+    // key — a replay cannot borrow another proposal's decision.
+    let (rejected_command, committed_at) = reject(&store, "proposal/ref-selector:prop-r");
+    insert_run(
+        &store,
+        run("r-rej", IntakeRunState::Open, IntakeTrigger::Manual),
+    );
+    admit_batch(&store, "r-rej", vec![candidate("r-rej", 0, "prop-r")]);
+
+    let (_command, work_id, _seq) = submit(&store, "proposal/ref-selector:prop-w");
+    let mut replay = IntakeCandidate {
+        status: IntakeCandidateStatus::Replayed,
+        status_reason: Some("idempotency_conflict".into()),
+        command_id: Some(rejected_command),
+        work_id: Some(work_id),
+        committed_seq: Some(committed_at),
+        ..candidate("r-rej", 0, "prop-r")
+    };
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: replay.clone(),
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "replayed rejection carrying a work link must conflict: {err:?}"
+    );
+
+    replay.work_id = None;
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateIntakeCandidate {
+                candidate: replay,
+                expected_status: IntakeCandidateStatus::Pending,
+            })
+        })
+        .unwrap();
+}
+
 // --- decision links into the command ledger -------------------------
 
 fn host() -> HostInstanceId {
@@ -1650,7 +1986,7 @@ fn newer_format_is_refused() {
     }
     {
         let conn = Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 10i64).unwrap();
+        conn.pragma_update(None, "user_version", 11i64).unwrap();
     }
     match SqliteStore::open(&db, 1) {
         Err(StoreError::UnsupportedFormat { .. }) => {}

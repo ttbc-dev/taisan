@@ -1295,7 +1295,9 @@ fn run(cli: Cli) -> i32 {
             let identity =
                 envelope::query_identity("intake_detail", &actor, cli.idempotency_key.as_deref());
             match store.transact_deferred(|tx| projection::intake_run_detail(tx, &run)) {
-                Ok(r) => emit(envelope::query_envelope(&r, identity, Some(run))),
+                // Run-scoped: the run id lives inside `result`, and the
+                // envelope's `work_id` is reserved for Work identities.
+                Ok(r) => emit(envelope::query_envelope(&r, identity, None)),
                 Err(e) => emit(envelope::error_envelope(
                     Some(identity),
                     envelope::ErrorClass::Store,

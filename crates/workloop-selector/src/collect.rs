@@ -134,8 +134,10 @@ pub struct CollectionBounds {
     /// repositories not yet reached report [`ScanStatus::NotAttempted`],
     /// a scan already in flight reports [`ScanStatus::Truncated`].
     pub max_calls: usize,
-    /// Unix-seconds deadline checked before every call; a scan still
-    /// in flight reports [`ScanStatus::DeadlineExceeded`].
+    /// Unix-seconds deadline checked before every call and after
+    /// every page returns; a scan still in flight past it reports
+    /// [`ScanStatus::DeadlineExceeded`] and admits nothing — even a
+    /// final page.
     pub deadline_unix_seconds: i64,
 }
 
@@ -307,6 +309,14 @@ fn scan_repository<R: SourceReader + ?Sized>(
                 break;
             }
             Ok(page) => {
+                // The deadline bounds scan completion, not just call
+                // initiation: a page landing at or past it admits
+                // nothing — even a final page — so the repository
+                // reports DeadlineExceeded rather than Complete.
+                if now() >= bounds.deadline_unix_seconds {
+                    report.status = ScanStatus::DeadlineExceeded;
+                    break;
+                }
                 // The reader contract is "at most page_size facts";
                 // a page that breaks it cannot be trusted — the same
                 // failure class as malformed source data. Enforcing
@@ -384,12 +394,27 @@ fn validate_fact(repository: &RepositoryRef, fact: &CollectedIssue) -> Result<()
             fact.issue
         ));
     }
-    if fact.issue.issue.as_str().is_empty() {
-        return Err("fact carries an empty issue id".to_string());
-    }
-    if fact.title.is_empty() || fact.title.len() > MAX_TITLE_BYTES {
+    // The issue id is an opaque identity token under the same bound
+    // as revisions and digests. The message names only the
+    // repository: echoing the id would let a pathological value
+    // inflate the diagnostic it just failed.
+    if !bounded_token(fact.issue.issue.as_str()) {
         return Err(format!(
-            "fact {} title is empty or exceeds {MAX_TITLE_BYTES} bytes",
+            "a fact in {} carries an out-of-bounds issue id",
+            fact.issue.repository
+        ));
+    }
+    // The title becomes the candidate intent verbatim: bounded,
+    // control-free, and carrying at least one non-whitespace
+    // character — the protocol's intent shape.
+    if fact.title.is_empty()
+        || fact.title.len() > MAX_TITLE_BYTES
+        || fact.title.chars().any(char::is_control)
+        || !fact.title.chars().any(|c| !c.is_whitespace())
+    {
+        return Err(format!(
+            "fact {} title is empty, whitespace-only, control-bearing, \
+             or exceeds {MAX_TITLE_BYTES} bytes",
             fact.issue
         ));
     }
@@ -415,9 +440,9 @@ fn validate_fact(repository: &RepositoryRef, fact: &CollectedIssue) -> Result<()
     Ok(())
 }
 
-/// A source revision or content digest is an opaque bounded token —
-/// nonempty, at most 512 bytes, no control characters — matching the
-/// identity layer's opaque-id discipline.
+/// An opaque identity token — issue id, source revision, or content
+/// digest — is bounded: nonempty, at most 512 bytes, no control
+/// characters, matching the identity layer's opaque-id discipline.
 fn bounded_token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
 }

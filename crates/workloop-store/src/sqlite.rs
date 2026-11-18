@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `9` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `8`
+//! `PRAGMA user_version` is the format gate: `10` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `9`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -43,9 +43,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// request's durable Worker adapter binding; `7` adds the usage row's
 /// durable `last_progress_basis`; `8` adds the `intake_runs` /
 /// `intake_candidates` tables (`docs/intake-identity-storage.md`);
-/// `9` adds the `intake_settings` admission record (#213).
+/// `9` adds the `intake_settings` admission record (#213);
+/// `10` adds the `recovery_intents.retirement_generation` column (#139).
 /// Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 9;
+const FORMAT_VERSION: i64 = 10;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -319,7 +320,8 @@ impl SqliteStore {
             }
             // invocations.descendants, body_catalog.pin_state,
             // invocation_requests.adapter_binding,
-            // work_usage.last_progress_basis, and the pin-ledger
+            // work_usage.last_progress_basis,
+            // recovery_intents.retirement_generation, and the pin-ledger
             // reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
@@ -387,6 +389,20 @@ impl SqliteStore {
             if !has_progress_basis {
                 tx.execute_batch("ALTER TABLE work_usage ADD COLUMN last_progress_basis TEXT")
                     .map_err(internal)?;
+            }
+            let has_retirement_generation: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recovery_intents') \
+                     WHERE name='retirement_generation')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_retirement_generation {
+                tx.execute_batch(
+                    "ALTER TABLE recovery_intents ADD COLUMN retirement_generation INTEGER",
+                )
+                .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
@@ -1782,7 +1798,8 @@ impl ReadView for Tx<'_> {
         self.query_all(
             "SELECT intent_id, work_id, execution_id, kind, \
              due_at_unix_seconds, generation, evidence_basis, state, \
-             retirement_reason, scheduled_seq FROM recovery_intents \
+             retirement_reason, retirement_generation, scheduled_seq \
+             FROM recovery_intents \
              ORDER BY due_at_unix_seconds, intent_id",
             [],
             |row| {
@@ -1796,7 +1813,8 @@ impl ReadView for Tx<'_> {
                     evidence_basis: row.get(6)?,
                     state: untag(&row.get::<_, String>(7)?)?,
                     retirement_reason: row.get(8)?,
-                    scheduled_seq: row.get(9)?,
+                    retirement_generation: row.get::<_, Option<i64>>(9)?.map(|g| g as u64),
+                    scheduled_seq: row.get(10)?,
                 })
             },
         )
@@ -2623,8 +2641,9 @@ impl TxView for Tx<'_> {
                 self.exec(
                     "INSERT INTO recovery_intents (intent_id, work_id, \
                      execution_id, kind, due_at_unix_seconds, generation, \
-                     evidence_basis, state, retirement_reason, scheduled_seq) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     evidence_basis, state, retirement_reason, \
+                     retirement_generation, scheduled_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         intent.intent_id,
                         intent.work_id.0,
@@ -2635,6 +2654,7 @@ impl TxView for Tx<'_> {
                         intent.evidence_basis,
                         tag(&intent.state),
                         intent.retirement_reason,
+                        intent.retirement_generation.map(|g| g as i64),
                         intent.scheduled_seq,
                     ],
                 )?;
@@ -2643,20 +2663,22 @@ impl TxView for Tx<'_> {
                 intent_id,
                 state,
                 retirement_reason,
+                evidence_generation,
             } => {
                 // Closed lifecycle with idempotent retirement: a repeat
                 // of the recorded transition is a no-op, any other
                 // transition is refused.
-                let current: Option<String> = self
+                let current: Option<(String, i64, String)> = self
                     .tx
                     .query_row(
-                        "SELECT state FROM recovery_intents WHERE intent_id=?1",
+                        "SELECT state, generation, work_id FROM recovery_intents \
+                         WHERE intent_id=?1",
                         params![intent_id],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()
                     .map_err(map_err)?;
-                let Some(current) = current else {
+                let Some((current, intent_generation, work_id)) = current else {
                     return Err(StoreError::ConstraintConflict {
                         detail: format!("recovery intent {intent_id} is absent"),
                     });
@@ -2670,10 +2692,44 @@ impl TxView for Tx<'_> {
                         detail: format!("recovery intent {intent_id} is {current}, not pending"),
                     });
                 }
+                let retirement_generation = if matches!(state, RecoveryIntentState::Retired) {
+                    let evidence = evidence_generation.ok_or_else(|| StoreError::Internal {
+                        detail: format!(
+                            "recovery intent {intent_id} retirement carries no evidence generation"
+                        ),
+                    })?;
+                    // A decision made from evidence older than the
+                    // intent's own scheduling generation, or older than
+                    // the Work's current generation, is stale: it cannot
+                    // retire an intent newer activity owns.
+                    let work_generation: Option<i64> = self
+                        .tx
+                        .query_row(
+                            "SELECT version FROM works WHERE id=?1",
+                            params![work_id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(map_err)?;
+                    let required = work_generation
+                        .map(|g| (g as u64).max(intent_generation as u64))
+                        .unwrap_or(intent_generation as u64);
+                    if evidence < required {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "recovery intent {intent_id} cannot be retired by evidence \
+                                 generation {evidence} older than generation {required}"
+                            ),
+                        });
+                    }
+                    Some(evidence as i64)
+                } else {
+                    None
+                };
                 self.exec(
-                    "UPDATE recovery_intents SET state=?2, retirement_reason=?3 \
-                     WHERE intent_id=?1 AND state='pending'",
-                    params![intent_id, target, retirement_reason],
+                    "UPDATE recovery_intents SET state=?2, retirement_reason=?3, \
+                     retirement_generation=?4 WHERE intent_id=?1 AND state='pending'",
+                    params![intent_id, target, retirement_reason, retirement_generation],
                 )?;
             }
             Effect::InsertIntakeRun { run } => {
@@ -3111,6 +3167,51 @@ impl TxView for Tx<'_> {
                             tag(&candidate.status)
                         ),
                     });
+                }
+                // `replayed` reports the saved decision's outcome, so
+                // the Work link is whatever that decision recorded:
+                // an accepted decision that created Work must surface
+                // the same `work_id` here — the link can never be
+                // silently dropped — and a rejected decision never
+                // carries one. The command ledger is the authority.
+                if candidate.status == IntakeCandidateStatus::Replayed {
+                    let command_id = candidate
+                        .command_id
+                        .as_ref()
+                        .expect("links_ok guarantees a replayed command_id");
+                    match self.command_decision(command_id)? {
+                        Some(CommandDecision::Accepted { work_id, .. }) => {
+                            if candidate.work_id != work_id {
+                                return Err(StoreError::ConstraintConflict {
+                                    detail: format!(
+                                        "intake candidate {}/{} replayed link does not \
+                                         match the saved decision's work",
+                                        candidate.run_id, candidate.ordinal
+                                    ),
+                                });
+                            }
+                        }
+                        Some(CommandDecision::Rejected { .. }) => {
+                            if candidate.work_id.is_some() {
+                                return Err(StoreError::ConstraintConflict {
+                                    detail: format!(
+                                        "intake candidate {}/{} replayed a rejection \
+                                         but carries a work link",
+                                        candidate.run_id, candidate.ordinal
+                                    ),
+                                });
+                            }
+                        }
+                        None => {
+                            return Err(StoreError::ConstraintConflict {
+                                detail: format!(
+                                    "intake candidate {}/{} replays an absent command \
+                                     decision",
+                                    candidate.run_id, candidate.ordinal
+                                ),
+                            });
+                        }
+                    }
                 }
                 self.exec(
                     "UPDATE intake_candidates SET status=?3, \

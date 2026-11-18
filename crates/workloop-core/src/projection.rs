@@ -733,14 +733,17 @@ pub struct IntakeRunsView {
 }
 
 /// One candidate row inside a run detail, in returned ordinal order:
-/// proposal and replay identity, recorded status and bounded reason,
-/// and the decision links (`command_id`, `work_id`, `committed_seq`)
-/// where the status carries them.
+/// proposal and replay identity, payload digest, recorded status and
+/// bounded reason, and the decision links (`command_id`, `work_id`,
+/// `committed_seq`) where the status carries them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntakeCandidateView {
     pub ordinal: u32,
     pub proposal_key: String,
     pub replay_key: String,
+    /// Digest of the canonical candidate payload — the audit anchor
+    /// that survives after the adapter is gone.
+    pub payload_digest: String,
     pub status: IntakeCandidateStatus,
     pub status_reason: Option<String>,
     pub command_id: Option<CommandId>,
@@ -866,6 +869,7 @@ pub fn intake_run_detail(
             ordinal: c.ordinal,
             proposal_key: c.proposal_key.clone(),
             replay_key: c.replay_key.clone(),
+            payload_digest: c.payload_digest.clone(),
             status: c.status,
             status_reason: c.status_reason.clone(),
             command_id: c.command_id.clone(),
