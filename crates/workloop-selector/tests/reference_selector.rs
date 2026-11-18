@@ -135,29 +135,31 @@ fn sources_arg(path: &Path) -> Vec<String> {
 fn executable_proposes_eligible_issues_in_rank_order() {
     let dir = tmp_dir("rank");
     let r = repo();
-    // Three open labelled issues out of creation order, plus a closed
+    // Three open labelled issues whose creation order contradicts
+    // their Issue numbers — created ascending must win, so a
+    // number-ordered implementation fails this test. Plus a closed
     // one, an unlabelled one, and a labelled-but-wrong-label one.
     let issues = vec![
         fact(
-            issue(30, "i-new"),
-            IssueState::Open,
-            &["intake"],
-            300,
-            "newest",
-        ),
-        fact(
-            issue(10, "i-old"),
+            issue(30, "i-c"),
             IssueState::Open,
             &["intake"],
             100,
-            "oldest",
+            "created-oldest",
         ),
         fact(
-            issue(20, "i-mid"),
+            issue(10, "i-a"),
             IssueState::Open,
             &["intake"],
             200,
-            "middle",
+            "created-middle",
+        ),
+        fact(
+            issue(20, "i-b"),
+            IssueState::Open,
+            &["intake"],
+            300,
+            "created-newest",
         ),
         fact(
             issue(40, "i-closed"),
@@ -198,7 +200,12 @@ fn executable_proposes_eligible_issues_in_rank_order() {
     };
     assert_eq!(candidates.len(), 3, "only labelled open issues propose");
     let intents: Vec<&str> = candidates.iter().map(|c| c.task.intent.as_str()).collect();
-    assert_eq!(intents, ["oldest", "middle", "newest"]);
+    // created ascending decides before Issue number: number order
+    // would be 10/20/30, creation order is 100/200/300.
+    assert_eq!(
+        intents,
+        ["created-oldest", "created-middle", "created-newest"]
+    );
     // Every candidate binds the request's selector identity and task
     // mapping verbatim.
     for candidate in &candidates {
@@ -228,7 +235,10 @@ fn executable_honours_exclusions_and_max_candidates() {
         &dir,
         serde_json::json!({ repo_key(&r): { "pages": pages(issues) } }),
     );
-    let excluded = vec![issue(2, "i-b")];
+    // The *oldest* issue is excluded: an implementation that ignored
+    // exclusions would still rank "a" first under max_candidates=1,
+    // so this fixture discriminates.
+    let excluded = vec![issue(1, "i-a")];
     let repositories = vec![r.clone()];
     let spec = request_spec("req-2", &repositories, &excluded, 1, deadline_ms());
     let request = protocol::prepare_request(&spec, deadline_ms() - 30_000).unwrap();
@@ -240,11 +250,15 @@ fn executable_honours_exclusions_and_max_candidates() {
     let SelectorReply::Success { candidates } = reply else {
         panic!("expected success");
     };
-    // Exclusion removed i-b; max_candidates=1 keeps the oldest.
+    // Exclusion removed i-a; max_candidates=1 keeps the next-oldest.
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].task.intent, "a");
+    assert_eq!(candidates[0].task.intent, "b");
     assert!(
-        stderr.contains("truncated by max_candidates"),
+        stderr.contains("excluded=1"),
+        "stderr must count the excluded fact: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 eligible facts truncated by max_candidates"),
         "stderr: {stderr}"
     );
 }
@@ -254,33 +268,31 @@ fn executable_ranks_across_repositories_by_scoped_identity() {
     let dir = tmp_dir("scope");
     let r1 = RepositoryRef::new(host(), RepositoryId::trusted("repo-a"));
     let r2 = RepositoryRef::new(host(), RepositoryId::trusted("repo-b"));
-    let a = fact(
-        IssueRef {
-            repository: r1.clone(),
-            issue: IssueId::trusted("i-x"),
-            display_number: Some(5),
-        },
-        IssueState::Open,
-        &["intake"],
-        100,
-        "repo-a issue",
-    );
-    let b = fact(
-        IssueRef {
-            repository: r2.clone(),
-            issue: IssueId::trusted("i-y"),
-            display_number: Some(2),
-        },
-        IssueState::Open,
-        &["intake"],
-        100,
-        "repo-b issue",
-    );
+    // Identical created time AND identical Issue number across every
+    // fact, so only the scoped-identity tie-break can order them:
+    // repository id first ("repo-a" before "repo-b"), then issue id
+    // within a repository ("i-y" before "i-z").
+    let mk = |repository: &RepositoryRef, id: &str, title: &str| {
+        fact(
+            IssueRef {
+                repository: repository.clone(),
+                issue: IssueId::trusted(id),
+                display_number: Some(7),
+            },
+            IssueState::Open,
+            &["intake"],
+            100,
+            title,
+        )
+    };
+    let a_z = mk(&r1, "i-z", "repo-a zed");
+    let a_y = mk(&r1, "i-y", "repo-a why");
+    let b_a = mk(&r2, "i-a", "repo-b ay");
     let sources = write_sources(
         &dir,
         serde_json::json!({
-            repo_key(&r1): { "pages": pages(vec![a]) },
-            repo_key(&r2): { "pages": pages(vec![b]) },
+            repo_key(&r1): { "pages": pages(vec![a_z, a_y]) },
+            repo_key(&r2): { "pages": pages(vec![b_a]) },
         }),
     );
     let repositories = vec![r1, r2];
@@ -294,11 +306,9 @@ fn executable_ranks_across_repositories_by_scoped_identity() {
     let SelectorReply::Success { candidates } = reply else {
         panic!("expected success");
     };
-    assert_eq!(candidates.len(), 2);
-    // Same creation time: Issue number orders (2 before 5), and the
-    // scoped identity is the documented final tie-break.
-    assert_eq!(candidates[0].task.intent, "repo-b issue");
-    assert_eq!(candidates[1].task.intent, "repo-a issue");
+    assert_eq!(candidates.len(), 3);
+    let intents: Vec<&str> = candidates.iter().map(|c| c.task.intent.as_str()).collect();
+    assert_eq!(intents, ["repo-a why", "repo-a zed", "repo-b ay"]);
 }
 
 #[test]

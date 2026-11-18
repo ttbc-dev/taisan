@@ -15,8 +15,12 @@ use std::process::{Command, Output};
 use workloop_core::identity::{
     AdapterId, HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef,
 };
+use workloop_core::ports::ProcessControlPort;
+use workloop_core::store::{Effect, IntakeRun, IntakeRunState, IntakeTrigger, Store};
+use workloop_exec::supervisor::PosixProcessControl;
 use workloop_selector::protocol;
 use workloop_selector::{Proposal, Provenance, SourceBinding, TaskInput, proposal_key};
+use workloop_store::sqlite::{RunLeaseOwner, SqliteStore};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_workloop-cli"))
@@ -75,8 +79,8 @@ fn run_ok(root: &Path, profile: Option<&Path>, args: &[&str]) -> serde_json::Val
 }
 
 /// A minimal valid profile: one publication repository in scope and
-/// an enabled intake bound to the fixture selector script.
-fn profile_toml(selector_argv: &[String]) -> String {
+/// an intake bound to the fixture selector script.
+fn profile_toml_enabled(selector_argv: &[String], enabled: bool) -> String {
     let argv = selector_argv
         .iter()
         .map(|a| format!("\"{a}\""))
@@ -100,7 +104,7 @@ actor = "taisan-publisher"
 credential_ref = "env:TAISAN_TOKEN"
 
 [intake]
-enabled = true
+enabled = {enabled}
 interval_minutes = 30
 timeout_seconds = 60
 pending_queue_limit = 10
@@ -172,8 +176,12 @@ fn selector_fixture(root: &Path) -> Vec<String> {
 }
 
 fn write_profile(root: &Path, argv: &[String]) -> PathBuf {
+    write_profile_enabled(root, argv, true)
+}
+
+fn write_profile_enabled(root: &Path, argv: &[String], enabled: bool) -> PathBuf {
     let path = root.join("profile.toml");
-    std::fs::write(&path, profile_toml(argv)).unwrap();
+    std::fs::write(&path, profile_toml_enabled(argv, enabled)).unwrap();
     path
 }
 
@@ -327,4 +335,120 @@ fn run_once_drives_a_scheduled_startup_intake_without_blocking() {
     assert_eq!(items[0]["trigger"], "scheduled_startup");
     assert_eq!(items[0]["state"], "completed");
     assert_eq!(items[0]["candidates"]["accepted"], 1);
+}
+
+#[test]
+fn intake_profile_resolution_never_reads_the_json_install_config_flag() {
+    // `--config` on a store-backed command names the JSON installation
+    // record — the TOML profile resolves through `TAISAN_CONFIG`/XDG
+    // only. Passing `--config` must neither feed the JSON record to
+    // the profile loader nor suppress intake.
+    let dir = root("configflag");
+    let argv = selector_fixture(&dir);
+    let profile = write_profile(&dir, &argv);
+    let install = dir.join("install.json");
+    let install_arg = install.to_string_lossy().into_owned();
+    let out = intake_cli(
+        &dir,
+        Some(&profile),
+        &["--config", install_arg.as_str(), "intake"],
+    );
+    assert!(
+        out.status.success(),
+        "intake with --config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let env = envelope(&out);
+    assert_eq!(env["status"], "accepted", "{env}");
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    // The flag did name the installation record: it now exists as
+    // JSON, proving the two config channels stayed separate.
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&install).unwrap()).unwrap();
+    assert!(record["actor_id"].is_string(), "{record}");
+}
+
+#[test]
+fn intake_runs_with_automatic_intake_disabled() {
+    // A disabled `[intake]` stops the scheduler, not the verb: a
+    // complete selector binding is sufficient for a manual run.
+    let dir = root("disabled");
+    let argv = selector_fixture(&dir);
+    let profile = write_profile_enabled(&dir, &argv, false);
+    let env = run_ok(&dir, Some(&profile), &["intake"]);
+    assert_eq!(env["status"], "accepted", "{env}");
+    assert_eq!(env["result"]["state"], "completed", "{env}");
+    assert_eq!(env["result"]["launched"], true, "{env}");
+}
+
+#[test]
+fn intake_is_refused_while_the_intake_lease_is_held() {
+    let dir = root("busy");
+    let argv = selector_fixture(&dir);
+    let profile = write_profile(&dir, &argv);
+    // Hold the installation intake lease from this live process —
+    // the subprocess must refuse `intake_busy`, never queue.
+    let store = SqliteStore::open(&dir.join("workloop.db"), 10).unwrap();
+    let identity = PosixProcessControl::identity_of(std::process::id() as i32).unwrap();
+    let owner = RunLeaseOwner {
+        pid: identity.pid,
+        started_at: identity.started_at,
+        nonce: "cli-test-lease".to_string(),
+    };
+    store
+        .acquire_intake_lease(&owner, |id| PosixProcessControl.inspect(id), unix_now())
+        .unwrap();
+    let out = intake_cli(&dir, Some(&profile), &["intake"]);
+    assert!(!out.status.success());
+    let env = envelope(&out);
+    assert_eq!(env["status"], "rejected", "{env}");
+    assert_eq!(env["reason"]["code"], "intake_busy", "{env}");
+}
+
+#[test]
+fn intake_is_refused_while_a_run_is_active() {
+    let dir = root("activerun");
+    let argv = selector_fixture(&dir);
+    let profile = write_profile(&dir, &argv);
+    // Seed a durable `open` run owned by this live process: the
+    // recovery sweep leaves it (owner provably alive) and the
+    // coordinator's active-run guard refuses the new invocation.
+    let store = SqliteStore::open(&dir.join("workloop.db"), 10).unwrap();
+    let identity = PosixProcessControl::identity_of(std::process::id() as i32).unwrap();
+    let now = unix_now();
+    store
+        .transact(|tx| {
+            let run = IntakeRun {
+                run_id: tx.alloc_id("intake")?,
+                trigger: IntakeTrigger::Manual,
+                selector_id: AdapterId::trusted("test-sel"),
+                selector_version: 1,
+                policy_revision: 7,
+                settings_revision: None,
+                state: IntakeRunState::Open,
+                detail_code: None,
+                request_payload: b"{}".to_vec(),
+                request_digest: "0".repeat(64),
+                owner_pid: identity.pid,
+                owner_started_at: identity.started_at.clone(),
+                owner_nonce: "cli-test-run".to_string(),
+                created_unix_seconds: now,
+                finished_unix_seconds: None,
+                recorded_seq: tx.alloc_seq()?,
+            };
+            tx.apply(&Effect::InsertIntakeRun { run })
+        })
+        .unwrap();
+    let out = intake_cli(&dir, Some(&profile), &["intake"]);
+    assert!(!out.status.success());
+    let env = envelope(&out);
+    assert_eq!(env["status"], "rejected", "{env}");
+    assert_eq!(env["reason"]["code"], "intake_active", "{env}");
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }

@@ -739,10 +739,11 @@ fn run(cli: Cli) -> i32 {
             // due decisions, and skip-while-active all live there.
             // Invocations run on their own thread with their own store
             // connection, so a pending selector never blocks a phase.
-            // `--config`/`--state-dir` here resolve the TOML profile
-            // through the same precedence `init`/`check` use.
+            // The TOML profile resolves through `TAISAN_CONFIG`/XDG
+            // only: `--config` on a store-backed command is the JSON
+            // installation record, never the profile path.
             let mut intake_driver = intake::IntakeDriver::new(
-                cli.config.clone(),
+                None,
                 cli.state_dir.clone(),
                 actor.clone(),
                 config.clone(),
@@ -797,6 +798,10 @@ fn run(cli: Cli) -> i32 {
                 );
                 intake_driver.maybe_tick(&store, now());
                 if let Some(reason) = report.abort_reason() {
+                    // Join a still-running invocation before exiting —
+                    // otherwise its selector child is orphaned past the
+                    // process boundary.
+                    intake_driver.finish();
                     return emit(envelope::error_envelope(
                         Some(identity()),
                         envelope::ErrorClass::Store,
@@ -1062,6 +1067,16 @@ fn run(cli: Cli) -> i32 {
             ))
         }
         Commands::Intake => {
+            // `intake` reports through the query envelope deliberately:
+            // its durable result is the intake run itself (projectable
+            // via `intake-runs`/`intake-detail`), duplicate submission
+            // is refused structurally by the intake lease and the
+            // active-run guard rather than by a command-ledger replay
+            // key, and candidate-level idempotency lives in each
+            // proposal's replay key inside the coordinator. The run's
+            // `state`/`detail_code` — not the envelope status — carries
+            // per-run outcome, so a converged `interrupted` run still
+            // exits accepted: the invocation did its job.
             let identity =
                 || envelope::query_identity("intake", &actor, cli.idempotency_key.as_deref());
             // Close runs a proven-dead owner left behind before the
@@ -1074,24 +1089,26 @@ fn run(cli: Cli) -> i32 {
                     &e.to_string(),
                 ));
             }
-            let resolved =
-                match intake::resolve_intake(cli.config.as_deref(), cli.state_dir.as_deref()) {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        return emit(envelope::error_envelope(
-                            Some(identity()),
-                            envelope::ErrorClass::Config,
-                            "no installation profile — intake is not configured",
-                        ));
-                    }
-                    Err(e) => {
-                        return emit(envelope::error_envelope(
-                            Some(identity()),
-                            envelope::ErrorClass::Config,
-                            &e,
-                        ));
-                    }
-                };
+            // The TOML profile resolves through `TAISAN_CONFIG`/XDG
+            // only — `cli.config` is the JSON installation record on
+            // store-backed commands, never the profile path.
+            let resolved = match intake::resolve_intake(None, cli.state_dir.as_deref()) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        "no installation profile — intake is not configured",
+                    ));
+                }
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             let Some(selector) = resolved.selector.clone() else {
                 return emit(envelope::error_envelope(
                     Some(identity()),
@@ -1189,7 +1206,7 @@ fn run(cli: Cli) -> i32 {
         Commands::IntakeRuns { limit } => {
             let identity =
                 envelope::query_identity("intake_runs", &actor, cli.idempotency_key.as_deref());
-            let status = intake_status_value(cli.config.as_deref(), cli.state_dir.as_deref());
+            let status = intake_status_value(None, cli.state_dir.as_deref());
             match store.transact_deferred(|tx| projection::intake_runs(tx, limit)) {
                 Ok(workloop_core::projection::QueryResult::Found {
                     value,

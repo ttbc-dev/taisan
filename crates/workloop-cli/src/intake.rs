@@ -365,10 +365,12 @@ impl IntakeDriver {
     }
 
     /// Join a still-running invocation before the driver exits —
-    /// `run --once`, `--work`, shutdown, and tick-limit exits all leave
-    /// through here so no hidden selector child can outlive the
-    /// process. The wait is bounded by the configured adapter timeout
-    /// (≤ 300 s by profile validation).
+    /// `run --once`, `--work`, shutdown, tick-limit, and abort exits
+    /// all leave through here so no hidden selector child can outlive
+    /// the process. `join` itself has no timeout; what bounds the
+    /// wait is the invocation's own work — the selector exchange is
+    /// capped by the configured adapter timeout (≤ 300 s by profile
+    /// validation) and admission is a bounded loop of store writes.
     pub fn finish(&mut self) {
         if let Some(handle) = self.invocation.take() {
             match handle.join() {
