@@ -839,12 +839,13 @@ fn mid_batch_capacity_loss_defers_the_unattempted_remainder() {
 }
 
 /// A store fault inside one candidate's submit is never acknowledged:
-/// the candidate records `unknown` with the bounded reason, admission
-/// halts before the remainder, and the run stays `admitting` for
-/// recovery — the earlier accepted Work is untouched and the aborted
+/// admission halts before the remainder, the live owner closes the
+/// run `interrupted` rather than leaving it `admitting` forever, and
+/// the recovery sweep reconciles the unresolved candidate against the
+/// ledger — the earlier accepted Work is untouched and the aborted
 /// submit leaves no partial rows.
 #[test]
-fn a_submit_store_fault_marks_the_candidate_unknown_and_halts() {
+fn a_submit_store_fault_halts_and_reconciles_the_candidate() {
     let dir = tmp_root("unknown-candidate");
     let db = dir.join("workloop.db");
     let proposals = vec![
@@ -882,19 +883,23 @@ fn a_submit_store_fault_marks_the_candidate_unknown_and_halts() {
         "{:?}",
         report.candidates[0]
     );
+    // The unresolved candidate is reconciled against the ledger
+    // immediately: no decision was ever saved under its replay key,
+    // so it is `interrupted` — never silently acknowledged.
     assert_eq!(
         report.candidates[1].status,
-        IntakeCandidateStatus::Unknown,
+        IntakeCandidateStatus::Interrupted,
         "{:?}",
         report.candidates[1]
     );
     assert_eq!(
         report.candidates[1].status_reason.as_deref(),
-        Some("submit_outcome_unknown")
+        Some("no_saved_decision")
     );
-    // `unknown` is non-final: the halted run stays `admitting` for
-    // the recovery pass rather than reporting completed.
-    assert_eq!(report.state, IntakeRunState::Admitting);
+    // A live owner never leaves the run `admitting`: the halted run
+    // closes `interrupted` so the next invocation is not wedged.
+    assert_eq!(report.state, IntakeRunState::Interrupted);
+    assert_eq!(report.detail_code.as_deref(), Some("unresolved_candidates"));
 
     // Exactly one Work exists — the first candidate's. The aborted
     // submit committed nothing, and no ledger decision survives

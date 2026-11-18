@@ -92,7 +92,7 @@ Run states:
 | — | `skipped` | Recorded without adapter launch (e.g. preflight found zero free pending positions). Terminal at insert |
 | `open` | `admitting` | A whole-response-validated candidate batch (possibly empty) committed atomically with this transition |
 | `open` | `failed` | Invocation-level failure before a validated batch: transport, deadline, contract violation, adapter failure. `detail_code` carries the bounded protocol/launcher code |
-| `open`, `admitting` | `interrupted` | The owning invocation cannot continue: recovery proved the owner gone, or the live owner aborted on a propagating store fault (`store_error`). Candidates stay for ledger reconciliation |
+| `open`, `admitting` | `interrupted` | The owning invocation cannot continue: recovery proved the owner gone, or the live owner itself aborted — a propagating store fault (`store_error`) or admission halted with candidates still unresolved (`unresolved_candidates`). Candidates stay for ledger reconciliation |
 | `admitting` | `completed` | Every candidate reached a recorded terminal status |
 | terminal | — | `completed`, `failed`, `interrupted`, `skipped` never regress |
 
@@ -166,7 +166,8 @@ The pending-queue limit itself, its atomic enforcement inside submit, and the pr
 Recovery (#208) consumes these records; this section fixes the contract it relies on.
 
 - A run in `open` or `admitting` whose owner is proven gone is marked `interrupted` with a bounded `detail_code` (`owner_lost`, `no_conforming_response`, or `unresolved_candidates`). Unknown liveness retains exclusion — the run is not touched.
-- Candidates still `pending` or `unknown` under an interrupted run are reconciled against the command ledger by `replay_key` before any further admission: found decisions fix terminal status and links; absent decisions return candidates to `pending` (re-drivable) or `interrupted` per the documented policy — never silently acknowledged as accepted.
+- A live owner never leaves its own run `admitting`. When admission halts with `pending`/`unknown` candidates, or a propagating store fault ends the invocation, the owner closes the run `interrupted` (`unresolved_candidates` / `store_error`) and runs the same ledger reconciliation sweep recovery uses — the next invocation is not wedged behind the active-run guard, and no candidate is silently acknowledged. `admitting` therefore only ever belongs to a live in-flight invocation or a dead owner awaiting the sweep.
+- Candidates still `pending` or `unknown` under an interrupted run are reconciled against the command ledger by `replay_key` before any further admission: found decisions fix terminal status and links; absent decisions mark the candidate `interrupted` — never silently acknowledged as accepted. An interrupted candidate is terminal; a later run re-proposing the same semantic proposal creates a fresh candidate and submits fresh, because no decision exists under its replay key.
 - A run left `admitting` whose candidates are all terminal is closed `completed`.
 - A `skipped` or terminal run is never reopened; adapter swaps, configuration reloads, and restarts cannot rewrite run provenance or relabel a new candidate as a replay.
 
