@@ -91,6 +91,9 @@ fn v02_walkthrough_covers_install_and_operations() {
         "capacity",
         "restart",
         "duplicate",
+        "cargo install --path crates/workloop-selector --bin public-issue-selector",
+        "absent (no `[intake.selector]`)",
+        "joins it before exiting",
     ] {
         assert!(guide.contains(required), "guide omits {required:?}");
     }
@@ -125,6 +128,10 @@ fn v02_owner_checklist_exercises_every_required_scenario() {
         "configuration reload",
         "Expected results summary",
         "unexercised",
+        "adapter_source_unavailable",
+        "adapter_authentication_failed",
+        "adapter_deadline_exceeded",
+        "exchange_*",
     ] {
         assert!(checklist.contains(required), "checklist omits {required:?}");
     }
