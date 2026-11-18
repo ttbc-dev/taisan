@@ -26,6 +26,9 @@
 
 pub mod admission;
 pub mod collect;
+pub mod protocol;
+pub mod reference;
+pub mod strict_json;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -168,6 +171,9 @@ pub enum SkipReason {
     /// it from this run's output — truncation is explicit data, never
     /// indistinguishable from absence from the snapshot.
     TruncatedByBound,
+    /// The Issue is open and in scope but does not carry every label
+    /// the adapter's configured label filter requires (#214).
+    MissingLabels,
 }
 
 /// One snapshot fact that produced no proposal, with its reason.
@@ -286,7 +292,7 @@ pub fn propose(
 /// use as its opaque IssueId. Display numbers never enter identity
 /// comparison; this is a policy filter, and it never matches two
 /// facts to one entry across repositories or on absent metadata.
-fn excluded(excluded: &BTreeSet<IssueRef>, issue: &IssueRef) -> bool {
+pub(crate) fn excluded(excluded: &BTreeSet<IssueRef>, issue: &IssueRef) -> bool {
     excluded.contains(issue)
         || excluded.iter().any(|entry| {
             entry.repository == issue.repository
@@ -314,15 +320,13 @@ fn proposal(
         content_digest: fact.content_digest.clone(),
     };
     let required_permissions: Vec<String> = policy.required_permissions.iter().cloned().collect();
-    let key = sha256_hex(
-        PROPOSAL_TAG,
-        &canonical_json(&semantic_payload(
-            selector,
-            policy,
-            std::slice::from_ref(&source),
-            &task,
-            &required_permissions,
-        )),
+    let key = proposal_key(
+        selector.as_str(),
+        SELECTOR_VERSION,
+        policy.revision,
+        std::slice::from_ref(&source),
+        &task,
+        &required_permissions,
     );
     Proposal {
         key,
@@ -339,22 +343,71 @@ fn proposal(
     }
 }
 
+/// The deterministic digest a candidate's `key` must equal, computed
+/// over the canonical semantic payload of exactly the fields the wire
+/// contract carries. Exposed so both sides of the protocol — the
+/// emitting adapter and the validating caller — recompute identity
+/// from the same definition rather than trusting the wire value.
+pub fn proposal_key(
+    selector: &str,
+    selector_version: u32,
+    policy_revision: u64,
+    sources: &[SourceBinding],
+    task: &TaskInput,
+    required_permissions: &[String],
+) -> String {
+    sha256_hex(
+        PROPOSAL_TAG,
+        &canonical_json(&semantic_payload(
+            selector,
+            selector_version,
+            policy_revision,
+            sources,
+            task,
+            required_permissions,
+        )),
+    )
+}
+
+/// The canonical semantic object a proposal key digests — the
+/// `proposal-v1` payload itself. Callers persisting candidate
+/// provenance store these canonical bytes as `payload` and the
+/// [`proposal_key`] digest as `payload_digest`.
+pub fn proposal_semantic_json(
+    selector: &str,
+    selector_version: u32,
+    policy_revision: u64,
+    sources: &[SourceBinding],
+    task: &TaskInput,
+    required_permissions: &[String],
+) -> serde_json::Value {
+    semantic_payload(
+        selector,
+        selector_version,
+        policy_revision,
+        sources,
+        task,
+        required_permissions,
+    )
+}
+
 /// The canonical semantic fields a proposal key digests. Everything
 /// bookkeeping — cursors, fetch/run timestamps, display numbers,
 /// mutable labels — is absent by construction: it is never written
 /// into this payload.
 fn semantic_payload(
-    selector: &AdapterId,
-    policy: &SelectionPolicy,
+    selector: &str,
+    selector_version: u32,
+    policy_revision: u64,
     sources: &[SourceBinding],
     task: &TaskInput,
     required_permissions: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
         "schema": PROPOSAL_TAG,
-        "selector": selector.as_str(),
-        "selector_version": SELECTOR_VERSION,
-        "policy_revision": policy.revision,
+        "selector": selector,
+        "selector_version": selector_version,
+        "policy_revision": policy_revision,
         "sources": sources.iter().map(|s| {
             serde_json::json!({
                 "host": s.issue.repository.host.as_str(),

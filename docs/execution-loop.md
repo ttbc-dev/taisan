@@ -45,7 +45,7 @@ Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-fin
 
 ## Intake scheduling
 
-Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. It changes no runtime behavior by itself — the scheduler and CLI land in later v0.2 units — but the admission rule it names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
+Status: normative contract for #211 (v0.2). This section specifies the selector intake scheduler hosted by `taisan run`, its configuration reload, the one-shot intake CLI surface, and the installation-wide pending-queue admission policy. The scheduler, the `run` driver integration, the bounded adapter exchange, the coordinator, recovery, and the intake CLI verbs are implemented; persisting each tick's reloaded settings revision into the durable settings record remains a later v0.2 unit. The admission rule this section names is enforced inside the submit transaction: every `submit`, manual or selector-originated, passes the same capacity check described under [queue admission](#queue-admission).
 
 ### Scheduler model
 

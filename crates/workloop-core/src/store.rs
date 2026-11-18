@@ -818,6 +818,13 @@ pub trait ReadView {
         issues: &[IssueRef],
     ) -> Result<Vec<IntakeSourceOwner>, StoreError>;
 
+    /// Every scoped issue with a live owner — the same
+    /// queued/running/paused owner set [`Self::intake_source_owners`]
+    /// reports, unfiltered. The intake coordinator needs the complete
+    /// owned set *before* it can scope a request's exclusions, so this
+    /// read exists independently of any candidate issue list.
+    fn intake_owned_issues(&self) -> Result<Vec<IssueRef>, StoreError>;
+
     /// Every durable command decision, oldest first, reduced to
     /// [`CommandRecord`]. Read-only evidence for queries that must know
     /// which Commands were ever accepted (e.g. whether a released wait

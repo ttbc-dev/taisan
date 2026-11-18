@@ -1,6 +1,6 @@
 # Intake identity, persistence, and restart recovery
 
-Status: normative design for #206, implemented together with the #207 store changes as store format v8 against runtime revision `a175376`. This document specifies the durable records, states, and recovery rules for v0.2 intake. It changes no runtime API by itself; the coordinator is #203, recovery #208, and the CLI/scheduler contracts #209–#211. The [selector protocol](selector-protocol.md) (#200) remains authoritative for the wire contract, and [identity and admission](identity-storage.md) remains authoritative for command replay, overlap, and Work identity. Evidence distinctions follow the same rule as everywhere else: fixture results and owner-run live results are never conflated.
+Status: normative design for #206, implemented together with the #207 store changes as store format v8 against runtime revision `a175376`; the coordinator (#203), recovery (#208), CLI verbs and projections (#209–#210), scheduler (#215), `run` integration (#204), bounded exchange (#201), and the packaged reference Selector (#214) are implemented against this contract. This document specifies the durable records, states, and recovery rules for v0.2 intake. The [selector protocol](selector-protocol.md) (#200) remains authoritative for the wire contract, and [identity and admission](identity-storage.md) remains authoritative for command replay, overlap, and Work identity. Evidence distinctions follow the same rule as everywhere else: fixture results and owner-run live results are never conflated.
 
 ## Usage and authority
 

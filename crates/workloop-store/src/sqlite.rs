@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::identity::{AdapterId, HostInstanceId, StoreId};
+use workloop_core::identity::{AdapterId, HostInstanceId, RepositoryRef, StoreId};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
@@ -1907,6 +1907,35 @@ impl ReadView for Tx<'_> {
                 execution_state: untag(&row.get::<_, String>(2)?)?,
             })
         })
+    }
+
+    fn intake_owned_issues(&self) -> Result<Vec<workloop_core::identity::IssueRef>, StoreError> {
+        // The unfiltered owner set: every issue whose immutable
+        // membership belongs to a Work holding a queued, running, or
+        // paused Execution — the same live-owner rule
+        // `intake_source_owners` applies, minus the candidate filter.
+        // `issue_key` — not the full row — is the dedup unit: two
+        // Works may record the same issue under different display
+        // numbers, and exclusions must see each scoped identity once.
+        // Display numbers are presentational and carry no exclusion
+        // weight, so the reconstructed refs leave them absent.
+        self.query_all(
+            "SELECT DISTINCT wir.issue_key FROM work_issue_refs wir \
+             JOIN executions e ON e.work_id = wir.work_id \
+             WHERE e.state IN ('queued','running','paused') \
+             ORDER BY wir.issue_key",
+            [],
+            |row| {
+                let key: String = row.get(0)?;
+                let (repository, issue): (RepositoryRef, String) =
+                    serde_json::from_str(&key).map_err(conv)?;
+                Ok(workloop_core::identity::IssueRef {
+                    repository,
+                    issue: workloop_core::identity::IssueId::trusted(issue),
+                    display_number: None,
+                })
+            },
+        )
     }
 
     fn commands(&self) -> Result<Vec<CommandRecord>, StoreError> {

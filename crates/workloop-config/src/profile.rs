@@ -24,7 +24,7 @@
 //! always redacted. A load refusal therefore never carries a secret
 //! *value* into a message, log, or evidence record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use workloop_core::credential::CredentialProvider;
 use workloop_core::domain::{canonical_json, sha256_hex};
-use workloop_core::identity::{ActorRole, AdapterId, HostActorId, HostCapability, RepositoryId};
+use workloop_core::identity::{
+    ActorRole, AdapterId, HostActorId, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
+};
 use workloop_core::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
 /// The single schema version this runtime understands. A missing,
@@ -466,6 +468,21 @@ pub struct IntakeSelectorSection {
     /// bytes each and 16,384 bytes total, no NUL or control characters
     /// (docs/selector-protocol.md framing bounds).
     pub argv: Option<Vec<String>>,
+    /// Constraints every returned candidate's task must carry — the
+    /// request's `task_constraints`. Treated as a set: duplicates
+    /// collapse and the wire order is sorted.
+    #[serde(default)]
+    pub task_constraints: Vec<String>,
+    /// The exact verification argv every returned candidate's task
+    /// must carry, in order — the request's `verification_argv`.
+    /// Empty means no verification is required.
+    #[serde(default)]
+    pub verification_argv: Vec<String>,
+    /// The permission declaration every returned candidate must carry
+    /// — the request's `required_permissions`. Provenance only, never
+    /// a grant. Treated as a set like `task_constraints`.
+    #[serde(default)]
+    pub required_permissions: Vec<String>,
 }
 
 /// The resolved selector binding inside an [`IntakeSettings`] snapshot.
@@ -475,6 +492,12 @@ pub struct IntakeSelectorBinding {
     pub selector_version: u32,
     pub policy_revision: u64,
     pub argv: Vec<String>,
+    /// The request's `task_constraints`, sorted and deduplicated.
+    pub task_constraints: Vec<String>,
+    /// The request's `verification_argv`, verbatim order.
+    pub verification_argv: Vec<String>,
+    /// The request's `required_permissions`, sorted and deduplicated.
+    pub required_permissions: Vec<String>,
 }
 
 /// The validated intake-settings snapshot: concrete values resolved
@@ -1055,6 +1078,49 @@ impl Profile {
         }
         targets.into_iter().collect()
     }
+
+    /// The intake request's complete repository scope: every
+    /// repository the installation can read source issues from —
+    /// `use = "source"` entries plus `use = "publication"` entries,
+    /// which imply source reads. The host half is the host instance
+    /// identity (the declared `endpoint`), exactly as
+    /// [`Self::publication_targets`] resolves it; a host without an
+    /// endpoint contributes nothing. The result is sorted and
+    /// deduplicated — the selector protocol requires a unique sorted
+    /// allowlist, and identity collisions collapse rather than
+    /// duplicating.
+    ///
+    /// This is derived, never configured: the profile's repository
+    /// bindings *are* the intake scope, so the request can never
+    /// advertise a repository the installation does not already bind.
+    pub fn source_repositories(&self) -> Result<Vec<RepositoryRef>, String> {
+        let mut repositories = BTreeSet::new();
+        for host in self.hosts.values() {
+            let Some(endpoint) = &host.endpoint else {
+                continue;
+            };
+            let host_instance =
+                HostInstanceId::new(endpoint.clone()).map_err(|e| format!("host endpoint: {e}"))?;
+            for repository in &host.repositories {
+                // `use` was validated at load into the closed set
+                // {"source", "publication"}; both grant source reads,
+                // so every bound repository is in scope. The match is
+                // still written out so a future `use` value fails
+                // closed here rather than silently widening scope.
+                match repository.use_.as_deref() {
+                    Some("source") | Some("publication") => {}
+                    _ => continue,
+                }
+                let Some(id) = &repository.id else {
+                    continue;
+                };
+                let repository_id =
+                    RepositoryId::new(id.clone()).map_err(|e| format!("repository id: {e}"))?;
+                repositories.insert(RepositoryRef::new(host_instance.clone(), repository_id));
+            }
+        }
+        Ok(repositories.into_iter().collect())
+    }
 }
 
 /// A bare host name for the egress allowlist: ASCII labels of
@@ -1132,12 +1198,107 @@ fn resolve_intake_selector(
             "intake.selector.argv: total exceeds {MAX_ARGV_TOTAL_BYTES} bytes"
         ));
     }
+    let task_constraints = check_task_strings(
+        "intake.selector.task_constraints",
+        &section.task_constraints,
+        MAX_CONSTRAINT_ITEMS,
+        MAX_CONSTRAINT_BYTES,
+    )?;
+    let verification_argv = check_verification_argv(&section.verification_argv)?;
+    let required_permissions = check_task_strings(
+        "intake.selector.required_permissions",
+        &section.required_permissions,
+        MAX_PERMISSION_ITEMS,
+        MAX_PERMISSION_BYTES,
+    )?;
     Ok(IntakeSelectorBinding {
         adapter: adapter.to_string(),
         selector_version: section.selector_version,
         policy_revision: section.policy_revision,
         argv: argv.clone(),
+        task_constraints,
+        verification_argv,
+        required_permissions,
     })
+}
+
+/// The protocol's task-default bounds (docs/selector-protocol.md):
+/// constraints and permissions are sets — duplicates collapse and the
+/// resolved vector is sorted, which is exactly the wire order the
+/// request contract requires.
+const MAX_CONSTRAINT_ITEMS: usize = 64;
+const MAX_CONSTRAINT_BYTES: usize = 4_096;
+const MAX_PERMISSION_ITEMS: usize = 32;
+const MAX_PERMISSION_BYTES: usize = 128;
+
+/// Validate one set-valued string list (`task_constraints` or
+/// `required_permissions`) against the protocol's per-item and count
+/// bounds, then resolve it sorted and deduplicated. Refusals name the
+/// key and index but never echo the value — an operator may have
+/// pasted anything here.
+fn check_task_strings(
+    key: &str,
+    values: &[String],
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<Vec<String>, String> {
+    if values.len() > max_items {
+        return Err(format!(
+            "{key}: expected at most {max_items} entries, got {}",
+            values.len()
+        ));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if value.is_empty() || value.len() > max_bytes {
+            return Err(format!("{key}[{index}]: must be 1–{max_bytes} bytes"));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!(
+                "{key}[{index}]: <redacted> contains control characters"
+            ));
+        }
+    }
+    let mut resolved: Vec<String> = values
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    resolved.sort();
+    Ok(resolved)
+}
+
+/// Validate `verification_argv` against the protocol's argv bounds —
+/// the same count, per-item, total, and control-character rules as the
+/// selector `argv` itself — keeping the configured order verbatim:
+/// argv order is semantic, never sorted.
+fn check_verification_argv(argv: &[String]) -> Result<Vec<String>, String> {
+    if argv.len() > MAX_ARGV_ITEMS {
+        return Err(format!(
+            "intake.selector.verification_argv: expected at most {MAX_ARGV_ITEMS} entries, got {}",
+            argv.len()
+        ));
+    }
+    let mut total = 0usize;
+    for (index, arg) in argv.iter().enumerate() {
+        if arg.is_empty() || arg.len() > MAX_ARGV_ITEM_BYTES {
+            return Err(format!(
+                "intake.selector.verification_argv[{index}]: must be 1–{MAX_ARGV_ITEM_BYTES} bytes"
+            ));
+        }
+        if arg.chars().any(char::is_control) {
+            return Err(format!(
+                "intake.selector.verification_argv[{index}]: <redacted> contains control characters"
+            ));
+        }
+        total += arg.len() + 1;
+    }
+    if total > MAX_ARGV_TOTAL_BYTES {
+        return Err(format!(
+            "intake.selector.verification_argv: total exceeds {MAX_ARGV_TOTAL_BYTES} bytes"
+        ));
+    }
+    Ok(argv.to_vec())
 }
 
 /// Validate a `credential_ref`'s shape only — never its value. The

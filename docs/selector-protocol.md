@@ -1,6 +1,6 @@
 # Stateless external Selector protocol
 
-Status: normative design for #200, protocol version `1` for v0.2. This document specifies a future external command boundary. It does not implement a process launcher, change installation configuration, or authorize live execution. The existing snapshot-based reference Selector remains available.
+Status: normative design for #200, protocol version `1` for v0.2. This document specifies the external command boundary. The wire contract is implemented by `workloop-selector` (request construction, whole-response validation, and the packaged reference executable) and `workloop-exec`'s bounded exchange (direct argv launch, stream caps, deadline, and process-group cleanup); it authorizes no live execution by itself. The snapshot-based reference Selector remains available for in-process use.
 
 The [JSON Schema](selector-protocol.schema.json) defines the complete structural request and response shapes. The byte limits, cross-field rules, identity calculation, and admission rules below are equally normative. A schema pass alone is insufficient. This contract reuses [adapter boundaries](adapter-boundaries.md), [identity and admission](identity-storage.md), and the implemented `Proposal` and Proposal-to-submit translation in `workloop-selector`.
 

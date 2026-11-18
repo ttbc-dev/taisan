@@ -35,7 +35,7 @@ use crate::isolation;
 /// signal so a reused pid is never signaled.
 pub struct PosixProcessControl;
 
-fn ps_output(args: &[&str]) -> std::io::Result<String> {
+pub(crate) fn ps_output(args: &[&str]) -> std::io::Result<String> {
     // The row/lstart parsers below are written for the C locale's ctime
     // format; a localized `ps` renders different field text (e.g. a CJK
     // weekday), which must not read back as an incomplete table row.
@@ -64,7 +64,7 @@ fn checked_ps_output(out: Output, allows_absence: bool) -> std::io::Result<Strin
 /// day field is space-padded for single-digit days (`Oct  4`), so the
 /// stored verifier is whitespace-normalized — every identity path
 /// (spawn, snapshot, re-verify) must produce the same string.
-fn normalize_lstart(s: &str) -> String {
+pub(crate) fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -109,7 +109,7 @@ fn parse_table_row<const N: usize>(line: &str) -> Result<Option<([i32; N], Strin
 /// verified start-time mismatch) may prove a stop; `Failed` proves
 /// nothing and must surface as `Unknown`/`Failed` to callers.
 #[derive(Debug, PartialEq, Eq)]
-enum LstartLookup {
+pub(crate) enum LstartLookup {
     Present(String),
     Absent,
     Failed(String),
@@ -131,7 +131,7 @@ fn classify_lstart_lookup(out: std::io::Result<String>) -> LstartLookup {
     }
 }
 
-fn lstart_of(pid: i32) -> LstartLookup {
+pub(crate) fn lstart_of(pid: i32) -> LstartLookup {
     classify_lstart_lookup(ps_output(&["-o", "lstart=", "-p", &pid.to_string()]))
 }
 
@@ -181,7 +181,7 @@ fn peek_exit_status(pid: i32) -> Option<i32> {
 /// an absent owner leaves only this probe's own stragglers holding the
 /// group.
 #[derive(Debug, PartialEq, Eq)]
-enum ProbeSignalPlan {
+pub(crate) enum ProbeSignalPlan {
     /// The leader re-verified: it and the group this probe created are
     /// still ours to signal.
     LeaderAndGroup,
@@ -196,7 +196,11 @@ enum ProbeSignalPlan {
     Nothing,
 }
 
-fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> ProbeSignalPlan {
+pub(crate) fn probe_signal_plan(
+    pid: i32,
+    recorded_lstart: &str,
+    lookup: &LstartLookup,
+) -> ProbeSignalPlan {
     match lookup {
         LstartLookup::Present(now) if now == recorded_lstart => ProbeSignalPlan::LeaderAndGroup,
         LstartLookup::Absent => ProbeSignalPlan::GroupOnly,
@@ -224,7 +228,7 @@ fn probe_signal_plan(pid: i32, recorded_lstart: &str, lookup: &LstartLookup) -> 
 /// the wait-error paths so a wedged probe cannot outlive its bound on
 /// either one. Returns the plan applied so the caller can report an
 /// unsignalled bound as unknown fate rather than claiming `Bounded`.
-fn signal_probe_bound(pid: i32, recorded_lstart: &str) -> ProbeSignalPlan {
+pub(crate) fn signal_probe_bound(pid: i32, recorded_lstart: &str) -> ProbeSignalPlan {
     let plan = probe_signal_plan(pid, recorded_lstart, &lstart_of(pid));
     match plan {
         ProbeSignalPlan::LeaderAndGroup => unsafe {

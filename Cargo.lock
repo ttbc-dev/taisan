@@ -738,6 +738,7 @@ dependencies = [
  "workloop-core",
  "workloop-exec",
  "workloop-github",
+ "workloop-intake",
  "workloop-selector",
  "workloop-store",
 ]
@@ -809,6 +810,20 @@ dependencies = [
  "serde",
  "serde_json",
  "workloop-core",
+ "workloop-selector",
+ "workloop-store",
+]
+
+[[package]]
+name = "workloop-intake"
+version = "0.0.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "workloop-config",
+ "workloop-core",
+ "workloop-exec",
  "workloop-selector",
  "workloop-store",
 ]

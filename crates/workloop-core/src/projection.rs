@@ -11,7 +11,10 @@ use crate::observation::{
     ArtifactFact, HostActionStatus, ObservationFact, Outcome, ProcessStateFact, ReadRevision,
     ReadSubject,
 };
-use crate::store::{Deferral, IntakeSourceOwner, ReadView, StoreError};
+use crate::store::{
+    Deferral, IntakeCandidateStatus, IntakeRunState, IntakeSourceOwner, IntakeTrigger, ReadView,
+    StoreError,
+};
 use crate::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
 /// Whether a source's evidence could actually be read. An unavailable or
@@ -671,6 +674,214 @@ pub fn intake_preflight(
         pending_count,
         free_positions: u64::from(pending_queue_limit).saturating_sub(pending_count),
         source_owners,
+    })
+}
+
+/// Per-status candidate counts for one run — every status is counted
+/// separately so a partial batch can never read as wholly accepted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntakeCandidateCounts {
+    pub pending: usize,
+    pub accepted: usize,
+    pub replayed: usize,
+    pub rejected: usize,
+    pub capacity_deferred: usize,
+    pub unknown: usize,
+    pub interrupted: usize,
+    pub total: usize,
+}
+
+/// One intake run as the run-list query reports it: identity and
+/// provenance fields plus candidate outcome counts. Read-only — the
+/// query changes no run state and holds no schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeRunView {
+    pub run_id: String,
+    pub trigger: IntakeTrigger,
+    pub selector_id: String,
+    pub selector_version: u32,
+    pub policy_revision: u64,
+    /// The intake-settings revision the run was admitted under;
+    /// audit provenance only.
+    pub settings_revision: Option<String>,
+    pub state: IntakeRunState,
+    /// Bounded diagnostic for `failed`/`interrupted`/`skipped`.
+    pub detail_code: Option<String>,
+    pub created_unix_seconds: i64,
+    pub finished_unix_seconds: Option<i64>,
+    pub recorded_seq: EventSequence,
+    pub candidates: IntakeCandidateCounts,
+}
+
+/// The bounded run list plus the durable status facts a caller can
+/// report without the adapter: the live run, the newest completed
+/// run (last success), and the newest failed-or-interrupted run
+/// (last failure). `next_due` and reload diagnostics are
+/// scheduler-process state and are never fabricated here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeRunsView {
+    /// Newest-first, at most `limit` entries.
+    pub items: Vec<IntakeRunView>,
+    /// Whether older runs exist beyond the returned bound.
+    pub truncated: bool,
+    /// The single `open`/`admitting` run, when one exists.
+    pub active_run: Option<String>,
+    /// Newest `completed` run — the last successful intake.
+    pub last_completed_run: Option<String>,
+    /// Newest `failed` or `interrupted` run — the last failed intake.
+    pub last_failed_run: Option<String>,
+}
+
+/// One candidate row inside a run detail, in returned ordinal order:
+/// proposal and replay identity, recorded status and bounded reason,
+/// and the decision links (`command_id`, `work_id`, `committed_seq`)
+/// where the status carries them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeCandidateView {
+    pub ordinal: u32,
+    pub proposal_key: String,
+    pub replay_key: String,
+    pub status: IntakeCandidateStatus,
+    pub status_reason: Option<String>,
+    pub command_id: Option<CommandId>,
+    pub work_id: Option<WorkId>,
+    pub committed_seq: Option<EventSequence>,
+}
+
+/// One run plus its candidates — the `intake-detail` query result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntakeRunDetailView {
+    pub run: IntakeRunView,
+    /// Digest of the canonical request payload — audit anchor; the
+    /// payload bytes themselves stay in the store.
+    pub request_digest: String,
+    /// The lease owner identity the run was created under.
+    pub owner_pid: i32,
+    pub candidates: Vec<IntakeCandidateView>,
+}
+
+/// Upper bound on one `intake-runs` page — the query contract's
+/// output bound.
+pub const MAX_INTAKE_RUNS_LIMIT: usize = 100;
+
+fn intake_run_view(run: &crate::store::IntakeRun, counts: IntakeCandidateCounts) -> IntakeRunView {
+    IntakeRunView {
+        run_id: run.run_id.clone(),
+        trigger: run.trigger,
+        selector_id: run.selector_id.as_str().to_string(),
+        selector_version: run.selector_version,
+        policy_revision: run.policy_revision,
+        settings_revision: run.settings_revision.clone(),
+        state: run.state,
+        detail_code: run.detail_code.clone(),
+        created_unix_seconds: run.created_unix_seconds,
+        finished_unix_seconds: run.finished_unix_seconds,
+        recorded_seq: run.recorded_seq,
+        candidates: counts,
+    }
+}
+
+fn candidate_counts(
+    statuses: impl Iterator<Item = IntakeCandidateStatus>,
+) -> IntakeCandidateCounts {
+    let mut counts = IntakeCandidateCounts::default();
+    for status in statuses {
+        counts.total += 1;
+        match status {
+            IntakeCandidateStatus::Pending => counts.pending += 1,
+            IntakeCandidateStatus::Accepted => counts.accepted += 1,
+            IntakeCandidateStatus::Replayed => counts.replayed += 1,
+            IntakeCandidateStatus::Rejected => counts.rejected += 1,
+            IntakeCandidateStatus::CapacityDeferred => counts.capacity_deferred += 1,
+            IntakeCandidateStatus::Unknown => counts.unknown += 1,
+            IntakeCandidateStatus::Interrupted => counts.interrupted += 1,
+        }
+    }
+    counts
+}
+
+/// The bounded intake run list, newest-first. `limit` is clamped to
+/// [`MAX_INTAKE_RUNS_LIMIT`]; the view reports whether older runs were
+/// cut. Read-only: the query changes no run state and consults no
+/// adapter.
+pub fn intake_runs(
+    tx: &dyn ReadView,
+    limit: usize,
+) -> Result<QueryResult<IntakeRunsView>, StoreError> {
+    let limit = limit.min(MAX_INTAKE_RUNS_LIMIT);
+    let runs = tx.intake_runs()?;
+    let active = runs
+        .iter()
+        .find(|r| matches!(r.state, IntakeRunState::Open | IntakeRunState::Admitting))
+        .map(|r| r.run_id.clone());
+    let last_completed = runs
+        .iter()
+        .rev()
+        .find(|r| r.state == IntakeRunState::Completed)
+        .map(|r| r.run_id.clone());
+    let last_failed = runs
+        .iter()
+        .rev()
+        .find(|r| {
+            matches!(
+                r.state,
+                IntakeRunState::Failed | IntakeRunState::Interrupted
+            )
+        })
+        .map(|r| r.run_id.clone());
+    let truncated = runs.len() > limit;
+    let mut items = Vec::with_capacity(limit.min(runs.len()));
+    for run in runs.iter().rev().take(limit) {
+        let candidates = tx.intake_candidates(&run.run_id)?;
+        let counts = candidate_counts(candidates.iter().map(|c| c.status));
+        items.push(intake_run_view(run, counts));
+    }
+    Ok(QueryResult::Found {
+        value: IntakeRunsView {
+            items,
+            truncated,
+            active_run: active,
+            last_completed_run: last_completed,
+            last_failed_run: last_failed,
+        },
+        as_of: tx.last_seq()?,
+        sources: vec![store_source()],
+    })
+}
+
+/// One run plus its candidates in original ordinal order. `NotFound`
+/// for an unknown run id — never an empty detail.
+pub fn intake_run_detail(
+    tx: &dyn ReadView,
+    run_id: &str,
+) -> Result<QueryResult<IntakeRunDetailView>, StoreError> {
+    let Some(run) = tx.intake_run(run_id)? else {
+        return Ok(QueryResult::NotFound);
+    };
+    let candidates = tx.intake_candidates(run_id)?;
+    let counts = candidate_counts(candidates.iter().map(|c| c.status));
+    let views = candidates
+        .iter()
+        .map(|c| IntakeCandidateView {
+            ordinal: c.ordinal,
+            proposal_key: c.proposal_key.clone(),
+            replay_key: c.replay_key.clone(),
+            status: c.status,
+            status_reason: c.status_reason.clone(),
+            command_id: c.command_id.clone(),
+            work_id: c.work_id.clone(),
+            committed_seq: c.committed_seq,
+        })
+        .collect();
+    Ok(QueryResult::Found {
+        value: IntakeRunDetailView {
+            run: intake_run_view(&run, counts),
+            request_digest: run.request_digest.clone(),
+            owner_pid: run.owner_pid,
+            candidates: views,
+        },
+        as_of: tx.last_seq()?,
+        sources: vec![store_source()],
     })
 }
 
