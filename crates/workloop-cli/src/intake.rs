@@ -678,6 +678,10 @@ pending_queue_limit = {limit}
             .revision();
         assert_eq!(record.settings_revision, expected);
         assert_eq!(record.pending_queue_limit, 3);
+        assert!(
+            record.recorded_seq > 0,
+            "recorded_seq allocated: {record:?}"
+        );
     }
 
     /// Identical content keeps the revision — the record is not
@@ -715,6 +719,7 @@ pending_queue_limit = {limit}
         let after = settings_record(&store).unwrap();
         assert_eq!(after.pending_queue_limit, 7);
         assert_ne!(after.settings_revision, before.settings_revision);
+        assert_ne!(after.recorded_seq, before.recorded_seq);
     }
 
     /// An invalid reload suppresses the write: the last valid record
