@@ -284,10 +284,21 @@ fn concurrent_first_open_bootstraps_once_without_a_unique_failure() {
     for handle in handles {
         match handle.join().unwrap() {
             Ok(store) => stores.push(store),
-            Err(StoreError::ConstraintConflict { detail }) => {
-                panic!("first-open collided on bootstrap: {detail}")
+            // Bootstrap failures map through `internal`, so the pre-fix
+            // UNIQUE collision arrives as `Internal` rather than
+            // `ConstraintConflict`; name it explicitly either way.
+            Err(e) => {
+                let collided = matches!(
+                    &e,
+                    StoreError::ConstraintConflict { detail }
+                        | StoreError::Internal { detail }
+                        if detail.contains("store_meta.key")
+                );
+                if collided {
+                    panic!("first-open collided on bootstrap: {e:?}");
+                }
+                panic!("concurrent first-open failed instead of waiting: {e:?}");
             }
-            Err(e) => panic!("concurrent first-open failed instead of waiting: {e:?}"),
         }
     }
 
