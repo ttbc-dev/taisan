@@ -281,10 +281,11 @@ pub fn artifact(
     ))
 }
 
-/// Write `bytes` to `path` through a sibling temporary file, renaming
-/// only after the full content is durably on disk. The destination is
-/// created fresh — it was checked absent at the boundary — and no
-/// partial content is ever left under the caller's path.
+/// Write `bytes` to `path` through a sibling temporary file, linking
+/// it into place only after the full content is durably on disk. The
+/// destination is created fresh — it was checked absent at the
+/// boundary — and no partial content is ever left under the caller's
+/// path.
 fn publish(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -306,7 +307,21 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .and_then(|()| f.sync_all())
             .map_err(|e| format!("cannot write the artifact bytes: {e}"))?;
         drop(f);
-        std::fs::rename(&tmp, path).map_err(|e| format!("cannot publish the artifact: {e}"))
+        // link(2) fails with EEXIST when the destination name is
+        // taken, so the no-overwrite guarantee is atomic — a
+        // check-then-rename pair would let a concurrent creator slip
+        // between the check and the rename.
+        std::fs::hard_link(&tmp, path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "the --output destination already exists".to_string()
+            } else {
+                format!("cannot publish the artifact: {e}")
+            }
+        })?;
+        // The destination already holds the complete bytes; dropping
+        // the temp name is housekeeping.
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
     };
     let result = write();
     if result.is_err() {
