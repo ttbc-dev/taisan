@@ -1493,17 +1493,22 @@ fn is_protected(managed: &Path, protected: &[PathBuf]) -> bool {
         let parent = path.parent()?;
         Some(std::fs::canonicalize(parent).ok()?.join(name))
     };
+    // `managed` is fixed for the whole scan, so resolve its canonical
+    // forms once instead of once per protected entry.
+    let managed_canonical = std::fs::canonicalize(managed).ok();
+    let managed_location = canonical_location(managed);
     protected.iter().any(|p| {
         if p == managed {
             return true;
         }
-        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(p), std::fs::canonicalize(managed))
-            && a == b
+        if let (Ok(p_canonical), Some(managed_canonical)) =
+            (std::fs::canonicalize(p), managed_canonical.as_ref())
+            && p_canonical == *managed_canonical
         {
             return true;
         }
-        match (canonical_location(p), canonical_location(managed)) {
-            (Some(a), Some(b)) => a == b,
+        match (canonical_location(p), managed_location.as_ref()) {
+            (Some(p_location), Some(managed_location)) => p_location == *managed_location,
             _ => false,
         }
     })
