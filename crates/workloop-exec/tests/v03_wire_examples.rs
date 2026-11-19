@@ -252,3 +252,52 @@ fn v03_operational_profile_records_the_single_host_decisions() {
         );
     }
 }
+
+/// The operational sections must keep the rechecked baseline distinct
+/// from the v0.3 target: the stop path, the reconciliation bound, and
+/// the `check` preflight scope are stated against what is actually
+/// enforced, so a later implementation cannot silently adopt a target
+/// claim as evidence.
+#[test]
+fn v03_operational_claims_separate_baseline_from_target() {
+    let doc = read_doc();
+    let operational = section(
+        &doc,
+        "## 14. Operational launch, verification, and host composition",
+    );
+    for required in [
+        "The rechecked stop path sends SIGKILL directly",
+        "the SIGTERM stage and grace wait are not implemented",
+        "The setup preflight, not the read-only `check`",
+    ] {
+        assert!(
+            operational.contains(required),
+            "v0.3 operational section does not separate baseline from target: {required:?}"
+        );
+    }
+
+    let loop_doc = std::fs::read_to_string(repo_root().join("docs/execution-loop.md"))
+        .expect("read execution-loop.md");
+    let loop_operational = section(&loop_doc, "### Operational host-driver composition (v0.3)");
+    for required in [
+        "reconciles at most 8 items per tick",
+        "the ≤ 16 reconciliation budget in the loop defaults is a v0.3 target",
+        "is not the phase-6 recovery-scheduling bound",
+    ] {
+        assert!(
+            loop_operational.contains(required),
+            "execution loop states the enforced reconciliation bound incorrectly: {required:?}"
+        );
+    }
+
+    let worker = std::fs::read_to_string(repo_root().join("docs/worker-protocol.md"))
+        .expect("read worker-protocol.md");
+    let worker_operational = section(
+        &worker,
+        "### Operational delivery and managed lifecycle (v0.3)",
+    );
+    assert!(
+        worker_operational.contains("rechecked baseline stop path sends SIGKILL directly"),
+        "worker protocol presents the v0.3 stop target as the rechecked baseline"
+    );
+}
