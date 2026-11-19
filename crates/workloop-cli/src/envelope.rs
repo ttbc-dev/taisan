@@ -26,11 +26,11 @@ pub const EXIT_UNKNOWN: i32 = 6;
 
 /// Reason/detail text is bounded so a provider stack trace or a fat
 /// config error can never bloat or corrupt the contract surface.
-const MESSAGE_BOUND: usize = 240;
+pub(crate) const MESSAGE_BOUND: usize = 240;
 const EVIDENCE_BOUND: usize = 16;
 const EVIDENCE_ITEM_BOUND: usize = 240;
 
-fn bounded(s: &str, limit: usize) -> String {
+pub(crate) fn bounded(s: &str, limit: usize) -> String {
     if s.chars().count() <= limit {
         return s.to_string();
     }

@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::envelope::{MESSAGE_BOUND, bounded};
 use workloop_evidence_protocol::{
     ArtifactRequest, ArtifactResult, CommandKind, ErrorCode, ExportError, ExportRequest,
     MAX_RECORDS, ProtocolError, ProtocolVersion, QueryCommand, QueryEnvelope, QuerySource,
@@ -129,7 +130,10 @@ fn error(cmd: Option<QueryCommand>, code: ErrorCode, message: impl Into<String>)
         None,
         Some(ProtocolError {
             code,
-            message: message.into(),
+            // The frozen envelope validator bounds reason.message at
+            // 240 chars; a long store or decode error must truncate,
+            // never overflow the contract surface.
+            message: bounded(&message.into(), MESSAGE_BOUND),
         }),
     ))
 }
