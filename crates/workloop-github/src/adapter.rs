@@ -115,6 +115,7 @@ pub struct GitHubAdapter<C> {
     /// own adapter — an effect never migrates across hosts.
     bound_host: Option<HostInstanceId>,
     applied: Vec<String>,
+    poll_records: u64,
 }
 
 impl<C: GitHubApi> GitHubAdapter<C> {
@@ -123,6 +124,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: None,
             applied: Vec::new(),
+            poll_records: 0,
         }
     }
 
@@ -133,6 +135,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: Some(host),
             applied: Vec::new(),
+            poll_records: 0,
         }
     }
 
@@ -839,15 +842,20 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
         let Some(work_id) = observation.subject_work_id.clone() else {
-            return self
-                .ingest(store, config, observation, now_unix_seconds)
-                .map(|_| ());
+            let receipt = self.ingest(store, config, observation, now_unix_seconds)?;
+            if matches!(receipt, IngestReceipt::Recorded) {
+                self.poll_records = self.poll_records.wrapping_add(1);
+            }
+            return Ok(());
         };
         let execution_id = observation.subject_execution_id.clone();
         if !poll_fact_is_new(store, &work_id, &execution_id, &observation.fact)? {
             return Ok(());
         }
-        self.ingest(store, config, observation, now_unix_seconds)?;
+        let receipt = self.ingest(store, config, observation, now_unix_seconds)?;
+        if matches!(receipt, IngestReceipt::Recorded) {
+            self.poll_records = self.poll_records.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -925,7 +933,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     .max_by_key(|execution| execution.ordinal)
                     .map(|execution| execution.id))
             })?;
+            let before = self.poll_records;
             self.refresh_change_for_work(store, config, &change, &work_id, &execution_id, now)?;
+            if self.poll_records != before {
+                report.ingested += 1;
+            } else {
+                report.unchanged += 1;
+            }
         }
         Ok(report)
     }
@@ -1119,7 +1133,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 &review.author,
                 &review.review_id,
             )?
-            .unwrap_or_else(|| target_revision.clone());
+            .or_else(|| target_revision.clone());
             let observation = Observation {
                 delivery: Some(DeliveryId {
                     scope: DeliveryScope::Host {
@@ -2281,7 +2295,7 @@ fn recorded_review_target(
     head: &CommitRevision,
     source: &str,
     source_revision: &str,
-) -> Result<Option<Option<CommitRevision>>, StoreError> {
+) -> Result<Option<CommitRevision>, StoreError> {
     store.transact(|tx| {
         Ok(tx
             .observations_for_work(work_id)?
@@ -2297,7 +2311,7 @@ fn recorded_review_target(
                     && s == source
                     && sr.as_deref() == Some(source_revision) =>
                 {
-                    Some(target.target_revision.clone())
+                    target.target_revision.clone()
                 }
                 _ => None,
             }))

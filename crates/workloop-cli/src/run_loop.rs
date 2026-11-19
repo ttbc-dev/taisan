@@ -3636,4 +3636,188 @@ mod tests {
             "a changed conclusion is new evidence"
         );
     }
+    #[test]
+    fn the_source_refresh_report_counts_each_change_subject_exactly_once() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-report");
+        let change = change_ref("cr-report");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-report"), Ok(FakeGitHub::pull("head-1")));
+        fake.checks.insert(
+            cfg_key("head-1"),
+            Ok(vec![RemoteCheckRun {
+                check_run_id: "run-1".into(),
+                name: "ci".into(),
+                head_sha: "head-1".into(),
+                conclusion: CheckConclusion::Success,
+                producer: "app-ci".into(),
+            }]),
+        );
+        fake.reviews.insert(cfg_key("cr-report"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-report"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let cfg = config();
+        let first = adapter
+            .refresh_sources(&store, &cfg, &mut || NOW, None, None)
+            .unwrap();
+        assert_eq!(
+            (first.ingested, first.unchanged, first.deferred.len()),
+            (1, 0, 0),
+            "the first poll of one change subject is one ingested subject"
+        );
+        let repeat = adapter
+            .refresh_sources(&store, &cfg, &mut || NOW, None, None)
+            .unwrap();
+        assert_eq!(
+            (repeat.ingested, repeat.unchanged),
+            (0, 1),
+            "an identical repeat is one unchanged subject"
+        );
+        adapter.client_mut().checks.insert(
+            cfg_key("head-1"),
+            Ok(vec![RemoteCheckRun {
+                check_run_id: "run-1".into(),
+                name: "ci".into(),
+                head_sha: "head-1".into(),
+                conclusion: CheckConclusion::Failure,
+                producer: "app-ci".into(),
+            }]),
+        );
+        let changed = adapter
+            .refresh_sources(&store, &cfg, &mut || NOW, None, None)
+            .unwrap();
+        assert_eq!(
+            (changed.ingested, changed.unchanged),
+            (1, 0),
+            "a check-only transition still counts as an ingested subject"
+        );
+        adapter.client_mut().reviews.insert(
+            cfg_key("cr-report"),
+            Err(ApiError::Unknown {
+                reason: "outage".into(),
+            }),
+        );
+        let outage = adapter
+            .refresh_sources(&store, &cfg, &mut || NOW, None, None)
+            .unwrap();
+        assert_eq!(
+            (outage.ingested, outage.unchanged),
+            (1, 0),
+            "unavailable evidence is still a new observation for the subject"
+        );
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            report.phases[0].processed, 1,
+            "phase 1 reports the processed change subject"
+        );
+    }
+
+    #[test]
+    fn a_webhook_partial_review_pins_the_first_concrete_target() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-whpin");
+        let change = change_ref("cr-whpin");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        open_change_receipt(&store, &w, &change, "main");
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head.clone(),
+            },
+            HostActionStatus::Applied,
+        );
+        let review = |id: &str| RemoteReview {
+            review_id: id.into(),
+            commit_sha: "head-1".into(),
+            author: "reviewer".into(),
+            body: String::new(),
+            changes_requested: false,
+        };
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-whpin"), Ok(FakeGitHub::pull("head-1")));
+        fake.reviews
+            .insert(cfg_key("cr-whpin"), Ok(vec![review("rv-1")]));
+        fake.findings.insert(cfg_key("cr-whpin"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let cfg = config();
+        let delivery = workloop_github::adapter::WebhookDelivery {
+            event_id: "guid-rv1".into(),
+            emitted_at: NOW,
+            fact: workloop_github::adapter::WebhookFact::Review {
+                change: change.clone(),
+                head: head.clone(),
+                review_id: "rv-1".into(),
+                source: "reviewer".into(),
+            },
+        };
+        let receipt = adapter
+            .deliver_webhook(&store, &cfg, &delivery, NOW)
+            .unwrap();
+        assert_eq!(
+            receipt,
+            workloop_core::work::IngestReceipt::Recorded,
+            "the webhook records its partial, target-less review"
+        );
+        let detail = |store: &SqliteStore| {
+            let detail = store
+                .transact(|tx| projection::work_detail(&*tx, &w, NOW))
+                .unwrap();
+            let QueryResult::Found { value, .. } = detail else {
+                panic!("work detail missing: {detail:?}")
+            };
+            value
+        };
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            detail(&store).current_round_id.is_some(),
+            "the first concrete target seals the review seen earlier as partial"
+        );
+        let dup = adapter
+            .deliver_webhook(&store, &cfg, &delivery, NOW)
+            .unwrap();
+        assert_eq!(
+            dup,
+            workloop_core::work::IngestReceipt::Duplicate,
+            "the same delivery GUID stays idempotent"
+        );
+        adapter
+            .client_mut()
+            .branches
+            .insert(cfg_key("main"), Ok(Some("tb-2".into())));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            detail(&store).current_round_id,
+            None,
+            "the pinned review is not rebound to the moved target"
+        );
+        adapter.client_mut().reviews.insert(
+            cfg_key("cr-whpin"),
+            Ok(vec![review("rv-1"), review("rv-2")]),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            detail(&store).current_round_id.is_some(),
+            "a genuinely new review under the moved target seals the current round"
+        );
+    }
 }
