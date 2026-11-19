@@ -127,6 +127,34 @@ Validation rules:
 - The `[intake]` section (v0.2, #211) configures scheduled and one-shot selector intake through the argv adapter protocol of [selector protocol](selector-protocol.md). Its absence means automatic intake disabled with the documented defaults — interval 30 minutes, timeout 120 seconds, pending-queue limit 10 Work — and a pre-v0.2 profile loads unchanged. `enabled = true` requires a complete `[intake.selector]` binding; the reverse is not required, because `pending_queue_limit` is an installation-wide admission bound that applies to manual `submit` whether or not any selector is configured. Exactly one selector binding exists per installation: duplicate keys, unknown fields, and multiple selector declarations are refused structurally. `argv` follows the protocol bounds — 1–64 nonempty strings, at most 4,096 bytes each and 16,384 bytes total, no NUL or control characters — and launches directly without shell expansion. `interval_minutes` is a positive whole number of minutes; `timeout_seconds` is a positive integer at most 300 so the request deadline stays inside the protocol's 300,000 ms bound; `pending_queue_limit` is a positive integer. Zero, negative, fractional, and unit-suffixed values are load errors — never silently "unlimited". The section carries no credential references: the selector inherits source-read authority from `use = "source"`/`publication` repositories and resolves credentials only at the adapter boundary. Changed intake content yields a new settings revision — a digest of the complete validated section — while identical content keeps the revision; reload and due-time semantics are owned by the [execution loop](execution-loop.md#intake-scheduling). Intake settings govern new admission only: an accepted Work keeps its recorded binding, budgets, and unresolved effects across every reload.
 - Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects. Switching the `[selector]` section in or out changes only which admission path new submissions take — it never rebinds existing Work.
 
+## Clean-install v0.2 profile
+
+The [v0.2 installation and operation guide](v0.2.md) is the
+operator-facing walkthrough. The sanitized, structurally valid starting
+profile is [`docs/examples/v0.2/config.toml`](examples/v0.2/config.toml):
+one host, one publication repository, publication/review/discussion
+roles, one worker binding, and exactly one `[intake.selector]` binding.
+It contains no credential values and no live identity.
+
+The v0.2 intake keys and defaults are:
+
+| Key | Default | Rule |
+| --- | --- | --- |
+| `[intake].enabled` | `false` | Automatic scheduled intake is off. The one-shot `taisan intake` verb still requires only a configured selector binding. |
+| `[intake].interval_minutes` | `30` | Positive whole minutes on the internal scheduler grid. |
+| `[intake].timeout_seconds` | `120` | Positive integer, at most `300`; the selector exchange deadline. |
+| `[intake].pending_queue_limit` | `10` | Positive integer installation-wide pending-Work bound, applied to manual and Selector submissions alike. |
+| `[intake.selector]` | absent | Exactly one binding when present; `enabled = true` requires it. |
+
+The scheduler's fixed 60-second settings tick is internal to
+`taisan run`. No cron, systemd, launchd, or other OS timer is required.
+Reload, enable/disable, interval-change, adapter-swap, and no-catch-up
+semantics are specified in the
+[execution loop](execution-loop.md#intake-scheduling) and demonstrated
+by the [v0.2 walkthrough](v0.2.md#operation-walkthrough). Changing only
+the selector binding is a configuration-only adapter replacement; it
+never rewrites accepted Work bindings.
+
 ## Credential references and secret hygiene
 
 A `credential_ref` names a slot, not a secret. Resolution happens once per use at the adapter boundary; the resolved value stays inside the adapter process and is never persisted, logged, placed on argv, embedded in intents or receipts, or exported in evidence.

@@ -184,9 +184,16 @@ New cross-component scenarios added by this issue:
 
 ### #219 — installation/operation/owner-run documentation
 
-Pending implementation (documentation issue, no test surface). Its
-owner-acceptance checklist and evidence template must keep the
-fixture/live distinction this record maintains.
+Documentation delivered in `docs/v0.2.md`,
+`docs/v0.2-owner-run-checklist.md`,
+`docs/v0.2-evidence-template.md`, and the sanitized
+`docs/examples/v0.2/config.toml`. The static checks in
+`crates/workloop-cli/tests/v02_docs.rs` are **automated
+fixture/contract evidence**: they parse the example and assert that the
+walkthrough, checklist, and template carry the required steps, default
+bounds, labels, and redaction/unexercised fields. They create no Issue,
+enable no automation, and launch no Worker. The owner-run rows remain
+pending under #205 and are not claimed here.
 
 ### #205 — owner-run public acceptance and milestone completion
 
