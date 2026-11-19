@@ -74,7 +74,15 @@ fn descriptor(
         sha256: sha256(payload),
         byte_length: payload.len() as u64,
         media_type: "application/json".into(),
-        availability: Availability::Available,
+        // The artifact command cannot serve payloads over
+        // MAX_ARTIFACT_BYTES, so the descriptor must not advertise
+        // them as available; the citing record carries an artifact
+        // gap instead.
+        availability: if payload.len() > MAX_ARTIFACT_BYTES {
+            Availability::Unavailable
+        } else {
+            Availability::Available
+        },
     }
 }
 
@@ -553,6 +561,20 @@ impl Replay {
             {
                 source_refs.push(source_ref);
                 artifacts.push(artifact);
+            }
+        }
+        let mut gaps = gaps;
+        for art in &artifacts {
+            if art.availability != Availability::Available {
+                gaps.push(Gap {
+                    code: GapCode::SourceUnavailable,
+                    scope: GapScope::Artifact {
+                        artifact_id: art.artifact_id.clone(),
+                        sha256: art.sha256.clone(),
+                    },
+                    evidence_class: EvidenceClass::Artifact,
+                    reason: "the retained payload exceeds the artifact byte limit".into(),
+                });
             }
         }
         let body = RecordBody {
@@ -1791,6 +1813,7 @@ struct Assembly {
     artifacts: BTreeMap<String, ArtifactDescriptor>,
     gaps: Vec<Gap>,
     gap_scopes: BTreeSet<(String, String)>,
+    artifact_gaps: BTreeSet<(String, String)>,
 }
 
 impl Assembly {
@@ -1801,6 +1824,7 @@ impl Assembly {
             artifacts: BTreeMap::new(),
             gaps: vec![],
             gap_scopes: BTreeSet::new(),
+            artifact_gaps: BTreeSet::new(),
         }
     }
 
@@ -1964,7 +1988,20 @@ pub fn export_page(
                 drain += 1;
             }
             candidate_gaps.append(&mut endpoint_gaps);
-            candidate_gaps.extend(item.gaps.iter().cloned());
+            candidate_gaps.extend(
+                item.gaps
+                    .iter()
+                    .filter(|g| match &g.scope {
+                        GapScope::Artifact {
+                            artifact_id,
+                            sha256,
+                        } if g.evidence_class == EvidenceClass::Artifact => a
+                            .artifact_gaps
+                            .insert((artifact_id.clone(), sha256.clone())),
+                        _ => true,
+                    })
+                    .cloned(),
+            );
             let mut candidate_arts = a.artifacts.clone();
             for art in &item.artifacts {
                 candidate_arts.insert(art.artifact_id.clone(), art.clone());

@@ -969,3 +969,47 @@ fn store_epoch_is_a_durable_history_identity() {
     let store = SqliteStore::open(&path, 2).unwrap();
     assert_eq!(store.evidence_identity().unwrap().1, epoch);
 }
+
+#[test]
+fn oversized_payloads_export_unavailable_with_an_artifact_gap() {
+    let store = SqliteStore::open(&db_path("big"), 2).unwrap();
+    // `output` is retained in the event payload but never projected
+    // into the record, so the page stays small while the artifact
+    // exceeds the retrieval bound.
+    let mut effects = full_history();
+    for e in &mut effects {
+        if let Effect::InsertVerificationResult { result } = e {
+            result.output = "x".repeat(MAX_ARTIFACT_BYTES + 1);
+        }
+    }
+    append(&store, &effects);
+    // drain runs the frozen validator over the whole sequence: the
+    // page must carry an unavailable descriptor plus the artifact gap
+    // the contract requires for unciteable sources.
+    let (pages, _snapshot) = drain(&store, 500);
+    let page = &pages[0].1;
+    let big = page
+        .artifacts
+        .iter()
+        .find(|a| a.byte_length as usize > MAX_ARTIFACT_BYTES)
+        .expect("the oversized event's descriptor is on the page");
+    assert_eq!(big.availability, Availability::Unavailable);
+    assert!(page.gaps.iter().any(|g| {
+        g.evidence_class == EvidenceClass::Artifact
+            && matches!(
+                &g.scope,
+                GapScope::Artifact { artifact_id, .. } if *artifact_id == big.artifact_id
+            )
+    }));
+    // Retrieval agrees: the artifact command refuses the payload.
+    let snap = snapshot(&store);
+    let req = ArtifactRequest {
+        protocol_version: ProtocolVersion::V1,
+        artifact_id: big.artifact_id.clone(),
+        sha256: big.sha256.clone(),
+    };
+    assert_eq!(
+        evidence::artifact_bytes(&req, &snap).unwrap_err().code,
+        ErrorCode::ArtifactTooLarge
+    );
+}
