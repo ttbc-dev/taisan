@@ -36,6 +36,7 @@ const GUIDE_PATH: &str = "docs/v0.2.md";
 const CHECKLIST_PATH: &str = "docs/v0.2-owner-run-checklist.md";
 const TEMPLATE_PATH: &str = "docs/v0.2-evidence-template.md";
 const EXAMPLE_CONFIG_PATH: &str = "docs/examples/v0.2/config.toml";
+const EXAMPLE_RECORD_PATH: &str = "docs/examples/v0.2/workloop.config.json";
 const FIXTURE_LABEL: &str = "automated fixture/contract evidence";
 const LIVE_LABEL: &str = "owner-run live evidence";
 
@@ -220,6 +221,44 @@ fn v02_sanitized_profile_parses_with_documented_defaults() {
     assert!(
         !text.contains("ghp_") && !text.contains("github_pat_"),
         "the sanitized example must not carry a token-shaped value"
+    );
+}
+
+/// The sanitized installation record the guide publishes must load
+/// through the same path every store-backed command uses: the JSON
+/// deserializes as an `Installation`, `workloop_config()` accepts the
+/// binding (non-empty capabilities and host actors, nonzero contract
+/// version), and the worker declaration resolves. The guide embeds the
+/// file verbatim — the example is its single source, so drift between
+/// the two is a test failure, never a stale instruction.
+#[test]
+fn v02_sanitized_installation_record_loads() {
+    let text = read(EXAMPLE_RECORD_PATH);
+    let installation: workloop_config::Installation =
+        serde_json::from_str(&text).expect("the published sanitized record must deserialize");
+
+    installation
+        .workloop_config()
+        .expect("the published record must produce a valid work config");
+    installation
+        .worker_isolation_profile()
+        .expect("the published record must name an approved isolation profile");
+    assert!(
+        !installation.worker_argv.is_empty(),
+        "the published record must carry the worker argv run launches"
+    );
+    assert!(
+        installation
+            .allowed_effects
+            .as_ref()
+            .is_some_and(|e| e.host_write),
+        "the published record must permit host effects"
+    );
+
+    let guide = read(GUIDE_PATH);
+    assert!(
+        guide.contains(text.trim()),
+        "guide omits the published record verbatim: {EXAMPLE_RECORD_PATH}"
     );
 }
 
