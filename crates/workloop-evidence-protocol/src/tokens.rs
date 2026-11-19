@@ -232,10 +232,15 @@ impl ExportToken {
                 }
             }
             TokenKind::Checkpoint => {
-                if self.watermark < retained_from_seq {
+                // The pinned lower boundary must still be retained:
+                // replaying from a later boundary renumbers revisions
+                // the consumer already committed, which the contract
+                // answers with checkpoint_expired, not a corrupt delta.
+                if self.retained_from_seq < retained_from_seq || self.watermark < retained_from_seq
+                {
                     return Err(ExportError::new(
                         ErrorCode::CheckpointExpired,
-                        "the checkpoint watermark is below retained history",
+                        "the checkpoint's pinned history is no longer retained",
                     ));
                 }
             }
@@ -414,6 +419,14 @@ mod tests {
                 .unwrap_err()
                 .code,
             ErrorCode::SnapshotExpired
+        );
+        // A checkpoint whose pinned lower boundary was purged can no
+        // longer continue the consumer's committed revision sequence.
+        assert_eq!(
+            t.check_binding(TokenKind::Checkpoint, "inst-1", "10", 5, 100, 1100)
+                .unwrap_err()
+                .code,
+            ErrorCode::CheckpointExpired
         );
         // A cursor whose lower checkpoint sits above its own pinned
         // watermark would emit after_seq > snapshot_seq.
