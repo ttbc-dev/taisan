@@ -1802,8 +1802,15 @@ fn page_fits(
         next_cursor: None,
         checkpoint: None,
     };
-    serde_json::to_vec(&page)
-        .map(|b| b.len() + PAGE_TOKEN_MARGIN <= MAX_PAGE_BYTES)
+    // The CLI emits the envelope with to_string_pretty and the consumer
+    // bounds the raw `result` bytes, so measure that wire form: the
+    // page sits one nesting level deep, adding two indent bytes per
+    // line on top of the standalone pretty serialization.
+    serde_json::to_string_pretty(&page)
+        .map(|wire| {
+            let nesting = wire.bytes().filter(|&b| b == b'\n').count() * 2;
+            wire.len() + nesting + PAGE_TOKEN_MARGIN <= MAX_PAGE_BYTES
+        })
         .unwrap_or(false)
 }
 
