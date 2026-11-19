@@ -297,7 +297,9 @@ fn init_persists_allowlist_credential_references_and_identities() {
     assert_eq!(profile.roles["review"].actor.as_deref(), Some(REVIEWER));
     let publication_evidence = &profile.identity_evidence["publication"];
     assert_eq!(publication_evidence.login, PUBLISHER);
-    assert_eq!(publication_evidence.host_instance, ENDPOINT);
+    // The persisted evidence records the canonical host instance,
+    // not the endpoint spelling the observation carried.
+    assert_eq!(publication_evidence.host_instance, "***.github.com");
     assert_eq!(publication_evidence.repository, PUBLICATION_REPO);
     assert_eq!(publication_evidence.observed_unix_seconds, 1_763_000_000);
     let review_evidence = &profile.identity_evidence["review"];
@@ -313,6 +315,46 @@ fn init_persists_allowlist_credential_references_and_identities() {
         outcome.egress_allowlist,
         vec!["crates.io", "static.crates.io"]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Host-instance identity compares in canonical form: an observed
+/// host instance supplied under the bare-host spelling names the same
+/// instance as the declared endpoint, so `init` accepts it, persists
+/// the canonical form as evidence, and `check` does not report
+/// `identity.evidence_mismatch` (docs/identity-storage.md).
+#[test]
+fn host_instance_identity_compares_in_canonical_form() {
+    let dir = temp_root("canonical-host-instance");
+    review_token(&dir);
+    let config = dir.join("config.toml");
+    let state = dir.join("state");
+    // canonical_host_instance(ENDPOINT): scheme and path are transport
+    // spelling; the bare host is the identity.
+    let canonical = "***.github.com";
+
+    let mut observed = spec(&dir, 1_763_000_000);
+    for observation in &mut observed.observations {
+        observation.host_instance = canonical.into();
+    }
+    init(&config, &observed).expect("init accepts the canonical spelling");
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    let profile = parse_profile(&text).unwrap();
+    assert_eq!(
+        profile.identity_evidence["publication"].host_instance, canonical,
+        "evidence records the canonical host instance"
+    );
+
+    // Plain check: the identity stage compares canonical forms, so
+    // canonical evidence against the endpoint declaration passes.
+    let report = {
+        let mut options = CheckOptions::new(&state);
+        options.env_lookup = &env_present;
+        check(&config, &mut options)
+    };
+    assert_stage(&report, CheckStage::ConfigParse, StageStatus::Pass);
+    assert_stage(&report, CheckStage::IdentityTuples, StageStatus::Pass);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

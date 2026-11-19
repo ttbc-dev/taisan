@@ -19,7 +19,7 @@ use workloop_core::domain::{
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability, HostInstanceId,
-    IssueId, IssueRef, RepositoryId, RepositoryRef, RoleBinding,
+    IssueId, IssueRef, RepositoryId, RepositoryRef, RoleBinding, canonical_host_instance,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig};
 use workloop_selector::SelectionPolicy;
@@ -540,14 +540,23 @@ impl Installation {
         }
     }
 
+    /// The bound host instance identity: the configured `host_instance`
+    /// reduced to its canonical host-instance form, so an endpoint
+    /// spelling and the bare host name one identity — the same
+    /// canonicalization admission applies to source issues
+    /// (docs/identity-storage.md).
+    fn host_instance_id(&self) -> Result<HostInstanceId, String> {
+        HostInstanceId::new(canonical_host_instance(&self.host_instance))
+            .map_err(|e| format!("installation host_instance: {e}"))
+    }
+
     /// The `work`-level config derived from the installation record.
     /// The installation file is external input: every identity string,
     /// role name, and capability name is validated at this boundary —
     /// an unparseable value is a hard error, never a silently degraded
     /// or mis-bound configuration.
     pub fn workloop_config(&self) -> Result<WorkloopConfig, String> {
-        let host = HostInstanceId::new(self.host_instance.clone())
-            .map_err(|e| format!("installation host_instance: {e}"))?;
+        let host = self.host_instance_id()?;
         let repository_id = RepositoryId::new(self.repository.clone())
             .map_err(|e| format!("installation repository: {e}"))?;
         let repository = RepositoryRef::new(host.clone(), repository_id);
@@ -658,8 +667,7 @@ impl Installation {
         };
         let section: SelectorSection = serde_json::from_value(raw.clone())
             .map_err(|e| format!("installation selector: {e}"))?;
-        let host = HostInstanceId::new(self.host_instance.clone())
-            .map_err(|e| format!("installation host_instance: {e}"))?;
+        let host = self.host_instance_id()?;
         let adapter = AdapterId::new(section.adapter.clone())
             .map_err(|e| format!("installation selector.adapter: {e}"))?;
         let mut allowlist = BTreeSet::new();

@@ -226,7 +226,10 @@ pub struct IdentityEvidence {
     /// role's `actor` — the bound identity is the verified adapter-side
     /// identity, never a display alias.
     pub login: String,
-    /// Observed host instance identity (the role's host endpoint).
+    /// Observed host instance identity — the canonical host instance
+    /// derived from the role's host endpoint (`https://api.github.com`
+    /// records `github.com`); comparisons canonicalize both sides, so
+    /// evidence written under either spelling names the same instance.
     pub host_instance: String,
     /// Observed repository stable id, declared under the role's host.
     pub repository: String,
