@@ -29,6 +29,7 @@ use workloop_core::projection::{self, Availability, CommandResultLookup, SourceS
 use workloop_core::store::Store;
 use workloop_core::work::{WorkloopConfig, handle_command};
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
+#[cfg(test)]
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::retention::PlanBounds;
 use workloop_store::sqlite::SqliteStore;
@@ -751,7 +752,16 @@ fn run(cli: Cli) -> i32 {
                     ));
                 }
             };
-            let mut github = FixtureGithub::new();
+            let mut github = match run_loop::RunHost::from_config(&config) {
+                Ok(host) => host,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        Some(identity()),
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
             // Single-flight: one lease covers the whole run, taken
             // before the first pass and released when this process ends.
             // A second `run` fails closed with `lock.held`; a crashed

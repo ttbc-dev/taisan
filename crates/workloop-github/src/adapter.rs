@@ -39,20 +39,25 @@
 //!   on evidence, never on a merge.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
-use workloop_core::domain::{ExecutionId, WorkId, canonical_json, sha256_hex};
+use workloop_core::domain::{ExecutionId, WorkId, canonical_json, new_id, sha256_hex};
 use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId, HostActorRef,
-    HostInstanceId,
+    HostInstanceId, RepositoryRef, canonical_host_instance,
 };
 use workloop_core::observation::{
     BranchState, CheckConclusion, Completeness, DeliveryId, DeliveryScope, HostActionStatus,
-    NormalizedEffectFact, Observation, ObservationFact, OccurrenceInput, RefRelation,
+    IssueState, NormalizedEffectFact, Observation, ObservationFact, OccurrenceInput, ReadSubject,
+    RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding};
+use crate::fixture::{
+    SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
+};
 
 /// One delivered GitHub webhook: the transport GUID GitHub assigned,
 /// the time it stamped on the event, and the fact the event asserts —
@@ -110,11 +115,7 @@ pub struct GitHubAdapter<C> {
     /// own adapter — an effect never migrates across hosts.
     bound_host: Option<HostInstanceId>,
     applied: Vec<String>,
-    /// Distinguishes successive local head reads. A read is evidence
-    /// of what the host reports *now*, so re-observing a head after a
-    /// force push must not deduplicate against an earlier read of the
-    /// same revision.
-    next_read: u64,
+    poll_records: u64,
 }
 
 impl<C: GitHubApi> GitHubAdapter<C> {
@@ -123,7 +124,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: None,
             applied: Vec::new(),
-            next_read: 0,
+            poll_records: 0,
         }
     }
 
@@ -134,13 +135,8 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             client,
             bound_host: Some(host),
             applied: Vec::new(),
-            next_read: 0,
+            poll_records: 0,
         }
-    }
-
-    fn next_read_event_id(&mut self, change: &ChangeRequestRef, head: &str, at: i64) -> String {
-        self.next_read = self.next_read.wrapping_add(1);
-        format!("read:{change}@{}@{at}#{}", head, self.next_read)
     }
 
     /// The capability set this adapter declares. Every name is backed
@@ -158,6 +154,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             "comment_create",
             "checks_read",
             "review_findings_read",
+            "issue_read",
         ]
     }
 
@@ -232,6 +229,61 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             self.attempt(store, config, intent, now_unix_seconds)?;
         }
         Ok(())
+    }
+
+    pub fn apply_outbox_bounded(
+        &mut self,
+        store: &impl Store,
+        _config: &WorkloopConfig,
+        _clock: &mut dyn FnMut() -> i64,
+        _deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        _max_items: usize,
+    ) -> Result<crate::fixture::OutboxReport, StoreError> {
+        if self.any_outstanding_intents(store, scope)? {
+            return Err(StoreError::Internal {
+                detail: "production host writes are unsupported in this driver".into(),
+            });
+        }
+        Ok(crate::fixture::OutboxReport::default())
+    }
+
+    pub fn reconcile_outbox_bounded(
+        &mut self,
+        store: &impl Store,
+        _config: &WorkloopConfig,
+        _clock: &mut dyn FnMut() -> i64,
+        _deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        _max_items: usize,
+    ) -> Result<crate::fixture::ReconcileReport, StoreError> {
+        if self.any_outstanding_intents(store, scope)? {
+            return Err(StoreError::Internal {
+                detail: "production host writes are unsupported in this driver".into(),
+            });
+        }
+        Ok(crate::fixture::ReconcileReport::default())
+    }
+
+    fn any_outstanding_intents(
+        &self,
+        store: &impl Store,
+        scope: Option<&WorkId>,
+    ) -> Result<bool, StoreError> {
+        store.transact(|tx| {
+            Ok(tx.action_intents()?.into_iter().any(|intent| {
+                let applicable = self
+                    .bound_host
+                    .as_ref()
+                    .is_none_or(|bound| *bound == intent.host);
+                let scoped = scope.is_none_or(|work_id| intent.work_id == *work_id);
+                let outstanding = matches!(
+                    intent.status,
+                    HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+                );
+                applicable && scoped && outstanding
+            }))
+        })
     }
 
     /// Deliver one webhook. The event's own fact is recorded under its
@@ -344,6 +396,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 &execution_id,
                 now_unix_seconds,
                 None,
+                None,
+                &delivery.event_id,
+                false,
             )?;
         }
         // The fresh read: what GitHub reports *now* is the recorded
@@ -403,10 +458,99 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         let Some((work_id, execution_id)) = attribute_change(store, change)? else {
             return Ok(());
         };
+        self.refresh_change_for_work(
+            store,
+            config,
+            change,
+            &work_id,
+            &execution_id,
+            now_unix_seconds,
+        )
+    }
+
+    pub fn refresh_change_for_work(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        change: &ChangeRequestRef,
+        work_id: &WorkId,
+        execution_id: &Option<ExecutionId>,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let bound = store.transact(|tx| {
+            Ok(tx.work(work_id)?.map(|work| {
+                (
+                    work.binding.repository,
+                    work.binding.adapter,
+                    work.binding.contract_version,
+                )
+            }))
+        })?;
+        let Some((bound_repository, bound_adapter, bound_contract)) = bound else {
+            return Err(StoreError::ConstraintConflict {
+                detail: "work binding missing".into(),
+            });
+        };
+        if bound_adapter != config.host.adapter
+            || bound_contract != config.host.contract_version
+            || bound_repository != config.host.repository
+            || bound_repository != change.repository
+        {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!(
+                    "work {work} binding does not cover change repository {repo}",
+                    work = work_id.0.as_str(),
+                    repo = change.repository,
+                ),
+            });
+        }
+        if self
+            .bound_host
+            .as_ref()
+            .is_some_and(|bound| *bound != change.repository.host)
+        {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!(
+                    "adapter host binding does not cover {host}",
+                    host = change.repository.host,
+                ),
+            });
+        }
+        if let Some(eid) = execution_id {
+            let belongs = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(work_id)?
+                    .iter()
+                    .any(|execution| &execution.id == eid))
+            })?;
+            if !belongs {
+                return Err(StoreError::ConstraintConflict {
+                    detail: "execution does not belong to the supplied work".into(),
+                });
+            }
+        }
+        // Distinguishes successive local head reads. A read is evidence
+        // of what the host reports *now*, so re-observing a head after a
+        // force push must not deduplicate against an earlier read of the
+        // same revision.
+        let epoch = new_id("poll");
+        let mut target_revision: Option<CommitRevision> = None;
         // The repository read gates every subject read: an unreachable
         // repository invents no facts and the next pass catches up.
         if self.client.read_repository(&change.repository).is_err() {
-            return Ok(());
+            return self.record_unavailable_review(
+                store,
+                config,
+                change,
+                work_id,
+                execution_id,
+                None,
+                "repository read failed",
+                None,
+                &epoch,
+                true,
+                now_unix_seconds,
+            );
         }
         let pull = match self
             .client
@@ -415,10 +559,29 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             Ok(pull) => pull,
             // Outage or unknown change: no facts invented, nothing
             // recorded — the next successful read catches up.
-            Err(_) => return Ok(()),
+            Err(_) => {
+                return self.record_unavailable_review(
+                    store,
+                    config,
+                    change,
+                    work_id,
+                    execution_id,
+                    None,
+                    "change read failed",
+                    None,
+                    &epoch,
+                    true,
+                    now_unix_seconds,
+                );
+            }
         };
         let head = CommitRevision::new(change.repository.clone(), pull.head_sha)
             .map_err(|detail| StoreError::Internal { detail })?;
+        let work_label = work_id.0.as_str();
+        let exec_label = execution_id
+            .as_ref()
+            .map(|id| id.0.clone())
+            .unwrap_or_else(|| "none".into());
         let host_obs = |fact: ObservationFact, event_id: String, at: i64| -> Observation {
             Observation {
                 delivery: Some(DeliveryId {
@@ -434,8 +597,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 observed_unix_seconds: at,
             }
         };
-        let read_id = self.next_read_event_id(change, &head.object, now_unix_seconds);
-        self.ingest(
+        let read_id = format!(
+            "read:{work_label}:{exec_label}:{change}@{}#{epoch}",
+            head.object
+        );
+        self.poll_ingest(
             store,
             config,
             Observation {
@@ -458,12 +624,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // carries the run's own SHA.
         let runs = match self.client.check_runs(&change.repository, &head.object) {
             Ok(runs) => runs,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                return self.record_unavailable_review(
+                    store,
+                    config,
+                    change,
+                    work_id,
+                    execution_id,
+                    Some(&head),
+                    "check runs read failed",
+                    target_revision.clone(),
+                    &epoch,
+                    true,
+                    now_unix_seconds,
+                );
+            }
         };
         for run in runs {
             let run_head = CommitRevision::new(change.repository.clone(), run.head_sha.clone())
                 .map_err(|detail| StoreError::Internal { detail })?;
-            self.ingest(
+            self.poll_ingest(
                 store,
                 config,
                 host_obs(
@@ -477,7 +657,10 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         },
                         conclusion: run.conclusion.clone(),
                     },
-                    format!("check:{change}:{}@{:?}", run.check_run_id, run.conclusion),
+                    format!(
+                        "check:{work_label}:{exec_label}:{change}:{}@{:?}#{epoch}",
+                        run.check_run_id, run.conclusion
+                    ),
                     now_unix_seconds,
                 ),
                 now_unix_seconds,
@@ -488,15 +671,299 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // carries the findings read from the host. The empty stream
         // binds this read's own head, the revision just recorded as
         // current.
+        match self
+            .client
+            .read_branch(&change.repository, &pull.target_branch)
+        {
+            Ok(remote_head) => {
+                let state = match remote_head {
+                    Some(object) => {
+                        let revision = CommitRevision::new(change.repository.clone(), object)
+                            .map_err(|detail| StoreError::Internal { detail })?;
+                        target_revision = Some(revision.clone());
+                        BranchState::At { revision }
+                    }
+                    None => BranchState::Absent,
+                };
+                self.poll_ingest(
+                    store,
+                    config,
+                    host_obs(
+                        ObservationFact::BranchState {
+                            repository: change.repository.clone(),
+                            branch: pull.target_branch.clone(),
+                            state,
+                        },
+                        format!(
+                            "branch:{work_label}:{exec_label}:{}:{}#{epoch}",
+                            change.repository, pull.target_branch
+                        ),
+                        now_unix_seconds,
+                    ),
+                    now_unix_seconds,
+                )?;
+            }
+            Err(_) => {
+                self.poll_ingest(
+                    store,
+                    config,
+                    host_obs(
+                        ObservationFact::HostRead {
+                            subject: ReadSubject::Head {
+                                repository: change.repository.clone(),
+                                branch: pull.target_branch.clone(),
+                            },
+                            revision: None,
+                            subject_version: 0,
+                            actor: HostActorRef {
+                                host: change.repository.host.clone(),
+                                actor: HostActorId::trusted("github.poll"),
+                            },
+                            completeness: Completeness::Unavailable {
+                                reason: "target branch read failed".into(),
+                            },
+                        },
+                        format!(
+                            "branch-read:{work_label}:{exec_label}:{}:{}#{epoch}",
+                            change.repository, pull.target_branch
+                        ),
+                        now_unix_seconds,
+                    ),
+                    now_unix_seconds,
+                )?;
+                let known_target = latest_recorded_target_revision(
+                    store,
+                    work_id,
+                    &change.repository,
+                    &pull.target_branch,
+                )?;
+                return self.record_unavailable_review(
+                    store,
+                    config,
+                    change,
+                    work_id,
+                    execution_id,
+                    Some(&head),
+                    "target branch read failed",
+                    known_target,
+                    &epoch,
+                    true,
+                    now_unix_seconds,
+                );
+            }
+        }
+        // Reviews keep the commit they examined — a review of the
+        // superseded head stays bound to it, and the round it seals
+        // carries the findings read from the host. The empty stream
+        // binds this read's own head, the revision just recorded as
+        // current.
         self.ingest_review_state(
             store,
             config,
             change,
-            &work_id,
-            &execution_id,
+            work_id,
+            execution_id,
             now_unix_seconds,
             Some(&head),
+            target_revision,
+            &epoch,
+            true,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_unavailable_review(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        change: &ChangeRequestRef,
+        work_id: &WorkId,
+        execution_id: &Option<ExecutionId>,
+        head: Option<&CommitRevision>,
+        reason: &str,
+        target_revision: Option<CommitRevision>,
+        epoch: &str,
+        dedup_by_content: bool,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let head = match head {
+            Some(head) => Some(head.clone()),
+            None => latest_recorded_head(store, work_id, change)?
+                .and_then(|object| CommitRevision::new(change.repository.clone(), object).ok()),
+        };
+        let Some(head) = head else { return Ok(()) };
+        let work_label = work_id.0.as_str();
+        let exec_label = execution_id
+            .as_ref()
+            .map(|id| id.0.clone())
+            .unwrap_or_else(|| "none".into());
+        let token = sha256_hex("poll-unavailable-v1", reason.as_bytes());
+        let observation = Observation {
+            delivery: Some(DeliveryId {
+                scope: DeliveryScope::Host {
+                    host: change.repository.host.clone(),
+                },
+                source: "github.poll".into(),
+                event_id: format!(
+                    "review-unavailable:{work_label}:{exec_label}:{change}@{}#{token}#{epoch}",
+                    head.object
+                ),
+            }),
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: execution_id.clone(),
+            fact: ObservationFact::Review {
+                target: DiffTarget {
+                    change: change.clone(),
+                    head,
+                    base: None,
+                    target_revision,
+                },
+                source: "github.reviews".into(),
+                source_revision: None,
+                completeness: Completeness::Unavailable {
+                    reason: reason.into(),
+                },
+                occurrences: vec![],
+            },
+            observed_unix_seconds: now_unix_seconds,
+        };
+        if dedup_by_content {
+            self.poll_ingest(store, config, observation, now_unix_seconds)?;
+        } else {
+            self.ingest(store, config, observation, now_unix_seconds)?;
+        }
+        Ok(())
+    }
+
+    fn poll_ingest(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        observation: Observation,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let Some(work_id) = observation.subject_work_id.clone() else {
+            let receipt = self.ingest(store, config, observation, now_unix_seconds)?;
+            if matches!(receipt, IngestReceipt::Recorded) {
+                self.poll_records = self.poll_records.wrapping_add(1);
+            }
+            return Ok(());
+        };
+        let execution_id = observation.subject_execution_id.clone();
+        if !poll_fact_is_new(store, &work_id, &execution_id, &observation.fact)? {
+            return Ok(());
+        }
+        let receipt = self.ingest(store, config, observation, now_unix_seconds)?;
+        if matches!(receipt, IngestReceipt::Recorded) {
+            self.poll_records = self.poll_records.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn refresh_sources(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError> {
+        let now = clock();
+        let mut report = SourceRefreshReport::default();
+        if let Some(d) = deadline {
+            let remaining = d.saturating_sub(now).max(0) as u64;
+            self.client
+                .set_read_deadline(Some(Instant::now() + Duration::from_secs(remaining)));
+        }
+        for (work_id, execution_id, source) in declared_sources(store, scope)? {
+            if !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)? {
+                continue;
+            }
+            let key = source.issue.to_string();
+            if let Some(d) = deadline
+                && clock() >= d
+            {
+                report.deferred.push(key);
+                continue;
+            }
+            // The transport serves exactly one host instance: a
+            // declared source on any other host can never be read
+            // through it, so it records `unavailable` — the source
+            // gate holds — rather than reading a same-slug issue on
+            // the served host and binding the foreign identity to the
+            // wrong remote's state.
+            let served = canonical_host_instance(source.issue.repository.host.as_str())
+                == canonical_host_instance(config.host.repository.host.as_str());
+            let (revision, digest, state) = if !served {
+                (String::new(), String::new(), IssueState::Unavailable)
+            } else {
+                match self.client.read_issue(&source.issue) {
+                    Ok(remote) => (remote.source_revision, remote.content_digest, remote.state),
+                    Err(_) => (String::new(), String::new(), IssueState::Unavailable),
+                }
+            };
+            let latest = latest_recorded_issue(store, &work_id, &source.issue)?;
+            if latest.as_ref() == Some(&(revision.clone(), digest.clone(), state.clone())) {
+                report.unchanged += 1;
+                continue;
+            }
+            self.ingest(
+                store,
+                config,
+                Observation {
+                    delivery: None,
+                    subject_work_id: Some(work_id),
+                    subject_execution_id: Some(execution_id),
+                    fact: ObservationFact::Issue {
+                        issue: source.issue,
+                        source_revision: revision,
+                        content_digest: digest,
+                        state,
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
+            report.ingested += 1;
+        }
+        for (work_id, change) in attributed_change_pairs(store, scope)? {
+            let key = format!("{}:{change}", work_id.0);
+            if let Some(d) = deadline
+                && clock() >= d
+            {
+                report.deferred.push(key);
+                continue;
+            }
+            if change.repository != config.host.repository
+                || !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)?
+            {
+                continue;
+            }
+            // Only an active Execution owes the change a poll — the
+            // same scope `declared_sources` applies to issue reads. A
+            // finished Work's change is history: re-reading it could
+            // only ingest late facts onto a terminal Execution.
+            let Some(execution_id) = store
+                .transact(|tx| Ok(tx.active_execution(&work_id)?.map(|execution| execution.id)))?
+            else {
+                continue;
+            };
+            let before = self.poll_records;
+            self.refresh_change_for_work(
+                store,
+                config,
+                &change,
+                &work_id,
+                &Some(execution_id),
+                now,
+            )?;
+            if self.poll_records != before {
+                report.ingested += 1;
+            } else {
+                report.unchanged += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// Read one change's review state — the review stream plus the
@@ -523,14 +990,32 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         execution_id: &Option<ExecutionId>,
         now_unix_seconds: i64,
         poll_head: Option<&CommitRevision>,
+        mut target_revision: Option<CommitRevision>,
+        epoch: &str,
+        dedup_by_content: bool,
     ) -> Result<(), StoreError> {
-        let Ok(reviews) = self
+        let reviews = match self
             .client
             .reviews(&change.repository, &change.change_request)
-        else {
+        {
+            Ok(reviews) => reviews,
             // Outage or unknown change: no facts invented — the next
             // successful read catches up.
-            return Ok(());
+            Err(_) => {
+                return self.record_unavailable_review(
+                    store,
+                    config,
+                    change,
+                    work_id,
+                    execution_id,
+                    poll_head,
+                    "reviews read failed",
+                    target_revision,
+                    epoch,
+                    dedup_by_content,
+                    now_unix_seconds,
+                );
+            }
         };
         let findings = self
             .client
@@ -548,8 +1033,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         .client
                         .read_pull(&change.repository, &change.change_request)
                     else {
-                        return Ok(());
+                        return self.record_unavailable_review(
+                            store,
+                            config,
+                            change,
+                            work_id,
+                            execution_id,
+                            None,
+                            "change read failed",
+                            None,
+                            epoch,
+                            dedup_by_content,
+                            now_unix_seconds,
+                        );
                     };
+                    target_revision = latest_recorded_target_revision(
+                        store,
+                        work_id,
+                        &change.repository,
+                        &pull.target_branch,
+                    )?;
                     CommitRevision::new(change.repository.clone(), pull.head_sha)
                         .map_err(|detail| StoreError::Internal { detail })?
                 }
@@ -574,37 +1077,45 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             // empty stream at the current one, and an identical re-read
             // still deduplicates.
             let token = review_fact_token(&completeness, &occurrences);
-            self.ingest(
-                store,
-                config,
-                Observation {
-                    delivery: Some(DeliveryId {
-                        scope: DeliveryScope::Host {
-                            host: change.repository.host.clone(),
-                        },
-                        source: "github.poll".into(),
-                        event_id: format!("review-empty:{change}@{}#{token}", head.object),
-                    }),
-                    subject_work_id: Some(work_id.clone()),
-                    subject_execution_id: execution_id.clone(),
-                    fact: ObservationFact::Review {
-                        target: DiffTarget {
-                            change: change.clone(),
-                            head,
-                            base: None,
-                            target_revision: None,
-                        },
-                        // No reviewer: the stream itself is the
-                        // source of this fact.
-                        source: "github.reviews".into(),
-                        source_revision: None,
-                        completeness,
-                        occurrences,
+            let exec_label = execution_id
+                .as_ref()
+                .map(|id| id.0.clone())
+                .unwrap_or_else(|| "none".into());
+            let observation = Observation {
+                delivery: Some(DeliveryId {
+                    scope: DeliveryScope::Host {
+                        host: change.repository.host.clone(),
                     },
-                    observed_unix_seconds: now_unix_seconds,
+                    source: "github.poll".into(),
+                    event_id: format!(
+                        "review-empty:{}:{exec_label}:{change}@{}#{token}#{epoch}",
+                        work_id.0.as_str(),
+                        head.object
+                    ),
+                }),
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: execution_id.clone(),
+                fact: ObservationFact::Review {
+                    target: DiffTarget {
+                        change: change.clone(),
+                        head,
+                        base: None,
+                        target_revision: target_revision.clone(),
+                    },
+                    // No reviewer: the stream itself is the
+                    // source of this fact.
+                    source: "github.reviews".into(),
+                    source_revision: None,
+                    completeness,
+                    occurrences,
                 },
-                now_unix_seconds,
-            )?;
+                observed_unix_seconds: now_unix_seconds,
+            };
+            if dedup_by_content {
+                self.poll_ingest(store, config, observation, now_unix_seconds)?;
+            } else {
+                self.ingest(store, config, observation, now_unix_seconds)?;
+            }
             return Ok(());
         }
         for review in &reviews {
@@ -632,35 +1143,52 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             // while an identical re-read deduplicates — the same rule
             // the check facts use for a changed conclusion.
             let token = review_fact_token(&completeness, &occurrences);
-            self.ingest(
+            let exec_label = execution_id
+                .as_ref()
+                .map(|id| id.0.clone())
+                .unwrap_or_else(|| "none".into());
+            let review_target = recorded_review_target(
                 store,
-                config,
-                Observation {
-                    delivery: Some(DeliveryId {
-                        scope: DeliveryScope::Host {
-                            host: change.repository.host.clone(),
-                        },
-                        source: "github.poll".into(),
-                        event_id: format!("review:{change}@{}#{token}", review.review_id),
-                    }),
-                    subject_work_id: Some(work_id.clone()),
-                    subject_execution_id: execution_id.clone(),
-                    fact: ObservationFact::Review {
-                        target: DiffTarget {
-                            change: change.clone(),
-                            head: review_head,
-                            base: None,
-                            target_revision: None,
-                        },
-                        source: review.author.clone(),
-                        source_revision: Some(review.review_id.clone()),
-                        completeness,
-                        occurrences,
+                work_id,
+                change,
+                &review_head,
+                &review.author,
+                &review.review_id,
+            )?
+            .or_else(|| target_revision.clone());
+            let observation = Observation {
+                delivery: Some(DeliveryId {
+                    scope: DeliveryScope::Host {
+                        host: change.repository.host.clone(),
                     },
-                    observed_unix_seconds: now_unix_seconds,
+                    source: "github.poll".into(),
+                    event_id: format!(
+                        "review:{}:{exec_label}:{change}@{}#{token}#{epoch}",
+                        work_id.0.as_str(),
+                        review.review_id
+                    ),
+                }),
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: execution_id.clone(),
+                fact: ObservationFact::Review {
+                    target: DiffTarget {
+                        change: change.clone(),
+                        head: review_head.clone(),
+                        base: None,
+                        target_revision: review_target,
+                    },
+                    source: review.author.clone(),
+                    source_revision: Some(review.review_id.clone()),
+                    completeness,
+                    occurrences,
                 },
-                now_unix_seconds,
-            )?;
+                observed_unix_seconds: now_unix_seconds,
+            };
+            if dedup_by_content {
+                self.poll_ingest(store, config, observation, now_unix_seconds)?;
+            } else {
+                self.ingest(store, config, observation, now_unix_seconds)?;
+            }
         }
         Ok(())
     }
@@ -1678,6 +2206,235 @@ fn attribute_change(
     })
 }
 
+fn work_bound_to_config(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    bound_host: Option<&HostInstanceId>,
+    work_id: &WorkId,
+) -> Result<bool, StoreError> {
+    store.transact(|tx| {
+        Ok(tx.work(work_id)?.is_some_and(|work| {
+            work.binding.adapter == config.host.adapter
+                && work.binding.repository == config.host.repository
+                && work.binding.contract_version == config.host.contract_version
+                && bound_host.is_none_or(|bound| *bound == work.binding.repository.host)
+        }))
+    })
+}
+
+fn poll_fact_is_new(
+    store: &impl Store,
+    work_id: &WorkId,
+    execution_id: &Option<ExecutionId>,
+    fact: &ObservationFact,
+) -> Result<bool, StoreError> {
+    let observations = store.transact(|tx| {
+        Ok(tx
+            .observations_for_work(work_id)?
+            .into_iter()
+            .filter(|o| &o.subject_execution_id == execution_id)
+            .collect::<Vec<_>>())
+    })?;
+    let bytes = serde_json::to_vec(fact).unwrap_or_default();
+    let same = |o: &Observation| serde_json::to_vec(&o.fact).unwrap_or_default() == bytes;
+    match fact {
+        ObservationFact::ChangeHead { change, .. } => {
+            let latest = observations.iter().rev().find(
+                |o| matches!(&o.fact, ObservationFact::ChangeHead { change: c, .. } if c == change),
+            );
+            Ok(!latest.is_some_and(same))
+        }
+        ObservationFact::Check {
+            change,
+            head,
+            check_id,
+            producer,
+            ..
+        } => {
+            let latest = observations.iter().rev().find(|o| {
+                matches!(&o.fact,
+                    ObservationFact::Check { change: c, head: h, check_id: i, producer: pr, .. }
+                    if c == change && h == head && i == check_id && pr == producer)
+            });
+            Ok(!latest.is_some_and(same))
+        }
+        ObservationFact::BranchState {
+            repository, branch, ..
+        } => {
+            let latest = observations.iter().rev().find(|o| {
+                matches!(&o.fact,
+                    ObservationFact::BranchState { repository: r, branch: b, .. }
+                    if r == repository && b == branch)
+            });
+            Ok(!latest.is_some_and(same))
+        }
+        ObservationFact::HostRead { subject, .. } => {
+            let latest = observations.iter().rev().find(
+                |o| matches!(&o.fact, ObservationFact::HostRead { subject: s, .. } if s == subject),
+            );
+            Ok(!latest.is_some_and(same))
+        }
+        ObservationFact::Review {
+            target,
+            source,
+            source_revision,
+            completeness,
+            ..
+        } => {
+            if !completeness.is_complete() {
+                let latest_any = observations.iter().rev().find(
+                    |o| matches!(&o.fact, ObservationFact::Review { target: t, .. } if t == target),
+                );
+                return Ok(!latest_any.is_some_and(same));
+            }
+            let idx_same = observations.iter().rposition(|o| {
+                matches!(&o.fact,
+                    ObservationFact::Review {
+                        target: t, source: s, source_revision: sr, ..
+                    } if t == target && s == source && sr == source_revision)
+            });
+            let Some(idx) = idx_same else { return Ok(true) };
+            if !same(&observations[idx]) {
+                return Ok(true);
+            }
+            Ok(observations[idx + 1..].iter().any(|o| {
+                matches!(&o.fact,
+                    ObservationFact::Review {
+                        target: t,
+                        completeness: Completeness::Unavailable { .. } | Completeness::Partial { .. },
+                        ..
+                    } if t == target)
+            }))
+        }
+        _ => Ok(true),
+    }
+}
+
+fn recorded_review_target(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+    head: &CommitRevision,
+    source: &str,
+    source_revision: &str,
+) -> Result<Option<CommitRevision>, StoreError> {
+    store.transact(|tx| {
+        Ok(tx
+            .observations_for_work(work_id)?
+            .iter()
+            .find_map(|o| match &o.fact {
+                ObservationFact::Review {
+                    target,
+                    source: s,
+                    source_revision: sr,
+                    ..
+                } if &target.change == change
+                    && &target.head == head
+                    && s == source
+                    && sr.as_deref() == Some(source_revision) =>
+                {
+                    target.target_revision.clone()
+                }
+                _ => None,
+            }))
+    })
+}
+
+fn latest_recorded_target_revision(
+    store: &impl Store,
+    work_id: &WorkId,
+    repository: &RepositoryRef,
+    branch: &str,
+) -> Result<Option<CommitRevision>, StoreError> {
+    store.transact(|tx| {
+        Ok(tx
+            .observations_for_work(work_id)?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, o)| match &o.fact {
+                ObservationFact::BranchState {
+                    repository: r,
+                    branch: b,
+                    state,
+                } if r == repository && b == branch => {
+                    Some((o.observed_unix_seconds, index, state))
+                }
+                _ => None,
+            })
+            .max_by_key(|(t, i, _)| (*t, *i))
+            .and_then(|(_, _, state)| match state {
+                BranchState::At { revision } => Some(revision.clone()),
+                BranchState::Absent => None,
+            }))
+    })
+}
+
+fn change_pair_key(
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> (String, RepositoryRef, ChangeRequestId) {
+    (
+        work_id.0.as_str().to_string(),
+        change.repository.clone(),
+        change.change_request.clone(),
+    )
+}
+
+fn attributed_change_pairs(
+    store: &impl Store,
+    scope: Option<&WorkId>,
+) -> Result<Vec<(WorkId, ChangeRequestRef)>, StoreError> {
+    let mut pairs: std::collections::BTreeMap<
+        (String, RepositoryRef, ChangeRequestId),
+        (WorkId, ChangeRequestRef),
+    > = std::collections::BTreeMap::new();
+    let mut note = |work_id: &WorkId, change: &ChangeRequestRef| {
+        pairs.insert(
+            change_pair_key(work_id, change),
+            (work_id.clone(), change.clone()),
+        );
+    };
+    for intent in store.transact(|tx| tx.action_intents())? {
+        if let Some(work_id) = scope
+            && intent.work_id != *work_id
+        {
+            continue;
+        }
+        match &intent.action {
+            HostAction::UpdateChangeRequest { change, .. }
+            | HostAction::PostComment { change, .. }
+            | HostAction::PublishReviewFeedback { change, .. }
+            | HostAction::ReplyToThread { change, .. }
+            | HostAction::ResolveThread { change, .. }
+            | HostAction::MarkReady { change, .. } => note(&intent.work_id, change),
+            _ => {}
+        }
+        for effect in &intent.effects {
+            match effect {
+                NormalizedEffectFact::ChangeOpened { change, .. }
+                | NormalizedEffectFact::MetadataUpdated { change, .. }
+                | NormalizedEffectFact::CommentPosted { change, .. }
+                | NormalizedEffectFact::ReviewPublished { change, .. }
+                | NormalizedEffectFact::ReplyPosted { change, .. }
+                | NormalizedEffectFact::ThreadResolved { change, .. }
+                | NormalizedEffectFact::ReadyObserved { change, .. } => {
+                    note(&intent.work_id, change)
+                }
+                _ => {}
+            }
+        }
+    }
+    for observation in store.transact(|tx| tx.all_observations())? {
+        if let ObservationFact::ChangeHead { change, .. } = &observation.fact
+            && let Some(work_id) = &observation.subject_work_id
+            && scope.is_none_or(|scoped| scoped == work_id)
+        {
+            note(work_id, change);
+        }
+    }
+    Ok(pairs.into_values().collect())
+}
+
 /// The real adapter on the shared integration port — the same two
 /// calls the fixture implements, so the contract tests exercise one
 /// port against both.
@@ -1699,5 +2456,43 @@ impl<C: GitHubApi> crate::port::IntegrationPort for GitHubAdapter<C> {
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
         GitHubAdapter::apply_outbox(self, store, config, now_unix_seconds)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workloop_core::identity::{HostInstanceId, RepositoryId};
+
+    #[test]
+    fn pair_keys_never_collapse_display_equal_tuples() {
+        let work = WorkId("w-1".into());
+        let a = change_pair_key(
+            &work,
+            &ChangeRequestRef {
+                repository: RepositoryRef::new(
+                    HostInstanceId::trusted("github.com"),
+                    RepositoryId::trusted("owner/name"),
+                ),
+                change_request: ChangeRequestId::trusted("7"),
+                display_number: None,
+            },
+        );
+        let b = change_pair_key(
+            &work,
+            &ChangeRequestRef {
+                repository: RepositoryRef::new(
+                    HostInstanceId::trusted("github.com/owner"),
+                    RepositoryId::trusted("name"),
+                ),
+                change_request: ChangeRequestId::trusted("7"),
+                display_number: None,
+            },
+        );
+        assert_eq!(
+            format!("{}", a.1),
+            format!("{}", b.1),
+            "the crafted repos share a Display string"
+        );
+        assert_ne!(a, b, "the typed key keeps them distinct");
     }
 }

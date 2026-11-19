@@ -5,10 +5,10 @@
 
 use std::collections::BTreeMap;
 
-use workloop_core::identity::{ChangeRequestId, RepositoryRef};
-use workloop_core::observation::CheckConclusion;
+use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::api::{
-    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemotePull, RemoteReview,
+    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
     RemoteReviewFinding,
 };
 
@@ -65,6 +65,10 @@ pub struct InMemoryGitHub {
     checks: Vec<(String, RemoteCheckRun)>,
     /// `(repository, change id)` → reviews, oldest first.
     reviews: BTreeMap<(String, String), Vec<RemoteReview>>,
+    /// `(repository, issue id)` → the issue's current read — scoped
+    /// identity, so a shared display number elsewhere is a different
+    /// issue.
+    issues: BTreeMap<(String, String), RemoteIssue>,
     /// Posted review findings in submission order: `(repository, change id)`.
     findings: Vec<(String, String, RemoteReviewFinding)>,
     /// Every mutation, in order — the write history assertions use.
@@ -125,6 +129,38 @@ impl InMemoryGitHub {
         if let Some(pull) = self.pulls.get_mut(&key) {
             pull.head_sha = head.to_string();
         }
+    }
+
+    /// Test control: the authoritative read the remote reports for one
+    /// source issue, keyed by scoped `(repository, issue id)` identity.
+    pub fn set_issue(
+        &mut self,
+        issue: &IssueRef,
+        source_revision: &str,
+        content_digest: &str,
+        state: IssueState,
+    ) {
+        self.issues.insert(
+            (
+                issue.repository.to_string(),
+                issue.issue.as_str().to_string(),
+            ),
+            RemoteIssue {
+                source_revision: source_revision.to_string(),
+                content_digest: content_digest.to_string(),
+                state,
+            },
+        );
+    }
+
+    /// The stored issue read, for assertions on post-effect state.
+    pub fn issue_read(&self, issue: &IssueRef) -> Option<RemoteIssue> {
+        self.issues
+            .get(&(
+                issue.repository.to_string(),
+                issue.issue.as_str().to_string(),
+            ))
+            .cloned()
     }
 
     /// Test control: seed a check run bound to the exact SHA it
@@ -545,6 +581,15 @@ impl GitHubApi for InMemoryGitHub {
             .filter(|(repo, change, _)| *repo == repository && change == change_id.as_str())
             .map(|(_, _, finding)| finding.clone())
             .collect())
+    }
+
+    fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
+        if let Some(err) = self.take_lost("read_issue") {
+            return Err(err);
+        }
+        self.issue_read(issue).ok_or_else(|| ApiError::Refused {
+            reason: "issue not found".into(),
+        })
     }
 
     fn contains_revision(

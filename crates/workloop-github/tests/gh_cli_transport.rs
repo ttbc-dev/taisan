@@ -10,8 +10,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use workloop_core::identity::{ChangeRequestId, HostInstanceId, RepositoryId, RepositoryRef};
-use workloop_core::observation::CheckConclusion;
+use workloop_core::identity::{
+    ChangeRequestId, HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef,
+};
+use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::adapter::GitHubAdapter;
 use workloop_github::api::{ApiError, GitHubApi};
 use workloop_github::gh_cli::GhCliApi;
@@ -663,5 +665,216 @@ esac
     assert_eq!(
         api.read_repository(&repository()).unwrap(),
         Some("abc123".to_string())
+    );
+}
+
+#[test]
+fn read_issue_returns_validated_state_revision_and_digest() {
+    let dir = tempdir("read-issue");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+case "$2" in
+  repos/owner/repo/issues/7) echo '{"number":7,"state":"open","title":"hello","body":"world","updated_at":"2026-01-01T00:00:00Z"}' ;;
+  repos/owner/repo/issues/8) echo '{"number":8,"state":"closed","title":"t","body":null,"updated_at":"r2"}' ;;
+  repos/owner/repo/issues/9) echo '{"number":10,"state":"open","title":"t","body":"b","updated_at":"r3"}' ;;
+  repos/owner/repo/issues/11) echo '{"number":11,"state":"weird","title":"t","body":"b","updated_at":"r4"}' ;;
+  repos/owner/repo/issues/12) echo '{"number":12,"state":"open","title":"t","body":"b"}' ;;
+  repos/owner/repo/issues/13) echo '{"number":13,"state":"open","title":"t","body":["a","b"],"updated_at":"r5"}' ;;
+  repos/owner/repo/issues/14) echo '{"number":14,"state":"open","title":"t","body":42,"updated_at":"r6"}' ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh);
+    let make = |number: u64| IssueRef {
+        repository: repository(),
+        issue: IssueId::trusted(number.to_string()),
+        display_number: Some(number),
+    };
+    let open = api.read_issue(&make(7)).unwrap();
+    assert_eq!(open.source_revision, "2026-01-01T00:00:00Z");
+    assert_eq!(open.state, IssueState::Open);
+    assert_eq!(
+        open.content_digest,
+        workloop_selector::issue_content_digest("hello", "world"),
+        "the digest is the shared selector convention"
+    );
+    let closed = api.read_issue(&make(8)).unwrap();
+    assert_eq!(closed.state, IssueState::Closed);
+    assert_eq!(
+        closed.content_digest,
+        workloop_selector::issue_content_digest("t", ""),
+        "a null body digests as empty, matching the selector convention"
+    );
+    for (number, why) in [
+        (9, "a mismatched response number"),
+        (11, "an unrecognised state"),
+        (12, "a missing updated_at"),
+        (13, "an array body"),
+        (14, "a numeric body"),
+    ] {
+        assert!(
+            matches!(api.read_issue(&make(number)), Err(ApiError::Refused { .. })),
+            "{why} refuses: issue {number}"
+        );
+    }
+    let log = calls(&dir);
+    assert!(log.contains("repos/owner/repo/issues/7"), "endpoint: {log}");
+    assert!(!log.contains("issues/$2"), "no unvalidated endpoint: {log}");
+}
+
+#[test]
+fn read_issue_refuses_malformed_identities_before_any_request() {
+    let dir = tempdir("read-issue-bad-id");
+    let gh = stub_gh(&dir, "gh", "echo '{}' ");
+    let mut api = GhCliApi::with_gh(gh);
+    for id in ["abc", "0", "-1", "1;rm", "1/../2"] {
+        let issue = IssueRef {
+            repository: repository(),
+            issue: IssueId::trusted(id),
+            display_number: None,
+        };
+        assert!(
+            matches!(api.read_issue(&issue), Err(ApiError::Refused { .. })),
+            "identity {id:?} refuses"
+        );
+    }
+    let bad_repo = IssueRef {
+        repository: RepositoryRef::new(
+            HostInstanceId::trusted("install-u36e"),
+            RepositoryId::trusted("not-a-slug"),
+        ),
+        issue: IssueId::trusted("7"),
+        display_number: Some(7),
+    };
+    assert!(matches!(
+        api.read_issue(&bad_repo),
+        Err(ApiError::Refused { .. })
+    ));
+    assert!(
+        calls(&dir).is_empty(),
+        "no request is issued for refused identities"
+    );
+}
+
+#[test]
+fn a_pinned_hostname_survives_an_environment_retarget() {
+    if std::env::var("GH_HOST").ok().as_deref() != Some("evil.example.com") {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "a_pinned_hostname_survives_an_environment_retarget",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("GH_HOST", "evil.example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the hostile-GH_HOST child run failed");
+        return;
+    }
+    let dir = tempdir("hostname-pin");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+echo "GH_HOST=$GH_HOST" >> "$log.env"
+case "$2" in
+  repos/owner/repo/issues/7) echo '{"number":7,"state":"open","title":"t","body":"b","updated_at":"r1"}' ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh).with_hostname("github.com");
+    let issue = IssueRef {
+        repository: repository(),
+        issue: IssueId::trusted("7"),
+        display_number: Some(7),
+    };
+    let remote = api.read_issue(&issue).unwrap();
+    assert_eq!(remote.state, IssueState::Open);
+    let log = calls(&dir);
+    assert!(
+        log.contains("--hostname github.com"),
+        "the endpoint is pinned explicitly: {log}"
+    );
+    let env_log = fs::read_to_string(dir.join("calls.log.env")).unwrap_or_default();
+    assert_eq!(
+        env_log.trim(),
+        "GH_HOST=",
+        "GH_HOST never reaches the child"
+    );
+}
+
+#[test]
+fn successive_calls_share_one_absolute_deadline() {
+    let dir = tempdir("read-deadline-shared");
+    let body = format!(
+        r#"
+n_file="{dir}/n"
+n=$(( $(cat "$n_file" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$n_file"
+case "$n" in
+  1) echo '{{"number":7,"state":"open","title":"t","body":"b","updated_at":"r1"}}' ;;
+  *) sleep 30 ;;
+esac
+exit 0
+"#,
+        dir = dir.display()
+    );
+    let gh = stub_gh(&dir, "gh", &body);
+    let mut api = GhCliApi::with_gh(gh);
+    let issue = IssueRef {
+        repository: repository(),
+        issue: IssueId::trusted("7"),
+        display_number: Some(7),
+    };
+    api.set_read_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    ));
+    assert!(api.read_issue(&issue).is_ok(), "the first call answers");
+    assert!(
+        matches!(api.read_issue(&issue), Err(ApiError::Unknown { .. })),
+        "the second call dies at the shared deadline, not a fresh budget"
+    );
+    assert!(
+        matches!(api.read_issue(&issue), Err(ApiError::Unknown { .. })),
+        "a later call never gets a fresh per-call budget"
+    );
+    assert_eq!(
+        calls(&dir).lines().count(),
+        2,
+        "the deadline-expired third call never reached the stub"
+    );
+}
+
+#[test]
+fn an_elapsed_read_deadline_refuses_before_spawning() {
+    let dir = tempdir("read-deadline");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+case "$2" in
+  repos/owner/repo/issues/7) echo '{"number":7,"state":"open","title":"t","body":"b","updated_at":"r1"}' ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh);
+    let issue = IssueRef {
+        repository: repository(),
+        issue: IssueId::trusted("7"),
+        display_number: Some(7),
+    };
+    assert!(api.read_issue(&issue).is_ok(), "baseline read answers");
+    api.set_read_deadline(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    ));
+    assert!(
+        matches!(api.read_issue(&issue), Err(ApiError::Unknown { .. })),
+        "an elapsed absolute deadline refuses rather than respawning"
+    );
+    assert_eq!(
+        calls(&dir).lines().count(),
+        1,
+        "the expired call never reached the stub"
     );
 }

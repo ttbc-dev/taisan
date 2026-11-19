@@ -3064,7 +3064,7 @@ impl FixtureGithub {
 /// The spec-declared issue sources of in-scope Works that still have an
 /// active Execution — the exact set phase 1 owes an authoritative read,
 /// paired with the Execution the read's Observation binds to.
-fn declared_sources(
+pub(crate) fn declared_sources(
     store: &impl Store,
     scope: Option<&WorkId>,
 ) -> Result<Vec<(WorkId, ExecutionId, SourceSnapshot)>, StoreError> {
@@ -3093,7 +3093,7 @@ fn declared_sources(
 /// The latest recorded `issue` read for one declared source, ordered by
 /// observed time then row order — the same "latest wins" rule the
 /// source gate uses.
-fn latest_recorded_issue(
+pub(crate) fn latest_recorded_issue(
     store: &impl Store,
     work_id: &WorkId,
     issue: &IssueRef,
@@ -3131,7 +3131,7 @@ fn latest_recorded_issue(
 /// The latest recorded `change_head` for one change, ordered by
 /// observed time then row order — the same "latest wins" rule the
 /// assessment paths use.
-fn latest_recorded_head(
+pub(crate) fn latest_recorded_head(
     store: &impl Store,
     work_id: &WorkId,
     change: &ChangeRequestRef,
