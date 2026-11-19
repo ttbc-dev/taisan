@@ -101,9 +101,10 @@ opaque_id!(CredentialRef, "credential_ref");
 /// source-gate lookups then treat one real Issue as two.
 ///
 /// The canonical form is the lowercase authority — `host` or
-/// `host:port`. Scheme, credentials, path, query, and a scheme-default
-/// port (`:443` on `https`, `:80` on `http`) are transport spelling and
-/// take no part; a non-default port stays because two instances on one
+/// `host:port`. Scheme (matched case-insensitively), userinfo,
+/// path, query, fragment, and a scheme-default port (`:443` on
+/// `https`, `:80` on `http`) are transport spelling and take no
+/// part; a non-default port stays because two instances on one
 /// hostname at different ports are different services, and a changed
 /// endpoint must never reuse an existing host-instance identity
 /// (docs/identity-storage.md). The public GitHub API endpoint reduces
@@ -117,11 +118,17 @@ opaque_id!(CredentialRef, "credential_ref");
 pub fn canonical_host_instance(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
     let (scheme, rest) = trimmed.split_once("://").unwrap_or(("", trimmed));
-    let authority = rest.split('/').next().unwrap_or_default();
-    let authority = match scheme {
-        "https" if authority.ends_with(":443") => &authority[..authority.len() - 4],
-        "http" if authority.ends_with(":80") => &authority[..authority.len() - 3],
-        _ => authority,
+    // The authority ends at the first path, query, or fragment
+    // delimiter; userinfo never enters host identity — an endpoint
+    // carrying credentials must not persist them into durable
+    // records.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = match scheme.as_str() {
+        "https" if host_port.ends_with(":443") => &host_port[..host_port.len() - 4],
+        "http" if host_port.ends_with(":80") => &host_port[..host_port.len() - 3],
+        _ => host_port,
     };
     match authority.to_ascii_lowercase().as_str() {
         "api.github.com" => "github.com".to_string(),
@@ -638,6 +645,21 @@ mod tests {
         );
         assert_eq!(
             canonical_host_instance("https://api.github.com:443"),
+            "github.com"
+        );
+        // Userinfo, query, fragment, and scheme case are transport
+        // spelling too — and credentials must never reach durable
+        // host identity.
+        assert_eq!(
+            canonical_host_instance("https://token@api.github.com"),
+            "github.com"
+        );
+        assert_eq!(
+            canonical_host_instance("https://api.github.com?x=1"),
+            "github.com"
+        );
+        assert_eq!(
+            canonical_host_instance("HTTPS://api.github.com:443"),
             "github.com"
         );
         assert_eq!(canonical_host_instance("host-local"), "host-local");
