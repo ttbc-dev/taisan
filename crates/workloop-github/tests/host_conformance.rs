@@ -191,6 +191,15 @@ impl OutboxHost for GitHubAdapter<InMemoryGitHub> {
     fn emit(&self, store: &SqliteStore, config: &WorkloopConfig, observation: Observation) {
         self.ingest(store, config, observation, NOW).unwrap();
     }
+    fn seed_issue(&mut self, issue: &IssueRef, source_revision: &str, content_digest: &str) {
+        self.client_mut()
+            .set_issue(issue, source_revision, content_digest, IssueState::Open);
+    }
+    fn issue_read(&self, issue: &IssueRef) -> Option<(String, String, IssueState)> {
+        self.client()
+            .issue_read(issue)
+            .map(|read| (read.source_revision, read.content_digest, read.state))
+    }
 }
 
 fn capabilities(names: &BTreeSet<&'static str>) -> BTreeSet<HostCapability> {
@@ -1787,15 +1796,15 @@ fn gitlab_fixture_runs_the_same_suite_within_its_declared_set() {
 
 /// The real adapter runs the unchanged suite within its declared set:
 /// every baseline, head-bound, partial-receipt, snapshot, permission,
-/// scope, swap, and admission row is covered; the issue-read row and
-/// the optional discussion/ready rows are explicit-unsupported because
-/// the adapter does not declare them — never skipped or weakened.
+/// scope, swap, admission, and issue-read row is covered; the optional
+/// discussion/ready rows are explicit-unsupported because the adapter
+/// does not declare them — never skipped or weakened.
 #[test]
 fn real_adapter_runs_the_same_suite_within_its_declared_set() {
     let mut adapter = GitHubAdapter::new(InMemoryGitHub::new());
     let results = run_suite(&mut adapter);
     for result in &results {
-        if result.row.starts_with("HC-READ-") || result.row.starts_with("HC-OPT-") {
+        if result.row.starts_with("HC-OPT-") {
             assert!(
                 matches!(result.outcome, MatrixOutcome::Unsupported { .. }),
                 "undeclared row is explicit-unsupported: {result:?}"

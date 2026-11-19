@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use workloop_core::domain::{ExecutionId, WorkId, canonical_json, new_id, sha256_hex};
 use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId, HostActorRef,
-    HostInstanceId, RepositoryRef,
+    HostInstanceId, RepositoryRef, canonical_host_instance,
 };
 use workloop_core::observation::{
     BranchState, CheckConclusion, Completeness, DeliveryId, DeliveryScope, HostActionStatus,
@@ -154,6 +154,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             "comment_create",
             "checks_read",
             "review_findings_read",
+            "issue_read",
         ]
     }
 
@@ -885,9 +886,21 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 report.deferred.push(key);
                 continue;
             }
-            let (revision, digest, state) = match self.client.read_issue(&source.issue) {
-                Ok(remote) => (remote.source_revision, remote.content_digest, remote.state),
-                Err(_) => (String::new(), String::new(), IssueState::Unavailable),
+            // The transport serves exactly one host instance: a
+            // declared source on any other host can never be read
+            // through it, so it records `unavailable` — the source
+            // gate holds — rather than reading a same-slug issue on
+            // the served host and binding the foreign identity to the
+            // wrong remote's state.
+            let served = canonical_host_instance(source.issue.repository.host.as_str())
+                == canonical_host_instance(config.host.repository.host.as_str());
+            let (revision, digest, state) = if !served {
+                (String::new(), String::new(), IssueState::Unavailable)
+            } else {
+                match self.client.read_issue(&source.issue) {
+                    Ok(remote) => (remote.source_revision, remote.content_digest, remote.state),
+                    Err(_) => (String::new(), String::new(), IssueState::Unavailable),
+                }
             };
             let latest = latest_recorded_issue(store, &work_id, &source.issue)?;
             if latest.as_ref() == Some(&(revision.clone(), digest.clone(), state.clone())) {
@@ -926,15 +939,24 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             {
                 continue;
             }
-            let execution_id = store.transact(|tx| {
-                Ok(tx
-                    .executions_for_work(&work_id)?
-                    .into_iter()
-                    .max_by_key(|execution| execution.ordinal)
-                    .map(|execution| execution.id))
-            })?;
+            // Only an active Execution owes the change a poll — the
+            // same scope `declared_sources` applies to issue reads. A
+            // finished Work's change is history: re-reading it could
+            // only ingest late facts onto a terminal Execution.
+            let Some(execution_id) = store
+                .transact(|tx| Ok(tx.active_execution(&work_id)?.map(|execution| execution.id)))?
+            else {
+                continue;
+            };
             let before = self.poll_records;
-            self.refresh_change_for_work(store, config, &change, &work_id, &execution_id, now)?;
+            self.refresh_change_for_work(
+                store,
+                config,
+                &change,
+                &work_id,
+                &Some(execution_id),
+                now,
+            )?;
             if self.poll_records != before {
                 report.ingested += 1;
             } else {

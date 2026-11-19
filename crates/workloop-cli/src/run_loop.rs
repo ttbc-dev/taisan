@@ -475,13 +475,12 @@ pub fn run_pass<H: HostDriver>(
         }};
     }
 
-    // The in-process fixture owns the host legs only when the
-    // installation binds it; any other adapter identity names an
-    // out-of-process adapter (e.g. the S1 bridge) that performs host
-    // reads and effects against the same store. Running the fixture
-    // then would fabricate `unavailable` source reads and applied
-    // receipts for real pending intents.
-    // Phase 1 — source refresh (host adapter, read only).
+    // Phase 1 — source refresh (host adapter, read only). The
+    // configured `RunHost` owns the host legs: the in-process fixture
+    // or the production GitHub adapter. Any other adapter identity is
+    // refused when the run configures its host, so a pass never
+    // fabricates reads or receipts for an adapter that does not own
+    // them.
     if gated!(0) {
         let refresh_deadline = source_deadline.min(deadline);
         let result = pass.host.refresh_sources(
@@ -3818,6 +3817,130 @@ mod tests {
         assert!(
             detail(&store).current_round_id.is_some(),
             "a genuinely new review under the moved target seals the current round"
+        );
+    }
+
+    #[test]
+    fn the_production_adapter_declares_issue_read_for_source_bound_work() {
+        // A config derived from the adapter's own declared set — the
+        // shape contract and live tests build — must admit a
+        // source-bound Submit. The driver reads declared issues, so a
+        // missing `issue_read` rejects that Work as
+        // unsupported_capability even though the read exists.
+        let store = SqliteStore::in_memory(2).unwrap();
+        let mut cfg = config_with_issue_read();
+        cfg.declared_capabilities = GitHubAdapter::<FakeGitHub>::declared_capabilities()
+            .iter()
+            .map(|name| HostCapability::from_name(name).expect("contract capability name"))
+            .collect();
+        let d = handle_command(
+            &store,
+            &cfg,
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: "k-caps".into(),
+                body: CommandBody::Submit {
+                    intent: "intent-caps".into(),
+                    sources: vec![source(7, "rev-1", "d1")],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            matches!(d, CommandDecision::Accepted { .. }),
+            "a source-bound submit under the adapter's declared set is admitted: {d:?}"
+        );
+    }
+
+    #[test]
+    fn a_source_on_an_unserved_host_records_unavailable_and_is_never_read() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let foreign_source = SourceSnapshot {
+            issue: IssueRef {
+                repository: RepositoryRef::new(
+                    HostInstanceId::trusted("ghe.corp.example"),
+                    RepositoryId::trusted("other/repo"),
+                ),
+                issue: IssueId::trusted("issue-9"),
+                display_number: Some(9),
+            },
+            source_revision: "rev-f".into(),
+            content_digest: "digest-f".into(),
+        };
+        let (w, _e) = submit_with_sources(&store, "k-foreign-src", vec![foreign_source]);
+        let mut fake = FakeGitHub::new();
+        // The answer the served host would return if the read were
+        // attempted: recording it would bind the foreign source to the
+        // wrong remote's state.
+        fake.issues.insert(
+            "issue-9".into(),
+            Ok(RemoteIssue {
+                source_revision: "rev-wrong-host".into(),
+                content_digest: "d-wrong".into(),
+                state: IssueState::Open,
+            }),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            issue_facts(&store, &w).last().unwrap(),
+            &(String::new(), String::new(), IssueState::Unavailable),
+            "an unserved host is unavailable evidence, never the served host's answer"
+        );
+    }
+
+    #[test]
+    fn a_finished_works_change_is_never_polled_again() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-finished");
+        let change = change_ref("cr-done");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        // The Execution reaches a terminal state: the Work's change is
+        // history and phase 1 owes it no further reads — the same
+        // active-Execution scope `declared_sources` applies to issues.
+        store
+            .transact(|tx| {
+                let mut execution = tx.execution(&e)?.unwrap();
+                let expected = execution.state.clone();
+                execution.state = ExecutionState::Succeeded;
+                tx.apply(&Effect::UpdateExecution {
+                    execution,
+                    expected_state: expected,
+                })
+            })
+            .unwrap();
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-done"), Ok(FakeGitHub::pull("head-1")));
+        fake.reviews.insert(cfg_key("cr-done"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-done"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(statuses(&report), vec!["completed"; 8]);
+        assert!(
+            head_facts(&store, &w).is_empty(),
+            "a finished Work's change is never re-read: {:?}",
+            head_facts(&store, &w)
         );
     }
 }

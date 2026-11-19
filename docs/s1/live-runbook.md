@@ -128,6 +128,14 @@ adapter mode `taisan run` skips the in-process fixture's source-refresh
 and host-outbox phases (`external_adapter` in the tick report) — the
 bridge owns those legs.
 
+> **Composition note:** on trees containing the v0.3 in-process host
+> driver (#265), `taisan run` refuses an installation whose `adapter` is
+> not `fixture`/`github` — v0.3 §14.7 requires a non-production adapter
+> to fail closed rather than silently skip the source-refresh and
+> host-outbox phases. Profile R reproduction therefore requires a tree
+> predating that composition; the recorded U8.1-live evidence stands on
+> the trees it ran against.
+
 ### 2.2 Profile T — target profile (blocked)
 
 When the §1.4 blockers land, the deltas are: `adapter: "github"`,
