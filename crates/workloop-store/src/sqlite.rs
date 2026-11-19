@@ -241,11 +241,28 @@ impl SqliteStore {
         let mut bootstrapping = false;
         if version == 0 {
             if !table_set(&conn)?.is_empty() {
-                return Err(StoreError::UnsupportedFormat {
-                    detail: "unversioned store file (pre-v1 format); \
-                             archive it and start a new store"
-                        .into(),
-                });
+                // The stamp read above and this table scan are two
+                // separate autocommit reads: a concurrent first-opener can
+                // commit its bootstrap between them, leaving this opener
+                // with version==0 and the winner's tables. Re-read the
+                // stamp before refusing — a stamp still 0 is the genuine
+                // pre-v1 archive, refused untouched; a stamp that changed
+                // is the winner's store, reopened through the ordinary
+                // gate instead of being misread as a legacy file.
+                let stamped_now: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .map_err(internal)?;
+                if stamped_now == 0 {
+                    return Err(StoreError::UnsupportedFormat {
+                        detail: "unversioned store file (pre-v1 format); \
+                                 archive it and start a new store"
+                            .into(),
+                    });
+                }
+                // The stamp only ever moves 0 -> FORMAT_VERSION (one
+                // atomic bootstrap commit), so the re-run reads a nonzero
+                // stamp, skips this branch, and cannot recurse again.
+                return Self::init(conn, capacity);
             }
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
@@ -441,13 +458,29 @@ impl SqliteStore {
             // the store_meta row land together or not at all, so a crash
             // can never leave a table-bearing version-0 file (refused as
             // a legacy archive on next open) or a stamped store without a
-            // store_id.
-            let tx = conn.unchecked_transaction().map_err(internal)?;
+            // store_id. The gate above runs before this transaction, so a
+            // second first-opener can have passed it too; begin IMMEDIATE
+            // to take the writer lock before touching the file. Re-read the
+            // stamp under that lock: if a winner committed while this
+            // connection waited, reopen through the ordinary gate so an
+            // older winner is upgraded and a foreign one is refused rather
+            // than overwriting its commit.
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .map_err(internal)?;
+            let stamped: i64 = tx
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(internal)?;
+            if stamped != 0 {
+                tx.rollback().map_err(internal)?;
+                return Self::init(conn, capacity);
+            }
             tx.execute_batch(SCHEMA).map_err(internal)?;
             tx.pragma_update(None, "user_version", FORMAT_VERSION)
                 .map_err(internal)?;
+            // The insert is still OR IGNORE: a duplicate store_id must never
+            // surface as a bootstrap failure.
             tx.execute(
-                "INSERT INTO store_meta (key, value) VALUES ('store_id', ?1)",
+                "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('store_id', ?1)",
                 params![new_id("store")],
             )
             .map_err(internal)?;

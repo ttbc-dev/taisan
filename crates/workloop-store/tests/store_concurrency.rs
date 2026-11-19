@@ -227,3 +227,97 @@ fn preview_fails_fast_under_held_write_lock() {
     drop(b);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Regression: two first-opens of a not-yet-created store must not
+/// collide on the bootstrap `store_id` row. Both can read the version-0
+/// / empty-table gate before either commits; the loser must wait on the
+/// winner's bootstrap transaction and then reuse its store identity
+/// instead of surfacing the `store_meta.key` UNIQUE violation.
+///
+/// A blocker transaction holds the writer lock on the empty file so both
+/// openers pass the format gate before either can bootstrap.
+#[test]
+fn concurrent_first_open_bootstraps_once_without_a_unique_failure() {
+    use std::sync::{Arc, Barrier};
+
+    use workloop_core::store::StoreError;
+
+    let root = std::env::temp_dir().join(format!(
+        "workloop-store-bootstrap-race-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.db");
+
+    // Put the empty file in WAL mode first: the openers' own WAL pragma
+    // is then a no-op, so the blocker below stalls them at BEGIN
+    // IMMEDIATE (after each has read the version-0 / empty-table gate)
+    // rather than on the journal-mode conversion.
+    {
+        let init = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = init
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+    let blocker = rusqlite::Connection::open(&db).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            SqliteStore::open(&db, 1)
+        }));
+    }
+    // Both openers have read the gate and are waiting on the writer
+    // lock by now; release it so the race reaches the bootstrap.
+    std::thread::sleep(Duration::from_millis(300));
+    blocker.execute_batch("COMMIT;").unwrap();
+    drop(blocker);
+
+    let mut stores = Vec::new();
+    for handle in handles {
+        match handle.join().unwrap() {
+            Ok(store) => stores.push(store),
+            // Bootstrap failures map through `internal`, so the pre-fix
+            // UNIQUE collision arrives as `Internal` rather than
+            // `ConstraintConflict`; name it explicitly either way.
+            Err(e) => {
+                let collided = matches!(
+                    &e,
+                    StoreError::ConstraintConflict { detail }
+                        | StoreError::Internal { detail }
+                        if detail.contains("store_meta.key")
+                );
+                if collided {
+                    panic!("first-open collided on bootstrap: {e:?}");
+                }
+                panic!("concurrent first-open failed instead of waiting: {e:?}");
+            }
+        }
+    }
+
+    let ids: Vec<_> = stores
+        .iter()
+        .map(|store| store.transact(|tx| tx.store_id()).unwrap())
+        .collect();
+    assert_eq!(
+        ids[0], ids[1],
+        "both connections must see the winner's store identity"
+    );
+    // Both handles are usable writers on the one bootstrapped store.
+    stores[0].transact(|tx| tx.alloc_seq()).unwrap();
+    stores[1].transact(|tx| tx.alloc_seq()).unwrap();
+    assert_eq!(stores[0].transact(|tx| tx.last_seq()).unwrap(), 2);
+    drop(stores);
+
+    let reopened = SqliteStore::open(&db, 1).unwrap();
+    assert_eq!(reopened.transact(|tx| tx.store_id()).unwrap(), ids[0]);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&root);
+}
