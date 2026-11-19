@@ -174,6 +174,7 @@ Before mutation the caller retains `(origin, actor, idempotency_key)`, the exact
 | `run --work <id>` | driver | the loop itself — diagnostic scope, no intake scheduling |
 | `intake` | driver | one invocation under the scheduler's single-flight lease |
 | `intake-runs`, `intake-detail` | query | none — durable intake records |
+| `evidence export`, `evidence artifact` | query | none — read-only `rui-evidence/1` producer over recorded history ([rui evidence protocol v1](rui-evidence-v1.md)) |
 
 `cancel` acceptance records a stop intent; it is never stop proof — the Execution settles through the uncertain-stop path until writer safety is established. `acknowledge` applies to the current Attention version only and releases nothing.
 

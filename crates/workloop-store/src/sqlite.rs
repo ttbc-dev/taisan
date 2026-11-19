@@ -46,7 +46,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `9` adds the `intake_settings` admission record (#213);
 /// `10` adds the `recovery_intents.retirement_generation` column (#139).
 /// Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 10;
+pub(crate) const FORMAT_VERSION: i64 = 10;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp

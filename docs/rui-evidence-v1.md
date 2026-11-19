@@ -5,7 +5,37 @@ T1 defines the wire contract and synthetic examples for issue #228. The
 [JSON Schema](../fixtures/rui-evidence-v1/schema.json), and
 [freeze manifest](../fixtures/rui-evidence-v1/freeze-manifest.json) identify
 the contract at this revision. Owner acceptance and merge establish the freeze
-for consumer R1. T2, T3, and T4 cover the live exporter, CLI, and interoperability.
+for consumer R1. T4 covers live interoperability.
+
+## Producer commands
+
+T2 and T3 implement the producer over the CLI. The only supported
+protocol version is `rui-evidence/1`; any other version is refused with
+`unsupported_protocol`. The commands are read-only — they replay the
+append-only recorded history and never invoke a worker, refresh a host,
+or mutate orchestration state.
+
+```sh
+taisan --config CONFIG evidence export [--after CHECKPOINT | --cursor PAGE_CURSOR] [--limit N]
+taisan --config CONFIG evidence artifact --id ARTIFACT_ID --sha256 DIGEST --output NEW_PATH
+```
+
+`evidence export` emits one page per call inside the existing result
+envelope: `command.kind` is `evidence_export`, `result` is the export
+page, `as_of` equals `snapshot_seq`, and `sources` names the recorded
+history read. `--limit` defaults to 100 and must lie within `1..=500`.
+`--after` continues a completed export from its committed checkpoint;
+`--cursor` continues an open page sequence from `next_cursor`. An open
+sequence is pinned to the watermark its cursor binds: writes that land
+after the watermark never appear in that sequence and are exported by a
+later delta.
+
+`evidence artifact` resolves an `event:<seq>` artifact id, verifies the
+requested digest against the exact retained bytes, and publishes them
+through a temporary file — an existing destination is refused and a
+failure leaves no output behind. `command.kind` is `evidence_artifact`
+and the result carries the descriptor plus `bytes_written`. Reason
+codes and exit classes follow [Query failures](#query-failures).
 
 The schema root groups named message definitions for lookup. Validate a message
 against its definition. Parse `body_json` separately against `RecordBody`
