@@ -241,11 +241,28 @@ impl SqliteStore {
         let mut bootstrapping = false;
         if version == 0 {
             if !table_set(&conn)?.is_empty() {
-                return Err(StoreError::UnsupportedFormat {
-                    detail: "unversioned store file (pre-v1 format); \
-                             archive it and start a new store"
-                        .into(),
-                });
+                // The stamp read above and this table scan are two
+                // separate autocommit reads: a concurrent first-opener can
+                // commit its bootstrap between them, leaving this opener
+                // with version==0 and the winner's tables. Re-read the
+                // stamp before refusing — a stamp still 0 is the genuine
+                // pre-v1 archive, refused untouched; a stamp that changed
+                // is the winner's store, reopened through the ordinary
+                // gate instead of being misread as a legacy file.
+                let stamped_now: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .map_err(internal)?;
+                if stamped_now == 0 {
+                    return Err(StoreError::UnsupportedFormat {
+                        detail: "unversioned store file (pre-v1 format); \
+                                 archive it and start a new store"
+                            .into(),
+                    });
+                }
+                // The stamp only ever moves 0 -> FORMAT_VERSION (one
+                // atomic bootstrap commit), so the re-run reads a nonzero
+                // stamp, skips this branch, and cannot recurse again.
+                return Self::init(conn, capacity);
             }
             bootstrapping = true;
         } else if version < FORMAT_VERSION {
