@@ -1032,7 +1032,7 @@ pub fn classify_report(
     // digest member, never a re-serialization.
     let body_digest = report_v2_digest(&report_canonical_body(&value));
     let mut reasons: Vec<String> = Vec::new();
-    if report.request_id != binding.request_id {
+    if report.request_id != binding.request_id || report.request_digest != binding.request_digest {
         reasons.push("report.wrong_request".into());
     }
     if report.invocation_id != binding.invocation_id {
@@ -1040,9 +1040,6 @@ pub fn classify_report(
     }
     if report.role != binding.role {
         reasons.push("report.wrong_role".into());
-    }
-    if report.request_digest != binding.request_digest {
-        reasons.push("report.wrong_request".into());
     }
     if report.report_digest != body_digest {
         reasons.push("report.digest_mismatch".into());
@@ -1054,7 +1051,6 @@ pub fn classify_report(
         ));
     }
     if !reasons.is_empty() {
-        reasons.dedup();
         return invalid(reasons);
     }
     let classification = match report.status {
@@ -1527,6 +1523,40 @@ mod tests {
             other => panic!("expected invalid, got {other:?}"),
         }
         assert!(classified.report.is_none());
+    }
+
+    #[test]
+    fn a_wrong_request_is_reported_once() {
+        let expected = vec![
+            "report.wrong_request".to_string(),
+            "report.wrong_invocation".to_string(),
+            "report.wrong_role".to_string(),
+        ];
+        let other_digest = "0".repeat(64);
+        for binding in [
+            ReportBinding {
+                request_id: "other:inv:9",
+                request_digest: &other_digest,
+                ..doc_binding()
+            },
+            ReportBinding {
+                request_id: "other:inv:9",
+                ..doc_binding()
+            },
+            ReportBinding {
+                request_digest: &other_digest,
+                ..doc_binding()
+            },
+        ] {
+            let classified = classify_report(DOC_INVALID_REPORT.as_bytes(), &binding, 1_048_576);
+            assert_eq!(
+                classified.classification,
+                ReportClassification::Invalid {
+                    reasons: expected.clone()
+                }
+            );
+            assert!(classified.report.is_none());
+        }
     }
 
     #[test]
