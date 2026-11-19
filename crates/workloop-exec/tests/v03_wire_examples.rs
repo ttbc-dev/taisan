@@ -107,6 +107,10 @@ fn v03_invalid_report_differs_from_the_request_it_names() {
     ));
 
     assert_eq!(invalid["request_id"], request["request_id"]);
+    assert_eq!(
+        invalid["request_digest"], request["request_digest"],
+        "the invalid example must echo the request digest so it isolates the invocation and role errors instead of also failing the request binding"
+    );
     assert!(
         invalid["role"] != request["role"],
         "the invalid example must exercise report.wrong_role"
@@ -114,5 +118,10 @@ fn v03_invalid_report_differs_from_the_request_it_names() {
     assert!(
         invalid["invocation_id"] != request["invocation_id"],
         "the invalid example must exercise report.wrong_invocation"
+    );
+    assert_eq!(
+        digest(&invalid, "worker-report-v2", "report_digest"),
+        string(&invalid, "report_digest"),
+        "the invalid example must carry a verifying report_digest so report.digest_mismatch is not an additional error"
     );
 }
