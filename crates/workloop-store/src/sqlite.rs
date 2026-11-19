@@ -18,7 +18,8 @@
 //! file — archive-only), and a newer version are all refused at open.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
@@ -48,7 +49,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `11` adds the `worker_request_bodies` canonical-body record for the
 /// versioned executable Worker request (`docs/v0.3.md`, #256).
 /// Older files upgrade additively at open.
-const FORMAT_VERSION: i64 = 11;
+pub(crate) const FORMAT_VERSION: i64 = 11;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -181,6 +182,62 @@ impl std::fmt::Display for RunLeaseError {
 }
 
 impl std::error::Error for RunLeaseError {}
+
+/// Nonces of lease grants held by live guards in this process, with a
+/// reference count so one holder's release cannot mark dead a nonce
+/// another live holder still owns. A recorded owner row naming this
+/// process (same pid and started_at) with a nonce absent from the map
+/// belongs to a guard that was dropped while its release write failed
+/// — provably gone, so the lease is reclaimable without waiting for
+/// the process to die. A nonce still present belongs to a live guard
+/// in this process and must report `Held` like any other live owner.
+static LIVE_LEASE_NONCES: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Process-wide gate held across the whole lease acquire window —
+/// row read, ownership write, commit, and nonce registration. The
+/// committed row and the holder's nonce registration must be atomic
+/// with respect to other connections in this process: without the
+/// gate, a second connection can observe the committed row in the
+/// gap before `register_live_nonce` runs, find the recorded nonce
+/// absent from [`LIVE_LEASE_NONCES`], and reclaim a lease a live
+/// same-process guard still holds.
+static LEASE_ACQUIRE_GATE: Mutex<()> = Mutex::new(());
+
+fn register_live_nonce(nonce: &str) {
+    if let Ok(mut nonces) = LIVE_LEASE_NONCES.lock() {
+        *nonces.entry(nonce.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn renew_live_nonce(nonce: &str) {
+    // A renewal is the same logical grant re-entering: it must not
+    // double-count its own presence, but it re-arms the nonce when an
+    // earlier release write forgot it while the row survived.
+    if let Ok(mut nonces) = LIVE_LEASE_NONCES.lock() {
+        nonces.entry(nonce.to_string()).or_insert(1);
+    }
+}
+
+fn forget_live_nonce(nonce: &str) {
+    if let Ok(mut nonces) = LIVE_LEASE_NONCES.lock()
+        && let Some(count) = nonces.get_mut(nonce)
+    {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            nonces.remove(nonce);
+        }
+    }
+}
+
+fn is_live_nonce(nonce: &str) -> bool {
+    // An uninspectable registry fails closed: the nonce reads as live
+    // so a recorded owner is never reclaimed on doubt.
+    LIVE_LEASE_NONCES
+        .lock()
+        .map(|nonces| nonces.contains_key(nonce))
+        .unwrap_or(true)
+}
 
 /// A granted run lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,8 +562,21 @@ impl SqliteStore {
             .map_err(internal)?;
             tx.commit().map_err(internal)?;
         }
+        // The evidence epoch is a durable per-file identity: minted
+        // once, never touched by additive migrations, and carried by
+        // the file itself so tokens from another store generation
+        // mismatch rather than silently continuing a diverged history.
+        conn.execute(
+            "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('history_epoch', ?1)",
+            params![new_id("epoch")],
+        )
+        .map_err(internal)?;
         // Seed the fixed slot rows once; claiming is an UPDATE inside the
-        // caller's transaction.
+        // caller's transaction. The configured capacity is the effective
+        // limit, recorded here so a later open with a smaller value
+        // shrinks admission: free rows beyond it are trimmed, rows still
+        // held are honored until released but can never be re-claimed —
+        // the claim picks only `slot_id < configured_capacity`.
         for slot in 0..capacity {
             conn.execute(
                 "INSERT OR IGNORE INTO capacity_slots (slot_id) VALUES (?1)",
@@ -514,6 +584,18 @@ impl SqliteStore {
             )
             .map_err(internal)?;
         }
+        conn.execute(
+            "INSERT OR REPLACE INTO store_meta (key, value) \
+             VALUES ('configured_capacity', ?1)",
+            params![capacity.to_string()],
+        )
+        .map_err(internal)?;
+        conn.execute(
+            "DELETE FROM capacity_slots \
+             WHERE slot_id >= ?1 AND execution_id IS NULL",
+            params![i64::from(capacity)],
+        )
+        .map_err(internal)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -554,6 +636,11 @@ impl SqliteStore {
         now_unix_seconds: i64,
         lease_key: &str,
     ) -> Result<RunLeaseGrant, RunLeaseError> {
+        let _acquire_gate = LEASE_ACQUIRE_GATE.lock().map_err(|_| {
+            RunLeaseError::Store(StoreError::Internal {
+                detail: "lease acquire gate poisoned".into(),
+            })
+        })?;
         let mut guard = self.conn.lock().map_err(|_| {
             RunLeaseError::Store(StoreError::Internal {
                 detail: "store lock poisoned".into(),
@@ -571,6 +658,7 @@ impl SqliteStore {
             )
             .optional()
             .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+        let mut renewed = false;
         let grant = match existing {
             None => {
                 insert_lease(&tx, owner, now_unix_seconds, lease_key)
@@ -580,6 +668,9 @@ impl SqliteStore {
             Some((pid, _started_at, nonce)) if nonce == owner.nonce && pid == owner.pid => {
                 // The same holder re-entering (a repeated pass of one
                 // driver): refresh the acquisition stamp, keep ownership.
+                // The nonce is renewed, not registered — this grant
+                // already counted its presence when it was granted.
+                renewed = true;
                 tx.execute(
                     "UPDATE run_lease SET acquired_unix_seconds=?1 \
                      WHERE lease_key=?2",
@@ -588,43 +679,74 @@ impl SqliteStore {
                 .map_err(|e| RunLeaseError::Store(map_err(e)))?;
                 RunLeaseGrant::Acquired
             }
-            Some((pid, started_at, _)) => {
-                let evidence = inspect(&ProcessIdentity {
-                    pid,
-                    started_at,
-                    pgid: None,
-                });
-                match evidence {
-                    ProcessEvidence::Alive { .. } => {
-                        return Err(RunLeaseError::Held { owner_pid: pid });
-                    }
-                    ProcessEvidence::Stopped { .. } => {
-                        // The recorded driver is provably gone (or its
-                        // pid was reused under a different start time):
-                        // its lease is reclaimable, never concurrent.
-                        tx.execute(
-                            "UPDATE run_lease SET owner_pid=?1, \
+            Some((pid, started_at, nonce)) => {
+                let dead_guard_here =
+                    pid == owner.pid && started_at == owner.started_at && !is_live_nonce(&nonce);
+                if dead_guard_here {
+                    // The recorded owner is this very process but its
+                    // nonce is held by no live guard here: the guard
+                    // was dropped while its release write failed.
+                    // Reclaiming cannot create concurrency — a live
+                    // same-process holder keeps its nonce registered
+                    // and reads `Alive` below instead.
+                    tx.execute(
+                        "UPDATE run_lease SET owner_pid=?1, \
+                         owner_started_at=?2, owner_nonce=?3, \
+                         acquired_unix_seconds=?4 \
+                         WHERE lease_key=?5",
+                        params![
+                            owner.pid,
+                            owner.started_at,
+                            owner.nonce,
+                            now_unix_seconds,
+                            lease_key
+                        ],
+                    )
+                    .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+                    RunLeaseGrant::Reclaimed { previous_pid: pid }
+                } else {
+                    let evidence = inspect(&ProcessIdentity {
+                        pid,
+                        started_at,
+                        pgid: None,
+                    });
+                    match evidence {
+                        ProcessEvidence::Alive { .. } => {
+                            return Err(RunLeaseError::Held { owner_pid: pid });
+                        }
+                        ProcessEvidence::Stopped { .. } => {
+                            // The recorded driver is provably gone (or its
+                            // pid was reused under a different start time):
+                            // its lease is reclaimable, never concurrent.
+                            tx.execute(
+                                "UPDATE run_lease SET owner_pid=?1, \
                              owner_started_at=?2, owner_nonce=?3, \
                              acquired_unix_seconds=?4 \
                              WHERE lease_key=?5",
-                            params![
-                                owner.pid,
-                                owner.started_at,
-                                owner.nonce,
-                                now_unix_seconds,
-                                lease_key
-                            ],
-                        )
-                        .map_err(|e| RunLeaseError::Store(map_err(e)))?;
-                        RunLeaseGrant::Reclaimed { previous_pid: pid }
-                    }
-                    ProcessEvidence::Unknown { reason } => {
-                        return Err(RunLeaseError::Unavailable { reason });
+                                params![
+                                    owner.pid,
+                                    owner.started_at,
+                                    owner.nonce,
+                                    now_unix_seconds,
+                                    lease_key
+                                ],
+                            )
+                            .map_err(|e| RunLeaseError::Store(map_err(e)))?;
+                            RunLeaseGrant::Reclaimed { previous_pid: pid }
+                        }
+                        ProcessEvidence::Unknown { reason } => {
+                            return Err(RunLeaseError::Unavailable { reason });
+                        }
                     }
                 }
             }
         };
         tx.commit().map_err(|e| RunLeaseError::Store(internal(e)))?;
+        if renewed {
+            renew_live_nonce(&owner.nonce);
+        } else {
+            register_live_nonce(&owner.nonce);
+        }
         Ok(grant)
     }
 
@@ -661,6 +783,10 @@ impl SqliteStore {
     }
 
     fn release_lease(&self, owner: &RunLeaseOwner, lease_key: &str) -> Result<(), StoreError> {
+        // The guard is dead once release runs, whatever the write's
+        // outcome: forgetting the nonce first means a failed delete
+        // leaves a reclaimable row instead of a same-process wedge.
+        forget_live_nonce(&owner.nonce);
         let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
             detail: "store lock poisoned".into(),
         })?;
@@ -1538,11 +1664,30 @@ impl ReadView for Tx<'_> {
     }
 
     fn slot_limit(&self) -> Result<u32, StoreError> {
-        let n: i64 = self
+        // The effective limit is the last configured capacity — the
+        // row count can exceed it while slots beyond the shrink point
+        // remain held.
+        let configured: Option<String> = self
             .tx
-            .query_row("SELECT COUNT(*) FROM capacity_slots", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM store_meta WHERE key='configured_capacity'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
             .map_err(map_err)?;
-        Ok(n as u32)
+        match configured {
+            Some(value) => value.parse::<u32>().map_err(|_| StoreError::Internal {
+                detail: format!("corrupt configured_capacity: {value:?}"),
+            }),
+            None => {
+                let n: i64 = self
+                    .tx
+                    .query_row("SELECT COUNT(*) FROM capacity_slots", [], |r| r.get(0))
+                    .map_err(map_err)?;
+                Ok(n as u32)
+            }
+        }
     }
 
     fn slot_holders(&self) -> Result<Vec<(ExecutionId, EventSequence)>, StoreError> {
@@ -2319,11 +2464,13 @@ impl TxView for Tx<'_> {
                 update_execution(self, execution, expected_state)?;
             }
             Effect::ClaimSlot { execution_id } => {
+                let limit = self.slot_limit()?;
                 let n = self.exec(
                     "UPDATE capacity_slots SET execution_id=?1 \
                      WHERE slot_id = (SELECT slot_id FROM capacity_slots \
-                                      WHERE execution_id IS NULL LIMIT 1)",
-                    params![execution_id.0],
+                                      WHERE execution_id IS NULL AND slot_id < ?2 \
+                                      LIMIT 1)",
+                    params![execution_id.0, i64::from(limit)],
                 )?;
                 if n == 0 {
                     return Err(StoreError::NoFreeSlot);

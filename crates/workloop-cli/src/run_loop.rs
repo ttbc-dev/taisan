@@ -37,7 +37,7 @@ use workloop_core::work::{
 use workloop_exec::adapter;
 use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
-use workloop_github::fixture::FixtureGithub;
+use workloop_github::fixture::{FixtureGithub, OutboxReport, ReconcileReport};
 use workloop_store::retention::{SweepParams, SweepReport};
 use workloop_store::sqlite::SqliteStore;
 
@@ -576,15 +576,24 @@ pub fn run_pass(
                     let mut p = PhaseReport::completed(PHASES[3]);
                     p.processed = reconciled.examined + r.attempted;
                     p.deferred = deferred;
+                    // Intents the pass examined but cannot settle —
+                    // credential-blocked ones stay `pending` awaiting
+                    // repair, skipped ones reappear every pass — are
+                    // held with their recorded reason so a silent stall
+                    // is visible in the tick report.
+                    let (held, credential_blocked) = outbox_held(&reconciled, &r);
+                    p.held = held;
                     p.reason = Some(format!(
-                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={}",
+                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={} credential_blocked={} skipped={}",
                         reconciled.applied,
                         reconciled.failed,
                         reconciled.still_unknown,
                         r.applied,
                         r.failed,
                         r.unknown,
-                        r.unsupported
+                        r.unsupported,
+                        credential_blocked,
+                        r.skipped.len()
                     ));
                     p
                 }
@@ -887,6 +896,47 @@ fn uuidish() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}-{}", std::process::id())
+}
+
+/// Compose the outbox phase's held list and credential-blocked count
+/// from the reconcile and apply-drain reports. A pending intent that
+/// fails the credential gate is reported by both passes; each blocked
+/// intent is listed and counted once. The apply drain returns its
+/// routing verdicts — a missing Execution, a denied host_write, a
+/// foreign host — before reaching the credential gate, while reconcile
+/// credential-checks every outstanding intent first, so one intent can
+/// surface under both a credential code and a skipped reason. The
+/// drain's verdict is the proximate reason no write was attempted, so
+/// it wins and each intent is held exactly once.
+fn outbox_held(reconciled: &ReconcileReport, applied: &OutboxReport) -> (Vec<String>, usize) {
+    let skipped_ids: std::collections::HashSet<&str> = applied
+        .skipped
+        .iter()
+        .map(|s| s.action_id.as_str())
+        .collect();
+    let mut held_ids = std::collections::HashSet::new();
+    let mut credential_blocked = 0;
+    let mut held: Vec<String> = Vec::new();
+    for b in reconciled
+        .credential_blocked
+        .iter()
+        .chain(&applied.credential_blocked)
+    {
+        if skipped_ids.contains(b.action_id.as_str()) {
+            continue;
+        }
+        if held_ids.insert(b.action_id.clone()) {
+            credential_blocked += 1;
+            held.push(format!("{}:{}", b.action_id, b.code));
+        }
+    }
+    held.extend(
+        applied
+            .skipped
+            .iter()
+            .map(|s| format!("{}:{}", s.action_id, s.reason)),
+    );
+    (held, credential_blocked)
 }
 
 #[cfg(test)]
@@ -1935,6 +1985,50 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// A pending intent that fails the credential gate is reported by
+    /// both the reconcile pass and the apply drain; the phase lists and
+    /// counts it once, alongside genuinely distinct blocks and skips.
+    #[test]
+    fn outbox_held_dedupes_credential_blocks_across_both_passes() {
+        let block = |action_id: &str| workloop_github::fixture::CredentialBlock {
+            action_id: action_id.into(),
+            code: "credential.missing",
+        };
+        let reconciled = ReconcileReport {
+            credential_blocked: vec![block("act-1"), block("act-2"), block("act-4")],
+            ..Default::default()
+        };
+        let applied = OutboxReport {
+            credential_blocked: vec![block("act-1")],
+            skipped: vec![
+                workloop_github::fixture::SkippedIntent {
+                    action_id: "act-3".into(),
+                    reason: "missing_execution",
+                },
+                workloop_github::fixture::SkippedIntent {
+                    action_id: "act-4".into(),
+                    reason: "host_write_denied",
+                },
+            ],
+            ..Default::default()
+        };
+        let (held, credential_blocked) = outbox_held(&reconciled, &applied);
+        assert_eq!(
+            credential_blocked, 2,
+            "one intent blocked once, and a credential block shadowed by              the drain's routing verdict is not counted"
+        );
+        assert_eq!(
+            held,
+            vec![
+                "act-1:credential.missing".to_string(),
+                "act-2:credential.missing".to_string(),
+                "act-3:missing_execution".to_string(),
+                "act-4:host_write_denied".to_string(),
+            ],
+            "act-4 is held once under the drain's verdict, not twice with              contradictory reasons"
         );
     }
 

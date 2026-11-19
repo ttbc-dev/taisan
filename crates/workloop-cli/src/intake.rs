@@ -21,8 +21,10 @@ use workloop_core::identity::RepositoryRef;
 use workloop_core::store::{Effect, IntakeSettingsRecord, IntakeTrigger, Store};
 use workloop_core::work::WorkloopConfig;
 use workloop_intake::scheduler::{IntakeScheduler, SETTINGS_TICK_SECONDS, TickDecision};
-use workloop_intake::{self, IntakeError, IntakeParams, IntakeReport, SelectorBinding};
-use workloop_store::sqlite::SqliteStore;
+use workloop_intake::{
+    self, IntakeError, IntakeParams, IntakeReport, RecoveryOutcome, SelectorBinding,
+};
+use workloop_store::sqlite::{RunLeaseOwner, SqliteStore};
 
 /// The resolved intake configuration for one settings-check tick:
 /// the validated settings snapshot plus, when a complete selector
@@ -120,6 +122,7 @@ fn selector_config(binding: &IntakeSelectorBinding) -> Result<SelectorConfig, St
 struct OwnedInvocation {
     db_path: PathBuf,
     capacity: u32,
+    owner: RunLeaseOwner,
     trigger: IntakeTrigger,
     binding: SelectorBinding,
     task_constraints: Vec<String>,
@@ -275,6 +278,15 @@ pub struct IntakeDriver {
     selector_cwd: PathBuf,
     next_check_unix_seconds: i64,
     invocation: Option<std::thread::JoinHandle<InvocationOutcome>>,
+    /// The lease-owner identity recorded before the current invocation
+    /// thread was spawned — the exact nonce its durable run carries.
+    invocation_owner: Option<RunLeaseOwner>,
+    /// Ended invocations whose run/lease reconciliation has not yet
+    /// succeeded (a store fault can defeat it). Retried every tick
+    /// until the close and stale-lease release commit; tracked as a
+    /// list so a still-stale lease cannot be overwritten by a later
+    /// invocation's identity.
+    orphaned_invocations: Vec<RunLeaseOwner>,
     /// The last profile diagnostic already reported on stderr — the
     /// same failure is announced once, not every tick.
     last_diagnostic: Option<String>,
@@ -304,23 +316,76 @@ impl IntakeDriver {
             // profile is immediately due at startup by contract.
             next_check_unix_seconds: 0,
             invocation: None,
+            invocation_owner: None,
+            orphaned_invocations: Vec::new(),
             last_diagnostic: None,
         }
     }
 
     /// Reap a finished invocation thread, reporting its bounded
-    /// outcome on stderr. Returns whether an invocation is still live.
-    fn invocation_alive(&mut self) -> bool {
+    /// outcome on stderr, then reconcile anything it left behind. A
+    /// panicking thread unwinds past the live-owner close guard, and a
+    /// store fault can defeat the best-effort close *and* the lease
+    /// drop; in both cases the durable run stays `open`/`admitting`
+    /// under this live process and would suppress every later tick
+    /// until restart. The identity carried from before the spawn names
+    /// the exact run/lease to close, so only this invocation's leftovers
+    /// are touched. Returns whether an invocation is still live.
+    fn invocation_alive(&mut self, store: &SqliteStore, now_unix_seconds: i64) -> bool {
         let finished = self.invocation.as_ref().is_some_and(|h| h.is_finished());
         if finished && let Some(handle) = self.invocation.take() {
+            let owner = self.invocation_owner.take();
             match handle.join() {
                 Ok(outcome) => {
                     eprintln!("taisan: intake invocation finished: {}", outcome.summary())
                 }
                 Err(_) => eprintln!("taisan: intake invocation thread panicked"),
             }
+            if let Some(owner) = owner {
+                self.orphaned_invocations.push(owner);
+            }
         }
+        self.reconcile_orphans(store, now_unix_seconds);
         self.invocation.is_some()
+    }
+
+    /// Close runs whose invocation already ended and release the
+    /// leases their failed drops may have left. Retained across ticks
+    /// when the store is still faulting, so a transient fault cannot
+    /// make an orphan permanent.
+    fn reconcile_orphans(&mut self, store: &SqliteStore, now_unix_seconds: i64) {
+        if self.orphaned_invocations.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.orphaned_invocations);
+        for owner in pending {
+            // Close the run first: releasing the lease while a
+            // non-terminal run still exists would let a concurrent
+            // invocation acquire it only to be refused by the
+            // active-run guard.
+            match workloop_intake::recover_ended_invocation(
+                store,
+                &self.actor,
+                &owner,
+                now_unix_seconds,
+            ) {
+                Ok(report) if matches!(report.outcome, RecoveryOutcome::Incomplete) => {
+                    eprintln!("taisan: intake orphan recovery incomplete; retrying next tick");
+                    self.orphaned_invocations.push(owner);
+                }
+                Ok(_) => match store.release_intake_lease(&owner) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("taisan: intake orphan lease release: {e}");
+                        self.orphaned_invocations.push(owner);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("taisan: intake orphan recovery: {e}");
+                    self.orphaned_invocations.push(owner);
+                }
+            }
+        }
     }
 
     /// Whether a durable `open`/`admitting` run exists — the other
@@ -341,7 +406,7 @@ impl IntakeDriver {
             return;
         }
         self.next_check_unix_seconds = now_unix_seconds + SETTINGS_TICK_SECONDS;
-        self.invocation_alive();
+        self.invocation_alive(store, now_unix_seconds);
 
         // A run orphaned mid-session — its recorded owner proven dead
         // after this process started — would suppress every later Due
@@ -377,7 +442,9 @@ impl IntakeDriver {
             }
         };
         let settings = resolved.as_ref().map(|c| &c.settings);
-        let active = self.invocation.is_some() || Self::durable_active(store);
+        let active = self.invocation.is_some()
+            || !self.orphaned_invocations.is_empty()
+            || Self::durable_active(store);
         let decision = self.scheduler.tick(now_unix_seconds, settings, active);
         if let (TickDecision::Due { trigger }, Some(config)) = (decision, resolved)
             && let Some(selector) = config.selector.clone()
@@ -397,9 +464,21 @@ impl IntakeDriver {
     }
 
     fn spawn(&mut self, trigger: IntakeTrigger, config: IntakeConfig, selector: SelectorConfig) {
+        // Record the owner before spawning so a thread that panics or
+        // cannot write its own close still leaves the driver able to
+        // name the exact run and lease to reconcile.
+        let owner = match workloop_intake::new_lease_owner() {
+            Ok(owner) => owner,
+            Err(e) => {
+                eprintln!("taisan: intake invocation not started: {e:?}");
+                return;
+            }
+        };
+        self.invocation_owner = Some(owner.clone());
         let owned = OwnedInvocation {
             db_path: self.db_path.clone(),
             capacity: self.capacity,
+            owner,
             trigger,
             binding: selector.binding,
             task_constraints: selector.task_constraints,
@@ -468,7 +547,7 @@ fn run_owned(owned: OwnedInvocation) -> InvocationOutcome {
         .unwrap_or_default();
     let now_secs = epoch.as_secs() as i64;
     let now_ms = epoch.as_millis() as i64;
-    match workloop_intake::run_intake(&store, &params, now_secs, now_ms) {
+    match workloop_intake::run_intake_with_owner(&store, &params, now_secs, now_ms, owned.owner) {
         Ok(report) => InvocationOutcome::from_report(report),
         Err(e) => InvocationOutcome::from_error(&e),
     }
@@ -477,14 +556,17 @@ fn run_owned(owned: OwnedInvocation) -> InvocationOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::time::Duration;
 
     use workloop_core::domain::{ActorKind, AllowedEffects, ExecutionBudget, WorkPolicy};
     use workloop_core::identity::{
         ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability,
         HostInstanceId, RepositoryId, RoleBinding,
     };
+    use workloop_core::ports::ProcessControlPort;
     use workloop_core::store::{Effect, IntakeRun, IntakeRunState};
     use workloop_core::work::HostTemplate;
     use workloop_exec::supervisor::PosixProcessControl;
@@ -593,6 +675,155 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state, IntakeRunState::Interrupted);
+    }
+
+    /// The wedge this driver must reconcile: an invocation thread ends
+    /// (here by panic, standing in for a panic or a store fault that
+    /// also defeated the best-effort close and lease release) while
+    /// its `open` run and lease remain under this still-live process.
+    /// The very next settings tick must close that run and release the
+    /// lease, so the due schedule fires again without a restart.
+    #[test]
+    fn maybe_tick_reconciles_an_ended_invocation_and_resumes_scheduled_intake() {
+        let dir = root("orphan-resume");
+        let selector = selector_empty_success_script(&dir);
+        let profile = dir.join("config.toml");
+        std::fs::write(&profile, enabled_profile_toml(&selector, 4)).unwrap();
+        let store = SqliteStore::open(&dir.join("workloop.db"), 4).unwrap();
+        let mut driver = driver_for(&profile, &dir);
+
+        // The identity a real spawn records before starting its thread.
+        let owner = workloop_intake::new_lease_owner().unwrap();
+        let run = IntakeRun {
+            run_id: "intake-orphan-ended".into(),
+            trigger: IntakeTrigger::ScheduledInterval,
+            selector_id: AdapterId::trusted("test-sel"),
+            selector_version: 1,
+            policy_revision: 7,
+            settings_revision: None,
+            state: IntakeRunState::Open,
+            detail_code: None,
+            request_payload: b"{}".to_vec(),
+            request_digest: "d".repeat(64),
+            owner_pid: owner.pid,
+            owner_started_at: owner.started_at.clone(),
+            owner_nonce: owner.nonce.clone(),
+            created_unix_seconds: TICK_NOW - 1,
+            finished_unix_seconds: None,
+            recorded_seq: 1,
+        };
+        store
+            .transact(|tx| tx.apply(&Effect::InsertIntakeRun { run }))
+            .unwrap();
+        // Its drop-release failed too: the lease still names the ended
+        // invocation, which a later acquisition would read as `Held`
+        // because this pid is alive.
+        store
+            .acquire_intake_lease(&owner, |id| PosixProcessControl.inspect(id), TICK_NOW)
+            .unwrap();
+
+        // A finished invocation thread whose panic unwound past the
+        // coordinator's close guard.
+        driver.invocation_owner = Some(owner.clone());
+        driver.invocation = Some(std::thread::spawn(|| -> InvocationOutcome {
+            panic!("simulated intake invocation panic")
+        }));
+        while !driver.invocation.as_ref().unwrap().is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // One settings tick reaps the thread, reconciles its run and
+        // lease, then finds intake due and spawns a fresh invocation.
+        driver.maybe_tick(&store, TICK_NOW);
+        driver.finish();
+
+        let orphan = store
+            .transact_deferred(|tx| tx.intake_run("intake-orphan-ended"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphan.state, IntakeRunState::Interrupted);
+        assert_eq!(
+            orphan.detail_code.as_deref(),
+            Some("invocation_orphaned"),
+            "reconciliation records a bounded reason"
+        );
+        assert!(
+            store
+                .transact_deferred(|tx| tx.active_intake_run())
+                .unwrap()
+                .is_none(),
+            "no non-terminal run may remain to suppress the schedule"
+        );
+        let runs = store.transact_deferred(|tx| tx.intake_runs()).unwrap();
+        assert_eq!(runs.len(), 2, "the scheduled invocation ran: {runs:?}");
+        let resumed = runs
+            .iter()
+            .find(|r| r.run_id != "intake-orphan-ended")
+            .expect("a fresh run exists");
+        assert_eq!(
+            resumed.state,
+            IntakeRunState::Completed,
+            "scheduled intake resumed without a restart"
+        );
+        assert_ne!(
+            resumed.owner_nonce, owner.nonce,
+            "the resumed run belongs to a fresh invocation"
+        );
+    }
+
+    /// A selector that returns a conforming empty success response —
+    /// just enough for a scheduled invocation to complete.
+    fn selector_empty_success_script(dir: &Path) -> String {
+        let template = String::from_utf8(workloop_selector::protocol::success_response(
+            "__RID__",
+            &[],
+        ))
+        .unwrap();
+        let template_path = dir.join("response.template");
+        std::fs::write(&template_path, template).unwrap();
+        let script_path = dir.join("sel.sh");
+        let script = format!(
+            "#!/bin/sh\nreq=$(cat)\nrid=$(printf '%s' \"$req\" | sed -n \
+             's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\n\
+             sed \"s/__RID__/$rid/g\" '{}'\n",
+            template_path.display()
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_path.to_string_lossy().into_owned()
+    }
+
+    fn enabled_profile_toml(selector: &str, limit: u32) -> String {
+        format!(
+            r#"schema_version = 1
+
+[hosts.h1]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "0123456789"
+use = "publication"
+
+[roles.publication]
+host = "h1"
+actor = "taisan-publisher"
+credential_ref = "env:TAISAN_TOKEN"
+
+[intake]
+enabled = true
+interval_minutes = 30
+timeout_seconds = 10
+pending_queue_limit = {limit}
+
+[intake.selector]
+adapter = "test-sel"
+selector_version = 1
+policy_revision = 7
+argv = ["/bin/sh", "{selector}"]
+"#
+        )
     }
 
     /// A minimal valid profile whose `[intake]` section is disabled —

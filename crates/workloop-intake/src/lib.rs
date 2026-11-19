@@ -151,7 +151,23 @@ pub fn run_intake(
     now_unix_seconds: i64,
     now_unix_ms: i64,
 ) -> Result<IntakeReport, IntakeError> {
-    let lease = IntakeLease::acquire(store, now_unix_seconds)?;
+    let owner = new_lease_owner()?;
+    run_intake_with_owner(store, params, now_unix_seconds, now_unix_ms, owner)
+}
+
+/// [`run_intake`] under a caller-supplied lease-owner identity. The
+/// CLI driver records the identity before spawning the invocation
+/// thread, so a run left non-terminal by a panicking or faulted
+/// invocation can later be reconciled by its exact nonce rather than
+/// by pid liveness alone — the owning process is still alive.
+pub fn run_intake_with_owner(
+    store: &SqliteStore,
+    params: &IntakeParams<'_>,
+    now_unix_seconds: i64,
+    now_unix_ms: i64,
+    owner: RunLeaseOwner,
+) -> Result<IntakeReport, IntakeError> {
+    let lease = IntakeLease::acquire(store, owner, now_unix_seconds)?;
 
     // Preflight in one deferred read: an already-active run refuses
     // the invocation outright (the lease makes this rare — it covers
@@ -464,8 +480,11 @@ struct IntakeLease<'a> {
 }
 
 impl<'a> IntakeLease<'a> {
-    fn acquire(store: &'a SqliteStore, now: i64) -> Result<Self, IntakeError> {
-        let owner = lease_owner()?;
+    fn acquire(
+        store: &'a SqliteStore,
+        owner: RunLeaseOwner,
+        now: i64,
+    ) -> Result<Self, IntakeError> {
         store
             .acquire_intake_lease(
                 &owner,
@@ -488,8 +507,10 @@ impl Drop for IntakeLease<'_> {
 }
 
 /// This process's lease-owner identity: pid plus the `lstart`
-/// verifier, with a fresh nonce per acquisition.
-fn lease_owner() -> Result<RunLeaseOwner, IntakeError> {
+/// verifier, with a fresh nonce per acquisition. The CLI driver calls
+/// this before spawning an invocation so it can name the exact owner
+/// it must reconcile if the thread ends without closing its run.
+pub fn new_lease_owner() -> Result<RunLeaseOwner, IntakeError> {
     let identity =
         PosixProcessControl::identity_of(std::process::id() as i32).map_err(|reason| {
             IntakeError::Lease {
@@ -1086,9 +1107,70 @@ pub fn recover_intake(
         workloop_core::ports::ProcessEvidence::Stopped { .. } => {}
     }
 
-    // Owner proven gone. Reconcile every unresolved candidate against
-    // the ledger first: found decisions fix terminal status and
-    // links; absent decisions become `interrupted`.
+    // Owner proven gone. Reconcile and close exactly as an ended
+    // invocation does, with the recovery-origin detail codes.
+    reconcile_and_close_run(
+        store,
+        actor,
+        &run,
+        now_unix_seconds,
+        "no_conforming_response",
+        "owner_lost",
+    )
+}
+
+/// Reconcile a run whose owning invocation has already ended inside a
+/// still-live process: a panic unwound past the live-owner close
+/// guard, or the same store fault that ended the invocation also
+/// defeated its best-effort close and lease release. The match is
+/// exact — pid, process start verifier, and the invocation's lease
+/// nonce — so a run owned by any other identity is left to the
+/// ordinary owner-liveness [`recover_intake`] path (which may also
+/// sweep leftovers). A matching `open`/`admitting` run is closed
+/// `interrupted` with `invocation_orphaned` (or `completed` when every
+/// candidate reconciles to a decided terminal status), and its
+/// unresolved candidates are reconciled against the ledger.
+pub fn recover_ended_invocation(
+    store: &SqliteStore,
+    actor: &Actor,
+    owner: &RunLeaseOwner,
+    now_unix_seconds: i64,
+) -> Result<RecoveryReport, StoreError> {
+    let active = store.transact_deferred(|tx| tx.active_intake_run())?;
+    match active {
+        Some(run)
+            if run.owner_pid == owner.pid
+                && run.owner_started_at == owner.started_at
+                && run.owner_nonce == owner.nonce =>
+        {
+            reconcile_and_close_run(
+                store,
+                actor,
+                &run,
+                now_unix_seconds,
+                "invocation_orphaned",
+                "invocation_orphaned",
+            )
+        }
+        _ => recover_intake(store, actor, now_unix_seconds),
+    }
+}
+
+/// The shared candidate reconciliation and guarded run close. The two
+/// detail arguments are the bounded diagnostics the caller records for
+/// an `open` run and for an `admitting` run that cannot close
+/// `completed` (an unresolved or already-`interrupted` candidate).
+fn reconcile_and_close_run(
+    store: &SqliteStore,
+    actor: &Actor,
+    run: &IntakeRun,
+    now_unix_seconds: i64,
+    open_detail: &str,
+    lost_detail: &str,
+) -> Result<RecoveryReport, StoreError> {
+    // Reconcile every unresolved candidate against the ledger first:
+    // found decisions fix terminal status and links; absent decisions
+    // become `interrupted`.
     let mut reconciled = 0usize;
     let candidates = store.transact_deferred(|tx| tx.intake_candidates(&run.run_id))?;
     // An `interrupted` candidate — whether this pass marks it now or
@@ -1127,9 +1209,9 @@ pub fn recover_intake(
     // `detail_code` is a failure diagnostic: a run recovered to
     // `completed` carries none, exactly like a live owner's close.
     let (final_state, detail) = match run.state {
-        IntakeRunState::Open => (IntakeRunState::Interrupted, Some("no_conforming_response")),
+        IntakeRunState::Open => (IntakeRunState::Interrupted, Some(open_detail)),
         IntakeRunState::Admitting if !any_interrupted => (IntakeRunState::Completed, None),
-        _ => (IntakeRunState::Interrupted, Some("owner_lost")),
+        _ => (IntakeRunState::Interrupted, Some(lost_detail)),
     };
     let close = store.transact(|tx| {
         tx.apply(&Effect::UpdateIntakeRun {
@@ -1169,7 +1251,7 @@ pub fn recover_intake(
     };
 
     Ok(RecoveryReport {
-        active_run: Some(run.run_id),
+        active_run: Some(run.run_id.clone()),
         outcome: RecoveryOutcome::Recovered { final_state },
         candidates_reconciled: reconciled,
     })

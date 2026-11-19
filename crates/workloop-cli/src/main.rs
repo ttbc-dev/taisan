@@ -4,6 +4,7 @@
 //! Queries — the CLI is a replaceable interface, not an authority.
 
 mod envelope;
+mod evidence;
 mod intake;
 mod run_loop;
 
@@ -269,6 +270,44 @@ enum Commands {
     Retention {
         #[command(subcommand)]
         command: RetentionCommands,
+    },
+    /// Read-only `rui-evidence/1` evidence queries over recorded
+    /// history: snapshot-pinned page export and exact artifact
+    /// retrieval. Never invokes a worker or refreshes a host.
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommands {
+    /// One page of the recorded-history export. `--after` resumes from
+    /// a committed checkpoint, `--cursor` continues an open page
+    /// sequence; both tokens are opaque strings from a prior page.
+    Export {
+        /// Committed checkpoint token from a completed export.
+        #[arg(long, conflicts_with = "cursor")]
+        after: Option<String>,
+        /// Page cursor from the previous page's `next_cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum records on this page (1..=500).
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+    },
+    /// Write one retained artifact's exact bytes to a new file after
+    /// digest verification. Refuses an existing destination.
+    Artifact {
+        /// Artifact id from a page's `artifacts` list.
+        #[arg(long)]
+        id: String,
+        /// Expected SHA-256 digest (64 lowercase hex characters).
+        #[arg(long)]
+        sha256: String,
+        /// New file to receive the exact retained bytes.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -811,9 +850,6 @@ fn run(cli: Cli) -> i32 {
                     "taisan: pass {passes_done}: {} phase(s)",
                     report.phases.len()
                 );
-                if let Some(driver) = intake_driver.as_mut() {
-                    driver.maybe_tick(&store, now());
-                }
                 if let Some(reason) = report.abort_reason() {
                     // Join a still-running invocation before exiting —
                     // otherwise its selector child is orphaned past the
@@ -826,6 +862,15 @@ fn run(cli: Cli) -> i32 {
                         envelope::ErrorClass::Store,
                         &reason,
                     ));
+                }
+                // A pass that aborted starts no new intake work — the
+                // invocation would only sit under finish()'s join on
+                // the error path. `--once` still evaluates scheduling:
+                // the startup-due intake is part of the one pass the
+                // run documents, joined by finish() before the terminal
+                // envelope.
+                if let Some(driver) = intake_driver.as_mut() {
+                    driver.maybe_tick(&store, now());
                 }
                 if once || (ticks != 0 && passes_done >= ticks) {
                     break;
@@ -842,9 +887,14 @@ fn run(cli: Cli) -> i32 {
                     let slice = remaining_ms.min(100);
                     std::thread::sleep(std::time::Duration::from_millis(slice));
                     remaining_ms -= slice;
+                    if shutdown_requested() {
+                        break;
+                    }
                     // The settings-check tick is 60 seconds regardless
                     // of the pass interval — evaluate it inside the
-                    // idle gap so a long interval cannot starve it.
+                    // idle gap so a long interval cannot starve it. A
+                    // shutdown observed inside the slice must not spawn
+                    // an invocation finish() then has to join.
                     if let Some(driver) = intake_driver.as_mut() {
                         driver.maybe_tick(&store, now());
                     }
@@ -1408,6 +1458,19 @@ fn run(cli: Cli) -> i32 {
                     envelope::ErrorClass::Store,
                     &e.to_string(),
                 )),
+            }
+        }
+        Commands::Evidence { command } => {
+            let actor_label = envelope::actor_label(&actor);
+            match command {
+                EvidenceCommands::Export {
+                    after,
+                    cursor,
+                    limit,
+                } => evidence::export(&store, &actor_label, after, cursor, limit),
+                EvidenceCommands::Artifact { id, sha256, output } => {
+                    evidence::artifact(&store, &actor_label, id, sha256, output)
+                }
             }
         }
         Commands::Retention { command } => {
