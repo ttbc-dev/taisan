@@ -576,15 +576,37 @@ pub fn run_pass(
                     let mut p = PhaseReport::completed(PHASES[3]);
                     p.processed = reconciled.examined + r.attempted;
                     p.deferred = deferred;
+                    // Intents the pass examined but cannot settle —
+                    // credential-blocked ones stay `pending` awaiting
+                    // repair, skipped ones reappear every pass — are
+                    // held with their recorded reason so a silent stall
+                    // is visible in the tick report.
+                    p.held = reconciled
+                        .credential_blocked
+                        .iter()
+                        .map(|b| format!("{}:{}", b.action_id, b.code))
+                        .chain(
+                            r.credential_blocked
+                                .iter()
+                                .map(|b| format!("{}:{}", b.action_id, b.code)),
+                        )
+                        .chain(
+                            r.skipped
+                                .iter()
+                                .map(|s| format!("{}:{}", s.action_id, s.reason)),
+                        )
+                        .collect();
                     p.reason = Some(format!(
-                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={}",
+                        "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={} credential_blocked={} skipped={}",
                         reconciled.applied,
                         reconciled.failed,
                         reconciled.still_unknown,
                         r.applied,
                         r.failed,
                         r.unknown,
-                        r.unsupported
+                        r.unsupported,
+                        reconciled.credential_blocked.len() + r.credential_blocked.len(),
+                        r.skipped.len()
                     ));
                     p
                 }

@@ -6,7 +6,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use workloop_core::domain::*;
+use workloop_core::identity::*;
+use workloop_core::observation::*;
 use workloop_core::ports::ProcessControlPort;
+use workloop_core::store::*;
 use workloop_exec::supervisor::PosixProcessControl;
 use workloop_store::retention::CatalogBody;
 use workloop_store::sqlite::{RunLeaseOwner, SqliteStore};
@@ -550,4 +554,97 @@ fn a_sigint_finishes_the_phase_boundary_and_exits_gracefully() {
         String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pending outbox intent the drain can never attempt — its Work has
+/// no Execution — must be visible in the phase-4 report's held list
+/// instead of silently stalling every pass.
+#[test]
+fn the_outbox_phase_surfaces_unattemptable_intents_as_held() {
+    let dir = root("outbox-held");
+    // The default installation denies `host_write`, which stops the
+    // drain before any item — grant it so the intent reaches attempt.
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "actor_id": "op",
+            "actor_kind": "human",
+            "host_instance": "host-local",
+            "repository": "local-repo",
+            "adapter": "fixture",
+            "contract_version": 1,
+            "capabilities": ["push_ref"],
+            "host_actors": { "publication": "fixture-agent" },
+            "host_credentials": {},
+            "required_checks": [],
+            "capacity": 1,
+            "worker_argv": [],
+            "workspace_root": dir.join("workspaces"),
+            "allowed_effects": {
+                "workspace_write": true,
+                "host_write": true,
+                "network": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    {
+        let store = store(&dir);
+        store
+            .transact(|tx| {
+                let repository = RepositoryRef::new(
+                    HostInstanceId::trusted("github.test"),
+                    RepositoryId::trusted("owner/repo"),
+                );
+                let action_id = tx.alloc_id("act")?;
+                let created_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertHostActionIntent {
+                    intent: HostActionIntent {
+                        action_id,
+                        work_id: WorkId("w-ghost".into()),
+                        host: HostInstanceId::trusted("github.test"),
+                        repository: repository.clone(),
+                        role: ActorRole::Publication,
+                        actor: HostActorRef {
+                            host: HostInstanceId::trusted("github.test"),
+                            actor: HostActorId::trusted("actor-1"),
+                        },
+                        action: HostAction::PushRef {
+                            branch: "work/w-ghost".into(),
+                            produced: CommitRevision::new(repository.clone(), "deadbeef").unwrap(),
+                            expected_prior: None,
+                        },
+                        payload_digest: "test".into(),
+                        status: HostActionStatus::Pending,
+                        authenticated_actor: None,
+                        effects: vec![],
+                        created_seq,
+                    },
+                })?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let out = run_cli(&dir, &["run", "--once"]);
+    assert!(
+        out.status.success(),
+        "run --once failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let store = store(&dir);
+    let report: serde_json::Value =
+        serde_json::from_str(&store.events("tick_report").unwrap()[0]).unwrap();
+    let outbox = &report["phases"][3];
+    assert_eq!(outbox["phase"], "host_outbox");
+    let held = outbox["held"].as_array().unwrap();
+    assert!(
+        held.iter()
+            .any(|h| h.as_str().unwrap().ends_with(":missing_execution")),
+        "the unroutable intent names its reason: {outbox}"
+    );
+    assert!(
+        outbox["reason"].as_str().unwrap().contains("skipped=1"),
+        "{outbox}"
+    );
 }
