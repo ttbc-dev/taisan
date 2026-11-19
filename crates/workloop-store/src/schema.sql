@@ -1,12 +1,14 @@
--- workloop v10 store: current-state tables enforcing structural
+-- workloop v11 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 10` marks the format; a stamped older file with
+-- `PRAGMA user_version = 11` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
 -- candidate tables specified in docs/intake-identity-storage.md; v9
 -- added the intake_settings admission record (#213); v10 added the
--- recovery_intents.retirement_generation column (#139).
+-- recovery_intents.retirement_generation column (#139); v11 added the
+-- worker_request_bodies canonical v2 request-body record (docs/v0.3.md,
+-- #256).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,

@@ -370,9 +370,13 @@ pub struct WorkerRequestBody {
 }
 
 impl WorkerRequestBody {
-    /// The recorded digest recomputed over the stored body — `false`
-    /// marks a corrupt row the reader must refuse to launch from.
+    /// The recorded format and digest re-checked over the stored body
+    /// — `false` marks a corrupt or non-v2 row the reader must refuse
+    /// to launch from.
     pub fn verifies(&self) -> bool {
+        if self.format_version != WORKER_REQUEST_V2_FORMAT {
+            return false;
+        }
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.canonical_body) else {
             return false;
         };
@@ -490,12 +494,21 @@ fn check_tagged_members(request: &serde_json::Value) -> Result<(), RequestInvali
 
 impl WorkerRequestV2 {
     /// Canonical body bytes with `request_digest` omitted — the exact
-    /// bytes the durable body row stores.
+    /// bytes [`Self::digest`] covers. These are not the stored body:
+    /// the durable row and the worker's wire body are
+    /// [`Self::to_canonical_bytes`], which carry the digest member.
     pub fn canonical_body(&self) -> Vec<u8> {
         canonical_minus(
             &serde_json::to_value(self).expect("request serializes"),
             "request_digest",
         )
+    }
+
+    /// The full canonical request bytes — `request_digest` member
+    /// included — exactly what the durable body row stores and what
+    /// [`Self::parse`] accepts on verbatim replay.
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("request serializes"))
     }
 
     /// The digest of this request's canonical body.
@@ -1165,6 +1178,33 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{kind} round-trip failed: {e}"));
             assert_eq!(parsed.task, draft.task, "{kind}");
         }
+    }
+
+    /// The durable body stores `to_canonical_bytes` — digest member
+    /// included — and verbatim replay parses it; `WorkerRequestBody`
+    /// verification covers both the digest and the format version.
+    #[test]
+    fn the_durable_body_round_trips_with_its_digest() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.request_digest = request.digest();
+        let bytes = request.to_canonical_bytes();
+        let parsed = WorkerRequestV2::parse(&bytes).expect("stored bytes parse on replay");
+        assert_eq!(parsed.request_digest, request.request_digest);
+
+        let body = WorkerRequestBody {
+            request_id: request.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: request.digest(),
+        };
+        assert!(body.verifies());
+
+        let mut tampered = body.clone();
+        tampered.canonical_body = b"{}".to_vec();
+        assert!(!tampered.verifies(), "a tampered body reads as corrupt");
+        let mut foreign = body.clone();
+        foreign.format_version = "taisan.worker.request/9".into();
+        assert!(!foreign.verifies(), "a non-v2 row reads as corrupt");
     }
 
     #[test]

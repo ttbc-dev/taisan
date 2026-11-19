@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `10` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `9`
+//! `PRAGMA user_version` is the format gate: `11` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `10`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -1660,14 +1660,25 @@ impl ReadView for Tx<'_> {
         &self,
         request_id: &str,
     ) -> Result<Option<workloop_core::worker_v2::WorkerRequestBody>, StoreError> {
-        self.query_opt(
+        let body = self.query_opt(
             &format!(
                 "SELECT {WORKER_REQUEST_BODY_COLS} FROM worker_request_bodies \
                  WHERE request_id=?1"
             ),
             params![request_id],
             worker_request_body_from_row,
-        )
+        )?;
+        // The durable body is replayed verbatim, so the read re-checks
+        // the recorded format and digest: a tampered or foreign-version
+        // row is corrupt, never replayable — and never silently absent,
+        // which would downgrade the dispatch onto the legacy v1 path.
+        match body {
+            Some(body) if body.verifies() => Ok(Some(body)),
+            Some(_) => Err(StoreError::Internal {
+                detail: format!("worker request body {request_id} failed integrity verification"),
+            }),
+            None => Ok(None),
+        }
     }
 
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {

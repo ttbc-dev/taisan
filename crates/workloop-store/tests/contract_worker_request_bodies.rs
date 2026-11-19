@@ -135,11 +135,18 @@ fn body(request_id: &str, goal: &str) -> WorkerRequestBody {
     let canonical = format!(
         "{{\"format_version\":\"taisan.worker.request/2\",\"goal\":\"{goal}\",\"request_id\":\"{request_id}\"}}"
     );
+    // The recorded digest is the real `request_v2_digest` over the
+    // stored body minus `request_digest` — the read path re-verifies
+    // it, so fixture bodies must carry a genuine digest.
+    let mut value: serde_json::Value = serde_json::from_slice(canonical.as_bytes()).unwrap();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("request_digest");
+    }
     WorkerRequestBody {
         request_id: request_id.into(),
         format_version: "taisan.worker.request/2".into(),
         canonical_body: canonical.into_bytes(),
-        body_digest: format!("digest-of-{goal}"),
+        body_digest: workloop_core::worker_v2::request_v2_digest(&canonical_json(&value)),
     }
 }
 
@@ -343,5 +350,61 @@ fn a_truncated_v10_store_is_still_refused() {
         matches!(err, StoreError::UnsupportedFormat { .. }),
         "the refusal names the format, not a missing table: {err:?}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A tampered or foreign-version body row reads as corrupt — the
+/// verbatim replay path is never handed bytes that fail verification,
+/// and the row is not silently reported absent (which would downgrade
+/// the dispatch onto the legacy v1 path).
+#[test]
+fn a_tampered_body_reads_as_corrupt() {
+    let root = temp_root("tampered-body");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-tamper");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1 WHERE request_id=?2",
+            rusqlite::params![b"{}".to_vec(), request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a tampered body is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
+    );
+
+    // A foreign format version fails the same gate.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE worker_request_bodies SET format_version='taisan.worker.request/9', \
+             canonical_body=?1, body_digest=?2 WHERE request_id=?3",
+            rusqlite::params![
+                body(&request_id, "verifiable").canonical_body,
+                body(&request_id, "verifiable").body_digest,
+                request_id
+            ],
+        )
+        .unwrap();
+    }
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(&request_id))
+            .is_err(),
+        "a non-v2 body row is corrupt"
+    );
+    drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
