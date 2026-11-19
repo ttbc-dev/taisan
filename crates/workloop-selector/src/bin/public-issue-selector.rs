@@ -45,8 +45,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workloop_core::domain::{canonical_json, sha256_hex};
-use workloop_core::identity::{AdapterId, IssueId, IssueRef, RepositoryRef};
+use workloop_core::identity::{
+    AdapterId, IssueId, IssueRef, RepositoryRef, canonical_host_instance,
+};
 use workloop_selector::collect::{
     self, CollectedIssue, CollectionBounds, IssuePage, RepositoryReport, ScanStatus,
     SourceReadError, SourceReader,
@@ -469,8 +470,10 @@ impl SourceReader for FileSourceReader {
 ///
 /// `gh api` always resolves against github.com, so the backend can
 /// only serve repositories whose host instance the operator declared
-/// as the github.com endpoint — anything else fails closed instead of
-/// silently scanning github.com under a foreign scope.
+/// as a github.com endpoint — anything else fails closed instead of
+/// silently scanning github.com under a foreign scope. The comparison
+/// is over canonical host instances: `https://api.github.com` and
+/// `github.com` name the same instance.
 struct GhSourceReader {
     endpoints: BTreeSet<String>,
 }
@@ -508,7 +511,16 @@ impl SourceReader for GhSourceReader {
         cursor: Option<&str>,
         page_size: usize,
     ) -> Result<IssuePage, SourceReadError> {
-        if !self.endpoints.contains(repository.host.as_str()) {
+        // Scope is an identity comparison, not a transport string
+        // match: `canonical_host_instance` reduces a profile endpoint
+        // (`https://api.github.com`) and the installation-side identity
+        // (`github.com`) to the same host instance.
+        let requested = canonical_host_instance(repository.host.as_str());
+        let declared = self
+            .endpoints
+            .iter()
+            .any(|e| canonical_host_instance(e) == requested);
+        if !declared {
             return Err(SourceReadError::Unavailable {
                 reason: "repository host is not a declared github.com endpoint".into(),
             });
@@ -595,6 +607,14 @@ fn gh_issue(
         .and_then(|v| v.as_str())
         .ok_or_else(|| malformed("issue has no title"))?
         .to_string();
+    // `body` is required task content but nullable on the wire: an
+    // absent or null body digests as the empty string, matching the
+    // authoritative re-read on the bridge side.
+    let body = object
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let created_at = object
         .get("created_at")
         .and_then(|v| v.as_str())
@@ -640,6 +660,15 @@ fn gh_issue(
         }
         None => return Err(malformed("issue has no state")),
     };
+    // The digest binds the exact read: a content change produces a
+    // different digest and therefore a different proposal identity.
+    // It is the shared issue-content convention (`s1-issue-v1` over
+    // `title\nbody`) so the
+    // authoritative re-read at execution computes the same value
+    // for an unchanged Issue — a selector-specific digest here
+    // would make every admitted Work look `Changed` at the source
+    // gate.
+    let content_digest = workloop_selector::issue_content_digest(&title, &body);
     Ok(CollectedIssue {
         issue,
         state: issue_state,
@@ -647,9 +676,7 @@ fn gh_issue(
         created_unix_seconds: created_at,
         title,
         revision,
-        // The digest binds the exact read: a content change produces a
-        // different digest and therefore a different proposal identity.
-        content_digest: sha256_hex("gh-issue-v1", &canonical_json(value)),
+        content_digest,
     })
 }
 

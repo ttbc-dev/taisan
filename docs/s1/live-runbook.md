@@ -296,7 +296,8 @@ never reuse.
 
 Expected: pretty JSON `{issue, source_revision, content_digest, state:
 "open"}`, exit 0. `source_revision` is the host's `updatedAt` token;
-`content_digest` is the tagged sha256 of `title\nbody`. These are the
+`content_digest` is the canonical issue-content digest —
+`s1-issue-v1` over `title\nbody` — the same function the selector binds at admission. These are the
 exact `--issue-revision`/`--issue-digest` values `submit` requires — the
 CLI never fabricates them. A non-zero exit or `state != "open"` stops
 the run.

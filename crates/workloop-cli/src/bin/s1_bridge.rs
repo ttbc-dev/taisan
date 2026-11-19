@@ -117,10 +117,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The S1 issue identity convention: `source_revision` is the host's
-/// `updatedAt` token; `content_digest` is the tagged sha256 of
-/// `title\nbody`. Both are real reads — the bridge recomputes them on
-/// every source poll, so an edited issue surfaces as `changed`.
+/// The issue identity convention shared with the selector side:
+/// `source_revision` is the host's `updatedAt` token; `content_digest`
+/// is the canonical issue-content digest — `s1-issue-v1` over
+/// `title\nbody` (`workloop_selector::issue_content_digest`). Both are real reads —
+/// the bridge recomputes them on every source poll, so an edited issue
+/// surfaces as `changed` while an unchanged one matches the spec the
+/// admitting selector bound.
 fn issue_identity(repo: &str, number: u64) -> Result<(String, String, IssueState, u64), String> {
     let v = gh_json(&[
         "issue",
@@ -134,7 +137,7 @@ fn issue_identity(repo: &str, number: u64) -> Result<(String, String, IssueState
     let revision = v["updatedAt"].as_str().unwrap_or_default().to_string();
     let title = v["title"].as_str().unwrap_or_default();
     let body = v["body"].as_str().unwrap_or_default();
-    let digest = sha256_hex("s1-issue-v1", format!("{title}\n{body}").as_bytes());
+    let digest = workloop_selector::issue_content_digest(title, body);
     let state = match v["state"].as_str().unwrap_or("") {
         "CLOSED" => IssueState::Closed,
         _ => IssueState::Open,

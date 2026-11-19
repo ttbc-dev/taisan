@@ -92,11 +92,79 @@ opaque_id!(AdapterId, "adapter_id");
 // (`credential` module), so Core stores the reference unparsed.
 opaque_id!(CredentialRef, "credential_ref");
 
+/// Canonical host-instance identity for an endpoint string or a bare
+/// host name. Intake profiles bind `hosts.<key>.endpoint` (a URL like
+/// `https://api.github.com`) as the identity of the repositories behind
+/// it, while installation records and manual submission name the host
+/// instance directly (`github.com`). Without normalization the same
+/// repository exists under two host identities — claims, dedupe, and
+/// source-gate lookups then treat one real Issue as two.
+///
+/// The canonical form is the lowercase authority — `host` or
+/// `host:port`. Scheme (matched case-insensitively), userinfo,
+/// path, query, fragment, and a scheme-default port (`:443` on
+/// `https`, `:80` on `http`) are transport spelling and take no
+/// part; a non-default port stays because two instances on one
+/// hostname at different ports are different services, and a changed
+/// endpoint must never reuse an existing host-instance identity
+/// (docs/identity-storage.md). The public GitHub API endpoint reduces
+/// to `github.com`: that equivalence is endpoint data every identity
+/// comparison in this workspace converges on — admission, durable
+/// claims, and the source gate — and it is recorded here rather than
+/// injected from an adapter crate, which could never reach Core or the
+/// store (both sit below every adapter in the dependency graph).
+/// Provider endpoint aliases beyond the public GitHub pair belong to
+/// the adapter boundary, not here.
+pub fn canonical_host_instance(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("", trimmed));
+    // The authority ends at the first path, query, or fragment
+    // delimiter; userinfo never enters host identity — an endpoint
+    // carrying credentials must not persist them into durable
+    // records.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = match scheme.as_str() {
+        "https" if host_port.ends_with(":443") => &host_port[..host_port.len() - 4],
+        "http" if host_port.ends_with(":80") => &host_port[..host_port.len() - 3],
+        _ => host_port,
+    };
+    match authority.to_ascii_lowercase().as_str() {
+        "api.github.com" => "github.com".to_string(),
+        host => host.to_string(),
+    }
+}
+
 /// Repository identity `(host_instance, repository_id)`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct RepositoryRef {
     pub host: HostInstanceId,
     pub repository: RepositoryId,
+}
+
+// Deserialization canonicalizes the host half: durable records and
+// snapshots written before host-instance unification may carry raw
+// endpoint spellings, and every reader must see the one canonical
+// identity — the same reduction admission, claims, and the source
+// gate apply. The repository id still compares exactly. Serialization
+// is unchanged: a read-then-written record converges to the canonical
+// spelling on its next persist.
+impl<'de> Deserialize<'de> for RepositoryRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            host: HostInstanceId,
+            repository: RepositoryId,
+        }
+        let raw = Raw::deserialize(d)?;
+        let host =
+            HostInstanceId::new(canonical_host_instance(raw.host.as_str())).unwrap_or(raw.host);
+        Ok(Self {
+            host,
+            repository: raw.repository,
+        })
+    }
 }
 
 impl RepositoryRef {
@@ -567,6 +635,60 @@ impl SourceGate {
 mod tests {
     use super::*;
 
+    /// Endpoint spellings and bare host names must reduce to one host
+    /// instance: `https://api.github.com` (profile endpoint) and
+    /// `github.com` (installation host instance) are the same instance,
+    /// and non-URL identities pass through unchanged.
+    #[test]
+    fn endpoint_spellings_reduce_to_one_host_instance() {
+        assert_eq!(
+            canonical_host_instance("https://api.github.com"),
+            "github.com"
+        );
+        assert_eq!(canonical_host_instance("api.github.com"), "github.com");
+        assert_eq!(canonical_host_instance("https://github.com"), "github.com");
+        assert_eq!(canonical_host_instance("github.com"), "github.com");
+        assert_eq!(
+            canonical_host_instance("https://GHE.corp.example/api/v3"),
+            "ghe.corp.example"
+        );
+        // A non-default port is part of the instance identity: two
+        // services on one hostname at different ports never collapse.
+        assert_eq!(
+            canonical_host_instance("https://ghe.corp.example:8443"),
+            "ghe.corp.example:8443"
+        );
+        // Scheme-default ports are transport spelling, not identity.
+        assert_eq!(
+            canonical_host_instance("https://ghe.corp.example:443"),
+            "ghe.corp.example"
+        );
+        assert_eq!(
+            canonical_host_instance("http://ghe.corp.example:80"),
+            "ghe.corp.example"
+        );
+        assert_eq!(
+            canonical_host_instance("https://api.github.com:443"),
+            "github.com"
+        );
+        // Userinfo, query, fragment, and scheme case are transport
+        // spelling too — and credentials must never reach durable
+        // host identity.
+        assert_eq!(
+            canonical_host_instance("https://token@api.github.com"),
+            "github.com"
+        );
+        assert_eq!(
+            canonical_host_instance("https://api.github.com?x=1"),
+            "github.com"
+        );
+        assert_eq!(
+            canonical_host_instance("HTTPS://api.github.com:443"),
+            "github.com"
+        );
+        assert_eq!(canonical_host_instance("host-local"), "host-local");
+    }
+
     /// Identity, ordering, and bucketing must not split on display
     /// metadata: a renumbered or absent display number still names the
     /// same issue and the same change request.
@@ -629,5 +751,20 @@ mod tests {
             .is_err()
         );
         assert!(HostBinding::new(AdapterId::trusted("fixture"), repository, 1, [], actors).is_ok());
+    }
+
+    /// Deserialization reduces a raw endpoint spelling to the canonical
+    /// host-instance identity every durable reader shares; the
+    /// repository id and non-default ports are untouched.
+    #[test]
+    fn repository_ref_deserialization_canonicalizes_the_host() {
+        let spelled: RepositoryRef =
+            serde_json::from_str(r#"{"host":"https://api.github.com","repository":"repo-a"}"#)
+                .unwrap();
+        assert_eq!(spelled.host.as_str(), "github.com");
+        assert_eq!(spelled.repository.as_str(), "repo-a");
+        let kept: RepositoryRef =
+            serde_json::from_str(r#"{"host":"ghe.example:8443","repository":"repo-a"}"#).unwrap();
+        assert_eq!(kept.host.as_str(), "ghe.example:8443");
     }
 }

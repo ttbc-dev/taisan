@@ -82,7 +82,7 @@ Each candidate is the existing Proposal shape, `#/$defs/proposal`:
 | --- | --- |
 | `key` | Recomputed semantic digest described below |
 | `selector`, `selector_version`, `policy_revision` | Must equal the request's values |
-| `sources` | Complete nonempty group of `SourceBinding` objects. Each has an `issue`, its exact source `revision`, and `content_digest` |
+| `sources` | Complete nonempty group of `SourceBinding` objects. Each has an `issue`, its exact source `revision`, and `content_digest`. For a GitHub Issue the digest is the canonical issue-content digest — `s1-issue-v1` over `title\nbody` (`workloop_selector::issue_content_digest`) — the same convention the authoritative re-read at execution uses, or every admitted Work reads `Changed` at the source gate |
 | `task.intent` | One explicit intent for the whole Work, supplied by the adapter |
 | `task.constraints` | Sorted distinct constraints, including every request `task_constraints` entry. The adapter may add constraints |
 | `task.verification_argv` | Must equal the request's ordered argv exactly |

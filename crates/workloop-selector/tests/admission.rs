@@ -388,6 +388,48 @@ fn a_stale_source_read_holds_the_work_for_reapproval() {
 /// as explicit data, so there is nothing to translate. Combined with
 /// the overlap and capability tests, the selector path cannot bypass
 /// allowlist, admission, or idempotency.
+/// A snapshot fact carrying a raw endpoint spelling names the same
+/// host instance as the canonical allowlist entry — `propose`
+/// normalizes host identity before comparing, so the Issue is
+/// eligible rather than silently skipped as not-allowlisted, and the
+/// emitted proposal carries the canonical identity admission records.
+#[test]
+fn an_endpoint_spelled_fact_matches_the_canonical_allowlist() {
+    let spelled = IssueRef {
+        repository: RepositoryRef::new(
+            HostInstanceId::trusted("https://api.github.com"),
+            RepositoryId::trusted("local-repo"),
+        ),
+        issue: IssueId::trusted("7"),
+        display_number: Some(7),
+    };
+    let set = propose(
+        &selector(),
+        &SelectorSnapshot {
+            issues: vec![fact(spelled, "rev-1", "digest-1", "endpoint spelled")],
+            ..SelectorSnapshot::default()
+        },
+        &SelectionPolicy {
+            allowlist: BTreeSet::from([RepositoryRef::new(
+                HostInstanceId::trusted("github.com"),
+                RepositoryId::trusted("local-repo"),
+            )]),
+            ..policy(&[])
+        },
+    );
+    assert!(
+        set.skipped.is_empty(),
+        "the spelled fact must not be skipped: {:?}",
+        set.skipped
+    );
+    assert_eq!(set.proposals.len(), 1);
+    assert_eq!(
+        set.proposals[0].sources[0].issue.repository.host.as_str(),
+        "github.com",
+        "the proposal carries the canonical identity admission records"
+    );
+}
+
 #[test]
 fn an_unallowlisted_source_is_refused_before_any_command() {
     let set = propose(

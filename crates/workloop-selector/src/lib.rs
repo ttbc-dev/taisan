@@ -34,7 +34,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use workloop_core::domain::{canonical_json, sha256_hex};
-use workloop_core::identity::{AdapterId, IssueRef, RepositoryRef};
+use workloop_core::identity::{
+    AdapterId, HostInstanceId, IssueRef, RepositoryRef, canonical_host_instance,
+};
 
 /// The semantic version this reference selector stamps on its
 /// proposals — part of proposal identity, so a semantic change to what
@@ -66,6 +68,24 @@ pub struct IssueFact {
 pub enum IssueState {
     Open,
     Closed,
+}
+
+/// The canonical Issue-content digest: `sha256` of `title\nbody` under
+/// the `s1-issue-v1` tag — the tag the bridge persisted into spec
+/// snapshots before this contract existed. Spec snapshots store the
+/// digest verbatim and the source gate compares it exactly, so the tag
+/// is retained: re-tagging would force every in-flight Work approved
+/// under the bridge's convention to read `Changed` once after upgrade.
+/// Every boundary that binds an Issue read into a
+/// [`IssueFact::content_digest`], a proposal `SourceBinding`, or a
+/// spec `SourceSnapshot` — and every adapter that performs the
+/// authoritative re-read the source gate compares against — must use
+/// this one function. Two different digest rules over the same Issue
+/// make every selector-admitted Work look `Changed` at the gate.
+/// `revision` (the host's own update marker) and lifecycle `state`
+/// travel separately and never enter the content digest.
+pub fn issue_content_digest(title: &str, body: &str) -> String {
+    sha256_hex("s1-issue-v1", format!("{title}\n{body}").as_bytes())
 }
 
 /// The snapshot/cursor of available source facts a selector run sees.
@@ -216,16 +236,43 @@ pub struct ProposalSet {
 ///
 /// Pure and total — no store, clock, or I/O; an empty or all-refused
 /// snapshot yields an empty `proposals`, never an error.
+/// Reduce a fact's repository host to canonical host-instance
+/// identity before any comparison — the allowlist and exclusions are
+/// built from the installation's canonical host, and admission
+/// applies the same reduction, so a raw endpoint spelling must not
+/// fork the Issue's identity here (or in dedup).
+fn canonical_issue(issue: &IssueRef) -> IssueRef {
+    let Ok(host) = HostInstanceId::new(canonical_host_instance(issue.repository.host.as_str()))
+    else {
+        return issue.clone();
+    };
+    IssueRef {
+        repository: RepositoryRef::new(host, issue.repository.repository.clone()),
+        ..issue.clone()
+    }
+}
+
 pub fn propose(
     selector: &AdapterId,
     snapshot: &SelectorSnapshot,
     policy: &SelectionPolicy,
 ) -> ProposalSet {
+    // Facts are normalized to canonical host identity up front: the
+    // allowlist, exclusions, dedup, and the emitted proposal all see
+    // one spelling of the same Issue.
+    let normalized: Vec<IssueFact> = snapshot
+        .issues
+        .iter()
+        .map(|fact| IssueFact {
+            issue: canonical_issue(&fact.issue),
+            ..fact.clone()
+        })
+        .collect();
     // Dedup by Issue identity: identical repeated facts collapse; two
     // facts claiming one identity with different content conflict.
     let mut facts: BTreeMap<&IssueRef, &IssueFact> = BTreeMap::new();
     let mut conflicts: BTreeSet<&IssueRef> = BTreeSet::new();
-    for fact in &snapshot.issues {
+    for fact in &normalized {
         // A recorded conflict is a property of the snapshot read, not of
         // pairwise order: once two facts disagree on an identity, no
         // later matching fact can re-admit it.
@@ -435,4 +482,21 @@ fn semantic_payload(
         },
         "required_permissions": required_permissions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The digest tag is the bridge's persisted convention: spec
+    /// snapshots store `content_digest` verbatim and the source gate
+    /// compares it exactly, so `issue_content_digest` must keep
+    /// producing the `s1-issue-v1` values pre-upgrade stores recorded.
+    #[test]
+    fn the_digest_keeps_the_persisted_tag() {
+        assert_eq!(
+            issue_content_digest("a title", "a body"),
+            sha256_hex("s1-issue-v1", "a title\na body".as_bytes())
+        );
+    }
 }

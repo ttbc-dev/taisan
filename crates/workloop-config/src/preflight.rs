@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use workloop_core::credential::CredentialProvider;
-use workloop_core::identity::ActorRole;
+use workloop_core::identity::{ActorRole, canonical_host_instance};
 use workloop_core::ports::{CapabilityRead, IdentityRead, ObservedIdentity, ProbePort};
 use workloop_core::worker::{DEFAULT_ISOLATION_PROFILE_ID, isolation_profile};
 
@@ -611,7 +611,10 @@ fn stage_identity_tuples(profile: &Profile) -> Vec<Diagnostic> {
             ));
         }
         let endpoint = host.endpoint.as_deref().unwrap_or_default();
-        if evidence.host_instance != endpoint {
+        // Host-instance identity compares in canonical form: evidence
+        // recorded under either the endpoint or the bare-host spelling
+        // names the same instance (docs/identity-storage.md).
+        if canonical_host_instance(&evidence.host_instance) != canonical_host_instance(endpoint) {
             diagnostics.push(Diagnostic::new(
                 "identity.evidence_mismatch",
                 format!("{key}.host_instance"),
@@ -1524,7 +1527,9 @@ fn stage_probe(
                 ),
             )];
         }
-        if observed.host_instance != endpoint || observed.repository != repository {
+        if canonical_host_instance(&observed.host_instance) != canonical_host_instance(&endpoint)
+            || observed.repository != repository
+        {
             return vec![Diagnostic::new(
                 "identity.context_mismatch",
                 format!("identity_evidence.{role_name}"),
@@ -1667,7 +1672,10 @@ fn refresh_identity_evidence(
             .ok_or_else(|| format!("identity_evidence.{role_name}: table expected"))?;
         let fields = [
             ("login", observed.login.clone()),
-            ("host_instance", observed.host_instance.clone()),
+            (
+                "host_instance",
+                canonical_host_instance(&observed.host_instance),
+            ),
             ("repository", observed.repository.clone()),
         ];
         for (field, value) in fields {
@@ -2022,7 +2030,9 @@ fn validate_spec(spec: &InitSpec) -> Result<(), String> {
                     observation.login, role.role, role.actor
                 ));
             }
-            if observation.host_instance != host.endpoint {
+            if canonical_host_instance(&observation.host_instance)
+                != canonical_host_instance(&host.endpoint)
+            {
                 return Err(format!(
                     "init: observed host instance '{}' for role '{}' does not match its declared endpoint '{}'",
                     observation.host_instance, role.role, host.endpoint
@@ -2132,7 +2142,7 @@ fn render(spec: &InitSpec) -> Result<String, String> {
         table.insert("login".into(), Value::String(observation.login.clone()));
         table.insert(
             "host_instance".into(),
-            Value::String(observation.host_instance.clone()),
+            Value::String(canonical_host_instance(&observation.host_instance)),
         );
         table.insert(
             "repository".into(),

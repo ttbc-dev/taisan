@@ -14,7 +14,8 @@ use crate::command::{
 use crate::domain::*;
 use crate::identity::{
     ActorRole, CommitRevision, DiffTarget, EvidenceRef, HostActorRef, HostBinding, HostCapability,
-    IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
+    HostInstanceId, IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
+    canonical_host_instance,
 };
 use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
@@ -696,6 +697,29 @@ fn decide_submit(
     constraints: &[String],
     verification_argv: &[Vec<String>],
 ) -> Verdict {
+    // Host-instance identity is canonicalized once, at admission, before
+    // any claim check or spec binding: the selector path derives source
+    // repositories from profile endpoints (`https://api.github.com`)
+    // while manual submission binds the installation's host instance
+    // (`github.com`), and adapters may hand in either spelling. Without
+    // a single canonical form here, one real Issue exists under two
+    // identities and claims, dedupe, and the source gate diverge.
+    // Claims and membership persisted before this canonicalization keep
+    // their original spelling; the store's claim and owner reads apply
+    // the same canonical form, so an upgraded store enforces the same
+    // one-Issue-one-claim rule.
+    let canonical_sources: Vec<SourceSnapshot> = sources
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            let canonical = canonical_host_instance(s.issue.repository.host.as_str());
+            if !canonical.is_empty() {
+                s.issue.repository.host = HostInstanceId::trusted(canonical);
+            }
+            s
+        })
+        .collect();
+    let sources = &canonical_sources[..];
     // Capability guard: the binding's required set must be declared as
     // supported by this installation. An undeclared capability can never
     // silently authorize an effect later.
@@ -2502,7 +2526,11 @@ fn capability_state(
             host: report_host,
             capabilities,
         } = &o.fact
-            && report_host == host
+            // Reports persisted before unification may carry raw
+            // endpoint spellings; the comparison is on canonical
+            // host-instance identity, not transport spelling.
+            && canonical_host_instance(report_host.as_str())
+                == canonical_host_instance(host.as_str())
         {
             for entry in capabilities {
                 if &entry.capability == capability {

@@ -34,6 +34,7 @@ use workloop_core::credential::CredentialProvider;
 use workloop_core::domain::{canonical_json, sha256_hex};
 use workloop_core::identity::{
     ActorRole, AdapterId, HostActorId, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
+    canonical_host_instance,
 };
 use workloop_core::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
@@ -225,7 +226,10 @@ pub struct IdentityEvidence {
     /// role's `actor` — the bound identity is the verified adapter-side
     /// identity, never a display alias.
     pub login: String,
-    /// Observed host instance identity (the role's host endpoint).
+    /// Observed host instance identity — the canonical host instance
+    /// derived from the role's host endpoint (`https://api.github.com`
+    /// records `github.com`); comparisons canonicalize both sides, so
+    /// evidence written under either spelling names the same instance.
     pub host_instance: String,
     /// Observed repository stable id, declared under the role's host.
     pub repository: String,
@@ -1054,14 +1058,17 @@ impl Profile {
     /// publication, so a publication intent aimed at one is refused
     /// structurally before any adapter call.
     ///
-    /// The host half is the host instance identity — the declared
-    /// `endpoint`, never the local `[hosts.<alias>]` table key. Host
-    /// identity is distinct from a display alias and a changed
-    /// endpoint cannot reuse it (docs/identity-storage.md), so two
-    /// aliases on one endpoint name one target and a retargeted alias
-    /// names a different one. A host without an endpoint (impossible
-    /// after validation) contributes no target; the alias is never
-    /// substituted, and duplicate identity pairs collapse.
+    /// The host half is the declared `endpoint` itself — the transport
+    /// destination publication binds to, never the local
+    /// `[hosts.<alias>]` table key. A changed endpoint names a
+    /// different target (docs/identity-storage.md), so two aliases on
+    /// one endpoint collapse to one target and a retargeted alias
+    /// names a different one. This is endpoint identity, not the
+    /// canonical host-instance identity [`Self::source_repositories`]
+    /// derives — the two APIs answer different questions. A host
+    /// without an endpoint (impossible after validation) contributes
+    /// no target; the alias is never substituted, and duplicate
+    /// identity pairs collapse.
     pub fn publication_targets(&self) -> Vec<(String, String)> {
         let mut targets = std::collections::BTreeSet::new();
         for host in self.hosts.values() {
@@ -1082,13 +1089,19 @@ impl Profile {
     /// The intake request's complete repository scope: every
     /// repository the installation can read source issues from —
     /// `use = "source"` entries plus `use = "publication"` entries,
-    /// which imply source reads. The host half is the host instance
-    /// identity (the declared `endpoint`), exactly as
-    /// [`Self::publication_targets`] resolves it; a host without an
-    /// endpoint contributes nothing. The result is sorted and
-    /// deduplicated — the selector protocol requires a unique sorted
-    /// allowlist, and identity collisions collapse rather than
-    /// duplicating.
+    /// which imply source reads. The host half is the canonical
+    /// host-instance identity derived from the declared `endpoint`
+    /// (`https://api.github.com` → `github.com`), so intake-bound
+    /// repositories share identity with the same repository named by
+    /// an installation record or `submit --issue` — one Issue, one
+    /// claim. This is deliberately not the pair
+    /// [`Self::publication_targets`] returns: that API keys on the
+    /// declared endpoint because a publication target is a transport
+    /// destination, while this scope is a set of durable identities.
+    /// A host without an endpoint contributes nothing. The result is
+    /// sorted and deduplicated — the selector protocol requires a
+    /// unique sorted allowlist, and identity collisions collapse
+    /// rather than duplicating.
     ///
     /// This is derived, never configured: the profile's repository
     /// bindings *are* the intake scope, so the request can never
@@ -1099,8 +1112,13 @@ impl Profile {
             let Some(endpoint) = &host.endpoint else {
                 continue;
             };
-            let host_instance =
-                HostInstanceId::new(endpoint.clone()).map_err(|e| format!("host endpoint: {e}"))?;
+            // The endpoint is transport detail; the bound host identity
+            // is its canonical instance (`https://api.github.com` →
+            // `github.com`) so intake-bound repositories share identity
+            // with the same repository named by an installation record
+            // or `submit --issue` — one Issue, one claim.
+            let host_instance = HostInstanceId::new(canonical_host_instance(endpoint))
+                .map_err(|e| format!("host endpoint: {e}"))?;
             for repository in &host.repositories {
                 // `use` was validated at load into the closed set
                 // {"source", "publication"}; both grant source reads,
