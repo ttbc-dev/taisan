@@ -380,7 +380,16 @@ impl WorkerRequestBody {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.canonical_body) else {
             return false;
         };
-        self.body_digest == request_v2_digest(&canonical_minus(&value, "request_digest"))
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        // `request_digest` is excluded from its own digest, so the
+        // embedded member is re-checked explicitly — a row whose
+        // digest member alone was altered reads as corrupt here, not
+        // only when the body is parsed for launch.
+        self.body_digest == digest
+            && value
+                .get("request_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(digest.as_str())
     }
 }
 
@@ -1198,6 +1207,19 @@ mod tests {
             body_digest: request.digest(),
         };
         assert!(body.verifies());
+
+        // The embedded `request_digest` member is excluded from its
+        // own digest, so altering that member alone must still read
+        // as corrupt — the gate re-checks it explicitly.
+        let mut member_tampered = body.clone();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&member_tampered.canonical_body).unwrap();
+        value["request_digest"] = serde_json::Value::String("0".repeat(64));
+        member_tampered.canonical_body = canonical_json(&value);
+        assert!(
+            !member_tampered.verifies(),
+            "a tampered digest member reads as corrupt"
+        );
 
         let mut tampered = body.clone();
         tampered.canonical_body = b"{}".to_vec();

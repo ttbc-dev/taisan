@@ -137,16 +137,25 @@ fn body(request_id: &str, goal: &str) -> WorkerRequestBody {
     );
     // The recorded digest is the real `request_v2_digest` over the
     // stored body minus `request_digest` — the read path re-verifies
-    // it, so fixture bodies must carry a genuine digest.
+    // it, so fixture bodies must carry a genuine digest. The embedded
+    // member carries that same digest: it is excluded from its own
+    // hash, so the read gate re-checks it explicitly.
     let mut value: serde_json::Value = serde_json::from_slice(canonical.as_bytes()).unwrap();
     if let Some(map) = value.as_object_mut() {
         map.remove("request_digest");
     }
+    let digest = workloop_core::worker_v2::request_v2_digest(&canonical_json(&value));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "request_digest".into(),
+            serde_json::Value::String(digest.clone()),
+        );
+    }
     WorkerRequestBody {
         request_id: request_id.into(),
         format_version: "taisan.worker.request/2".into(),
-        canonical_body: canonical.into_bytes(),
-        body_digest: workloop_core::worker_v2::request_v2_digest(&canonical_json(&value)),
+        canonical_body: canonical_json(&value),
+        body_digest: digest,
     }
 }
 
@@ -404,6 +413,44 @@ fn a_tampered_body_reads_as_corrupt() {
             .transact(|tx| tx.worker_request_body(&request_id))
             .is_err(),
         "a non-v2 body row is corrupt"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `request_digest` is excluded from its own digest, so altering that
+/// member alone leaves `body_digest` consistent — the read gate
+/// re-checks the embedded member explicitly and the row still reads
+/// as corrupt.
+#[test]
+fn a_tampered_digest_member_reads_as_corrupt() {
+    let root = temp_root("tampered-digest-member");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-digest-tamper");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body(&request_id, "verifiable").canonical_body).unwrap();
+        value["request_digest"] = serde_json::Value::String("0".repeat(64));
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1 WHERE request_id=?2",
+            rusqlite::params![canonical_json(&value), request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a tampered digest member is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
     );
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
