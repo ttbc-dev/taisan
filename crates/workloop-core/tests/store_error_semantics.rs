@@ -147,6 +147,12 @@ impl ReadView for FailingTx<'_> {
     ) -> Result<Option<workloop_core::worker::WorkerRequestExport>, StoreError> {
         Ok(None)
     }
+    fn worker_request_body(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<workloop_core::worker_v2::WorkerRequestBody>, StoreError> {
+        Ok(None)
+    }
     fn reservation(&self, _resource_key: &str) -> Result<Option<ResourceReservation>, StoreError> {
         unimplemented!()
     }

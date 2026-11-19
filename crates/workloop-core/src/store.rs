@@ -238,6 +238,18 @@ pub enum Effect {
         request_id: String,
         process_identity: String,
     },
+    /// The canonical executable request body for one durable dispatch
+    /// request (`taisan.worker.request/2`, `docs/v0.3.md`). Written in
+    /// the commit that binds the request before launch; a restart
+    /// replays these bytes verbatim rather than reconstructing the
+    /// request from mutable live configuration. A duplicate insert
+    /// under the same `request_id` is a replay when the recorded bytes
+    /// are identical and a `ConstraintConflict` when they differ —
+    /// the store never silently replaces the body an already-launched
+    /// worker was handed.
+    InsertWorkerRequestBody {
+        body: crate::worker_v2::WorkerRequestBody,
+    },
     /// Replaces the singleton intake-settings record, guarded by the
     /// caller-observed revision: `expected_revision` must equal the
     /// currently recorded `settings_revision`, and `None` requires the
@@ -729,6 +741,14 @@ pub trait ReadView {
         &self,
         request_id: &str,
     ) -> Result<Option<WorkerRequestExport>, StoreError>;
+    /// The canonical executable request body recorded for a durable
+    /// dispatch request; `None` = absent (a legacy v1 dispatch or a
+    /// request recorded before the v2 wire existed). Callers replay the
+    /// bytes verbatim; they never reconstruct a body.
+    fn worker_request_body(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::worker_v2::WorkerRequestBody>, StoreError>;
     /// The first recorded handoff row for an Invocation; an Invocation
     /// may carry one handoff per required artifact.
     fn handoff_for_invocation(

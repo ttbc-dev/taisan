@@ -395,6 +395,22 @@ CREATE TABLE IF NOT EXISTS worker_request_exports (
     process_identity TEXT
 );
 
+-- The canonical executable request body for one durable dispatch
+-- request (`taisan.worker.request/2`, docs/v0.3.md): written in the
+-- commit that binds the request before launch, and replayed verbatim —
+-- a restart re-reads the recorded bytes, it never reconstructs the
+-- request from mutable live configuration. `format_version` is the
+-- recorded wire format: a request row with no body row is a legacy v1
+-- dispatch and is never silently made executable under v2. The
+-- primary key makes a second insert for the same request conflict;
+-- equal bytes read as a replay, different bytes are refused.
+CREATE TABLE IF NOT EXISTS worker_request_bodies (
+    request_id TEXT PRIMARY KEY REFERENCES invocation_requests(request_id),
+    format_version TEXT NOT NULL,
+    canonical_body BLOB NOT NULL,
+    body_digest TEXT NOT NULL
+);
+
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.
 -- Phase 1 computes the eligible set and persists it here (bounded by
 -- max_bodies/max_bytes); phase 2 executes it. An interrupted phase 2
