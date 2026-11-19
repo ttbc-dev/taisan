@@ -40,7 +40,7 @@ capacity_slots = 1
 
 [hosts.h1]
 adapter = "github"                    # adapter id from the adapter registry
-endpoint = "https://api.github.com"   # stable endpoint identity, not a display alias
+endpoint = "https://api.github.com"   # endpoint is transport detail; source-bound identities derive its canonical host instance (`github.com`)
 contract_version = 1
 
 [[hosts.h1.repositories]]

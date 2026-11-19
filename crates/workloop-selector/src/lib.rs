@@ -68,6 +68,19 @@ pub enum IssueState {
     Closed,
 }
 
+/// The canonical Issue-content digest: `sha256` of `title\nbody` under
+/// the `issue-content-v1` tag. Every boundary that binds an Issue read
+/// into a [`IssueFact::content_digest`], a proposal `SourceBinding`, or
+/// a spec `SourceSnapshot` — and every adapter that performs the
+/// authoritative re-read the source gate compares against — must use
+/// this one function. Two different digest rules over the same Issue
+/// make every selector-admitted Work look `Changed` at the gate.
+/// `revision` (the host's own update marker) and lifecycle `state`
+/// travel separately and never enter the content digest.
+pub fn issue_content_digest(title: &str, body: &str) -> String {
+    sha256_hex("issue-content-v1", format!("{title}\n{body}").as_bytes())
+}
+
 /// The snapshot/cursor of available source facts a selector run sees.
 /// `cursor` and `fetched_unix_seconds` are bookkeeping: they are carried
 /// into proposal provenance but never into proposal identity.

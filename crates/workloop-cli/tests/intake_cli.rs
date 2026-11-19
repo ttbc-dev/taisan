@@ -133,7 +133,10 @@ fn proposal() -> Proposal {
     let source = SourceBinding {
         issue: IssueRef {
             repository: RepositoryRef::new(
-                HostInstanceId::trusted("https://api.github.com"),
+                // The profile endpoint `https://api.github.com`
+                // normalizes to the `github.com` host instance — the
+                // identity every intake-bound source carries.
+                HostInstanceId::trusted("github.com"),
                 RepositoryId::trusted("0123456789"),
             ),
             issue: IssueId::trusted("issue-1"),
@@ -543,12 +546,12 @@ fn swapping_only_the_profile_selector_selects_the_fixture_adapter() {
         &sources,
         serde_json::to_string(&serde_json::json!({
             "repositories": {
-                "https://api.github.com/0123456789": {
+                "github.com/0123456789": {
                     "pages": [{
                         "issues": [{
                             "issue": {
                                 "repository": {
-                                    "host": "https://api.github.com",
+                                    "host": "github.com",
                                     "repository": "0123456789",
                                 },
                                 "issue": "issue-9",

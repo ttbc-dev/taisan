@@ -327,6 +327,129 @@ fn a_matching_source_read_unblocks_dispatch() {
     );
 }
 
+/// A Work admitted through the selector proposal path — its
+/// `SourceSnapshot` bound by `submit_command` — crosses the source gate
+/// when the authoritative re-read recomputes the same canonical digest
+/// at the same revision, and still holds when the read differs. Both
+/// sides of the gate share `issue_content_digest`, and admission
+/// canonicalizes the host instance, so a selector-bound identity and an
+/// installation-bound identity for the same Issue coincide.
+#[test]
+fn a_selector_admitted_work_crosses_the_gate_on_a_matching_read() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let issue = IssueRef {
+        repository: RepositoryRef::new(
+            HostInstanceId::trusted("github.com"),
+            RepositoryId::trusted("owner/repo"),
+        ),
+        issue: IssueId::trusted("45"),
+        display_number: Some(45),
+    };
+    let digest = workloop_selector::issue_content_digest("a title", "a body");
+    let proposal = workloop_selector::Proposal {
+        key: "prop-1".into(),
+        selector: AdapterId::trusted("public-issue-selector"),
+        selector_version: 1,
+        policy_revision: 1,
+        sources: vec![workloop_selector::SourceBinding {
+            issue: issue.clone(),
+            revision: "rev-1".into(),
+            content_digest: digest.clone(),
+        }],
+        task: workloop_selector::TaskInput {
+            intent: "selector task".into(),
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+        required_permissions: vec![],
+        provenance: workloop_selector::Provenance::default(),
+    };
+    let request = workloop_selector::admission::submit_command(
+        &proposal,
+        Actor {
+            kind: ActorKind::Human,
+            external_id: "op".into(),
+        },
+    );
+    let d = handle_command(&store, &config_with_issue_read(), &request, NOW).unwrap();
+    let CommandDecision::Accepted {
+        work_id: Some(w),
+        effect: CommandEffect::WorkCreated { execution_id: e },
+        ..
+    } = d
+    else {
+        panic!("selector submit: {d:?}")
+    };
+
+    // The bridge-side re-read computes the same canonical digest for an
+    // unchanged Issue: the gate matches and dispatch proceeds.
+    let mut gh = FixtureGithub::new();
+    gh.set_issue(&issue, "rev-1", &digest, IssueState::Open);
+    gh.refresh_sources(&store, &config(), &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(gate_of(&store, &w), SourceGate::Matches);
+    store
+        .transact(|tx| dispatch_once(tx, &config_with_issue_read(), NOW).map(|_| ()))
+        .unwrap();
+    assert_eq!(execution_of(&store, &e).state, ExecutionState::Ready);
+
+    // A genuinely changed read still fails closed.
+    gh.set_issue(&issue, "rev-2", "changed-digest", IssueState::Open);
+    gh.refresh_sources(&store, &config(), &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(gate_of(&store, &w), SourceGate::Changed);
+}
+
+/// Endpoint and bare-host spellings of one host instance share a single
+/// source claim: admission canonicalizes the host, so a selector-style
+/// `https://api.github.com` source and an installation-style
+/// `github.com` source for the same Issue collide instead of producing
+/// two Works.
+#[test]
+fn endpoint_and_bare_host_spellings_share_one_source_claim() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let make = |host: &str| SourceSnapshot {
+        issue: IssueRef {
+            repository: RepositoryRef::new(
+                HostInstanceId::trusted(host),
+                RepositoryId::trusted("owner/repo"),
+            ),
+            issue: IssueId::trusted("45"),
+            display_number: Some(45),
+        },
+        source_revision: "rev-1".into(),
+        content_digest: "d".into(),
+    };
+    submit_with_sources(&store, "k-ep", vec![make("https://api.github.com")]);
+
+    let d = handle_command(
+        &store,
+        &config_with_issue_read(),
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "k-bare".into(),
+            body: CommandBody::Submit {
+                intent: "bare-host submit".into(),
+                sources: vec![make("github.com")],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    match d {
+        CommandDecision::Rejected { reason, .. } => {
+            assert_eq!(reason, RejectionCode::Ineligible);
+        }
+        other => panic!("expected Ineligible rejection, got {other:?}"),
+    }
+}
+
 /// A changed read holds dispatch: the queued Execution pauses for
 /// reapproval instead of being admitted on a stale spec.
 #[test]

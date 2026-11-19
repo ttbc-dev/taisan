@@ -14,7 +14,8 @@ use crate::command::{
 use crate::domain::*;
 use crate::identity::{
     ActorRole, CommitRevision, DiffTarget, EvidenceRef, HostActorRef, HostBinding, HostCapability,
-    IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
+    HostInstanceId, IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
+    canonical_host_instance,
 };
 use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
@@ -696,6 +697,25 @@ fn decide_submit(
     constraints: &[String],
     verification_argv: &[Vec<String>],
 ) -> Verdict {
+    // Host-instance identity is canonicalized once, at admission, before
+    // any claim check or spec binding: the selector path derives source
+    // repositories from profile endpoints (`https://api.github.com`)
+    // while manual submission binds the installation's host instance
+    // (`github.com`), and adapters may hand in either spelling. Without
+    // a single canonical form here, one real Issue exists under two
+    // identities and claims, dedupe, and the source gate diverge.
+    let canonical_sources: Vec<SourceSnapshot> = sources
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            let canonical = canonical_host_instance(s.issue.repository.host.as_str());
+            if !canonical.is_empty() {
+                s.issue.repository.host = HostInstanceId::trusted(canonical);
+            }
+            s
+        })
+        .collect();
+    let sources = &canonical_sources[..];
     // Capability guard: the binding's required set must be declared as
     // supported by this installation. An undeclared capability can never
     // silently authorize an effect later.

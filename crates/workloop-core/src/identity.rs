@@ -92,6 +92,34 @@ opaque_id!(AdapterId, "adapter_id");
 // (`credential` module), so Core stores the reference unparsed.
 opaque_id!(CredentialRef, "credential_ref");
 
+/// Canonical host-instance identity for an endpoint string or a bare
+/// host name. Intake profiles bind `hosts.<key>.endpoint` (a URL like
+/// `https://api.github.com`) as the identity of the repositories behind
+/// it, while installation records and manual submission name the host
+/// instance directly (`github.com`). Without normalization the same
+/// repository exists under two host identities — claims, dedupe, and
+/// source-gate lookups then treat one real Issue as two. Returns the
+/// lowercase bare host, with the public GitHub API endpoint reduced to
+/// `github.com`; a value that is already a bare host is returned
+/// unchanged.
+pub fn canonical_host_instance(endpoint: &str) -> String {
+    let bare = endpoint
+        .trim()
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint.trim())
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    match bare.to_ascii_lowercase().as_str() {
+        "api.github.com" => "github.com".to_string(),
+        host => host.to_string(),
+    }
+}
+
 /// Repository identity `(host_instance, repository_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryRef {
@@ -566,6 +594,30 @@ impl SourceGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Endpoint spellings and bare host names must reduce to one host
+    /// instance: `https://api.github.com` (profile endpoint) and
+    /// `github.com` (installation host instance) are the same instance,
+    /// and non-URL identities pass through unchanged.
+    #[test]
+    fn endpoint_spellings_reduce_to_one_host_instance() {
+        assert_eq!(
+            canonical_host_instance("https://api.github.com"),
+            "github.com"
+        );
+        assert_eq!(canonical_host_instance("api.github.com"), "github.com");
+        assert_eq!(canonical_host_instance("https://github.com"), "github.com");
+        assert_eq!(canonical_host_instance("github.com"), "github.com");
+        assert_eq!(
+            canonical_host_instance("https://GHE.corp.example/api/v3"),
+            "ghe.corp.example"
+        );
+        assert_eq!(
+            canonical_host_instance("https://ghe.corp.example:8443"),
+            "ghe.corp.example"
+        );
+        assert_eq!(canonical_host_instance("host-local"), "host-local");
+    }
 
     /// Identity, ordering, and bucketing must not split on display
     /// metadata: a renumbered or absent display number still names the

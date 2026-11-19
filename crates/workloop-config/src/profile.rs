@@ -34,6 +34,7 @@ use workloop_core::credential::CredentialProvider;
 use workloop_core::domain::{canonical_json, sha256_hex};
 use workloop_core::identity::{
     ActorRole, AdapterId, HostActorId, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
+    canonical_host_instance,
 };
 use workloop_core::work::DEFAULT_PENDING_QUEUE_LIMIT;
 
@@ -1099,8 +1100,13 @@ impl Profile {
             let Some(endpoint) = &host.endpoint else {
                 continue;
             };
-            let host_instance =
-                HostInstanceId::new(endpoint.clone()).map_err(|e| format!("host endpoint: {e}"))?;
+            // The endpoint is transport detail; the bound host identity
+            // is its canonical instance (`https://api.github.com` →
+            // `github.com`) so intake-bound repositories share identity
+            // with the same repository named by an installation record
+            // or `submit --issue` — one Issue, one claim.
+            let host_instance = HostInstanceId::new(canonical_host_instance(endpoint))
+                .map_err(|e| format!("host endpoint: {e}"))?;
             for repository in &host.repositories {
                 // `use` was validated at load into the closed set
                 // {"source", "publication"}; both grant source reads,
