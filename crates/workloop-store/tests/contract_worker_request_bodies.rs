@@ -264,6 +264,112 @@ fn a_body_without_a_request_row_is_refused() {
     );
 }
 
+fn expect_refused_then_recovered(store: &SqliteStore, request_id: &str, bad: WorkerRequestBody) {
+    let err = store
+        .transact(|tx| tx.apply(&Effect::InsertWorkerRequestBody { body: bad }))
+        .expect_err("an unverifiable body is refused at the write boundary");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(request_id))
+            .unwrap()
+            .is_none(),
+        "no row is left behind by the refused write"
+    );
+    let corrected = body(request_id, "corrected");
+    apply_effects(
+        store,
+        &[Effect::InsertWorkerRequestBody {
+            body: corrected.clone(),
+        }],
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.worker_request_body(request_id))
+            .unwrap()
+            .expect("the corrected body records"),
+        corrected
+    );
+}
+
+#[test]
+fn an_invalid_json_body_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badjson");
+    let mut bad = body(&request_id, "goal");
+    bad.canonical_body = b"{not json".to_vec();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_bad_body_digest_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-baddigest");
+    let mut bad = body(&request_id, "goal");
+    bad.body_digest = "0".repeat(64);
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_unsupported_format_version_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badver");
+    let mut bad = body(&request_id, "goal");
+    bad.format_version = "taisan.worker.request/9".into();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_mismatched_request_id_member_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badid");
+    let mut bad = body("other:inv:9", "goal");
+    bad.request_id = request_id.clone();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_mismatched_request_digest_member_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badrdigest");
+    let mut bad = body(&request_id, "goal");
+    let mut value: serde_json::Value = serde_json::from_slice(&bad.canonical_body).unwrap();
+    value["request_digest"] = serde_json::Value::String("0".repeat(64));
+    bad.canonical_body = canonical_json(&value);
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_invalid_reinsert_leaves_the_original_body() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badreinsert");
+    let recorded = body(&request_id, "first");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: recorded.clone(),
+        }],
+    );
+    let mut bad = body(&request_id, "second");
+    bad.body_digest = "0".repeat(64);
+    let err = store
+        .transact(|tx| tx.apply(&Effect::InsertWorkerRequestBody { body: bad }))
+        .expect_err("an unverifiable replacement is refused");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+    let read = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the original body survives the refused write");
+    assert_eq!(read, recorded);
+    assert_eq!(read.canonical_body, recorded.canonical_body);
+}
+
 /// Regression: a v10 store gains `worker_request_bodies` on open, keeps
 /// every pre-upgrade row, and the new table accepts writes on the
 /// upgraded file.

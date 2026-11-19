@@ -2606,6 +2606,14 @@ impl TxView for Tx<'_> {
                 // bytes mean the store is asked to replace a body an
                 // already-launched worker may hold, which is refused
                 // here rather than by the schema alone.
+                if !body.verifies() {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "worker request body {} failed integrity verification",
+                            body.request_id
+                        ),
+                    });
+                }
                 let existing: Option<(Vec<u8>, String, String)> = self.query_opt(
                     "SELECT canonical_body, format_version, body_digest \
                          FROM worker_request_bodies WHERE request_id=?1",
