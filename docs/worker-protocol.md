@@ -2,6 +2,8 @@
 
 Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory is merged in `docs/extraction-coverage.json`; all 33 Worker-owned inventory targets are mapped to clauses and shared-suite cases — or to an approved deferral — in [worker requirements](worker-requirements.md). #51's [failure classification](evidence-gates.md#failure-classification-and-recovery-decisions) and [Work-wide accounting](evidence-gates.md#work-wide-recovery-accounting) govern normalized recovery decisions; Worker reason codes alone do not authorize retries.
 
+The [v0.3 executable request and report contract](v0.3.md) reconciles this document with the implemented narrow `WorkerRequest` export, the `execution` supervisor, and the independent contract Worker at baseline `51f0b34daf33a1975a39b7614f5ceeac7dabf431`. It inventories actual versus designed behavior, publishes provider-neutral versioned request/report schemas and wire examples, and defines the cutover that preserves historical v1 request digests, bindings, and evidence. Where this document's v0.1 schema and the v0.3 wire contract differ, the v0.3 document is authoritative for new requests; this document remains the design of record for the v0.1 behavior and gates.
+
 ## Owner decisions
 
 The owner chose these in the #52 working session on 2026-11-07:
@@ -25,6 +27,11 @@ The owner approved these refinements in the #52 session on 2026-11-08:
 
 These choices shape implementation units U2 and U4 in the [implementation plan](implementation-plan.md). They do not authorize implementation, and no runtime or live behavior is claimed here.
 
+The v0.3 executable request/report contract has its own open owner
+decisions ([v0.3 §10](v0.3.md#10-open-owner-decisions-blocking-dependent-implementation)).
+Those decisions block the dependent implementation; this table remains
+the v0.1 design record.
+
 ## Roles and authority
 
 | Component | Owns | Never does |
@@ -43,12 +50,21 @@ Worker-runtime authentication, session handling, prompt construction, tool permi
 
 ### Entry point and files
 
-The supervisor starts one sandbox per Invocation. Inside it, `worker_argv` runs as:
+The target design starts one sandbox per Invocation. Inside it, `worker_argv` runs as:
 
 ```text
 <worker_argv...> run --request /taisan/request.json --out /taisan/out
 <worker_argv...> describe
 ```
+
+This is the target `argv-v2` transport specified in
+[v0.3](v0.3.md#41-transport), not the behavior implemented at the
+v0.1/v0.2 baseline. At `51f0b34` the supervisor appends `describe` to
+the bound argv for the declaration probe and otherwise spawns the bound
+argv with the managed workspace as cwd under the environment profile; it
+starts no namespace sandbox, writes no request file, and binds no out
+directory. The fixture and contract Workers are exercised
+through their test modes, not through this transport.
 
 `describe` is effect-free from the worker's perspective: it prints the adapter's `WorkerCapabilities` and runtime version, and is run at setup validation and before dispatch to bind the exact declaration into the Invocation request. It is still a spawned process, so it runs through the supervisor's process-control port in its own process group with a bounded wait; a wedged probe is killed with its group. `describe` is fail-closed: when the probe does not answer with a declaration — spawn refused, bound elapsed, non-zero exit, unparseable body, or no adapter identity — the adapter is not selectable and no synthetic declaration is compared or dispatched on. The request is refused as `adapter.declaration_unavailable`, a configuration repair that never masquerades as a version mismatch or an empty capability surface. A request whose Execution can no longer launch is never probed at all.
 
@@ -61,9 +77,27 @@ The supervisor starts one sandbox per Invocation. Inside it, `worker_argv` runs 
 
 The out directory belongs to exactly one Invocation ID and is never reused. Any file the Worker writes elsewhere does not survive the sandbox and cannot be evidence.
 
+### Implementation status at `51f0b34`
+
+The implemented export is not the schema below. `WorkerRequest` in
+`workloop-core/src/worker.rs` currently carries only `format_version`
+(`taisan.worker.request/1`), `kind`, `invocation_id`, a derived
+`request_id` (`worker:<invocation_id>`), `profile_id`, and
+`workspace_root`; its digest uses tag `worker-request-v1`. The
+supervisor commits that row before launch and binds it to the spawned
+identity. It does not deliver the row as a request file, does not bind
+an out directory, and does not read a report. Required artifacts are
+discovered in the workspace and reported as present/corrupt/missing
+facts; process exit and stop proof come from the process-control port.
+The role/task/report shapes below are therefore **design targets**, not
+compiled APIs or live behavior. The [v0.3 inventory](v0.3.md#2-inventory-actual-versus-designed-at-51f0b34)
+records each exact gap and the reuse boundary.
+
 ### Schemas
 
-Target Rust shapes, reusing #50/#51 identities; not compiled APIs.
+Target Rust shapes, reusing #50/#51 identities; not compiled APIs. The
+provider-neutral v2 wire contract for new requests and reports is
+[v0.3](v0.3.md); the shapes here describe the v0.1 design surface.
 
 ```rust
 struct WorkerRequest {
@@ -381,4 +415,16 @@ Every Worker-owned requirement #50's inventory assigns to this issue — 33 targ
 - **U5**: CLI loop drives export, verification, and recovery ticks.
 - **U8**: live smoke with the real runtime inside the profile.
 
-No runtime, sandbox, proxy, or live evidence exists today; the existing fixture worker and supervisor tests cover only their narrow process assertions.
+At `51f0b34` the implemented Worker boundary is narrower than this
+design: a durable v1 export, process supervision and stop proof, an
+environment-hygiene launch, durable git-object handoff, and a
+supervisor-run verification runner exist and are covered by
+fixture/contract tests. The executable v2 request/report transport, four
+role-specific bodies, typed report ingestion, namespace and egress
+enforcement, isolation preflight, and a live reference coding-agent
+runtime do not exist. Authorized live S1 evidence exercised a scenario
+bridge and a deterministic scenario shim, not this v2 contract, a real
+coding-agent runtime, four distinct Worker roles, or the namespace/egress
+profile; it is never evidence for those claims. The
+[v0.3 contract](v0.3.md) is the dependency for their implementation and
+records the owner decisions that must be settled first.
