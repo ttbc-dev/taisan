@@ -37,7 +37,7 @@ use workloop_core::work::{
 use workloop_exec::adapter;
 use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
-use workloop_github::fixture::FixtureGithub;
+use workloop_github::fixture::{FixtureGithub, OutboxReport, ReconcileReport};
 use workloop_store::retention::{SweepParams, SweepReport};
 use workloop_store::sqlite::SqliteStore;
 
@@ -581,21 +581,8 @@ pub fn run_pass(
                     // repair, skipped ones reappear every pass — are
                     // held with their recorded reason so a silent stall
                     // is visible in the tick report.
-                    p.held = reconciled
-                        .credential_blocked
-                        .iter()
-                        .map(|b| format!("{}:{}", b.action_id, b.code))
-                        .chain(
-                            r.credential_blocked
-                                .iter()
-                                .map(|b| format!("{}:{}", b.action_id, b.code)),
-                        )
-                        .chain(
-                            r.skipped
-                                .iter()
-                                .map(|s| format!("{}:{}", s.action_id, s.reason)),
-                        )
-                        .collect();
+                    let (held, credential_blocked) = outbox_held(&reconciled, &r);
+                    p.held = held;
                     p.reason = Some(format!(
                         "reconciled(applied={} failed={} unknown={}) applied={} failed={} unknown={} unsupported={} credential_blocked={} skipped={}",
                         reconciled.applied,
@@ -605,7 +592,7 @@ pub fn run_pass(
                         r.failed,
                         r.unknown,
                         r.unsupported,
-                        reconciled.credential_blocked.len() + r.credential_blocked.len(),
+                        credential_blocked,
                         r.skipped.len()
                     ));
                     p
@@ -909,6 +896,33 @@ fn uuidish() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}-{}", std::process::id())
+}
+
+/// Compose the outbox phase's held list and credential-blocked count
+/// from the reconcile and apply-drain reports. A pending intent that
+/// fails the credential gate is reported by both passes; each blocked
+/// intent is listed and counted once. Skipped intents join the held
+/// list with their recorded reason.
+fn outbox_held(reconciled: &ReconcileReport, applied: &OutboxReport) -> (Vec<String>, usize) {
+    let mut blocked_ids = std::collections::HashSet::new();
+    let held_blocked: Vec<String> = reconciled
+        .credential_blocked
+        .iter()
+        .chain(&applied.credential_blocked)
+        .filter(|b| blocked_ids.insert(b.action_id.clone()))
+        .map(|b| format!("{}:{}", b.action_id, b.code))
+        .collect();
+    let credential_blocked = blocked_ids.len();
+    let held = held_blocked
+        .into_iter()
+        .chain(
+            applied
+                .skipped
+                .iter()
+                .map(|s| format!("{}:{}", s.action_id, s.reason)),
+        )
+        .collect();
+    (held, credential_blocked)
 }
 
 #[cfg(test)]
@@ -1957,6 +1971,39 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// A pending intent that fails the credential gate is reported by
+    /// both the reconcile pass and the apply drain; the phase lists and
+    /// counts it once, alongside genuinely distinct blocks and skips.
+    #[test]
+    fn outbox_held_dedupes_credential_blocks_across_both_passes() {
+        let block = |action_id: &str| workloop_github::fixture::CredentialBlock {
+            action_id: action_id.into(),
+            code: "credential.missing",
+        };
+        let reconciled = ReconcileReport {
+            credential_blocked: vec![block("act-1"), block("act-2")],
+            ..Default::default()
+        };
+        let applied = OutboxReport {
+            credential_blocked: vec![block("act-1")],
+            skipped: vec![workloop_github::fixture::SkippedIntent {
+                action_id: "act-3".into(),
+                reason: "missing_execution",
+            }],
+            ..Default::default()
+        };
+        let (held, credential_blocked) = outbox_held(&reconciled, &applied);
+        assert_eq!(credential_blocked, 2, "one intent blocked once, not twice");
+        assert_eq!(
+            held,
+            vec![
+                "act-1:credential.missing".to_string(),
+                "act-2:credential.missing".to_string(),
+                "act-3:missing_execution".to_string(),
+            ]
         );
     }
 

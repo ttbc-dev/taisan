@@ -187,6 +187,16 @@ impl std::error::Error for RunLeaseError {}
 static LIVE_LEASE_NONCES: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Process-wide gate held across the whole lease acquire window —
+/// row read, ownership write, commit, and nonce registration. The
+/// committed row and the holder's nonce registration must be atomic
+/// with respect to other connections in this process: without the
+/// gate, a second connection can observe the committed row in the
+/// gap before `register_live_nonce` runs, find the recorded nonce
+/// absent from [`LIVE_LEASE_NONCES`], and reclaim a lease a live
+/// same-process guard still holds.
+static LEASE_ACQUIRE_GATE: Mutex<()> = Mutex::new(());
+
 fn register_live_nonce(nonce: &str) {
     if let Ok(mut nonces) = LIVE_LEASE_NONCES.lock() {
         *nonces.entry(nonce.to_string()).or_insert(0) += 1;
@@ -598,6 +608,11 @@ impl SqliteStore {
         now_unix_seconds: i64,
         lease_key: &str,
     ) -> Result<RunLeaseGrant, RunLeaseError> {
+        let _acquire_gate = LEASE_ACQUIRE_GATE.lock().map_err(|_| {
+            RunLeaseError::Store(StoreError::Internal {
+                detail: "lease acquire gate poisoned".into(),
+            })
+        })?;
         let mut guard = self.conn.lock().map_err(|_| {
             RunLeaseError::Store(StoreError::Internal {
                 detail: "store lock poisoned".into(),
