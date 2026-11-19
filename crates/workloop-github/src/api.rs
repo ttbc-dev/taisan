@@ -18,8 +18,9 @@
 //!   outstanding until reconciled by action ID, and never retries it
 //!   blindly.
 
-use workloop_core::identity::{ChangeRequestId, RepositoryRef};
-use workloop_core::observation::CheckConclusion;
+use std::time::Instant;
+use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::observation::{CheckConclusion, IssueState};
 
 /// One transport-level failure of a GitHub API call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,13 @@ pub struct RemoteComment {
     /// The workloop marker tag the posting intent carried, echoed by
     /// the host so a lost response can be reconciled by marker.
     pub marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIssue {
+    pub source_revision: String,
+    pub content_digest: String,
+    pub state: IssueState,
 }
 
 /// The transport seam. A live implementation issues HTTPS calls; the
@@ -233,4 +241,12 @@ pub trait GitHubApi {
         ancestor: &str,
         descendant: &str,
     ) -> Result<bool, ApiError>;
+
+    fn read_issue(&mut self, _issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
+        Err(ApiError::Refused {
+            reason: "issue reads are not supported by this transport".into(),
+        })
+    }
+
+    fn set_read_deadline(&mut self, _deadline: Option<Instant>) {}
 }

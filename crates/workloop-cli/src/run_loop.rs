@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use workloop_config::{Installation, LoopConfig, RetentionConfig};
 use workloop_core::domain::{ExecutionId, ExecutionState, WorkId};
-use workloop_core::identity::AdapterId;
 use workloop_core::observation::HostActionStatus;
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::projection::{self, QueryResult};
@@ -37,7 +36,9 @@ use workloop_core::work::{
 use workloop_exec::adapter;
 use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
-use workloop_github::fixture::{FixtureGithub, OutboxReport, ReconcileReport};
+use workloop_github::adapter::GitHubAdapter;
+use workloop_github::fixture::{FixtureGithub, OutboxReport, ReconcileReport, SourceRefreshReport};
+use workloop_github::gh_cli::GhCliApi;
 use workloop_store::retention::{SweepParams, SweepReport};
 use workloop_store::sqlite::SqliteStore;
 
@@ -215,14 +216,208 @@ impl PassSettings {
     }
 }
 
+pub trait HostDriver {
+    fn refresh_sources(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError>;
+
+    fn reconcile_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError>;
+
+    fn apply_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError>;
+}
+
+impl HostDriver for FixtureGithub {
+    fn refresh_sources(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError> {
+        FixtureGithub::refresh_sources(self, store, config, clock, deadline, scope)
+    }
+
+    fn reconcile_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError> {
+        FixtureGithub::reconcile_outbox_bounded(
+            self, store, config, clock, deadline, scope, max_items,
+        )
+    }
+
+    fn apply_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError> {
+        FixtureGithub::apply_outbox_bounded(self, store, config, clock, deadline, scope, max_items)
+    }
+}
+
+impl<C: workloop_github::api::GitHubApi> HostDriver for GitHubAdapter<C> {
+    fn refresh_sources(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError> {
+        GitHubAdapter::refresh_sources(self, store, config, clock, deadline, scope)
+    }
+
+    fn reconcile_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError> {
+        GitHubAdapter::reconcile_outbox_bounded(
+            self, store, config, clock, deadline, scope, max_items,
+        )
+    }
+
+    fn apply_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError> {
+        GitHubAdapter::apply_outbox_bounded(self, store, config, clock, deadline, scope, max_items)
+    }
+}
+
+pub enum RunHost {
+    Fixture(Box<FixtureGithub>),
+    Github(Box<GitHubAdapter<GhCliApi>>),
+}
+
+impl RunHost {
+    pub fn from_config(config: &WorkloopConfig) -> Result<Self, String> {
+        match config.host.adapter.as_str() {
+            "fixture" => Ok(Self::Fixture(Box::new(FixtureGithub::new()))),
+            "github" => {
+                if config.allowed_effects.host_write {
+                    return Err("driver.production_effects_unavailable".into());
+                }
+                if config.host.repository.host.as_str() != "github.com"
+                    || workloop_core::identity::canonical_host_instance(
+                        config.host.repository.host.as_str(),
+                    ) != "github.com"
+                {
+                    return Err("driver.host_unsupported".into());
+                }
+                let api = GhCliApi::new().with_hostname("github.com");
+                Ok(Self::Github(Box::new(GitHubAdapter::for_host(
+                    workloop_core::identity::HostInstanceId::trusted("github.com"),
+                    api,
+                ))))
+            }
+            other => Err(format!("unsupported host adapter: {other}")),
+        }
+    }
+}
+
+impl HostDriver for RunHost {
+    fn refresh_sources(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+    ) -> Result<SourceRefreshReport, StoreError> {
+        match self {
+            Self::Fixture(host) => host.refresh_sources(store, config, clock, deadline, scope),
+            Self::Github(host) => host.refresh_sources(store, config, clock, deadline, scope),
+        }
+    }
+
+    fn reconcile_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError> {
+        match self {
+            Self::Fixture(host) => {
+                host.reconcile_outbox_bounded(store, config, clock, deadline, scope, max_items)
+            }
+            Self::Github(host) => {
+                host.reconcile_outbox_bounded(store, config, clock, deadline, scope, max_items)
+            }
+        }
+    }
+
+    fn apply_outbox_bounded(
+        &mut self,
+        store: &SqliteStore,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+        scope: Option<&WorkId>,
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError> {
+        match self {
+            Self::Fixture(host) => {
+                host.apply_outbox_bounded(store, config, clock, deadline, scope, max_items)
+            }
+            Self::Github(host) => {
+                host.apply_outbox_bounded(store, config, clock, deadline, scope, max_items)
+            }
+        }
+    }
+}
+
 /// Everything one pass drives. The supervisor and host adapter are
 /// owned by the caller so their state persists across ticks of one run.
-pub struct Pass<'a> {
+pub struct Pass<'a, H: HostDriver = FixtureGithub> {
     pub store: &'a SqliteStore,
     pub config: &'a WorkloopConfig,
     pub settings: &'a PassSettings,
     pub supervisor: Option<&'a Supervisor<PosixProcessControl>>,
-    pub host: &'a mut FixtureGithub,
+    pub host: &'a mut H,
     /// The installation state root: the one boundary every reclaimable
     /// body (CAS, workspace, out directory, handoff object) lives under.
     pub state_root: &'a Path,
@@ -233,8 +428,8 @@ pub struct Pass<'a> {
 /// production it reads the wall clock. `shutdown` is checked at every
 /// phase boundary: when it reports true the current phase finishes and
 /// the remaining phases are reported `shutdown`, never started.
-pub fn run_pass(
-    pass: &mut Pass<'_>,
+pub fn run_pass<H: HostDriver>(
+    pass: &mut Pass<'_, H>,
     scope: Option<&WorkId>,
     clock: &mut dyn FnMut() -> i64,
     shutdown: &dyn Fn() -> bool,
@@ -286,31 +481,25 @@ pub fn run_pass(
     // reads and effects against the same store. Running the fixture
     // then would fabricate `unavailable` source reads and applied
     // receipts for real pending intents.
-    let in_process_fixture = pass.config.host.adapter == AdapterId::trusted("fixture");
-
     // Phase 1 — source refresh (host adapter, read only).
     if gated!(0) {
-        if !in_process_fixture {
-            push!(PhaseReport::skipped(PHASES[0], "external_adapter"));
-        } else {
-            let refresh_deadline = source_deadline.min(deadline);
-            let result = pass.host.refresh_sources(
-                pass.store,
-                pass.config,
-                clock,
-                Some(refresh_deadline),
-                scope,
-            );
-            push!(match result {
-                Ok(r) => {
-                    let mut p = PhaseReport::completed(PHASES[0]);
-                    p.processed = r.unchanged + r.ingested;
-                    p.deferred = r.deferred;
-                    p
-                }
-                Err(e) => PhaseReport::failed(PHASES[0], e),
-            });
-        }
+        let refresh_deadline = source_deadline.min(deadline);
+        let result = pass.host.refresh_sources(
+            pass.store,
+            pass.config,
+            clock,
+            Some(refresh_deadline),
+            scope,
+        );
+        push!(match result {
+            Ok(r) => {
+                let mut p = PhaseReport::completed(PHASES[0]);
+                p.processed = r.unchanged + r.ingested;
+                p.deferred = r.deferred;
+                p
+            }
+            Err(e) => PhaseReport::failed(PHASES[0], e),
+        });
     }
 
     // Phase 2 — dispatch admission (Core judges; the whole scan shares
@@ -511,9 +700,7 @@ pub fn run_pass(
     // receipt lost mid-flight settles from the remote's observed
     // state before any new attempt — never by replaying the write.
     if gated!(3) {
-        if !in_process_fixture {
-            push!(PhaseReport::skipped(PHASES[3], "external_adapter"));
-        } else {
+        {
             let result = pass
                 .host
                 .reconcile_outbox_bounded(
@@ -946,9 +1133,16 @@ mod tests {
     use workloop_core::command::*;
     use workloop_core::domain::*;
     use workloop_core::identity::*;
-    use workloop_core::observation::{HostActionStatus, IssueState};
+    use workloop_core::observation::{
+        CheckConclusion, Completeness, HostActionStatus, IssueState, NormalizedEffectFact,
+        Observation, ObservationFact,
+    };
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
+    use workloop_github::api::{
+        ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
+        RemoteReviewFinding,
+    };
 
     const NOW: i64 = 1_700_000_000;
     const TICK: u64 = 60;
@@ -2040,6 +2234,1406 @@ mod tests {
             shutdown_requested(),
             "SIGINT is recorded for the next phase boundary instead of \
              taking the default mid-phase kill disposition"
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeGitHub {
+        repo_ok: bool,
+        issues: std::collections::HashMap<String, Result<RemoteIssue, ApiError>>,
+        pulls: std::collections::HashMap<String, Result<RemotePull, ApiError>>,
+        branches: std::collections::HashMap<String, Result<Option<String>, ApiError>>,
+        checks: std::collections::HashMap<String, Result<Vec<RemoteCheckRun>, ApiError>>,
+        reviews: std::collections::HashMap<String, Result<Vec<RemoteReview>, ApiError>>,
+        findings: std::collections::HashMap<String, Result<Vec<RemoteReviewFinding>, ApiError>>,
+        deadlines: Vec<Option<std::time::Instant>>,
+    }
+
+    impl FakeGitHub {
+        fn new() -> Self {
+            Self {
+                repo_ok: true,
+                ..Default::default()
+            }
+        }
+
+        fn pull(head_sha: &str) -> RemotePull {
+            RemotePull {
+                id: "pr-1".into(),
+                display_number: 1,
+                head_sha: head_sha.into(),
+                source_branch: "work/w".into(),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+                merged: false,
+            }
+        }
+    }
+
+    impl GitHubApi for FakeGitHub {
+        fn read_repository(
+            &mut self,
+            _repository: &RepositoryRef,
+        ) -> Result<Option<String>, ApiError> {
+            if self.repo_ok {
+                Ok(Some("default-head".into()))
+            } else {
+                Err(ApiError::Unknown {
+                    reason: "outage".into(),
+                })
+            }
+        }
+
+        fn read_branch(
+            &mut self,
+            repository: &RepositoryRef,
+            branch: &str,
+        ) -> Result<Option<String>, ApiError> {
+            self.branches
+                .get(&format!("{repository}:{branch}"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(ApiError::Unknown {
+                        reason: "branch read unsupported".into(),
+                    })
+                })
+        }
+
+        fn write_ref(
+            &mut self,
+            _repository: &RepositoryRef,
+            _branch: &str,
+            _new_head: &str,
+            _expected_prior: Option<&str>,
+        ) -> Result<String, ApiError> {
+            unreachable!("the read-only driver never writes")
+        }
+
+        fn read_pull(
+            &mut self,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+        ) -> Result<RemotePull, ApiError> {
+            self.pulls
+                .get(&format!("{repository}:{}", change_id.as_str()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(ApiError::Unknown {
+                        reason: "outage".into(),
+                    })
+                })
+        }
+
+        fn open_pull(
+            &mut self,
+            _repository: &RepositoryRef,
+            _source_branch: &str,
+            _target_branch: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<RemotePull, ApiError> {
+            unreachable!("the read-only driver never writes")
+        }
+
+        fn update_pull(
+            &mut self,
+            _repository: &RepositoryRef,
+            _change_id: &ChangeRequestId,
+            _title: Option<&str>,
+            _body: Option<&str>,
+        ) -> Result<RemotePull, ApiError> {
+            unreachable!("the read-only driver never writes")
+        }
+
+        fn comment_on_pull(
+            &mut self,
+            _repository: &RepositoryRef,
+            _change_id: &ChangeRequestId,
+            _marker: &str,
+            _body: &str,
+        ) -> Result<RemoteComment, ApiError> {
+            unreachable!("the read-only driver never writes")
+        }
+
+        fn find_comment(
+            &mut self,
+            _repository: &RepositoryRef,
+            _change_id: &ChangeRequestId,
+            _marker: &str,
+        ) -> Result<Option<RemoteComment>, ApiError> {
+            unreachable!("the read-only driver never reconciles writes")
+        }
+
+        fn list_pulls_on_branch(
+            &mut self,
+            _repository: &RepositoryRef,
+            _source_branch: &str,
+            _head_sha: &str,
+        ) -> Result<Vec<RemotePull>, ApiError> {
+            unreachable!("the read-only driver never reconciles writes")
+        }
+
+        fn check_runs(
+            &mut self,
+            repository: &RepositoryRef,
+            head_sha: &str,
+        ) -> Result<Vec<RemoteCheckRun>, ApiError> {
+            self.checks
+                .get(&format!("{repository}:{head_sha}"))
+                .cloned()
+                .unwrap_or(Ok(vec![]))
+        }
+
+        fn reviews(
+            &mut self,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+        ) -> Result<Vec<RemoteReview>, ApiError> {
+            self.reviews
+                .get(&format!("{repository}:{}", change_id.as_str()))
+                .cloned()
+                .unwrap_or(Ok(vec![]))
+        }
+
+        fn review_findings(
+            &mut self,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+        ) -> Result<Vec<RemoteReviewFinding>, ApiError> {
+            self.findings
+                .get(&format!("{repository}:{}", change_id.as_str()))
+                .cloned()
+                .unwrap_or(Ok(vec![]))
+        }
+
+        fn contains_revision(
+            &mut self,
+            _repository: &RepositoryRef,
+            _ancestor: &str,
+            _descendant: &str,
+        ) -> Result<bool, ApiError> {
+            unreachable!("the read-only driver never compares revisions")
+        }
+
+        fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
+            self.issues
+                .get(issue.issue.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(ApiError::Unknown {
+                        reason: "outage".into(),
+                    })
+                })
+        }
+
+        fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) {
+            self.deadlines.push(deadline);
+        }
+    }
+
+    fn remote_key(repository: &RepositoryRef, id: &str) -> String {
+        format!("{repository}:{id}")
+    }
+
+    fn cfg_key(id: &str) -> String {
+        remote_key(&config().host.repository, id)
+    }
+
+    fn change_ref(id: &str) -> ChangeRequestRef {
+        ChangeRequestRef {
+            repository: config().host.repository.clone(),
+            change_request: ChangeRequestId::trusted(id),
+            display_number: None,
+        }
+    }
+
+    fn production_adapter(client: FakeGitHub) -> GitHubAdapter<FakeGitHub> {
+        GitHubAdapter::for_host(config().host.repository.host.clone(), client)
+    }
+
+    fn run_production(
+        store: &SqliteStore,
+        settings: &PassSettings,
+        adapter: &mut GitHubAdapter<FakeGitHub>,
+        clock: &mut dyn FnMut() -> i64,
+    ) -> TickReport {
+        let cfg = config();
+        run_pass(
+            &mut Pass {
+                store,
+                config: &cfg,
+                settings,
+                supervisor: None,
+                host: adapter,
+                state_root: std::path::Path::new("."),
+            },
+            None,
+            clock,
+            &|| false,
+        )
+    }
+
+    fn issue_facts(store: &SqliteStore, work_id: &WorkId) -> Vec<(String, String, IssueState)> {
+        store
+            .transact(|tx| tx.observations_for_work(work_id))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::Issue {
+                    source_revision,
+                    content_digest,
+                    state,
+                    ..
+                } => Some((
+                    source_revision.clone(),
+                    content_digest.clone(),
+                    state.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn head_facts(store: &SqliteStore, work_id: &WorkId) -> Vec<String> {
+        store
+            .transact(|tx| tx.observations_for_work(work_id))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::ChangeHead { head, .. } => Some(head.object.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn review_facts(store: &SqliteStore, work_id: &WorkId) -> Vec<(String, Completeness)> {
+        store
+            .transact(|tx| tx.observations_for_work(work_id))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::Review {
+                    target,
+                    completeness,
+                    ..
+                } => Some((target.head.object.clone(), completeness.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn open_change_receipt(
+        store: &SqliteStore,
+        work_id: &WorkId,
+        change: &ChangeRequestRef,
+        target_branch: &str,
+    ) {
+        let action_id = insert_outbox_intent(
+            store,
+            work_id,
+            HostAction::OpenChangeRequest {
+                source_branch: "work/w".into(),
+                target_branch: target_branch.into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+            HostActionStatus::Applied,
+        );
+        workloop_core::work::handle_observation(
+            store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id,
+                    authenticated_actor: None,
+                    status: HostActionStatus::Applied,
+                    effects: vec![NormalizedEffectFact::ChangeOpened {
+                        change: change.clone(),
+                        head: CommitRevision::new(config().host.repository.clone(), "head-open")
+                            .unwrap(),
+                        source_branch: "work/w".into(),
+                        target_branch: target_branch.into(),
+                    }],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_run_driver_selects_the_configured_adapter_visibly() {
+        let mut cfg = config();
+        assert!(
+            matches!(RunHost::from_config(&cfg), Ok(RunHost::Fixture(_))),
+            "fixture config must not pick production"
+        );
+        cfg.host.adapter = AdapterId::trusted("github");
+        cfg.allowed_effects.host_write = false;
+        cfg.host.repository = RepositoryRef::new(
+            HostInstanceId::trusted("github.com"),
+            RepositoryId::trusted("owner/repo"),
+        );
+        assert!(
+            matches!(RunHost::from_config(&cfg), Ok(RunHost::Github(_))),
+            "github config must not pick the fixture"
+        );
+        cfg.host.repository = RepositoryRef::new(
+            HostInstanceId::trusted("host-local"),
+            RepositoryId::trusted("local-repo"),
+        );
+        let err = RunHost::from_config(&cfg).err().unwrap();
+        assert!(
+            err.contains("driver.host_unsupported"),
+            "a non-github.com host refuses before any run: {err}"
+        );
+        cfg.host.repository = RepositoryRef::new(
+            HostInstanceId::trusted("ghe.corp.example"),
+            RepositoryId::trusted("owner/repo"),
+        );
+        let err = RunHost::from_config(&cfg).err().unwrap();
+        assert!(
+            err.contains("driver.host_unsupported"),
+            "an enterprise host refuses before any run: {err}"
+        );
+        for alias in ["api.github.com", "https://github.com", "github.com/owner"] {
+            cfg.host.repository = RepositoryRef::new(
+                HostInstanceId::trusted(alias),
+                RepositoryId::trusted("owner/repo"),
+            );
+            let err = RunHost::from_config(&cfg).err().unwrap();
+            assert!(
+                err.contains("driver.host_unsupported"),
+                "raw host {alias} must refuse rather than be remapped: {err}"
+            );
+        }
+        cfg.host.repository = RepositoryRef::new(
+            HostInstanceId::trusted("github.com"),
+            RepositoryId::trusted("owner/repo"),
+        );
+        cfg.allowed_effects.host_write = true;
+        let err = RunHost::from_config(&cfg).err().unwrap();
+        assert!(
+            err.contains("production_effects_unavailable"),
+            "github + host_write refuses before any run: {err}"
+        );
+        cfg.host.adapter = AdapterId::trusted("s1_bridge");
+        let err = RunHost::from_config(&cfg).err().unwrap();
+        assert!(
+            err.contains("unsupported host adapter"),
+            "an unknown adapter is a visible config error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_production_driver_ingests_source_issue_facts_and_deduplicates() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) =
+            submit_with_sources(&store, "k-prod-src", vec![source(7, "rev-1", "digest-1")]);
+        let mut fake = FakeGitHub::new();
+        fake.issues.insert(
+            "issue-7".into(),
+            Ok(RemoteIssue {
+                source_revision: "rev-1".into(),
+                content_digest: "digest-1".into(),
+                state: IssueState::Open,
+            }),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(statuses(&report), vec!["completed"; 8]);
+        assert_eq!(
+            issue_facts(&store, &w).last().unwrap(),
+            &("rev-1".into(), "digest-1".into(), IssueState::Open)
+        );
+        let before = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .len();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(report.phases[0].status, "completed");
+        assert_eq!(
+            store
+                .transact(|tx| tx.observations_for_work(&w))
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn the_production_driver_records_outage_then_recovers() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit_with_sources(&store, "k-prod-out", vec![source(7, "rev-1", "d1")]);
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(statuses(&report), vec!["completed"; 8]);
+        assert_eq!(
+            issue_facts(&store, &w).last().unwrap(),
+            &(String::new(), String::new(), IssueState::Unavailable),
+            "an unreadable source is recorded unavailable, never clean"
+        );
+        adapter.client_mut().issues.insert(
+            "issue-7".into(),
+            Ok(RemoteIssue {
+                source_revision: "rev-1".into(),
+                content_digest: "d1".into(),
+                state: IssueState::Open,
+            }),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            issue_facts(&store, &w).last().unwrap(),
+            &("rev-1".into(), "d1".into(), IssueState::Open),
+            "the next pass records the recovered read"
+        );
+    }
+
+    #[test]
+    fn two_works_sharing_one_change_each_record_their_own_facts() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w1, _e1) = submit(&store, "k-share-1");
+        let (w2, _e2) = submit(&store, "k-share-2");
+        let change = change_ref("cr-shared");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        for w in [&w1, &w2] {
+            insert_outbox_intent(
+                &store,
+                w,
+                HostAction::MarkReady {
+                    change: change.clone(),
+                    expected_head: head.clone(),
+                },
+                HostActionStatus::Applied,
+            );
+        }
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-shared"), Ok(FakeGitHub::pull("head-1")));
+        fake.checks.insert(
+            cfg_key("head-1"),
+            Ok(vec![RemoteCheckRun {
+                check_run_id: "run-9".into(),
+                name: "ci".into(),
+                head_sha: "head-1".into(),
+                conclusion: CheckConclusion::Success,
+                producer: "app-ci".into(),
+            }]),
+        );
+        fake.reviews.insert(cfg_key("cr-shared"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-shared"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(statuses(&report), vec!["completed"; 8]);
+        for w in [&w1, &w2] {
+            assert_eq!(head_facts(&store, w), vec!["head-1".to_string()]);
+            let observations = store.transact(|tx| tx.observations_for_work(w)).unwrap();
+            let check = observations.iter().find_map(|o| match &o.fact {
+                ObservationFact::Check {
+                    check_id,
+                    producer,
+                    conclusion,
+                    head,
+                    ..
+                } => Some((
+                    check_id.clone(),
+                    producer.actor.clone(),
+                    conclusion.clone(),
+                    head.object.clone(),
+                )),
+                _ => None,
+            });
+            assert_eq!(
+                check.map(|(id, actor, conclusion, head)| (
+                    id,
+                    actor.as_str().to_string(),
+                    conclusion,
+                    head
+                )),
+                Some((
+                    "ci".into(),
+                    "app-ci".into(),
+                    CheckConclusion::Success,
+                    "head-1".into()
+                )),
+                "work {} keeps the exact check producer and head",
+                w.0
+            );
+        }
+        let ids: Vec<String> = store
+            .transact(|tx| tx.all_observations())
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.delivery.as_ref().map(|d| d.event_id.clone()))
+            .filter(|id| id.starts_with("check:"))
+            .collect();
+        assert_eq!(ids.len(), 2, "each work records its own check fact");
+        assert!(ids.iter().any(|id| id.contains(&w1.0)));
+        assert!(ids.iter().any(|id| id.contains(&w2.0)));
+        for w in [&w1, &w2] {
+            let review = review_facts(&store, w)
+                .into_iter()
+                .find(|(_, completeness)| completeness.is_complete());
+            assert_eq!(
+                review.map(|(h, _)| h),
+                Some("head-1".to_string()),
+                "work {} keeps its own complete review at the exact head",
+                w.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_adapter_instance_still_records_the_new_head() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-fresh");
+        let change = change_ref("cr-fresh");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let settings = settings();
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-fresh"), Ok(FakeGitHub::pull("head-1")));
+        let mut adapter = production_adapter(fake);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-fresh"), Ok(FakeGitHub::pull("head-2")));
+        let mut adapter = production_adapter(fake);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            head_facts(&store, &w),
+            vec!["head-1".to_string(), "head-2".to_string()],
+            "the fresh instance records the moved head"
+        );
+    }
+
+    #[test]
+    fn a_failed_review_read_records_unavailable_not_empty() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-review-out");
+        let change = change_ref("cr-review");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-9").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-review"), Ok(FakeGitHub::pull("head-9")));
+        fake.reviews.insert(
+            cfg_key("cr-review"),
+            Err(ApiError::Unknown {
+                reason: "outage".into(),
+            }),
+        );
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let completeness = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .find_map(|o| match &o.fact {
+                ObservationFact::Review {
+                    target,
+                    completeness,
+                    ..
+                } => Some((target.head.object.clone(), completeness.clone())),
+                _ => None,
+            });
+        assert_eq!(
+            completeness,
+            Some((
+                "head-9".into(),
+                Completeness::Unavailable {
+                    reason: "reviews read failed".into()
+                }
+            )),
+            "a review endpoint failure is unavailable evidence at the exact head"
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-review"), Ok(FakeGitHub::pull("head-9")));
+        fake.reviews.insert(cfg_key("cr-review"), Ok(vec![]));
+        fake.findings.insert(
+            cfg_key("cr-review"),
+            Err(ApiError::Unknown {
+                reason: "outage".into(),
+            }),
+        );
+        let mut adapter = production_adapter(fake);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let observations = store.transact(|tx| tx.observations_for_work(&w)).unwrap();
+        let unavailable: Vec<_> = observations
+            .iter()
+            .filter(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Review {
+                        completeness: Completeness::Unavailable { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(unavailable.len(), 2);
+    }
+
+    #[test]
+    fn production_outbox_with_outstanding_intents_fails_visibly() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-prod-outbox");
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::PushRef {
+                branch: "work/w".into(),
+                produced: CommitRevision::new(config().host.repository.clone(), "h-1").unwrap(),
+                expected_prior: None,
+            },
+            HostActionStatus::Pending,
+        );
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(report.phases[3].phase, "host_outbox");
+        assert_eq!(
+            report.phases[3].status, "failed",
+            "a pending production write is a visible unsupported error: {:?}",
+            report.phases[3]
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        assert_eq!(
+            intents[0].status,
+            HostActionStatus::Pending,
+            "the intent is never attempted"
+        );
+        let store = SqliteStore::in_memory(2).unwrap();
+        submit(&store, "k-prod-empty");
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            statuses(&report),
+            vec!["completed"; 8],
+            "no outstanding intents means an empty outbox report"
+        );
+    }
+
+    #[test]
+    fn the_refresh_deadline_defers_subjects_and_later_phases_report() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        submit_with_sources(&store, "k-dl-1", vec![source(7, "r", "d")]);
+        submit_with_sources(&store, "k-dl-2", vec![source(8, "r", "d")]);
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let settings = settings();
+        let mut calls = 0u32;
+        let report = run_production(&store, &settings, &mut adapter, &mut || {
+            calls += 1;
+            if calls <= 4 { NOW } else { NOW + TICK as i64 }
+        });
+        assert_eq!(report.phases.len(), 8);
+        assert_eq!(report.phases[0].status, "completed");
+        assert_eq!(
+            report.phases[0].deferred.len(),
+            1,
+            "one source is deferred to the next pass: {:?}",
+            report.phases[0]
+        );
+        assert!(
+            report.phases.iter().all(|p| p.status != "failed"),
+            "deadline deferral is never a failed phase: {:?}",
+            report.phases
+        );
+        assert_eq!(
+            adapter.client_mut().deadlines.len(),
+            1,
+            "the adapter installs one absolute read deadline per refresh"
+        );
+    }
+
+    #[test]
+    fn out_of_order_head_history_never_rolls_the_current_head_back() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-order");
+        let cfg = config();
+        let change = change_ref("cr-order");
+        open_change_receipt(&store, &w, &change, "main");
+        let obs = |head: &str, at: i64| Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e.clone()),
+            fact: ObservationFact::ChangeHead {
+                change: change.clone(),
+                head: CommitRevision::new(cfg.host.repository.clone(), head).unwrap(),
+            },
+            observed_unix_seconds: at,
+        };
+        workloop_core::work::handle_observation(&store, &cfg, &obs("head-new", NOW + 10), NOW + 10)
+            .unwrap();
+        workloop_core::work::handle_observation(&store, &cfg, &obs("head-new", NOW + 10), NOW + 10)
+            .unwrap();
+        workloop_core::work::handle_observation(&store, &cfg, &obs("head-old", NOW), NOW + 20)
+            .unwrap();
+        let heads = head_facts(&store, &w);
+        assert_eq!(
+            heads,
+            vec![
+                "head-new".to_string(),
+                "head-new".to_string(),
+                "head-old".to_string()
+            ],
+            "history keeps every delivery"
+        );
+        let detail = store
+            .transact(|tx| projection::work_detail(&*tx, &w, NOW + 30))
+            .unwrap();
+        let QueryResult::Found { value: detail, .. } = detail else {
+            panic!("work detail missing: {detail:?}")
+        };
+        assert_eq!(
+            detail
+                .current_change
+                .and_then(|(_, head)| head)
+                .map(|h| h.object),
+            Some("head-new".to_string()),
+            "the stale delivery stays history — current never rolls back"
+        );
+    }
+
+    #[test]
+    fn a_change_outside_the_works_binding_is_never_rebound() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-rebind");
+        let foreign = ChangeRequestRef {
+            repository: RepositoryRef::new(
+                config().host.repository.host.clone(),
+                RepositoryId::trusted("other-repo"),
+            ),
+            change_request: ChangeRequestId::trusted("cr-9"),
+            display_number: None,
+        };
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let cfg = config();
+        let result = adapter.refresh_change_for_work(&store, &cfg, &foreign, &w, &Some(e), NOW);
+        assert!(
+            matches!(result, Err(StoreError::ConstraintConflict { .. })),
+            "a foreign repository cannot be re-attributed: {result:?}"
+        );
+        assert!(head_facts(&store, &w).is_empty(), "no fact was ingested");
+    }
+
+    #[test]
+    fn a_poll_availability_cycle_at_one_head_recovers_then_fails_again() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-cycle");
+        let change = change_ref("cr-cycle");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-9").unwrap();
+        open_change_receipt(&store, &w, &change, "main");
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-cycle"), Ok(FakeGitHub::pull("head-9")));
+        fake.reviews.insert(cfg_key("cr-cycle"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-cycle"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let review_availability = |store: &SqliteStore| {
+            let detail = store
+                .transact(|tx| projection::work_detail(&*tx, &w, NOW))
+                .unwrap();
+            let QueryResult::Found { sources, value, .. } = detail else {
+                panic!("work detail missing: {detail:?}")
+            };
+            (
+                sources
+                    .iter()
+                    .find(|s| s.source.starts_with("review"))
+                    .map(|s| s.availability.clone()),
+                value.current_round_id.is_some(),
+            )
+        };
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            review_availability(&store),
+            (Some(projection::Availability::Known), true),
+            "the first clean poll seals the complete round"
+        );
+        adapter.client_mut().reviews.insert(
+            cfg_key("cr-cycle"),
+            Err(ApiError::Unknown {
+                reason: "outage".into(),
+            }),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            review_facts(&store, &w).last().unwrap().1,
+            Completeness::Unavailable {
+                reason: "reviews read failed".into()
+            },
+            "the outage is the latest recorded review evidence"
+        );
+        assert_eq!(
+            review_availability(&store),
+            (Some(projection::Availability::Known), true),
+            "the projection retains the prior sealed round through the outage window"
+        );
+        adapter
+            .client_mut()
+            .reviews
+            .insert(cfg_key("cr-cycle"), Ok(vec![]));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            review_facts(&store, &w).last().unwrap().1,
+            Completeness::Complete,
+            "the recovered poll is re-ingested at the same head, not deduplicated away"
+        );
+        assert_eq!(
+            review_availability(&store),
+            (Some(projection::Availability::Known), true),
+            "the projected review availability is known again"
+        );
+        adapter.client_mut().reviews.insert(
+            cfg_key("cr-cycle"),
+            Err(ApiError::Unknown {
+                reason: "outage".into(),
+            }),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            review_facts(&store, &w).last().unwrap().1,
+            Completeness::Unavailable {
+                reason: "reviews read failed".into()
+            },
+            "the second identical outage is recorded too"
+        );
+        assert_eq!(
+            review_availability(&store),
+            (Some(projection::Availability::Known), true),
+            "the prior complete round stays projected through the second outage"
+        );
+        let review_observations = review_facts(&store, &w);
+        assert_eq!(
+            review_observations
+                .iter()
+                .map(|(_, c)| c.is_complete())
+                .collect::<Vec<_>>(),
+            vec![true, false, true, false],
+            "every poll episode lands its own review fact"
+        );
+    }
+
+    #[test]
+    fn findings_changes_a_b_a_resurface_the_first_set() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-aba");
+        let change = change_ref("cr-aba");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let finding = |id: &str| RemoteReviewFinding {
+            finding_id: id.into(),
+            review_id: "rv-1".into(),
+            commit_sha: "head-1".into(),
+            body: format!("body-{id}"),
+        };
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-aba"), Ok(FakeGitHub::pull("head-1")));
+        fake.reviews.insert(cfg_key("cr-aba"), Ok(vec![]));
+        fake.findings
+            .insert(cfg_key("cr-aba"), Ok(vec![finding("f-a")]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let round_sets = |store: &SqliteStore| {
+            store
+                .transact(|tx| {
+                    let rounds = tx.rounds_for_work(&w)?;
+                    let mut sets = Vec::new();
+                    for round in &rounds {
+                        sets.push(
+                            tx.occurrences(&round.id)?
+                                .into_iter()
+                                .map(|o| o.source_key)
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    Ok(sets)
+                })
+                .unwrap()
+        };
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(round_sets(&store), vec![vec!["f-a".to_string()]]);
+        adapter
+            .client_mut()
+            .findings
+            .insert(cfg_key("cr-aba"), Ok(vec![finding("f-b")]));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            round_sets(&store),
+            vec![vec!["f-a".to_string()], vec!["f-b".to_string()]]
+        );
+        adapter
+            .client_mut()
+            .findings
+            .insert(cfg_key("cr-aba"), Ok(vec![finding("f-a")]));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let sets = round_sets(&store);
+        assert_eq!(
+            sets.last().unwrap(),
+            &vec!["f-a".to_string()],
+            "the return to the earlier finding set is re-ingested, not suppressed: {sets:?}"
+        );
+    }
+
+    #[test]
+    fn a_work_bound_to_a_different_adapter_is_never_read() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let mut drifted_cfg = config_with_issue_read();
+        drifted_cfg.host.adapter = AdapterId::trusted("legacy-github");
+        let d = handle_command(
+            &store,
+            &drifted_cfg,
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: "k-drifted".into(),
+                body: CommandBody::Submit {
+                    intent: "intent-drifted".into(),
+                    sources: vec![source(7, "rev-1", "d1")],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        let CommandDecision::Accepted {
+            work_id: Some(w),
+            effect: CommandEffect::WorkCreated { execution_id },
+            ..
+        } = d
+        else {
+            panic!("submit drifted: {d:?}")
+        };
+        let mut fake = FakeGitHub::new();
+        fake.issues.insert(
+            "issue-7".into(),
+            Ok(RemoteIssue {
+                source_revision: "rev-1".into(),
+                content_digest: "d1".into(),
+                state: IssueState::Open,
+            }),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(statuses(&report), vec!["completed"; 8]);
+        assert!(
+            issue_facts(&store, &w).is_empty(),
+            "a foreign-adapter work is skipped, never read: {:?}",
+            issue_facts(&store, &w)
+        );
+        let cfg = config();
+        let change = change_ref("cr-drifted");
+        let result = adapter.refresh_change_for_work(
+            &store,
+            &cfg,
+            &change,
+            &w,
+            &Some(execution_id.clone()),
+            NOW,
+        );
+        assert!(
+            matches!(result, Err(StoreError::ConstraintConflict { .. })),
+            "an explicit read of a drifted-adapter work is rejected: {result:?}"
+        );
+        assert!(head_facts(&store, &w).is_empty());
+    }
+
+    #[test]
+    fn refresh_change_for_work_rejects_a_foreign_execution() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w1, _e1) = submit(&store, "k-exec-1");
+        let (_w2, e2) = submit(&store, "k-exec-2");
+        let mut adapter = production_adapter(FakeGitHub::new());
+        let cfg = config();
+        let change = change_ref("cr-exec");
+        let result = adapter.refresh_change_for_work(&store, &cfg, &change, &w1, &Some(e2), NOW);
+        assert!(
+            matches!(result, Err(StoreError::ConstraintConflict { .. })),
+            "an execution of another work is rejected: {result:?}"
+        );
+        assert!(head_facts(&store, &w1).is_empty());
+    }
+
+    #[test]
+    fn the_same_change_id_in_another_repository_never_crosses() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-cross");
+        let change = change_ref("cr-x");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-a").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let other_repo = RepositoryRef::new(
+            config().host.repository.host.clone(),
+            RepositoryId::trusted("other-repo"),
+        );
+        let foreign_change = ChangeRequestRef {
+            repository: other_repo.clone(),
+            change_request: ChangeRequestId::trusted("cr-x"),
+            display_number: None,
+        };
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::ChangeHead {
+                    change: foreign_change,
+                    head: CommitRevision::new(other_repo.clone(), "head-b").unwrap(),
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-x"), Ok(FakeGitHub::pull("head-a")));
+        fake.pulls.insert(
+            remote_key(&other_repo, "cr-x"),
+            Ok(FakeGitHub::pull("head-b")),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let heads = head_facts(&store, &w);
+        assert_eq!(
+            heads.iter().filter(|h| h.as_str() == "head-a").count(),
+            1,
+            "the bound repository's read lands: {heads:?}"
+        );
+        assert_eq!(
+            heads.iter().filter(|h| h.as_str() == "head-b").count(),
+            1,
+            "the foreign repository's observation stays its own evidence: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_branch_move_updates_the_current_target_without_a_head_move() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-target");
+        let change = change_ref("cr-target");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        open_change_receipt(&store, &w, &change, "main");
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-target"), Ok(FakeGitHub::pull("head-1")));
+        fake.reviews.insert(cfg_key("cr-target"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-target"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let detail = |store: &SqliteStore| {
+            let detail = store
+                .transact(|tx| projection::work_detail(&*tx, &w, NOW))
+                .unwrap();
+            let QueryResult::Found { value, .. } = detail else {
+                panic!("work detail missing: {detail:?}")
+            };
+            value
+        };
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let first = detail(&store);
+        assert!(
+            first.current_round_id.is_some(),
+            "the review fact binds the observed target revision: {first:?}"
+        );
+        adapter
+            .client_mut()
+            .branches
+            .insert(cfg_key("main"), Ok(Some("tb-2".into())));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let second = detail(&store);
+        assert_eq!(
+            head_facts(&store, &w)
+                .iter()
+                .filter(|h| h.as_str() == "head-1")
+                .count(),
+            1,
+            "the head never moved and the identical re-read is deduplicated"
+        );
+        assert_ne!(
+            first.current_round_id, second.current_round_id,
+            "a target-only move is a new diff target with its own round"
+        );
+        let targets: Vec<Option<String>> = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::Review { target, .. } => {
+                    Some(target.target_revision.as_ref().map(|r| r.object.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Some("tb-1".to_string()), Some("tb-2".to_string())],
+            "each review binds the target revision it was read against"
+        );
+    }
+
+    #[test]
+    fn a_historical_review_is_never_rebound_onto_a_moved_target() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-pin");
+        let change = change_ref("cr-pin");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        open_change_receipt(&store, &w, &change, "main");
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let review = |id: &str| RemoteReview {
+            review_id: id.into(),
+            commit_sha: "head-1".into(),
+            author: "reviewer".into(),
+            body: String::new(),
+            changes_requested: false,
+        };
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-pin"), Ok(FakeGitHub::pull("head-1")));
+        fake.reviews
+            .insert(cfg_key("cr-pin"), Ok(vec![review("rv-1")]));
+        fake.findings.insert(cfg_key("cr-pin"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let detail = |store: &SqliteStore| {
+            let detail = store
+                .transact(|tx| projection::work_detail(&*tx, &w, NOW))
+                .unwrap();
+            let QueryResult::Found { value, sources, .. } = detail else {
+                panic!("work detail missing: {detail:?}")
+            };
+            (value, sources)
+        };
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let (first, _) = detail(&store);
+        assert!(
+            first.current_round_id.is_some(),
+            "the clean review seals a round for the observed target"
+        );
+        adapter
+            .client_mut()
+            .branches
+            .insert(cfg_key("main"), Ok(Some("tb-2".into())));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let (moved, moved_sources) = detail(&store);
+        assert_eq!(
+            moved.current_round_id, None,
+            "the old review is not re-sealed for the moved target"
+        );
+        assert!(
+            moved_sources
+                .iter()
+                .any(|s| s.source == "review"
+                    && s.availability == projection::Availability::Unavailable),
+            "the review surface reports unavailable for the unmanned target: {moved_sources:?}"
+        );
+        let rv1_targets: Vec<Option<String>> = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::Review {
+                    target,
+                    source_revision,
+                    ..
+                } if source_revision.as_deref() == Some("rv-1") => {
+                    Some(target.target_revision.as_ref().map(|r| r.object.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rv1_targets.iter().all(|t| t.as_deref() == Some("tb-1")),
+            "the historical review stays bound to the target it examined: {rv1_targets:?}"
+        );
+        adapter
+            .client_mut()
+            .reviews
+            .insert(cfg_key("cr-pin"), Ok(vec![review("rv-1"), review("rv-2")]));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let (fresh, _) = detail(&store);
+        assert!(
+            fresh.current_round_id.is_some(),
+            "the genuinely new review seals the current target"
+        );
+        let rv2_targets: Vec<Option<String>> = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::Review {
+                    target,
+                    source_revision,
+                    ..
+                } if source_revision.as_deref() == Some("rv-2") => {
+                    Some(target.target_revision.as_ref().map(|r| r.object.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rv2_targets,
+            vec![Some("tb-2".to_string())],
+            "the new review binds the target it was observed under"
+        );
+    }
+
+    #[test]
+    fn identical_polls_record_each_fact_once_per_state() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-dedup");
+        let change = change_ref("cr-dedup");
+        let head = CommitRevision::new(config().host.repository.clone(), "head-1").unwrap();
+        insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::MarkReady {
+                change: change.clone(),
+                expected_head: head,
+            },
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.pulls
+            .insert(cfg_key("cr-dedup"), Ok(FakeGitHub::pull("head-1")));
+        fake.checks.insert(
+            cfg_key("head-1"),
+            Ok(vec![RemoteCheckRun {
+                check_run_id: "run-1".into(),
+                name: "ci".into(),
+                head_sha: "head-1".into(),
+                conclusion: CheckConclusion::Success,
+                producer: "app-ci".into(),
+            }]),
+        );
+        fake.reviews.insert(cfg_key("cr-dedup"), Ok(vec![]));
+        fake.findings.insert(cfg_key("cr-dedup"), Ok(vec![]));
+        fake.branches
+            .insert(cfg_key("main"), Ok(Some("tb-1".into())));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let count = |store: &SqliteStore| {
+            store
+                .transact(|tx| tx.observations_for_work(&w))
+                .unwrap()
+                .len()
+        };
+        let first = count(&store);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            count(&store),
+            first,
+            "identical polls record no duplicate facts"
+        );
+        let rounds = store.transact(|tx| tx.rounds_for_work(&w)).unwrap().len();
+        assert_eq!(rounds, 1, "identical polls seal no extra round");
+        adapter.client_mut().checks.insert(
+            cfg_key("head-1"),
+            Ok(vec![RemoteCheckRun {
+                check_run_id: "run-1".into(),
+                name: "ci".into(),
+                head_sha: "head-1".into(),
+                conclusion: CheckConclusion::Failure,
+                producer: "app-ci".into(),
+            }]),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            count(&store) > first,
+            "a changed conclusion is new evidence"
         );
     }
 }

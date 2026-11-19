@@ -33,11 +33,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use workloop_core::identity::{ChangeRequestId, RepositoryRef};
-use workloop_core::observation::CheckConclusion;
+use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::observation::{CheckConclusion, IssueState};
 
 use crate::api::{
-    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemotePull, RemoteReview,
+    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
     RemoteReviewFinding,
 };
 
@@ -108,6 +108,8 @@ pub struct GhCliApi {
     /// so a node id from another repository can never be read through
     /// this repository's number namespace.
     pull_numbers: HashMap<String, (u64, String)>,
+    hostname: Option<String>,
+    read_deadline: Option<Instant>,
 }
 
 impl GhCliApi {
@@ -117,6 +119,8 @@ impl GhCliApi {
             gh: PathBuf::from("gh"),
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
+            hostname: None,
+            read_deadline: None,
         }
     }
 
@@ -127,12 +131,19 @@ impl GhCliApi {
             gh: gh.into(),
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
+            hostname: None,
+            read_deadline: None,
         }
     }
 
     /// Override the per-call subprocess ceiling.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
         self
     }
 
@@ -163,8 +174,24 @@ impl GhCliApi {
     /// timeout is [`ApiError::Unknown`] — the request may have been
     /// issued before the ceiling hit.
     fn run(&self, args: &[String], body: Option<&serde_json::Value>) -> Result<GhOutput, ApiError> {
+        let effective = match self.read_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ApiError::Unknown {
+                        reason: format!("gh api {}: read deadline elapsed", args.join(" ")),
+                    });
+                }
+                remaining.min(self.timeout)
+            }
+            None => self.timeout,
+        };
         let mut command = Command::new(&self.gh);
         command.arg("api").args(args);
+        if let Some(hostname) = &self.hostname {
+            command.arg("--hostname").arg(hostname);
+            command.env_remove("GH_HOST");
+        }
         if body.is_some() {
             command.arg("--input").arg("-");
         }
@@ -203,7 +230,7 @@ impl GhCliApi {
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stdout_reader = spawn_drain(child.stdout.take(), MAX_OUTPUT, &stdout_buf);
         let stderr_reader = spawn_drain(child.stderr.take(), MAX_OUTPUT, &stderr_buf);
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + effective;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -1021,5 +1048,60 @@ impl GitHubApi for GhCliApi {
             value.get("status").and_then(|v| v.as_str()),
             Some("ahead" | "identical")
         ))
+    }
+
+    fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
+        let slug = Self::slug(&issue.repository)?;
+        let id = issue.issue.as_str();
+        let number = id
+            .parse::<u64>()
+            .ok()
+            .filter(|number| *number > 0 && number.to_string() == id)
+            .ok_or_else(|| ApiError::Refused {
+                reason: format!("issue id is not a positive decimal number: {id}"),
+            })?;
+        let endpoint = format!("repos/{slug}/issues/{number}");
+        let value = self.api("GET", &endpoint, None)?;
+        let malformed = |reason: &str| ApiError::Refused {
+            reason: format!("gh api {endpoint}: malformed issue response: {reason}"),
+        };
+        let reported = value
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| malformed("missing or non-numeric number"))?;
+        if reported != number {
+            return Err(malformed(
+                "response number does not match the requested issue",
+            ));
+        }
+        let state = match value.get("state").and_then(|v| v.as_str()) {
+            Some("open") => IssueState::Open,
+            Some("closed") => IssueState::Closed,
+            _ => return Err(malformed("state is not open or closed")),
+        };
+        let title = value
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| malformed("title is not a string"))?;
+        let body = match value.get("body") {
+            None | Some(serde_json::Value::Null) => "",
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| malformed("body is not a string"))?,
+        };
+        let source_revision = value
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| malformed("missing or empty updated_at"))?;
+        Ok(RemoteIssue {
+            source_revision: source_revision.to_string(),
+            content_digest: workloop_selector::issue_content_digest(title, body),
+            state,
+        })
+    }
+
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) {
+        self.read_deadline = deadline;
     }
 }
