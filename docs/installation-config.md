@@ -136,6 +136,25 @@ one host, one publication repository, publication/review/discussion
 roles, one worker binding, and exactly one `[intake.selector]` binding.
 It contains no credential values and no live identity.
 
+The profile is not the only configuration file a running installation
+reads — the single-TOML design above is the target, while the current
+runtime keeps a second file. The store-backed commands (`submit`,
+`run`, `intake`, …) load a JSON **installation record** — `--config`,
+or `<db-stem>.config.json` beside `--db` — which carries the host
+binding (`adapter`, `host_instance`, `repository`, `host_actors`,
+`capabilities`, `contract_version` — all required at load), the actor
+binding, `capacity`, `worker_argv`, `worker_isolation_profile`,
+`workspace_root`, `allowed_effects`, and the
+`budget`/`policy`/`retention`/`loop` overrides. The profile's
+`[worker]` section is the declaration `check` stage 5 validates;
+`worker_argv` in the installation record is the launch source
+`taisan run` binds. The guide's
+[two-file section](v0.2.md#two-files-the-profile-and-the-installation-record)
+documents the reconciliation an operator performs; `check --probe`
+requests the opt-in adapter capability stage but no probe backend is
+wired into this runtime yet, so that stage fails closed
+`capability.unknown` rather than fabricating a result.
+
 The v0.2 intake keys and defaults are:
 
 | Key | Default | Rule |
