@@ -1,0 +1,608 @@
+//! Contract tests: durable Worker request bodies (`worker_request_bodies`,
+//! store format 11, `docs/v0.3.md`).
+
+use std::collections::BTreeSet;
+
+use workloop_core::command::*;
+use workloop_core::domain::*;
+use workloop_core::identity::*;
+use workloop_core::store::*;
+use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
+use workloop_core::worker_v2::WorkerRequestBody;
+use workloop_store::sqlite::SqliteStore;
+
+const NOW: i64 = 1_700_000_000;
+
+fn host() -> HostInstanceId {
+    HostInstanceId::trusted("test-host")
+}
+
+fn repo() -> RepositoryRef {
+    RepositoryRef::new(host(), RepositoryId::trusted("local-repo"))
+}
+
+fn publisher() -> HostActorRef {
+    HostActorRef {
+        host: host(),
+        actor: HostActorId::trusted("pub-agent"),
+    }
+}
+
+fn config() -> WorkloopConfig {
+    WorkloopConfig {
+        host: HostTemplate {
+            adapter: AdapterId::trusted("fixture"),
+            repository: repo(),
+            contract_version: 1,
+            actors: vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: publisher(),
+                credential_ref: CredentialRef::trusted("cred-publication"),
+            }],
+        },
+        declared_capabilities: BTreeSet::from([
+            HostCapability::RepositoryRead,
+            HostCapability::PushRef,
+            HostCapability::ChangeRequestCreate,
+            HostCapability::ChangeRequestRead,
+            HostCapability::ChecksRead,
+            HostCapability::ReviewFindingsRead,
+        ]),
+        lanes: LanePolicy::default(),
+        required_checks: vec!["ci".into()],
+        allowed_effects: AllowedEffects {
+            workspace_write: true,
+            host_write: true,
+            network: false,
+        },
+        budget: ExecutionBudget::default(),
+        policy: WorkPolicy::default(),
+    }
+}
+
+fn actor() -> Actor {
+    Actor {
+        kind: ActorKind::Human,
+        external_id: "op".into(),
+    }
+}
+
+fn submit(key: &str) -> CommandRequest {
+    CommandRequest {
+        actor: actor(),
+        origin: Origin("cli".into()),
+        idempotency_key: key.into(),
+        body: CommandBody::Submit {
+            intent: "do the thing".into(),
+            sources: vec![],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    }
+}
+
+fn accepted_with_execution(d: &CommandDecision) -> (WorkId, ExecutionId) {
+    match d {
+        CommandDecision::Accepted {
+            work_id, effect, ..
+        } => {
+            let eid = match effect {
+                CommandEffect::WorkCreated { execution_id }
+                | CommandEffect::ExecutionCreated { execution_id } => execution_id.clone(),
+                other => panic!("expected an execution effect, got {other:?}"),
+            };
+            (work_id.clone().expect("work_id"), eid)
+        }
+        other => panic!("expected accepted, got {other:?}"),
+    }
+}
+
+fn apply_effects(store: &SqliteStore, effects: &[Effect]) {
+    store
+        .transact(|tx| {
+            for e in effects {
+                tx.apply(e)?;
+            }
+            Ok(())
+        })
+        .expect("setup effects apply");
+}
+
+/// Open a store, admit one Work, and plant the durable request row a
+/// v2 body binds to.
+fn seeded_request(store: &SqliteStore, key: &str) -> String {
+    let (work_id, execution_id) =
+        accepted_with_execution(&handle_command(store, &config(), &submit(key), NOW).unwrap());
+    let request_id = format!("{key}:inv:0");
+    apply_effects(
+        store,
+        &[Effect::InsertRequest {
+            request: InvocationRequest {
+                request_id: request_id.clone(),
+                work_id,
+                execution_id,
+                role: InvocationRole::Coding,
+                spec_revision: 1,
+                payload: serde_json::json!({}),
+                adapter_binding: None,
+            },
+        }],
+    );
+    request_id
+}
+
+fn body(request_id: &str, goal: &str) -> WorkerRequestBody {
+    let canonical = format!(
+        "{{\"format_version\":\"taisan.worker.request/2\",\"goal\":\"{goal}\",\"request_id\":\"{request_id}\"}}"
+    );
+    // The recorded digest is the real `request_v2_digest` over the
+    // stored body minus `request_digest` — the read path re-verifies
+    // it, so fixture bodies must carry a genuine digest. The embedded
+    // member carries that same digest: it is excluded from its own
+    // hash, so the read gate re-checks it explicitly.
+    let mut value: serde_json::Value = serde_json::from_slice(canonical.as_bytes()).unwrap();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("request_digest");
+    }
+    let digest = workloop_core::worker_v2::request_v2_digest(&canonical_json(&value));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "request_digest".into(),
+            serde_json::Value::String(digest.clone()),
+        );
+    }
+    WorkerRequestBody {
+        request_id: request_id.into(),
+        format_version: "taisan.worker.request/2".into(),
+        canonical_body: canonical_json(&value),
+        body_digest: digest,
+    }
+}
+
+fn temp_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "workloop-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// A recorded body reads back verbatim — the same bytes, the same
+/// digest, never reconstructed.
+#[test]
+fn a_recorded_body_reads_back_verbatim() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "body-rt");
+    let recorded = body(&request_id, "ship it");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: recorded.clone(),
+        }],
+    );
+    let read = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the body is durable");
+    assert_eq!(read, recorded);
+    assert_eq!(read.canonical_body, recorded.canonical_body);
+}
+
+/// A second insert with identical bytes is a replay — the write is
+/// idempotent under crash-and-retry.
+#[test]
+fn reinserting_identical_bytes_is_a_replay() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "body-replay");
+    let recorded = body(&request_id, "same");
+    for _ in 0..2 {
+        apply_effects(
+            &store,
+            &[Effect::InsertWorkerRequestBody {
+                body: recorded.clone(),
+            }],
+        );
+    }
+    let read = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the replayed body is durable");
+    assert_eq!(read, recorded);
+}
+
+/// A second insert with different bytes under the same request_id is
+/// refused: the store never replaces the body an already-launched
+/// worker may hold.
+#[test]
+fn a_conflicting_body_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "body-conflict");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "first"),
+        }],
+    );
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: body(&request_id, "second"),
+            })
+        })
+        .expect_err("different bytes under one request_id conflict");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+    let read = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the original body survives the refused write");
+    assert_eq!(read, body(&request_id, "first"));
+}
+
+/// A body referencing no request row is refused by the foreign key —
+/// bodies only exist attached to a durable dispatch request.
+#[test]
+fn a_body_without_a_request_row_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let err = store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: body("req:nonexistent", "orphan"),
+            })
+        })
+        .expect_err("an orphaned body row is refused");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+}
+
+fn expect_refused_then_recovered(store: &SqliteStore, request_id: &str, bad: WorkerRequestBody) {
+    let err = store
+        .transact(|tx| tx.apply(&Effect::InsertWorkerRequestBody { body: bad }))
+        .expect_err("an unverifiable body is refused at the write boundary");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(request_id))
+            .unwrap()
+            .is_none(),
+        "no row is left behind by the refused write"
+    );
+    let corrected = body(request_id, "corrected");
+    apply_effects(
+        store,
+        &[Effect::InsertWorkerRequestBody {
+            body: corrected.clone(),
+        }],
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.worker_request_body(request_id))
+            .unwrap()
+            .expect("the corrected body records"),
+        corrected
+    );
+}
+
+#[test]
+fn an_invalid_json_body_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badjson");
+    let mut bad = body(&request_id, "goal");
+    bad.canonical_body = b"{not json".to_vec();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_bad_body_digest_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-baddigest");
+    let mut bad = body(&request_id, "goal");
+    bad.body_digest = "0".repeat(64);
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_unsupported_format_version_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badver");
+    let mut bad = body(&request_id, "goal");
+    bad.format_version = "taisan.worker.request/9".into();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_mismatched_request_id_member_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badid");
+    let mut bad = body("other:inv:9", "goal");
+    bad.request_id = request_id.clone();
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_mismatched_request_digest_member_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badrdigest");
+    let mut bad = body(&request_id, "goal");
+    let mut value: serde_json::Value = serde_json::from_slice(&bad.canonical_body).unwrap();
+    value["request_digest"] = serde_json::Value::String("0".repeat(64));
+    bad.canonical_body = canonical_json(&value);
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_invalid_reinsert_leaves_the_original_body() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-badreinsert");
+    let recorded = body(&request_id, "first");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: recorded.clone(),
+        }],
+    );
+    let mut bad = body(&request_id, "second");
+    bad.body_digest = "0".repeat(64);
+    let err = store
+        .transact(|tx| tx.apply(&Effect::InsertWorkerRequestBody { body: bad }))
+        .expect_err("an unverifiable replacement is refused");
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "the refusal is a typed conflict: {err:?}"
+    );
+    let read = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the original body survives the refused write");
+    assert_eq!(read, recorded);
+    assert_eq!(read.canonical_body, recorded.canonical_body);
+}
+
+/// Regression: a v10 store gains `worker_request_bodies` on open, keeps
+/// every pre-upgrade row, and the new table accepts writes on the
+/// upgraded file.
+#[test]
+fn a_v10_store_gains_the_request_bodies_table() {
+    let root = temp_root("upgrade-v10");
+    let db = root.join("store.db");
+    let request_id = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let id = seeded_request(&store, "up-v10");
+        drop(store);
+        id
+    };
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE worker_request_bodies; PRAGMA user_version=10;")
+            .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name='worker_request_bodies')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real v10 store");
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v10 store upgrades in place");
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 11, "the upgrade lands on the current format");
+    // The pre-upgrade request row survives and the new table accepts
+    // its body on the upgraded file.
+    assert!(
+        store
+            .transact(|tx| tx.request(&request_id))
+            .unwrap()
+            .is_some(),
+        "the pre-upgrade request survives"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(&request_id))
+            .unwrap()
+            .is_none(),
+        "the v10 file carried no body"
+    );
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "post-upgrade"),
+        }],
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.worker_request_body(&request_id))
+            .unwrap()
+            .expect("the upgraded file records bodies")
+            .canonical_body,
+        body(&request_id, "post-upgrade").canonical_body
+    );
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A file that claims v10 but lacks the v10-era tables is still
+/// refused — the upgrade path accepts only a real previous release.
+#[test]
+fn a_truncated_v10_store_is_still_refused() {
+    let root = temp_root("truncated-v10");
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE worker_request_bodies; DROP TABLE intake_settings; \
+             PRAGMA user_version=10;",
+        )
+        .unwrap();
+    }
+    let err = match SqliteStore::open(&db, 1) {
+        Ok(_) => panic!("a truncated v10 file is refused"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::UnsupportedFormat { .. }),
+        "the refusal names the format, not a missing table: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A tampered or foreign-version body row reads as corrupt — the
+/// verbatim replay path is never handed bytes that fail verification,
+/// and the row is not silently reported absent (which would downgrade
+/// the dispatch onto the legacy v1 path).
+#[test]
+fn a_tampered_body_reads_as_corrupt() {
+    let root = temp_root("tampered-body");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-tamper");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1 WHERE request_id=?2",
+            rusqlite::params![b"{}".to_vec(), request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a tampered body is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
+    );
+
+    // A foreign format version fails the same gate.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE worker_request_bodies SET format_version='taisan.worker.request/9', \
+             canonical_body=?1, body_digest=?2 WHERE request_id=?3",
+            rusqlite::params![
+                body(&request_id, "verifiable").canonical_body,
+                body(&request_id, "verifiable").body_digest,
+                request_id
+            ],
+        )
+        .unwrap();
+    }
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(&request_id))
+            .is_err(),
+        "a non-v2 body row is corrupt"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `request_digest` is excluded from its own digest, so altering that
+/// member alone leaves `body_digest` consistent — the read gate
+/// re-checks the embedded member explicitly and the row still reads
+/// as corrupt.
+#[test]
+fn a_tampered_digest_member_reads_as_corrupt() {
+    let root = temp_root("tampered-digest-member");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-digest-tamper");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body(&request_id, "verifiable").canonical_body).unwrap();
+        value["request_digest"] = serde_json::Value::String("0".repeat(64));
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1 WHERE request_id=?2",
+            rusqlite::params![canonical_json(&value), request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a tampered digest member is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The embedded `request_id` is covered by `body_digest`, so a row
+/// written with a key/member mismatch verifies consistently — the
+/// read gate re-checks the embedded identity against the row key and
+/// the row still reads as corrupt.
+#[test]
+fn a_mismatched_request_id_member_reads_as_corrupt() {
+    let root = temp_root("mismatched-request-id");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-id-mismatch");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body(&request_id, "verifiable").canonical_body).unwrap();
+        value["request_id"] = serde_json::Value::String("other:inv:9".into());
+        // Keep the row self-consistent: recompute the digest over the
+        // mismatched body — embedded member and column alike — so only
+        // the identity check can refuse it.
+        let mut stripped = value.clone();
+        stripped.as_object_mut().unwrap().remove("request_digest");
+        let digest = workloop_core::worker_v2::request_v2_digest(&canonical_json(&stripped));
+        value["request_digest"] = serde_json::Value::String(digest.clone());
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1, body_digest=?2              WHERE request_id=?3",
+            rusqlite::params![canonical_json(&value), digest, request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a mismatched request_id is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}

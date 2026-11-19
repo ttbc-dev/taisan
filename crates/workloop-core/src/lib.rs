@@ -11,3 +11,4 @@ pub mod stage;
 pub mod store;
 pub mod work;
 pub mod worker;
+pub mod worker_v2;

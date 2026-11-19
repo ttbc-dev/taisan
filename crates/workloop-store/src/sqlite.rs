@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `10` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `9`
+//! `PRAGMA user_version` is the format gate: `11` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `10`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -45,9 +45,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// durable `last_progress_basis`; `8` adds the `intake_runs` /
 /// `intake_candidates` tables (`docs/intake-identity-storage.md`);
 /// `9` adds the `intake_settings` admission record (#213);
-/// `10` adds the `recovery_intents.retirement_generation` column (#139).
+/// `10` adds the `recovery_intents.retirement_generation` column (#139);
+/// `11` adds the `worker_request_bodies` canonical-body record for the
+/// versioned executable Worker request (`docs/v0.3.md`, #256).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 10;
+pub(crate) const FORMAT_VERSION: i64 = 11;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -86,6 +88,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "stop_intents",
     "store_meta",
     "verification_results",
+    "worker_request_bodies",
     "worker_request_exports",
     "work_issue_refs",
     "work_usage",
@@ -121,6 +124,10 @@ const V8_ADDED_TABLES: &[&str] = &["intake_candidates", "intake_runs"];
 /// The table the v8 → v9 migration adds (the intake-settings admission
 /// record). Installed by the same `SCHEMA` batch on upgrade.
 const V9_ADDED_TABLES: &[&str] = &["intake_settings"];
+
+/// The table the v10 → v11 migration adds (the canonical v2 Worker
+/// request bodies). Installed by the same `SCHEMA` batch on upgrade.
+const V10_ADDED_TABLES: &[&str] = &["worker_request_bodies"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -350,6 +357,7 @@ impl SqliteStore {
                             && !V5_ADDED_TABLES.contains(t)
                             && !V8_ADDED_TABLES.contains(t)
                             && !V9_ADDED_TABLES.contains(t)
+                            && !V10_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -360,6 +368,7 @@ impl SqliteStore {
                             && !V5_ADDED_TABLES.contains(t)
                             && !V8_ADDED_TABLES.contains(t)
                             && !V9_ADDED_TABLES.contains(t)
+                            && !V10_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
@@ -369,17 +378,27 @@ impl SqliteStore {
                         !V5_ADDED_TABLES.contains(t)
                             && !V8_ADDED_TABLES.contains(t)
                             && !V9_ADDED_TABLES.contains(t)
+                            && !V10_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V8_ADDED_TABLES.contains(t) && !V9_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V8_ADDED_TABLES.contains(t)
+                            && !V9_ADDED_TABLES.contains(t)
+                            && !V10_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 9 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V9_ADDED_TABLES.contains(t))
+                    .filter(|t| !V9_ADDED_TABLES.contains(t) && !V10_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else if version < 11 {
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V10_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
                 EXPECTED_TABLES.iter().all(|t| present.contains(*t))
@@ -1159,6 +1178,19 @@ fn worker_request_export_from_row(
     })
 }
 
+const WORKER_REQUEST_BODY_COLS: &str = "request_id, format_version, canonical_body, body_digest";
+
+fn worker_request_body_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<workloop_core::worker_v2::WorkerRequestBody, rusqlite::Error> {
+    Ok(workloop_core::worker_v2::WorkerRequestBody {
+        request_id: row.get(0)?,
+        format_version: row.get(1)?,
+        canonical_body: row.get(2)?,
+        body_digest: row.get(3)?,
+    })
+}
+
 const VERIFICATION_COLS: &str = "id, artifact_id, requirement, argv, produced, \
     environment_digest, result, output, recorded_seq";
 
@@ -1799,6 +1831,31 @@ impl ReadView for Tx<'_> {
             params![request_id],
             worker_request_export_from_row,
         )
+    }
+
+    fn worker_request_body(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<workloop_core::worker_v2::WorkerRequestBody>, StoreError> {
+        let body = self.query_opt(
+            &format!(
+                "SELECT {WORKER_REQUEST_BODY_COLS} FROM worker_request_bodies \
+                 WHERE request_id=?1"
+            ),
+            params![request_id],
+            worker_request_body_from_row,
+        )?;
+        // The durable body is replayed verbatim, so the read re-checks
+        // the recorded format and digest: a tampered or foreign-version
+        // row is corrupt, never replayable — and never silently absent,
+        // which would downgrade the dispatch onto the legacy v1 path.
+        match body {
+            Some(body) if body.verifies() => Ok(Some(body)),
+            Some(_) => Err(StoreError::Internal {
+                detail: format!("worker request body {request_id} failed integrity verification"),
+            }),
+            None => Ok(None),
+        }
     }
 
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {
@@ -2587,6 +2644,55 @@ impl TxView for Tx<'_> {
                             "worker request export {request_id} is absent or already bound"
                         ),
                     });
+                }
+            }
+            Effect::InsertWorkerRequestBody { body } => {
+                // The primary key makes a second insert conflict; the
+                // effect resolves it rather than failing the
+                // transaction — identical bytes are a replay, different
+                // bytes mean the store is asked to replace a body an
+                // already-launched worker may hold, which is refused
+                // here rather than by the schema alone.
+                if !body.verifies() {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "worker request body {} failed integrity verification",
+                            body.request_id
+                        ),
+                    });
+                }
+                let existing: Option<(Vec<u8>, String, String)> = self.query_opt(
+                    "SELECT canonical_body, format_version, body_digest \
+                         FROM worker_request_bodies WHERE request_id=?1",
+                    params![body.request_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                match existing {
+                    Some((bytes, version, digest))
+                        if bytes == body.canonical_body
+                            && version == body.format_version
+                            && digest == body.body_digest => {}
+                    Some(..) => {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "worker request body {} already recorded with different content",
+                                body.request_id
+                            ),
+                        });
+                    }
+                    None => {
+                        self.exec(
+                            "INSERT INTO worker_request_bodies \
+                             (request_id, format_version, canonical_body, body_digest) \
+                             VALUES (?1,?2,?3,?4)",
+                            params![
+                                body.request_id,
+                                body.format_version,
+                                body.canonical_body,
+                                body.body_digest
+                            ],
+                        )?;
+                    }
                 }
             }
             Effect::SetIntakeSettings {

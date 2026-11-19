@@ -1,12 +1,14 @@
--- workloop v10 store: current-state tables enforcing structural
+-- workloop v11 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 10` marks the format; a stamped older file with
+-- `PRAGMA user_version = 11` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
 -- candidate tables specified in docs/intake-identity-storage.md; v9
 -- added the intake_settings admission record (#213); v10 added the
--- recovery_intents.retirement_generation column (#139).
+-- recovery_intents.retirement_generation column (#139); v11 added the
+-- worker_request_bodies canonical v2 request-body record (docs/v0.3.md,
+-- #256).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -393,6 +395,22 @@ CREATE TABLE IF NOT EXISTS worker_request_exports (
     state TEXT NOT NULL DEFAULT 'exported'
         CHECK (state IN ('exported', 'bound')),
     process_identity TEXT
+);
+
+-- The canonical executable request body for one durable dispatch
+-- request (`taisan.worker.request/2`, docs/v0.3.md): written in the
+-- commit that binds the request before launch, and replayed verbatim —
+-- a restart re-reads the recorded bytes, it never reconstructs the
+-- request from mutable live configuration. `format_version` is the
+-- recorded wire format: a request row with no body row is a legacy v1
+-- dispatch and is never silently made executable under v2. The
+-- primary key makes a second insert for the same request conflict;
+-- equal bytes read as a replay, different bytes are refused.
+CREATE TABLE IF NOT EXISTS worker_request_bodies (
+    request_id TEXT PRIMARY KEY REFERENCES invocation_requests(request_id),
+    format_version TEXT NOT NULL,
+    canonical_body BLOB NOT NULL,
+    body_digest TEXT NOT NULL
 );
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.

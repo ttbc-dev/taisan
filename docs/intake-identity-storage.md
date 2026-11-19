@@ -181,6 +181,8 @@ Store format v9 (#213) adds one more table and nothing else: the `intake_setting
 
 Store format v10 (#139) adds one nullable column, `recovery_intents.retirement_generation`, and no tables. Opening a v9 store adds it inside the same idempotent upgrade transaction and stamps `user_version = 10`; the column records the evidence generation a retirement was decided from, so a stale retirement decision cannot overwrite a newer intent's ownership.
 
+Store format v11 (#256) adds one table, `worker_request_bodies`, and no column changes. It records the canonical `taisan.worker.request/2` body bytes for each `invocation_requests` row together with the recorded wire `format_version` and the `body_digest` re-checked on every read; the primary key on `request_id` makes a second insert conflict, identical bytes read as a replay, and different bytes are refused rather than replacing a body an already-launched worker may hold. A request row with no body row is a legacy v1 dispatch and is never silently made executable under v2. Opening a v10 store installs the table inside the same idempotent upgrade transaction and stamps `user_version = 11`; existing Works, commands, claims, specs, and evidence are not read, rewritten, or re-keyed.
+
 Retention treats intake rows like the commands ledger: they are replay-critical identity and recovery evidence, never body-catalog entries, and no cleanup path deletes them. `request_payload` and candidate `payload` follow the same rule — they are retained because recovery and audit need them; if a future retention limit cannot preserve that, the tradeoff surfaces to the owner rather than silently deleting.
 
 ## Query results
