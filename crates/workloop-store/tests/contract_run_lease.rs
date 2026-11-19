@@ -3,11 +3,20 @@
 //! an uninspectable owner never yields the lease, and a stale holder's
 //! release cannot clear a reclaimed lease.
 
+use std::path::PathBuf;
+
 use workloop_core::domain::ProcessIdentity;
 use workloop_core::ports::ProcessEvidence;
 use workloop_store::sqlite::{RunLeaseError, RunLeaseGrant, RunLeaseOwner, SqliteStore};
 
 const NOW: i64 = 1_700_000_000;
+
+fn temp_root(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("workloop-lease-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 fn owner(pid: i32, started_at: &str, nonce: &str) -> RunLeaseOwner {
     RunLeaseOwner {
@@ -217,4 +226,50 @@ fn maintenance_lease_is_independent_of_the_driver_lease() {
             NOW,
         )
         .unwrap();
+}
+
+/// A lease row naming this process whose nonce no live guard holds —
+/// the end-state a dropped guard + failed release write leaves — is
+/// reclaimable without waiting for the process to die.
+#[test]
+fn a_dead_same_process_guards_lease_is_reclaimed() {
+    let db = temp_root("dead-guard").join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO run_lease (lease_key, owner_pid, owner_started_at, \
+             owner_nonce, acquired_unix_seconds) VALUES ('default', ?1, ?2, ?3, ?4)",
+            rusqlite::params![909_i32, "this-process", "nonce-dead", NOW],
+        )
+        .unwrap();
+    }
+    // Same pid and start-time as the recorded owner, fresh nonce: the
+    // dead guard's row is reclaimed on the spot.
+    let next = owner(909, "this-process", "nonce-next");
+    assert_eq!(
+        store.acquire_run_lease(&next, alive, NOW + 1).unwrap(),
+        RunLeaseGrant::Reclaimed { previous_pid: 909 }
+    );
+    // And a third same-process contender still fails closed while the
+    // live guard's nonce is held.
+    let third = owner(909, "this-process", "nonce-third");
+    match store.acquire_run_lease(&third, alive, NOW + 2) {
+        Err(RunLeaseError::Held { owner_pid }) => assert_eq!(owner_pid, 909),
+        other => panic!("expected lock.held, got {other:?}"),
+    }
+}
+
+/// A live same-process holder is never displaced: the nonce
+/// registration distinguishes it from a dead guard's leftover row.
+#[test]
+fn a_live_same_process_holder_still_reports_held() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let holder = owner(909, "this-process", "nonce-live");
+    store.acquire_run_lease(&holder, alive, NOW).unwrap();
+    let contender = owner(909, "this-process", "nonce-contender");
+    match store.acquire_run_lease(&contender, alive, NOW + 1) {
+        Err(RunLeaseError::Held { owner_pid }) => assert_eq!(owner_pid, 909),
+        other => panic!("expected lock.held, got {other:?}"),
+    }
 }

@@ -850,9 +850,6 @@ fn run(cli: Cli) -> i32 {
                     "taisan: pass {passes_done}: {} phase(s)",
                     report.phases.len()
                 );
-                if let Some(driver) = intake_driver.as_mut() {
-                    driver.maybe_tick(&store, now());
-                }
                 if let Some(reason) = report.abort_reason() {
                     // Join a still-running invocation before exiting —
                     // otherwise its selector child is orphaned past the
@@ -865,6 +862,15 @@ fn run(cli: Cli) -> i32 {
                         envelope::ErrorClass::Store,
                         &reason,
                     ));
+                }
+                // A pass that aborted starts no new intake work — the
+                // invocation would only sit under finish()'s join on
+                // the error path. `--once` still evaluates scheduling:
+                // the startup-due intake is part of the one pass the
+                // run documents, joined by finish() before the terminal
+                // envelope.
+                if let Some(driver) = intake_driver.as_mut() {
+                    driver.maybe_tick(&store, now());
                 }
                 if once || (ticks != 0 && passes_done >= ticks) {
                     break;
@@ -881,9 +887,14 @@ fn run(cli: Cli) -> i32 {
                     let slice = remaining_ms.min(100);
                     std::thread::sleep(std::time::Duration::from_millis(slice));
                     remaining_ms -= slice;
+                    if shutdown_requested() {
+                        break;
+                    }
                     // The settings-check tick is 60 seconds regardless
                     // of the pass interval — evaluate it inside the
-                    // idle gap so a long interval cannot starve it.
+                    // idle gap so a long interval cannot starve it. A
+                    // shutdown observed inside the slice must not spawn
+                    // an invocation finish() then has to join.
                     if let Some(driver) = intake_driver.as_mut() {
                         driver.maybe_tick(&store, now());
                     }

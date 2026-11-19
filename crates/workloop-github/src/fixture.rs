@@ -248,9 +248,10 @@ pub struct FixtureGithub {
 
 /// What one pending intent's pass did.
 enum AttemptOutcome {
-    /// No host attempt ran: the intent names another host instance, the
-    /// Execution is missing, or its `host_write` grant is denied.
-    Skipped,
+    /// No host attempt ran, with why: the intent names another host
+    /// instance, the Execution is missing, or its `host_write` grant is
+    /// denied.
+    Skipped(&'static str),
     /// A credential failure blocked the write before any host call;
     /// the intent stays `pending` and the pass reports the class.
     CredentialBlocked(&'static str),
@@ -395,6 +396,10 @@ pub struct OutboxReport {
     /// verification during the pass; each stays `pending` with its
     /// `credential.*` class recorded for the repair path.
     pub credential_blocked: Vec<CredentialBlock>,
+    /// In-scope pending intents the pass could not act on at all, each
+    /// with why — they stay `pending` and reappear every pass, so a
+    /// permanently unroutable intent must be visible in reports.
+    pub skipped: Vec<SkippedIntent>,
 }
 
 /// One intent a credential failure blocked before any host write. The
@@ -405,6 +410,16 @@ pub struct CredentialBlock {
     pub action_id: String,
     /// The `credential.*` failure class.
     pub code: &'static str,
+}
+
+/// One in-scope intent the pass never attempted, with why: another
+/// host instance owns the effect, the Execution is missing, or its
+/// `host_write` grant is denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedIntent {
+    pub action_id: String,
+    /// `host_mismatch` | `missing_execution` | `host_write_denied`.
+    pub reason: &'static str,
 }
 
 /// What one reconcile pass did against the outstanding intents:
@@ -1319,7 +1334,12 @@ impl FixtureGithub {
                         code,
                     });
                 }
-                AttemptOutcome::Skipped => {}
+                AttemptOutcome::Skipped(reason) => {
+                    report.skipped.push(SkippedIntent {
+                        action_id: action_id.clone(),
+                        reason,
+                    });
+                }
                 // The test-armed crash point: the remote mutation
                 // landed but the worker "died" before the receipt —
                 // the intent stays `pending` and the drain stops the
@@ -2152,7 +2172,7 @@ impl FixtureGithub {
             .as_ref()
             .is_some_and(|bound| *bound != intent.host)
         {
-            return Ok(AttemptOutcome::Skipped);
+            return Ok(AttemptOutcome::Skipped("host_mismatch"));
         }
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
@@ -2162,10 +2182,10 @@ impl FixtureGithub {
                 .max_by_key(|execution| execution.ordinal))
         })?;
         let Some(execution) = execution else {
-            return Ok(AttemptOutcome::Skipped);
+            return Ok(AttemptOutcome::Skipped("missing_execution"));
         };
         if !execution.allowed_effects.host_write {
-            return Ok(AttemptOutcome::Skipped);
+            return Ok(AttemptOutcome::Skipped("host_write_denied"));
         }
         // The adapter-boundary credential gate: with a book installed,
         // the intent's recorded role binding resolves its credential
