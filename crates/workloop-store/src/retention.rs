@@ -1479,13 +1479,31 @@ fn managed_path(root_abs: &Path, recorded: &str) -> Result<PathBuf, String> {
 /// different string. A protected file that does not exist still
 /// matches lexically: it must never be committed as `reclaimed`
 /// either.
+///
+/// When the file itself cannot be canonicalized — the `-journal`
+/// sidecar is routinely absent — the last resort is the canonical
+/// parent directory plus the file name. `std::path::absolute` keeps
+/// `..` and never resolves symlinks, so a protected entry's spelling
+/// can differ from the root-joined catalogue form while naming the
+/// same location; an entry whose parent resolves to the same
+/// directory identifies the same file, whether or not it exists yet.
 fn is_protected(managed: &Path, protected: &[PathBuf]) -> bool {
+    let canonical_location = |path: &Path| -> Option<PathBuf> {
+        let name = path.file_name()?;
+        let parent = path.parent()?;
+        Some(std::fs::canonicalize(parent).ok()?.join(name))
+    };
     protected.iter().any(|p| {
         if p == managed {
             return true;
         }
-        match (std::fs::canonicalize(p), std::fs::canonicalize(managed)) {
-            (Ok(a), Ok(b)) => a == b,
+        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(p), std::fs::canonicalize(managed))
+            && a == b
+        {
+            return true;
+        }
+        match (canonical_location(p), canonical_location(managed)) {
+            (Some(a), Some(b)) => a == b,
             _ => false,
         }
     })

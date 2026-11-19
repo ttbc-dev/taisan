@@ -757,6 +757,176 @@ fn protected_installation_files_are_held_and_not_counted() {
     assert_eq!(cas.pressure, "none");
 }
 
+/// Rows cataloguing the live installation files are held under every
+/// spelling a protected entry or a recorded path can carry.
+/// `std::path::absolute` preserves `..` and does not resolve symlinks,
+/// so a `--db`/`--config` spelling like `<root>/../<root>/workloop.db`
+/// never lexically equals the root-joined catalogue form. The
+/// `-journal` sidecar is routinely absent, so file-level
+/// canonicalization cannot identify it either — the match must hold on
+/// resolved path identity regardless of string form.
+#[test]
+fn installation_files_are_held_under_alternate_spellings() {
+    let fixture = Fixture::new("protected-spelling");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // The live store, the WAL/SHM sidecars and the config exist;
+    // `workloop.db-journal` is intentionally left absent.
+    for name in ["workloop.db", "workloop.db-wal", "workloop.db-shm"] {
+        std::fs::write(fixture.root.join(name), b"live").unwrap();
+    }
+    std::fs::write(fixture.root.join("config.json"), b"{}").unwrap();
+    let names = [
+        "workloop.db",
+        "workloop.db-wal",
+        "workloop.db-shm",
+        "workloop.db-journal",
+        "config.json",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        register(
+            &store,
+            &format!("install-{i}"),
+            NOW - 10_000 - i as i64,
+            4,
+            PinState::None,
+            name,
+        );
+    }
+    let dir_name = fixture.root.file_name().unwrap();
+    let alt_root = fixture.root.join("..").join(dir_name);
+    let protected: Vec<PathBuf> = names.iter().map(|name| alt_root.join(name)).collect();
+
+    let report = store
+        .retention_report(
+            &settings(Some(100), Some(1000)),
+            &fixture.root,
+            &protected,
+            NOW,
+        )
+        .unwrap();
+    for i in 0..names.len() {
+        let id = format!("install-{i}");
+        assert!(
+            report
+                .held
+                .iter()
+                .any(|h| h.body_id == id && h.reason == "protected_path"),
+            "{id} must be held as protected under an alternate spelling: {report:?}"
+        );
+    }
+    let cas = report
+        .categories
+        .iter()
+        .find(|c| c.category == "cas")
+        .unwrap();
+    assert_eq!(cas.present_bytes, 0, "protected rows are never counted");
+}
+
+/// A sidecar row that is absent at plan time must be held, not
+/// planned. SQLite creates the `-journal` file for the duration of a
+/// write transaction, so a plan that scheduled it for reclamation
+/// could delete a live hot journal mid-sweep.
+#[test]
+fn an_absent_sidecar_row_is_held_not_planned() {
+    let fixture = Fixture::new("protected-sidecar");
+    let store = SqliteStore::in_memory(1).unwrap();
+    register(
+        &store,
+        "journal-row",
+        NOW - 10_000,
+        8,
+        PinState::None,
+        "workloop.db-journal",
+    );
+    let rel_real = fixture.write_body("real", 10);
+    register(&store, "real", NOW - 10, 10, PinState::None, &rel_real);
+    let dir_name = fixture.root.file_name().unwrap();
+    let alt_root = fixture.root.join("..").join(dir_name);
+    let protected: Vec<PathBuf> = [
+        "workloop.db",
+        "workloop.db-wal",
+        "workloop.db-shm",
+        "workloop.db-journal",
+        "config.json",
+    ]
+    .iter()
+    .map(|name| alt_root.join(name))
+    .collect();
+
+    let plan = store
+        .reclaim_plan_candidates(
+            &settings(Some(100), None),
+            &bounds(),
+            &fixture.root,
+            &protected,
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        plan.entries.iter().all(|e| e.body_id != "journal-row"),
+        "the journal row must never enter the reclaim plan: {plan:?}"
+    );
+    assert!(
+        plan.skipped
+            .iter()
+            .chain(plan.held.iter())
+            .any(|h| h.body_id == "journal-row" && h.reason == "protected_path"),
+        "the journal row must be named held protected_path: {plan:?}"
+    );
+}
+
+/// Protection is resolved-path identity, not the file's name: a
+/// retained body elsewhere under the root that merely shares the
+/// store's file name is not held and reclaims normally.
+#[test]
+fn a_same_named_body_elsewhere_is_not_protected() {
+    let fixture = Fixture::new("protected-name");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // `write_body` places it under `bodies/`, a different directory
+    // than the live store.
+    let rel = fixture.write_body("workloop.db", 8);
+    register(&store, "named-alike", NOW - 10_000, 8, PinState::None, &rel);
+    let protected: Vec<PathBuf> = [
+        "workloop.db",
+        "workloop.db-wal",
+        "workloop.db-shm",
+        "workloop.db-journal",
+        "config.json",
+    ]
+    .iter()
+    .map(|name| fixture.root.join(name))
+    .collect();
+
+    let report = store
+        .retention_report(
+            &settings(Some(100), Some(1000)),
+            &fixture.root,
+            &protected,
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        !report
+            .held
+            .iter()
+            .any(|h| h.body_id == "named-alike" && h.reason == "protected_path"),
+        "an unrelated same-named body is not protected: {report:?}"
+    );
+    let plan = store
+        .reclaim_plan_candidates(
+            &settings(Some(100), None),
+            &bounds(),
+            &fixture.root,
+            &protected,
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        plan.entries.iter().any(|e| e.body_id == "named-alike"),
+        "the same-named body stays reclaimable: {plan:?}"
+    );
+}
+
 #[test]
 fn report_counts_unstatable_bodies_as_unknown_not_present() {
     let fixture = Fixture::new("unknown");

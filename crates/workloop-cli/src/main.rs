@@ -2146,6 +2146,34 @@ mod tests {
         )
     }
 
+    /// The protected set the sweep receives at every entry point is the
+    /// live store, its three SQLite sidecars and the config — the files
+    /// the retention review flagged as reachable. The sidecars are
+    /// spelled `<db>-<suffix>` (not `<db>.<suffix>`), and the config is
+    /// absolutized so a relative `--config` still names the real file.
+    #[test]
+    fn installation_files_covers_the_store_sidecars_and_config() {
+        let db = std::path::Path::new("/state/workloop.db");
+        let config = std::path::Path::new("rel/config.json");
+        let paths = installation_files(db, config);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/state/workloop.db"),
+                PathBuf::from("/state/workloop.db-wal"),
+                PathBuf::from("/state/workloop.db-shm"),
+                PathBuf::from("/state/workloop.db-journal"),
+                std::path::absolute(config).unwrap(),
+            ]
+        );
+        for sidecar in &paths[1..4] {
+            assert!(
+                sidecar.starts_with("/state"),
+                "sidecars stay under the state root: {sidecar:?}"
+            );
+        }
+    }
+
     #[test]
     fn host_state_persists_across_ticks_of_one_run() {
         let store = SqliteStore::in_memory(2).unwrap();
