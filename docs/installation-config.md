@@ -127,6 +127,63 @@ Validation rules:
 - The `[intake]` section (v0.2, #211) configures scheduled and one-shot selector intake through the argv adapter protocol of [selector protocol](selector-protocol.md). Its absence means automatic intake disabled with the documented defaults — interval 30 minutes, timeout 120 seconds, pending-queue limit 10 Work — and a pre-v0.2 profile loads unchanged. `enabled = true` requires a complete `[intake.selector]` binding; the reverse is not required, because `pending_queue_limit` is an installation-wide admission bound that applies to manual `submit` whether or not any selector is configured. Exactly one selector binding exists per installation: duplicate keys, unknown fields, and multiple selector declarations are refused structurally. `argv` follows the protocol bounds — 1–64 nonempty strings, at most 4,096 bytes each and 16,384 bytes total, no NUL or control characters — and launches directly without shell expansion. `interval_minutes` is a positive whole number of minutes; `timeout_seconds` is a positive integer at most 300 so the request deadline stays inside the protocol's 300,000 ms bound; `pending_queue_limit` is a positive integer. Zero, negative, fractional, and unit-suffixed values are load errors — never silently "unlimited". The section carries no credential references: the selector inherits source-read authority from `use = "source"`/`publication` repositories and resolves credentials only at the adapter boundary. Changed intake content yields a new settings revision — a digest of the complete validated section — while identical content keeps the revision; reload and due-time semantics are owned by the [execution loop](execution-loop.md#intake-scheduling). Intake settings govern new admission only: an accepted Work keeps its recorded binding, budgets, and unresolved effects across every reload.
 - Configuration edits apply to new Work. Accepted Work retains its saved binding and effective policy (unchanged from #50/#51 semantics); a config reload cannot retarget live Work or unresolved effects. Switching the `[selector]` section in or out changes only which admission path new submissions take — it never rebinds existing Work.
 
+## v0.3 operational profile (target schema revision 2)
+
+Status: design selection in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition). The keys below are additive and are not accepted by the current `schema_version = 1` loader. A dependent implementation may choose a different numeric revision, but it must not reinterpret a v1 profile as an operational v2 profile or silently ignore one of these keys. The v1 example above remains the loadable v1 profile.
+
+```toml
+schema_version = 2
+
+[host_driver]
+mode = "in_process"                    # only supported v0.3 value; `separate` is refused
+source_poll_seconds = 30               # source-read cadence, bounded by the pass
+outbox_max_per_tick = 8                # host effects attempted per pass
+reconcile_max_per_tick = 16            # unknown/partial effects read back per pass
+
+[worker]
+argv = ["taisan-worker-shim", "--runtime", "example-cli"]
+isolation_profile = "taisan-reference-v0.1"
+runtime_version = ">=2.0.0"
+model = "example-model"
+max_turns = 200
+max_runtime_seconds = 1800
+stdout_cap_bytes = 33554432            # per-stream cap; not a separate budget
+stderr_cap_bytes = 33554432            # both streams share one runtime.log total
+report_cap_bytes = 1048576
+credential_ref = "env:TAISAN_MODEL_TOKEN"   # runtime credential only; never a host token
+provider_config = "/home/operator/.config/taisan/provider.toml"  # non-secret, absolute
+
+[worker.egress]
+model_api_hosts = ["model-api.example"]  # bare host names, CONNECT 443 only
+
+[verification]
+toolchain = "/opt/taisan/toolchain"       # absolute, read-only bind
+cache_paths = ["/var/cache/taisan/deps"]  # absolute, read-only dependency caches
+
+[verification.egress]
+allowlist = ["crates.io", "static.crates.io"]
+```
+
+Validation and delivery rules:
+
+- `schema_version = 2` requires the complete operational profile. A v2 profile that omits `[worker].credential_ref`, a non-empty model-API host set, the toolchain, or `[host_driver].mode` is a load error; there is no fallback to hygiene-only execution, an ambient runtime credential, or an unrestricted network.
+- `[host_driver].mode` accepts exactly `in_process` in v0.3. `separate` is reserved for a later owner decision and is refused now, as is an unknown value; the scenario bridge is not a valid production mode.
+- `[worker].credential_ref` uses the same `env:`/`file:`/`command:` provider rules as a role reference and resolves only at the supervisor boundary. It grants model access only. It is not a repository-host role and cannot be used for a `push_ref`, comment, review, or other host effect.
+- `[worker].provider_config` is an absolute path to a non-secret file or directory (model identity, endpoint host, limits, empty MCP configuration). It must be owner-readable and must not contain a credential value; a secret found there is a configuration error, not a tolerated convenience. The supervisor renders or validates it and mounts it read-only; `/workspace` cannot override it.
+- `[worker].stdout_cap_bytes` and `[worker].stderr_cap_bytes` are per-stream truncation points, not separate budgets. Both streams and child-server output are copied into one `runtime.log` whose retained total is the request's shared `max_log_bytes` (32 MiB); the two per-stream values are clamped together by that shared cap and never total 64 MiB. Once the log is full, further bytes are dropped and truncation is recorded.
+- `[worker.egress].model_api_hosts` is a non-empty list of bare host names: no scheme, port, path, wildcard, IP literal, or empty entry. It is disjoint from every `[hosts.*].endpoint` host and from `[verification.egress].allowlist`; overlap is a load error. It is the only destination the Worker proxy may CONNECT to.
+- `[verification].toolchain` and every `cache_paths` entry are absolute, present, and readable before the first dispatch. They are mounted read-only into the verification sandbox. A missing toolchain or cache is a preflight failure, never a download at verification time.
+- `[verification.egress].allowlist` remains the installation default. The effective per-command set is this list plus the Work's immutable `verification_egress_hosts` declared at admission; it never includes a model-API host. A Work that needs an undeclared host is an admission gap, not a reason to open the network.
+- All numeric keys are positive integers with the documented units. `0`, negative, fractional, and unit-suffixed values are load errors; `0` is never silently "unlimited". The outbox/reconcile values may not exceed the global per-tick bounds in the [execution loop](execution-loop.md#loop-model).
+- Unknown keys anywhere in a v2 profile are refused, including an attempt to spell a mount path, credential variable name, or proxy host in an unmodelled location. Mounts and the proxy are profile-owned, not operator-injected.
+- `[hosts.*]`, `[[hosts.*.repositories]]`, `[roles.*]`, capability floors, recovery, retention, selector, and intake retain their existing semantics. The host driver uses those bindings; it does not create a second host or credential table.
+
+Compatibility:
+
+- A v1 profile loads and keeps its recorded behavior. It does not gain v2 enforcement and must not be presented as namespace- or egress-enforced.
+- A request or Work accepted under v1 keeps its binding, budgets, credential references, isolation profile id, and unresolved effects. A reload or a v2 config affects only requests not yet bound.
+- Removing the v2 profile, toolchain, or driver stops new v2 dispatch; running requests keep their recorded binding only while their profile is still installed. Otherwise they are abandoned with a typed repair/unsupported reason and the work is re-issued; a running Invocation is never migrated or silently downgraded.
+
 ## Clean-install v0.2 profile
 
 The [v0.2 installation and operation guide](v0.2.md) is the
@@ -219,13 +276,13 @@ Two boundaries, both auditable and non-destructive.
 1. Parse `config.toml` (schema_version, unknown keys, structural validity)
 2. Identity tuples: host/repository/actor scoping, allowlist coherence, role completeness
 3. Credential references: provider shape valid, slots resolvable in *existence* (env present, file readable with `0600`, command exits zero) — values are never echoed
-4. Paths: state/workspace/bodies/handoff roots exist or are creatable, writable, correctly nested
-5. Worker runtime: `worker.argv` resolves deterministically and `runtime_version` constraint matches the observed binary
-6. Isolation primitives: the declared sandbox mechanism is present (bubblewrap, egress proxy endpoint)
+4. Paths: state/workspace/bodies/handoff roots exist or are creatable, writable, correctly nested; a v2 profile additionally requires the absolute provider-config path and every verification toolchain/cache path to be present and readable
+5. Worker runtime: `worker.argv` resolves deterministically, `runtime_version` constraint matches the observed binary, and a v2 profile's runtime credential reference resolves in existence without echoing its value
+6. Isolation primitives and operational profile: `bwrap` and the CONNECT-proxy endpoint are present, and (v2) the model-API host set, in-process host driver, read-only mount set, and verification toolchain can be resolved. A missing primitive refuses v2 dispatch; it never degrades to hygiene-only
 7. Store: schema version recognized, no unknown/corrupt state
 8. `--probe` only: read-only `capabilities()` calls for each bound actor and the pinned repository context; reported per operation and actor
 
-`check` is read-only: it creates no Work, mutates no config, and touches no remote state beyond the opt-in probe. Its output is a structured per-stage report — absent config, malformed TOML, missing/expired/unresolvable credentials, and unwritable paths are each distinct results with the exact key/path named.
+`check` is read-only: it creates no Work, mutates no config, and touches no remote state beyond the opt-in probe. Its output is a structured per-stage report — absent config, malformed TOML, missing/expired/unresolvable credentials, and unwritable paths are each distinct results with the exact key/path named. A passing `check` proves declared prerequisites, not live namespace or egress enforcement; the operational negative probes in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition) are separate evidence.
 
 ## Failure and repair semantics
 
@@ -242,6 +299,9 @@ Configuration, authentication, and environment failures follow the shared repair
 | Source unavailable | `source.unavailable` | Transient: hold/retry within recovery bounds | Fresh authoritative read |
 | Absent worker runtime | `runtime.missing` | Operator installs the pinned runtime | `check` stage 5 passes |
 | Runtime version mismatch | `runtime.version_mismatch` | Upgrade runtime or update the pin deliberately | Observed version satisfies the pin |
+| Missing `bwrap`, proxy, or model-API allowlist | `isolation.primitive_missing` | Install the approved primitive or bind a profile that has it; never weaken the profile | `check` stage 6 and the v0.3 negative probes pass |
+| Missing verification toolchain/cache | `verification.toolchain_missing` | Operator installs the pinned toolchain/cache or updates the pin deliberately | `check` resolves the toolchain and cache read-only |
+| In-process host driver unavailable or wrong mode | `host_driver.mode_unsupported` | Choose the supported `in_process` driver; a separate driver needs its own owner decision | `check` stage 6 passes and the driver constructs |
 | Changed actor binding mid-Work | `binding.actor_mismatch` | n/a — original binding retained | Original actor reconciles existing effects; new actor serves new Work only |
 | Broken config left unchanged | (no code — no retry) | n/a | Resume requires the failed prerequisite's evidence to have changed |
 
@@ -273,6 +333,11 @@ Values are illustrative, not executed evidence.
 | Config adds `comment_write` to review requirements mid-Work | Existing Work's saved binding/policy unchanged; the new floor applies to Work accepted afterward |
 | `--probe` unreachable | `capability.unknown`, not `denied`; admission/dispatch hold rather than fail-closed to a wrong negative |
 | Unresolved push intent, then token revoked and replaced by a different actor's token | Reconciliation uses the intent's original actor; the replacement actor does not reattribute or replay it |
+| `[worker].provider_config` names a path containing a token | Load/check error; provider config is non-secret and the credential belongs only in its `credential_ref` |
+| `[worker.egress].model_api_hosts` overlaps a host endpoint or verification allowlist | Load error; the model and verification allowlists are disjoint and a wildcard is refused |
+| v2 profile omits `bwrap`, proxy, toolchain, or `mode = "in_process"` | Load/preflight refuses v2 dispatch; no fallback to a v1 profile or hygiene-only launch |
+| v1 profile loads after the v2 revision is introduced | Loads unchanged; its recorded behavior is retained and no v2 enforcement is claimed |
+| Config edit while a v2 request is running | The running request keeps its mounts, credentials, driver, and budgets; only new requests bind the edit |
 
 ## Planned verification
 
@@ -304,6 +369,12 @@ Named checks for the configuration contract suite (CF). Planned contract scenari
 | CF-22 | Deterministic runtime resolution | `worker.argv` resolution ignores ambient PATH surprises; explicit overrides only |
 | CF-23 | Sanitized example parses | The documented example loads under the same validator |
 | CF-24 | Interrupted `init` publish | Either no config or a complete config exists; scratch residue never loads |
+| CF-25 | v2 operational profile missing a required key or containing a non-`in_process` driver | Load refused naming the key; no partial profile and no v1 fallback |
+| CF-26 | v2 provider config contains a secret, is workspace-supplied, or is not read-only | Refused/ignored; only the supervisor-rendered read-only config is used |
+| CF-27 | v2 model-API host set contains a URL, port, wildcard, empty entry, host overlap, or verification-host overlap | Load error; no wildcard-like grant reaches the proxy |
+| CF-28 | v2 runtime credential is absent, unresolvable, or resolves to a host token | Environment repair; dispatch refused; the value never appears in output |
+| CF-29 | v2 verification toolchain/cache missing or writable | Preflight fails closed; verification never installs dependencies from an open network |
+| CF-30 | v1 and v2 profiles coexist across new and running requests | New requests bind v2; running requests keep recorded v1/v2 bindings; no silent upgrade, downgrade, or retarget |
 
 ## Requirement mapping
 
