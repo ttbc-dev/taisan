@@ -736,6 +736,7 @@ dependencies = [
  "serde_json",
  "workloop-config",
  "workloop-core",
+ "workloop-evidence-protocol",
  "workloop-exec",
  "workloop-github",
  "workloop-intake",
@@ -855,6 +856,7 @@ dependencies = [
  "serde",
  "serde_json",
  "workloop-core",
+ "workloop-evidence-protocol",
 ]
 
 [[package]]
