@@ -2526,7 +2526,11 @@ fn capability_state(
             host: report_host,
             capabilities,
         } = &o.fact
-            && report_host == host
+            // Reports persisted before unification may carry raw
+            // endpoint spellings; the comparison is on canonical
+            // host-instance identity, not transport spelling.
+            && canonical_host_instance(report_host.as_str())
+                == canonical_host_instance(host.as_str())
         {
             for entry in capabilities {
                 if &entry.capability == capability {

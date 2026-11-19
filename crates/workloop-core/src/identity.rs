@@ -137,10 +137,34 @@ pub fn canonical_host_instance(endpoint: &str) -> String {
 }
 
 /// Repository identity `(host_instance, repository_id)`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct RepositoryRef {
     pub host: HostInstanceId,
     pub repository: RepositoryId,
+}
+
+// Deserialization canonicalizes the host half: durable records and
+// snapshots written before host-instance unification may carry raw
+// endpoint spellings, and every reader must see the one canonical
+// identity — the same reduction admission, claims, and the source
+// gate apply. The repository id still compares exactly. Serialization
+// is unchanged: a read-then-written record converges to the canonical
+// spelling on its next persist.
+impl<'de> Deserialize<'de> for RepositoryRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            host: HostInstanceId,
+            repository: RepositoryId,
+        }
+        let raw = Raw::deserialize(d)?;
+        let host =
+            HostInstanceId::new(canonical_host_instance(raw.host.as_str())).unwrap_or(raw.host);
+        Ok(Self {
+            host,
+            repository: raw.repository,
+        })
+    }
 }
 
 impl RepositoryRef {
@@ -727,5 +751,20 @@ mod tests {
             .is_err()
         );
         assert!(HostBinding::new(AdapterId::trusted("fixture"), repository, 1, [], actors).is_ok());
+    }
+
+    /// Deserialization reduces a raw endpoint spelling to the canonical
+    /// host-instance identity every durable reader shares; the
+    /// repository id and non-default ports are untouched.
+    #[test]
+    fn repository_ref_deserialization_canonicalizes_the_host() {
+        let spelled: RepositoryRef =
+            serde_json::from_str(r#"{"host":"https://api.github.com","repository":"repo-a"}"#)
+                .unwrap();
+        assert_eq!(spelled.host.as_str(), "github.com");
+        assert_eq!(spelled.repository.as_str(), "repo-a");
+        let kept: RepositoryRef =
+            serde_json::from_str(r#"{"host":"ghe.example:8443","repository":"repo-a"}"#).unwrap();
+        assert_eq!(kept.host.as_str(), "ghe.example:8443");
     }
 }

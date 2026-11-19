@@ -34,7 +34,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use workloop_core::domain::{canonical_json, sha256_hex};
-use workloop_core::identity::{AdapterId, IssueRef, RepositoryRef};
+use workloop_core::identity::{
+    AdapterId, HostInstanceId, IssueRef, RepositoryRef, canonical_host_instance,
+};
 
 /// The semantic version this reference selector stamps on its
 /// proposals — part of proposal identity, so a semantic change to what
@@ -234,16 +236,43 @@ pub struct ProposalSet {
 ///
 /// Pure and total — no store, clock, or I/O; an empty or all-refused
 /// snapshot yields an empty `proposals`, never an error.
+/// Reduce a fact's repository host to canonical host-instance
+/// identity before any comparison — the allowlist and exclusions are
+/// built from the installation's canonical host, and admission
+/// applies the same reduction, so a raw endpoint spelling must not
+/// fork the Issue's identity here (or in dedup).
+fn canonical_issue(issue: &IssueRef) -> IssueRef {
+    let Ok(host) = HostInstanceId::new(canonical_host_instance(issue.repository.host.as_str()))
+    else {
+        return issue.clone();
+    };
+    IssueRef {
+        repository: RepositoryRef::new(host, issue.repository.repository.clone()),
+        ..issue.clone()
+    }
+}
+
 pub fn propose(
     selector: &AdapterId,
     snapshot: &SelectorSnapshot,
     policy: &SelectionPolicy,
 ) -> ProposalSet {
+    // Facts are normalized to canonical host identity up front: the
+    // allowlist, exclusions, dedup, and the emitted proposal all see
+    // one spelling of the same Issue.
+    let normalized: Vec<IssueFact> = snapshot
+        .issues
+        .iter()
+        .map(|fact| IssueFact {
+            issue: canonical_issue(&fact.issue),
+            ..fact.clone()
+        })
+        .collect();
     // Dedup by Issue identity: identical repeated facts collapse; two
     // facts claiming one identity with different content conflict.
     let mut facts: BTreeMap<&IssueRef, &IssueFact> = BTreeMap::new();
     let mut conflicts: BTreeSet<&IssueRef> = BTreeSet::new();
-    for fact in &snapshot.issues {
+    for fact in &normalized {
         // A recorded conflict is a property of the snapshot read, not of
         // pairwise order: once two facts disagree on an identity, no
         // later matching fact can re-admit it.

@@ -1126,7 +1126,10 @@ fn intent_from_row(row: &rusqlite::Row<'_>) -> Result<HostActionIntent, rusqlite
     Ok(HostActionIntent {
         action_id: row.get(0)?,
         work_id: WorkId(row.get::<_, String>(1)?),
-        host: HostInstanceId::trusted(row.get::<_, String>(2)?),
+        // The recorded host is an endpoint spelling on rows written
+        // before host-instance unification; reads reduce it to the
+        // canonical identity the bound adapter compares against.
+        host: HostInstanceId::trusted(canonical_host_instance(&row.get::<_, String>(2)?)),
         repository: de_row(&row.get::<_, String>(3)?)?,
         role: untag(&row.get::<_, String>(4)?)?,
         actor: de_row(&row.get::<_, String>(5)?)?,

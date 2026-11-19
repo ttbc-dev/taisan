@@ -4769,6 +4769,142 @@ fn an_applied_push_receipt_records_the_next_stage_intent() {
         .unwrap();
 }
 
+/// Regression: a capability report persisted under a raw endpoint
+/// spelling still authorizes the effect — capability lookup compares
+/// canonical host-instance identity, so pre-unification reports keep
+/// working after the installation host canonicalizes.
+#[test]
+fn an_endpoint_spelled_capability_report_still_authorizes() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("pc-cap"), NOW).unwrap(),
+    );
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pc-cap-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "pc-cap-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "pc-cap-check"),
+            },
+        ],
+    );
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::CapabilityReport {
+                host: HostInstanceId::trusted("https://test-host"),
+                capabilities: vec![
+                    CapabilityEntry {
+                        capability: HostCapability::PushRef,
+                        support: CapabilityState::Supported,
+                        authorization: CapabilityState::Authorized,
+                    },
+                    CapabilityEntry {
+                        capability: HostCapability::ChangeRequestCreate,
+                        support: CapabilityState::Supported,
+                        authorization: CapabilityState::Authorized,
+                    },
+                ],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: invocation.id.clone(),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Present {
+                    digest: "artifact-digest".into(),
+                },
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let pushes = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                .count())
+        })
+        .unwrap();
+    assert_eq!(
+        pushes, 1,
+        "the endpoint-spelled report authorizes the stage-1 push intent"
+    );
+}
+
+/// Regression: an intent row persisted under a raw endpoint spelling
+/// reads back with the canonical host-instance identity — rows written
+/// before host unification keep matching the bound adapter.
+#[test]
+fn an_endpoint_spelled_intent_reads_back_canonical() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ih1"), NOW).unwrap());
+    apply_effects(
+        &store,
+        &[Effect::InsertHostActionIntent {
+            intent: HostActionIntent {
+                action_id: "act-raw-host".into(),
+                work_id: w.clone(),
+                host: HostInstanceId::trusted("https://test-host"),
+                repository: repo(),
+                role: ActorRole::Publication,
+                actor: publisher(),
+                action: HostAction::PushRef {
+                    branch: format!("work/{}", w.0),
+                    produced: rev("head-1"),
+                    expected_prior: None,
+                },
+                payload_digest: "test".into(),
+                status: HostActionStatus::Pending,
+                authenticated_actor: None,
+                effects: vec![],
+                created_seq: 0,
+            },
+        }],
+    );
+    let intents = store.transact(|tx| tx.action_intents()).unwrap();
+    let intent = intents
+        .iter()
+        .find(|i| i.action_id == "act-raw-host")
+        .expect("the inserted intent reads back");
+    assert_eq!(
+        intent.host.as_str(),
+        "test-host",
+        "the raw endpoint spelling reduces to the canonical host instance"
+    );
+}
+
 /// Regression: the equivalent-failure streak signs the whole failing set.
 /// Two failing required checks must still reach the limit — signing each
 /// check separately would alternate the signature and never pause.
