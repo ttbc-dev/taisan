@@ -1152,6 +1152,110 @@ fn a_batch_store_fault_aborts_the_run_instead_of_wedging() {
     assert_eq!(second.candidates.len(), 2);
 }
 
+/// The wedge guard's residual window: a store fault that also defeats
+/// the live owner's best-effort close *and* the lease drop leaves the
+/// run `open` and the lease held under a still-live process. Ordinary
+/// recovery rightly refuses (the pid is alive); the ended invocation's
+/// exact nonce reconciles it, the stale lease is released, and the
+/// next scheduled invocation completes.
+#[test]
+fn a_close_and_release_fault_reconciles_by_the_ended_invocation_nonce() {
+    let dir = tmp_root("ended-invocation-wedge");
+    let db = dir.join("workloop.db");
+    let proposals = vec![
+        proposal("issue-1", "first work"),
+        proposal("issue-2", "second work"),
+    ];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = SqliteStore::open(&db, 4).unwrap();
+
+    // One fault window defeats the validated batch insert, the guarded
+    // close, and the lease release — exactly the same-fault shape the
+    // issue describes.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fault_candidate_batch BEFORE INSERT ON intake_candidates
+           BEGIN SELECT RAISE(ABORT, 'injected batch fault'); END;
+         CREATE TRIGGER fault_close BEFORE UPDATE ON intake_runs
+           BEGIN SELECT RAISE(ABORT, 'injected close fault'); END;
+         CREATE TRIGGER fault_release BEFORE DELETE ON run_lease
+           BEGIN SELECT RAISE(ABORT, 'injected release fault'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let owner = workloop_intake::new_lease_owner().unwrap();
+    let p = params(&f, &f.binding, Duration::from_secs(10));
+    let err = workloop_intake::run_intake_with_owner(&f.store, &p, NOW, NOW_MS, owner.clone())
+        .unwrap_err();
+    assert!(
+        matches!(err, IntakeError::Store(_)),
+        "expected a store error, got {err:?}"
+    );
+
+    // The wedge: a non-terminal run and its lease remain under this
+    // provably live process.
+    let wedged = f
+        .store
+        .transact_deferred(|tx| tx.active_intake_run())
+        .unwrap()
+        .expect("the fault left the run non-terminal");
+    assert_eq!(wedged.state, IntakeRunState::Open);
+    assert_eq!(wedged.owner_nonce, owner.nonce);
+    let recovery = workloop_intake::recover_intake(&f.store, &f.actor, NOW).unwrap();
+    assert!(
+        matches!(
+            recovery.outcome,
+            workloop_intake::RecoveryOutcome::OwnerAlive
+        ),
+        "pid liveness alone cannot reconcile it: {recovery:?}"
+    );
+
+    // The transient window clears.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER fault_candidate_batch; DROP TRIGGER fault_close; DROP TRIGGER fault_release;",
+    )
+    .unwrap();
+    drop(conn);
+
+    // The ended invocation's exact identity closes the run with a
+    // bounded reason and no leftover candidates.
+    let report =
+        workloop_intake::recover_ended_invocation(&f.store, &f.actor, &owner, NOW + 1).unwrap();
+    match report.outcome {
+        workloop_intake::RecoveryOutcome::Recovered { final_state } => {
+            assert_eq!(final_state, IntakeRunState::Interrupted)
+        }
+        other => panic!("expected Recovered, got {other:?}"),
+    }
+    let closed = f
+        .store
+        .transact_deferred(|tx| tx.intake_run(&wedged.run_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(closed.state, IntakeRunState::Interrupted);
+    assert_eq!(closed.detail_code.as_deref(), Some("invocation_orphaned"));
+    assert!(
+        f.store
+            .transact_deferred(|tx| tx.active_intake_run())
+            .unwrap()
+            .is_none()
+    );
+
+    // The driver releases the stale lease after closing the run; a new
+    // invocation (fresh nonce) then completes normally.
+    f.store.release_intake_lease(&owner).unwrap();
+    let next_owner = workloop_intake::new_lease_owner().unwrap();
+    let second =
+        workloop_intake::run_intake_with_owner(&f.store, &p, NOW + 2, NOW_MS + 2000, next_owner)
+            .unwrap();
+    assert_eq!(second.state, IntakeRunState::Completed);
+    assert_eq!(second.candidates.len(), 2);
+}
+
 /// The same guard on the `admitting` side: a propagating store error
 /// after every candidate reached a decided status still closes the
 /// run `interrupted` — the accepted Work and ledger decisions are
