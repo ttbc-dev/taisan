@@ -249,16 +249,19 @@ fn checksum(unsigned_json: &str) -> String {
 }
 
 /// The stable snapshot identity one open page sequence shares. The id
-/// is deterministic over the snapshot binding so a retried first page
-/// names the same logical snapshot.
+/// binds the snapshot's identity material plus a per-sequence nonce:
+/// the contract requires every new export sequence to carry a fresh
+/// snapshot id, so two polls at the same watermark must not collide —
+/// only pages of one sequence (via the cursor token) reuse it.
 pub fn snapshot_id(
     installation_id: &str,
     store_epoch: &str,
     after_seq: Option<u64>,
     watermark: u64,
+    nonce: &str,
 ) -> String {
     let material = format!(
-        "{PROTOCOL}|{installation_id}|{store_epoch}|{}|{watermark}",
+        "{PROTOCOL}|{installation_id}|{store_epoch}|{}|{watermark}|{nonce}",
         after_seq
             .map(|s| s.to_string())
             .unwrap_or_else(|| "full".into())
@@ -428,10 +431,13 @@ mod tests {
 
     #[test]
     fn snapshot_ids_are_deterministic_and_distinct() {
-        let a = snapshot_id("i", "e", None, 10);
-        let b = snapshot_id("i", "e", None, 10);
+        let a = snapshot_id("i", "e", None, 10, "n1");
+        let b = snapshot_id("i", "e", None, 10, "n1");
         assert_eq!(a, b);
-        assert_ne!(a, snapshot_id("i", "e", Some(5), 10));
-        assert_ne!(a, snapshot_id("i", "e", None, 11));
+        // A fresh nonce is a fresh export sequence: same binding,
+        // different id — the contract's polling guarantee.
+        assert_ne!(a, snapshot_id("i", "e", None, 10, "n2"));
+        assert_ne!(a, snapshot_id("i", "e", Some(5), 10, "n1"));
+        assert_ne!(a, snapshot_id("i", "e", None, 11, "n1"));
     }
 }

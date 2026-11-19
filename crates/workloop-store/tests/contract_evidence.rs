@@ -811,7 +811,8 @@ fn export_never_writes_or_needs_the_projection() {
     let _ = drain(&store, 2);
     assert_eq!(store.count_events("effect").unwrap(), before);
     // Concurrent readers share the connection: two interleaved exports
-    // see identical pages.
+    // see identical record content — each is its own export sequence,
+    // so only the snapshot identity and its tokens may differ.
     let snap = snapshot(&store);
     let req = ExportRequest {
         protocol_version: ProtocolVersion::V1,
@@ -822,7 +823,55 @@ fn export_never_writes_or_needs_the_projection() {
     let a = evidence::export_page(&req, &snap, NOW).unwrap();
     let snap2 = snapshot(&store);
     let b = evidence::export_page(&req, &snap2, NOW).unwrap();
-    assert_eq!(a, b);
+    assert_ne!(a.snapshot_id, b.snapshot_id);
+    assert_eq!(a.entities, b.entities);
+    assert_eq!(a.links, b.links);
+    assert_eq!(a.artifacts, b.artifacts);
+    assert_eq!(a.gaps, b.gaps);
+    assert_eq!(a.snapshot_seq, b.snapshot_seq);
+    assert_eq!(a.retained_from_seq, b.retained_from_seq);
+    assert_eq!(a.after_seq, b.after_seq);
+}
+
+#[test]
+fn idle_deltas_mint_fresh_snapshot_ids() {
+    // Two --after polls with no writes between them produce the same
+    // binding (after=W, watermark=W); the contract requires each new
+    // export sequence to carry a snapshot id unseen in the validated
+    // chain, so the producer must mint fresh ids.
+    let store = SqliteStore::open(&db_path("idle"), 2).unwrap();
+    append(&store, &full_history());
+    let snap = snapshot(&store);
+    let artifact_bytes = artifact_bytes(&snap);
+    let full_req = ExportRequest {
+        protocol_version: ProtocolVersion::V1,
+        after: None,
+        cursor: None,
+        limit: 500,
+    };
+    let full_page = evidence::export_page(&full_req, &snap, NOW).unwrap();
+    validate_page(&full_req, &full_page).unwrap();
+    let history = validate_snapshot(
+        &[(full_req.clone(), full_page.clone())],
+        None,
+        &artifact_bytes,
+    )
+    .unwrap();
+    let mut checkpoint = full_page.checkpoint.clone().unwrap();
+    let mut history = history;
+    for _ in 0..2 {
+        let req = ExportRequest {
+            protocol_version: ProtocolVersion::V1,
+            after: Some(checkpoint.clone()),
+            cursor: None,
+            limit: 500,
+        };
+        let page = evidence::export_page(&req, &snap, NOW).unwrap();
+        validate_page(&req, &page).unwrap();
+        history =
+            validate_snapshot(&[(req, page.clone())], Some(&history), &artifact_bytes).unwrap();
+        checkpoint = page.checkpoint.clone().unwrap();
+    }
 }
 
 #[test]
@@ -904,4 +953,19 @@ fn derived_bindings_cite_their_supporting_events() {
         cited_relation(Relation::ExecutionHasRepair),
         BTreeSet::from(["event:10".to_string()])
     );
+}
+
+#[test]
+fn store_epoch_is_a_durable_history_identity() {
+    // The epoch is minted once per store file and survives reopen —
+    // it is the history namespace tokens bind, not the schema version,
+    // so additive migrations must not invalidate live cursors.
+    let path = db_path("epoch");
+    let store = SqliteStore::open(&path, 2).unwrap();
+    append(&store, &full_history());
+    let epoch = store.evidence_identity().unwrap().1;
+    assert_eq!(snapshot(&store).store_epoch, epoch);
+    drop(store);
+    let store = SqliteStore::open(&path, 2).unwrap();
+    assert_eq!(store.evidence_identity().unwrap().1, epoch);
 }

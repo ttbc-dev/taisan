@@ -486,6 +486,15 @@ impl SqliteStore {
             .map_err(internal)?;
             tx.commit().map_err(internal)?;
         }
+        // The evidence epoch is a durable per-file identity: minted
+        // once, never touched by additive migrations, and carried by
+        // the file itself so tokens from another store generation
+        // mismatch rather than silently continuing a diverged history.
+        conn.execute(
+            "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('history_epoch', ?1)",
+            params![new_id("epoch")],
+        )
+        .map_err(internal)?;
         // Seed the fixed slot rows once; claiming is an UPDATE inside the
         // caller's transaction.
         for slot in 0..capacity {

@@ -24,7 +24,7 @@ use workloop_core::domain::*;
 use workloop_core::store::{Effect, StoreError};
 use workloop_evidence_protocol::*;
 
-use crate::sqlite::{FORMAT_VERSION, SqliteStore, internal, map_err};
+use crate::sqlite::{SqliteStore, internal, map_err};
 
 /// One `event_log` row: the recorded sequence, the row kind and the
 /// verbatim payload JSON.
@@ -150,10 +150,17 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_err)?;
         drop(stmt);
+        let store_epoch: String = tx
+            .query_row(
+                "SELECT value FROM store_meta WHERE key='history_epoch'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
         tx.commit().map_err(internal)?;
         Ok(HistorySnapshot {
             installation_id,
-            store_epoch: FORMAT_VERSION.to_string(),
+            store_epoch,
             watermark: watermark as u64,
             retained_from_seq: retained_from as u64,
             events,
@@ -189,7 +196,14 @@ impl SqliteStore {
                 |r| r.get(0),
             )
             .map_err(map_err)?;
-        Ok((installation_id, FORMAT_VERSION.to_string()))
+        let store_epoch: String = guard
+            .query_row(
+                "SELECT value FROM store_meta WHERE key='history_epoch'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok((installation_id, store_epoch))
     }
 }
 
@@ -1832,6 +1846,11 @@ pub fn export_page(
             format!("export request failed boundary validation ({e})"),
         )
     })?;
+    // Every export sequence mints a fresh snapshot id: the contract
+    // requires ids unseen anywhere earlier in the validated chain, so
+    // two polls at the same watermark must not collide — only pages of
+    // one sequence (via the cursor token) reuse it.
+    let snap_nonce = new_id("snap");
     let (after_seq, watermark, retained, snap_id, mut position, mut gap_pos, minted) =
         match (&request.after, &request.cursor) {
             (Some(a), _) => {
@@ -1854,6 +1873,7 @@ pub fn export_page(
                         &snap.store_epoch,
                         Some(after),
                         snap.watermark,
+                        &snap_nonce,
                     ),
                     0u64,
                     0u64,
@@ -1889,6 +1909,7 @@ pub fn export_page(
                     &snap.store_epoch,
                     None,
                     snap.watermark,
+                    &snap_nonce,
                 ),
                 0,
                 0,
