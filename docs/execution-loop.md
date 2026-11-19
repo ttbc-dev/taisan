@@ -22,7 +22,7 @@ Status: owner-approved target design from the #55 review. This document changes 
 
 - **Run lock.** At most one loop holds the installation's run lease (a store-locked row in the existing capacity machinery) at a time; a second `run` fails closed with `lock.held`. Ordinary Commands and Queries never take the run lock — they work against the store directly.
 - **Crash safety.** Every durable effect is a store transaction; a crash mid-pass leaves no half-applied phase. Restart re-enters through phase order and reconciles recorded identities — a pass is resumable, never resumed blindly.
-- **Shutdown.** SIGINT/SIGTERM finishes the current phase boundary and exits. Worker processes are independent of the loop: shutdown never kills, suspends, or invalidates a live Invocation; reconciliation on the next pass re-attaches by recorded process identity.
+- **Shutdown.** SIGINT/SIGTERM finishes the current phase boundary and exits. Worker processes are independent of the loop: shutdown never kills, suspends, or invalidates a live Invocation or any child runtime server in its process tree; reconciliation on the next pass re-attaches by recorded process identity and never starts a second writer.
 - **Per-Work isolation.** A failure processing one Work inside a phase is recorded against that Work and the phase continues for others. A phase-level infrastructure failure (store unreachable, adapter constructor failure) aborts the pass and reports the failure — the next tick retries from phase order.
 - **Tick deadline.** A pass exceeding `loop.tick_deadline_seconds` (120 s) stops starting new work in the current phase, persists progress, and reports `tick.deadline` per unfinished item — remaining items are handled next pass, never silently dropped.
 
@@ -30,16 +30,29 @@ Status: owner-approved target design from the #55 review. This document changes 
 
 | # | Phase | Bounded by | Driver |
 | --- | --- | --- | --- |
-| 1 | Source refresh: read declared sources for active Works (issue/PR head, named checks), ingest deduplicated Observations | per-source `loop.source_refresh_timeout_seconds` (30 s) | host adapter (read only) |
+| 1 | Source refresh: read declared sources for active Works (issue/PR head, named checks), ingest deduplicated Observations | per-source `loop.source_refresh_timeout_seconds` (30 s) | host adapter (read only; in-process production driver in v0.3) |
 | 2 | Dispatch admission: `listQueuedExecutions` in enqueue order → `work` rechecks version/eligibility/capacity/head/ownership/recovery budget → atomic `queued→ready` + capacity reserve + InvocationRequest → `execution` persists Invocation and launches via supervisor | capacity; no extra per-tick cap | Core judges; supervisor launches |
 | 3 | In-flight supervision: poll recorded process identities, collect exits, read WorkerReports, run mechanical verification against the handed-off commit, ingest results; execute pending `stop_intents`; detect escaped/zombie descendants | per-Invocation worker bounds | supervisor |
-| 4 | Host outbox: apply pending `pr_action_intents` (push/PR create/comment) and reconcile unknown effects by read-back against original binding | ≤ 8 items/tick | host adapter (write) |
+| 4 | Host outbox: apply pending `pr_action_intents` (push/PR create/comment) and reconcile unknown effects by read-back against original binding | ≤ 8 items/tick | host adapter (write; in-process production driver in v0.3) |
 | 5 | Timed sweep: evaluate per-Invocation bounds, `recovery.automatic_time_limit_seconds`, `recovery.effect_reconcile_seconds` windows, and no-progress detection → Core records stop intents, deadline transitions, or Attention; re-assess `waiting` Executions whose recorded evidence may have completed without a triggering observation | clock-derived | Core |
 | 6 | Recovery scheduling: consume `recovery_intents` with `due_at ≤ now` (requeue after revalidation); suppress equivalent failures; retire obsolete intents | ≤ 16 items/tick | Core |
 | 7 | Retention sweep: periodic pass per [retention policy](retention-policy.md) (3600 s cadence, ≤ 256 bodies / 1 GiB) | retention limits | runtime tooling |
 | 8 | Attention derivation: recompute the current Attention set (uncertainty duration, unanswered judgments, escalation counters, `protected_over_limit`) | derived | Core |
 
 Completion assessment is level-triggered, not only edge-triggered on observation ingest: phase 5 re-runs the completion assessment for every `waiting` Execution that survives the protective bound checks, inside that Execution's own transaction. Re-assessment re-derives every gate — current diff target, latest check conclusions, sealed review rounds and judgments, invariant assessment plus its completed check Invocation, Invocation/artifact state, and applied stage intents — from durable records; it cannot succeed on stale, partial, or superseded-target evidence, and it never acts on cached or claimed state. Protective bounds keep precedence: an Execution the sweep stops or fails is never re-assessed in the same pass. Only the loop invokes it — `run`, or a scoped `--work` diagnostic pass limited to that Work; no Command triggers re-assessment. The cost bound is one assessment read-set per nonterminal `waiting` Execution per pass.
+
+### Operational host-driver composition (v0.3)
+
+The [v0.3 operational profile](v0.3.md#14-operational-launch-verification-and-host-composition) selects the single-host composition. It reuses the phases above; it does not add a parallel loop or a second control plane.
+
+- **Driver.** The production host driver is an in-process `RepositoryHostPort` adapter constructed by `taisan run` and bound from configuration (`[hosts.<instance>]` plus `[host_driver]`). The run lease covers it. A separate host-driver process is not a v0.3 mode; `[host_driver].mode` accepts only `in_process`, and an unknown or `separate` value fails at load. The scenario bridge is a test/evidence harness, not a production driver.
+- **No silent phase skip.** The current fixture-only composition skips source refresh and host outbox when the configured adapter is not the in-process fixture. v0.3 must not carry that behavior into production: a production adapter either composes the in-process driver or v2 dispatch is refused with a typed configuration reason. Source or outbox silence is never treated as an empty result.
+- **Source polling.** Phase 1 polls the allowlisted source/publication repositories on the pass cadence (30 s default) with a 30 s per-source bound; no webhook ingress is required. Delivery IDs deduplicate per `(host instance, adapter source, event id)` with a per-subject discriminator for shared state such as a target-branch head. A missing source is `unavailable`, which holds dependent dispatch/publication and is distinct from an empty finding or check set.
+- **Bounded outbox and reconciliation.** Phase 4 keeps the ≤ 8 effect and ≤ 16 reconciliation item bounds. A read-only reconcile pass runs before applying remaining pending intents. Reconciliation uses the recorded action ID, payload digest, repository/branch/change identity, produced revision, and original actor/credential binding; a resolved effect is adopted with its normalized receipt, an unread or ambiguous effect stays `unknown`, and neither authorizes a blind replay, a new actor, or a new write from the reconciliation path.
+- **Partial effects and restart.** Push/create/comment/review/thread/ready effects retain independent receipts. Restart reconstructs the outbox from durable actions and observations, not from in-memory state, and reconciles under the original binding even after a config or credential change. A running Invocation is independent of loop shutdown and is re-attached by recorded process identity on the next pass.
+- **Binding and cutover.** Later requests may use the v2 configuration; a request that is already recorded keeps its host/repository/adapter/contract/actor/credential binding, worker profile, mounts, and budgets. A reload never retargets or migrates it. The exact host-driver keys and the v1/v2 compatibility rules are in the [installation configuration](installation-config.md#v03-operational-profile-target-schema-revision-2) and [v0.3 §14.8](v0.3.md#148-compatibility-and-cutover).
+
+The operational acceptance cases OPS-01–OPS-19 in [v0.3 §14.9](v0.3.md#149-operational-acceptance-matrix) extend this loop's failure matrix; they are planned tests, not executed results.
 
 Commands are loop-independent: `submit`, `retry`, `resume`, `cancel`, `judge-findings`, `release-judgment`, `acknowledge`, `check`, and `retention` transact directly against the store and succeed whether or not `run` is live. The loop only progresses already-accepted Work. If the loop is down, Work holds in its recorded state and resumes progress on the next pass — a stopped loop is backpressure, not failure.
 
@@ -262,6 +275,7 @@ Named contract tests; all are future tests, no live claim:
 | LP-26 | Equivalent-failure suppression: classifier key matching, limit hold, suppressed intent recording |
 | LP-27 | Timeout recovery sequence ordering: intent → proven stop → reconcile → requeue/handoff |
 | LP-28 | Sanitization: untrusted fields in Observations/envelopes stripped; closed error vocabulary |
+| LP-29 | Operational host-driver composition: in-process production driver selected, non-production/scenario adapter refused rather than phase-skipped, source polling deduplicates by scoped identity, outbox/reconcile bounds hold, and original-action reconciliation survives restart/config change (OPS-13–OPS-18) |
 
 ## Six design aspects
 
@@ -269,10 +283,10 @@ Named contract tests; all are future tests, no live claim:
 | --- | --- |
 | State transitions | Tick phases drive recorded transitions only; `queued→ready` + capacity + request is one transaction; recovery intents have a closed pending/consumed/retired lifecycle |
 | Failure semantics | Every failure row specifies detection evidence, permitted action, bounds, and escalation; `unknown` is a first-class outcome, never collapsed into success or empty |
-| Trust boundaries | CLI drives I/O/timing; Core judges supplied facts; supervisor/host adapters execute effects; skills carry no execution authority; untrusted Observation text is sanitized at ingest |
-| Identity invariants | Work/Execution/Invocation/request/intent/Command identities are durable; requeue keeps the Execution, retry mints a new one, intent generation prevents resurrection |
-| Information preservation | Original binding, receipts, WIP, failure classifiers, and retirement reasons are retained; `unknown` and `unavailable` remain distinguishable |
-| Resource bounds | Per-tick phase bounds, tick deadline, capacity-derived dispatch, persisted backoff, equivalent-failure limits, and the Work-wide time budget compose; none replenish another |
+| Trust boundaries | CLI drives I/O/timing; Core judges supplied facts; supervisor/host adapters execute effects; skills carry no execution authority; untrusted Observation text is sanitized at ingest; the v0.3 in-process host driver keeps host credentials outside the Worker sandbox |
+| Identity invariants | Work/Execution/Invocation/request/intent/Command identities are durable; requeue keeps the Execution, retry mints a new one, intent generation prevents resurrection; host effects keep their original actor/action binding |
+| Information preservation | Original binding, receipts, WIP, failure classifiers, and retirement reasons are retained; `unknown` and `unavailable` remain distinguishable; a v1 request is never relabelled as v2-enforced |
+| Resource bounds | Per-tick phase bounds, tick deadline, capacity-derived dispatch, persisted backoff, equivalent-failure limits, the Work-wide time budget, and the v0.3 verification/output/stop bounds compose; none replenish another |
 
 Open questions: the concrete jitter policy for `recovery.retry.backoff_seconds` (scheduled in the [installation config](installation-config.md) reference); whether a `--phase` filter joins `--work` on `run` (defaults to no — phases are not independently safe to skip).
 

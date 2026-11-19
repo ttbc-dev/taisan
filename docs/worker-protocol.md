@@ -2,7 +2,7 @@
 
 Status: concrete design for #52, stacked on the [identity/storage design](identity-storage.md) (#50, PR #57) and the [evidence and gate design](evidence-gates.md) (#51, PR #58). Documentation only. No runtime code, configuration, sandbox, proxy, credential installation, or live E2E is added or claimed. #50's comprehensive source behavior inventory is merged in `docs/extraction-coverage.json`; all 33 Worker-owned inventory targets are mapped to clauses and shared-suite cases — or to an approved deferral — in [worker requirements](worker-requirements.md). #51's [failure classification](evidence-gates.md#failure-classification-and-recovery-decisions) and [Work-wide accounting](evidence-gates.md#work-wide-recovery-accounting) govern normalized recovery decisions; Worker reason codes alone do not authorize retries.
 
-The [v0.3 executable request and report contract](v0.3.md) reconciles this document with the implemented narrow `WorkerRequest` export, the `execution` supervisor, and the independent contract Worker at baseline `51f0b34daf33a1975a39b7614f5ceeac7dabf431`. It inventories actual versus designed behavior, publishes provider-neutral versioned request/report schemas and wire examples, and defines the cutover that preserves historical v1 request digests, bindings, and evidence. Where this document's v0.1 schema and the v0.3 wire contract differ, the v0.3 document is authoritative for new requests; this document remains the design of record for the v0.1 behavior and gates.
+The [v0.3 executable request and report contract](v0.3.md) reconciles this document with the implemented narrow `WorkerRequest` export, the `execution` supervisor, and the independent contract Worker at baseline `51f0b34daf33a1975a39b7614f5ceeac7dabf431`. It inventories actual versus designed behavior, publishes provider-neutral versioned request/report schemas and wire examples, and defines the cutover that preserves historical v1 request digests, bindings, and evidence. Its [operational launch, verification, and host composition section](v0.3.md#14-operational-launch-verification-and-host-composition) selects the single-host v0.3 mount/credential/provider-config delivery, model-API egress, verification toolchain and allowlist, managed process lifecycle, in-process host driver, and compatibility rules. Where this document's v0.1 schema and the v0.3 wire contract differ, the v0.3 document is authoritative for new requests; this document remains the design of record for the v0.1 behavior and gates.
 
 ## Owner decisions
 
@@ -71,11 +71,20 @@ through their test modes, not through this transport.
 | Path inside the sandbox | Owner and mode | Contents |
 | --- | --- | --- |
 | `/taisan/request.json` | Supervisor writes before spawn; read-only bind | Canonical `WorkerRequest`; its digest is stored with the request |
-| `/taisan/out/` | Fresh per-Invocation directory under the installation state root; read-write bind | `report.json`, `runtime.log` (bounded stream copy), optional `checkpoint.json` |
-| `/workspace` | The Execution's managed workspace; read-write bind | Git worktree on `work/<work_id>`; the only writable source tree |
+| `/taisan/out/` | Fresh per-Invocation directory under the installation state root; read-write bind | `report.json`, `runtime.log` (bounded stream copy), optional `checkpoint.json`, and assessment scratch |
+| `/workspace` | The Execution's managed workspace; read-write bind for `coding`/`fix`, read-only bind for `invariant_check`/`review` | Git worktree on `work/<work_id>`; the only writable source tree for a writer |
 | `/taisan/runtime-auth` | Read-only bind of only the selected runtime credential file, if the credential reference resolves to a file | Never repository-host credentials |
+| `/taisan/provider-config` | Supervisor-rendered, read-only bind | Non-secret model/provider configuration (model identity, endpoint host, limits, empty MCP config); no credential value and no workspace override |
 
-The out directory belongs to exactly one Invocation ID and is never reused. Any file the Worker writes elsewhere does not survive the sandbox and cannot be evidence.
+Provider-config delivery, the runtime credential reference, the
+model-API CONNECT proxy, the verification toolchain/cache, and the
+child-runtime-server lifecycle are selected in
+[v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition).
+The v1/v0.2 implementation has no mount set at all: this table is the
+target profile, not the launch behavior at the rechecked baseline. The
+out directory belongs to exactly one Invocation ID and is never reused.
+Any file the Worker writes elsewhere does not survive the sandbox and
+cannot be evidence.
 
 ### Implementation status at `51f0b34`
 
@@ -91,7 +100,12 @@ discovered in the workspace and reported as present/corrupt/missing
 facts; process exit and stop proof come from the process-control port.
 The role/task/report shapes below are therefore **design targets**, not
 compiled APIs or live behavior. The [v0.3 inventory](v0.3.md#2-inventory-actual-versus-designed-at-51f0b34)
-records each exact gap and the reuse boundary.
+records each exact gap and the reuse boundary. The
+[v0.3 operational mapping](v0.3.md#141-existing-implementation-mapped-to-the-required-boundary)
+separates what is declared, what is fixture/contract evidence, and what
+is actually enforced: at the rechecked baseline the launch is hygiene
+only, the handoff and POSIX stop proof are implemented, and the
+namespace/egress/read-only-mount/verification-toolchain profile is not.
 
 ### Schemas
 
@@ -278,7 +292,7 @@ The runner is a supervised effect of the CLI loop, not a Worker Invocation; it i
 
 ### Selected profile
 
-- **Filesystem.** Read-only binds of the system directories the runtime and toolchain need; tmpfs for `HOME`, `/tmp`, and `/run`; read-write binds only for `/workspace` (read-only for InvariantCheck and CodeReview) and `/taisan/out`; read-only bind of `/taisan/request.json` and, if needed, the single runtime credential file. The owner's home directory, other workspaces, the state store, the handoff repository, and installation config are not mounted.
+- **Filesystem.** Read-only binds of the system directories the runtime and toolchain need; tmpfs for `HOME`, `/tmp`, and `/run`; read-write binds only for `/workspace` (read-only for InvariantCheck and CodeReview) and `/taisan/out`; read-only bind of `/taisan/request.json`, the supervisor-rendered `/taisan/provider-config`, and, if needed, the single runtime credential file. The owner's home directory, other workspaces, the state store, the handoff repository, and installation config are not mounted.
 - **Credentials.** The environment is constructed from an allowlist, not inherited. Runtime credentials come from a credential reference resolved by the supervisor and passed as an environment variable or a read-only file; their values never appear in argv, request files, logs, or evidence. No repository-host credential, git credential helper, SSH agent socket, or keyring socket enters the sandbox. Git inside the sandbox pins its rules through the environment, because repository-local `.git/config` outranks `GIT_CONFIG_GLOBAL`: `GIT_ALLOW_PROTOCOL=file` denies every transport except the local one regardless of any `protocol.<name>` a workspace plants, and an empty `credential.helper` at `GIT_CONFIG_COUNT` command scope clears every helper a lower scope accumulated. The generated `GIT_CONFIG_GLOBAL` config carries the same rules (`credential.helper=` and `protocol.allow=never` except `file`) as a second layer.
 - **Network (N1, mandatory).** `--unshare-net` leaves only loopback. A taisan-owned CONNECT proxy outside the sandbox listens on a Unix socket bound into the sandbox and exposed to the runtime as `HTTPS_PROXY` through an in-sandbox relay. The proxy allows CONNECT only to the configured model-API host names and port 443, resolves DNS itself, logs allowed and denied destinations as bounded evidence, and denies everything else. TLS is not inspected. Coding, Fix, InvariantCheck, and CodeReview Invocations all get the same model-API-only proxy. Read-only assessment roles need model access too. The supervisor verification runner gets no proxy or runtime credentials.
 - **Process.** `--unshare-pid` makes bwrap's child the PID-namespace init; `--die-with-parent` and `--new-session` prevent survival after the supervisor-spawned leader and terminal injection.
@@ -298,6 +312,17 @@ Before the first dispatch with a profile, and whenever the profile, runtime vers
 - a `setsid` child is killed when the namespace init exits.
 
 Any failing or skipped probe refuses dispatch with a repair prerequisite. There is no fallback to hygiene-only execution, and a flag or `AllowedEffects` value never substitutes for these probes.
+
+### Operational delivery and managed lifecycle (v0.3)
+
+The [v0.3 operational profile](v0.3.md#14-operational-launch-verification-and-host-composition) selects the concrete single-host wiring for this profile:
+
+- **Fixed mounts.** System directories read-only; `/workspace` read-write only for Coding/Fix and read-only for InvariantCheck/CodeReview; `/taisan/out` fresh and read-write per Invocation; `/taisan/request.json` read-only; one `/taisan/runtime-auth` file read-only; a supervisor-rendered `/taisan/provider-config` read-only. The workspace cannot supply or shadow provider configuration or credentials.
+- **Credential delivery.** One `[worker].credential_ref` resolved at the supervisor boundary, injected as one allowlisted environment variable or a read-only file. No repository-host credential, helper, agent socket, or keyring enters the sandbox. A missing credential is an environment repair, never a weaker read or an anonymous run.
+- **Model-API egress.** The mandatory N1 proxy of the selected profile, CONNECT-only on port 443 to the exact configured model-API hosts, for all four roles. No repository host, registry, source host, or verification host is reachable through it.
+- **Child runtime servers.** A runtime-internal server (MCP, language server, or similar) is a descendant of the one Invocation process tree, not a new Invocation. It inherits the sandbox and dies with the PID namespace init. Only the shim leader's process identity and the recorded descendant snapshot are stop-proof subjects.
+- **Output caps.** `report.json` is capped at 1 MiB before parsing; `runtime.log` and child-server output share the 32 MiB retained cap with truncation recorded; a full child pipe never blocks the parent. Assessment roles receive a read-only workspace and may write only bounded scratch inside `/taisan/out`; the v1 snapshot copy remains defence-in-depth, not the read-only mount.
+- **Stop evidence and restart.** The stop intent and descendant snapshot precede signal; every recorded `pid + start time` is re-verified; SIGTERM, the 10 s grace, and SIGKILL cover the group and namespace; the namespace init and each recorded identity must inspect as stopped. A restart re-attaches by recorded identity, never starts a second writer, never reuses an out directory, and never adopts a child server from a dead runtime. Uncertainty retains the slot, reservations, and workspace.
 
 ### Limitations
 
@@ -392,6 +417,7 @@ Every Worker-owned requirement #50's inventory assigns to this issue — 33 targ
 | Stop grace between SIGTERM and SIGKILL | 10 s |
 | `report.json` size cap | 1 MiB |
 | `runtime.log` retained cap | 32 MiB (truncation recorded) |
+| Child runtime server stdout/stderr | Shares the 32 MiB `runtime.log` cap; truncation recorded, never a blocking pipe |
 | Verification per-command timeout | 30 min, bounded by the Execution deadline |
 | Verification output cap per command | 8 MiB |
 | Shim-level retries | 0 (runtime-internal retries only) |
