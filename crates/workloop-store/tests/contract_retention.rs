@@ -484,6 +484,125 @@ fn protected_installation_paths_are_held_not_reclaimed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A protected entry whose spelling differs from the catalogue form —
+/// `std::path::absolute` preserves `..`, so `--db <root>/../<root>/db`
+/// produces entries no recorded path can equal lexically — must still
+/// hold a sidecar row whose file does not exist. The `-journal`
+/// sidecar is routinely absent; SQLite creates it for the duration of
+/// a write transaction, so the check cannot depend on the file being
+/// present at sweep time.
+#[test]
+fn an_absent_sidecar_is_held_under_an_alternate_spelling() {
+    let dir = root("protected-absent");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // Rows recorded relative to the state root — the form producers
+    // use for managed paths. `workloop.db-journal` intentionally has
+    // no file on disk.
+    for (i, name) in ["workloop.db", "workloop.db-journal"].iter().enumerate() {
+        store
+            .register_body(&CatalogBody {
+                body_id: format!("install-{i}"),
+                category: "cas".into(),
+                path: name.to_string(),
+                bytes: 4,
+                registered_unix_seconds: NOW - 100,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+    }
+    let path = register(&store, &dir, "b1", NOW - 90, Some(NOW - 10), false, 8);
+
+    // Protected entries spelled through a `..`-bearing form of the
+    // same directory — what `std::path::absolute` yields for a
+    // `--db`/`--config` argument containing `..`.
+    let dir_name = dir.file_name().unwrap().to_os_string();
+    let alt_root = dir.join("..").join(&dir_name);
+    let mut p = params();
+    p.protected = vec![
+        alt_root.join("workloop.db"),
+        alt_root.join("workloop.db-wal"),
+        alt_root.join("workloop.db-shm"),
+        alt_root.join("workloop.db-journal"),
+        alt_root.join("config.json"),
+    ];
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+
+    assert_eq!(
+        report.reclaimed.len(),
+        1,
+        "only the ordinary body is reclaimed"
+    );
+    assert!(!path.exists());
+    for id in ["install-0", "install-1"] {
+        assert!(
+            report
+                .held
+                .iter()
+                .any(|h| h.body_id == id && h.reason == "protected_path"),
+            "{id} is held under the alternate spelling: {:?}",
+            report.held
+        );
+        assert_eq!(store.body_state(id).unwrap().unwrap().0, "present");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same absent-sidecar hold must survive a symlinked-directory
+/// spelling: `--db <link>/workloop.db` produces protected entries a
+/// canonical catalogue row never equals lexically, and an absent
+/// sidecar cannot be file-canonicalized. The canonical parent
+/// directory still identifies it.
+#[test]
+fn an_absent_sidecar_is_held_through_a_symlinked_directory() {
+    let dir = root("protected-symlink");
+    let store = SqliteStore::in_memory(1).unwrap();
+    store
+        .register_body(&CatalogBody {
+            body_id: "journal-row".into(),
+            category: "cas".into(),
+            path: "workloop.db-journal".into(),
+            bytes: 4,
+            registered_unix_seconds: NOW - 100,
+            eligible_after_unix_seconds: Some(NOW - 10),
+            pinned: false,
+        })
+        .unwrap();
+    let path = register(&store, &dir, "b1", NOW - 90, Some(NOW - 10), false, 8);
+
+    let link = dir.join("root-link");
+    std::os::unix::fs::symlink(dir.as_path(), &link).unwrap();
+    let mut p = params();
+    p.protected = vec![
+        link.join("workloop.db"),
+        link.join("workloop.db-wal"),
+        link.join("workloop.db-shm"),
+        link.join("workloop.db-journal"),
+        link.join("config.json"),
+    ];
+    let report = store.retention_sweep(&p, &dir, NOW).unwrap();
+
+    assert_eq!(
+        report.reclaimed.len(),
+        1,
+        "only the ordinary body is reclaimed"
+    );
+    assert!(!path.exists());
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.body_id == "journal-row" && h.reason == "protected_path"),
+        "the absent journal row is held under the symlinked spelling: {:?}",
+        report.held
+    );
+    assert_eq!(
+        store.body_state("journal-row").unwrap().unwrap().0,
+        "present"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_managed_directory_body_is_removed_with_its_contents() {
     let dir = root("dirbody");
