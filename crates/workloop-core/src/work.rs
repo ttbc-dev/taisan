@@ -704,6 +704,10 @@ fn decide_submit(
     // (`github.com`), and adapters may hand in either spelling. Without
     // a single canonical form here, one real Issue exists under two
     // identities and claims, dedupe, and the source gate diverge.
+    // Claims and membership persisted before this canonicalization keep
+    // their original spelling; the store's claim and owner reads apply
+    // the same canonical form, so an upgraded store enforces the same
+    // one-Issue-one-claim rule.
     let canonical_sources: Vec<SourceSnapshot> = sources
         .iter()
         .map(|s| {

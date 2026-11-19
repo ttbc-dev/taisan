@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use workloop_core::command::{CommandDecision, CommandId};
 use workloop_core::domain::*;
-use workloop_core::identity::{AdapterId, HostInstanceId, StoreId};
+use workloop_core::identity::{AdapterId, HostInstanceId, StoreId, canonical_host_instance};
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
@@ -808,10 +808,28 @@ fn command_key_matches_replay(stored_key: &str, stored_digest: &str, replay_key:
             .is_some_and(|suffix| suffix == stored_digest)
 }
 
+/// The identity two spellings of one Issue share: the canonical host
+/// instance replaces whatever endpoint spelling was persisted. Rows
+/// written before host canonicalization carry the raw endpoint; every
+/// claim and membership read compares this form so an upgraded store
+/// still enforces one-Issue-one-claim.
+fn canonical_issue(issue: &workloop_core::identity::IssueRef) -> workloop_core::identity::IssueRef {
+    let mut issue = issue.clone();
+    let canonical = canonical_host_instance(issue.repository.host.as_str());
+    if !canonical.is_empty() {
+        issue.repository.host = HostInstanceId::trusted(canonical);
+    }
+    issue
+}
+
 /// Issue identity key: repository + opaque issue id — never the display
 /// number, which is presentational and must not participate in claims.
+/// The key is computed over the canonical host instance; rows written
+/// before canonicalization keep their original key and are matched by
+/// the tolerant reads, not by this value.
 fn issue_key(issue: &workloop_core::identity::IssueRef) -> String {
-    json(&(issue.repository.clone(), issue.issue.as_str()))
+    let issue = canonical_issue(issue);
+    json(&(issue.repository, issue.issue.as_str()))
         .unwrap_or_else(|_| unreachable!("issue key serializes"))
 }
 
@@ -1458,11 +1476,22 @@ impl ReadView for Tx<'_> {
         &self,
         issue: &workloop_core::identity::IssueRef,
     ) -> Result<Option<WorkId>, StoreError> {
-        self.query_opt(
-            "SELECT work_id FROM issue_claims WHERE issue_key=?1",
-            params![issue_key(issue)],
-            |row| Ok(WorkId(row.get::<_, String>(0)?)),
-        )
+        // Rows persisted before host canonicalization carry the raw
+        // endpoint spelling in both the key and the document, so the
+        // match is on the canonical identity rather than the stored
+        // key bytes. `issue_claims` holds only active claims — the
+        // scan stays small.
+        let want = canonical_issue(issue);
+        let rows = self.query_all("SELECT issue, work_id FROM issue_claims", [], |row| {
+            Ok((
+                de_row::<workloop_core::identity::IssueRef>(&row.get::<_, String>(0)?)?,
+                WorkId(row.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows
+            .into_iter()
+            .find(|(stored, _)| canonical_issue(stored) == want)
+            .map(|(_, work_id)| work_id))
     }
 
     fn work_usage(&self, work_id: &WorkId) -> Result<Option<WorkUsage>, StoreError> {
@@ -1987,23 +2016,33 @@ impl ReadView for Tx<'_> {
         // and `uncertain` own their issues exactly like `queued`,
         // `running`, and `paused` — only the three terminal states
         // release them.
-        let keys: Vec<String> = issues.iter().map(issue_key).collect();
-        let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
+        // The match is on canonical identity, not stored key bytes:
+        // membership rows written before host canonicalization carry
+        // the raw endpoint spelling. The candidate set is bounded by
+        // the preflight scope and the owner set by live Works, so the
+        // filter runs in memory over the joined rows.
+        let wanted: std::collections::BTreeSet<workloop_core::identity::IssueRef> =
+            issues.iter().map(canonical_issue).collect();
+        let owners = self.query_all(
             "SELECT wir.issue, wir.work_id, e.state \
              FROM work_issue_refs wir \
              JOIN executions e ON e.work_id = wir.work_id \
-             WHERE wir.issue_key IN ({placeholders}) \
-               AND e.state NOT IN ('succeeded','failed','cancelled') \
-             ORDER BY wir.issue_key, wir.work_id"
-        );
-        self.query_all(&sql, rusqlite::params_from_iter(keys.iter()), |row| {
-            Ok(IntakeSourceOwner {
-                issue: de_row(&row.get::<_, String>(0)?)?,
-                work_id: WorkId(row.get::<_, String>(1)?),
-                execution_state: untag(&row.get::<_, String>(2)?)?,
-            })
-        })
+             WHERE e.state NOT IN ('succeeded','failed','cancelled') \
+             ORDER BY wir.issue_key, wir.work_id",
+            [],
+            |row| {
+                let issue: workloop_core::identity::IssueRef = de_row(&row.get::<_, String>(0)?)?;
+                Ok(IntakeSourceOwner {
+                    issue: canonical_issue(&issue),
+                    work_id: WorkId(row.get::<_, String>(1)?),
+                    execution_state: untag(&row.get::<_, String>(2)?)?,
+                })
+            },
+        )?;
+        Ok(owners
+            .into_iter()
+            .filter(|o| wanted.contains(&o.issue))
+            .collect())
     }
 
     fn intake_owned_issues(&self) -> Result<Vec<workloop_core::identity::IssueRef>, StoreError> {
@@ -2028,6 +2067,11 @@ impl ReadView for Tx<'_> {
             |row| {
                 let mut issue: workloop_core::identity::IssueRef =
                     de_row(&row.get::<_, String>(0)?)?;
+                // Membership written before host canonicalization keeps
+                // the raw endpoint spelling; consumers compare against
+                // canonical request repositories, so the read returns
+                // the canonical identity.
+                issue = canonical_issue(&issue);
                 if issue.display_number == Some(0) {
                     issue.display_number = None;
                 }

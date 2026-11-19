@@ -98,23 +98,32 @@ opaque_id!(CredentialRef, "credential_ref");
 /// it, while installation records and manual submission name the host
 /// instance directly (`github.com`). Without normalization the same
 /// repository exists under two host identities — claims, dedupe, and
-/// source-gate lookups then treat one real Issue as two. Returns the
-/// lowercase bare host, with the public GitHub API endpoint reduced to
-/// `github.com`; a value that is already a bare host is returned
-/// unchanged.
+/// source-gate lookups then treat one real Issue as two.
+///
+/// The canonical form is the lowercase authority — `host` or
+/// `host:port`. Scheme, credentials, path, query, and a scheme-default
+/// port (`:443` on `https`, `:80` on `http`) are transport spelling and
+/// take no part; a non-default port stays because two instances on one
+/// hostname at different ports are different services, and a changed
+/// endpoint must never reuse an existing host-instance identity
+/// (docs/identity-storage.md). The public GitHub API endpoint reduces
+/// to `github.com`: that equivalence is endpoint data every identity
+/// comparison in this workspace converges on — admission, durable
+/// claims, and the source gate — and it is recorded here rather than
+/// injected from an adapter crate, which could never reach Core or the
+/// store (both sit below every adapter in the dependency graph).
+/// Provider endpoint aliases beyond the public GitHub pair belong to
+/// the adapter boundary, not here.
 pub fn canonical_host_instance(endpoint: &str) -> String {
-    let bare = endpoint
-        .trim()
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint.trim())
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    match bare.to_ascii_lowercase().as_str() {
+    let trimmed = endpoint.trim();
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("", trimmed));
+    let authority = rest.split('/').next().unwrap_or_default();
+    let authority = match scheme {
+        "https" if authority.ends_with(":443") => &authority[..authority.len() - 4],
+        "http" if authority.ends_with(":80") => &authority[..authority.len() - 3],
+        _ => authority,
+    };
+    match authority.to_ascii_lowercase().as_str() {
         "api.github.com" => "github.com".to_string(),
         host => host.to_string(),
     }
@@ -612,9 +621,24 @@ mod tests {
             canonical_host_instance("https://GHE.corp.example/api/v3"),
             "ghe.corp.example"
         );
+        // A non-default port is part of the instance identity: two
+        // services on one hostname at different ports never collapse.
         assert_eq!(
             canonical_host_instance("https://ghe.corp.example:8443"),
+            "ghe.corp.example:8443"
+        );
+        // Scheme-default ports are transport spelling, not identity.
+        assert_eq!(
+            canonical_host_instance("https://ghe.corp.example:443"),
             "ghe.corp.example"
+        );
+        assert_eq!(
+            canonical_host_instance("http://ghe.corp.example:80"),
+            "ghe.corp.example"
+        );
+        assert_eq!(
+            canonical_host_instance("https://api.github.com:443"),
+            "github.com"
         );
         assert_eq!(canonical_host_instance("host-local"), "host-local");
     }
