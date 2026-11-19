@@ -119,8 +119,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// The issue identity convention shared with the selector side:
 /// `source_revision` is the host's `updatedAt` token; `content_digest`
-/// is the canonical `issue-content-v1` digest of `title\nbody`
-/// (`workloop_selector::issue_content_digest`). Both are real reads —
+/// is the canonical issue-content digest — `s1-issue-v1` over
+/// `title\nbody` (`workloop_selector::issue_content_digest`). Both are real reads —
 /// the bridge recomputes them on every source poll, so an edited issue
 /// surfaces as `changed` while an unchanged one matches the spec the
 /// admitting selector bound.

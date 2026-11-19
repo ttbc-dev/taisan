@@ -69,16 +69,21 @@ pub enum IssueState {
 }
 
 /// The canonical Issue-content digest: `sha256` of `title\nbody` under
-/// the `issue-content-v1` tag. Every boundary that binds an Issue read
-/// into a [`IssueFact::content_digest`], a proposal `SourceBinding`, or
-/// a spec `SourceSnapshot` — and every adapter that performs the
+/// the `s1-issue-v1` tag — the tag the bridge persisted into spec
+/// snapshots before this contract existed. Spec snapshots store the
+/// digest verbatim and the source gate compares it exactly, so the tag
+/// is retained: re-tagging would force every in-flight Work approved
+/// under the bridge's convention to read `Changed` once after upgrade.
+/// Every boundary that binds an Issue read into a
+/// [`IssueFact::content_digest`], a proposal `SourceBinding`, or a
+/// spec `SourceSnapshot` — and every adapter that performs the
 /// authoritative re-read the source gate compares against — must use
 /// this one function. Two different digest rules over the same Issue
 /// make every selector-admitted Work look `Changed` at the gate.
 /// `revision` (the host's own update marker) and lifecycle `state`
 /// travel separately and never enter the content digest.
 pub fn issue_content_digest(title: &str, body: &str) -> String {
-    sha256_hex("issue-content-v1", format!("{title}\n{body}").as_bytes())
+    sha256_hex("s1-issue-v1", format!("{title}\n{body}").as_bytes())
 }
 
 /// The snapshot/cursor of available source facts a selector run sees.
@@ -448,4 +453,21 @@ fn semantic_payload(
         },
         "required_permissions": required_permissions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The digest tag is the bridge's persisted convention: spec
+    /// snapshots store `content_digest` verbatim and the source gate
+    /// compares it exactly, so `issue_content_digest` must keep
+    /// producing the `s1-issue-v1` values pre-upgrade stores recorded.
+    #[test]
+    fn the_digest_keeps_the_persisted_tag() {
+        assert_eq!(
+            issue_content_digest("a title", "a body"),
+            sha256_hex("s1-issue-v1", "a title\na body".as_bytes())
+        );
+    }
 }

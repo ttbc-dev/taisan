@@ -662,7 +662,8 @@ fn gh_issue(
     };
     // The digest binds the exact read: a content change produces a
     // different digest and therefore a different proposal identity.
-    // It is the shared `issue-content-v1` convention so the
+    // It is the shared issue-content convention (`s1-issue-v1` over
+    // `title\nbody`) so the
     // authoritative re-read at execution computes the same value
     // for an unchanged Issue — a selector-specific digest here
     // would make every admitted Work look `Changed` at the source
