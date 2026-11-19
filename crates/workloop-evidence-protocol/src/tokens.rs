@@ -170,13 +170,15 @@ impl ExportToken {
 
     /// Rebind checks for a continuation: the token must be the kind the
     /// caller needs, belong to this installation and epoch, still sit
-    /// inside retained history, and still be within the snapshot TTL.
+    /// inside retained history, still be within the snapshot TTL, and
+    /// not pin a watermark beyond the store's current history.
     pub fn check_binding(
         &self,
         expected: TokenKind,
         installation_id: &str,
         store_epoch: &str,
         retained_from_seq: u64,
+        current_watermark: u64,
         now_unix_seconds: i64,
     ) -> Result<(), ExportError> {
         if self.kind != expected {
@@ -196,8 +198,24 @@ impl ExportToken {
                 "token was issued under a different store epoch",
             ));
         }
+        // A token pinned above the store's current watermark names
+        // history that no longer exists (restore or rewind): the
+        // sequence can never complete, so it expires rather than
+        // serving a stale page or an empty delta.
+        if self.watermark > current_watermark {
+            return Err(ExportError::new(
+                match expected {
+                    TokenKind::Cursor => ErrorCode::SnapshotExpired,
+                    TokenKind::Checkpoint => ErrorCode::CheckpointExpired,
+                },
+                "the token's pinned watermark is beyond the store's current history",
+            ));
+        }
         match expected {
             TokenKind::Cursor => {
+                if self.after_seq.is_some_and(|a| a > self.watermark) {
+                    return Err(invalid("token checkpoint exceeds its snapshot watermark"));
+                }
                 if self.retained_from_seq < retained_from_seq || self.watermark < retained_from_seq
                 {
                     return Err(ExportError::new(
@@ -328,25 +346,25 @@ mod tests {
     fn binding_checks() {
         let t = token(TokenKind::Checkpoint);
         assert_eq!(
-            t.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 1100)
+            t.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 100, 1100)
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidCursor
         );
         assert_eq!(
-            t.check_binding(TokenKind::Checkpoint, "other", "10", 1, 1100)
+            t.check_binding(TokenKind::Checkpoint, "other", "10", 1, 100, 1100)
                 .unwrap_err()
                 .code,
             ErrorCode::InstallationMismatch
         );
         assert_eq!(
-            t.check_binding(TokenKind::Checkpoint, "inst-1", "11", 1, 1100)
+            t.check_binding(TokenKind::Checkpoint, "inst-1", "11", 1, 100, 1100)
                 .unwrap_err()
                 .code,
             ErrorCode::EpochMismatch
         );
         assert_eq!(
-            t.check_binding(TokenKind::Checkpoint, "inst-1", "10", 43, 1100)
+            t.check_binding(TokenKind::Checkpoint, "inst-1", "10", 43, 100, 1100)
                 .unwrap_err()
                 .code,
             ErrorCode::CheckpointExpired
@@ -361,14 +379,51 @@ mod tests {
                 "inst-1",
                 "10",
                 1,
+                100,
                 2000 + SNAPSHOT_TTL_SECONDS
             )
             .unwrap_err()
             .code,
             ErrorCode::SnapshotExpired
         );
-        c.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 2000)
+        c.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 100, 2000)
             .unwrap();
+    }
+
+    #[test]
+    fn watermark_beyond_current_history_expires() {
+        // A restore or rewind leaves the store below the watermark a
+        // token pinned: the sequence can never complete, so the token
+        // expires instead of serving a stale page or empty delta.
+        let t = token(TokenKind::Checkpoint);
+        assert_eq!(
+            t.check_binding(TokenKind::Checkpoint, "inst-1", "10", 1, 41, 1100)
+                .unwrap_err()
+                .code,
+            ErrorCode::CheckpointExpired
+        );
+        let c = ExportToken {
+            kind: TokenKind::Cursor,
+            ..token(TokenKind::Cursor)
+        };
+        assert_eq!(
+            c.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 41, 1100)
+                .unwrap_err()
+                .code,
+            ErrorCode::SnapshotExpired
+        );
+        // A cursor whose lower checkpoint sits above its own pinned
+        // watermark would emit after_seq > snapshot_seq.
+        let bad = ExportToken {
+            after_seq: Some(50),
+            ..token(TokenKind::Cursor)
+        };
+        assert_eq!(
+            bad.check_binding(TokenKind::Cursor, "inst-1", "10", 1, 100, 1100)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidCursor
+        );
     }
 
     #[test]

@@ -534,6 +534,27 @@ fn artifact_writes_exact_bytes_and_refuses_an_existing_path() {
     let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(env["reason"]["code"], "digest_mismatch");
     assert!(!other.exists(), "no partial artifact is published");
+    // A non-canonical alias parses to the same seq but is not a
+    // retained artifact id.
+    let alias = descriptor.artifact_id.replacen("event:", "event:0", 1);
+    let alias_out = root.join("alias.json");
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "artifact",
+            "--id",
+            &alias,
+            "--sha256",
+            &descriptor.sha256,
+            "--output",
+            &alias_out.to_string_lossy(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(env["reason"]["code"], "artifact_unavailable");
+    assert!(!alias_out.exists());
 }
 
 #[test]

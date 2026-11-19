@@ -78,6 +78,29 @@ fn descriptor(
     }
 }
 
+/// The source reference and descriptor for another retained event —
+/// the cited fragment behind a binding the producer derived rather
+/// than recorded. `snap.events` is seq-ordered, so the lookup is a
+/// binary search; a seq naming no retained effect row cites nothing.
+fn supporting_ref(snap: &HistorySnapshot, seq: u64) -> Option<(SourceRef, ArtifactDescriptor)> {
+    let event = snap
+        .events
+        .binary_search_by_key(&seq, |e| e.seq)
+        .ok()
+        .map(|i| &snap.events[i])?;
+    let payload = event.payload.as_bytes();
+    Some((
+        SourceRef {
+            artifact_id: artifact_id(event.seq),
+            sha256: sha256(payload),
+            locator: Locator::JsonPointer {
+                pointer: String::new(),
+            },
+        },
+        descriptor(&snap.installation_id, &snap.store_epoch, event.seq, payload),
+    ))
+}
+
 impl SqliteStore {
     /// A consistent read of the recorded history for the evidence
     /// exporter. Read-only: the query holds a deferred transaction, no
@@ -177,16 +200,12 @@ pub fn artifact_bytes(
     request: &ArtifactRequest,
     snapshot: &HistorySnapshot,
 ) -> Result<(ArtifactDescriptor, Vec<u8>), ExportError> {
-    let seq = request
-        .artifact_id
-        .strip_prefix("event:")
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| {
-            ExportError::new(
-                ErrorCode::ArtifactUnavailable,
-                "artifact id is not in the retained namespace",
-            )
-        })?;
+    let seq = artifact_seq(&request.artifact_id).ok_or_else(|| {
+        ExportError::new(
+            ErrorCode::ArtifactUnavailable,
+            "artifact id is not in the retained namespace",
+        )
+    })?;
     let event = snapshot
         .events
         .iter()
@@ -220,6 +239,16 @@ pub fn artifact_from_payload(
     seq: u64,
     payload: &str,
 ) -> Result<(ArtifactDescriptor, Vec<u8>), ExportError> {
+    // The descriptor id is minted from `seq`; a request naming a
+    // non-canonical alias (`event:01`) would produce a receipt whose
+    // id fails request/result equality, so only the canonical spelling
+    // of this seq is served.
+    if request.artifact_id != artifact_id(seq) {
+        return Err(ExportError::new(
+            ErrorCode::ArtifactUnavailable,
+            "artifact id is not in the retained namespace",
+        ));
+    }
     let bytes = payload.as_bytes();
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err(ExportError::new(
@@ -237,11 +266,12 @@ pub fn artifact_from_payload(
     Ok((d, bytes.to_vec()))
 }
 
-/// The retained row sequence an `event:<seq>` artifact id names.
-pub fn artifact_seq(artifact_id: &str) -> Option<u64> {
-    artifact_id
-        .strip_prefix("event:")
-        .and_then(|s| s.parse::<u64>().ok())
+/// The retained row sequence an `event:<seq>` artifact id names. Only
+/// the canonical spelling resolves: `event:01` parses to seq 1 but
+/// names no retained artifact, so the minted id must round-trip.
+pub fn artifact_seq(id: &str) -> Option<u64> {
+    let seq = id.strip_prefix("event:")?.parse::<u64>().ok()?;
+    (artifact_id(seq) == id).then_some(seq)
 }
 
 // ------------------------------------------------------------------
@@ -323,15 +353,15 @@ fn verification_sid(check_id: &str) -> String {
 }
 
 /// One stream item: the projected wire record plus the artifact
-/// descriptor its source reference names and the gaps its own evidence
-/// requires. `refs` lists every endpoint revision the record needs
-/// resolved so the assembly pass can emit missing-endpoint gaps.
+/// descriptors its source references name and the gaps its own
+/// evidence requires. `refs` lists every endpoint revision the record
+/// needs resolved so the assembly pass can emit missing-endpoint gaps.
 #[derive(Debug)]
 struct StreamItem {
     record: Record,
     kind: RecordKind,
     refs: Vec<RevisionRef>,
-    artifact: ArtifactDescriptor,
+    artifacts: Vec<ArtifactDescriptor>,
     gaps: Vec<Gap>,
 }
 
@@ -418,6 +448,39 @@ impl Replay {
         refs: Vec<RevisionRef>,
         gaps: Vec<Gap>,
     ) -> RevisionRef {
+        self.emit_supported(
+            items,
+            snap,
+            event,
+            source_id,
+            work_id,
+            assertion,
+            data,
+            kind,
+            refs,
+            gaps,
+            &[],
+        )
+    }
+
+    /// Mint and emit a record that cites additional retained events as
+    /// supporting fragments — the recorded facts a derived binding
+    /// rests on, per the contract's supporting-evidence rule.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_supported(
+        &mut self,
+        items: &mut Vec<StreamItem>,
+        snap: &HistorySnapshot,
+        event: &HistoryEvent,
+        source_id: &str,
+        work_id: &str,
+        assertion: Assertion,
+        data: RecordData,
+        kind: RecordKind,
+        refs: Vec<RevisionRef>,
+        gaps: Vec<Gap>,
+        support_seqs: &[u64],
+    ) -> RevisionRef {
         let (revision, revision_seq) = self.mint(source_id, event.seq);
         self.emit_named(
             items,
@@ -432,6 +495,7 @@ impl Replay {
             gaps,
             revision.clone(),
             revision_seq,
+            support_seqs,
         );
         rref(source_id, &revision)
     }
@@ -452,8 +516,31 @@ impl Replay {
         gaps: Vec<Gap>,
         revision: String,
         revision_seq: u64,
+        support_seqs: &[u64],
     ) {
         let payload_sha = sha256(event.payload.as_bytes());
+        let mut source_refs = vec![SourceRef {
+            artifact_id: artifact_id(event.seq),
+            sha256: payload_sha,
+            locator: Locator::JsonPointer {
+                pointer: String::new(),
+            },
+        }];
+        let mut artifacts = vec![descriptor(
+            &snap.installation_id,
+            &snap.store_epoch,
+            event.seq,
+            event.payload.as_bytes(),
+        )];
+        let mut cited = BTreeSet::from([event.seq]);
+        for &seq in support_seqs {
+            if cited.insert(seq)
+                && let Some((source_ref, artifact)) = supporting_ref(snap, seq)
+            {
+                source_refs.push(source_ref);
+                artifacts.push(artifact);
+            }
+        }
         let body = RecordBody {
             record_kind: kind,
             source_id: source_id.into(),
@@ -461,13 +548,7 @@ impl Replay {
             revision_seq,
             work_id: work_id.into(),
             assertion,
-            source_refs: vec![SourceRef {
-                artifact_id: artifact_id(event.seq),
-                sha256: payload_sha,
-                locator: Locator::JsonPointer {
-                    pointer: String::new(),
-                },
-            }],
+            source_refs,
             data,
         };
         let body_json = serde_json::to_string(&body).expect("record body serializes");
@@ -482,12 +563,7 @@ impl Replay {
             },
             kind,
             refs,
-            artifact: descriptor(
-                &snap.installation_id,
-                &snap.store_epoch,
-                event.seq,
-                event.payload.as_bytes(),
-            ),
+            artifacts,
             gaps,
         });
         self.emitted.insert((source_id.into(), revision.clone()));
@@ -506,6 +582,35 @@ impl Replay {
         to: RevisionRef,
         assertion: Assertion,
     ) {
+        self.emit_link_supported(
+            items,
+            snap,
+            event,
+            work_id,
+            relation,
+            from,
+            to,
+            assertion,
+            &[],
+        );
+    }
+
+    /// Emit a link whose assertion rests on recorded fragments beyond
+    /// the minting event; `support_seqs` names those events so the
+    /// link's source references cite them.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_link_supported(
+        &mut self,
+        items: &mut Vec<StreamItem>,
+        snap: &HistorySnapshot,
+        event: &HistoryEvent,
+        work_id: &str,
+        relation: Relation,
+        from: RevisionRef,
+        to: RevisionRef,
+        assertion: Assertion,
+        support_seqs: &[u64],
+    ) {
         let relation_tag = serde_json::to_value(relation)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -517,7 +622,7 @@ impl Replay {
             return;
         }
         let refs = vec![from.clone(), to.clone()];
-        self.emit(
+        self.emit_supported(
             items,
             snap,
             event,
@@ -528,6 +633,7 @@ impl Replay {
             RecordKind::Link,
             refs,
             vec![],
+            support_seqs,
         );
     }
 
@@ -549,14 +655,16 @@ impl Replay {
     /// names no execution, so the binding is derived from the durable
     /// artifact-handoff record whose `produced` matches the reviewed
     /// head — the only recorded fact that binds the review's target to
-    /// the execution that produced it.
-    fn execution_for_head(&self, head: &str, before_seq: u64) -> Option<String> {
+    /// the execution that produced it. Returns the handoff event's seq
+    /// alongside the execution id so derived records can cite the
+    /// supporting fragment.
+    fn execution_for_head(&self, head: &str, before_seq: u64) -> Option<(u64, String)> {
         self.produced_heads
             .get(head)?
             .iter()
             .filter(|(seq, _, _)| *seq <= before_seq)
             .max_by_key(|(seq, _, _)| *seq)
-            .map(|(_, _, exec)| exec.clone())
+            .map(|(seq, _, exec)| (*seq, exec.clone()))
     }
 
     /// The judgment that authorized a fix dispatch: the latest judgment
@@ -853,6 +961,7 @@ fn emit_execution(
         vec![],
         rev.clone(),
         rev_seq,
+        &[],
     );
     if first {
         rep.emit_link(
@@ -963,9 +1072,16 @@ fn emit_round(
 ) {
     let sid = round_sid(&round.id);
     let head = round.target.head.object.clone();
-    let exec_ref = rep
-        .execution_for_head(&head, event.seq)
-        .and_then(|eid| rep.latest_ref(&exec_sid(&eid)));
+    let exec_binding = rep.execution_for_head(&head, event.seq);
+    let exec_ref = exec_binding
+        .as_ref()
+        .and_then(|(_, eid)| rep.latest_ref(&exec_sid(eid)));
+    // The handoff event that produced the reviewed head is the
+    // recorded fragment the derived execution binding rests on.
+    let support: &[u64] = match &exec_binding {
+        Some((seq, _)) => std::slice::from_ref(seq),
+        None => &[],
+    };
     let Some(exec_ref) = exec_ref else {
         // No recorded binding exists: name the round's own revision as
         // missing evidence rather than invent an endpoint.
@@ -992,7 +1108,7 @@ fn emit_round(
         "the round's execution binding is derived from the recorded \
          handoff whose produced head matches the reviewed head",
     );
-    let round_ref = rep.emit(
+    let round_ref = rep.emit_supported(
         items,
         snap,
         event,
@@ -1016,8 +1132,9 @@ fn emit_round(
         RecordKind::Entity,
         vec![exec_ref.clone()],
         vec![],
+        support,
     );
-    rep.emit_link(
+    rep.emit_link_supported(
         items,
         snap,
         event,
@@ -1026,6 +1143,7 @@ fn emit_round(
         exec_ref,
         round_ref.clone(),
         assertion,
+        support,
     );
     for occ in occurrences {
         emit_finding(rep, items, snap, event, round, occ, Some(&round_ref));
@@ -1197,12 +1315,17 @@ fn emit_judgment(
     // The review-scope outcome records the judgment itself. Its
     // execution binding derives the same way the round's does.
     let outcome_sid = format!("outcome:review:{}", judgment.id);
-    let exec_ref = rep
-        .execution_for_head(&round.target.head.object, event.seq)
-        .and_then(|eid| rep.latest_ref(&exec_sid(&eid)));
+    let exec_binding = rep.execution_for_head(&round.target.head.object, event.seq);
+    let exec_ref = exec_binding
+        .as_ref()
+        .and_then(|(_, eid)| rep.latest_ref(&exec_sid(eid)));
+    let support: &[u64] = match &exec_binding {
+        Some((seq, _)) => std::slice::from_ref(seq),
+        None => &[],
+    };
     match exec_ref {
         Some(exec_ref) => {
-            rep.emit(
+            rep.emit_supported(
                 items,
                 snap,
                 event,
@@ -1224,6 +1347,7 @@ fn emit_judgment(
                 RecordKind::Entity,
                 vec![exec_ref],
                 vec![],
+                support,
             );
         }
         None => {
@@ -1297,6 +1421,12 @@ fn emit_repair(
         }
         None => (None, vec![], Assertion::Observed),
     };
+    // The judgment event that authorized the fix dispatch is the
+    // recorded fragment the derived round/finding bindings rest on.
+    let support: &[u64] = match &authorizer {
+        Some((_, judgment_seq)) => std::slice::from_ref(judgment_seq),
+        None => &[],
+    };
     let state = match handoff.state {
         HandoffState::Acknowledged => State::Passed,
         HandoffState::Invalid => State::Failed,
@@ -1309,7 +1439,7 @@ fn emit_repair(
     });
     let mut refs = vec![exec_ref.clone()];
     refs.extend(round_ref.iter().cloned());
-    let repair_ref = rep.emit(
+    let repair_ref = rep.emit_supported(
         items,
         snap,
         event,
@@ -1330,6 +1460,7 @@ fn emit_repair(
         RecordKind::Entity,
         refs,
         vec![],
+        support,
     );
     if first {
         rep.emit_link(
@@ -1343,7 +1474,7 @@ fn emit_repair(
             Assertion::Observed,
         );
         if let Some(r_ref) = round_ref {
-            rep.emit_link(
+            rep.emit_link_supported(
                 items,
                 snap,
                 event,
@@ -1352,10 +1483,11 @@ fn emit_repair(
                 r_ref,
                 repair_ref.clone(),
                 assertion.clone(),
+                support,
             );
         }
         for finding_ref in addressed {
-            rep.emit_link(
+            rep.emit_link_supported(
                 items,
                 snap,
                 event,
@@ -1364,6 +1496,7 @@ fn emit_repair(
                 repair_ref.clone(),
                 finding_ref,
                 assertion.clone(),
+                support,
             );
         }
     }
@@ -1708,6 +1841,7 @@ pub fn export_page(
                     &snap.installation_id,
                     &snap.store_epoch,
                     snap.retained_from_seq,
+                    snap.watermark,
                     now_unix_seconds,
                 )?;
                 let after = t.watermark;
@@ -1733,6 +1867,7 @@ pub fn export_page(
                     &snap.installation_id,
                     &snap.store_epoch,
                     snap.retained_from_seq,
+                    snap.watermark,
                     now_unix_seconds,
                 )?;
                 (
@@ -1810,7 +1945,9 @@ pub fn export_page(
             candidate_gaps.append(&mut endpoint_gaps);
             candidate_gaps.extend(item.gaps.iter().cloned());
             let mut candidate_arts = a.artifacts.clone();
-            candidate_arts.insert(item.artifact.artifact_id.clone(), item.artifact.clone());
+            for art in &item.artifacts {
+                candidate_arts.insert(art.artifact_id.clone(), art.clone());
+            }
             let fits = page_fits(
                 &ctx,
                 &a.entities

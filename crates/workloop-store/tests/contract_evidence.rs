@@ -645,6 +645,31 @@ fn token_binding_rejects_wrong_installation_epoch_and_expiry() {
         evidence::export_page(&req, &snap, NOW).unwrap_err().code,
         ErrorCode::CheckpointExpired
     );
+    // A token pinned above the store's current watermark names
+    // history a restore or rewind removed: it expires rather than
+    // serving a stale page or an empty delta.
+    assert_eq!(
+        ask(&ExportToken {
+            watermark: snap.watermark + 1,
+            ..base.clone()
+        }),
+        ErrorCode::SnapshotExpired
+    );
+    let future_checkpoint = ExportToken {
+        kind: TokenKind::Checkpoint,
+        watermark: snap.watermark + 1,
+        ..base.clone()
+    };
+    let req = ExportRequest {
+        protocol_version: ProtocolVersion::V1,
+        after: Some(future_checkpoint.encode()),
+        cursor: None,
+        limit: 10,
+    };
+    assert_eq!(
+        evidence::export_page(&req, &snap, NOW).unwrap_err().code,
+        ErrorCode::CheckpointExpired
+    );
     // Kind confusion: a checkpoint is not a cursor.
     let wrong_kind = ExportToken {
         kind: TokenKind::Checkpoint,
@@ -745,6 +770,37 @@ fn artifact_retrieval_returns_exact_retained_bytes() {
         evidence::artifact_bytes(&foreign, &snap).unwrap_err().code,
         ErrorCode::ArtifactUnavailable
     );
+    // A non-canonical alias parses to the same seq but names no
+    // retained artifact: the descriptor id is minted from the seq, so
+    // serving it would fail request/result id equality downstream.
+    let mut alias = req.clone();
+    alias.artifact_id = format!("event:0{}", event.seq);
+    assert_eq!(
+        evidence::artifact_bytes(&alias, &snap).unwrap_err().code,
+        ErrorCode::ArtifactUnavailable
+    );
+    assert_eq!(
+        evidence::artifact_from_payload(
+            &alias,
+            &snap.installation_id,
+            &snap.store_epoch,
+            event.seq,
+            &event.payload,
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::ArtifactUnavailable
+    );
+    let (d, b) = evidence::artifact_from_payload(
+        &req,
+        &snap.installation_id,
+        &snap.store_epoch,
+        event.seq,
+        &event.payload,
+    )
+    .unwrap();
+    assert_eq!(d.artifact_id, req.artifact_id);
+    assert_eq!(b, event.payload.as_bytes());
 }
 
 #[test]
@@ -767,4 +823,85 @@ fn export_never_writes_or_needs_the_projection() {
     let snap2 = snapshot(&store);
     let b = evidence::export_page(&req, &snap2, NOW).unwrap();
     assert_eq!(a, b);
+}
+
+#[test]
+fn derived_bindings_cite_their_supporting_events() {
+    let store = SqliteStore::open(&db_path("support"), 2).unwrap();
+    append(&store, &full_history());
+    let (pages, _snapshot) = drain(&store, 500);
+    let bodies: Vec<RecordBody> = pages
+        .iter()
+        .flat_map(|(_, p)| {
+            p.entities
+                .iter()
+                .map(|r| parse_record(r, RecordKind::Entity).unwrap())
+                .chain(
+                    p.links
+                        .iter()
+                        .map(|r| parse_record(r, RecordKind::Link).unwrap()),
+                )
+        })
+        .collect();
+    let cited = |source_id: &str| -> BTreeSet<String> {
+        bodies
+            .iter()
+            .find(|b| b.source_id == source_id)
+            .map(|b| {
+                b.source_refs
+                    .iter()
+                    .map(|s| s.artifact_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let cited_relation = |relation: Relation| -> BTreeSet<String> {
+        bodies
+            .iter()
+            .find(|b| matches!(&b.data, RecordData::Link { relation: r, .. } if *r == relation))
+            .map(|b| {
+                b.source_refs
+                    .iter()
+                    .map(|s| s.artifact_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // full_history seqs: 5 = coding handoff (produced head-1),
+    // 6 = review round, 7 = fix judgment, 10 = fix handoff.
+    // The round's execution binding derives from the produced-head
+    // handoff, so the round entity and its link cite that event.
+    assert_eq!(
+        cited("round:round-1"),
+        BTreeSet::from(["event:5".to_string(), "event:6".to_string()])
+    );
+    assert_eq!(
+        cited_relation(Relation::ExecutionHasRound),
+        BTreeSet::from(["event:5".to_string(), "event:6".to_string()])
+    );
+    // The repair's round and addressed-finding bindings derive from
+    // the authorizing judgment, so the attempt entity and its links
+    // cite the judgment event alongside the minting handoff.
+    assert_eq!(
+        cited("repair:art-f1"),
+        BTreeSet::from(["event:7".to_string(), "event:10".to_string()])
+    );
+    for relation in [Relation::RoundHasRepair, Relation::RepairAddressesFinding] {
+        assert_eq!(
+            cited_relation(relation),
+            BTreeSet::from(["event:7".to_string(), "event:10".to_string()]),
+            "{relation:?}"
+        );
+    }
+    // The review-scope outcome's execution binding cites the same
+    // produced-head handoff as the round's.
+    assert_eq!(
+        cited("outcome:review:j-1"),
+        BTreeSet::from(["event:5".to_string(), "event:7".to_string()])
+    );
+    // Recorded-fact links keep citing only their minting event.
+    assert_eq!(
+        cited_relation(Relation::ExecutionHasRepair),
+        BTreeSet::from(["event:10".to_string()])
+    );
 }
