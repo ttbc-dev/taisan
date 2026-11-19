@@ -35,6 +35,28 @@ fn subsection<'a>(doc: &'a str, heading: &str) -> &'a str {
     }
 }
 
+/// Body of a heading, up to the next heading of the same or a higher level.
+///
+/// Unlike [`subsection`], this stops at any enclosing `##` heading too, so a
+/// `###` operational subsection cannot borrow phrases from later sections.
+fn section<'a>(doc: &'a str, heading: &str) -> &'a str {
+    let start = doc
+        .find(heading)
+        .unwrap_or_else(|| panic!("missing heading {heading}"));
+    let level = heading.chars().take_while(|c| *c == '#').count();
+    let rest = &doc[start + heading.len()..];
+    let mut end = rest.len();
+    for (newline, _) in rest.match_indices('\n') {
+        let line = &rest[newline + 1..];
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 && hashes <= level && line.as_bytes().get(hashes) == Some(&b' ') {
+            end = newline;
+            break;
+        }
+    }
+    &rest[..end]
+}
+
 /// First fenced `json` block in `body`.
 fn json_block(body: &str) -> &str {
     let start = body
@@ -132,10 +154,10 @@ fn v03_invalid_report_differs_from_the_request_it_names() {
 #[test]
 fn v03_operational_profile_records_the_single_host_decisions() {
     let doc = read_doc();
-    let section = doc
-        .split("## 14. Operational launch, verification, and host composition")
-        .nth(1)
-        .expect("v0.3 must keep the operational launch/verification/host section");
+    let operational = section(
+        &doc,
+        "## 14. Operational launch, verification, and host composition",
+    );
 
     for heading in [
         "### 14.1 Existing implementation mapped to the required boundary",
@@ -150,14 +172,14 @@ fn v03_operational_profile_records_the_single_host_decisions() {
         "### 14.11 Non-claims",
     ] {
         assert!(
-            section.contains(heading),
+            operational.contains(heading),
             "operational section omits {heading:?}"
         );
     }
 
     for decision in ["OP-1", "OP-2", "OP-3", "OP-4", "OP-5", "OP-6", "OP-7"] {
         assert!(
-            section.contains(decision),
+            operational.contains(decision),
             "operational section omits decision {decision}"
         );
     }
@@ -172,53 +194,60 @@ fn v03_operational_profile_records_the_single_host_decisions() {
         "runtime setup, credential installation, model call",
     ] {
         assert!(
-            section.contains(required),
+            operational.contains(required),
             "operational section omits required phrase {required:?}"
         );
     }
 
     let config = std::fs::read_to_string(repo_root().join("docs/installation-config.md"))
         .expect("read installation-config.md");
-    for required in [
+    let config_operational = section(
+        &config,
         "## v0.3 operational profile (target schema revision 2)",
+    );
+    for required in [
         "[host_driver]",
         "credential_ref",
         "model_api_hosts",
         "toolchain",
         "cache_paths",
+        "not separate budgets",
     ] {
         assert!(
-            config.contains(required),
+            config_operational.contains(required),
             "installation config omits operational key {required:?}"
         );
     }
 
     let loop_doc = std::fs::read_to_string(repo_root().join("docs/execution-loop.md"))
         .expect("read execution-loop.md");
+    let loop_operational = section(&loop_doc, "### Operational host-driver composition (v0.3)");
     for required in [
-        "### Operational host-driver composition (v0.3)",
         "in_process",
         "Source polling",
         "Bounded outbox and reconciliation",
         "original actor/credential binding",
     ] {
         assert!(
-            loop_doc.contains(required),
+            loop_operational.contains(required),
             "execution loop omits operational composition phrase {required:?}"
         );
     }
 
     let worker = std::fs::read_to_string(repo_root().join("docs/worker-protocol.md"))
         .expect("read worker-protocol.md");
-    for required in [
+    let worker_operational = section(
+        &worker,
         "### Operational delivery and managed lifecycle (v0.3)",
+    );
+    for required in [
         "/taisan/provider-config",
         "Child runtime servers",
         "read-only workspace",
         "restart",
     ] {
         assert!(
-            worker.contains(required),
+            worker_operational.contains(required),
             "worker protocol omits operational lifecycle phrase {required:?}"
         );
     }

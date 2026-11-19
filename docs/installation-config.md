@@ -147,8 +147,8 @@ runtime_version = ">=2.0.0"
 model = "example-model"
 max_turns = 200
 max_runtime_seconds = 1800
-stdout_cap_bytes = 33554432            # runtime.log, includes child-server output
-stderr_cap_bytes = 33554432
+stdout_cap_bytes = 33554432            # per-stream cap; not a separate budget
+stderr_cap_bytes = 33554432            # both streams share one runtime.log total
 report_cap_bytes = 1048576
 credential_ref = "env:TAISAN_MODEL_TOKEN"   # runtime credential only; never a host token
 provider_config = "/home/operator/.config/taisan/provider.toml"  # non-secret, absolute
@@ -170,6 +170,7 @@ Validation and delivery rules:
 - `[host_driver].mode` accepts exactly `in_process` in v0.3. `separate` is reserved for a later owner decision and is refused now, as is an unknown value; the scenario bridge is not a valid production mode.
 - `[worker].credential_ref` uses the same `env:`/`file:`/`command:` provider rules as a role reference and resolves only at the supervisor boundary. It grants model access only. It is not a repository-host role and cannot be used for a `push_ref`, comment, review, or other host effect.
 - `[worker].provider_config` is an absolute path to a non-secret file or directory (model identity, endpoint host, limits, empty MCP configuration). It must be owner-readable and must not contain a credential value; a secret found there is a configuration error, not a tolerated convenience. The supervisor renders or validates it and mounts it read-only; `/workspace` cannot override it.
+- `[worker].stdout_cap_bytes` and `[worker].stderr_cap_bytes` are per-stream truncation points, not separate budgets. Both streams and child-server output are copied into one `runtime.log` whose retained total is the request's shared `max_log_bytes` (32 MiB); the two per-stream values are clamped together by that shared cap and never total 64 MiB. Once the log is full, further bytes are dropped and truncation is recorded.
 - `[worker.egress].model_api_hosts` is a non-empty list of bare host names: no scheme, port, path, wildcard, IP literal, or empty entry. It is disjoint from every `[hosts.*].endpoint` host and from `[verification.egress].allowlist`; overlap is a load error. It is the only destination the Worker proxy may CONNECT to.
 - `[verification].toolchain` and every `cache_paths` entry are absolute, present, and readable before the first dispatch. They are mounted read-only into the verification sandbox. A missing toolchain or cache is a preflight failure, never a download at verification time.
 - `[verification.egress].allowlist` remains the installation default. The effective per-command set is this list plus the Work's immutable `verification_egress_hosts` declared at admission; it never includes a model-API host. A Work that needs an undeclared host is an admission gap, not a reason to open the network.
