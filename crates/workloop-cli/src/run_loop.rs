@@ -901,27 +901,41 @@ fn uuidish() -> String {
 /// Compose the outbox phase's held list and credential-blocked count
 /// from the reconcile and apply-drain reports. A pending intent that
 /// fails the credential gate is reported by both passes; each blocked
-/// intent is listed and counted once. Skipped intents join the held
-/// list with their recorded reason.
+/// intent is listed and counted once. The apply drain returns its
+/// routing verdicts — a missing Execution, a denied host_write, a
+/// foreign host — before reaching the credential gate, while reconcile
+/// credential-checks every outstanding intent first, so one intent can
+/// surface under both a credential code and a skipped reason. The
+/// drain's verdict is the proximate reason no write was attempted, so
+/// it wins and each intent is held exactly once.
 fn outbox_held(reconciled: &ReconcileReport, applied: &OutboxReport) -> (Vec<String>, usize) {
-    let mut blocked_ids = std::collections::HashSet::new();
-    let held_blocked: Vec<String> = reconciled
+    let skipped_ids: std::collections::HashSet<&str> = applied
+        .skipped
+        .iter()
+        .map(|s| s.action_id.as_str())
+        .collect();
+    let mut held_ids = std::collections::HashSet::new();
+    let mut credential_blocked = 0;
+    let mut held: Vec<String> = Vec::new();
+    for b in reconciled
         .credential_blocked
         .iter()
         .chain(&applied.credential_blocked)
-        .filter(|b| blocked_ids.insert(b.action_id.clone()))
-        .map(|b| format!("{}:{}", b.action_id, b.code))
-        .collect();
-    let credential_blocked = blocked_ids.len();
-    let held = held_blocked
-        .into_iter()
-        .chain(
-            applied
-                .skipped
-                .iter()
-                .map(|s| format!("{}:{}", s.action_id, s.reason)),
-        )
-        .collect();
+    {
+        if skipped_ids.contains(b.action_id.as_str()) {
+            continue;
+        }
+        if held_ids.insert(b.action_id.clone()) {
+            credential_blocked += 1;
+            held.push(format!("{}:{}", b.action_id, b.code));
+        }
+    }
+    held.extend(
+        applied
+            .skipped
+            .iter()
+            .map(|s| format!("{}:{}", s.action_id, s.reason)),
+    );
     (held, credential_blocked)
 }
 
@@ -1984,26 +1998,37 @@ mod tests {
             code: "credential.missing",
         };
         let reconciled = ReconcileReport {
-            credential_blocked: vec![block("act-1"), block("act-2")],
+            credential_blocked: vec![block("act-1"), block("act-2"), block("act-4")],
             ..Default::default()
         };
         let applied = OutboxReport {
             credential_blocked: vec![block("act-1")],
-            skipped: vec![workloop_github::fixture::SkippedIntent {
-                action_id: "act-3".into(),
-                reason: "missing_execution",
-            }],
+            skipped: vec![
+                workloop_github::fixture::SkippedIntent {
+                    action_id: "act-3".into(),
+                    reason: "missing_execution",
+                },
+                workloop_github::fixture::SkippedIntent {
+                    action_id: "act-4".into(),
+                    reason: "host_write_denied",
+                },
+            ],
             ..Default::default()
         };
         let (held, credential_blocked) = outbox_held(&reconciled, &applied);
-        assert_eq!(credential_blocked, 2, "one intent blocked once, not twice");
+        assert_eq!(
+            credential_blocked, 2,
+            "one intent blocked once, and a credential block shadowed by              the drain's routing verdict is not counted"
+        );
         assert_eq!(
             held,
             vec![
                 "act-1:credential.missing".to_string(),
                 "act-2:credential.missing".to_string(),
                 "act-3:missing_execution".to_string(),
-            ]
+                "act-4:host_write_denied".to_string(),
+            ],
+            "act-4 is held once under the drain's verdict, not twice with              contradictory reasons"
         );
     }
 
