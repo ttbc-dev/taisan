@@ -455,3 +455,48 @@ fn a_tampered_digest_member_reads_as_corrupt() {
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The embedded `request_id` is covered by `body_digest`, so a row
+/// written with a key/member mismatch verifies consistently — the
+/// read gate re-checks the embedded identity against the row key and
+/// the row still reads as corrupt.
+#[test]
+fn a_mismatched_request_id_member_reads_as_corrupt() {
+    let root = temp_root("mismatched-request-id");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-id-mismatch");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body(&request_id, "verifiable").canonical_body).unwrap();
+        value["request_id"] = serde_json::Value::String("other:inv:9".into());
+        // Keep the row self-consistent: recompute the digest over the
+        // mismatched body — embedded member and column alike — so only
+        // the identity check can refuse it.
+        let mut stripped = value.clone();
+        stripped.as_object_mut().unwrap().remove("request_digest");
+        let digest = workloop_core::worker_v2::request_v2_digest(&canonical_json(&stripped));
+        value["request_digest"] = serde_json::Value::String(digest.clone());
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1, body_digest=?2              WHERE request_id=?3",
+            rusqlite::params![canonical_json(&value), digest, request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("a mismatched request_id is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption: {err:?}"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}

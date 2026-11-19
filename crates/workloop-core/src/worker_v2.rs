@@ -381,11 +381,20 @@ impl WorkerRequestBody {
             return false;
         };
         let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
-        // `request_digest` is excluded from its own digest, so the
-        // embedded member is re-checked explicitly — a row whose
-        // digest member alone was altered reads as corrupt here, not
-        // only when the body is parsed for launch.
+        // Identity members are covered by the digest, so post-insert
+        // tampering already fails it — but a row written with a
+        // mismatched key/member pair verifies consistently. The gate
+        // therefore re-checks the embedded identity against the row's
+        // own fields, and the self-referential `request_digest`
+        // member, which is excluded from its own digest, against the
+        // recomputed value.
         self.body_digest == digest
+            && value.get("request_id").and_then(serde_json::Value::as_str)
+                == Some(self.request_id.as_str())
+            && value
+                .get("format_version")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.format_version.as_str())
             && value
                 .get("request_digest")
                 .and_then(serde_json::Value::as_str)
@@ -404,6 +413,15 @@ pub fn request_v2_digest(canonical_body: &[u8]) -> String {
 /// omitted.
 pub fn report_v2_digest(canonical_body: &[u8]) -> String {
     sha256_hex(REPORT_DIGEST_TAG, canonical_body)
+}
+
+/// Canonical bytes of a raw `taisan.worker.report/2` value with
+/// `report_digest` omitted — the exact input `report_v2_digest`
+/// covers. Digest verification must run on the transmitted value,
+/// never on a typed re-serialization: `Option` members serialize
+/// `None` as `null`, inventing members a valid wire report may omit.
+pub fn report_canonical_body(value: &serde_json::Value) -> Vec<u8> {
+    canonical_minus(value, "report_digest")
 }
 
 /// Canonical bytes of a JSON value minus one top-level member — the
@@ -590,6 +608,18 @@ impl WorkerRequestV2 {
                 format!(
                     "required_capabilities.role {:?} disagrees with role {:?}",
                     self.required_capabilities.role, self.role
+                ),
+            ));
+        }
+        // `resume` is unsupported for any v2 dispatch (§5.2): the
+        // request must not demand a resume mode the contract does not
+        // define — continuation refs are the only carry-over.
+        if self.required_capabilities.resume != "unsupported" {
+            return Err(invalid(
+                "request.invalid",
+                format!(
+                    "required_capabilities.resume {:?} — v2 resume is unsupported",
+                    self.required_capabilities.resume
                 ),
             ));
         }
@@ -909,21 +939,6 @@ pub struct WorkerReportV2 {
     pub log: Option<ReportLog>,
 }
 
-impl WorkerReportV2 {
-    /// Canonical body bytes with `report_digest` omitted.
-    pub fn canonical_body(&self) -> Vec<u8> {
-        canonical_minus(
-            &serde_json::to_value(self).expect("report serializes"),
-            "report_digest",
-        )
-    }
-
-    /// The digest of this report's canonical body.
-    pub fn digest(&self) -> String {
-        report_v2_digest(&self.canonical_body())
-    }
-}
-
 /// The binding a report must echo: the exact request it answers.
 pub struct ReportBinding<'a> {
     pub request_id: &'a str,
@@ -1015,7 +1030,7 @@ pub fn classify_report(
     };
     // The declared digest is verified over the raw body minus its
     // digest member, never a re-serialization.
-    let body_digest = report_v2_digest(&canonical_minus(&value, "report_digest"));
+    let body_digest = report_v2_digest(&report_canonical_body(&value));
     let mut reasons: Vec<String> = Vec::new();
     if report.request_id != binding.request_id {
         reasons.push("report.wrong_request".into());
@@ -1227,6 +1242,21 @@ mod tests {
         let mut foreign = body.clone();
         foreign.format_version = "taisan.worker.request/9".into();
         assert!(!foreign.verifies(), "a non-v2 row reads as corrupt");
+
+        // A row whose embedded `request_id` names a different
+        // dispatch verifies consistently — the digest covers whatever
+        // content was stored — so the gate re-checks the embedded
+        // identity against the row's own key.
+        let mut foreign_id = body.clone();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&foreign_id.canonical_body).unwrap();
+        value["request_id"] = serde_json::Value::String("e-9:inv:9".into());
+        foreign_id.body_digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        foreign_id.canonical_body = canonical_json(&value);
+        assert!(
+            !foreign_id.verifies(),
+            "a mismatched request_id reads as corrupt"
+        );
     }
 
     #[test]
@@ -1401,6 +1431,18 @@ mod tests {
     }
 
     #[test]
+    fn a_request_demanding_resume_is_invalid() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).unwrap();
+        request.required_capabilities.resume = "session".into();
+        match request.validate() {
+            Err(RequestInvalid::Invalid { detail, .. }) => {
+                assert!(detail.contains("resume"), "{detail}")
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn duplicate_group_entries_are_invalid() {
         let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).unwrap();
         let TaskBody::Coding { issues, .. } = &mut request.task else {
@@ -1421,12 +1463,41 @@ mod tests {
         let classified = classify_report(DOC_REPORT.as_bytes(), &doc_binding(), 1_048_576);
         assert_eq!(classified.classification, ReportClassification::Negative);
         let report = classified.report.expect("negative report parses");
+        // The digest is verified over the transmitted value, never a
+        // typed re-serialization — `Option` members would invent
+        // `null`s the wire body may not carry.
+        let value: serde_json::Value = serde_json::from_slice(DOC_REPORT.as_bytes()).unwrap();
         assert_eq!(
-            report.digest(),
+            report_v2_digest(&report_canonical_body(&value)),
             "f057b455539282e75af552dc5fd8da03ac827157a0ef2ec4415484019032ff2d"
         );
         assert_eq!(report.reason.code, "checks_failed");
         assert_eq!(report.runtime_usage.as_ref().unwrap().turns, Some(8));
+    }
+
+    /// `Option` members may be absent on the wire; the digest covers
+    /// the transmitted value, so omission — not an invented `null` —
+    /// is what the Worker hashed.
+    #[test]
+    fn a_report_omitting_optional_members_still_verifies() {
+        let mut value: serde_json::Value = serde_json::from_slice(DOC_REPORT.as_bytes()).unwrap();
+        let map = value.as_object_mut().unwrap();
+        for member in ["claimed_head", "runtime_usage", "log"] {
+            map.remove(member);
+        }
+        value["continuation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_commit");
+        value["report_digest"] =
+            serde_json::Value::String(report_v2_digest(&report_canonical_body(&value)));
+        let raw = canonical_json(&value);
+        let classified = classify_report(&raw, &doc_binding(), 1_048_576);
+        assert_eq!(
+            classified.classification,
+            ReportClassification::Negative,
+            "an omitted-member report is not a digest mismatch"
+        );
     }
 
     #[test]
