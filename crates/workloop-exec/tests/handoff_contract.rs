@@ -1410,6 +1410,44 @@ fn install_sandbox(
     (bwrap, relay, bwrap_log, relay_log)
 }
 
+/// A refused enforcement boundary records Inconclusive without ever
+/// registering a worktree in the handoff repository — registering the
+/// checkout is part of the cost the refusal exists to avoid, and the
+/// post-run `worktree remove` is only best-effort.
+#[test]
+fn a_refused_enforcement_boundary_registers_no_worktree() {
+    let root = tmp_root("enfrefuse");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vnoadd");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    install_sandbox(
+        &mut layout,
+        &root,
+        port,
+        vec!["deps.example".into()],
+        vec!["model.example".into()],
+    );
+    // A declared egress host that names a model-API host is refused at
+    // the enforcement boundary (§14.5).
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["git".into(), "rev-parse".into(), "HEAD".into()],
+        &scratch,
+        &["model.example".into()],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(res.output.contains("egress_denied"), "{}", res.output);
+    let listed = git(&layout.repository, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listed.contains("verify-"),
+        "the refused boundary registered a worktree:\n{listed}"
+    );
+}
+
 #[test]
 fn contained_verification_binds_the_declared_sandbox_shape() {
     let root = tmp_root("verify-contained");
