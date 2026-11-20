@@ -1034,6 +1034,33 @@ fn an_oversized_snapshot_body_refuses_dispatch() {
     assert!(!pending_ids(&store).contains(&rid));
 }
 
+/// Spec input the closed-envelope validation refuses — here a
+/// `verification_argv` count past `max_verification_commands` — is a
+/// typed `request.invalid` dispatch refusal recorded against the
+/// request, never a build fault that leaves the request pending and
+/// wedges every later consume pass.
+#[test]
+fn a_request_failing_envelope_validation_is_a_typed_refusal_never_a_wedge() {
+    let root = tmp_root("invalid");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    // The profile bounds verification commands at 4 — five argv
+    // entries make the built body fail `WorkerRequestV2` validation.
+    let argv: Vec<Vec<String>> = (0..5).map(|i| vec!["true".into(), i.to_string()]).collect();
+    let (w, _e, rid) = admit_ex(&store, "v2-invalid", vec![], argv);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.invalid");
+    assert!(invocation_for(&store, &rid).is_none());
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
 #[test]
 fn fix_dispatch_binds_the_acknowledged_predecessor_and_failed_evidence() {
     let root = tmp_root("fix");
@@ -1377,6 +1404,59 @@ fn an_invariant_check_snapshots_the_produced_commit_not_the_live_tree() {
         !snap.join("uncommitted.txt").exists(),
         "uncommitted files never enter the checked tree"
     );
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
+}
+
+/// A worker-planted executable git hook inside the producing
+/// workspace must never run under the supervisor's own git work: the
+/// snapshot is cloned into a fresh `.git`, so `post-checkout` —
+/// which a copy would carry executable — never executes.
+#[test]
+fn an_invariant_check_snapshot_never_runs_a_planted_workspace_hook() {
+    let root = tmp_root("ic-hook");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-ichook", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    // The planted hook: executable, inside the worker-writable
+    // `.git`, and side-effecting outside the scratch tree — exactly
+    // what a copied `.git` would run during the produced checkout.
+    let marker = root.join("hook-ran");
+    let hook = ws.join(".git").join("hooks").join("post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    assert!(
+        !marker.exists(),
+        "the planted workspace hook never executed under the supervisor"
+    );
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
     assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
 }
 
@@ -1915,6 +1995,61 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
         !pending_ids(&store).contains(&rid1),
         "the consumed request is terminal for its binding"
     );
+}
+
+/// A request deadline that elapses while the launch is being
+/// prepared — after the pass-start read `build_request_body`
+/// validated against — must still block the spawn: the
+/// spawn-boundary recheck reads the clock again, abandons the
+/// recorded Invocation, and no worker process ever exists.
+#[test]
+fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("race-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-dline", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    std::fs::create_dir_all(sup.workspace_of(&w)).unwrap();
+    // The deadline lands inside the launch window: valid against the
+    // pass timestamp `build_request_body` checks, elapsed by the time
+    // the spawn boundary re-reads the clock.
+    store
+        .transact(|tx| {
+            let mut exec = tx.execution(&e)?.expect("execution");
+            exec.budget.runtime_limit_seconds = 60;
+            exec.started_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: exec,
+                expected_state: ExecutionState::Ready,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    let mut clock = || NOW + 120;
+    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
+        .unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Abandoned,
+        "the spawn-boundary deadline recheck abandoned the prepared invocation"
+    );
+    assert!(invocation.process_identity.is_none(), "no process started");
 }
 
 /// A v2 supervisor over a caller-chosen worker argv — the
