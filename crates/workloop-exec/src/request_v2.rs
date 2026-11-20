@@ -289,6 +289,15 @@ fn wire_target(
             detail: "the current target does not carry exact commit ids".into(),
         });
     }
+    // A dispatch before the target-branch revision is observed pins
+    // nothing the report could later prove — the review waits for the
+    // observation rather than minting a body that can never bind
+    // (wire docs: an absent revision proves no match).
+    let Some(target_revision) = &target.target_revision else {
+        return Err(DispatchRefusal::HeadStale {
+            detail: "the target-branch revision is not yet observed".into(),
+        });
+    };
     let repository = work.binding.repository.clone();
     let snapshot = DiffSnapshot::new(
         target.change.clone(),
@@ -302,6 +311,7 @@ fn wire_target(
         base: base.to_string(),
         head: target.head.object.clone(),
         diff_digest: snapshot.snapshot_id(),
+        target_revision: Some(target_revision.object.clone()),
     })
 }
 
@@ -733,6 +743,7 @@ pub fn build_request_body(
                             source: occurrence.source_key.clone(),
                             digest: content_digest,
                             order: order as u64,
+                            summary: occurrence.summary.clone(),
                         });
                     }
                     if findings.is_empty() {
@@ -1027,6 +1038,7 @@ fn round_source_round(
                 severity: o.severity,
                 position: o.position,
                 thread_id: o.thread_id,
+                summary: o.summary,
             })
             .collect();
         let judgment = tx

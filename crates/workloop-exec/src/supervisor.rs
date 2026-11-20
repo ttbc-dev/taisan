@@ -591,6 +591,19 @@ impl ProcessControlPort for PosixProcessControl {
         }
         let mut out = Vec::new();
         for (pid, cwd) in occupants {
+            // `cwd_within` canonicalizes the reported path and treats
+            // an unresolvable cwd as "not inside" — but a reported
+            // path spelled inside `dir` cannot be proven outside it
+            // either (a live writer whose cwd was deleted). `mapped`
+            // already holds the pid, so skipping it here would slip
+            // it past the completeness gate: fail the scan instead,
+            // matching the same fail-closed contract.
+            if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
+                return Err(format!(
+                    "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                    cwd.display()
+                ));
+            }
             if !cwd_within(Some(&cwd), &dir) {
                 continue;
             }
@@ -3222,7 +3235,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
             InvocationRole::InvariantCheck => self.check_workspace(&invocation.id.0),
             _ => self.workspace_of(&request.work_id),
         };
-        let canonical_dir = std::fs::canonicalize(&launch_dir).unwrap_or(launch_dir);
+        let canonical_dir =
+            std::fs::canonicalize(&launch_dir).unwrap_or_else(|_| launch_dir.clone());
         // Every process identity the store already accounts for —
         // leaders, descendant snapshots, and stop-intent proofs across
         // all nonterminal executions — so a recorded writer is never
@@ -3232,11 +3246,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // signature an unrecorded writer can still be found by. A
         // request with no recorded binding has no signature to search:
         // nothing can be proven, so it stays uncertain.
-        let Some(expected_command) = request
-            .adapter_binding
-            .as_ref()
-            .map(|binding| binding.argv.join(" "))
-        else {
+        let Some(binding) = request.adapter_binding.as_ref() else {
             return self.report_unidentified_unknown(
                 store,
                 request,
@@ -3244,10 +3254,55 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             );
         };
-        let matches = match self.port.matching_processes(&expected_command) {
-            Ok(matches) => matches,
-            // An unreadable process table proves nothing in either
-            // direction — stay uncertain.
+        // The signature is the full command line the spawn actually
+        // exec'd, which is the bare argv only for v1. A v2 launch
+        // appended the `run --request/--out` transport pair — the
+        // sandbox paths under containment, the host io paths
+        // uncontained — and the durable record does not name which
+        // gate the spawn took, so every shape the line could have
+        // taken is a signature. Missing the v2 shapes would leave a
+        // v2 writer unmatchable: never re-bound, and eventually
+        // declared absent on directory occupancy alone. The bare argv
+        // alone is never a v2 signature either — the spawn exec'd none
+        // of it, so a foreign process running just those words must
+        // neither adopt the launch nor hold absence open forever.
+        let body = store.transact(|tx| tx.worker_request_body(&request.request_id))?;
+        let mut signatures = Vec::new();
+        if body.is_none() {
+            signatures.push(binding.argv.join(" "));
+        }
+        let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
+            .join(crate::isolation::sanitize_key(&invocation.id.0));
+        if body.is_some() {
+            let mut contained = binding.argv.clone();
+            contained.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                containment::SANDBOX_REQUEST.to_string(),
+                "--out".to_string(),
+                containment::SANDBOX_OUT.to_string(),
+            ]);
+            signatures.push(contained.join(" "));
+            let mut host = binding.argv.clone();
+            host.extend([
+                "run".to_string(),
+                "--request".into(),
+                io_dir.join("request.json").to_string_lossy().into_owned(),
+                "--out".into(),
+                io_dir.join("out").to_string_lossy().into_owned(),
+            ]);
+            signatures.push(host.join(" "));
+        }
+        // A contained launch exec'd none of those lines — the spawn
+        // ran the bwrap outer argv `bwrap_args` produced. Re-evaluate
+        // the recorded binding's gate and rebuild the exact plan the
+        // launch used: `Uncontained` means no wrapped argv could
+        // exist; a refused gate or an unresolvable boundary means the
+        // wrapped argv cannot be reconstructed — the orphan's
+        // signature is then unprovable, so stay uncertain rather than
+        // declare absence on an incomplete search.
+        match self.containment_gate(&binding.argv, now_unix_seconds)? {
+            Ok(Gate::Uncontained) => {}
             Err(_) => {
                 return self.report_unidentified_unknown(
                     store,
@@ -3256,7 +3311,82 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     now_unix_seconds,
                 );
             }
-        };
+            Ok(Gate::Ready { primitive, worker }) => {
+                let (inner_argv, workspace_read_only, mounts_io) = if let Some(body) = &body {
+                    // A durable body that no longer parses is corrupt
+                    // evidence, not a v1 request — the contained shape
+                    // cannot be reconstructed either, so stay
+                    // uncertain.
+                    let Ok(wire) = WorkerRequestV2::parse(&body.canonical_body) else {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    };
+                    let mut inner = binding.argv.clone();
+                    inner.extend([
+                        "run".to_string(),
+                        "--request".to_string(),
+                        containment::SANDBOX_REQUEST.to_string(),
+                        "--out".to_string(),
+                        containment::SANDBOX_OUT.to_string(),
+                    ]);
+                    (inner, wire.workspace.read_only, true)
+                } else {
+                    (binding.argv.clone(), false, false)
+                };
+                let plan = MountPlan {
+                    workspace: Some((launch_dir.clone(), workspace_read_only)),
+                    request: mounts_io.then(|| io_dir.join("request.json")),
+                    input: mounts_io.then(|| io_dir.join("input")),
+                    out: mounts_io.then(|| io_dir.join("out")),
+                    gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
+                    extra_rw_binds: vec![],
+                    worker: worker.clone(),
+                };
+                match self.contained_exec(
+                    &primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &WorkerEnv::default(),
+                ) {
+                    Ok((argv, _)) => signatures.push(argv.join(" ")),
+                    Err(_) => {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    }
+                }
+            }
+        }
+        let mut matches = Vec::new();
+        for signature in &signatures {
+            match self.port.matching_processes(signature) {
+                Ok(found) => matches.extend(found),
+                // An unreadable process table proves nothing in either
+                // direction — stay uncertain.
+                Err(_) => {
+                    return self.report_unidentified_unknown(
+                        store,
+                        request,
+                        &invocation.id,
+                        now_unix_seconds,
+                    );
+                }
+            }
+        }
         // Every signature match the store does not already account for.
         // A recorded writer — another work's live process, a snapshotted
         // descendant, a stop-proof identity — is never this launch's
@@ -3326,10 +3456,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation: next,
                         expected_state: invocation.state.clone(),
                     })?;
-                    tx.apply(&Effect::BindWorkerRequestExport {
-                        request_id: bound_request_id,
-                        process_identity: bound_identity.clone(),
-                    })?;
+                    // A v1 launch binds its export row to the spawned
+                    // handle. A v2 request has no export — its durable
+                    // body is the launch record and the running
+                    // Invocation carries the identity — so the bind
+                    // applies only when the export row exists;
+                    // requiring it would reject the whole commit.
+                    if tx.worker_request_export(&bound_request_id)?.is_some() {
+                        tx.apply(&Effect::BindWorkerRequestExport {
+                            request_id: bound_request_id,
+                            process_identity: bound_identity.clone(),
+                        })?;
+                    }
                     Ok(Some(()))
                 }) {
                     Ok(Some(())) => self.report(

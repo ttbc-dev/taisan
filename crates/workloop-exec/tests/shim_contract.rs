@@ -301,6 +301,57 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     );
 }
 
+/// A lost CONTAINED launch leaves a writer running under the bwrap
+/// outer argv — the bare bound argv never reaches the process table.
+/// Re-binding must search the wrapped signature the launch actually
+/// exec'd, or the orphan is missed and the launch is later declared
+/// absent on directory occupancy alone.
+#[test]
+fn a_lost_contained_launch_rebinds_by_the_wrapped_signature() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("lost-contained");
+    let port = ScriptedProcessControl::new();
+    // Exactly the launch gate: the version probe plus the nine-probe
+    // battery. Every later probe — `describe` and the recovery pass's
+    // re-proof — falls through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    // Spawn happened; the response was lost — the process may exist.
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "timeout between spawn and response".into(),
+    });
+    let sup = Supervisor::new(port.clone(), root, vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-lost-contained",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-lost-contained");
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.poll_invocations(&store, NOW).unwrap();
+    sup.run_once(&store, NOW + 1).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "the lost start response never produces a second writer"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Running,
+        "the bwrap-wrapped orphan is found by the argv the spawn really exec'd"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert!(
+        invocation.process_identity.is_some(),
+        "the orphaned writer's identity is re-recorded"
+    );
+}
+
 #[test]
 fn an_unbound_export_holds_the_invocation_uncertain() {
     let store = SqliteStore::in_memory(1).unwrap();

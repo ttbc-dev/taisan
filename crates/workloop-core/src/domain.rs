@@ -925,6 +925,9 @@ pub struct FindingOccurrence {
     pub severity: Option<String>,
     pub position: Option<String>,
     pub thread_id: Option<String>,
+    /// The human-readable finding text from the sealed claim.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// An immutable, exact-set judgment over one sealed round.

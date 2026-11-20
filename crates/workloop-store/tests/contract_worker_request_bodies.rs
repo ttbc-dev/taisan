@@ -510,7 +510,7 @@ fn a_v10_store_gains_the_request_bodies_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11, "the upgrade lands on the current format");
+    assert_eq!(version, 12, "the upgrade lands on the current format");
     // The pre-upgrade request row survives and the new table accepts
     // its body on the upgraded file.
     assert!(
@@ -761,5 +761,52 @@ fn a_mismatched_request_id_member_reads_as_corrupt() {
         "the refusal names corruption: {err:?}"
     );
     drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression: a store stamped 11 before the `summary` column existed
+/// gains `finding_occurrences.summary` on open — the upgrade is
+/// additive, idempotent, and lands on the current format.
+#[test]
+fn a_v11_store_gains_the_occurrence_summary_column() {
+    let root = temp_root("upgrade-v11");
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE finding_occurrences DROP COLUMN summary; \
+             PRAGMA user_version=11;",
+        )
+        .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('finding_occurrences') \
+                 WHERE name='summary')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real pre-summary v11 store");
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v11 store upgrades in place");
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 12, "the upgrade lands on the current format");
+    // The occurrences read the column the upgrade restored — it would
+    // have failed `no such column: summary` before the bump.
+    assert!(
+        store
+            .transact(|tx| tx.occurrences("no-such-round"))
+            .unwrap()
+            .is_empty(),
+        "the upgraded file answers occurrence reads"
+    );
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    let _ = SqliteStore::open(&db, 1).unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }

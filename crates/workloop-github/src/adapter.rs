@@ -2664,6 +2664,7 @@ fn review_occurrences(
             severity: None,
             position: None,
             thread_id: None,
+            summary: Some(finding.body.clone()),
         })
         .chain(
             reviews
@@ -2678,6 +2679,7 @@ fn review_occurrences(
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: Some(review.body.clone()),
                 }),
         )
         .collect();

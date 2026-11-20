@@ -400,6 +400,13 @@ pub struct OccurrenceInput {
     pub position: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The human-readable finding text the claim carried — what the
+    /// reviewer found, so operators and Fix workers read the sealed
+    /// evidence rather than only its key. Absent on facts recorded
+    /// before the field existed and on adapter-minted occurrences
+    /// that carry no prose.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

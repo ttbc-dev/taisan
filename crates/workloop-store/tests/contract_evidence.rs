@@ -228,6 +228,7 @@ fn round(round_id: &str, work_id: &str, head: &str, occurrences: &[&str]) -> Eff
                 severity: Some("warn".into()),
                 position: None,
                 thread_id: None,
+                summary: None,
             })
             .collect(),
     }
