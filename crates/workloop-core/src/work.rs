@@ -2530,8 +2530,12 @@ fn capability_state(
     host: &crate::identity::HostInstanceId,
     capability: &HostCapability,
 ) -> Result<Option<crate::observation::CapabilityEntry>, StoreError> {
-    let mut latest: Option<(i64, usize, crate::observation::CapabilityEntry)> = None;
-    for (index, o) in tx.all_observations()?.iter().enumerate() {
+    // The newest report is the host's complete declaration: a
+    // capability absent from it is revoked — falling back to an older
+    // report's entry would keep a withdrawn grant usable.
+    let observations = tx.all_observations()?;
+    let mut latest_report: Option<(i64, usize, &Vec<crate::observation::CapabilityEntry>)> = None;
+    for (index, o) in observations.iter().enumerate() {
         if let ObservationFact::CapabilityReport {
             host: report_host,
             capabilities,
@@ -2542,23 +2546,18 @@ fn capability_state(
             && canonical_host_instance(report_host.as_str())
                 == canonical_host_instance(host.as_str())
         {
-            for entry in capabilities {
-                if &entry.capability == capability {
-                    let key = (o.observed_unix_seconds, index, entry.clone());
-                    latest = Some(match latest {
-                        Some(old)
-                            if old.0 > o.observed_unix_seconds
-                                || (old.0 == o.observed_unix_seconds && old.1 > index) =>
-                        {
-                            old
-                        }
-                        _ => key,
-                    });
-                }
+            let key = (o.observed_unix_seconds, index);
+            if latest_report.is_none_or(|old| key > (old.0, old.1)) {
+                latest_report = Some((key.0, key.1, capabilities));
             }
         }
     }
-    Ok(latest.map(|(_, _, e)| e))
+    Ok(latest_report.and_then(|(_, _, capabilities)| {
+        capabilities
+            .iter()
+            .find(|entry| &entry.capability == capability)
+            .cloned()
+    }))
 }
 
 /// What happened to an ingested Observation.

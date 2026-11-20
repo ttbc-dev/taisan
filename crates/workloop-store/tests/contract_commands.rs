@@ -4862,6 +4862,109 @@ fn an_endpoint_spelled_capability_report_still_authorizes() {
     );
 }
 
+/// Regression: the newest capability report is the host's complete
+/// declaration — a capability omitted from it is revoked, so an older
+/// report's `Authorized` entry must not keep authorizing the effect.
+#[test]
+fn a_capability_omitted_from_the_latest_report_is_revoked() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config(), &submit("pc-revoke"), NOW).unwrap(),
+    );
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "pc-revoke-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "pc-revoke-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "pc-revoke-check"),
+            },
+        ],
+    );
+    let report = |capabilities: Vec<CapabilityEntry>, at: i64| Observation {
+        delivery: None,
+        subject_work_id: Some(w.clone()),
+        subject_execution_id: Some(e1.clone()),
+        fact: ObservationFact::CapabilityReport {
+            host: HostInstanceId::trusted("https://test-host"),
+            capabilities,
+        },
+        observed_unix_seconds: at,
+    };
+    let entry = |capability: HostCapability| CapabilityEntry {
+        capability,
+        support: CapabilityState::Supported,
+        authorization: CapabilityState::Authorized,
+    };
+    // The older report authorized both capabilities; the newer one —
+    // the operator removed `push_ref` from the declared set — omits
+    // it. Omission is revocation: the stale grant must not hold.
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &report(
+            vec![
+                entry(HostCapability::PushRef),
+                entry(HostCapability::ChangeRequestCreate),
+            ],
+            NOW,
+        ),
+        NOW,
+    )
+    .unwrap();
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &report(vec![entry(HostCapability::ChangeRequestCreate)], NOW + 10),
+        NOW + 10,
+    )
+    .unwrap();
+    workloop_core::work::handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: invocation.id.clone(),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Present {
+                    digest: "artifact-digest".into(),
+                },
+            },
+            observed_unix_seconds: NOW + 20,
+        },
+        NOW + 20,
+    )
+    .unwrap();
+    let pushes = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .filter(|i| matches!(i.action, HostAction::PushRef { .. }))
+                .count())
+        })
+        .unwrap();
+    assert_eq!(
+        pushes, 0,
+        "the revoked push_ref capability never authorizes an intent"
+    );
+}
+
 /// Regression: an intent row persisted under a raw endpoint spelling
 /// reads back with the canonical host-instance identity — rows written
 /// before host unification keep matching the bound adapter.
