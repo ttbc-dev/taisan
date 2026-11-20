@@ -445,7 +445,7 @@ fn retain_issue_snapshots(
     if snapshots.is_empty() {
         return Ok(());
     }
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     let horizon = CategoryLimits::documented_default(CAS_CATEGORY)
         .and_then(|limits| limits.max_age)
         .map(|max_age| now_unix_seconds.saturating_add(max_age));
@@ -1849,6 +1849,58 @@ mod tests {
         );
     }
 
+    /// Catalogue paths are installation-relative — a managed body
+    /// records a `bodies/…` path under the state root — and the sweep
+    /// resolves them under the same state root. An eligible body loses
+    /// both its bytes and its `present` state; a mismatched resolution
+    /// root would mark the row `reclaimed` as `missing` while the real
+    /// file survives.
+    #[test]
+    fn the_retention_sweep_reclaims_an_eligible_body_under_the_bodies_root() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let settings = settings();
+        let state_root = pass_state_root();
+        let rel = "bodies/issue-snapshot/eligible";
+        let file = state_root.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"snapshot").unwrap();
+        store
+            .register_body(&workloop_store::retention::CatalogBody {
+                body_id: "snap-1".into(),
+                category: "cas".into(),
+                path: rel.into(),
+                bytes: 8,
+                registered_unix_seconds: NOW - 100,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+
+        let mut host = FixtureGithub::new();
+        let report = run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: state_root.as_path(),
+            },
+            None,
+            &mut || NOW,
+            &|| false,
+        );
+
+        let retention = &report.phases[6];
+        assert_eq!(retention.phase, "retention_sweep");
+        assert_eq!(retention.status, "completed");
+        assert!(!file.exists(), "the sweep deletes the body file: {file:?}");
+        let (state, reason, _) = store.body_state("snap-1").unwrap().unwrap();
+        assert_eq!(state, "reclaimed");
+        assert_eq!(reason.as_deref(), Some("age_expired"));
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
     /// Attention derivation always runs and never consults the deadline
     /// itself. The closing clock read must surface a pass that crossed
     /// the deadline while deriving Attention.
@@ -2215,7 +2267,7 @@ mod tests {
         assert_eq!(entry.state, "present");
         assert_eq!(entry.category, CAS_CATEGORY);
         // The file under the CAS root resolves to verified bytes.
-        let bodies = BodyStore::new(state_root.join("bodies"));
+        let bodies = BodyStore::new(state_root.clone());
         let resolved = bodies
             .resolve_at(&store, CAS_CATEGORY, &path)
             .unwrap()

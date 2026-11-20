@@ -9,8 +9,9 @@
 //! Two identity shapes coexist:
 //!
 //! - **Content-addressed** — `retain` stores bytes at
-//!   `bodies/<content_id>`; the catalogue `body_id` and `path` are the
-//!   same digest, so the file location *is* the integrity check.
+//!   `bodies/<content_id>`; the catalogue `body_id` is the digest and
+//!   the path the same digest's `bodies/` location, so the file
+//!   location *is* the integrity check.
 //! - **Lookup-addressed** — `retain_at` stores bytes at a deterministic
 //!   catalogue path (issue snapshots resolve by the spec-bound
 //!   `(issue, source_revision, content_digest)` identity) while
@@ -118,8 +119,10 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<(), BodyError> {
         .map_err(|e| BodyError::Fault(format!("sync dir {}: {e}", dir.display())))
 }
 
-/// The CAS root: `<root>/<path>` files plus the catalogue rows that
-/// describe them. One instance per installation state root.
+/// The installation state root: catalogue paths resolve under it —
+/// the same rule the retention sweep enforces — so a managed body
+/// records a `bodies/…` path and its file lives at
+/// `<state_root>/bodies/…`. One instance per installation state root.
 #[derive(Debug, Clone)]
 pub struct BodyStore {
     root: PathBuf,
@@ -135,9 +138,10 @@ impl BodyStore {
     }
 
     /// The managed file location for a catalogue `path` entry. The
-    /// recorded path must be relative, contain no `..`/root components,
-    /// and resolve inside the root — the same rule the retention sweep
-    /// enforces, so a row the sweep would refuse is never read either.
+    /// recorded path is installation-relative: no `..`/root components,
+    /// resolved inside the state root — the same rule the retention
+    /// sweep enforces, so a row the sweep would refuse is never read
+    /// either.
     fn managed(&self, recorded: &str) -> Result<PathBuf, BodyError> {
         use std::path::Component;
         let raw = Path::new(recorded);
@@ -278,15 +282,16 @@ impl BodyStore {
         self.write_at(
             catalog,
             category,
-            &id,
+            &format!("bodies/{id}"),
             bytes,
             now_unix_seconds,
             eligible_after_unix_seconds,
         )
     }
 
-    /// Retain `bytes` at a deterministic lookup `path` (e.g. an issue
-    /// snapshot's spec-bound identity path). The catalogue `body_id`
+    /// Retain `bytes` at a deterministic installation-relative lookup
+    /// `path` (e.g. an issue snapshot's spec-bound `bodies/…` identity
+    /// path). The catalogue `body_id`
     /// remains the content digest, so [`Self::resolve`] verifies the
     /// bytes identically; [`Self::resolve_at`] finds the row by path.
     /// `eligible_after_unix_seconds` follows [`Self::retain`].
@@ -570,7 +575,7 @@ mod tests {
             .retain_at(
                 &catalog,
                 CAS_CATEGORY,
-                "issue-snapshot/abc",
+                "bodies/issue-snapshot/abc",
                 &bytes,
                 100,
                 None,
@@ -579,7 +584,7 @@ mod tests {
         assert_eq!(id, content_id(&bytes));
         // Path lookup finds the same verified body.
         let resolved = store
-            .resolve_at(&catalog, CAS_CATEGORY, "issue-snapshot/abc")
+            .resolve_at(&catalog, CAS_CATEGORY, "bodies/issue-snapshot/abc")
             .expect("resolve_at")
             .expect("present");
         assert_eq!(resolved.body_id, id);
@@ -592,7 +597,7 @@ mod tests {
                 .retain_at(
                     &catalog,
                     CAS_CATEGORY,
-                    "issue-snapshot/def",
+                    "bodies/issue-snapshot/def",
                     &bytes,
                     100,
                     None
@@ -604,7 +609,7 @@ mod tests {
             store.retain_at(
                 &catalog,
                 CAS_CATEGORY,
-                "issue-snapshot/abc",
+                "bodies/issue-snapshot/abc",
                 b"other",
                 100,
                 None
@@ -641,7 +646,7 @@ mod tests {
         let id = store
             .retain(&catalog, CAS_CATEGORY, b"good", 100, None)
             .unwrap();
-        std::fs::write(root.join(&id), b"tampered").unwrap();
+        std::fs::write(root.join("bodies").join(&id), b"tampered").unwrap();
         assert!(matches!(
             store.resolve(&catalog, &id),
             Err(BodyError::Corrupt { .. }) | Err(BodyError::Fault(_))

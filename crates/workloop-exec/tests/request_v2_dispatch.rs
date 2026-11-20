@@ -279,7 +279,7 @@ fn retained_issue_source(
         body,
         digest,
     );
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     bodies
         .retain_at(
             store,
@@ -295,7 +295,7 @@ fn retained_issue_source(
 
 fn dispatch_profile(state_root: &Path, src: &Path) -> V2Dispatch {
     V2Dispatch {
-        bodies: BodyStore::new(state_root.join("bodies")),
+        bodies: BodyStore::new(state_root.to_path_buf()),
         sources: vec![RepositorySource {
             repository: repo(),
             path: src.to_path_buf(),
@@ -939,7 +939,7 @@ fn a_snapshot_disagreeing_with_the_spec_is_stale_never_dispatched() {
         "body",
         "digest-5",
     );
-    BodyStore::new(state_root.join("bodies"))
+    BodyStore::new(state_root.to_path_buf())
         .retain_at(
             &store,
             CAS_CATEGORY,
@@ -971,7 +971,7 @@ fn a_corrupt_snapshot_file_is_body_corrupt_never_partial_input() {
     let (source, snapshot) = retained_issue_source(&store, &state_root, 6, "rev-6", "t", "b");
     // Tamper with the retained bytes behind the catalogue's back: the
     // row still says `present`, the file no longer recomputes.
-    let file = state_root.join("bodies").join(snapshot.retained_path());
+    let file = state_root.join(snapshot.retained_path());
     std::fs::write(&file, b"tampered").unwrap();
     let (w, _e, rid) = admit(&store, "v2-corrupt", vec![source]);
     let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
@@ -1677,7 +1677,7 @@ fn a_leftover_io_tree_from_a_crashed_attempt_is_rebuilt_never_trusted() {
     let TaskBody::Coding { goal, .. } = &wire.task else {
         panic!("expected coding task")
     };
-    let resolved = BodyStore::new(state_root.join("bodies"))
+    let resolved = BodyStore::new(state_root.to_path_buf())
         .resolve_at(store.body_catalog(), CAS_CATEGORY, &goal.body_ref)
         .unwrap()
         .expect("goal body resolves");

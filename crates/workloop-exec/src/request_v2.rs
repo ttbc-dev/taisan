@@ -81,8 +81,9 @@ pub struct InvariantSetConfig {
 /// requires.
 #[derive(Debug, Clone)]
 pub struct V2Dispatch {
-    /// The content-addressed retained-body store
-    /// (`<state_root>/bodies`).
+    /// The content-addressed retained-body store rooted at the
+    /// installation state root — managed bodies record `bodies/…`
+    /// catalogue paths.
     pub bodies: BodyStore,
     /// Local repository sources matched by the Work's recorded
     /// repository binding — the supervisor-side read path for base
@@ -375,7 +376,7 @@ fn retain_derived(
             detail: format!("retained {prefix} body is {} bytes", bytes.len()),
         }));
     }
-    let path = format!("{prefix}/{digest}");
+    let path = format!("bodies/{prefix}/{digest}");
     bodies
         .retain_at(
             catalog,
@@ -599,7 +600,7 @@ pub fn build_request_body(
             }));
         }
         Some(GoalRef {
-            body_ref: format!("goal/{goal_digest}"),
+            body_ref: format!("bodies/goal/{goal_digest}"),
             media_type: "text/markdown".into(),
             bytes: resolved.bytes.len() as u64,
             digest: goal_digest,
@@ -1265,7 +1266,7 @@ pub fn materialize_invocation_io(
             // freezes the identities. Nothing to materialize.
         }
         TaskBody::InvariantCheck { invariant_set, .. } => {
-            let path = format!("invariant-set/{}", invariant_set.digest);
+            let path = format!("bodies/invariant-set/{}", invariant_set.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,
@@ -1298,7 +1299,7 @@ pub fn materialize_invocation_io(
                 .map_err(|e| mat_fault(e.to_string()))?;
         }
         TaskBody::CodeReview { review_source, .. } => {
-            let path = format!("review-source/{}", review_source.digest);
+            let path = format!("bodies/review-source/{}", review_source.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,
@@ -1332,7 +1333,7 @@ pub fn materialize_invocation_io(
         && let FixOrigin::Prepublication { failed_evidence } = origin.as_ref()
     {
         for (index, evidence) in failed_evidence.iter().enumerate() {
-            let path = format!("failed-evidence/{}", evidence.digest);
+            let path = format!("bodies/failed-evidence/{}", evidence.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,

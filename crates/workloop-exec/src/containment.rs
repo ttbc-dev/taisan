@@ -578,7 +578,14 @@ fn run_named_probe(
                 if trimmed.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", &trimmed[..trimmed.len().min(200)])
+                    // The 200-byte detail bound lands on a char
+                    // boundary — a lossy-rendered probe output can
+                    // carry multi-byte characters there.
+                    let mut end = trimmed.len().min(200);
+                    while !trimmed.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!(": {}", &trimmed[..end])
                 }
             }),
         ),
