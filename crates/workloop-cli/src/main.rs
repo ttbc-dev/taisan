@@ -1991,6 +1991,11 @@ fn build_supervisor(
     installation: &Installation,
     state_root: &std::path::Path,
 ) -> Result<Option<Supervisor<PosixProcessControl>>, String> {
+    // The dispatch section validates before the absent-worker answer:
+    // a configured `worker_dispatch` without `worker_argv` is
+    // incomplete configuration and must refuse, not start with no
+    // supervisor while the operator's v2 selection is ignored.
+    let worker_dispatch = installation.worker_dispatch()?;
     if installation.worker_argv.is_empty() {
         return Ok(None);
     }
@@ -2081,7 +2086,7 @@ fn build_supervisor(
     // bound repository only; verification egress hosts are the
     // installation allowlist every request declares. Absent section:
     // the recorded v1 argv-only launch is unchanged.
-    let supervisor = match installation.worker_dispatch()? {
+    let supervisor = match worker_dispatch {
         Some(profile) => {
             let dispatch = workloop_exec::request_v2::V2Dispatch {
                 bodies: workloop_exec::bodies::BodyStore::new(state_root.join("bodies")),
@@ -2515,6 +2520,28 @@ mod tests {
             .unwrap()
             .expect("worker_argv configured");
         assert!(supervisor.v2.is_none(), "no profile, no v2 dispatch");
+
+        // A configured section with no `worker_argv` is incomplete
+        // configuration: it refuses at composition rather than
+        // starting with no supervisor while the v2 selection is
+        // silently ignored.
+        installation.worker_argv = vec![];
+        installation.worker_dispatch = Some(workloop_config::WorkerDispatchSection {
+            source_path: "/srv/bound-repo".into(),
+            budget: workloop_config::WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set: None,
+            capabilities: vec![],
+        });
+        let err = build_supervisor(&config(), &installation, &state_root)
+            .err()
+            .expect("a dispatch section without worker_argv refuses");
+        assert!(err.contains("worker_argv"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
