@@ -127,6 +127,28 @@ pub enum ObservationFact {
         /// file is gone where evidence was accepted).
         observed_report: Option<WorkerReportEvidence>,
     },
+    /// The supervisor's verdict on one retained Worker `claimed_head`
+    /// checked against an acknowledged handoff's `produced` commit
+    /// (`docs/v0.3.md` §6.3). The claim stays evidence: `agrees`
+    /// records whether the claim named the commit the handoff
+    /// actually promoted, and a `false` verdict never moves,
+    /// replaces, or blocks the artifact — the acknowledged ref plus
+    /// supervisor-run verification on that exact commit remain the
+    /// only authority.
+    ClaimedHeadCheck {
+        invocation_id: InvocationId,
+        /// The artifact whose `produced` commit was compared — one
+        /// Invocation may hand off several required artifacts, each
+        /// with its own promoted commit.
+        artifact_id: String,
+        /// The commit the Worker claimed (always present — a report
+        /// carrying no `claimed_head` records no verdict at all).
+        claimed: String,
+        /// The commit the acknowledged handoff promoted.
+        produced: String,
+        /// `claimed == produced`.
+        agrees: bool,
+    },
     /// An authoritative read of a source issue. Drives the source gate:
     /// compared against the approved spec snapshot, never trusted by
     /// position or timestamp alone.

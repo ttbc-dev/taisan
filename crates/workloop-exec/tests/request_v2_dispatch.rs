@@ -190,6 +190,17 @@ fn admit(
     key: &str,
     sources: Vec<SourceSnapshot>,
 ) -> (WorkId, ExecutionId, String) {
+    admit_ex(store, key, sources, vec![])
+}
+
+/// `admit` with caller-declared `verification_argv` — the spec payload
+/// the handoff's independent checks read.
+fn admit_ex(
+    store: &SqliteStore,
+    key: &str,
+    sources: Vec<SourceSnapshot>,
+    verification_argv: Vec<Vec<String>>,
+) -> (WorkId, ExecutionId, String) {
     let cfg = config();
     let d = handle_command(
         store,
@@ -202,7 +213,7 @@ fn admit(
                 intent: format!("intent-{key}"),
                 sources,
                 constraints: vec![],
-                verification_argv: vec![],
+                verification_argv,
             },
         },
         NOW,
@@ -2672,4 +2683,561 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
     // Let the pass finish the Invocation; the automatic collection at
     // the proven stop sees the same conflict and dedupes against it.
     drive_to_done(&sup, &store, &rid);
+}
+
+// === Produced-commit handoff and independent verification
+// (docs/v0.3.md §6.3) ==============================================
+
+/// The managed workspace directory for one Work — where the worker's
+/// commits live before handoff exports them.
+fn managed_workspace(root: &Path, work_id: &WorkId) -> PathBuf {
+    root.join("ws").join(format!("ws-{}", work_id.0))
+}
+
+/// The durable handoff row for `<invocation>/artifact.json`.
+fn handoff_row(store: &SqliteStore, invocation_id: &InvocationId) -> ArtifactHandoff {
+    store
+        .transact(|tx| tx.artifact_handoff(&format!("{}/artifact.json", invocation_id.0)))
+        .unwrap()
+        .expect("handoff row recorded")
+}
+
+/// The `ClaimedHeadCheck` facts recorded against one Execution.
+fn claim_facts(store: &SqliteStore, execution_id: &ExecutionId) -> Vec<ObservationFact> {
+    store
+        .transact(|tx| tx.observations_for_execution(execution_id))
+        .unwrap()
+        .into_iter()
+        .map(|o| o.fact)
+        .filter(|f| matches!(f, ObservationFact::ClaimedHeadCheck { .. }))
+        .collect()
+}
+
+/// Drive only the poll phase until the Invocation resolves `Done` —
+/// no handoff pass runs, so a test can mutate the workspace in the
+/// gap between stop-proof and export exactly like a crashed or
+/// adversarial interleaving would.
+fn poll_to_done(sup: &Supervisor<PosixProcessControl>, store: &SqliteStore, rid: &str) {
+    for _ in 0..100 {
+        sup.poll_invocations(store, NOW).unwrap();
+        if invocation_state(store, rid) == Some(InvocationState::Done) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("invocation {rid} did not resolve Done");
+}
+
+/// A v2 Coding dispatch whose fixture commits its artifact on the
+/// managed branch hands the produced commit through the durable
+/// export → quarantine-import → acknowledge path: the acknowledged
+/// ref resolves exactly that commit, the recorded base is the
+/// request's pinned fork point (never a workspace ref), and the
+/// manifest binds the exact `base..produced` object set.
+#[test]
+fn a_v2_coding_invocation_hands_off_the_produced_commit() {
+    let root = tmp_root("handoff-ok");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-handoff-ok", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let produced = row.produced.clone().expect("produced recorded");
+    assert!(row.manifest_digest.is_some(), "manifest bound");
+
+    // The produced commit is exactly the managed branch's head — the
+    // commit the worker made — and it descends from the pinned base.
+    let ws = managed_workspace(&root, &w);
+    let head = git(&ws, &["rev-parse", &format!("work/{}", w.0)]);
+    assert_eq!(produced, head);
+    assert_eq!(row.base, newer, "the base is the request's pin");
+    git(&ws, &["merge-base", "--is-ancestor", &newer, &produced]);
+
+    // Promote once: the acknowledged ref in the installation handoff
+    // repository resolves the produced commit, the exact change
+    // objects are present, and the row is terminal — a repeated
+    // drive is a no-op.
+    let lay = layout(&root);
+    assert_eq!(
+        git(
+            &lay.repository,
+            &["rev-parse", "--verify", &artifact_ref(&row.artifact_id)]
+        ),
+        produced
+    );
+    let changes = git(
+        &lay.repository,
+        &["rev-list", "--objects", &format!("{newer}..{produced}")],
+    );
+    assert!(
+        changes.lines().any(|l| l.starts_with(&produced)),
+        "the produced commit is in the promoted object set: {changes}"
+    );
+    assert!(workloop_exec::handoff::reclaimable(&lay, &row));
+    sup.drive_handoffs(&store).unwrap();
+    let again = handoff_row(&store, &inv.id);
+    assert_eq!(again.produced, Some(produced));
+    assert_eq!(again.state, HandoffState::Acknowledged);
+}
+
+/// A `claimed_head` naming the commit the handoff promoted is
+/// recorded as an agreeing verdict — evidence that survives beside
+/// the artifact, changing nothing about it.
+#[test]
+fn a_claimed_head_matching_the_produced_commit_records_agreement() {
+    let root = tmp_root("claim-agree");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, e, rid) = admit(&store, "v2-claim-agree", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit", "--claim-head", "HEAD"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let facts = claim_facts(&store, &e);
+    assert_eq!(facts.len(), 1, "one verdict fact: {facts:?}");
+    let ObservationFact::ClaimedHeadCheck {
+        claimed,
+        produced,
+        agrees,
+        ..
+    } = &facts[0]
+    else {
+        unreachable!()
+    };
+    assert!(agrees, "the claim named the promoted commit");
+    assert_eq!(claimed, produced);
+    // The verdict carries no authority either way: material progress
+    // and failure classification stay empty for it.
+    assert_eq!(material_progress_basis(&facts[0]), None);
+    assert_eq!(classify_failure(&facts[0]), None);
+}
+
+/// A `claimed_head` naming a different commit — here the produced
+/// commit's own parent — is retained as a disagreeing verdict and
+/// never adopted: the handoff still promotes the real produced
+/// commit and the ref resolves it, not the claim.
+#[test]
+fn a_claimed_head_disagreeing_with_produced_is_retained_never_adopted() {
+    let root = tmp_root("claim-differ");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-claim-differ", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit", "--claim-head", "HEAD^"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let produced = row.produced.clone().unwrap();
+
+    let facts = claim_facts(&store, &e);
+    assert_eq!(facts.len(), 1, "one verdict fact: {facts:?}");
+    let ObservationFact::ClaimedHeadCheck {
+        claimed,
+        produced: checked,
+        agrees,
+        artifact_id,
+        ..
+    } = &facts[0]
+    else {
+        unreachable!()
+    };
+    assert!(
+        !agrees,
+        "the claim named the parent, not the produced commit"
+    );
+    assert_eq!(claimed, &newer, "HEAD^ resolved to the base commit");
+    assert_eq!(checked, &produced);
+    assert_eq!(artifact_id, &row.artifact_id);
+
+    // The disagreement moved nothing: the acknowledged ref still
+    // resolves the real produced commit.
+    let lay = layout(&root);
+    assert_eq!(
+        git(
+            &lay.repository,
+            &["rev-parse", "--verify", &artifact_ref(&row.artifact_id)]
+        ),
+        produced
+    );
+    let _ = w;
+}
+
+/// A produced commit on foreign root history — with a worker-planted
+/// `aaa-decoy` branch that a *derived* base would prefer over
+/// `taisan-base` — is `stale_base` invalid: the pinned request base
+/// bounds ancestry, never a ref the Worker controls.
+#[test]
+fn a_produced_commit_not_descending_from_the_pinned_base_is_invalid() {
+    let root = tmp_root("handoff-stale");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-handoff-stale", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    poll_to_done(&sup, &store, &rid);
+
+    // After the proven stop but before any handoff pass, rewrite the
+    // managed branch onto foreign root history and plant a decoy ref
+    // sorting before `taisan-base` — exactly what `derive_base`
+    // would have bounded against.
+    let ws = managed_workspace(&root, &w);
+    let tree = git(&ws, &["rev-parse", "HEAD^{tree}"]);
+    let foreign_root = git(
+        &ws,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit-tree",
+            &tree,
+            "-m",
+            "foreign root",
+        ],
+    );
+    let foreign_work = git(
+        &ws,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit-tree",
+            &tree,
+            "-p",
+            &foreign_root,
+            "-m",
+            "foreign work",
+        ],
+    );
+    git(&ws, &["branch", "aaa-decoy", &foreign_root]);
+    git(
+        &ws,
+        &[
+            "update-ref",
+            &format!("refs/heads/work/{}", w.0),
+            &foreign_work,
+        ],
+    );
+
+    sup.drive_handoffs(&store).unwrap();
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Invalid, "{row:?}");
+    assert_eq!(row.invalid_reason.as_deref(), Some("stale_base"));
+    assert_eq!(row.base, newer, "the recorded base stayed the pin");
+    assert!(row.produced.is_none(), "nothing was promoted");
+}
+
+/// A produced revision that cannot be resolved at export time — the
+/// managed branch is gone by the time the handoff pass runs — is a
+/// transport loss charged to the recovery bound, never a promoted
+/// artifact: the row settles `recovery_exhausted` with no produced
+/// commit and no ref ever written into the installation handoff
+/// repository.
+#[test]
+fn an_unresolvable_produced_commit_fails_closed_never_promotes() {
+    let root = tmp_root("handoff-missing");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-handoff-missing", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    poll_to_done(&sup, &store, &rid);
+
+    // The writer is proven stopped; before any handoff pass the
+    // produced revision disappears — `rev-parse --verify` can no
+    // longer resolve it.
+    let ws = managed_workspace(&root, &w);
+    git(
+        &ws,
+        &["update-ref", "-d", &format!("refs/heads/work/{}", w.0)],
+    );
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    for _ in 0..8 {
+        sup.drive_handoffs(&store).unwrap();
+        if handoff_row(&store, &inv.id).state == HandoffState::Invalid {
+            break;
+        }
+    }
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Invalid, "{row:?}");
+    assert_eq!(row.invalid_reason.as_deref(), Some("recovery_exhausted"));
+    assert!(row.produced.is_none(), "nothing was promoted");
+
+    // No artifact ref was ever written into the installation
+    // repository.
+    let lay = layout(&root);
+    let refs = git(&lay.repository, &["for-each-ref", "refs/taisan/artifacts"]);
+    assert!(refs.is_empty(), "no artifact ref: {refs}");
+}
+
+/// A handoff row interrupted at `export_started` — the durable state
+/// a crash between row creation and bundle write leaves — resumes on
+/// the next pass from its committed stage and identity: one row, one
+/// produced commit, acknowledged once.
+#[test]
+fn an_interrupted_v2_handoff_resumes_from_its_durable_stage() {
+    let root = tmp_root("handoff-resume");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-handoff-resume", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    poll_to_done(&sup, &store, &rid);
+
+    // Crash residue: the row exists at its first durable stage with
+    // the pinned base already recorded — no bundle, no produced.
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let aid = format!("{}/artifact.json", inv.id.0);
+    let mut residue = ArtifactHandoff {
+        artifact_id: aid.clone(),
+        invocation_id: inv.id.clone(),
+        request_id: inv.request_id.clone(),
+        work_id: w.clone(),
+        execution_id: e.clone(),
+        base: newer.clone(),
+        produced: None,
+        manifest_digest: None,
+        state: HandoffState::ExportStarted,
+        invalid_reason: None,
+        attempt: 0,
+        recorded_seq: 0,
+    };
+    store
+        .transact(|tx| {
+            residue.recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: residue.clone(),
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    sup.drive_handoffs(&store).unwrap();
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let ws = managed_workspace(&root, &w);
+    assert_eq!(
+        row.produced.as_deref(),
+        Some(git(&ws, &["rev-parse", &format!("work/{}", w.0)]).as_str())
+    );
+}
+
+/// Mutating the managed branch after acknowledgement cannot move the
+/// artifact: the ref still resolves the produced commit, the row is
+/// unchanged, and the workspace stays reclaimable — post-run writes
+/// are WIP evidence at most, never artifact motion.
+#[test]
+fn a_post_acknowledgement_workspace_mutation_cannot_move_the_artifact() {
+    let root = tmp_root("handoff-postmut");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-handoff-postmut", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let produced = row.produced.clone().unwrap();
+
+    // A later commit lands on the managed branch — the artifact does
+    // not follow it.
+    let ws = managed_workspace(&root, &w);
+    git(
+        &ws,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "post-ack mutation",
+        ],
+    );
+    let moved = git(&ws, &["rev-parse", &format!("work/{}", w.0)]);
+    assert_ne!(moved, produced, "the branch really moved");
+
+    sup.drive_handoffs(&store).unwrap();
+    let again = handoff_row(&store, &inv.id);
+    assert_eq!(again.state, HandoffState::Acknowledged);
+    assert_eq!(again.produced.as_deref(), Some(produced.as_str()));
+    let lay = layout(&root);
+    assert_eq!(
+        git(
+            &lay.repository,
+            &["rev-parse", "--verify", &artifact_ref(&row.artifact_id)]
+        ),
+        produced
+    );
+    assert!(workloop_exec::handoff::reclaimable(&lay, &again));
+}
+
+/// Declared verification argv runs on a clean detached worktree of
+/// the exact produced commit in the installation handoff repository:
+/// exit-0 with empty output is a legitimate Pass, non-zero is Fail,
+/// a >64KiB writer proves the v2 8 MiB output bound (the recorded v1
+/// 64 KiB cap would have truncated it), and a command outliving its
+/// bound is Inconclusive — never a pass.
+#[test]
+fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
+    let root = tmp_root("verify-v2");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let argv: Vec<Vec<String>> = [
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "git rev-parse HEAD".to_string(),
+        ],
+        vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+        vec!["sh".to_string(), "-c".to_string(), "false".to_string()],
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "head -c 200000 /dev/zero | tr '\\0' 'x'; echo tail-marker".to_string(),
+        ],
+    ]
+    .to_vec();
+    let (_w, _e, rid) = admit_ex(&store, "v2-verify", vec![], argv.clone());
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let produced = row.produced.clone().unwrap();
+    let results = store
+        .transact(|tx| tx.verification_results(&row.artifact_id))
+        .unwrap();
+    assert_eq!(
+        results.len(),
+        4,
+        "every declared argv recorded: {results:?}"
+    );
+    let by_req: std::collections::HashMap<_, _> =
+        results.iter().map(|r| (r.requirement.clone(), r)).collect();
+
+    // The check ran inside a detached worktree at the exact produced
+    // commit — `git rev-parse HEAD` there names it.
+    let head_check = by_req["verification_argv[0]"];
+    assert_eq!(head_check.result, VerificationOutcome::Pass);
+    assert_eq!(head_check.produced, produced);
+    assert_eq!(head_check.output.trim(), produced);
+    assert_eq!(head_check.argv, argv[0]);
+
+    // Empty legitimate output is a Pass, recorded verbatim.
+    let empty = by_req["verification_argv[1]"];
+    assert_eq!(empty.result, VerificationOutcome::Pass);
+    assert!(empty.output.is_empty(), "empty output stays empty");
+
+    // A failing check is Fail — evidence, not a retry.
+    let failed = by_req["verification_argv[2]"];
+    assert_eq!(failed.result, VerificationOutcome::Fail);
+
+    // ~200 KiB of output exceeds the recorded v1 64 KiB cap: the v2
+    // 8 MiB bound retained the whole tail.
+    let loud = by_req["verification_argv[3]"];
+    assert_eq!(loud.result, VerificationOutcome::Pass);
+    assert!(
+        loud.output.len() > 64 * 1024,
+        "v2 bound retained past the v1 cap: {}",
+        loud.output.len()
+    );
+    assert!(loud.output.len() <= 8 * 1024 * 1024);
+    assert!(loud.output.contains("tail-marker"));
+
+    // A command outliving its bound is Inconclusive — the injected
+    // short timeout stands in for the profile's; timeout can never
+    // pass.
+    let lay = layout(&root);
+    let scratch = root.join("verify-scratch");
+    let timed_out = workloop_exec::handoff::verify_with_timeout(
+        &store,
+        &lay,
+        &row.artifact_id,
+        "verification_argv[9]",
+        &["sh".into(), "-c".into(), "sleep 30".into()],
+        &scratch,
+        Duration::from_millis(300),
+        64 * 1024,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);
+    assert!(timed_out.output.contains("exceeded"));
 }

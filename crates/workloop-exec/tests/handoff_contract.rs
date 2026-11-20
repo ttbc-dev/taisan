@@ -1011,6 +1011,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &["sh".into(), "-c".into(), "sleep 5".into()],
         &scratch,
         Duration::from_millis(200),
+        64 * 1024,
         &[],
     )
     .unwrap();
@@ -1025,6 +1026,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &["sh".into(), "-c".into(), "kill -9 $$".into()],
         &scratch,
         Duration::from_secs(10),
+        64 * 1024,
         &[],
     )
     .unwrap();
@@ -1040,6 +1042,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &[],
         &scratch,
         Duration::from_secs(10),
+        64 * 1024,
         &[],
     )
     .unwrap();
@@ -1059,6 +1062,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         ],
         &scratch,
         Duration::from_secs(30),
+        64 * 1024,
         &[],
     )
     .unwrap();
@@ -1089,6 +1093,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         ],
         &scratch,
         Duration::from_millis(200),
+        64 * 1024,
         &[],
     )
     .unwrap();

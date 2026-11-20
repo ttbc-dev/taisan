@@ -716,9 +716,21 @@ pub fn reclaimable(layout: &HandoffLayout, handoff: &ArtifactHandoff) -> bool {
     .unwrap_or(false)
 }
 
-/// Wall-clock bound for one verification command (docs/worker-protocol:
-/// the runner is bounded by its own per-command timeout).
-const VERIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+/// Wall-clock bound for one verification command under the recorded
+/// v1 hygiene-only profile (docs/worker-protocol: the runner is
+/// bounded by its own per-command timeout). A dispatch carrying a
+/// verified `taisan.worker.request/2` body selects the approved §14.5
+/// profile instead — the bound follows the durable request record,
+/// never the ambient configuration.
+const VERIFICATION_TIMEOUT_V1: Duration = Duration::from_secs(300);
+/// Captured-output bound under the recorded v1 profile: the 64 KiB
+/// tail read back after the runner settles.
+const VERIFICATION_OUTPUT_V1: u64 = 64 * 1024;
+/// The approved v2 verification profile (`docs/v0.3.md` §14.5): 30
+/// minutes per command — never silently inherited from v1.
+const VERIFICATION_TIMEOUT_V2: Duration = Duration::from_secs(30 * 60);
+/// The approved v2 captured-output bound: an 8 MiB tail.
+const VERIFICATION_OUTPUT_V2: u64 = 8 * 1024 * 1024;
 
 enum VerificationRun {
     Finished(std::process::ExitStatus),
@@ -1196,6 +1208,7 @@ pub fn verify(
     scratch: &Path,
     declared_egress_hosts: &[String],
 ) -> Result<VerificationResult, HandoffError> {
+    let (timeout, output_cap) = verification_bounds(store, artifact_id)?;
     verify_with_timeout(
         store,
         layout,
@@ -1203,9 +1216,37 @@ pub fn verify(
         requirement,
         argv,
         scratch,
-        VERIFICATION_COMMAND_TIMEOUT,
+        timeout,
+        output_cap,
         declared_egress_hosts,
     )
+}
+
+/// The per-command bounds the durable dispatch record selects: a
+/// verified `taisan.worker.request/2` body means the approved §14.5
+/// 30 min / 8 MiB profile; a v1 dispatch or an absent body keeps the
+/// recorded 300 s / 64 KiB values. Selection reads durable state
+/// only — the handoff row's own request id decides, so a later
+/// configuration change cannot silently re-bound an in-flight
+/// artifact.
+fn verification_bounds(
+    store: &impl Store,
+    artifact_id: &str,
+) -> Result<(Duration, u64), HandoffError> {
+    let v2 = store.transact(|tx| {
+        Ok(match tx.artifact_handoff(artifact_id)? {
+            Some(handoff) => matches!(
+                tx.worker_request_body(&handoff.request_id)?,
+                Some(body) if body.verifies()
+            ),
+            None => false,
+        })
+    })?;
+    Ok(if v2 {
+        (VERIFICATION_TIMEOUT_V2, VERIFICATION_OUTPUT_V2)
+    } else {
+        (VERIFICATION_TIMEOUT_V1, VERIFICATION_OUTPUT_V1)
+    })
 }
 
 #[doc(hidden)]
@@ -1218,6 +1259,7 @@ pub fn verify_with_timeout(
     argv: &[String],
     scratch: &Path,
     timeout: Duration,
+    output_cap: u64,
     declared_egress_hosts: &[String],
 ) -> Result<VerificationResult, HandoffError> {
     let handoff = store
@@ -1367,15 +1409,16 @@ pub fn verify_with_timeout(
             };
             // Read back only the bounded tail — never the whole file:
             // a large writer must not size the supervisor's memory.
-            const TAIL: u64 = 64 * 1024;
+            // The cap is the dispatch profile's: 64 KiB recorded v1,
+            // 8 MiB approved v2.
             let captured = match std::fs::File::open(&log_path) {
                 Ok(f) => {
                     use std::io::{Read, Seek, SeekFrom};
                     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
                     let mut r = std::io::BufReader::new(f);
-                    let _ = r.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
+                    let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
                     let mut bytes = Vec::new();
-                    let _ = r.take(TAIL).read_to_end(&mut bytes);
+                    let _ = r.take(output_cap).read_to_end(&mut bytes);
                     String::from_utf8_lossy(&bytes).into_owned()
                 }
                 Err(_) => String::new(),
