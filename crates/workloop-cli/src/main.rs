@@ -2072,6 +2072,13 @@ fn build_supervisor(
     } else {
         None
     };
+    // Finished v2 Invocations retain their report evidence into the
+    // CAS root regardless of the current `worker_dispatch` section —
+    // collection follows the recorded request body, so the store is
+    // installed whenever a state root exists.
+    let supervisor = supervisor.with_body_store(workloop_exec::bodies::BodyStore::new(
+        state_root.join("bodies"),
+    ));
     // The v2 dispatch profile (`docs/v0.3.md` §4/§14.8): a validated
     // `worker_dispatch` section means requests not yet consumed launch
     // through the complete bound-request transport — the durable

@@ -5,6 +5,7 @@ use crate::identity::{
     ChangeRequestRef, CommitRevision, DiffSnapshot, DiffTarget, EvidenceRef, HostActorRef,
     HostCapability, HostInstanceId, IssueRef, RepositoryRef,
 };
+use crate::worker_v2::ReportClassification;
 
 /// Delivery identity for transports that assign one (webhooks, worker
 /// reports). The scope disambiguates which authority issued the id, so a
@@ -86,6 +87,45 @@ pub enum ObservationFact {
         request_id: String,
         code: String,
         detail: String,
+    },
+    /// The supervisor-collected `taisan.worker.report/2` evidence for
+    /// one v2 Invocation (`docs/v0.3.md` §6): the classification the
+    /// envelope earned against the exact durable request binding,
+    /// plus references to the retained report/log bodies. Claims
+    /// inside the report — `claimed_head`, `claimed_checks`,
+    /// `findings`, `invariant_items` — stay claims: this fact is
+    /// evidence for later gates, never authority over lifecycle,
+    /// artifacts, or completion.
+    WorkerReport {
+        invocation_id: InvocationId,
+        request_id: String,
+        classification: ReportClassification,
+        /// The retained report evidence: CAS body id of the exact
+        /// bytes the supervisor read, the retained byte count, and
+        /// whether the on-disk file exceeded the read bound (an
+        /// oversize report keeps a bounded truncated prefix, never
+        /// the tail it did not read). `None` only when no report
+        /// file existed — the `absent` class.
+        report: Option<WorkerReportEvidence>,
+        /// The measured `runtime.log` retention under the same
+        /// bounded-read rule; `None` when no regular log file existed
+        /// or the path was unsafe — the worker's own `log` descriptor
+        /// stays a claim inside the report body.
+        log: Option<WorkerReportEvidence>,
+    },
+    /// A different report-byte identity observed for an Invocation
+    /// that already carries accepted `WorkerReport` evidence. The
+    /// conflict is retained alongside — the accepted bytes are never
+    /// overwritten and the new bytes are never silently adopted.
+    WorkerReportConflict {
+        invocation_id: InvocationId,
+        request_id: String,
+        /// The accepted report evidence identity (`None` = the
+        /// accepted classification was `absent`).
+        accepted_report: Option<WorkerReportEvidence>,
+        /// The conflicting identity now observed (`None` = the report
+        /// file is gone where evidence was accepted).
+        observed_report: Option<WorkerReportEvidence>,
     },
     /// An authoritative read of a source issue. Drives the source gate:
     /// compared against the approved spec snapshot, never trusted by
@@ -359,6 +399,24 @@ pub enum ArtifactFact {
     Present { digest: String },
     Missing,
     Corrupt { reason: Option<String> },
+}
+
+/// One retained worker-output body referenced by a `WorkerReport`
+/// fact: the CAS content id of the exact bytes the supervisor read,
+/// how many bytes were retained, and whether the on-disk file
+/// exceeded the read bound — a truncated retention is honest about
+/// the tail it never read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerReportEvidence {
+    /// The CAS `content_id` (`retained-body-cas-v1` digest) of the
+    /// retained bytes — resolves through the body catalogue.
+    pub body_id: String,
+    /// Retained byte count (may be below the file's true size when
+    /// `truncated`).
+    pub bytes: u64,
+    /// The file exceeded the invocation's budget bound; only the
+    /// bounded prefix was retained.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

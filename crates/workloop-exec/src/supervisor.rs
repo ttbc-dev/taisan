@@ -29,6 +29,7 @@ use workloop_core::worker::{
 use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
+use crate::bodies::BodyStore;
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -682,6 +683,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// composition root always installs one built from the approved
     /// installation configuration.
     pub runtime_boundary: Option<RuntimeBoundary>,
+    /// The CAS body store worker report evidence is retained into.
+    /// Independent of `v2`: report collection follows the *recorded*
+    /// request body, so a finished v2 Invocation keeps its evidence
+    /// even after the dispatch profile is removed from configuration.
+    /// `None` fails report collection for v2 invocations rather than
+    /// recording evidence that cannot resolve.
+    pub body_store: Option<BodyStore>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -701,6 +709,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             handoff: None,
             v2: None,
             runtime_boundary: None,
+            body_store: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -728,7 +737,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// their recorded Invocation — the format is fixed at consumption,
     /// never upgraded in place.
     pub fn with_v2_dispatch(mut self, dispatch: V2Dispatch) -> Self {
+        // Report collection retains into the same CAS root the
+        // dispatch profile writes request bodies to, unless the
+        // composition root installed a body store explicitly.
+        if self.body_store.is_none() {
+            self.body_store = Some(dispatch.bodies.clone());
+        }
         self.v2 = Some(dispatch);
+        self
+    }
+
+    /// Install the CAS body store finished v2 Invocations retain their
+    /// report evidence into. The composition root sets this whenever a
+    /// state root exists — independent of `worker_dispatch`, because
+    /// collection follows the recorded request body, not the current
+    /// dispatch configuration.
+    pub fn with_body_store(mut self, bodies: BodyStore) -> Self {
+        self.body_store = Some(bodies);
         self
     }
 
@@ -2760,6 +2785,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 },
                 now_unix_seconds,
             )?;
+        }
+        // The process tree is proven stopped before this runs, so the
+        // Invocation-owned out directory is final: collect the v2
+        // report evidence now, before the exit fact resolves the
+        // writer — a crash after the exit commit could never retry the
+        // collection. v1 requests collect nothing.
+        if let Some(fact) = crate::report_v2::collect(
+            store,
+            self.body_store
+                .as_ref()
+                .or(self.v2.as_ref().map(|d| &d.bodies)),
+            &self.workspace_root,
+            invocation,
+            &request,
+            now_unix_seconds,
+        )? {
+            self.report(store, &request, fact, now_unix_seconds)?;
         }
         self.report(
             store,

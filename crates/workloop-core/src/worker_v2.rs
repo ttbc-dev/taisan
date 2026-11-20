@@ -1437,8 +1437,11 @@ pub struct ReportBinding<'a> {
 }
 
 /// The supervisor-owned report classification (§6.1): what the
-/// validated envelope means, never what the Worker claims.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// validated envelope means, never what the Worker claims. Serialized
+/// inside the `WorkerReport` observation fact, so the durable evidence
+/// record carries the exact class the supervisor assigned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReportClassification {
     /// A valid positive claim for this exact request — still only
     /// evidence; handoff and verification stand between it and any
