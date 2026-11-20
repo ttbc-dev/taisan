@@ -41,7 +41,7 @@ use workloop_core::worker_v2::{
     member_claim_digest,
 };
 
-use crate::bodies::{BodyStore, CAS_CATEGORY};
+use crate::bodies::{BodyError, BodyStore, CAS_CATEGORY};
 use crate::supervisor::ExecError;
 
 /// Everything the binding decision reads, gathered once per
@@ -174,14 +174,15 @@ fn gather(
             "worker assessment binding requires the CAS body store".into(),
         ));
     };
-    let resolved = bodies
-        .resolve(store.body_catalog(), &report_evidence.body_id)
-        .map_err(|e| ExecError::Fault(format!("resolve worker report body: {e}")))?;
-    let Some(resolved) = resolved else {
-        return Err(ExecError::Fault(format!(
-            "worker report body {} is missing from the catalog",
-            report_evidence.body_id
-        )));
+    let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+        // Retention may have reclaimed the body since the report was
+        // recorded — unavailable evidence binds nothing, never a fault
+        // that wedges every pass.
+        Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(None),
+        Err(e) => {
+            return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+        }
+        Ok(Some(resolved)) => resolved,
     };
     let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
         .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
@@ -346,6 +347,12 @@ fn resolve_invariant_set(
     let path = format!("invariant-set/{}", invariant_set.digest);
     let resolved = bodies
         .resolve_at(store.body_catalog(), CAS_CATEGORY, &path)
+        .or_else(|e| match e {
+            // Retention may have reclaimed the body — unverifiable
+            // coverage is incomplete evidence, never a pass fault.
+            BodyError::Unavailable { .. } => Ok(None),
+            _ => Err(e),
+        })
         .map_err(|e| ExecError::Fault(format!("resolve invariant set body: {e}")))?;
     let Some(resolved) = resolved else {
         return Ok(None);

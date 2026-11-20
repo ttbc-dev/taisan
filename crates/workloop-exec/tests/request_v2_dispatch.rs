@@ -1863,6 +1863,35 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
     );
 }
 
+/// A request deadline that elapses while the launch is still being
+/// prepared — declaration, materialization, workspace — is caught at
+/// the spawn boundary: the recorded Invocation abandons and no
+/// worker process starts. The tick deadline is unset so the pass's
+/// only clock read is the spawn-boundary recheck itself; `now` built
+/// the request body while the deadline still held.
+#[test]
+fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("racing-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-deadline", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+
+    let mut clock = || i64::MAX;
+    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
+        .unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert!(
+        !pending_ids(&store).contains(&rid),
+        "the consumed request is terminal for its binding"
+    );
+}
+
 /// A v2 supervisor over a caller-chosen worker argv — the
 /// declaration-drift and transport-failure cases need argv shapes
 /// `supervisor_v2`'s fixed `--wire v2` tail does not produce.

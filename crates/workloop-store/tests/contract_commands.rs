@@ -8,7 +8,8 @@ use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::store::*;
 use workloop_core::work::{
-    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command, sweep,
+    HostTemplate, IngestReceipt, WorkloopConfig, dispatch_once, handle_command, handle_observation,
+    sweep,
 };
 use workloop_store::sqlite::SqliteStore;
 
@@ -4764,6 +4765,226 @@ fn an_applied_push_receipt_records_the_next_stage_intent() {
                 .find(|i| matches!(i.action, HostAction::OpenChangeRequest { .. }))
                 .expect("the receipt recorded the open intent");
             assert_eq!(open.status, HostActionStatus::Pending);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The push intent names the produced commit the acknowledged handoff
+/// recorded — never the artifact fact's payload digest, which
+/// identifies bytes, not a git object a remote ref can target.
+#[test]
+fn the_push_intent_names_the_acknowledged_produced_commit() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ph1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "ph1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "ph1-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "ph1-check"),
+            },
+            // The durable handoff names the produced commit — the
+            // object `push_ref` must target.
+            Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: "ph1-coding/artifact.json".into(),
+                    invocation_id: invocation.id.clone(),
+                    request_id: invocation.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: e1.clone(),
+                    base: "base-sha".into(),
+                    produced: Some("produced-commit".into()),
+                    manifest_digest: Some("manifest-digest".into()),
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    recorded_seq: 0,
+                },
+                expected_seq: 0,
+            },
+        ],
+    );
+    let emit = |fact: ObservationFact| {
+        handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![
+            CapabilityEntry {
+                capability: HostCapability::PushRef,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+            CapabilityEntry {
+                capability: HostCapability::ChangeRequestCreate,
+                support: CapabilityState::Supported,
+                authorization: CapabilityState::Authorized,
+            },
+        ],
+    });
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let produced = intents
+                .iter()
+                .find_map(|i| match &i.action {
+                    HostAction::PushRef { produced, .. } => Some(produced.object.clone()),
+                    _ => None,
+                })
+                .expect("stage-1 push intent recorded");
+            assert_eq!(
+                produced, "produced-commit",
+                "the push targets the produced commit, not the artifact digest"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Publication waits for the produced commit to be durable: an
+/// artifact fact lands while the handoff is still unacknowledged, so
+/// no push intent records; the acknowledgement's claim check is the
+/// wake that re-drives the stage.
+#[test]
+fn publication_waits_for_the_acknowledged_produced_commit() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ph2"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "ph2-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: Some("artifact-digest".into()),
+    }];
+    let handoff = |state: HandoffState| Effect::UpsertHandoff {
+        handoff: ArtifactHandoff {
+            artifact_id: "ph2-coding/artifact.json".into(),
+            invocation_id: invocation.id.clone(),
+            request_id: invocation.request_id.clone(),
+            work_id: w.clone(),
+            execution_id: e1.clone(),
+            base: "base-sha".into(),
+            produced: Some("produced-commit".into()),
+            manifest_digest: Some("manifest-digest".into()),
+            state,
+            invalid_reason: None,
+            attempt: 0,
+            recorded_seq: 0,
+        },
+        expected_seq: 0,
+    };
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            },
+            Effect::InsertInvocation {
+                invocation: recorded_check_invocation(&e1, "ph2-check"),
+            },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "ph2-check"),
+            },
+            // Imported but not yet acknowledged: the produced commit
+            // is quarantined, not yet durable under its artifact ref.
+            handoff(HandoffState::Imported),
+        ],
+    );
+    let emit = |fact: ObservationFact| {
+        handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    };
+    emit(ObservationFact::CapabilityReport {
+        host: host(),
+        capabilities: vec![CapabilityEntry {
+            capability: HostCapability::PushRef,
+            support: CapabilityState::Supported,
+            authorization: CapabilityState::Authorized,
+        }],
+    });
+    emit(ObservationFact::Artifact {
+        invocation_id: invocation.id.clone(),
+        required_artifact: "artifact.json".into(),
+        state: ArtifactFact::Present {
+            digest: "artifact-digest".into(),
+        },
+    });
+    assert!(
+        store
+            .transact(|tx| Ok(tx
+                .action_intents()?
+                .iter()
+                .all(|i| !matches!(i.action, HostAction::PushRef { .. }))))
+            .unwrap(),
+        "no push intent before the produced commit is durable"
+    );
+    // The handoff acknowledges; its claim check re-drives the stage.
+    apply_effects(&store, &[handoff(HandoffState::Acknowledged)]);
+    emit(ObservationFact::ClaimedHeadCheck {
+        invocation_id: invocation.id.clone(),
+        artifact_id: "ph2-coding/artifact.json".into(),
+        claimed: "produced-commit".into(),
+        produced: "produced-commit".into(),
+        agrees: true,
+    });
+    store
+        .transact(|tx| {
+            let intents = tx.action_intents()?;
+            let produced = intents
+                .iter()
+                .find_map(|i| match &i.action {
+                    HostAction::PushRef { produced, .. } => Some(produced.object.clone()),
+                    _ => None,
+                })
+                .expect("the claim check re-drove publication");
+            assert_eq!(produced, "produced-commit");
             Ok(())
         })
         .unwrap();

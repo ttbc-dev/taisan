@@ -31,7 +31,7 @@ use workloop_core::worker_v2::{
 };
 
 use crate::adapter;
-use crate::bodies::BodyStore;
+use crate::bodies::{BodyError, BodyStore};
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -1658,14 +1658,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 "worker report claim check requires the CAS body store".into(),
             ));
         };
-        let resolved = bodies
-            .resolve(store.body_catalog(), &report_evidence.body_id)
-            .map_err(|e| ExecError::Fault(format!("resolve worker report body: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Err(ExecError::Fault(format!(
-                "worker report body {} is missing from the catalog",
-                report_evidence.body_id
-            )));
+        let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+            // Retention may have reclaimed the body since the report
+            // was recorded — unavailable evidence is skipped, never a
+            // fault that wedges every pass.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(()),
+            Err(e) => {
+                return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+            }
+            Ok(Some(resolved)) => resolved,
         };
         let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
             .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
@@ -1728,7 +1729,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             {
                 continue;
             }
-            self.reconcile_or_start(store, &request, now_unix_seconds)?;
+            self.reconcile_or_start(store, &request, now_unix_seconds, clock)?;
         }
         Ok(())
     }
@@ -1738,6 +1739,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let lock = self.lock_for(&request.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1781,7 +1783,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // already consumed above replays its recorded Invocation
         // regardless of which profile is configured now.
         if self.v2.is_some() {
-            return self.start_v2(store, request, now_unix_seconds);
+            return self.start_v2(store, request, now_unix_seconds, clock);
         }
 
         // The Execution state gates the describe probe too: a request
@@ -2199,6 +2201,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let dispatch = self
             .v2
@@ -2638,8 +2641,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // or cancel committed during declaration, materialization, or
         // preparation still blocks the launch. The recorded Invocation
         // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > now_unix_seconds
+        // starts after authorization expires. The deadline is read
+        // from the live clock, not the pass timestamp — preparation
+        // may consume minutes between them.
+        let authorized = wire.budget.deadline_unix_seconds > clock()
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);
