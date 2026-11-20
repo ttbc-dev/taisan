@@ -1103,6 +1103,21 @@ impl GitHubApi for GhCliApi {
         })
     }
 
+    /// `gh api user` — the login the ambient token acts as. The
+    /// guarded-write path attests this identity on its receipts; a
+    /// token resolving to another login is a mismatch, never a write
+    /// under the bound actor's name.
+    fn viewer(&mut self) -> Result<String, ApiError> {
+        let value = self.api("GET", "user", None)?;
+        value
+            .get("login")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ApiError::Unknown {
+                reason: "gh api user: response carried no login".into(),
+            })
+    }
+
     fn set_read_deadline(&mut self, deadline: Option<Instant>) {
         self.read_deadline = deadline;
     }

@@ -4222,24 +4222,26 @@ fn check_exited_zero(
         }))
 }
 
-/// Whether `candidates` holds an invariant-check Invocation whose own
-/// evidence is positive — `Done` on a proven exit status of 0. This is
-/// the only check result publication and completion may count; both
-/// gates share it so they can never drift apart.
+/// Whether the *latest* invariant-check Invocation's own evidence is
+/// positive — `Done` on a proven exit status of 0. A superseded pass
+/// never satisfies the gate: once a newer check is recorded its
+/// result supersedes every earlier one, so a failed or unresolved
+/// newest check holds the lane closed. This is the only check result
+/// publication and completion may count; both gates share it so they
+/// can never drift apart.
 fn satisfied_invariant_check(
     tx: &dyn ReadView,
     execution_id: &ExecutionId,
     candidates: &[Invocation],
 ) -> Result<bool, StoreError> {
-    for invocation in candidates {
-        if invocation.role == InvocationRole::InvariantCheck
-            && invocation.state == InvocationState::Done
-            && check_exited_zero(tx, execution_id, invocation)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let Some(latest) = candidates
+        .iter()
+        .rev()
+        .find(|i| i.role == InvocationRole::InvariantCheck)
+    else {
+        return Ok(false);
+    };
+    Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
 }
 
 /// `succeeded` requires the required stage effects applied, the declared
@@ -4371,27 +4373,34 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
             }
         }
     }
-    // Invariant lane: a complete assessment on the current target whose
-    // every item is positive AND a completed invariant-check Invocation
-    // recorded after the latest producing Invocation. The assessment
+    // Invariant lane: the *latest* assessment on the current target is
+    // complete with every item positive AND the newest invariant-check
+    // Invocation recorded after the latest producing Invocation exited
+    // 0. A superseded positive assessment never counts — a newer check
+    // reporting a violation, an incomplete run, or nothing at all
+    // displaces it as the lane's deciding evidence. The assessment
     // fact alone never substitutes for the check's own durable record.
     // Disabled lanes count nothing either way.
     if spec.payload.lanes.invariant_check {
-        let ok = observations.iter().any(|o| {
-            matches!(
-                &o.fact,
+        let ok = observations
+            .iter()
+            .rev()
+            .find_map(|o| match &o.fact {
                 ObservationFact::Assessment {
                     target: t,
-                    complete: true,
+                    complete,
                     items,
                     ..
-                } if t == &target
-                    && !items.is_empty()
-                    && items.iter().all(|i| {
-                        i.verdict == crate::observation::AssessmentVerdict::Positive
-                    })
-            )
-        });
+                } if t == &target => Some(
+                    *complete
+                        && !items.is_empty()
+                        && items
+                            .iter()
+                            .all(|i| i.verdict == crate::observation::AssessmentVerdict::Positive),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false);
         let checked = match invocations.iter().rposition(|i| {
             matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
                 && i.state == InvocationState::Done

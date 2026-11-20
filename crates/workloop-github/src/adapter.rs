@@ -2022,11 +2022,25 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             fact,
             observed_unix_seconds: now,
         };
+        // Every guarded-write receipt attests only the verified
+        // ambient identity: `gh` acts as whatever login its token
+        // resolves to, so the actor is verified through the host,
+        // never assumed from the intent's claim. `None` records an
+        // unattested identity exactly.
+        let authenticated = self
+            .client
+            .viewer()
+            .ok()
+            .and_then(|login| HostActorId::new(login).ok())
+            .map(|actor| HostActorRef {
+                host: intent.actor.host.clone(),
+                actor,
+            });
         let result =
             |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
                 ObservationFact::HostActionResult {
                     action_id,
-                    authenticated_actor: Some(intent.actor.clone()),
+                    authenticated_actor: authenticated.clone(),
                     status,
                     effects,
                 }
@@ -2091,6 +2105,47 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 return Ok(AttemptOutcome::Attempted);
             }
             RemoteEffect::Absent { .. } => {}
+        }
+
+        // A write runs only under the verified bound identity: an
+        // unattested credential never authors an effect, and a foreign
+        // one is recorded — the durable ingest settles the receipt
+        // `unknown{actor_mismatch}` and the intent stays outstanding
+        // until the ambient credential matches the binding.
+        match &authenticated {
+            Some(actor) if actor == &intent.actor => {}
+            Some(actor) => {
+                self.ingest(
+                    store,
+                    config,
+                    obs(ObservationFact::HostActionResult {
+                        action_id: intent.action_id.clone(),
+                        authenticated_actor: Some(actor.clone()),
+                        status: HostActionStatus::Unknown {
+                            reason: "actor_mismatch".into(),
+                        },
+                        effects: vec![],
+                    }),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
+            None => {
+                self.ingest(
+                    store,
+                    config,
+                    obs(ObservationFact::HostActionResult {
+                        action_id: intent.action_id.clone(),
+                        authenticated_actor: None,
+                        status: HostActionStatus::Unknown {
+                            reason: "actor_unverifiable".into(),
+                        },
+                        effects: vec![],
+                    }),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
         }
 
         match &intent.action {
