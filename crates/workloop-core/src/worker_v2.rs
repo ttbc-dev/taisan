@@ -110,8 +110,10 @@ pub struct DiffTarget {
     /// hex when observed). A target-branch-only move invalidates the
     /// review just as a head move does — two assessments compare only
     /// on an identical target. Absent on bodies minted before the
-    /// binding existed, which can never prove a revision match.
-    #[serde(default)]
+    /// binding existed, which can never prove a revision match. The
+    /// member is omitted when absent so a pre-binding body
+    /// re-serializes to the bytes its recorded digest was taken over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_revision: Option<String>,
 }
 
@@ -547,7 +549,9 @@ pub struct ReviewSourceOccurrence {
     pub position: Option<String>,
     pub thread_id: Option<String>,
     /// The human-readable finding text from the sealed claim.
-    #[serde(default)]
+    /// Omitted when absent so a review source minted before the
+    /// member existed keeps the digest it was recorded under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
 
@@ -1892,6 +1896,58 @@ mod tests {
         assert!(
             !incomplete.verifies(),
             "a digest-consistent incomplete envelope reads as corrupt"
+        );
+    }
+
+    /// Bodies minted before `target_revision` existed carry no member
+    /// for it; `None` must serialize as absence, not `null`, or every
+    /// pre-binding durable body stops verifying on upgrade and its
+    /// in-flight request reads as corrupt.
+    #[test]
+    fn a_body_minted_before_the_target_binding_still_verifies() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.role = crate::domain::InvocationRole::Review;
+        request.required_capabilities.role = crate::domain::InvocationRole::Review;
+        request.workspace.read_only = true;
+        request.task = TaskBody::CodeReview {
+            target: DiffTarget {
+                change: "change-5".into(),
+                base: "0".repeat(40),
+                head: "1".repeat(40),
+                diff_digest: "d".repeat(64),
+                target_revision: Some("2".repeat(40)),
+            },
+            review_source: ReviewSourceRef {
+                source: "review-source-3".into(),
+                bytes: 4096,
+                digest: "a".repeat(64),
+                source_revision: "3".into(),
+            },
+        };
+        // Mint the body the pre-binding schema wrote: no
+        // `target_revision` member at all.
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        value["task"]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_revision");
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(digest);
+        let bytes = canonical_json(&value);
+        let parsed = WorkerRequestV2::parse(&bytes).expect("pre-binding body parses");
+        let TaskBody::CodeReview { target, .. } = &parsed.task else {
+            panic!("task kind changed on parse");
+        };
+        assert_eq!(target.target_revision, None);
+        let body = WorkerRequestBody {
+            request_id: parsed.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: parsed.digest(),
+        };
+        assert!(
+            body.verifies(),
+            "a body minted before the target binding must keep verifying"
         );
     }
 

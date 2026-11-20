@@ -3100,11 +3100,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // signature an unrecorded writer can still be found by. A
         // request with no recorded binding has no signature to search:
         // nothing can be proven, so it stays uncertain.
-        let Some(expected_command) = request
-            .adapter_binding
-            .as_ref()
-            .map(|binding| binding.argv.join(" "))
-        else {
+        let Some(binding) = request.adapter_binding.as_ref() else {
             return self.report_unidentified_unknown(
                 store,
                 request,
@@ -3112,19 +3108,57 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             );
         };
-        let matches = match self.port.matching_processes(&expected_command) {
-            Ok(matches) => matches,
-            // An unreadable process table proves nothing in either
-            // direction — stay uncertain.
-            Err(_) => {
-                return self.report_unidentified_unknown(
-                    store,
-                    request,
-                    &invocation.id,
-                    now_unix_seconds,
-                );
+        // The signature is the full command line the spawn actually
+        // exec'd, which is the bare argv only for v1. A v2 launch
+        // appended the `run --request/--out` transport pair — the
+        // sandbox paths under containment, the host io paths
+        // uncontained — and the durable record does not name which
+        // gate the spawn took, so every shape the line could have
+        // taken is a signature. Missing the v2 shapes would leave a
+        // v2 writer unmatchable: never re-bound, and eventually
+        // declared absent on directory occupancy alone.
+        let mut signatures = vec![binding.argv.join(" ")];
+        if store
+            .transact(|tx| tx.worker_request_body(&request.request_id))?
+            .is_some()
+        {
+            let mut contained = binding.argv.clone();
+            contained.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                containment::SANDBOX_REQUEST.to_string(),
+                "--out".to_string(),
+                containment::SANDBOX_OUT.to_string(),
+            ]);
+            signatures.push(contained.join(" "));
+            let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
+                .join(crate::isolation::sanitize_key(&invocation.id.0));
+            let mut host = binding.argv.clone();
+            host.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                io_dir.join("request.json").to_string_lossy().into_owned(),
+                "--out".to_string(),
+                io_dir.join("out").to_string_lossy().into_owned(),
+            ]);
+            signatures.push(host.join(" "));
+        }
+        let mut matches = Vec::new();
+        for signature in &signatures {
+            match self.port.matching_processes(signature) {
+                Ok(found) => matches.extend(found),
+                // An unreadable process table proves nothing in either
+                // direction — stay uncertain.
+                Err(_) => {
+                    return self.report_unidentified_unknown(
+                        store,
+                        request,
+                        &invocation.id,
+                        now_unix_seconds,
+                    );
+                }
             }
-        };
+        }
         // Every signature match the store does not already account for.
         // A recorded writer — another work's live process, a snapshotted
         // descendant, a stop-proof identity — is never this launch's
@@ -3194,10 +3228,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation: next,
                         expected_state: invocation.state.clone(),
                     })?;
-                    tx.apply(&Effect::BindWorkerRequestExport {
-                        request_id: bound_request_id,
-                        process_identity: bound_identity.clone(),
-                    })?;
+                    // A v1 launch binds its export row to the spawned
+                    // handle. A v2 request has no export — its durable
+                    // body is the launch record and the running
+                    // Invocation carries the identity — so the bind
+                    // applies only when the export row exists;
+                    // requiring it would reject the whole commit.
+                    if tx.worker_request_export(&bound_request_id)?.is_some() {
+                        tx.apply(&Effect::BindWorkerRequestExport {
+                            request_id: bound_request_id,
+                            process_identity: bound_identity.clone(),
+                        })?;
+                    }
                     Ok(Some(()))
                 }) {
                     Ok(Some(())) => self.report(
