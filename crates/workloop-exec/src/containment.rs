@@ -68,10 +68,13 @@ pub const SANDBOX_TOOLCHAIN: &str = "/taisan/toolchain";
 /// The fixed read-only system binds every contained launch gets —
 /// the runtime and toolchain surface, never an owner home, another
 /// workspace, the store, the handoff repository, or installation
-/// config (`docs/v0.3.md` §14.3). Only directories that exist on the
-/// host are bound; a merged-usr layout binds `/bin`/`/sbin` as the
-/// symlinks they are.
-const SYSTEM_BINDS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"];
+/// config (`docs/v0.3.md` §14.3). `/etc` and `/opt` are excluded on
+/// the same rule: they are host configuration and third-party
+/// install trees, not the runtime — a world-readable host secret or
+/// site config there must stay invisible to the sandbox (OPS-04).
+/// Only directories that exist on the host are bound; a merged-usr
+/// layout binds `/bin`/`/sbin` as the symlinks they are.
+const SYSTEM_BINDS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64"];
 
 /// How long a failed proof suppresses re-probing: an operator fixes
 /// the environment, the next window re-proves. Successful evidence

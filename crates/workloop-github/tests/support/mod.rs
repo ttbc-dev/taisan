@@ -79,6 +79,9 @@ pub struct InMemoryGitHub {
     /// `operation` → lost response returned *after* the effect landed
     /// (or, for a read, instead of answering). One-shot per arming.
     lost: BTreeMap<String, ApiError>,
+    /// The login `viewer()` attests — the ambient identity the double
+    /// models; the suite's bound publisher by default.
+    viewer: Option<String>,
     next_comment: u64,
 }
 
@@ -91,6 +94,12 @@ impl InMemoryGitHub {
     /// drove on this remote.
     pub fn writes(&self) -> &[String] {
         &self.writes
+    }
+
+    /// Test control: the login `viewer()` attests on the next calls —
+    /// the ambient credential's verified identity.
+    pub fn set_viewer(&mut self, login: &str) {
+        self.viewer = Some(login.to_string());
     }
 
     /// The head the remote records for `(repository, branch)`.
@@ -621,5 +630,18 @@ impl GitHubApi for InMemoryGitHub {
             current = parent.clone();
         }
         Ok(false)
+    }
+
+    fn viewer(&mut self) -> Result<String, ApiError> {
+        if let Some(err) = self.take_refusal("viewer") {
+            return Err(err);
+        }
+        if let Some(err) = self.take_lost("viewer") {
+            return Err(err);
+        }
+        Ok(self
+            .viewer
+            .clone()
+            .unwrap_or_else(|| "pub-agent".to_string()))
     }
 }

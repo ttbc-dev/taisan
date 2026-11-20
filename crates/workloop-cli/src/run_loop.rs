@@ -2529,6 +2529,9 @@ mod tests {
         comment_seq: u64,
         /// One-shot armed faults per operation name.
         armed: std::collections::HashMap<String, ArmedFault>,
+        /// The login `viewer()` attests — the ambient identity the
+        /// double models; the suite's bound publisher by default.
+        viewer: Option<String>,
     }
 
     impl FakeGitHub {
@@ -2876,6 +2879,10 @@ mod tests {
                         reason: "outage".into(),
                     })
                 })
+        }
+
+        fn viewer(&mut self) -> Result<String, ApiError> {
+            Ok(self.viewer.clone().unwrap_or_else(|| "bot-pub".into()))
         }
 
         fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) {
