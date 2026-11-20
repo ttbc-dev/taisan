@@ -660,6 +660,43 @@ fn fix_predecessor_failures_are_all_typed_refusals() {
 }
 
 #[test]
+fn fix_handoff_base_mismatch_refuses() {
+    let root = tmp_root("fix-base");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, rid, src, base, produced, aid) = fix_fixture(&store, &root, "p-fbase", "m-1");
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(&store, &layout, &src, &w, &e, &aid, &produced, &base, "m-1");
+
+    store
+        .transact(|tx| {
+            let mut h = tx.artifact_handoff(&aid)?.unwrap();
+            let expected = h.recorded_seq;
+            h.base = produced.clone();
+            h.recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: h,
+                expected_seq: expected,
+            })
+        })
+        .unwrap();
+    let err = sup
+        .prepare_workspace(
+            &store,
+            &rid,
+            &RepositorySource {
+                repository: repo(),
+                path: src.clone(),
+            },
+            NOW,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::InvalidPredecessor { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn fix_manifest_mismatch_and_non_descendant_refuse() {
     let root = tmp_root("fix-mismatch");
     let store = SqliteStore::in_memory(1).unwrap();
@@ -1700,6 +1737,11 @@ fn a_reservation_lost_mid_preparation_refuses_at_finalization() {
         .join(".prepare")
         .join(format!("{}.receipt.json", w.0));
     assert!(!receipt.exists(), "no success receipt was written");
+    let staging_left = std::fs::read_dir(layout.workspace_root.join(".prepare"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("staging-"));
+    assert!(!staging_left, "failed preparation removed its staging tree");
 }
 
 #[test]
@@ -1761,6 +1803,11 @@ fn a_new_writer_mid_preparation_refuses_at_finalization() {
     );
     assert!(!ws_path(&root, &w).exists());
     assert!(!receipt_path.exists());
+    let staging_left = std::fs::read_dir(layout.workspace_root.join(".prepare"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("staging-"));
+    assert!(!staging_left, "failed preparation removed its staging tree");
 }
 
 #[test]

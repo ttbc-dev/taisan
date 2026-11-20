@@ -721,6 +721,11 @@ fn gates(
                     detail: "handoff manifest digest disagrees".into(),
                 });
             }
+            if row.base != request.base.object {
+                return Err(PreparationError::InvalidPredecessor {
+                    detail: "handoff base disagrees".into(),
+                });
+            }
             (
                 predecessor.produced.clone(),
                 Some((predecessor.artifact_id.clone(), layout.repository.clone())),
@@ -1068,40 +1073,46 @@ fn prepare_locked(
     }
     let staging = unique_staging(&control, &gate.work.id.0);
     std::fs::create_dir(&staging).map_err(PreparationError::Io)?;
-    build_staging(
-        &staging,
-        &gate.base,
-        &gate.head,
-        &gate.branch,
-        &gate.predecessor,
-        source,
-    )?;
-    verify_git_dir_safe(&staging.join(".git"))?;
-    revalidate(
-        store,
-        request_id,
-        source,
-        handoff,
-        now_unix_seconds,
-        &gate,
-        || {
-            write_receipt(
-                &control,
-                &gate.work.id.0,
-                &Receipt {
-                    request_digest: gate.request.request_digest.clone(),
-                    work_id: gate.work.id.0.clone(),
-                    host: gate.request.repository.host.clone(),
-                    repository: gate.request.repository.repository.clone(),
-                    branch: gate.branch.clone(),
-                    base: gate.base.clone(),
-                    head: gate.head.clone(),
-                },
-            )?;
-            rename_noreplace(&staging, &final_path)?;
-            fsync_dir(&workspace_root)
-        },
-    )?;
+    let staged: Result<(), PreparationError> = (|| {
+        build_staging(
+            &staging,
+            &gate.base,
+            &gate.head,
+            &gate.branch,
+            &gate.predecessor,
+            source,
+        )?;
+        verify_git_dir_safe(&staging.join(".git"))?;
+        revalidate(
+            store,
+            request_id,
+            source,
+            handoff,
+            now_unix_seconds,
+            &gate,
+            || {
+                write_receipt(
+                    &control,
+                    &gate.work.id.0,
+                    &Receipt {
+                        request_digest: gate.request.request_digest.clone(),
+                        work_id: gate.work.id.0.clone(),
+                        host: gate.request.repository.host.clone(),
+                        repository: gate.request.repository.repository.clone(),
+                        branch: gate.branch.clone(),
+                        base: gate.base.clone(),
+                        head: gate.head.clone(),
+                    },
+                )?;
+                rename_noreplace(&staging, &final_path)?;
+                fsync_dir(&workspace_root)
+            },
+        )
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    staged?;
     Ok(PreparedWorkspace {
         path: final_path,
         branch: gate.branch,
