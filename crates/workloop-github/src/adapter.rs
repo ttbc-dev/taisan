@@ -56,6 +56,7 @@ use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding};
 use crate::fixture::{
+    AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
 };
 
@@ -231,59 +232,271 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Ok(())
     }
 
+    /// The bounded write drain the normal driver runs each tick:
+    /// attempt every outstanding (`pending`) in-scope intent in
+    /// order, bounded by the per-tick item budget and the tick
+    /// deadline. Only a real host attempt consumes the item budget —
+    /// an intent that cannot run yet (its host binding, missing
+    /// Execution, or denied `host_write` grant) is reported `skipped`
+    /// without charging the budget, so a permanently unroutable
+    /// intent never starves the ready intents behind it. The
+    /// untouched remainder is reported `deferred`, never dropped.
+    ///
+    /// Authentication is the transport's ambient credential (`gh`'s
+    /// own login or `GH_TOKEN`): this adapter performs no
+    /// per-credential binding, so `credential_blocked` is never
+    /// populated — the scenario-book credential gate belongs to the
+    /// fixture, not to this driver.
     pub fn apply_outbox_bounded(
         &mut self,
         store: &impl Store,
-        _config: &WorkloopConfig,
-        _clock: &mut dyn FnMut() -> i64,
-        _deadline: Option<i64>,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
         scope: Option<&WorkId>,
-        _max_items: usize,
-    ) -> Result<crate::fixture::OutboxReport, StoreError> {
-        if self.any_outstanding_intents(store, scope)? {
-            return Err(StoreError::Internal {
-                detail: "production host writes are unsupported in this driver".into(),
-            });
+        max_items: usize,
+    ) -> Result<OutboxReport, StoreError> {
+        // Attempts are tracked so an intent that cannot make progress
+        // is skipped for the rest of this pass — it neither loops the
+        // pass forever nor blocks later independent intents.
+        let mut report = OutboxReport::default();
+        if !config.allowed_effects.host_write {
+            return Ok(report);
         }
-        Ok(crate::fixture::OutboxReport::default())
+        let now = clock();
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
+        let mut attempted = HashSet::new();
+        loop {
+            // Both bounds stop the drain before the next item starts:
+            // the per-tick item budget and the tick deadline. Whichever
+            // trips, the untouched remainder is reported, never dropped.
+            if report.attempted >= max_items || deadline.is_some_and(|d| clock() >= d) {
+                report.deferred = store.transact(|tx| {
+                    Ok(tx
+                        .action_intents()?
+                        .into_iter()
+                        .filter(|i| {
+                            i.status == HostActionStatus::Pending
+                                && !attempted.contains(&i.action_id)
+                                && in_scope(i)
+                        })
+                        .map(|i| i.action_id)
+                        .collect())
+                })?;
+                break;
+            }
+            let next = store.transact(|tx| {
+                Ok(tx.action_intents()?.into_iter().find(|i| {
+                    i.status == HostActionStatus::Pending
+                        && !attempted.contains(&i.action_id)
+                        && in_scope(i)
+                }))
+            })?;
+            let Some(intent) = next else { break };
+            let action_id = intent.action_id.clone();
+            attempted.insert(action_id.clone());
+            match self.attempt(store, config, intent, now)? {
+                AttemptOutcome::Attempted => report.attempted += 1,
+                AttemptOutcome::CredentialBlocked(code) => {
+                    report.credential_blocked.push(CredentialBlock {
+                        action_id: action_id.clone(),
+                        code,
+                    });
+                }
+                AttemptOutcome::Skipped(reason) => {
+                    report.skipped.push(SkippedIntent {
+                        action_id: action_id.clone(),
+                        reason,
+                    });
+                }
+                AttemptOutcome::Crashed => {
+                    report.attempted += 1;
+                    report.deferred = store.transact(|tx| {
+                        Ok(tx
+                            .action_intents()?
+                            .into_iter()
+                            .filter(|i| {
+                                i.status == HostActionStatus::Pending
+                                    && !attempted.contains(&i.action_id)
+                                    && in_scope(i)
+                            })
+                            .map(|i| i.action_id)
+                            .collect())
+                    })?;
+                    break;
+                }
+            }
+            let status = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })?;
+            match status {
+                Some(HostActionStatus::Applied) => report.applied += 1,
+                Some(HostActionStatus::Failed { .. }) => report.failed += 1,
+                Some(HostActionStatus::Unknown { .. }) => report.unknown += 1,
+                Some(HostActionStatus::Unsupported { .. }) => report.unsupported += 1,
+                // Denied or unchanged: counted as attempted, still pending.
+                _ => {}
+            }
+        }
+        Ok(report)
     }
 
+    /// The bounded read-only reconcile pass the normal driver runs
+    /// before the write drain each tick: compare every outstanding
+    /// (`pending` or `unknown`) in-scope intent's recorded effect
+    /// against the remote's current state and feed the verdict
+    /// through the same `host_action_result` receipt path a write
+    /// attempt uses.
+    ///
+    /// An observed effect settles `applied` with the normalized fact
+    /// a fresh read derives — never on this adapter's say-so — a
+    /// definitive-absence read settles an `unknown` intent `failed`
+    /// (a `pending` intent may simply not have been attempted yet, so
+    /// absence leaves it pending), and an indeterminate read changes
+    /// nothing for `pending` and only refreshes the recorded reason
+    /// for `unknown`. Reconciliation performs host reads only and is
+    /// never a substitute for a write grant: the `host_write` check
+    /// stays in [`Self::attempt`] alone. Intents bound to another
+    /// host instance are left for that adapter.
     pub fn reconcile_outbox_bounded(
         &mut self,
         store: &impl Store,
-        _config: &WorkloopConfig,
-        _clock: &mut dyn FnMut() -> i64,
-        _deadline: Option<i64>,
+        config: &WorkloopConfig,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
         scope: Option<&WorkId>,
-        _max_items: usize,
-    ) -> Result<crate::fixture::ReconcileReport, StoreError> {
-        if self.any_outstanding_intents(store, scope)? {
-            return Err(StoreError::Internal {
-                detail: "production host writes are unsupported in this driver".into(),
-            });
+        max_items: usize,
+    ) -> Result<ReconcileReport, StoreError> {
+        let mut report = ReconcileReport::default();
+        let now = clock();
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
+        let outstanding = |i: &HostActionIntent| {
+            matches!(
+                i.status,
+                HostActionStatus::Pending | HostActionStatus::Unknown { .. }
+            )
+        };
+        let mut examined = HashSet::new();
+        loop {
+            if report.examined >= max_items || deadline.is_some_and(|d| clock() >= d) {
+                report.deferred = store.transact(|tx| {
+                    Ok(tx
+                        .action_intents()?
+                        .into_iter()
+                        .filter(|i| {
+                            outstanding(i) && !examined.contains(&i.action_id) && in_scope(i)
+                        })
+                        .map(|i| i.action_id)
+                        .collect())
+                })?;
+                break;
+            }
+            let next = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| outstanding(i) && !examined.contains(&i.action_id) && in_scope(i)))
+            })?;
+            let Some(intent) = next else { break };
+            let action_id = intent.action_id.clone();
+            examined.insert(action_id.clone());
+            // Not this instance's intent: leave it outstanding for the
+            // adapter bound to the recorded host — reconciliation
+            // never migrates an effect across host instances.
+            if self
+                .bound_host
+                .as_ref()
+                .is_some_and(|bound| *bound != intent.host)
+            {
+                continue;
+            }
+            report.examined += 1;
+            let work_id = intent.work_id.clone();
+            let execution_id = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(&work_id)?
+                    .into_iter()
+                    .max_by_key(|execution| execution.ordinal)
+                    .map(|execution| execution.id))
+            })?;
+            let obs = |fact: ObservationFact| Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: execution_id.clone(),
+                fact,
+                observed_unix_seconds: now,
+            };
+            let receipt = |status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
+                ObservationFact::HostActionResult {
+                    action_id: action_id.clone(),
+                    // The reconciliation read does not authenticate an
+                    // actor; `None` records exactly that.
+                    authenticated_actor: None,
+                    status,
+                    effects,
+                }
+            };
+            match self.observe_effect(store, &intent)? {
+                RemoteEffect::Present { fact } => {
+                    self.ingest(
+                        store,
+                        config,
+                        obs(receipt(HostActionStatus::Applied, vec![*fact])),
+                        now,
+                    )?;
+                }
+                RemoteEffect::Absent { reason } => {
+                    // Absence settles only an intent that already
+                    // carries a verdict: `unknown` becomes `failed` — a
+                    // definite no-effect outcome. A `pending` intent is
+                    // possibly never attempted, so absence is not
+                    // evidence of failure and the write drain's guarded
+                    // attempt arbitrates instead.
+                    if matches!(intent.status, HostActionStatus::Unknown { .. }) {
+                        self.ingest(
+                            store,
+                            config,
+                            obs(receipt(HostActionStatus::Failed { reason }, vec![])),
+                            now,
+                        )?;
+                    }
+                }
+                RemoteEffect::Indeterminate { reason } => {
+                    // Update the record when the read's explanation
+                    // moved; an unchanged reason needs no new receipt,
+                    // and a `pending` intent stays untouched — the
+                    // write drain's pre-write read records `unknown`.
+                    if let HostActionStatus::Unknown { reason: recorded } = &intent.status
+                        && recorded != &reason
+                    {
+                        self.ingest(
+                            store,
+                            config,
+                            obs(receipt(HostActionStatus::Unknown { reason }, vec![])),
+                            now,
+                        )?;
+                    }
+                }
+            }
+            let status = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })?;
+            match status {
+                Some(HostActionStatus::Applied) => report.applied += 1,
+                Some(HostActionStatus::Failed { .. }) => report.failed += 1,
+                Some(HostActionStatus::Unknown { .. }) => report.still_unknown += 1,
+                _ => {}
+            }
         }
-        Ok(crate::fixture::ReconcileReport::default())
-    }
-
-    fn any_outstanding_intents(
-        &self,
-        store: &impl Store,
-        scope: Option<&WorkId>,
-    ) -> Result<bool, StoreError> {
-        store.transact(|tx| {
-            Ok(tx.action_intents()?.into_iter().any(|intent| {
-                let applicable = self
-                    .bound_host
-                    .as_ref()
-                    .is_none_or(|bound| *bound == intent.host);
-                let scoped = scope.is_none_or(|work_id| intent.work_id == *work_id);
-                let outstanding = matches!(
-                    intent.status,
-                    HostActionStatus::Pending | HostActionStatus::Unknown { .. }
-                );
-                applicable && scoped && outstanding
-            }))
-        })
+        Ok(report)
     }
 
     /// Deliver one webhook. The event's own fact is recorded under its
@@ -1496,13 +1709,287 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Ok(resolved)
     }
 
+    /// The read-only half of effect reconciliation and the pre-write
+    /// check: compare `intent`'s recorded effect against the remote's
+    /// current state and report presence, definitive absence, or
+    /// indeterminacy. Performs no mutation; every `Present` carries
+    /// the normalized fact a fresh read derives.
+    ///
+    /// Absence is status-aware: a `pending` intent may simply never
+    /// have been attempted, so "not observed" is not evidence of
+    /// failure — for `open_change_request` a pull whose head moved
+    /// past the recorded source revision cannot be told apart from
+    /// never-created, and for `update_change_request` fields that do
+    /// not match cannot be told apart from a racing overwrite. Both
+    /// stay `Indeterminate` for an `unknown` intent rather than
+    /// authorizing a blind second write; a `pending` intent proceeds
+    /// to the guarded write, whose own preconditions arbitrate.
+    fn observe_effect(
+        &mut self,
+        store: &impl Store,
+        intent: &HostActionIntent,
+    ) -> Result<RemoteEffect, StoreError> {
+        let pending = intent.status == HostActionStatus::Pending;
+        match &intent.action {
+            HostAction::PushRef {
+                branch, produced, ..
+            } => {
+                let head = match self.client.read_branch(&intent.repository, branch) {
+                    Ok(head) => head,
+                    Err(_) => {
+                        return Ok(RemoteEffect::Indeterminate {
+                            reason: "branch read failed".into(),
+                        });
+                    }
+                };
+                let Some(head) = head else {
+                    return Ok(RemoteEffect::Absent {
+                        reason: "reconciled: the branch is absent".into(),
+                    });
+                };
+                if head == produced.object {
+                    return Ok(RemoteEffect::Present {
+                        fact: Box::new(NormalizedEffectFact::RefPublished {
+                            repository: intent.repository.clone(),
+                            branch: branch.clone(),
+                            produced: produced.clone(),
+                            observed: produced.clone(),
+                            relation: RefRelation::Equal,
+                        }),
+                    });
+                }
+                match self
+                    .client
+                    .contains_revision(&intent.repository, &produced.object, &head)
+                {
+                    Ok(true) => {
+                        let observed = CommitRevision::new(intent.repository.clone(), head)
+                            .map_err(|detail| StoreError::Internal { detail })?;
+                        Ok(RemoteEffect::Present {
+                            fact: Box::new(NormalizedEffectFact::RefPublished {
+                                repository: intent.repository.clone(),
+                                branch: branch.clone(),
+                                produced: produced.clone(),
+                                observed,
+                                relation: RefRelation::Ancestor,
+                            }),
+                        })
+                    }
+                    Ok(false) => Ok(RemoteEffect::Absent {
+                        reason: "reconciled: the branch does not contain the produced revision"
+                            .into(),
+                    }),
+                    // The ancestry read failed: the outcome cannot be
+                    // established — `unknown` and outstanding, never a
+                    // guess.
+                    Err(_) => Ok(RemoteEffect::Indeterminate {
+                        reason: "ancestry read failed".into(),
+                    }),
+                }
+            }
+            HostAction::OpenChangeRequest {
+                source_branch,
+                target_branch,
+                title,
+                body,
+            } => {
+                // Identify the effect by what this Work recorded when
+                // it issued the open — the source revision of its own
+                // applied push plus the intent's own payload. Neither
+                // the branch nor the revision alone identifies the
+                // effect: a foreign change can sit at the recorded
+                // revision, and a pull's head follows its source
+                // branch, so our own open can move past it. With no
+                // recorded push the intent stays indeterminate —
+                // branch identity alone never adopts somebody else's
+                // change.
+                let Some(source_revision) = recorded_source_revision(store, intent, source_branch)?
+                else {
+                    return Ok(RemoteEffect::Indeterminate {
+                        reason: "no recorded push identifies the source revision".into(),
+                    });
+                };
+                let pulls = match self.client.list_pulls_on_branch(
+                    &intent.repository,
+                    source_branch,
+                    &source_revision.object,
+                ) {
+                    Ok(pulls) => pulls,
+                    Err(_) => {
+                        return Ok(RemoteEffect::Indeterminate {
+                            reason: "change-request listing failed".into(),
+                        });
+                    }
+                };
+                match pulls.iter().find(|pull| {
+                    pull.target_branch == *target_branch
+                        && pull.title == *title
+                        && pull.body == *body
+                }) {
+                    Some(pull) => {
+                        let change = ChangeRequestRef {
+                            repository: intent.repository.clone(),
+                            change_request: ChangeRequestId::trusted(pull.id.clone()),
+                            display_number: Some(pull.display_number),
+                        };
+                        let head =
+                            CommitRevision::new(intent.repository.clone(), pull.head_sha.clone())
+                                .map_err(|detail| StoreError::Internal { detail })?;
+                        Ok(RemoteEffect::Present {
+                            fact: Box::new(NormalizedEffectFact::ChangeOpened {
+                                change,
+                                head,
+                                source_branch: source_branch.clone(),
+                                target_branch: target_branch.clone(),
+                            }),
+                        })
+                    }
+                    None => Ok(if pending {
+                        // No recorded attempt yet: the guarded create
+                        // arbitrates — the host's own duplicate refusal
+                        // covers the landed-then-moved-head residue.
+                        RemoteEffect::Absent {
+                            reason: "reconciled: no matching change request".into(),
+                        }
+                    } else {
+                        // A matching change may exist with a moved
+                        // head: `unknown` stays outstanding, never a
+                        // failed claim or an adoption of somebody
+                        // else's change.
+                        RemoteEffect::Indeterminate {
+                            reason: "no change request matches the recorded revision and payload"
+                                .into(),
+                        }
+                    }),
+                }
+            }
+            HostAction::UpdateChangeRequest {
+                change,
+                expected_head,
+                title,
+                body,
+            } => {
+                let pull = match self
+                    .client
+                    .read_pull(&intent.repository, &change.change_request)
+                {
+                    Ok(pull) => pull,
+                    Err(_) => {
+                        return Ok(RemoteEffect::Indeterminate {
+                            reason: "change-request read failed".into(),
+                        });
+                    }
+                };
+                // The head guard is part of the effect's contract: a
+                // moved head means the guarded write would abort, so
+                // matching fields cannot confirm this intent's write —
+                // a racing overwrite sets the same fields. A `pending`
+                // intent proceeds to the guarded write, whose own
+                // re-read records the honest `failed` verdict and the
+                // fresh position; an `unknown` intent stays
+                // outstanding rather than claim a success it cannot
+                // prove.
+                if pull.head_sha != expected_head.object {
+                    return Ok(if pending {
+                        RemoteEffect::Absent {
+                            reason: "reconciled: the change head moved past the recorded guard"
+                                .into(),
+                        }
+                    } else {
+                        RemoteEffect::Indeterminate {
+                            reason: "the change head moved; the guarded write's outcome cannot be confirmed"
+                                .into(),
+                        }
+                    });
+                }
+                // The update's post-condition: every field the intent
+                // carried is what the remote now stores. Omitted fields
+                // are unconstrained — a PATCH never rewrites them.
+                let applied = title.as_ref().is_none_or(|t| &pull.title == t)
+                    && body.as_ref().is_none_or(|b| &pull.body == b);
+                if !applied {
+                    return Ok(if pending {
+                        RemoteEffect::Absent {
+                            reason: "reconciled: stored fields differ from the recorded payload"
+                                .into(),
+                        }
+                    } else {
+                        // Fields that do not match are undecidable (our
+                        // write landing versus a racing overwrite): the
+                        // intent stays `unknown` and outstanding.
+                        RemoteEffect::Indeterminate {
+                            reason: "stored fields differ from the recorded payload".into(),
+                        }
+                    });
+                }
+                let fields_digest = sha256_hex(
+                    "change-meta-v1",
+                    &canonical_json(&serde_json::json!({
+                        "title": pull.title,
+                        "body": pull.body,
+                    })),
+                );
+                Ok(RemoteEffect::Present {
+                    fact: Box::new(NormalizedEffectFact::MetadataUpdated {
+                        change: change.clone(),
+                        head: expected_head.clone(),
+                        fields_digest,
+                    }),
+                })
+            }
+            HostAction::PostComment { change, marker, .. } => {
+                match self
+                    .client
+                    .find_comment(&intent.repository, &change.change_request, marker)
+                {
+                    Err(_) => Ok(RemoteEffect::Indeterminate {
+                        reason: "comment listing failed".into(),
+                    }),
+                    Ok(Some(comment)) => {
+                        let body_digest = sha256_hex(
+                            "comment-v1",
+                            &canonical_json(&serde_json::json!({
+                                "body": comment.body,
+                            })),
+                        );
+                        Ok(RemoteEffect::Present {
+                            fact: Box::new(NormalizedEffectFact::CommentPosted {
+                                change: change.clone(),
+                                comment_id: comment.comment_id,
+                                actor: intent.actor.clone(),
+                                marker: marker.clone(),
+                                body_digest,
+                                target: None,
+                            }),
+                        })
+                    }
+                    // A full listing that finds no marker is a
+                    // definite no-effect read — for `unknown` it
+                    // settles `failed`; for `pending` the guarded
+                    // write proceeds.
+                    Ok(None) => Ok(RemoteEffect::Absent {
+                        reason: "reconciled: no comment with the marker".into(),
+                    }),
+                }
+            }
+            // Outside the declared capability set: never attempted,
+            // so there is no remote effect to observe.
+            HostAction::PublishReviewFeedback { .. }
+            | HostAction::ReplyToThread { .. }
+            | HostAction::ResolveThread { .. }
+            | HostAction::MarkReady { .. } => Ok(RemoteEffect::Indeterminate {
+                reason: "operation has no remote read-back".into(),
+            }),
+        }
+    }
+
     fn attempt(
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
         intent: HostActionIntent,
         now: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<AttemptOutcome, StoreError> {
         // Not this instance's intent: leave it pending for the adapter
         // bound to the recorded host — an effect never migrates across
         // host instances. It is not a real attempt, so it never
@@ -1512,7 +1999,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             .as_ref()
             .is_some_and(|bound| *bound != intent.host)
         {
-            return Ok(());
+            return Ok(AttemptOutcome::Skipped("host_mismatch"));
         }
         let work_id = intent.work_id.clone();
         let execution = store.transact(|tx| {
@@ -1522,10 +2009,10 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 .max_by_key(|execution| execution.ordinal))
         })?;
         let Some(execution) = execution else {
-            return Ok(());
+            return Ok(AttemptOutcome::Skipped("missing_execution"));
         };
         if !execution.allowed_effects.host_write {
-            return Ok(());
+            return Ok(AttemptOutcome::Skipped("host_write_denied"));
         }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {
@@ -1562,7 +2049,48 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 )),
                 now,
             )?;
-            return Ok(());
+            return Ok(AttemptOutcome::Attempted);
+        }
+
+        // Reconcile-before-write: an intent whose effect the remote
+        // already shows settles from the read — the receipt a crash
+        // dropped is recovered, and the write is never re-executed to
+        // discover whether it happened. An indeterminate read keeps
+        // the intent outstanding rather than authorizing a second
+        // write; only a definitive absence proceeds to the guarded
+        // write below. The read never authenticates an actor, so the
+        // receipt carries `authenticated_actor: None` — the same
+        // record `reconcile_outstanding` writes.
+        match self.observe_effect(store, &intent)? {
+            RemoteEffect::Present { fact } => {
+                self.ingest(
+                    store,
+                    config,
+                    obs(ObservationFact::HostActionResult {
+                        action_id: intent.action_id.clone(),
+                        authenticated_actor: None,
+                        status: HostActionStatus::Applied,
+                        effects: vec![*fact],
+                    }),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
+            RemoteEffect::Indeterminate { reason } => {
+                self.ingest(
+                    store,
+                    config,
+                    obs(ObservationFact::HostActionResult {
+                        action_id: intent.action_id.clone(),
+                        authenticated_actor: None,
+                        status: HostActionStatus::Unknown { reason },
+                        effects: vec![],
+                    }),
+                    now,
+                )?;
+                return Ok(AttemptOutcome::Attempted);
+            }
+            RemoteEffect::Absent { .. } => {}
         }
 
         match &intent.action {
@@ -1600,7 +2128,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                         )),
                                         now,
                                     )?;
-                                    return Ok(());
+                                    return Ok(AttemptOutcome::Attempted);
                                 }
                             };
                         self.applied.push(format!(
@@ -1635,7 +2163,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                             )),
                                             now,
                                         )?;
-                                        return Ok(());
+                                        return Ok(AttemptOutcome::Attempted);
                                     }
                                 };
                                 (
@@ -1828,13 +2356,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                             )),
                             now,
                         )?;
-                        return Ok(());
+                        return Ok(AttemptOutcome::Attempted);
                     }
                     Err(ApiError::Unknown { .. }) => {
                         // The guard read itself is indeterminate: no
                         // write ran, so the intent stays `pending` for
                         // the next pass — never a fabricated result.
-                        return Ok(());
+                        return Ok(AttemptOutcome::Attempted);
                     }
                 };
                 if fresh.head_sha != expected_head.object {
@@ -1865,7 +2393,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         }),
                         now,
                     )?;
-                    return Ok(());
+                    return Ok(AttemptOutcome::Attempted);
                 }
                 match self.client.update_pull(
                     &intent.repository,
@@ -1952,9 +2480,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                             )),
                             now,
                         )?;
-                        return Ok(());
+                        return Ok(AttemptOutcome::Attempted);
                     }
-                    Err(ApiError::Unknown { .. }) => return Ok(()),
+                    Err(ApiError::Unknown { .. }) => return Ok(AttemptOutcome::Attempted),
                 };
                 if fresh.head_sha != expected_head.object {
                     // Abort before writing: failed receipt plus the
@@ -1983,7 +2511,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         }),
                         now,
                     )?;
-                    return Ok(());
+                    return Ok(AttemptOutcome::Attempted);
                 }
                 match self.client.comment_on_pull(
                     &intent.repository,
@@ -2054,7 +2582,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             | HostAction::ResolveThread { .. }
             | HostAction::MarkReady { .. } => {}
         }
-        Ok(())
+        Ok(AttemptOutcome::Attempted)
     }
 }
 
@@ -2134,6 +2662,29 @@ fn review_fact_token(completeness: &Completeness, occurrences: &[OccurrenceInput
             "occurrences": material,
         })),
     )
+}
+
+/// What one read-only comparison of an intent's recorded effect
+/// against the remote establishes — the tri-state every reconcile
+/// verdict and every pre-write check reduces to. Unlike the
+/// fixture's counterpart, the production read never authenticates
+/// an actor: receipts built from it carry
+/// `authenticated_actor: None`, exactly like
+/// [`GitHubAdapter::reconcile_outstanding`].
+enum RemoteEffect {
+    /// The remote shows the effect the intent recorded, with the
+    /// normalized fact a receipt reports.
+    Present { fact: Box<NormalizedEffectFact> },
+    /// The remote definitively shows the effect did not land;
+    /// `reason` is the `failed` receipt text an `unknown` intent
+    /// settles with. A `pending` intent treats absence as
+    /// "possibly never attempted" and proceeds to the guarded
+    /// write instead.
+    Absent { reason: String },
+    /// The read establishes neither presence nor absence — the
+    /// intent stays outstanding rather than authorizing a blind
+    /// second write.
+    Indeterminate { reason: String },
 }
 
 /// The source revision an `open_change_request` was issued against:
