@@ -578,7 +578,10 @@ fn run_named_probe(
                 if trimmed.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", &trimmed[..trimmed.len().min(200)])
+                    // Bound by characters: a byte slice can split a
+                    // multibyte codepoint and panic on worker output.
+                    let bounded: String = trimmed.chars().take(200).collect();
+                    format!(": {bounded}")
                 }
             }),
         ),
@@ -990,6 +993,35 @@ mod tests {
             extra_rw_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
         }
+    }
+
+    /// A failed probe's detail is bounded by characters, never by a
+    /// raw byte slice — worker output whose bound lands inside a
+    /// multibyte codepoint must not panic the battery.
+    #[test]
+    fn a_probe_detail_truncates_on_a_character_boundary() {
+        let port = ScriptedProcessControl::new();
+        let mut stdout = b"a".repeat(199);
+        stdout.extend_from_slice("あいうえお".as_bytes());
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            success: false,
+            stdout,
+        }));
+        let mut records = Vec::new();
+        run_named_probe(
+            &port,
+            Path::new("/usr/bin/bwrap"),
+            &plan_fixture(),
+            &["true".into()],
+            "/workspace",
+            &WorkerEnv::default(),
+            Path::new("/host"),
+            "p",
+            &mut records,
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].passed);
+        assert!(records[0].detail.contains('あ'), "{:?}", records[0].detail);
     }
 
     #[test]

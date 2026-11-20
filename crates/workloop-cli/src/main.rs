@@ -1551,12 +1551,15 @@ fn run(cli: Cli) -> i32 {
                     &e.to_string(),
                 ))
             };
+            // Catalogue paths resolve against the bodies root: every
+            // retain writes under `<state_root>/bodies`.
+            let bodies_root = state_root.join("bodies");
             match command {
                 RetentionCommands::Report => {
                     let as_of = store.transact_deferred(|tx| tx.last_seq()).ok();
                     match store.retention_report(
                         &category_settings,
-                        &state_root,
+                        &bodies_root,
                         &installation_files(&db_abs, &config_path),
                         now(),
                     ) {
@@ -1585,7 +1588,7 @@ fn run(cli: Cli) -> i32 {
                         return match store.reclaim_plan_candidates(
                             &category_settings,
                             &bounds,
-                            &state_root,
+                            &bodies_root,
                             &protected,
                             now(),
                         ) {
@@ -1638,7 +1641,7 @@ fn run(cli: Cli) -> i32 {
                     let plan = match store.reclaim_plan_create(
                         &category_settings,
                         &bounds,
-                        &state_root,
+                        &bodies_root,
                         &protected,
                         now(),
                     ) {
@@ -1647,7 +1650,7 @@ fn run(cli: Cli) -> i32 {
                     };
                     match store.reclaim_plan_execute(
                         &category_settings,
-                        &state_root,
+                        &bodies_root,
                         &protected,
                         retention.delete_error_limit,
                         now(),

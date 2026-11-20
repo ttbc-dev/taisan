@@ -976,7 +976,16 @@ pub fn run_pass<H: HostDriver>(
                             delete_error_limit: r.delete_error_limit,
                             protected: pass.settings.protected_paths.clone(),
                         };
-                        let result = pass.store.retention_sweep(&params, pass.state_root, now);
+                        // Catalogue paths resolve against the bodies
+                        // root — every retain writes under
+                        // `<state_root>/bodies`, so resolving against
+                        // the state root itself would call every
+                        // present body missing.
+                        let result = pass.store.retention_sweep(
+                            &params,
+                            &pass.state_root.join("bodies"),
+                            now,
+                        );
                         push!(match result {
                             Ok(report) => retention_phase(report),
                             Err(e) => PhaseReport::failed(name, e),
@@ -1844,6 +1853,58 @@ mod tests {
             "the retention sweep crossed the deadline: {:?}",
             report.phases
         );
+    }
+
+    /// The sweep resolves catalogue paths against the bodies root —
+    /// every retain writes under `<state_root>/bodies`. Resolving
+    /// against the state root itself would call every present body
+    /// missing and report a reclaim while the real file leaks.
+    #[test]
+    fn the_retention_sweep_reclaims_bodies_under_the_bodies_root() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let state_root = pass_state_root();
+        let bodies = state_root.join("bodies");
+        std::fs::create_dir_all(&bodies).unwrap();
+        let body_path = bodies.join("dead.blob");
+        std::fs::write(&body_path, b"stale payload").unwrap();
+        store
+            .register_body(&workloop_store::retention::CatalogBody {
+                body_id: "dead".into(),
+                category: "cas".into(),
+                path: "dead.blob".into(),
+                bytes: 13,
+                registered_unix_seconds: NOW - 100,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+
+        let mut host = FixtureGithub::new();
+        let settings = settings();
+        let report = run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: state_root.as_path(),
+            },
+            None,
+            &mut || NOW,
+            &|| false,
+        );
+        assert_eq!(
+            report.phases[6].status, "completed",
+            "{:?}",
+            report.phases[6]
+        );
+        assert!(
+            !body_path.exists(),
+            "the eligible body under <state_root>/bodies is reclaimed"
+        );
+        let (state, _, _) = store.body_state("dead").unwrap().unwrap();
+        assert_eq!(state, "reclaimed");
     }
 
     /// Attention derivation always runs and never consults the deadline
