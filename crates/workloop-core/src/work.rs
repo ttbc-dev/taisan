@@ -4167,12 +4167,17 @@ fn record_intent(
 }
 
 /// The revision `push_ref` must publish for `invocation`: the produced
-/// commit the newest acknowledged handoff names, or — for an
-/// invocation with no handoff rows at all — the first recorded
+/// commit the newest acknowledged handoff names, or — for a v1
+/// invocation that can never grow a handoff row — the first recorded
 /// artifact digest (the only produced identity non-git artifact
 /// worlds carry). `None` when handoff rows exist but none is
-/// acknowledged yet: the produced commit is not yet durable, and the
-/// acknowledgement's claim check re-drives this stage.
+/// acknowledged yet, and `None` while a v2 invocation has no rows at
+/// all: the row is written by the handoff drive after the exit fact
+/// lands, so an empty row set at that moment means pending, never
+/// absent — falling back would publish the payload digest (a byte
+/// hash, not a git object) as the produced commit. The
+/// acknowledgement's claim check re-drives this stage once the row
+/// is durable.
 fn produced_revision(
     tx: &dyn ReadView,
     invocation: &Invocation,
@@ -4200,6 +4205,12 @@ fn produced_revision(
         // Handoff rows exist but none is acknowledged: wait for the
         // sweep's claim check to re-drive publication.
         (true, None) => None,
+        // A v2 invocation always grows a handoff row after the exit
+        // fact — no rows yet is the pending window between finish and
+        // the handoff drive, not a non-git world. Only a legacy v1
+        // dispatch (no request body row) publishes the recorded
+        // digest token.
+        (false, _) if tx.worker_request_body(&invocation.request_id)?.is_some() => None,
         (false, _) => artifact_digests.first().cloned(),
     })
 }
