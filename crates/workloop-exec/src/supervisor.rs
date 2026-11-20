@@ -591,6 +591,19 @@ impl ProcessControlPort for PosixProcessControl {
         }
         let mut out = Vec::new();
         for (pid, cwd) in occupants {
+            // `cwd_within` canonicalizes the reported path and treats
+            // an unresolvable cwd as "not inside" — but a reported
+            // path spelled inside `dir` cannot be proven outside it
+            // either (a live writer whose cwd was deleted). `mapped`
+            // already holds the pid, so skipping it here would slip
+            // it past the completeness gate: fail the scan instead,
+            // matching the same fail-closed contract.
+            if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
+                return Err(format!(
+                    "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                    cwd.display()
+                ));
+            }
             if !cwd_within(Some(&cwd), &dir) {
                 continue;
             }
