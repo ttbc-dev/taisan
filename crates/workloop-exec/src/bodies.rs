@@ -101,6 +101,23 @@ impl From<StoreError> for BodyError {
     }
 }
 
+/// fsync one just-written file so its bytes survive a crash before
+/// the rename that publishes it.
+fn sync_file(path: &Path) -> Result<(), BodyError> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| BodyError::Fault(format!("sync {}: {e}", path.display())))
+}
+
+/// fsync a directory so a rename into it survives a crash: file data
+/// without the directory entry is unreachable, and the entry without
+/// file data is a corrupt body the next resolve refuses on.
+pub(crate) fn fsync_dir(dir: &Path) -> Result<(), BodyError> {
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| BodyError::Fault(format!("sync dir {}: {e}", dir.display())))
+}
+
 /// The CAS root: `<root>/<path>` files plus the catalogue rows that
 /// describe them. One instance per installation state root.
 #[derive(Debug, Clone)]
@@ -184,10 +201,14 @@ impl BodyStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Write-then-rename so a concurrent reader never sees a
                 // partial body; a same-bytes racer renames over an
-                // identical file harmlessly.
+                // identical file harmlessly. The file is fsynced
+                // before the rename and the directory after it, so a
+                // crash cannot leave the catalogue pointing at bytes
+                // the disk never saw.
                 let tmp = file.with_extension("tmp");
                 std::fs::write(&tmp, bytes)
                     .map_err(|e| BodyError::Fault(format!("write {}: {e}", tmp.display())))?;
+                sync_file(&tmp)?;
                 if let Err(e) = std::fs::rename(&tmp, &file) {
                     let _ = std::fs::remove_file(&tmp);
                     // A same-content racer may have won the rename;
@@ -206,6 +227,12 @@ impl BodyStore {
             Err(e) => {
                 return Err(BodyError::Fault(format!("read {}: {e}", file.display())));
             }
+        }
+        // The rename is only durable once the containing directory is
+        // synced — an existing-file reuse needed no rename, but the
+        // sync is harmless and keeps the publish path uniform.
+        if let Some(parent) = file.parent() {
+            fsync_dir(parent)?;
         }
         // A lookup path is single-tenant: if the catalogue already binds
         // this `(category, path)` to different content, the deterministic
@@ -398,6 +425,7 @@ impl BodyStore {
                 detail: "materialized bytes differ from the resolved body".into(),
             });
         }
+        sync_file(&tmp)?;
         std::fs::rename(&tmp, &dest).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             BodyError::Fault(format!("rename input {}: {e}", dest.display()))
@@ -408,6 +436,9 @@ impl BodyStore {
         perms.set_mode(0o444);
         std::fs::set_permissions(&dest, perms)
             .map_err(|e| BodyError::Fault(format!("chmod input {}: {e}", dest.display())))?;
+        if let Some(parent) = dest.parent() {
+            fsync_dir(parent)?;
+        }
         Ok(dest)
     }
 }

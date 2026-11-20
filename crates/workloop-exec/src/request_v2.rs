@@ -693,13 +693,23 @@ pub fn build_request_body(
                                 ),
                             }));
                         };
+                        // The wire `digest` binds the finding's content
+                        // identity; an occurrence the review source
+                        // recorded without one has nothing immutable to
+                        // bind — refuse rather than substitute the
+                        // source key into a digest field.
+                        let Some(content_digest) = occurrence.content_digest.clone() else {
+                            return Err(refusal(DispatchRefusal::FindingMissing {
+                                detail: format!(
+                                    "judgment {} selects occurrence {} which carries no content digest",
+                                    judgment.id, decision.occurrence_id
+                                ),
+                            }));
+                        };
                         findings.push(workloop_core::worker_v2::FindingOccurrenceRef {
                             occurrence: occurrence.id.clone(),
                             source: occurrence.source_key.clone(),
-                            digest: occurrence
-                                .content_digest
-                                .clone()
-                                .unwrap_or_else(|| occurrence.source_key.clone()),
+                            digest: content_digest,
                             order: order as u64,
                         });
                     }
@@ -1161,6 +1171,13 @@ pub fn materialize_invocation_io(
             let _ = std::fs::remove_file(&tmp);
             return Err(mat_fault("request file write verification failed"));
         }
+        // fsync before the rename and the directory after it: the
+        // durable body row is the source of truth, but a crash that
+        // loses the materialized file must never leave a partial or
+        // missing request.json the next pass would trust.
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| mat_fault(format!("sync {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &request_path)
             .map_err(|e| mat_fault(format!("rename {}: {e}", request_path.display())))?;
         let mut perms = std::fs::metadata(&request_path)
@@ -1169,6 +1186,7 @@ pub fn materialize_invocation_io(
         perms.set_mode(0o444);
         std::fs::set_permissions(&request_path, perms)
             .map_err(|e| mat_fault(format!("chmod {}: {e}", request_path.display())))?;
+        crate::bodies::fsync_dir(&dir).map_err(|e| mat_fault(e.to_string()))?;
     }
 
     // Continuation refs: a required body that does not resolve is a

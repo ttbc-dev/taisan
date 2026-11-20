@@ -11,7 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, CommandRequest};
+use workloop_core::command::{
+    CommandBody, CommandDecision, CommandEffect, CommandRequest, FindingChoice, FindingDecision,
+};
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
@@ -564,6 +566,69 @@ fn failed_verification(store: &SqliteStore, artifact_id: &str, produced: &str) {
         .unwrap();
 }
 
+/// Seal a review round on the Work's current diff target and record
+/// the exact-set judgment a review-origin Fix binds. `occurrences`
+/// are `(source_key, content_digest)` pairs — `None` mirrors a review
+/// source that recorded no content identity; `fix_indices` selects
+/// which occurrences the judgment marks for repair.
+fn judged_round(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    target: &workloop_core::identity::DiffTarget,
+    occurrences: &[(&str, Option<&str>)],
+    fix_indices: &[usize],
+) {
+    store
+        .transact(|tx| {
+            let round_seq = tx.alloc_seq()?;
+            let judgment_seq = tx.alloc_seq()?;
+            let round = ReviewRound {
+                id: "round-1".into(),
+                work_id: work_id.clone(),
+                target: target.clone(),
+                source: "reviewer".into(),
+                source_revision: None,
+                completeness: "complete".into(),
+                set_digest: "set-1".into(),
+                generation: 0,
+                seq: round_seq,
+            };
+            let occurrences: Vec<FindingOccurrence> = occurrences
+                .iter()
+                .enumerate()
+                .map(|(i, (key, digest))| FindingOccurrence {
+                    id: format!("occ-{}", i + 1),
+                    round_id: round.id.clone(),
+                    source_key: (*key).to_string(),
+                    content_digest: digest.map(|d| d.to_string()),
+                    severity: None,
+                    position: None,
+                    thread_id: None,
+                })
+                .collect();
+            let judgment = RoundJudgment {
+                id: "jdg-1".into(),
+                work_id: work_id.clone(),
+                round_id: round.id.clone(),
+                set_digest: round.set_digest.clone(),
+                decisions: fix_indices
+                    .iter()
+                    .map(|i| FindingDecision {
+                        occurrence_id: format!("occ-{}", i + 1),
+                        choice: FindingChoice::Fix,
+                        rationale: None,
+                    })
+                    .collect(),
+                actor_id: "reviewer".into(),
+                seq: judgment_seq,
+            };
+            tx.apply(&Effect::InsertReviewRound { round, occurrences })?;
+            tx.apply(&Effect::InsertRoundJudgment { judgment })?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// Open the Work's change request and record the head evidence that
 /// makes it the current accepted diff target: an applied
 /// `open_change_request` intent, its matching receipt, and the latest
@@ -745,6 +810,15 @@ fn coding_dispatch_materializes_the_request_and_per_invocation_io() {
         invocation_state(&store, &rid),
         Some(InvocationState::Done),
         "the clean-exit worker resolves Done"
+    );
+    // Done is only reachable through the recorded process identity:
+    // the launch committed `process_identity`/`descendants` with the
+    // spawn, and every exit observation inspected that identity — a
+    // v2 launch that lost its identity record could never resolve.
+    let resolved = invocation_for(&store, &rid).expect("resolved invocation");
+    assert!(
+        resolved.process_identity.is_some(),
+        "the v2 launch recorded its process identity"
     );
     assert!(
         !io_dir.exists(),
@@ -1038,6 +1112,130 @@ fn a_fix_without_durable_evidence_refuses_dispatch() {
     let refusals = dispatch_refusals(&store, &w);
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert_eq!(refusals[0].0, "request.evidence_missing");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+/// The accepted diff target every review-bound role shares: the
+/// opened change plus its latest head, exactly as `current_target`
+/// reconstructs it from the recorded observations.
+fn current_diff_target(
+    change: &ChangeRequestRef,
+    head: &CommitRevision,
+) -> workloop_core::identity::DiffTarget {
+    workloop_core::identity::DiffTarget {
+        change: change.clone(),
+        head: head.clone(),
+        base: None,
+        target_revision: None,
+    }
+}
+
+#[test]
+fn a_review_origin_fix_binds_the_judged_findings() {
+    let root = tmp_root("fix-review");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-fixreview", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), produced.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
+    let digest = "ab".repeat(32);
+    judged_round(
+        &store,
+        &w,
+        &current_diff_target(&change, &head),
+        &[("find-1", Some(digest.as_str())), ("find-2", None)],
+        &[0],
+    );
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Fix,
+        serde_json::json!({}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
+    let TaskBody::Fix { origin, .. } = &wire.task else {
+        panic!("expected fix task: {:?}", wire.task)
+    };
+    let FixOrigin::Review {
+        target,
+        round,
+        judgment,
+        findings,
+    } = origin.as_ref()
+    else {
+        panic!("expected review origin: {origin:?}")
+    };
+    assert_eq!(round, "round-1");
+    assert_eq!(judgment, "jdg-1");
+    assert_eq!(target.change, "cr-1");
+    assert_eq!(target.head, produced);
+    assert_eq!(findings.len(), 1, "only the Fix-judged occurrence binds");
+    assert_eq!(findings[0].occurrence, "occ-1");
+    assert_eq!(findings[0].source, "find-1");
+    assert_eq!(findings[0].digest, digest);
+    assert_eq!(findings[0].order, 0);
+}
+
+#[test]
+fn a_fix_whose_selected_finding_lacks_a_content_digest_refuses_dispatch() {
+    let root = tmp_root("fix-nodigest");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-fixnodigest", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), produced.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
+    // The review source recorded the finding without a content
+    // digest: there is no immutable content identity for the request
+    // to bind, so dispatch refuses rather than fabricate one.
+    judged_round(
+        &store,
+        &w,
+        &current_diff_target(&change, &head),
+        &[("find-1", None)],
+        &[0],
+    );
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Fix,
+        serde_json::json!({}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.finding_missing");
     assert!(invocation_for(&store, &rid1).is_none());
     assert!(!pending_ids(&store).contains(&rid1));
 }
