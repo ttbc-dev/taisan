@@ -2486,19 +2486,29 @@ fn pause_for_repair(
     // act on it. It is due immediately; the firing guards decide
     // whether it ever consumes — an explicit hold keeps it `pending`,
     // unmet prerequisites hold it, terminal evidence retires it.
-    let work = tx
-        .work(&execution.work_id)?
-        .ok_or_else(|| StoreError::Internal {
-            detail: "execution without work".into(),
-        })?;
-    schedule_recovery_intent(
-        tx,
-        &work,
-        Some(&execution.id),
-        "requeue",
-        now_unix_seconds,
-        classification,
-    )?;
+    // Dedupe parity with the `retry` guard: one pending `requeue` per
+    // Execution, so repeated pause/resume cycles can never accumulate
+    // intents that starve the per-tick recovery budget.
+    let requeue_pending = tx.recovery_intents()?.iter().any(|i| {
+        i.execution_id.as_ref() == Some(&execution.id)
+            && i.state == RecoveryIntentState::Pending
+            && i.kind == "requeue"
+    });
+    if !requeue_pending {
+        let work = tx
+            .work(&execution.work_id)?
+            .ok_or_else(|| StoreError::Internal {
+                detail: "execution without work".into(),
+            })?;
+        schedule_recovery_intent(
+            tx,
+            &work,
+            Some(&execution.id),
+            "requeue",
+            now_unix_seconds,
+            classification,
+        )?;
+    }
     Ok(None)
 }
 
@@ -2717,6 +2727,7 @@ fn assess(
     match &obs.fact {
         ObservationFact::ProcessState {
             invocation_id,
+            process_identity,
             state,
             ..
         } => assess_process(
@@ -2724,11 +2735,12 @@ fn assess(
             config,
             &execution,
             invocation_id,
+            process_identity,
             state,
             now_unix_seconds,
         ),
         ObservationFact::LaunchRefused { invocation_id, .. } => {
-            mark_invocation(tx, invocation_id, InvocationState::Abandoned)?;
+            mark_invocation(tx, invocation_id, |_| InvocationState::Abandoned)?;
             // Definitely no process exists. lifecycle.md permits this
             // transition only from `ready`: a late refusal delivered after
             // cancel/stop (or a terminal settle) must not resurrect the
@@ -3588,17 +3600,20 @@ fn assess_check_failure(
 fn mark_invocation(
     tx: &mut dyn TxView,
     invocation_id: &InvocationId,
-    state: InvocationState,
+    state: impl Fn(&Invocation) -> InvocationState,
 ) -> Result<(), StoreError> {
     for exec in tx.nonterminal_executions()? {
         for inv in tx.invocations_for_execution(&exec.id)? {
-            if inv.id == *invocation_id && inv.state.is_unresolved_writer() && inv.state != state {
-                let mut next = inv.clone();
-                next.state = state;
-                tx.apply(&Effect::UpdateInvocation {
-                    invocation: next,
-                    expected_state: inv.state.clone(),
-                })?;
+            if inv.id == *invocation_id && inv.state.is_unresolved_writer() {
+                let next_state = state(&inv);
+                if inv.state != next_state {
+                    let mut next = inv.clone();
+                    next.state = next_state;
+                    tx.apply(&Effect::UpdateInvocation {
+                        invocation: next,
+                        expected_state: inv.state.clone(),
+                    })?;
+                }
                 return Ok(());
             }
         }
@@ -3611,6 +3626,7 @@ fn assess_process(
     config: &WorkloopConfig,
     execution: &Execution,
     invocation_id: &InvocationId,
+    reported_identity: &str,
     state: &ProcessStateFact,
     now_unix_seconds: i64,
 ) -> Result<(), StoreError> {
@@ -3640,7 +3656,20 @@ fn assess_process(
             _ => Ok(()),
         },
         ProcessStateFact::Exited => {
-            mark_invocation(tx, invocation_id, InvocationState::Done)?;
+            // A proven exit resolves the writer. An Invocation that
+            // never recorded a process identity — the launch outcome
+            // was lost before the identity commit — is `abandoned`
+            // (proven unable to write), not `done`: nothing ran to
+            // finish. The fact must also carry no identity of its own:
+            // an exit reported against a named process is evidence a
+            // writer existed.
+            mark_invocation(tx, invocation_id, |inv| {
+                if inv.process_identity.is_none() && reported_identity.is_empty() {
+                    InvocationState::Abandoned
+                } else {
+                    InvocationState::Done
+                }
+            })?;
             match execution.state {
                 // A proven exit for a still-`ready` Execution is the
                 // lost-Running-report case: the writer ran and is gone,
@@ -4942,7 +4971,9 @@ pub struct RecoveryScan {
     /// Of those, Executions settled terminal instead (spent budget or
     /// Work-wide automatic-time ceiling).
     pub failed_terminal: usize,
-    /// Intents retired because terminal evidence invalidated them.
+    /// Intents retired because recorded evidence shows they can never
+    /// fire — terminal evidence, a progressing Execution, or a missing
+    /// target.
     pub retired: usize,
     /// Intents left `pending`, with the recorded reason.
     pub held: Vec<(String, String)>,
@@ -4954,12 +4985,14 @@ pub struct RecoveryScan {
 /// One bounded recovery-scheduling pass (loop phase 6): consume due
 /// `recovery_intents` with revalidation before any firing, ≤ `limit`
 /// items per tick. A due `requeue` intent re-enters the same paused
-/// Execution only when every recorded hold still allows it; terminal
-/// evidence retires the intent instead. Intents whose hold cannot be
-/// discharged (operator decision, unmet repair prerequisite, an
-/// Execution already progressing) stay `pending` with a reason — an
-/// automatic pass never overrules an explicit hold, never guesses an
-/// unknown `kind`, and never fires an intent twice.
+/// Execution only when every recorded hold still allows it; evidence
+/// that the intent can never fire — terminal evidence, or an
+/// Execution already progressing under another path — retires it
+/// instead. Intents whose hold cannot be discharged (operator
+/// decision, unmet repair prerequisite, a pause still settling) stay
+/// `pending` with a reason — an automatic pass never overrules an
+/// explicit hold, never guesses an unknown `kind`, and never fires an
+/// intent twice.
 ///
 /// Every intent fires under its OWN store transaction (the per-Work
 /// isolation the loop design requires): a conflict on one intent's
@@ -5162,10 +5195,22 @@ fn fire_requeue_intent(
     now: i64,
 ) -> Result<FireOutcome, StoreError> {
     if execution.state != ExecutionState::Paused {
-        // Already progressing (queued/ready/running/waiting/stopping/
-        // uncertain): a manual resume or another path owns the next
-        // move. The intent stays visible and pending, never forced.
-        return Ok(FireOutcome::Held("execution_active".into()));
+        // A pause still resolving — `stopping`/`uncertain` heading for
+        // `paused` — keeps its intent: it is the schedule for the pause
+        // being settled, not a stale row. An Execution already
+        // progressing again (queued/ready/running/waiting) was resumed
+        // by another path; this intent can never fire and is retired
+        // rather than left pending to consume the per-tick recovery
+        // budget on every pass.
+        return match execution.state {
+            ExecutionState::Stopping | ExecutionState::Uncertain => {
+                Ok(FireOutcome::Held("execution_active".into()))
+            }
+            _ => {
+                retire_intent(tx, intent, "execution_progressing")?;
+                Ok(FireOutcome::Retired)
+            }
+        };
     }
     // Equivalent-failure suppression: the Work's failure budget is
     // spent, so the automatic requeue is refused and recorded as
