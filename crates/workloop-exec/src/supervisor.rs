@@ -1175,6 +1175,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             (inner_argv.to_vec(), None)
         };
+        if let Some(reason) = containment::plan_denial(&plan) {
+            return Err(reason);
+        }
         Ok((
             containment::bwrap_args(primitive, &plan, &exec_argv, inner_cwd),
             containment::contained_env(env, egress_proxy),
@@ -1213,9 +1216,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1749,7 +1752,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             {
                 continue;
             }
-            self.reconcile_or_start(store, &request, now_unix_seconds)?;
+            self.reconcile_or_start(store, &request, now_unix_seconds, clock)?;
         }
         Ok(())
     }
@@ -1759,6 +1762,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let lock = self.lock_for(&request.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1802,7 +1806,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // already consumed above replays its recorded Invocation
         // regardless of which profile is configured now.
         if self.v2.is_some() {
-            return self.start_v2(store, request, now_unix_seconds);
+            return self.start_v2(store, request, now_unix_seconds, clock);
         }
 
         // The Execution state gates the describe probe too: a request
@@ -2107,7 +2111,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
-                    workspace: Some((workspace.clone(), false)),
+                    workspace: Some((
+                        workspace.clone(),
+                        // §14.6: assessment roles bind the workspace
+                        // read-only; writers keep read-write.
+                        matches!(
+                            request.role,
+                            InvocationRole::InvariantCheck | InvocationRole::Review
+                        ),
+                    )),
                     request: None,
                     input: None,
                     out: None,
@@ -2117,9 +2129,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2220,6 +2232,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let dispatch = self
             .v2
@@ -2569,6 +2582,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Unreachable in practice — a refused gate already
                 // carried its reason through `repair_reason` — but the
                 // launch never proceeds on an unproven boundary.
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2603,6 +2617,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         ) {
             Ok(env) => env,
             Err(why) => {
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2627,9 +2642,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2640,6 +2655,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 ) {
                     Ok(contained) => contained,
                     Err(reason) => {
+                        self.release_launch_workspace(request, &workspace);
                         self.refuse_launch(
                             store,
                             request,
@@ -2659,8 +2675,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // or cancel committed during declaration, materialization, or
         // preparation still blocks the launch. The recorded Invocation
         // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > now_unix_seconds
+        // starts after authorization expires. The deadline check
+        // reads the clock again: `now_unix_seconds` is the pass
+        // timestamp `build_request_body` already validated against,
+        // so only a fresh read catches a deadline that elapsed while
+        // the launch was being prepared.
+        let authorized = wire.budget.deadline_unix_seconds > clock()
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);
@@ -2675,14 +2695,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 Ok(())
             })?;
             // Unlike the earlier gate this runs after workspace
-            // preparation: the launch scratch and any check snapshot
-            // may already exist — release them with the io tree rather
-            // than leaving orphans for the next sweep.
+            // preparation: the launch scratch, any check snapshot, and
+            // the prepared workspace itself may already exist. A
+            // writer workspace must go together with its `.prepare`
+            // receipt — bound to this request's digest, it would
+            // refuse a Coding retry on 'receipt belongs to another
+            // request' — while a read role's workspace is never
+            // released. No process exists, so nothing owns the tree;
+            // a retry re-prepares from source or handoff.
+            self.release_launch_workspace(request, &workspace);
             isolation::release(&self.launch_scratch(&invocation.id.0));
             isolation::release(&self.check_workspace(&invocation.id.0));
             self.release_invocation_io(&invocation.id.0);
             return Ok(());
         }
+        // Any refusal below this point also owns the prepared
+        // workspace: the `SpawnError::Refused` arm releases it for
+        // the same receipt-conflict reason.
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 let descendants = self
@@ -2716,6 +2745,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
+                // No process exists; the workspace a writer role
+                // prepared must not wedge a retry on 'receipt belongs
+                // to another request', and a read role's workspace is
+                // never released.
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
@@ -2773,6 +2807,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
             crate::request_v2::invocation_io_root(&self.workspace_root)
                 .join(isolation::sanitize_key(invocation_id)),
         );
+    }
+
+    /// Reclaim the workspace a refused or abandoned launch owned. A
+    /// writer role's `workspace::prepare` output goes together with
+    /// its `.prepare` receipt — the receipt lives in a sibling
+    /// control area, not inside `ws-<work>`, so a deleted workspace
+    /// alone still refuses the Work's next preparation on 'receipt
+    /// belongs to another request'. The check's per-Invocation
+    /// snapshot is this launch's own scratch. The review leg's
+    /// workspace is the shared writer checkout `ws-<work>` — never
+    /// released here: `run_recovery_scoped`/`drive_handoffs` still
+    /// read the artifact and recovery source from it, so a refused
+    /// review launch must not destroy the producing tree.
+    fn release_launch_workspace(&self, request: &InvocationRequest, workspace: &Path) {
+        match request.role {
+            InvocationRole::Review => {}
+            InvocationRole::InvariantCheck => isolation::release(workspace),
+            _ => {
+                isolation::release(workspace);
+                crate::workspace::release_receipt(&self.workspace_root, &request.work_id.0);
+            }
+        }
     }
 
     /// Bound `.invocations`: per-Invocation request/input/output trees
@@ -3216,9 +3272,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker.as_path())),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     &primitive,

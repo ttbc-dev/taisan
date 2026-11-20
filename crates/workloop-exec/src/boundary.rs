@@ -76,6 +76,10 @@ pub struct BoundaryGrant {
 struct BoundaryReady {
     credential_file: Option<PathBuf>,
     provider_config: Option<PathBuf>,
+    /// The provider-config content identity captured at resolution —
+    /// `ensure` re-checks it so a post-resolution edit re-runs the
+    /// credential scan instead of riding on the cached grant.
+    provider_digest: String,
     proxy: Option<ConnectProxy>,
 }
 
@@ -141,6 +145,24 @@ impl RuntimeBoundary {
         if matches!(*state, BoundaryState::Unresolved) {
             *state = BoundaryState::Ready(self.resolve()?);
         }
+        // The provider config is mounted read-only into the sandbox:
+        // a post-resolution edit — including a same-size one that
+        // embeds the resolved credential — must re-run the scan, not
+        // ride on the cached grant.
+        let stale = match &*state {
+            BoundaryState::Ready(ready) => current_provider_digest(&self.config.provider_config)
+                .map(|digest| digest != ready.provider_digest)
+                .unwrap_or(true),
+            BoundaryState::Unresolved => unreachable!("state resolved above"),
+        };
+        if stale {
+            if let BoundaryState::Ready(ready) = &mut *state
+                && let Some(proxy) = ready.proxy.take()
+            {
+                proxy.shutdown();
+            }
+            *state = BoundaryState::Ready(self.resolve()?);
+        }
         match &*state {
             BoundaryState::Ready(ready) => Ok(BoundaryGrant {
                 credential_file: ready.credential_file.clone(),
@@ -169,6 +191,8 @@ impl RuntimeBoundary {
         if let Some(path) = &self.config.provider_config {
             self.validate_provider_config(path, credential_bytes.as_deref())?;
         }
+        let provider_digest = current_provider_digest(&self.config.provider_config)
+            .map_err(|e| format!("provider_config.unreadable: {e}"))?;
         let proxy = if self.config.model_api_hosts.is_empty() {
             None
         } else {
@@ -184,6 +208,7 @@ impl RuntimeBoundary {
         Ok(BoundaryReady {
             credential_file,
             provider_config: self.config.provider_config.clone(),
+            provider_digest,
             proxy,
         })
     }
@@ -265,20 +290,44 @@ impl Drop for RuntimeBoundary {
     }
 }
 
+/// The provider-config content identity `ensure` compares against
+/// the recorded grant: `None` for an unconfigured boundary, else the
+/// same digest the gate identity records.
+fn current_provider_digest(path: &Option<PathBuf>) -> Result<String, std::io::Error> {
+    match path {
+        None => Ok("none".to_string()),
+        Some(path) => provider_config_digest(path),
+    }
+}
+
+/// Bounded-memory digest of one file's full content: every byte feeds
+/// the digest through fixed-size chunks, so a same-size edit anywhere
+/// in the file changes the identity without buffering the file.
+fn file_content_digest(path: &Path) -> Result<String, std::io::Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut chunks = String::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        chunks.push_str(&sha256_hex("provider-config-chunk-v1", &buf[..n]));
+    }
+    Ok(sha256_hex("provider-config-file-v1", chunks.as_bytes()))
+}
+
 /// Bounded content digest of a provider-config path for the boundary
-/// identity: a file hashes its bytes (capped); a directory hashes a
-/// sorted manifest of member names, kinds, and sizes — enough that any
-/// edit re-proves the gate without hashing unbounded trees.
+/// identity: a file hashes its full bytes; a directory hashes a
+/// sorted manifest of member names, kinds, sizes, and content
+/// digests — enough that any edit, including a same-size one,
+/// re-proves the gate without hashing unbounded trees.
 fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
-    const MAX_FILE: u64 = 1024 * 1024;
     const MAX_ENTRIES: usize = 256;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
-        use std::io::Read;
-        let file = std::fs::File::open(path)?;
-        let mut buf = Vec::new();
-        file.take(MAX_FILE).read_to_end(&mut buf)?;
-        return Ok(sha256_hex("provider-config-file-v1", &buf));
+        return file_content_digest(path);
     }
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
@@ -320,7 +369,8 @@ fn collect_manifest(
             out.push(format!("dir:{rel}"));
             collect_manifest(root, &path, out, budget)?;
         } else if metadata.is_file() {
-            out.push(format!("file:{rel}:{}", metadata.len()));
+            let digest = file_content_digest(&path)?;
+            out.push(format!("file:{rel}:{}:{digest}", metadata.len()));
         }
     }
     Ok(())
@@ -451,6 +501,50 @@ mod tests {
         // identity_digest re-reads the file each call.
         let d2 = boundary.identity_digest().unwrap();
         assert_ne!(d1, d2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A same-size edit inside a provider-config directory changes the
+    /// content identity — the manifest hashes member bytes, not only
+    /// names and sizes.
+    #[test]
+    fn a_same_size_dir_edit_changes_the_provider_config_digest() {
+        let dir = tmp("samesize");
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let member = cfg_dir.join("provider.toml");
+        std::fs::write(&member, "token = \"aaaa\"\n").unwrap();
+        let d1 = provider_config_digest(&cfg_dir).unwrap();
+        std::fs::write(&member, "token = \"bbbb\"\n").unwrap();
+        let d2 = provider_config_digest(&cfg_dir).unwrap();
+        assert_ne!(d1, d2, "same-size content edits move the digest");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The grant cache must not carry a stale scan: embedding the
+    /// resolved credential into the provider config after the first
+    /// resolution — even at identical size — re-runs the
+    /// `contains_credential` check on the next `ensure`.
+    #[test]
+    fn a_post_resolution_provider_config_edit_re_runs_the_credential_scan() {
+        let dir = tmp("restage");
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN3", "sekrit3") };
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let member = cfg_dir.join("provider.toml");
+        std::fs::write(&member, "token = \"aaaaa\"\n").unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN3".into());
+        cfg.provider_config = Some(cfg_dir);
+        let boundary = RuntimeBoundary::new(cfg);
+        boundary.ensure().expect("a clean config resolves");
+        // A same-size edit that embeds the credential.
+        std::fs::write(&member, "token = \"sekrit3\"\n").unwrap();
+        let err = boundary.ensure().unwrap_err();
+        assert!(err.contains("provider_config.contains_credential"), "{err}");
+        assert!(!err.contains("sekrit3"));
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN3") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -344,7 +344,7 @@ const ISSUE_SNAPSHOT_DIGEST_TAG: &str = "issue-snapshot-v1";
 /// The catalogue path prefix every issue snapshot retains under; the
 /// lookup suffix is derived from the spec-bound identity only, so
 /// dispatch resolves a snapshot without scanning the catalogue.
-pub const ISSUE_SNAPSHOT_PATH_PREFIX: &str = "issue-snapshot/";
+pub const ISSUE_SNAPSHOT_PATH_PREFIX: &str = "bodies/issue-snapshot/";
 
 /// The immutable snapshot of one source issue's authoritative read —
 /// the retained body a `GroupedIssue.body` reference resolves to.
