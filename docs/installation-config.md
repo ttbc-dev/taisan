@@ -206,7 +206,13 @@ binding, `capacity`, `worker_argv`, `worker_isolation_profile`,
 `worker_model_api_hosts`, the verification-boundary keys
 `verification_toolchain`, `verification_cache_paths`, and
 `verification_egress_allowlist` ([v0.3 §14.3–§14.5](v0.3.md#14-operational-launch-verification-and-host-composition)),
-and the
+the optional v2 dispatch profile `worker_dispatch` —
+`source_path`, positive wire `budget` bounds, an optional approved
+`invariant_set`, and a `capabilities` floor; present means requests
+not yet consumed launch through the complete bound-request transport
+([v0.3 §4, §14.8](v0.3.md)), absent keeps the recorded v1 argv-only
+launch, and a semantically malformed section refuses `taisan run`'s
+supervisor composition (structural errors still fail at load) — and the
 `budget`/`policy`/`retention`/`loop` overrides. The profile's
 `[worker]` section is the declaration `check` stage 5 validates;
 `worker_argv` in the installation record is the launch source
