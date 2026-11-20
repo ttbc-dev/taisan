@@ -684,13 +684,20 @@ pub fn run_pass<H: HostDriver>(
                             continue;
                         }
                     };
-                    let (probe_exec_argv, probe_exec_env) = supervisor.contained_probe(
+                    let probed = supervisor.contained_probe(
                         &gate,
                         &supervisor.worker_argv,
                         Some(workspace.as_path()),
                         &prebind_scratch.join("gitconfig"),
                         &env,
                     );
+                    let Ok((probe_exec_argv, probe_exec_env)) = probed else {
+                        // A boundary refusal is recorded by the consume
+                        // path as a typed repair — the prebind probe
+                        // simply leaves the requests unbound.
+                        isolation::release(&prebind_scratch);
+                        continue;
+                    };
                     let declared = adapter::observe_worker_declaration_with_argv(
                         &supervisor.port,
                         &probe_exec_argv,

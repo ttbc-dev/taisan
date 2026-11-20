@@ -322,6 +322,7 @@ fn layout(root: &Path) -> HandoffLayout {
         repository: bare,
         workspace_root: root.join("ws"),
         out_root: root.join("out"),
+        verification: None,
     }
 }
 

@@ -1148,7 +1148,7 @@ impl Profile {
 /// matches — the proxy resolves these entries as exact host names on
 /// the fixed CONNECT port, so a wildcard-like entry must be refused
 /// at the load boundary, never deferred to the proxy.
-fn is_bare_host_name(entry: &str) -> bool {
+pub(crate) fn is_bare_host_name(entry: &str) -> bool {
     if entry.is_empty() || entry.len() > 253 {
         return false;
     }

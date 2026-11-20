@@ -50,6 +50,20 @@ pub const SANDBOX_OUT: &str = "/taisan/out";
 pub const SANDBOX_REQUEST: &str = "/taisan/request.json";
 pub const SANDBOX_INPUT: &str = "/taisan/input";
 pub const SANDBOX_GITCONFIG: &str = "/taisan/gitconfig";
+/// The runtime credential file — a read-only bind of exactly one
+/// supervisor-written file (`docs/v0.3.md` §14.3). Its content is the
+/// resolved credential; the path itself is the whole contract.
+pub const SANDBOX_RUNTIME_AUTH: &str = "/taisan/runtime-auth";
+/// The non-secret provider configuration — a read-only bind the
+/// supervisor validates before mounting; `/workspace` can never
+/// shadow it.
+pub const SANDBOX_PROVIDER_CONFIG: &str = "/taisan/provider-config";
+/// The supervisor-owned CONNECT proxy's Unix socket, bind-mounted so
+/// the in-sandbox relay can reach it (`docs/v0.3.md` §14.4).
+pub const SANDBOX_PROXY_SOCK: &str = "/taisan/proxy.sock";
+/// The pinned verification toolchain — verification sandboxes only
+/// (`docs/v0.3.md` §14.5).
+pub const SANDBOX_TOOLCHAIN: &str = "/taisan/toolchain";
 
 /// The fixed read-only system binds every contained launch gets —
 /// the runtime and toolchain surface, never an owner home, another
@@ -66,7 +80,7 @@ const EVIDENCE_RETRY_SECONDS: i64 = 300;
 
 /// Per-probe bound: every negative probe is a tiny shell program; a
 /// wedged sandbox answers `Bounded` and fails the battery.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What one contained launch binds into the sandbox. Every field is a
 /// host path the supervisor owns; the sandbox side is fixed by the
@@ -85,15 +99,43 @@ pub struct MountPlan {
     pub out: Option<PathBuf>,
     /// Generated git config → `/taisan/gitconfig`, read-only.
     pub gitconfig: Option<PathBuf>,
+    /// The resolved runtime credential file → `/taisan/runtime-auth`,
+    /// read-only. Never a repository-host credential, token helper,
+    /// SSH socket, or keyring.
+    pub runtime_auth: Option<PathBuf>,
+    /// The validated non-secret provider configuration →
+    /// `/taisan/provider-config`, read-only. A file or directory.
+    pub provider_config: Option<PathBuf>,
+    /// The CONNECT proxy's Unix socket → `/taisan/proxy.sock`,
+    /// read-only. Present only when the launch's egress allowlist is
+    /// non-empty.
+    pub proxy_sock: Option<PathBuf>,
+    /// The pinned verification toolchain → `/taisan/toolchain`,
+    /// read-only, plus a second bind at its own host path so declared
+    /// argv that names toolchain binaries absolutely still resolves
+    /// (verification sandboxes only).
+    pub toolchain: Option<PathBuf>,
+    /// Read-only dependency caches, each bound at its own absolute
+    /// host path so tool configuration that names them keeps working
+    /// (verification sandboxes only).
+    pub caches: Vec<PathBuf>,
     /// Absolute-path argv elements that exist on the host, bound
     /// read-only at their own path — a `python3 /opt/worker.py`
     /// launch keeps its script reachable. This can only ever expose
     /// what the uncontained launch already could read; it never adds
     /// a path the worker argv did not name.
     pub extra_binds: Vec<PathBuf>,
+    /// Absolute paths bound read-write at their own path — the
+    /// verification worktree's private gitdir is the only user: `git
+    /// status` must refresh its index, and the bind can never reach
+    /// another artifact's refs because it names exactly one
+    /// worktree's metadata directory.
+    pub extra_rw_binds: Vec<PathBuf>,
     /// The resolved host path of the worker executable, bound
-    /// read-only at its own absolute path.
-    pub worker: PathBuf,
+    /// read-only at its own absolute path. `None` for sandboxes whose
+    /// inner argv is not a single resolved executable (verification
+    /// commands resolve through PATH or `extra_binds`).
+    pub worker: Option<PathBuf>,
 }
 
 /// The gate's answer for one launch argv.
@@ -187,9 +229,11 @@ fn kernel_release() -> String {
 /// read-only binds at their own path. Flags, sandbox paths (which do
 /// not exist on the host), bare names, and missing paths are skipped
 /// — a path the worker needs but that is absent fails honestly inside
-/// the sandbox, never silently on the host.
-pub fn extra_binds(inner_argv: &[String], worker: &Path) -> Vec<PathBuf> {
-    let mut seen: HashSet<PathBuf> = HashSet::from([worker.to_path_buf()]);
+/// the sandbox, never silently on the host. `worker` names the one
+/// executable the plan binds separately; it is excluded here so the
+/// same path is never bound twice.
+pub fn extra_binds(inner_argv: &[String], worker: Option<&Path>) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = worker.map(Path::to_path_buf).into_iter().collect();
     let mut binds = Vec::new();
     for arg in inner_argv.iter().skip(1) {
         let path = Path::new(arg);
@@ -198,6 +242,23 @@ pub fn extra_binds(inner_argv: &[String], worker: &Path) -> Vec<PathBuf> {
         }
     }
     binds
+}
+
+/// Wrap `inner_argv` in the in-sandbox CONNECT relay
+/// (`docs/v0.3.md` §14.4): the relay binds `127.0.0.1` inside the
+/// network namespace, splices each connection to the bind-mounted
+/// proxy socket, and stays alive as the sandbox init for the worker's
+/// whole life. The contained environment's `HTTPS_PROXY` points at
+/// the relay; the worker argv itself never sees the socket path.
+pub fn relay_wrapped(inner_argv: &[String], relay_exe: &Path) -> Vec<String> {
+    let mut argv = Vec::with_capacity(inner_argv.len() + 6);
+    argv.push(relay_exe.to_string_lossy().into_owned());
+    argv.push("__sandbox-relay".to_string());
+    argv.push(SANDBOX_PROXY_SOCK.to_string());
+    argv.push(crate::egress::RELAY_LISTEN.to_string());
+    argv.push("--".to_string());
+    argv.extend(inner_argv.iter().cloned());
+    argv
 }
 
 /// Build the full outer argv: `<bwrap> <namespace flags> <fixed
@@ -276,10 +337,55 @@ pub fn bwrap_args(
             SANDBOX_GITCONFIG.to_string(),
         ]);
     }
+    if let Some(runtime_auth) = &plan.runtime_auth {
+        args.extend([
+            "--ro-bind".to_string(),
+            s(runtime_auth),
+            SANDBOX_RUNTIME_AUTH.to_string(),
+        ]);
+    }
+    if let Some(provider_config) = &plan.provider_config {
+        args.extend([
+            "--ro-bind".to_string(),
+            s(provider_config),
+            SANDBOX_PROVIDER_CONFIG.to_string(),
+        ]);
+    }
+    if let Some(proxy_sock) = &plan.proxy_sock {
+        args.extend([
+            "--ro-bind".to_string(),
+            s(proxy_sock),
+            SANDBOX_PROXY_SOCK.to_string(),
+        ]);
+    }
+    if let Some(toolchain) = &plan.toolchain {
+        args.extend([
+            "--ro-bind".to_string(),
+            s(toolchain),
+            SANDBOX_TOOLCHAIN.to_string(),
+        ]);
+        // Declared argv may name toolchain binaries by their host
+        // absolute path; the own-path bind keeps that spelling valid
+        // inside the sandbox. The canonical `/taisan/toolchain` mount
+        // above is the profile-owned location either way. A root
+        // toolchain path is never self-bound — that would mount the
+        // whole host filesystem.
+        if toolchain.file_name().is_some() {
+            args.extend(["--ro-bind".to_string(), s(toolchain), s(toolchain)]);
+        }
+    }
+    for cache in &plan.caches {
+        args.extend(["--ro-bind".to_string(), s(cache), s(cache)]);
+    }
     for extra in &plan.extra_binds {
         args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
     }
-    args.extend(["--ro-bind".to_string(), s(&plan.worker), s(&plan.worker)]);
+    for extra in &plan.extra_rw_binds {
+        args.extend(["--bind".to_string(), s(extra), s(extra)]);
+    }
+    if let Some(worker) = &plan.worker {
+        args.extend(["--ro-bind".to_string(), s(worker), s(worker)]);
+    }
     args.extend([
         "--chdir".to_string(),
         inner_cwd.to_string(),
@@ -294,9 +400,12 @@ pub fn bwrap_args(
 /// the read-only gitconfig bind. Every other allowlisted variable —
 /// `PATH`, the git transport/credential pins — passes verbatim: the
 /// sandbox adds no credential the profile did not already allow, and
-/// removes none the launch needs.
-pub fn contained_env(base: &WorkerEnv) -> WorkerEnv {
-    let mut vars = Vec::with_capacity(base.vars.len() + 3);
+/// removes none the launch needs. `egress_proxy` is the in-sandbox
+/// relay URL (`egress::RELAY_PROXY_URL`) when the launch's mount plan
+/// binds a CONNECT proxy socket — `None` leaves egress fully denied
+/// with no proxy variables at all.
+pub fn contained_env(base: &WorkerEnv, egress_proxy: Option<&str>) -> WorkerEnv {
+    let mut vars = Vec::with_capacity(base.vars.len() + 5);
     let mut seen = HashSet::new();
     for (name, value) in &base.vars {
         let value = match name.as_str() {
@@ -308,11 +417,18 @@ pub fn contained_env(base: &WorkerEnv) -> WorkerEnv {
         seen.insert(name.clone());
         vars.push((name.clone(), value));
     }
-    for (name, value) in [
+    let mut fixed: Vec<(&str, &str)> = vec![
         ("HOME", "/home"),
         ("TMPDIR", "/tmp"),
         ("GIT_CONFIG_GLOBAL", SANDBOX_GITCONFIG),
-    ] {
+    ];
+    if let Some(url) = egress_proxy {
+        // Both spellings: runtimes disagree on which proxy variable
+        // they honor, and the relay is the only egress either way.
+        fixed.push(("HTTPS_PROXY", url));
+        fixed.push(("https_proxy", url));
+    }
+    for (name, value) in fixed {
         if seen.insert(name.to_string()) {
             vars.push((name.to_string(), value.to_string()));
         }
@@ -331,6 +447,14 @@ struct Evidence {
     primitive: String,
     primitive_version: String,
     worker_argv: Vec<String>,
+    /// Digest of the runtime boundary the launch binds — credential
+    /// reference, provider-config content, and model-API hosts
+    /// (`docs/v0.3.md` §14.3). `None` on evidence written before the
+    /// boundary existed; a boundary change is an identity change and
+    /// re-proves the battery. The digest never contains credential
+    /// material — only the reference text and non-secret config.
+    #[serde(default)]
+    boundary_digest: Option<String>,
     probes: Vec<ProbeRecord>,
     passed: bool,
     failure: Option<String>,
@@ -369,6 +493,7 @@ fn identity_matches(
     primitive: &Path,
     primitive_version: &str,
     worker_argv: &[String],
+    boundary_digest: Option<&str>,
 ) -> bool {
     evidence.format == EVIDENCE_FORMAT
         && evidence.profile_id == profile.id
@@ -376,6 +501,7 @@ fn identity_matches(
         && evidence.primitive.as_str() == primitive.to_string_lossy()
         && evidence.primitive_version == primitive_version
         && evidence.worker_argv == worker_argv
+        && evidence.boundary_digest.as_deref() == boundary_digest
 }
 
 /// `<bwrap> --version`, bounded through the same process port every
@@ -383,7 +509,7 @@ fn identity_matches(
 /// upgrade re-proves the boundary rather than inheriting the old
 /// proof.
 fn primitive_version(
-    port: &impl ProcessControlPort,
+    port: &dyn ProcessControlPort,
     primitive: &Path,
     cwd: &Path,
 ) -> Result<String, GateError> {
@@ -428,7 +554,7 @@ fn primitive_version(
 /// battery closed.
 #[allow(clippy::too_many_arguments)]
 fn run_named_probe(
-    port: &impl ProcessControlPort,
+    port: &dyn ProcessControlPort,
     primitive: &Path,
     plan: &MountPlan,
     inner_argv: &[String],
@@ -475,7 +601,7 @@ fn run_named_probe(
 /// workspace stand-in, a writable out dir, and the generated
 /// gitconfig — the same shapes every role launch binds.
 fn run_battery(
-    port: &impl ProcessControlPort,
+    port: &dyn ProcessControlPort,
     workspace_root: &Path,
     profile: &IsolationProfile,
     primitive: &Path,
@@ -488,7 +614,7 @@ fn run_battery(
     let _ = std::fs::remove_dir_all(&scratch);
     let prepare_result = isolation::prepare(profile, &scratch);
     let env = match prepare_result {
-        Ok(env) => contained_env(&env),
+        Ok(env) => contained_env(&env, None),
         Err(why) => {
             let _ = std::fs::remove_dir_all(&scratch);
             return Err(fault(format!(
@@ -511,8 +637,14 @@ fn run_battery(
         input: None,
         out: Some(probe_out.clone()),
         gitconfig: Some(gitconfig),
+        runtime_auth: None,
+        provider_config: None,
+        proxy_sock: None,
+        toolchain: None,
+        caches: vec![],
         extra_binds: vec![],
-        worker: worker.to_path_buf(),
+        extra_rw_binds: vec![],
+        worker: Some(worker.to_path_buf()),
     };
     let mut records = Vec::new();
     let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
@@ -683,16 +815,20 @@ fn run_battery(
 }
 
 /// Evaluate the profile's containment requirement for one launch
-/// argv. `Ok(Gate::Uncontained)` means the profile declares no
-/// primitive; `Ok(Gate::Ready)` means the negative-probe evidence for
-/// this exact identity is recorded (or was just proven); `Err` is a
-/// typed refusal or an infrastructure fault — callers must never
-/// substitute the unwrapped launch.
+/// argv. `boundary_digest` is the runtime boundary's content identity
+/// (`RuntimeBoundary::identity_digest`): credential reference,
+/// provider-config content, and model-API hosts — `None` when no
+/// boundary is configured. `Ok(Gate::Uncontained)` means the profile
+/// declares no primitive; `Ok(Gate::Ready)` means the
+/// negative-probe evidence for this exact identity is recorded (or
+/// was just proven); `Err` is a typed refusal or an infrastructure
+/// fault — callers must never substitute the unwrapped launch.
 pub fn gate(
-    port: &impl ProcessControlPort,
+    port: &dyn ProcessControlPort,
     workspace_root: &Path,
     profile: &IsolationProfile,
     worker_argv: &[String],
+    boundary_digest: Option<&str>,
     now_unix_seconds: i64,
 ) -> Result<Gate, GateError> {
     gate_with_resolvers(
@@ -700,6 +836,7 @@ pub fn gate(
         workspace_root,
         profile,
         worker_argv,
+        boundary_digest,
         now_unix_seconds,
         &resolve_on_path,
         &resolve_worker,
@@ -711,10 +848,11 @@ pub fn gate(
 /// a real `bwrap` on the host.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gate_with_resolvers(
-    port: &impl ProcessControlPort,
+    port: &dyn ProcessControlPort,
     workspace_root: &Path,
     profile: &IsolationProfile,
     worker_argv: &[String],
+    boundary_digest: Option<&str>,
     now_unix_seconds: i64,
     resolve_primitive: &dyn Fn(&str) -> Option<PathBuf>,
     resolve_worker: &dyn Fn(&str) -> Option<PathBuf>,
@@ -752,6 +890,7 @@ pub(crate) fn gate_with_resolvers(
             &primitive,
             &version,
             worker_argv,
+            boundary_digest,
         )
     {
         if evidence.passed {
@@ -784,6 +923,7 @@ pub(crate) fn gate_with_resolvers(
         primitive: primitive.to_string_lossy().into_owned(),
         primitive_version: version,
         worker_argv: worker_argv.to_vec(),
+        boundary_digest: boundary_digest.map(str::to_string),
         probes: records,
         passed,
         failure: (!passed).then(|| failures.join("; ")),
@@ -841,8 +981,14 @@ mod tests {
             input: Some(PathBuf::from("/host/inv/input")),
             out: Some(PathBuf::from("/host/inv/out")),
             gitconfig: Some(PathBuf::from("/host/scratch/gitconfig")),
+            runtime_auth: None,
+            provider_config: None,
+            proxy_sock: None,
+            toolchain: None,
+            caches: vec![],
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
-            worker: PathBuf::from("/opt/worker"),
+            extra_rw_binds: vec![],
+            worker: Some(PathBuf::from("/opt/worker")),
         }
     }
 
@@ -933,19 +1079,30 @@ mod tests {
                 ("GIT_ALLOW_PROTOCOL".into(), "file".into()),
             ],
         };
-        let env = contained_env(&base);
+        let env = contained_env(&base, None);
         let map: std::collections::BTreeMap<_, _> = env.vars.iter().cloned().collect();
         assert_eq!(map["HOME"], "/home");
         assert_eq!(map["TMPDIR"], "/tmp");
         assert_eq!(map["GIT_CONFIG_GLOBAL"], "/taisan/gitconfig");
         assert_eq!(map["PATH"], "/usr/bin");
         assert_eq!(map["GIT_ALLOW_PROTOCOL"], "file");
+        // No egress proxy was granted — no proxy variables exist.
+        assert!(!map.contains_key("HTTPS_PROXY"));
+        assert!(!map.contains_key("https_proxy"));
         // Missing members are still set — the sandbox contract does
         // not depend on the base env carrying them.
-        let sparse = contained_env(&WorkerEnv::default());
+        let sparse = contained_env(&WorkerEnv::default(), None);
         let map: std::collections::BTreeMap<_, _> = sparse.vars.iter().cloned().collect();
         assert_eq!(map["HOME"], "/home");
         assert_eq!(map["GIT_CONFIG_GLOBAL"], "/taisan/gitconfig");
+    }
+
+    #[test]
+    fn contained_env_adds_proxy_variables_only_when_egress_is_granted() {
+        let env = contained_env(&WorkerEnv::default(), Some(crate::egress::RELAY_PROXY_URL));
+        let map: std::collections::BTreeMap<_, _> = env.vars.iter().cloned().collect();
+        assert_eq!(map["HTTPS_PROXY"], crate::egress::RELAY_PROXY_URL);
+        assert_eq!(map["https_proxy"], crate::egress::RELAY_PROXY_URL);
     }
 
     #[test]
@@ -963,7 +1120,7 @@ mod tests {
             "relative/script.py".into(),   // relative → skipped
             "/nonexistent/definitely".into(), // missing → skipped
         ];
-        let binds = extra_binds(&argv, worker);
+        let binds = extra_binds(&argv, Some(worker));
         assert_eq!(binds, vec![real.clone()]);
         let _ = std::fs::remove_file(&real);
     }
@@ -982,8 +1139,15 @@ mod tests {
     fn a_missing_primitive_refuses_the_gate() {
         let root = tmp("missing");
         let port = ScriptedProcessControl::new();
-        let err = gate(&port, &root, &primitive_profile(), &["worker".into()], 1000)
-            .expect_err("missing primitive refuses");
+        let err = gate(
+            &port,
+            &root,
+            &primitive_profile(),
+            &["worker".into()],
+            None,
+            1000,
+        )
+        .expect_err("missing primitive refuses");
         assert!(
             matches!(err, GateError::Refused(ref r) if r.contains("isolation.primitive_missing")),
             "{err:?}"
@@ -1004,6 +1168,7 @@ mod tests {
                 sandbox_primitive: None,
             },
             &["worker".into()],
+            None,
             1000,
         )
         .expect("uncontained gate");
@@ -1042,6 +1207,7 @@ mod tests {
             &root,
             &profile,
             &argv,
+            None,
             1_000,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
@@ -1058,6 +1224,7 @@ mod tests {
             &root,
             &profile,
             &argv,
+            None,
             1_001,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
@@ -1078,6 +1245,7 @@ mod tests {
             &root,
             &profile,
             &["/bin/sh".to_string(), "--other".to_string()],
+            None,
             1_002,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
@@ -1115,6 +1283,7 @@ mod tests {
             &root,
             &profile,
             &argv,
+            None,
             2_000,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
@@ -1132,6 +1301,7 @@ mod tests {
             &root,
             &profile,
             &argv,
+            None,
             2_001,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),

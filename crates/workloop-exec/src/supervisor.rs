@@ -29,6 +29,7 @@ use workloop_core::worker::{
 use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
+use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
 use crate::request_v2::V2Dispatch;
@@ -673,6 +674,14 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// consume path — a deployment never mixes the two for one
     /// request because the recorded Invocation decides the replay.
     pub v2: Option<V2Dispatch>,
+    /// The runtime credential/egress boundary (`docs/v0.3.md`
+    /// §14.3–§14.4): resolved lazily at the first contained launch or
+    /// `describe` probe and shared by every launch after. `None`
+    /// leaves contained launches with no credential, provider config,
+    /// or proxy binds — the v1-compatible empty boundary; the
+    /// composition root always installs one built from the approved
+    /// installation configuration.
+    pub runtime_boundary: Option<RuntimeBoundary>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -691,6 +700,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             isolation_profile: default_isolation_profile(),
             handoff: None,
             v2: None,
+            runtime_boundary: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -719,6 +729,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// never upgraded in place.
     pub fn with_v2_dispatch(mut self, dispatch: V2Dispatch) -> Self {
         self.v2 = Some(dispatch);
+        self
+    }
+
+    /// Install the runtime credential/egress boundary every contained
+    /// launch and `describe` probe resolves through. The boundary is
+    /// resolved lazily on first contained use; a resolution failure is
+    /// a typed launch refusal, never an ambient fallback.
+    pub fn with_runtime_boundary(mut self, boundary: RuntimeBoundary) -> Self {
+        self.runtime_boundary = Some(boundary);
         self
     }
 
@@ -792,11 +811,27 @@ impl<P: ProcessControlPort> Supervisor<P> {
         worker_argv: &[String],
         now_unix_seconds: i64,
     ) -> Result<Result<Gate, String>, ExecError> {
+        // The boundary identity joins the gate identity only for a
+        // contained profile: an unreadable provider config or an
+        // unresolvable boundary identity is itself a refusal, and an
+        // uncontained profile never resolves the boundary at all.
+        let boundary_digest = if self.isolation_profile.sandbox_primitive.is_some() {
+            match &self.runtime_boundary {
+                Some(boundary) => match boundary.identity_digest() {
+                    Ok(digest) => Some(digest),
+                    Err(reason) => return Ok(Err(reason)),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         match containment::gate(
             &self.port,
             &self.workspace_root,
             &self.isolation_profile,
             worker_argv,
+            boundary_digest.as_deref(),
             now_unix_seconds,
         ) {
             Ok(gate) => Ok(Ok(gate)),
@@ -805,13 +840,81 @@ impl<P: ProcessControlPort> Supervisor<P> {
         }
     }
 
+    /// Resolve the runtime boundary for one contained launch or probe.
+    /// `Ok(None)` when no boundary is installed — the contained launch
+    /// then binds no credential, provider config, or proxy (the
+    /// v1-compatible empty boundary). `Err` is a typed refusal
+    /// (`credential.*`, `provider_config.*`, `egress.*`) the caller
+    /// carries as a launch repair — never an ambient fallback.
+    fn boundary_grant(&self) -> Result<Option<BoundaryGrant>, String> {
+        match &self.runtime_boundary {
+            Some(boundary) => boundary.ensure().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Turn a worker-level argv plus a caller-filled mount plan into
+    /// the contained outer argv and environment — the single place the
+    /// runtime boundary becomes sandbox binds. The plan's boundary
+    /// fields (`runtime_auth`, `provider_config`, `proxy_sock`) are
+    /// filled from the grant here; a proxy grant also relay-wraps the
+    /// inner argv and exports `HTTPS_PROXY`. `Err` is a typed boundary
+    /// refusal; there is no unwrapped fallback.
+    fn contained_exec(
+        &self,
+        primitive: &Path,
+        mut plan: MountPlan,
+        inner_argv: &[String],
+        inner_cwd: &str,
+        env: &WorkerEnv,
+    ) -> Result<(Vec<String>, WorkerEnv), String> {
+        let grant = self.boundary_grant()?;
+        let proxy_granted = grant
+            .as_ref()
+            .is_some_and(|grant| grant.proxy_sock.is_some());
+        if let Some(grant) = &grant {
+            plan.runtime_auth = grant.credential_file.clone();
+            plan.provider_config = grant.provider_config.clone();
+            plan.proxy_sock = grant.proxy_sock.clone();
+        }
+        let (exec_argv, egress_proxy) = if proxy_granted {
+            // The proxy socket is bound at `/taisan/proxy.sock`; the
+            // relay is the sandbox init that serves `HTTPS_PROXY` on
+            // loopback and splices to it. The relay executable is an
+            // absolute argv path — bound read-only like every other
+            // named path.
+            let relay_exe = self
+                .runtime_boundary
+                .as_ref()
+                .map(|boundary| boundary.relay_exe().to_path_buf())
+                .ok_or_else(|| "egress.relay_unavailable: no boundary installed".to_string())?;
+            if relay_exe.is_absolute()
+                && relay_exe.exists()
+                && !plan.extra_binds.contains(&relay_exe)
+            {
+                plan.extra_binds.push(relay_exe.clone());
+            }
+            (
+                containment::relay_wrapped(inner_argv, &relay_exe),
+                Some(crate::egress::RELAY_PROXY_URL),
+            )
+        } else {
+            (inner_argv.to_vec(), None)
+        };
+        Ok((
+            containment::bwrap_args(primitive, &plan, &exec_argv, inner_cwd),
+            containment::contained_env(env, egress_proxy),
+        ))
+    }
+
     /// Wrap a `describe` probe for the gate's answer: a contained
     /// profile produces the bwrap outer argv, the sandbox env, and a
     /// mount plan binding the workspace read-only when it exists;
     /// `Uncontained` passes the plain argv/env through. `probe_argv`
     /// is the worker-level argv — the recorded binding surface never
     /// sees the launcher. Public for the same reason as
-    /// [`Self::containment_gate`].
+    /// [`Self::containment_gate`]. `Err` is a typed boundary refusal —
+    /// the caller records it like a gate refusal.
     pub fn contained_probe(
         &self,
         gate: &Gate,
@@ -819,10 +922,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         workspace: Option<&Path>,
         gitconfig: &Path,
         env: &WorkerEnv,
-    ) -> (Vec<String>, WorkerEnv) {
+    ) -> Result<(Vec<String>, WorkerEnv), String> {
         let inner_argv = adapter::describe_argv(probe_argv);
         match gate {
-            Gate::Uncontained => (inner_argv, env.clone()),
+            Gate::Uncontained => Ok((inner_argv, env.clone())),
             Gate::Ready { primitive, worker } => {
                 let workspace_bound = workspace.filter(|path| path.is_dir());
                 let plan = MountPlan {
@@ -831,18 +934,21 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     input: None,
                     out: None,
                     gitconfig: Some(gitconfig.to_path_buf()),
-                    extra_binds: containment::extra_binds(&inner_argv, worker),
-                    worker: worker.clone(),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_rw_binds: vec![],
+                    worker: Some(worker.clone()),
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
                 } else {
                     "/tmp"
                 };
-                (
-                    containment::bwrap_args(primitive, &plan, &inner_argv, inner_cwd),
-                    containment::contained_env(env),
-                )
+                self.contained_exec(primitive, plan, &inner_argv, inner_cwd, env)
             }
         }
     }
@@ -1069,14 +1175,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
                 return Ok(None);
             };
+            // The Work-declared verification egress hosts live in the
+            // immutable v2 request body; a v1 dispatch or an absent
+            // body declares none. An unverifiable body is corrupt
+            // durable state — the parse failure is a fault, never a
+            // silently empty grant.
+            let verification_egress_hosts = match tx.worker_request_body(&invocation.request_id)? {
+                Some(body) if body.verifies() => serde_json::from_slice::<
+                    workloop_core::worker_v2::WorkerRequestV2,
+                >(&body.canonical_body)
+                .map(|req| req.required_capabilities.verification_egress_hosts)
+                .map_err(|e| StoreError::Internal {
+                    detail: format!("worker request body unreadable: {e}"),
+                })?,
+                _ => Vec::new(),
+            };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
                 spec.payload.verification_argv.clone(),
+                verification_egress_hosts,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
-        let Some((invocation, work_id, verification_argv, bound)) = found else {
+        let Some((invocation, work_id, verification_argv, verification_egress_hosts, bound)) =
+            found
+        else {
             return Ok(None);
         };
         // The handoff base is derived inside the bounded export stage
@@ -1094,6 +1218,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 branch,
                 work_id,
                 verification_argv,
+                verification_egress_hosts,
             },
             bound,
         )))
@@ -1246,50 +1371,59 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 (Ok(gate), Ok(env)) => {
                     // The probe gets the same containment the launch
                     // will: the workspace bound read-only, the
-                    // generated gitconfig, no writable surfaces.
-                    let (probe_exec_argv, probe_exec_env) = self.contained_probe(
+                    // generated gitconfig, no writable surfaces — and
+                    // the same runtime boundary. A boundary refusal is
+                    // a configuration repair like a refused gate.
+                    match self.contained_probe(
                         gate,
                         &probe_argv,
                         Some(&workspace),
                         &probe_scratch.join("gitconfig"),
                         &env,
-                    );
-                    match &request.adapter_binding {
-                        Some(stored) => {
-                            match adapter::observe_worker_declaration_with_argv(
-                                &self.port,
-                                &probe_exec_argv,
-                                &workspace,
-                                &probe_exec_env,
-                            ) {
-                                Ok(observed) => match adapter::select_adapter(&observed, stored) {
-                                    adapter::AdapterSelection::Ready(binding) => {
-                                        (Some(binding), None)
+                    ) {
+                        Err(reason) => (
+                            None,
+                            Some(format!("isolation.containment_refused: {reason}")),
+                        ),
+                        Ok((probe_exec_argv, probe_exec_env)) => match &request.adapter_binding {
+                            Some(stored) => {
+                                match adapter::observe_worker_declaration_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &workspace,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok(observed) => {
+                                        match adapter::select_adapter(&observed, stored) {
+                                            adapter::AdapterSelection::Ready(binding) => {
+                                                (Some(binding), None)
+                                            }
+                                            adapter::AdapterSelection::ConfigurationRepair {
+                                                reason,
+                                            } => (None, Some(reason)),
+                                        }
                                     }
-                                    adapter::AdapterSelection::ConfigurationRepair { reason } => {
-                                        (None, Some(reason))
-                                    }
-                                },
-                                Err(why) => (
-                                    None,
-                                    Some(format!("adapter.declaration_unavailable: {why}")),
-                                ),
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
+                                }
                             }
-                        }
-                        None => {
-                            match adapter::observe_worker_declaration_with_argv(
-                                &self.port,
-                                &probe_exec_argv,
-                                &workspace,
-                                &probe_exec_env,
-                            ) {
-                                Ok(observed) => (Some(observed.binding(&probe_argv)), None),
-                                Err(why) => (
-                                    None,
-                                    Some(format!("adapter.declaration_unavailable: {why}")),
-                                ),
+                            None => {
+                                match adapter::observe_worker_declaration_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &workspace,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok(observed) => (Some(observed.binding(&probe_argv)), None),
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
+                                }
                             }
-                        }
+                        },
                     }
                 }
             };
@@ -1491,13 +1625,34 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     input: None,
                     out: None,
                     gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
-                    extra_binds: containment::extra_binds(&inner_argv, worker),
-                    worker: worker.clone(),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_rw_binds: vec![],
+                    worker: Some(worker.clone()),
                 };
-                (
-                    containment::bwrap_args(primitive, &plan, &inner_argv, "/workspace"),
-                    containment::contained_env(&launch_env_base),
-                )
+                match self.contained_exec(
+                    primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &launch_env_base,
+                ) {
+                    Ok(contained) => contained,
+                    Err(reason) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("isolation.containment_refused: {reason}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
             }
         };
         match self.port.spawn(&argv, &workspace, &launch_env) {
@@ -1718,41 +1873,50 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         // launch will: the workspace bound read-only
                         // when it exists, the generated gitconfig, and
                         // no writable surfaces — `describe` answers
-                        // inside the boundary it declares for.
+                        // inside the boundary it declares for, runtime
+                        // credential and egress profile included.
                         let probe_workspace = self.workspace_of(&request.work_id);
-                        let (probe_exec_argv, probe_exec_env) = self.contained_probe(
+                        let selected = match self.contained_probe(
                             gate,
                             &probe_argv,
                             Some(&probe_workspace),
                             &probe_scratch.join("gitconfig"),
                             &env,
-                        );
-                        let selected = match adapter::observe_worker_declaration_v2_with_argv(
-                            &self.port,
-                            &probe_exec_argv,
-                            &probe_cwd,
-                            &probe_exec_env,
                         ) {
-                            Ok((declared, surface)) => match declared.negotiate_v2(&wire) {
-                                Ok(()) => match &request.adapter_binding {
-                                    Some(stored) => {
-                                        match adapter::select_adapter(&surface, stored) {
-                                            adapter::AdapterSelection::Ready(binding) => {
-                                                (Some(binding), None)
-                                            }
-                                            adapter::AdapterSelection::ConfigurationRepair {
-                                                reason,
-                                            } => (None, Some(reason)),
-                                        }
-                                    }
-                                    None => (Some(surface.binding(&probe_argv)), None),
-                                },
-                                Err(why) => (None, Some(why.to_string())),
-                            },
-                            Err(why) => (
+                            Err(reason) => (
                                 None,
-                                Some(format!("adapter.declaration_unavailable: {why}")),
+                                Some(format!("isolation.containment_refused: {reason}")),
                             ),
+                            Ok((probe_exec_argv, probe_exec_env)) => {
+                                match adapter::observe_worker_declaration_v2_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &probe_cwd,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok((declared, surface)) => match declared.negotiate_v2(&wire) {
+                                        Ok(()) => match &request.adapter_binding {
+                                            Some(stored) => {
+                                                match adapter::select_adapter(&surface, stored)
+                                                    {
+                                                        adapter::AdapterSelection::Ready(binding) => {
+                                                            (Some(binding), None)
+                                                        }
+                                                        adapter::AdapterSelection::ConfigurationRepair {
+                                                            reason,
+                                                        } => (None, Some(reason)),
+                                                    }
+                                            }
+                                            None => (Some(surface.binding(&probe_argv)), None),
+                                        },
+                                        Err(why) => (None, Some(why.to_string())),
+                                    },
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
+                                }
+                            }
                         };
                         isolation::release(&probe_scratch);
                         selected
@@ -1971,13 +2135,34 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     input: Some(io.input_dir.clone()),
                     out: Some(io.out_dir.clone()),
                     gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
-                    extra_binds: containment::extra_binds(&inner_argv, worker),
-                    worker: worker.clone(),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_rw_binds: vec![],
+                    worker: Some(worker.clone()),
                 };
-                (
-                    containment::bwrap_args(primitive, &plan, &inner_argv, "/workspace"),
-                    containment::contained_env(&launch_env_base),
-                )
+                match self.contained_exec(
+                    primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &launch_env_base,
+                ) {
+                    Ok(contained) => contained,
+                    Err(reason) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("isolation.containment_refused: {reason}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
             }
         };
         match self.port.spawn(&argv, &workspace, &launch_env) {
@@ -3745,5 +3930,170 @@ mod tests {
             "a same-group straggler must be killed with the probe leader"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// An empty mount plan for `contained_exec` boundary tests — the
+    /// boundary fields start unset; the grant fills them.
+    fn empty_mount_plan() -> MountPlan {
+        MountPlan {
+            workspace: None,
+            request: None,
+            input: None,
+            out: None,
+            gitconfig: None,
+            runtime_auth: None,
+            provider_config: None,
+            proxy_sock: None,
+            toolchain: None,
+            caches: vec![],
+            extra_binds: vec![],
+            extra_rw_binds: vec![],
+            worker: None,
+        }
+    }
+
+    fn boundary_config(dir: &Path) -> crate::boundary::BoundaryConfig {
+        crate::boundary::BoundaryConfig {
+            credential_ref: None,
+            provider_config: None,
+            model_api_hosts: vec![],
+            runtime_dir: dir.join("runtime"),
+            egress_dir: dir.join("egress"),
+            relay_exe: PathBuf::from("/bin/sh"),
+        }
+    }
+
+    /// A boundary that cannot resolve its credential is a typed
+    /// refusal carried as launch evidence — never an ambient
+    /// credential and never an unwrapped launch.
+    #[test]
+    fn contained_exec_boundary_refusal_is_typed() {
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = boundary_config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_DEFINITELY_UNSET".into());
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        )
+        .with_runtime_boundary(crate::boundary::RuntimeBoundary::new(cfg));
+        let err = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains("credential.unresolvable"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resolved boundary becomes sandbox binds: the staged
+    /// credential and provider config mount read-only, the proxy
+    /// socket mounts and relay-wraps the inner argv, and the
+    /// environment exports only the relay proxy URL — the secret
+    /// value itself appears in neither argv nor env.
+    #[test]
+    fn contained_exec_grants_credential_config_and_relay() {
+        // SAFETY: test-only env mutation; the name is unique to this
+        // test so parallel tests cannot observe it.
+        unsafe { std::env::set_var("TAISAN_CONTAINED_EXEC_TOKEN", "sekrit-test-value") };
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_config = dir.join("provider.toml");
+        std::fs::write(&provider_config, "model = \"demo\"\n").unwrap();
+        let mut cfg = boundary_config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_TOKEN".into());
+        cfg.provider_config = Some(provider_config.clone());
+        cfg.model_api_hosts = vec!["model.example".into()];
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        )
+        .with_runtime_boundary(crate::boundary::RuntimeBoundary::new(cfg));
+        let (argv, env) = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap();
+        let joined = argv.join("\n");
+        assert!(joined.contains("/taisan/runtime-auth"), "{joined}");
+        assert!(joined.contains("/taisan/provider-config"), "{joined}");
+        assert!(joined.contains("/taisan/proxy.sock"), "{joined}");
+        assert!(joined.contains("__sandbox-relay"), "{joined}");
+        assert!(
+            env.vars
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://127.0.0.1:18080"),
+            "{:?}",
+            env.vars
+        );
+        assert!(
+            !joined.contains("sekrit-test-value")
+                && !env
+                    .vars
+                    .iter()
+                    .any(|(_, v)| v.contains("sekrit-test-value")),
+            "the credential value never enters argv or env"
+        );
+        unsafe { std::env::remove_var("TAISAN_CONTAINED_EXEC_TOKEN") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No boundary installed is the v1-compatible empty boundary:
+    /// contained argv carries no credential, provider config, proxy,
+    /// or relay — and no proxy variables.
+    #[test]
+    fn contained_exec_without_boundary_binds_nothing_extra() {
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        );
+        let (argv, env) = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap();
+        let joined = argv.join("\n");
+        for absent in [
+            "runtime-auth",
+            "provider-config",
+            "proxy.sock",
+            "__sandbox-relay",
+        ] {
+            assert!(!joined.contains(absent), "{joined}");
+        }
+        assert!(
+            !env.vars
+                .iter()
+                .any(|(k, _)| k.contains("PROXY") || k.contains("proxy")),
+            "{:?}",
+            env.vars
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
