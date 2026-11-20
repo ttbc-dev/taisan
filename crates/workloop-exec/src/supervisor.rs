@@ -2165,6 +2165,37 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
         };
+        // The post-consume Ready read is stale by workspace
+        // preparation and boundary resolution: re-verify authorization
+        // at the spawn boundary itself — the Execution still Ready and
+        // the request's own deadline unexpired — so a stop, deadline,
+        // or cancel committed during declaration, materialization, or
+        // preparation still blocks the launch. The recorded Invocation
+        // abandons exactly as the earlier gate does; no late writer
+        // starts after authorization expires.
+        let authorized = wire.budget.deadline_unix_seconds > now_unix_seconds
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !authorized {
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            // Unlike the earlier gate this runs after workspace
+            // preparation: the launch scratch and any check snapshot
+            // may already exist — release them with the io tree rather
+            // than leaving orphans for the next sweep.
+            isolation::release(&self.launch_scratch(&invocation.id.0));
+            isolation::release(&self.check_workspace(&invocation.id.0));
+            self.release_invocation_io(&invocation.id.0);
+            return Ok(());
+        }
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 let descendants = self

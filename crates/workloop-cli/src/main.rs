@@ -2064,13 +2064,51 @@ fn build_supervisor(
             profile: isolation_profile,
             toolchain: verification_boundary.toolchain,
             caches: verification_boundary.cache_paths,
-            egress_allowlist: verification_boundary.egress_allowlist,
+            egress_allowlist: verification_boundary.egress_allowlist.clone(),
             model_api_hosts: egress.model_api_hosts,
             egress_dir,
             relay_exe,
         })
     } else {
         None
+    };
+    // The v2 dispatch profile (`docs/v0.3.md` §4/§14.8): a validated
+    // `worker_dispatch` section means requests not yet consumed launch
+    // through the complete bound-request transport — the durable
+    // `taisan.worker.request/2` body plus `run --request/--out`. The
+    // CAS root matches the phase-1 snapshot retention root; the
+    // repository source is the supervisor-side read path for the
+    // bound repository only; verification egress hosts are the
+    // installation allowlist every request declares. Absent section:
+    // the recorded v1 argv-only launch is unchanged.
+    let supervisor = match installation.worker_dispatch()? {
+        Some(profile) => {
+            let dispatch = workloop_exec::request_v2::V2Dispatch {
+                bodies: workloop_exec::bodies::BodyStore::new(state_root.join("bodies")),
+                sources: vec![workloop_exec::workspace::RepositorySource {
+                    repository: config.host.repository.clone(),
+                    path: profile.source_path,
+                }],
+                invariant_set: profile.invariant_set.map(|set| {
+                    workloop_exec::request_v2::InvariantSetConfig {
+                        id: set.id,
+                        revision: set.revision,
+                        items: set.items,
+                    }
+                }),
+                budget: workloop_exec::request_v2::V2BudgetBounds {
+                    max_turns: profile.budget.max_turns,
+                    max_report_bytes: profile.budget.max_report_bytes,
+                    max_log_bytes: profile.budget.max_log_bytes,
+                    max_verification_commands: profile.budget.max_verification_commands,
+                    max_continuation_refs: profile.budget.max_continuation_refs,
+                },
+                capabilities: profile.capabilities,
+                verification_egress_hosts: verification_boundary.egress_allowlist,
+            };
+            supervisor.with_v2_dispatch(dispatch)
+        }
+        None => supervisor,
     };
     Ok(Some(supervisor.with_handoff(
         workloop_exec::handoff::HandoffLayout {
@@ -2395,5 +2433,88 @@ mod tests {
                 "update_change:host-local/local-repo:cr-1"
             ]
         );
+    }
+
+    /// The `worker_dispatch` installation section composes the v2
+    /// bound-request transport onto the run supervisor
+    /// (`docs/v0.3.md` §14.8): the CAS root is the state root's
+    /// `bodies`, the repository source is the configured checkout
+    /// bound to this installation's repository identity, and the
+    /// budget/invariant/capability surface comes from the validated
+    /// profile — never ambient defaults.
+    #[test]
+    fn worker_dispatch_profile_composes_the_v2_supervisor() {
+        let dir = std::env::temp_dir().join(format!(
+            "cli-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let mut installation = load_or_create(&config_path).unwrap();
+        installation.worker_argv = vec!["/opt/worker/bin/worker".into()];
+        installation.worker_dispatch = Some(workloop_config::WorkerDispatchSection {
+            source_path: "/srv/bound-repo".into(),
+            budget: workloop_config::WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set: Some(workloop_config::WorkerInvariantSetSection {
+                id: "invariants-1".into(),
+                revision: 1,
+                items: vec!["no-todo".into()],
+            }),
+            capabilities: vec!["artifact_json".into(), "process_control".into()],
+        });
+        installation.verification_egress_allowlist = vec!["static.crates.io".into()];
+        let state_root = dir.join("state");
+
+        let supervisor = build_supervisor(&config(), &installation, &state_root)
+            .unwrap()
+            .expect("worker_argv configured");
+        let dispatch = supervisor.v2.as_ref().expect("v2 dispatch attached");
+        assert_eq!(dispatch.bodies.root(), state_root.join("bodies"));
+        assert_eq!(dispatch.sources.len(), 1);
+        assert_eq!(dispatch.sources[0].repository, config().host.repository);
+        assert_eq!(
+            dispatch.sources[0].path,
+            std::path::PathBuf::from("/srv/bound-repo")
+        );
+        let set = dispatch.invariant_set.as_ref().expect("invariant set");
+        assert_eq!(set.id, "invariants-1");
+        assert_eq!(set.revision, 1);
+        assert_eq!(set.items, vec!["no-todo".to_string()]);
+        assert_eq!(dispatch.budget.max_turns, 8);
+        assert_eq!(
+            dispatch.capabilities,
+            vec!["artifact_json".to_string(), "process_control".to_string()]
+        );
+        assert_eq!(
+            dispatch.verification_egress_hosts,
+            vec!["static.crates.io".to_string()]
+        );
+
+        // A malformed section fails the composition closed — the run
+        // command surfaces it as a config error, never a degraded
+        // launch profile.
+        installation.worker_dispatch.as_mut().unwrap().source_path = "relative/repo".into();
+        let err = build_supervisor(&config(), &installation, &state_root)
+            .err()
+            .expect("a malformed dispatch section fails composition");
+        assert!(err.contains("source_path"), "{err}");
+
+        // Absent section: the v1 argv-only launch — no dispatch.
+        installation.worker_dispatch = None;
+        let supervisor = build_supervisor(&config(), &installation, &state_root)
+            .unwrap()
+            .expect("worker_argv configured");
+        assert!(supervisor.v2.is_none(), "no profile, no v2 dispatch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

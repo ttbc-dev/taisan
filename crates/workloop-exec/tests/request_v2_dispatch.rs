@@ -19,7 +19,9 @@ use workloop_core::identity::*;
 use workloop_core::observation::{
     HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact,
 };
-use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
+use workloop_core::store::{
+    BodyCatalog, Effect, HostAction, HostActionIntent, Store, StoreError, TxView,
+};
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
 };
@@ -1717,4 +1719,422 @@ fn without_the_v2_profile_the_v1_path_leaves_no_request_body() {
         "the v1 path writes no v2 request body"
     );
     let _ = w;
+}
+
+/// A store wrapper that commits a `Paused` transition in the first
+/// transaction after the consume commit's launch-authorization read —
+/// the racing stop/cancel the spawn-boundary recheck exists to catch
+/// (`docs/v0.3.md` §14.8). The flip lands after the post-consume
+/// `Ready` read returns but before the read-role launch path reaches
+/// `port.spawn`, so only the recheck immediately before spawn can
+/// still observe it.
+struct PauseAfterConsumeRead<'a> {
+    inner: &'a SqliteStore,
+    request_id: String,
+    execution_id: ExecutionId,
+    invocation_seen: std::cell::Cell<bool>,
+    flipped: std::cell::Cell<bool>,
+}
+
+impl Store for PauseAfterConsumeRead<'_> {
+    fn transact<R>(
+        &self,
+        f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let out = self.inner.transact(f)?;
+        if self.flipped.get() {
+            return Ok(out);
+        }
+        if self.invocation_seen.get() {
+            // The consume commit already landed; the transact that
+            // just returned is the post-consume authorization read.
+            // Commit the racing pause now — every later read,
+            // including the spawn-boundary recheck, sees it.
+            self.flipped.set(true);
+            self.inner.transact(|tx| {
+                let exec = tx.execution(&self.execution_id)?.expect("execution");
+                let mut next = exec.clone();
+                next.state = ExecutionState::Paused;
+                next.pause_reason = Some("racing stop".into());
+                next.paused_since_unix_seconds = Some(NOW);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: ExecutionState::Ready,
+                })?;
+                Ok(())
+            })?;
+        } else if self
+            .inner
+            .transact(|tx| tx.invocation_for_request(&self.request_id))?
+            .is_some()
+        {
+            self.invocation_seen.set(true);
+        }
+        Ok(out)
+    }
+
+    fn body_catalog(&self) -> &dyn BodyCatalog {
+        self.inner.body_catalog()
+    }
+}
+
+/// A stop committed in the window between the post-consume
+/// authorization read and the spawn itself — while the read-role
+/// launch path is still preparing — must block the launch: the
+/// recorded Invocation abandons and no worker process ever exists.
+/// The InvariantCheck role is the sharp case: its launch path runs
+/// no durable `workspace::prepare` gates, so the spawn-boundary
+/// recheck is the only authorization read left before `port.spawn`.
+#[test]
+fn a_stop_racing_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("racing-stop");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-race", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    std::fs::create_dir_all(sup.workspace_of(&w)).unwrap();
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    let racing = PauseAfterConsumeRead {
+        inner: &store,
+        request_id: rid1.clone(),
+        execution_id: e.clone(),
+        invocation_seen: std::cell::Cell::new(false),
+        flipped: std::cell::Cell::new(false),
+    };
+    sup.consume_requests(&racing, NOW).unwrap();
+
+    assert!(
+        racing.flipped.get(),
+        "the racing pause committed inside the launch window"
+    );
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Abandoned,
+        "the spawn-boundary recheck abandoned the prepared invocation"
+    );
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert_eq!(
+        execution(&store, &e).state,
+        ExecutionState::Paused,
+        "the racing stop stands — the launch never revived it"
+    );
+    assert!(
+        !pending_ids(&store).contains(&rid1),
+        "the consumed request is terminal for its binding"
+    );
+}
+
+/// A v2 supervisor over a caller-chosen worker argv — the
+/// declaration-drift and transport-failure cases need argv shapes
+/// `supervisor_v2`'s fixed `--wire v2` tail does not produce.
+fn supervisor_v2_argv(
+    root: &Path,
+    state_root: &Path,
+    src: &Path,
+    argv: Vec<String>,
+) -> Supervisor<PosixProcessControl> {
+    let handoff = layout(root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    fixture_sup(
+        PosixProcessControl,
+        handoff.workspace_root.clone(),
+        argv,
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(state_root, src))
+}
+
+/// A `taisan.worker.declaration/1` envelope with caller-chosen
+/// roles/capabilities — the `--decl-file` surface lets a real fixture
+/// process declare exactly the drifted surface a test needs.
+fn v2_decl(roles: &[&str], capabilities: &[&str]) -> String {
+    serde_json::json!({
+        "format_version": "taisan.worker.declaration/1",
+        "adapter": "workloop-fixture-worker",
+        "adapter_version": "1.0.0",
+        "runtime": {"product": "fixture-runtime", "version": "fixture-1.0.0"},
+        "protocol_versions": [
+            "taisan.worker.request/2",
+            "taisan.worker.report/2",
+        ],
+        "roles": roles,
+        "capabilities": capabilities,
+        "resume": "unsupported",
+        "checkpoints": "workspace_commits",
+        "runtime_artifact_store": null,
+        "local_retries": "runtime_internal",
+    })
+    .to_string()
+}
+
+/// A worker whose `describe` never answers — here a real `/bin/false`
+/// child exiting non-zero — is `adapter.declaration_unavailable`: an
+/// explicit configuration repair recorded before any launch, never a
+/// degraded start.
+#[test]
+fn an_unanswered_declaration_is_a_configuration_repair() {
+    let root = tmp_root("decl-silent");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-silent", vec![]);
+    let sup = supervisor_v2_argv(&root, &state_root, &src, vec!["/bin/false".into()]);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let refusals = launch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("declaration_unavailable"),
+        "the refusal names the unanswered declaration: {}",
+        refusals[0]
+    );
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A declaration that answers but does not offer the request's role
+/// is `adapter.role_mismatch` — the launch is refused before any
+/// worker process exists.
+#[test]
+fn a_declaration_lacking_the_request_role_refuses_launch() {
+    let root = tmp_root("decl-role");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-role", vec![]);
+    let decl = root.join("decl.json");
+    std::fs::write(
+        &decl,
+        v2_decl(
+            &["review"],
+            &["workspace_write", "artifact_json", "process_control"],
+        ),
+    )
+    .unwrap();
+    let argv = vec![
+        fixture_bin(),
+        "clean-exit".into(),
+        "--decl-file".into(),
+        decl.to_string_lossy().into_owned(),
+    ];
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let refusals = launch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("role_mismatch"),
+        "the refusal names the role mismatch: {}",
+        refusals[0]
+    );
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A declaration missing a required capability is
+/// `capability.missing` — the exact §5.2 negotiation, never a
+/// best-effort launch.
+#[test]
+fn a_declaration_missing_a_required_capability_refuses_launch() {
+    let root = tmp_root("decl-cap");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-cap", vec![]);
+    let decl = root.join("decl.json");
+    std::fs::write(
+        &decl,
+        v2_decl(
+            &["coding", "fix", "invariant_check", "review"],
+            &["workspace_write", "process_control"],
+        ),
+    )
+    .unwrap();
+    let argv = vec![
+        fixture_bin(),
+        "clean-exit".into(),
+        "--decl-file".into(),
+        decl.to_string_lossy().into_owned(),
+    ];
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let refusals = launch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("capability.missing"),
+        "the refusal names the missing capability: {}",
+        refusals[0]
+    );
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A request whose recorded binding no longer matches the freshly
+/// declared runtime is a configuration repair — the binding is
+/// immutable, the drift is named, and no worker starts under it.
+#[test]
+fn a_bound_request_whose_runtime_drifts_is_a_configuration_repair() {
+    let root = tmp_root("decl-drift");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, _e, rid) = admit(&store, "v2-drift", vec![]);
+    let argv = vec![
+        fixture_bin(),
+        "clean-exit".into(),
+        "--wire".into(),
+        "v2".into(),
+    ];
+    // The binding the request recorded when it bound: the real
+    // declaration's capability surface, but a runtime version the
+    // worker no longer reports — the upgrade happened after binding.
+    let (_declared, surface) = workloop_exec::adapter::observe_worker_declaration_v2(
+        &PosixProcessControl,
+        &argv,
+        &root,
+        &workloop_core::ports::WorkerEnv::default(),
+    )
+    .expect("the fixture declares its v2 surface");
+    let mut binding = surface.binding(&argv);
+    binding.runtime_version = "fixture-9.9.9".into();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::BindRequestAdapter {
+                request_id: rid.clone(),
+                binding: binding.clone(),
+            })
+        })
+        .unwrap();
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let refusals = launch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        refusals[0].contains("runtime.version_mismatch"),
+        "the refusal names the runtime drift: {}",
+        refusals[0]
+    );
+    // The refused request keeps its recorded binding — a later
+    // configuration can never retarget it.
+    let request = store
+        .transact(|tx| tx.request(&rid))
+        .unwrap()
+        .expect("request row");
+    assert_eq!(
+        request.adapter_binding.map(|b| b.runtime_version),
+        Some("fixture-9.9.9".to_string())
+    );
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A `taisan.worker.declaration/1` envelope for the scripted port —
+/// the same surface the fixture prints under `--wire v2`.
+fn scripted_v2_declaration() -> String {
+    v2_decl(
+        &["coding", "fix", "invariant_check", "review"],
+        &["workspace_write", "artifact_json", "process_control"],
+    )
+}
+
+/// A spawn whose outcome is lost — `SpawnError::Unknown` — leaves the
+/// recorded Invocation `Prepared` with no process identity: unknown,
+/// never retried. A later pass reconciles the recorded Invocation and
+/// reports the unknown writer again; it cannot start a second writer
+/// for the consumed request.
+#[test]
+fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
+    use workloop_core::ports::ProbeOutcome;
+    use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
+
+    let root = tmp_root("spawn-unknown");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-unknown", vec![]);
+    let _ = w;
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: scripted_v2_declaration().into_bytes(),
+        success: true,
+    }));
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        port.clone(),
+        handoff.workspace_root.clone(),
+        vec!["scripted-worker".into()],
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(&state_root, &src));
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Prepared,
+        "an unknown spawn outcome is never guessed"
+    );
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "the unknown outcome consumed exactly one start attempt"
+    );
+
+    // Reconciliation and further passes replay the recorded
+    // Invocation — the unknown writer is reported, never replaced.
+    sup.consume_requests(&store, NOW + 1).unwrap();
+    sup.run_once(&store, NOW + 2).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "no second writer ever starts for the consumed request"
+    );
+    let invocations: Vec<Invocation> = store
+        .transact(|tx| tx.invocations_for_execution(&e))
+        .unwrap();
+    assert_eq!(invocations.len(), 1, "exactly one Invocation ever");
+    assert_eq!(invocations[0].state, InvocationState::Prepared);
+    assert!(invocations[0].process_identity.is_none());
+    assert!(!pending_ids(&store).contains(&rid));
 }

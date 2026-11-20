@@ -171,6 +171,12 @@ pub struct Installation {
     /// verification allowlist.
     #[serde(default)]
     pub worker_model_api_hosts: Vec<String>,
+    /// The v2 Worker dispatch profile (`docs/v0.3.md` §4, §14.8):
+    /// present means requests not yet consumed launch through the
+    /// complete bound-request transport; absent keeps the recorded
+    /// v1 argv-only launch. Validated by [`Self::worker_dispatch`].
+    #[serde(default)]
+    pub worker_dispatch: Option<WorkerDispatchSection>,
     /// Absolute path to the pinned verification toolchain, bound
     /// read-only into the verification sandbox (`docs/v0.3.md` §14.5).
     #[serde(default)]
@@ -236,6 +242,67 @@ pub struct VerificationBoundary {
     pub cache_paths: Vec<PathBuf>,
     /// Installation-default verification egress hosts.
     pub egress_allowlist: Vec<String>,
+}
+
+/// The v2 Worker dispatch profile section of the installation record
+/// (`docs/v0.3.md` §4, §14.8). Presence selects the complete
+/// bound-request transport for requests not yet consumed; absence
+/// keeps the recorded v1 argv-only launch. Unknown keys are refused:
+/// a misspelled budget or capability key must surface as a load
+/// error, never silently degrade the profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerDispatchSection {
+    /// Absolute path to the supervisor-side local checkout of the
+    /// bound repository — the read path base resolution and managed
+    /// workspace preparation fetch from. The Worker never sees it.
+    pub source_path: String,
+    /// Per-request wire budget bounds; every field is a positive
+    /// integer — `0` is never "unlimited".
+    pub budget: WorkerDispatchBudgetSection,
+    /// The approved invariant set InvariantCheck requests bind.
+    /// Absent refuses every InvariantCheck dispatch as
+    /// `request.invariant_set_missing`.
+    #[serde(default)]
+    pub invariant_set: Option<WorkerInvariantSetSection>,
+    /// Capability floor every v2 declaration must cover; writer
+    /// roles additionally require `workspace_write`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// The wire budget bounds inside [`WorkerDispatchSection`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerDispatchBudgetSection {
+    pub max_turns: u64,
+    pub max_report_bytes: u64,
+    pub max_log_bytes: u64,
+    pub max_verification_commands: u64,
+    pub max_continuation_refs: u64,
+}
+
+/// The approved invariant set inside [`WorkerDispatchSection`]. A
+/// changed set is a new `(id, revision)` pair — the retained request
+/// body is immutable once written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerInvariantSetSection {
+    pub id: String,
+    pub revision: u64,
+    pub items: Vec<String>,
+}
+
+/// The validated v2 dispatch surface returned by
+/// [`Installation::worker_dispatch`].
+#[derive(Debug, Clone)]
+pub struct WorkerDispatchProfile {
+    /// Absolute path to the bound repository's local checkout.
+    pub source_path: PathBuf,
+    pub budget: WorkerDispatchBudgetSection,
+    pub invariant_set: Option<WorkerInvariantSetSection>,
+    /// Deduplicated capability floor, order preserved.
+    pub capabilities: Vec<String>,
 }
 
 /// The selector binding for alternate admission. Presence selects the
@@ -310,6 +377,31 @@ fn uuidish() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}-{}", std::process::id())
+}
+
+/// A `worker_dispatch` identifier (invariant id/item, capability
+/// name): non-empty, bounded, and free of control characters — the
+/// value is matched verbatim against a worker declaration or bound
+/// into a request, so a malformed entry is a configuration error at
+/// this boundary rather than a dispatch-time mystery.
+fn check_dispatch_token<'a>(
+    kind: &str,
+    value: &'a str,
+    max_bytes: usize,
+) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("installation {kind}: must not be empty"));
+    }
+    if trimmed.len() > max_bytes {
+        return Err(format!("installation {kind}: exceeds {max_bytes} bytes"));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "installation {kind}: control characters are refused"
+        ));
+    }
+    Ok(trimmed)
 }
 
 /// The unique scratch name the complete content is staged under before
@@ -527,6 +619,7 @@ fn load_or_create_with(
         worker_credential_ref: None,
         worker_provider_config: None,
         worker_model_api_hosts: vec![],
+        worker_dispatch: None,
         verification_toolchain: None,
         verification_cache_paths: vec![],
         verification_egress_allowlist: vec![],
@@ -715,6 +808,84 @@ impl Installation {
             cache_paths,
             egress_allowlist: allowlist,
         })
+    }
+
+    /// The validated v2 Worker dispatch profile
+    /// (`docs/v0.3.md` §4, §14.8). `None` means the installation keeps
+    /// the recorded v1 argv-only launch. A present section is
+    /// validated at this boundary: the source path must be absolute,
+    /// every budget bound a positive integer, the invariant set
+    /// complete, and capability names sane — a malformed section is a
+    /// configuration error, never a partially enforced profile. The
+    /// section also requires `worker_argv`: a dispatch profile with
+    /// no worker to dispatch to is incomplete configuration.
+    pub fn worker_dispatch(&self) -> Result<Option<WorkerDispatchProfile>, String> {
+        let Some(section) = &self.worker_dispatch else {
+            return Ok(None);
+        };
+        if self.worker_argv.is_empty() {
+            return Err(
+                "installation worker_dispatch requires worker_argv — a dispatch \
+                 profile with no worker to launch is incomplete"
+                    .into(),
+            );
+        }
+        let source_path = PathBuf::from(&section.source_path);
+        if !source_path.is_absolute() {
+            return Err(
+                "installation worker_dispatch.source_path: must be an absolute path".into(),
+            );
+        }
+        let budget = &section.budget;
+        for (name, value) in [
+            ("max_turns", budget.max_turns),
+            ("max_report_bytes", budget.max_report_bytes),
+            ("max_log_bytes", budget.max_log_bytes),
+            (
+                "max_verification_commands",
+                budget.max_verification_commands,
+            ),
+            ("max_continuation_refs", budget.max_continuation_refs),
+        ] {
+            if value == 0 {
+                return Err(format!(
+                    "installation worker_dispatch.budget.{name}: must be a positive integer"
+                ));
+            }
+        }
+        let invariant_set = match &section.invariant_set {
+            None => None,
+            Some(set) => {
+                let mut set = set.clone();
+                set.id = check_dispatch_token("worker_dispatch.invariant_set.id", &set.id, 256)?
+                    .to_string();
+                if set.items.is_empty() {
+                    return Err(
+                        "installation worker_dispatch.invariant_set.items: must name at \
+                         least one invariant"
+                            .into(),
+                    );
+                }
+                for item in &mut set.items {
+                    *item = check_dispatch_token("worker_dispatch.invariant_set.items", item, 256)?
+                        .to_string();
+                }
+                Some(set)
+            }
+        };
+        let mut capabilities: Vec<String> = Vec::new();
+        for entry in &section.capabilities {
+            let entry = check_dispatch_token("worker_dispatch.capabilities", entry, 128)?;
+            if !capabilities.iter().any(|c| c.as_str() == entry) {
+                capabilities.push(entry.to_string());
+            }
+        }
+        Ok(Some(WorkerDispatchProfile {
+            source_path,
+            budget: budget.clone(),
+            invariant_set,
+            capabilities,
+        }))
     }
 
     /// The bound host instance identity: the configured `host_instance`
@@ -1131,6 +1302,189 @@ mod tests {
         assert_eq!(
             boundary.toolchain.as_deref(),
             Some(std::path::Path::new("/opt/taisan/toolchain"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid dispatch section on an installation with no
+    /// `worker_argv` is incomplete configuration — the profile selects
+    /// a transport but names no worker to dispatch to.
+    #[test]
+    fn worker_dispatch_requires_worker_argv() {
+        let (dir, mut installation) = installation("dispatch-argv");
+        installation.worker_argv = vec![];
+        installation.worker_dispatch = Some(WorkerDispatchSection {
+            source_path: "/srv/repo".into(),
+            budget: WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set: None,
+            capabilities: vec![],
+        });
+        let err = installation.worker_dispatch().unwrap_err();
+        assert!(err.contains("worker_argv"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The source path must be absolute — a relative checkout would
+    /// resolve against whatever cwd the supervisor happened to start
+    /// in, never a stable read path.
+    #[test]
+    fn worker_dispatch_requires_an_absolute_source_path() {
+        let (dir, mut installation) = installation("dispatch-source");
+        installation.worker_argv = vec!["worker".into()];
+        installation.worker_dispatch = Some(WorkerDispatchSection {
+            source_path: "relative/repo".into(),
+            budget: WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set: None,
+            capabilities: vec![],
+        });
+        let err = installation.worker_dispatch().unwrap_err();
+        assert!(err.contains("source_path"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every budget bound must be a positive integer — `0` is a
+    /// configuration error, never "unlimited".
+    #[test]
+    fn worker_dispatch_rejects_zero_budget_bounds() {
+        let (dir, mut installation) = installation("dispatch-budget");
+        installation.worker_argv = vec!["worker".into()];
+        for field in [
+            "max_turns",
+            "max_report_bytes",
+            "max_log_bytes",
+            "max_verification_commands",
+            "max_continuation_refs",
+        ] {
+            let mut budget = WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            };
+            match field {
+                "max_turns" => budget.max_turns = 0,
+                "max_report_bytes" => budget.max_report_bytes = 0,
+                "max_log_bytes" => budget.max_log_bytes = 0,
+                "max_verification_commands" => budget.max_verification_commands = 0,
+                _ => budget.max_continuation_refs = 0,
+            }
+            installation.worker_dispatch = Some(WorkerDispatchSection {
+                source_path: "/srv/repo".into(),
+                budget,
+                invariant_set: None,
+                capabilities: vec![],
+            });
+            let err = installation.worker_dispatch().unwrap_err();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Invariant-set and capability identifiers are matched verbatim
+    /// against declarations and bound into requests — empty,
+    /// oversized, or control-character entries are configuration
+    /// errors at this boundary.
+    #[test]
+    fn worker_dispatch_validates_identifier_tokens() {
+        let (dir, mut installation) = installation("dispatch-tokens");
+        installation.worker_argv = vec!["worker".into()];
+        let section = |invariant_set, capabilities| WorkerDispatchSection {
+            source_path: "/srv/repo".into(),
+            budget: WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set,
+            capabilities,
+        };
+        installation.worker_dispatch = Some(section(
+            Some(WorkerInvariantSetSection {
+                id: "set-1".into(),
+                revision: 1,
+                items: vec![],
+            }),
+            vec![],
+        ));
+        let err = installation.worker_dispatch().unwrap_err();
+        assert!(err.contains("items"), "{err}");
+
+        installation.worker_dispatch = Some(section(
+            Some(WorkerInvariantSetSection {
+                id: "set\u{7}.1".into(),
+                revision: 1,
+                items: vec!["no-todo".into()],
+            }),
+            vec![],
+        ));
+        let err = installation.worker_dispatch().unwrap_err();
+        assert!(err.contains("invariant_set.id"), "{err}");
+
+        installation.worker_dispatch = Some(section(
+            None,
+            vec!["artifact_json".into(), "bad\ncap".into()],
+        ));
+        let err = installation.worker_dispatch().unwrap_err();
+        assert!(err.contains("capabilities"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid section normalizes identifiers (trim, dedup) and
+    /// returns the validated profile; absent stays `None` — the v1
+    /// argv-only launch is the default, never an implicit upgrade.
+    #[test]
+    fn worker_dispatch_validates_and_normalizes() {
+        let (dir, mut installation) = installation("dispatch-ok");
+        assert!(installation.worker_dispatch().unwrap().is_none());
+
+        installation.worker_argv = vec!["worker".into()];
+        installation.worker_dispatch = Some(WorkerDispatchSection {
+            source_path: "/srv/repo".into(),
+            budget: WorkerDispatchBudgetSection {
+                max_turns: 8,
+                max_report_bytes: 1 << 20,
+                max_log_bytes: 1 << 25,
+                max_verification_commands: 4,
+                max_continuation_refs: 4,
+            },
+            invariant_set: Some(WorkerInvariantSetSection {
+                id: " set-1 ".into(),
+                revision: 2,
+                items: vec![" no-todo ".into(), "tests-pass".into()],
+            }),
+            capabilities: vec![
+                " artifact_json ".into(),
+                "artifact_json".into(),
+                "process_control".into(),
+            ],
+        });
+        let profile = installation.worker_dispatch().unwrap().unwrap();
+        assert_eq!(profile.source_path, PathBuf::from("/srv/repo"));
+        let set = profile.invariant_set.unwrap();
+        assert_eq!(set.id, "set-1");
+        assert_eq!(set.revision, 2);
+        assert_eq!(
+            set.items,
+            vec!["no-todo".to_string(), "tests-pass".to_string()]
+        );
+        assert_eq!(
+            profile.capabilities,
+            vec!["artifact_json".to_string(), "process_control".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
