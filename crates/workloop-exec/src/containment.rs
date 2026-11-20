@@ -865,6 +865,11 @@ fn run_battery(
         "unmounted-path-invisible",
         &mut records,
     );
+    // The canary falls back to the host temp dir when no declared
+    // bind covers the workspace `.containment` dir — reclaim it so a
+    // first-launch proof never leaks `workloop-canary-<pid>` on the
+    // host.
+    let _ = std::fs::remove_dir_all(&canary);
     // tmpfs scratch is writable at /tmp and the fresh /home.
     run_named_probe(
         port,
