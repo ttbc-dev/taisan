@@ -275,6 +275,40 @@ impl BodyStore {
         eligible_after_unix_seconds: Option<i64>,
     ) -> Result<String, BodyError> {
         let id = content_id(bytes);
+        // The same content may already be catalogued under another
+        // logical path — e.g. a materialized input a worker echoes
+        // into its own report. That is an alias of the same content
+        // address, not a conflict: the bytes resolve by `body_id`
+        // identically either way, so re-observe the existing row to
+        // extend its eligibility horizon rather than force a second
+        // binding that must fail. A byte-count mismatch under one
+        // content address is a corrupt catalogue row and stays a
+        // fault, and a non-`present` row keeps the normal path —
+        // re-writing is the only way the bytes come back.
+        if let Some(existing) = catalog.body_entry(&id)?
+            && existing.state == "present"
+        {
+            if existing.bytes != bytes.len() as u64 {
+                return Err(BodyError::Corrupt {
+                    body_id: id,
+                    detail: format!(
+                        "catalogue records {} bytes under the content identity, body holds {}",
+                        existing.bytes,
+                        bytes.len()
+                    ),
+                });
+            }
+            catalog.register_body(&NewCatalogBody {
+                body_id: id.clone(),
+                category: existing.category,
+                path: existing.path,
+                bytes: existing.bytes,
+                registered_unix_seconds: now_unix_seconds,
+                eligible_after_unix_seconds,
+                pinned: existing.pinned,
+            })?;
+            return Ok(id);
+        }
         self.write_at(
             catalog,
             category,
@@ -611,6 +645,32 @@ mod tests {
             ),
             Err(BodyError::UnsafePath { .. }) | Err(BodyError::Fault(_))
         ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retain_aliases_content_already_registered_under_another_path() {
+        let root = tmp("alias");
+        let store = BodyStore::new(root.clone());
+        let catalog = MemCatalog::default();
+        let bytes = b"goal-contents-a-worker-can-echo".to_vec();
+        // The materialized input owns the first catalogue binding for
+        // this content — a different category and a lookup path.
+        let id = store
+            .retain_at(&catalog, "snapshot", "inputs/goal.md", &bytes, 100, None)
+            .expect("input retain");
+        // Worker-controlled evidence holding the same bytes is an
+        // alias of the same content address — a re-observation, not a
+        // conflicting registration that would fault the finish path.
+        let aliased = store
+            .retain(&catalog, CAS_CATEGORY, &bytes, 200, None)
+            .expect("evidence retain aliases the registered body");
+        assert_eq!(aliased, id);
+        let resolved = store
+            .resolve(&catalog, &id)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.bytes, bytes);
         let _ = std::fs::remove_dir_all(&root);
     }
 
