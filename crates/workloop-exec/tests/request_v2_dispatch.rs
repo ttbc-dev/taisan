@@ -1451,6 +1451,45 @@ fn a_review_without_a_current_target_is_head_stale_never_dispatched() {
 }
 
 #[test]
+fn a_review_whose_target_head_moved_past_the_produced_commit_is_head_stale() {
+    let root = tmp_root("review-moved");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-reviewmoved", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // The accepted target head is the base commit — the produced
+    // commit the workspace pins no longer matches the current head.
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), base.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+#[test]
 fn a_restart_replays_the_recorded_invocation_and_stored_body() {
     let root = tmp_root("restart");
     let state_root = root.join("state");

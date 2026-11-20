@@ -256,8 +256,29 @@ fn artifact_ref(handoff: &ArtifactHandoff) -> Result<ArtifactRef, DispatchRefusa
 fn wire_target(
     work: &Work,
     target: &CoreDiffTarget,
-    base: &str,
+    handoff: &ArtifactHandoff,
 ) -> Result<workloop_core::worker_v2::DiffTarget, DispatchRefusal> {
+    let base = &handoff.base;
+    let produced =
+        handoff
+            .produced
+            .as_deref()
+            .ok_or_else(|| DispatchRefusal::ArtifactUnavailable {
+                detail: format!("handoff {} has no produced commit", handoff.artifact_id),
+            })?;
+    // The workspace this request launches into is pinned at the
+    // acknowledged handoff's produced commit; a current target whose
+    // head has moved past it names code the mounted workspace does
+    // not contain — refuse HeadStale so a later pass binds the new
+    // head from a fresh handoff instead.
+    if target.head.object != produced {
+        return Err(DispatchRefusal::HeadStale {
+            detail: format!(
+                "the current target head {} moved past the produced commit {produced} the workspace pins",
+                target.head.object
+            ),
+        });
+    }
     if target.change.repository != work.binding.repository {
         return Err(DispatchRefusal::HeadStale {
             detail: "the current target names a foreign repository".into(),
@@ -723,7 +744,7 @@ pub fn build_request_body(
                             })
                         })?;
                         Some(FixOrigin::Review {
-                            target: wire_target(&durable.work, target, &handoff.base)?,
+                            target: wire_target(&durable.work, target, handoff)?,
                             round: round.id.clone(),
                             judgment: judgment.id.clone(),
                             findings,
@@ -848,7 +869,7 @@ pub fn build_request_body(
                     detail: "no acknowledged handoff records the review base".into(),
                 })
             })?;
-            let wire = wire_target(&durable.work, target, &handoff.base)?;
+            let wire = wire_target(&durable.work, target, handoff)?;
             // Prior-review context: the newest sealed round across all
             // targets, with its occurrence set and exact-set judgment —
             // read back fresh because the gather collected identities
