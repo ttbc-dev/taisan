@@ -1423,7 +1423,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,
@@ -1547,7 +1547,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             req.base.object,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (Vec::new(), String::new()),
                 };
             Ok(Some((
                 invocation.clone(),
