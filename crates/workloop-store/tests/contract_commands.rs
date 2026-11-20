@@ -1641,6 +1641,110 @@ fn resume_defers_terminal_settlement_while_a_host_write_is_outstanding() {
     );
 }
 
+/// Regression: a `pending` intent under a denied `host_write` grant
+/// can never be attempted — deferring the terminal settlement on it
+/// would stall the outcome forever with no in-flight effect to wait
+/// for. The intent record itself stays `pending` (a denied permission
+/// is a deferral, not a capability verdict); it just does not block
+/// the settle.
+#[test]
+fn resume_settles_terminally_when_the_only_outstanding_write_can_never_apply() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(1, 5);
+    let (work_id, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("rbd"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(workloop_core::work::admit_queued(tx, &config, &e1, NOW)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    force_state(&store, &e1, ExecutionState::Paused);
+    apply_effects(
+        &store,
+        &[Effect::ReleaseSlot {
+            execution_id: e1.clone(),
+        }],
+    );
+    // Deny the Execution's write grant: the drain's `host_write` gate
+    // keys the latest Execution, so the pending intent below can never
+    // be attempted — no effect exists to settle behind.
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&e1)?.unwrap();
+            let expected_state = e.state.clone();
+            e.allowed_effects.host_write = false;
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state,
+            })
+        })
+        .unwrap();
+    apply_effects(
+        &store,
+        &[Effect::InsertHostActionIntent {
+            intent: HostActionIntent {
+                action_id: "act-never-attemptable".into(),
+                work_id: work_id.clone(),
+                host: host(),
+                repository: repo(),
+                role: ActorRole::Publication,
+                actor: publisher(),
+                action: HostAction::PushRef {
+                    branch: format!("work/{}", work_id.0),
+                    produced: rev("artifact-digest"),
+                    expected_prior: None,
+                },
+                payload_digest: "test".into(),
+                status: HostActionStatus::Pending,
+                authenticated_actor: None,
+                effects: vec![],
+                created_seq: 0,
+            },
+        }],
+    );
+
+    let resume = req(
+        "rbd2",
+        CommandBody::Resume {
+            work_id: work_id.clone(),
+            expected_work_version: 1,
+            execution_id: e1.clone(),
+        },
+    );
+    let d = handle_command(&store, &config, &resume, NOW).unwrap();
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "an unattemptable write must not defer terminal settlement: {d:?}"
+    );
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(
+        e.terminal_code.as_deref(),
+        Some("invocation_budget_exhausted")
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e1 && d.reason == "outbox_reconciliation"),
+        "no outbox-reconciliation deferral for an unattemptable intent"
+    );
+    // The intent record itself is untouched: a denied permission is a
+    // deferral, not a verdict the supervisor may fabricate.
+    let status = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == "act-never-attemptable")
+                .map(|i| i.status))
+        })
+        .unwrap();
+    assert_eq!(status, Some(HostActionStatus::Pending));
+}
+
 #[test]
 fn review_admission_never_exceeds_max_review_rounds() {
     let store = SqliteStore::in_memory(1).unwrap();

@@ -945,6 +945,38 @@ pub fn outstanding_actions(tx: &dyn ReadView, work_id: &WorkId) -> Result<Vec<St
         .collect())
 }
 
+/// Outstanding effects that still justify deferring a terminal
+/// outcome: `unknown` intents always — the write may already have
+/// landed and only reconciliation settles it — and `pending` intents
+/// only while the Work's latest Execution still grants `host_write`.
+/// Under a denied grant the write drain can never attempt a pending
+/// intent, so deferring on it stalls the terminal outcome forever
+/// with no effect to wait for (the intent record itself stays
+/// `pending` — a denied permission is a deferral, not a verdict).
+pub fn settlement_blocking_actions(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<Vec<String>, StoreError> {
+    let host_write = tx
+        .executions_for_work(work_id)?
+        .into_iter()
+        .max_by_key(|execution| execution.ordinal)
+        .is_some_and(|execution| execution.allowed_effects.host_write);
+    Ok(tx
+        .action_intents()?
+        .into_iter()
+        .filter(|i| {
+            &i.work_id == work_id
+                && match i.status {
+                    HostActionStatus::Pending => host_write,
+                    HostActionStatus::Unknown { .. } => true,
+                    _ => false,
+                }
+        })
+        .map(|i| i.action_id)
+        .collect())
+}
+
 /// Whether recorded evidence covers a clean exit: every required artifact
 /// of the Invocation was reported `Present` with a digest matching any
 /// declared expectation.

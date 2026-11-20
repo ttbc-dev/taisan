@@ -3731,11 +3731,14 @@ fn settle_after_writer_gone(
         .unwrap_or(DesiredAction::Fail);
     // Terminal settlement waits for outstanding outbox effects to
     // reconcile (lifecycle.md): a pending or unknown host write must
-    // not be drained after a recorded cancellation/failure. The
-    // `host_action_result` observation re-drives this settle once the
-    // intent is resolved.
+    // not be drained after a recorded cancellation/failure. A pending
+    // intent counts only while the Work's latest Execution could still
+    // attempt it — under a denied `host_write` grant it can never
+    // deliver an effect, so deferring on it stalls the outcome
+    // forever. The `host_action_result` observation re-drives this
+    // settle once the intent is resolved.
     if matches!(desired, DesiredAction::Cancel | DesiredAction::Fail)
-        && !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty()
+        && !crate::projection::settlement_blocking_actions(tx, &execution.work_id)?.is_empty()
     {
         return Ok(());
     }
@@ -4725,14 +4728,16 @@ fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Resu
 /// for outstanding host writes to reconcile (lifecycle.md): intents are
 /// delivery-bound and would still apply under a recorded failure, so the
 /// stall is recorded as `outbox_reconciliation` instead of the terminal
-/// outcome. Returns true while the deferral stands.
+/// outcome. An intent that can never be attempted — `pending` under a
+/// denied `host_write` grant — does not defer: there is no in-flight
+/// effect to wait for. Returns true while the deferral stands.
 fn defer_terminal_while_outstanding(
     tx: &mut dyn TxView,
     work_id: &WorkId,
     execution_id: &ExecutionId,
     terminal_code: &str,
 ) -> Result<bool, StoreError> {
-    if crate::projection::outstanding_actions(tx, work_id)?.is_empty() {
+    if crate::projection::settlement_blocking_actions(tx, work_id)?.is_empty() {
         return Ok(false);
     }
     tx.apply(&Effect::RecordDeferral {

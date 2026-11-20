@@ -1162,6 +1162,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             (inner_argv.to_vec(), None)
         };
+        if let Some(reason) = containment::plan_denial(&plan) {
+            return Err(reason);
+        }
         Ok((
             containment::bwrap_args(primitive, &plan, &exec_argv, inner_cwd),
             containment::contained_env(env, egress_proxy),
