@@ -921,6 +921,17 @@ pub fn build_request_body(
     {
         capabilities.push("workspace_write".into());
     }
+    if matches!(
+        request.role,
+        InvocationRole::InvariantCheck | InvocationRole::Review
+    ) && !capabilities.iter().any(|c| c == "workspace_read_only")
+    {
+        // A read-only assessment requires the adapter to declare the
+        // read-only workspace capability (docs/v0.3.md §5/§7.5): an
+        // adapter that lacks it must fail negotiation, not launch a
+        // check or review it never agreed to contain.
+        capabilities.push("workspace_read_only".into());
+    }
     let required_capabilities = RequiredCapabilities {
         role: request.role.clone(),
         protocol_versions: vec![WORKER_REQUEST_V2_FORMAT.to_string()],

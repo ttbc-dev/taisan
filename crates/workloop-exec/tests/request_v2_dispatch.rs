@@ -743,6 +743,14 @@ fn coding_dispatch_materializes_the_request_and_per_invocation_io() {
     assert_eq!(wire.spec.revision, 1);
     assert!(matches!(wire.task, TaskBody::Coding { .. }));
     assert!(!wire.workspace.read_only);
+    assert!(
+        !wire
+            .required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the writer grant never requires the read-only capability"
+    );
 
     let invocation = invocation_for(&store, &rid).expect("invocation recorded");
     let io_root = invocation_io_root(&root.join("ws"));
@@ -1269,6 +1277,13 @@ fn invariant_check_binds_the_approved_set_read_only() {
     let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
     assert_eq!(wire.role, InvocationRole::InvariantCheck);
     assert!(wire.workspace.read_only, "the check grant is read-only");
+    assert!(
+        wire.required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the check requires the read-only capability so an adapter that lacks it fails negotiation"
+    );
     let TaskBody::InvariantCheck {
         artifact,
         invariant_set,
@@ -1365,6 +1380,13 @@ fn review_dispatch_binds_the_current_target_and_review_source() {
     let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
     assert_eq!(wire.role, InvocationRole::Review);
     assert!(wire.workspace.read_only, "the review grant is read-only");
+    assert!(
+        wire.required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the review requires the read-only capability so an adapter that lacks it fails negotiation"
+    );
     let TaskBody::CodeReview {
         target,
         review_source,

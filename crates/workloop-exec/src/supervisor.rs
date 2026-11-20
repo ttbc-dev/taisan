@@ -1857,7 +1857,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
-                    workspace: Some((workspace.clone(), false)),
+                    workspace: Some((
+                        workspace.clone(),
+                        // §14.6: assessment roles bind the workspace
+                        // read-only; writers keep read-write.
+                        matches!(
+                            request.role,
+                            InvocationRole::InvariantCheck | InvocationRole::Review
+                        ),
+                    )),
                     request: None,
                     input: None,
                     out: None,
