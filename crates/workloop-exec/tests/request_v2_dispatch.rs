@@ -1460,6 +1460,58 @@ fn an_invariant_check_snapshot_never_runs_a_planted_workspace_hook() {
     assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
 }
 
+/// A symlinked `.git` inside the worker-writable workspace can never
+/// retarget the supervisor's clone: the snapshot lstat-proves the
+/// entry is a real directory and refuses the launch rather than
+/// following the link or copying it into the check tree.
+#[test]
+fn an_invariant_check_snapshot_refuses_a_symlinked_git_dir() {
+    let root = tmp_root("ic-gitlink");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-iclink", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    // The worker has write access to its own workspace: swap `.git`
+    // for a symlink whose target a `Path::is_dir()` check would
+    // follow. The target need not even be a repository — the lstat
+    // guard refuses before any git work.
+    let decoy = root.join("decoy-repo");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::remove_dir_all(ws.join(".git")).unwrap();
+    std::os::unix::fs::symlink(&decoy, ws.join(".git")).unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert_eq!(
+        launch_refusals(&store, &w).len(),
+        1,
+        "the symlinked .git refused the launch"
+    );
+}
+
 #[test]
 fn an_invariant_check_without_an_approved_set_refuses_dispatch() {
     let root = tmp_root("ic-noset");
@@ -2050,6 +2102,14 @@ fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
         "the spawn-boundary deadline recheck abandoned the prepared invocation"
     );
     assert!(invocation.process_identity.is_none(), "no process started");
+    // The consumed request is terminal for its binding — a silent
+    // abandon would park the Execution `Ready` with no observation to
+    // drive it on, so the boundary reports the refusal.
+    assert_eq!(
+        launch_refusals(&store, &w),
+        vec!["request deadline elapsed during launch preparation".to_string()],
+        "the spawn-boundary abandon reports its refusal"
+    );
 }
 
 /// A v2 supervisor over a caller-chosen worker argv — the

@@ -1235,20 +1235,40 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // The snapshot is cloned, never copied: a local clone writes
         // a fresh `.git` with none of the worker-writable source's
         // hooks, filter commands, or `core.worktree` redirect, so a
-        // planted `post-checkout` hook, smudge filter, or symlinked
-        // `.git` can never execute or retarget supervisor-side git
-        // work. A commit the cloned object store does not carry
-        // refuses through the same path as a snapshot that could not
-        // be taken. A non-git workspace has no produced commit to
-        // check out — the raw copy is the only state the world
-        // carries.
+        // planted `post-checkout` hook or smudge filter can never
+        // execute supervisor-side. The `.git` entry must be a real
+        // directory: the worker has write access to its workspace and
+        // could plant a symlink whose target the supervisor's clone
+        // would follow — `is_dir()` follows links, so lstat the
+        // entry and refuse anything else (a staged workspace is a
+        // real `git init` repository, never a gitfile). Git runs
+        // through `workspace::git`'s scrubbed environment — the same
+        // hardened settings workspace preparation uses. A commit the
+        // cloned object store does not carry refuses through the
+        // same path as a snapshot that could not be taken. A non-git
+        // workspace has no produced commit to check out — the raw
+        // copy is the only state the world carries.
+        let real_git_dir = match std::fs::symlink_metadata(source.join(".git")) {
+            Ok(meta) if meta.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(ExecError::Fault(
+                    "workspace .git is not a real directory".into(),
+                ));
+            }
+            Err(_) => false,
+        };
         if let Some(produced) = produced
-            && source.join(".git").is_dir()
+            && real_git_dir
         {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            run_git(
+            let snapshot_git = |dir: &Path, args: &[&str]| {
+                crate::workspace::git(dir, args).map_err(|e| {
+                    ExecError::Fault(format!("check snapshot git {}: {e}", args.join(" ")))
+                })
+            };
+            snapshot_git(
                 &source,
                 &[
                     "clone",
@@ -1258,18 +1278,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     &dest.to_string_lossy(),
                 ],
             )?;
-            run_git(
-                &dest,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "checkout",
-                    "--quiet",
-                    "-f",
-                    "--detach",
-                    produced,
-                ],
-            )?;
+            snapshot_git(&dest, &["checkout", "--quiet", "-f", "--detach", produced])?;
         } else {
             copy_workspace_tree(&source, &dest)?;
         }
@@ -1580,19 +1589,35 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // An unverifiable body is corrupt durable state — the
             // parse failure is a fault, never a silently empty grant
             // or an unpinned base.
-            let (verification_egress_hosts, pinned_base) =
+            let (verification_egress_hosts, pinned_base, branch_start) =
                 match tx.worker_request_body(&invocation.request_id)? {
-                    Some(body) if body.verifies() => {
+                    Some(body) => {
+                        if !body.verifies() {
+                            return Err(StoreError::Internal {
+                                detail: "worker request body fails integrity verification".into(),
+                            });
+                        }
                         let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
                             .map_err(|e| StoreError::Internal {
                             detail: format!("worker request body unreadable: {e}"),
                         })?;
+                        // The branch start a no-op check measures
+                        // against: a Fix workspace branches at its
+                        // predecessor's produced commit, every other
+                        // role at the request's pinned base.
+                        let start = match &req.task {
+                            workloop_core::worker_v2::TaskBody::Fix { predecessor, .. } => {
+                                predecessor.produced.clone()
+                            }
+                            _ => req.base.object.clone(),
+                        };
                         (
                             req.required_capabilities.verification_egress_hosts,
                             req.base.object,
+                            start,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    None => (Vec::new(), String::new(), String::new()),
                 };
             Ok(Some((
                 invocation.clone(),
@@ -1600,6 +1625,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 spec.payload.verification_argv.clone(),
                 verification_egress_hosts,
                 pinned_base,
+                branch_start,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
@@ -1609,6 +1635,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             verification_argv,
             verification_egress_hosts,
             pinned_base,
+            branch_start,
             bound,
         )) = found
         else {
@@ -1630,6 +1657,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             crate::handoff::HandoffSeed {
                 invocation,
                 base,
+                branch_start,
                 branch,
                 work_id,
                 verification_argv,
@@ -2698,29 +2726,25 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // timestamp `build_request_body` already validated against,
         // so only a fresh read catches a deadline that elapsed while
         // the launch was being prepared. The recorded Invocation
-        // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > clock()
+        // abandons with a refusal report exactly as the earlier gate
+        // does; no late writer starts after authorization expires.
+        let deadline_ok = wire.budget.deadline_unix_seconds > clock();
+        let authorized = deadline_ok
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);
         if !authorized {
-            store.transact(|tx| {
-                let mut next = invocation.clone();
-                next.state = InvocationState::Abandoned;
-                tx.apply(&Effect::UpdateInvocation {
-                    invocation: next,
-                    expected_state: InvocationState::Prepared,
-                })?;
-                Ok(())
-            })?;
             // Unlike the earlier gate this runs after workspace
-            // preparation: the launch scratch and any check snapshot
-            // may already exist — release them with the io tree rather
-            // than leaving orphans for the next sweep.
-            isolation::release(&self.launch_scratch(&invocation.id.0));
-            isolation::release(&self.check_workspace(&invocation.id.0));
-            self.release_invocation_io(&invocation.id.0);
+            // preparation — and it must still report the refusal: a
+            // consumed request is terminal for its binding, so a
+            // silent abandon would park the Execution `Ready` with no
+            // pending request and no observation to drive it on.
+            let reason = if deadline_ok {
+                "execution left Ready during launch preparation"
+            } else {
+                "request deadline elapsed during launch preparation"
+            };
+            self.refuse_launch(store, request, &invocation, reason.into(), now_unix_seconds)?;
             return Ok(());
         }
         match self.port.spawn(&argv, &workspace, &launch_env) {
@@ -4293,25 +4317,6 @@ fn copy_workspace_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
         } else {
             std::fs::copy(&from, &to)?;
         }
-    }
-    Ok(())
-}
-
-/// `git -C dir <args>` with stderr carried into the fault — the check
-/// snapshot's checkout/clean the launch refusal reports.
-fn run_git(dir: &Path, args: &[&str]) -> Result<(), ExecError> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| ExecError::Fault(format!("git {}: {e}", args.join(" "))))?;
-    if !out.status.success() {
-        return Err(ExecError::Fault(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        )));
     }
     Ok(())
 }

@@ -223,6 +223,7 @@ fn seed(invocation: &Invocation, work_id: &WorkId, base: &str) -> HandoffSeed {
     HandoffSeed {
         invocation: invocation.clone(),
         base: base.to_string(),
+        branch_start: String::new(),
         branch: format!("work/{}", work_id.0),
         work_id: work_id.clone(),
         verification_argv: vec![],
@@ -874,6 +875,47 @@ fn a_branch_that_never_moved_is_nothing_produced() {
     assert!(
         !ref_exists(&layout.repository, &artifact_ref(&aid)),
         "an unchanged branch installs no artifact ref"
+    );
+}
+
+/// A Fix workspace branches at its predecessor's produced commit, not
+/// the recorded fork point: a branch that sits exactly on that start
+/// moved nothing and is `nothing_produced`, even though its HEAD
+/// descends past base.
+#[test]
+fn a_fix_branch_sitting_on_its_start_is_nothing_produced() {
+    let root = tmp_root("noprod-start");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-nostart");
+    let (layout, ws_dir) = layout(&root, &w);
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    git(&ws_dir, &["init", "-b", "main"]);
+    git(&ws_dir, &["config", "user.email", "t@t"]);
+    git(&ws_dir, &["config", "user.name", "t"]);
+    std::fs::write(ws_dir.join("seed.txt"), "base").unwrap();
+    git(&ws_dir, &["add", "."]);
+    git(&ws_dir, &["commit", "-m", "base"]);
+    let base = git(&ws_dir, &["rev-parse", "HEAD"]);
+    git(&ws_dir, &["checkout", "-b", &format!("work/{}", w.0)]);
+    // The predecessor produced one commit; the Fix branch starts at
+    // it and the writer commits nothing.
+    std::fs::write(ws_dir.join("artifact.txt"), "predecessor").unwrap();
+    git(&ws_dir, &["add", "."]);
+    git(&ws_dir, &["commit", "-m", "predecessor"]);
+    let start = git(&ws_dir, &["rev-parse", "HEAD"]);
+
+    let invocation = done_invocation(&e, "inv-nostart");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.branch_start = start;
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = row(&store, &aid).unwrap();
+    assert_eq!(h.state, HandoffState::Invalid);
+    assert_eq!(h.invalid_reason.as_deref(), Some("nothing_produced"));
+    assert!(
+        !ref_exists(&layout.repository, &artifact_ref(&aid)),
+        "an unmoved Fix branch installs no artifact ref"
     );
 }
 

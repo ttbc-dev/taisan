@@ -366,6 +366,13 @@ pub struct HandoffSeed {
     /// [`derive_base`]) — the revision `produced` must descend from.
     /// Empty when the workspace records no base branch.
     pub base: String,
+    /// The revision the managed branch was started at — `base` for a
+    /// fresh Coding workspace, the predecessor's produced commit for
+    /// a Fix (the workspace branches at produced, not the fork
+    /// point). Empty for a v1 dispatch, where `base` is the only
+    /// recorded start. `produced == branch_start` means the writer
+    /// committed nothing.
+    pub branch_start: String,
     /// Work branch the worker committed on (`work/<work_id>`).
     pub branch: String,
     pub work_id: WorkId,
@@ -494,13 +501,22 @@ fn export_stage(
         return mark_invalid(store, handoff, "stale_base");
     }
 
-    // A branch that never moved past base produced nothing — for a
-    // Coding/Fix writer that is an absent artifact, not a handoff.
+    // A branch that never moved past the revision it was started at
+    // produced nothing — for a Coding/Fix writer that is an absent
+    // artifact, not a handoff. A Fix branch starts at its
+    // predecessor's produced commit, not the fork point, so the
+    // no-op check reads `branch_start` whenever the launch recorded
+    // one.
+    let branch_start = if seed.branch_start.is_empty() {
+        handoff.base.as_str()
+    } else {
+        seed.branch_start.as_str()
+    };
     if matches!(
         seed.invocation.role,
         InvocationRole::Coding | InvocationRole::Fix
-    ) && !handoff.base.is_empty()
-        && produced == handoff.base
+    ) && !branch_start.is_empty()
+        && produced == branch_start
     {
         return mark_invalid(store, handoff, "nothing_produced");
     }
