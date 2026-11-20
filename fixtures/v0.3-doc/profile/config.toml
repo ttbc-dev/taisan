@@ -54,6 +54,6 @@ host = "h1"
 allowlist = ["crates.io", "static.crates.io"]
 
 [worker]
-argv = ["/Users/shin/src/github.com/shimpeiws/taisan-issue-269/target/debug/workloop-fixture-worker", "clean-exit", "--wire", "v2", "--git-commit", "--claim-head", "HEAD"]
+argv = ["target/debug/workloop-fixture-worker", "clean-exit", "--wire", "v2", "--git-commit", "--claim-head", "HEAD"]
 isolation_profile = "fixture-worker-v0.1"
 max_turns = 200

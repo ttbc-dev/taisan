@@ -474,6 +474,19 @@ fn bind_review(
         Completeness::Unavailable {
             reason: gathered.report.reason.code.clone(),
         }
+    } else if matches!(gathered.classification, ReportClassification::Negative)
+        && gathered.report.reason.code != "findings_reported"
+    {
+        // A negative claim that reports no findings seals a clean
+        // round with nothing to disposition — the report's own
+        // failure claim is never a completed review; its reason is
+        // the recorded evidence. `findings_reported` is the review's
+        // normal negative shape: its members seal as occurrences for
+        // judgment, and the completeness check still degrades an
+        // empty or malformed member set to partial.
+        Completeness::Partial {
+            reason: gathered.report.reason.code.clone(),
+        }
     } else {
         review_completeness(&gathered.report)
     };

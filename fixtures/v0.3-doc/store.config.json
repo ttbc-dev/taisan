@@ -21,7 +21,7 @@
   "required_checks": [],
   "capacity": 1,
   "worker_argv": [
-    "/Users/shin/src/github.com/shimpeiws/taisan-issue-269/target/debug/workloop-fixture-worker",
+    "target/debug/workloop-fixture-worker",
     "clean-exit",
     "--wire",
     "v2",
