@@ -1838,6 +1838,69 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
     );
 }
 
+/// The review leg launches inside the shared writer checkout — a
+/// refused or abandoned review launch must never release `ws-<work>`,
+/// the artifact and recovery source `run_recovery_scoped` and
+/// `drive_handoffs` still read. The racing stop lands the same
+/// abandonment the refuse paths take; the checkout outlives it.
+#[test]
+fn an_abandoned_review_launch_never_releases_the_shared_checkout() {
+    let root = tmp_root("review-ws-kept");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-review-race", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), produced.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    // The checkout the review would have run in — a surviving marker
+    // proves the abandonment released nothing.
+    let ws = sup.workspace_of(&w);
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("artifact.json"), b"{}").unwrap();
+
+    // The pause lands after the post-consume `Ready` read: the
+    // review's workspace resolves, then the spawn-boundary
+    // authorization read sees the stopped Execution.
+    let racing = PauseAfterConsumeRead {
+        inner: &store,
+        request_id: rid1.clone(),
+        execution_id: e.clone(),
+        invocation_seen: std::cell::Cell::new(false),
+        flipped: std::cell::Cell::new(false),
+    };
+    sup.consume_requests(&racing, NOW).unwrap();
+
+    assert!(
+        racing.flipped.get(),
+        "the racing pause committed inside the launch window"
+    );
+    let invocation = invocation_for(&store, &rid1).expect("review invocation");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert!(
+        ws.join("artifact.json").is_file(),
+        "the abandoned review launch never releases the shared checkout"
+    );
+}
+
 /// A request deadline that elapses while the launch is still being
 /// prepared — declaration, materialization, workspace — is caught at
 /// the spawn boundary: the recorded Invocation abandons and no
@@ -1869,6 +1932,20 @@ fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
         !sup.workspace_of(&_w).exists(),
         "the prepared writer workspace is released — its receipt is bound \
          to the abandoned request and would wedge a Coding retry"
+    );
+    let receipt = sup
+        .workspace_of(&_w)
+        .parent()
+        .expect("the workspace has a control-area parent")
+        .join(".prepare")
+        .join(format!(
+            "{}.receipt.json",
+            workloop_exec::isolation::sanitize_key(&_w.0)
+        ));
+    assert!(
+        !receipt.exists(),
+        "the receipt goes with the workspace — a surviving receipt still \
+         refuses the retry on 'receipt belongs to another request'"
     );
 }
 

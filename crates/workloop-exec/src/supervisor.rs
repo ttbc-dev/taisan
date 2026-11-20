@@ -2084,7 +2084,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Unreachable in practice — a refused gate already
                 // carried its reason through `repair_reason` — but the
                 // launch never proceeds on an unproven boundary.
-                isolation::release(&workspace);
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2119,7 +2119,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         ) {
             Ok(env) => env,
             Err(why) => {
-                isolation::release(&workspace);
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2157,7 +2157,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 ) {
                     Ok(contained) => contained,
                     Err(reason) => {
-                        isolation::release(&workspace);
+                        self.release_launch_workspace(request, &workspace);
                         self.refuse_launch(
                             store,
                             request,
@@ -2198,14 +2198,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             })?;
             // Unlike the earlier gate this runs after workspace
             // preparation: the launch scratch, any check snapshot, and
-            // the prepared workspace itself may already exist. The
-            // writer workspace must go too — its `.prepare` receipt is
-            // bound to this request's digest, and a Coding retry under
-            // the same Work re-prepares `ws-<work>` and would refuse
-            // on 'receipt belongs to another request' rather than
-            // relaunching. No process exists, so nothing owns the
-            // tree; a retry re-prepares from source or handoff.
-            isolation::release(&workspace);
+            // the prepared workspace itself may already exist. A
+            // writer workspace must go together with its `.prepare`
+            // receipt — bound to this request's digest, it would
+            // refuse a Coding retry on 'receipt belongs to another
+            // request' — while a read role's workspace is never
+            // released. No process exists, so nothing owns the tree;
+            // a retry re-prepares from source or handoff.
+            self.release_launch_workspace(request, &workspace);
             isolation::release(&self.launch_scratch(&invocation.id.0));
             isolation::release(&self.check_workspace(&invocation.id.0));
             self.release_invocation_io(&invocation.id.0);
@@ -2247,10 +2247,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
-                // No process exists; the prepared workspace this
-                // request receipted must not wedge a retry on
-                // 'receipt belongs to another request'.
-                isolation::release(&workspace);
+                // No process exists; the workspace a writer role
+                // prepared must not wedge a retry on 'receipt belongs
+                // to another request', and a read role's workspace is
+                // never released.
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
@@ -2308,6 +2309,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
             crate::request_v2::invocation_io_root(&self.workspace_root)
                 .join(isolation::sanitize_key(invocation_id)),
         );
+    }
+
+    /// Reclaim the workspace a refused or abandoned launch owned. A
+    /// writer role's `workspace::prepare` output goes together with
+    /// its `.prepare` receipt — the receipt lives in a sibling
+    /// control area, not inside `ws-<work>`, so a deleted workspace
+    /// alone still refuses the Work's next preparation on 'receipt
+    /// belongs to another request'. The check's per-Invocation
+    /// snapshot is this launch's own scratch. The review leg's
+    /// workspace is the shared writer checkout `ws-<work>` — never
+    /// released here: `run_recovery_scoped`/`drive_handoffs` still
+    /// read the artifact and recovery source from it, so a refused
+    /// review launch must not destroy the producing tree.
+    fn release_launch_workspace(&self, request: &InvocationRequest, workspace: &Path) {
+        match request.role {
+            InvocationRole::Review => {}
+            InvocationRole::InvariantCheck => isolation::release(workspace),
+            _ => {
+                isolation::release(workspace);
+                crate::workspace::release_receipt(&self.workspace_root, &request.work_id.0);
+            }
+        }
     }
 
     /// Bound `.invocations`: per-Invocation request/input/output trees

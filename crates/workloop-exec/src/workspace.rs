@@ -1139,6 +1139,17 @@ fn prepare_locked(
     })
 }
 
+/// Remove the prepare receipt one Work holds — the
+/// launch-abandonment counterpart of reclaiming the workspace tree:
+/// the receipt lives in the sibling `.prepare` control area, not
+/// inside `ws-<work>`, so a deleted workspace still leaves the
+/// receipt a retry would refuse on ("receipt belongs to another
+/// request"). A missing receipt is a no-op; a symlink at the path is
+/// removed as a link, never followed.
+pub fn release_receipt(workspace_root: &Path, work_id: &str) {
+    let _ = std::fs::remove_file(receipt_path(&control_area(workspace_root), work_id));
+}
+
 pub fn prepare(
     store: &impl Store,
     workspace_root: &Path,
