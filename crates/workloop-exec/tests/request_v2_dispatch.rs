@@ -1865,6 +1865,11 @@ fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
         !pending_ids(&store).contains(&rid),
         "the consumed request is terminal for its binding"
     );
+    assert!(
+        !sup.workspace_of(&_w).exists(),
+        "the prepared writer workspace is released — its receipt is bound \
+         to the abandoned request and would wedge a Coding retry"
+    );
 }
 
 /// A v2 supervisor over a caller-chosen worker argv — the

@@ -2084,6 +2084,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Unreachable in practice — a refused gate already
                 // carried its reason through `repair_reason` — but the
                 // launch never proceeds on an unproven boundary.
+                isolation::release(&workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2118,6 +2119,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         ) {
             Ok(env) => env,
             Err(why) => {
+                isolation::release(&workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2155,6 +2157,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 ) {
                     Ok(contained) => contained,
                     Err(reason) => {
+                        isolation::release(&workspace);
                         self.refuse_launch(
                             store,
                             request,
@@ -2194,14 +2197,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 Ok(())
             })?;
             // Unlike the earlier gate this runs after workspace
-            // preparation: the launch scratch and any check snapshot
-            // may already exist — release them with the io tree rather
-            // than leaving orphans for the next sweep.
+            // preparation: the launch scratch, any check snapshot, and
+            // the prepared workspace itself may already exist. The
+            // writer workspace must go too — its `.prepare` receipt is
+            // bound to this request's digest, and a Coding retry under
+            // the same Work re-prepares `ws-<work>` and would refuse
+            // on 'receipt belongs to another request' rather than
+            // relaunching. No process exists, so nothing owns the
+            // tree; a retry re-prepares from source or handoff.
+            isolation::release(&workspace);
             isolation::release(&self.launch_scratch(&invocation.id.0));
             isolation::release(&self.check_workspace(&invocation.id.0));
             self.release_invocation_io(&invocation.id.0);
             return Ok(());
         }
+        // Any refusal below this point also owns the prepared
+        // workspace: the `SpawnError::Refused` arm releases it for
+        // the same receipt-conflict reason.
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 let descendants = self
@@ -2235,6 +2247,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
+                // No process exists; the prepared workspace this
+                // request receipted must not wedge a retry on
+                // 'receipt belongs to another request'.
+                isolation::release(&workspace);
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
