@@ -1728,7 +1728,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             {
                 continue;
             }
-            self.reconcile_or_start(store, &request, now_unix_seconds)?;
+            self.reconcile_or_start(store, &request, now_unix_seconds, clock)?;
         }
         Ok(())
     }
@@ -1738,6 +1738,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let lock = self.lock_for(&request.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1781,7 +1782,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // already consumed above replays its recorded Invocation
         // regardless of which profile is configured now.
         if self.v2.is_some() {
-            return self.start_v2(store, request, now_unix_seconds);
+            return self.start_v2(store, request, now_unix_seconds, clock);
         }
 
         // The Execution state gates the describe probe too: a request
@@ -2199,6 +2200,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let dispatch = self
             .v2
@@ -2636,10 +2638,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // at the spawn boundary itself — the Execution still Ready and
         // the request's own deadline unexpired — so a stop, deadline,
         // or cancel committed during declaration, materialization, or
-        // preparation still blocks the launch. The recorded Invocation
+        // preparation still blocks the launch. The deadline comparison
+        // reads the clock again: `now_unix_seconds` is the pass
+        // timestamp `build_request_body` already validated against,
+        // so only a fresh read catches a deadline that elapsed while
+        // the launch was being prepared. The recorded Invocation
         // abandons exactly as the earlier gate does; no late writer
         // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > now_unix_seconds
+        let authorized = wire.budget.deadline_unix_seconds > clock()
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);

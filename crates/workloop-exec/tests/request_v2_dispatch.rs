@@ -1863,6 +1863,60 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
     );
 }
 
+/// The spawn-boundary authorization re-reads the deadline against the
+/// injected clock, not the pass-start timestamp — a request whose
+/// budget elapsed during launch preparation abandons rather than
+/// spawning.
+#[test]
+fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("race-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-dline", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    std::fs::create_dir_all(sup.workspace_of(&w)).unwrap();
+    // The deadline lands inside the launch window: valid against the
+    // pass timestamp `build_request_body` checks, elapsed by the time
+    // the spawn boundary re-reads the clock.
+    store
+        .transact(|tx| {
+            let mut exec = tx.execution(&e)?.expect("execution");
+            exec.budget.runtime_limit_seconds = 60;
+            exec.started_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: exec,
+                expected_state: ExecutionState::Ready,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    let mut clock = || NOW + 120;
+    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
+        .unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Abandoned,
+        "the spawn-boundary deadline recheck abandoned the prepared invocation"
+    );
+    assert!(invocation.process_identity.is_none(), "no process started");
+}
+
 /// A v2 supervisor over a caller-chosen worker argv — the
 /// declaration-drift and transport-failure cases need argv shapes
 /// `supervisor_v2`'s fixed `--wire v2` tail does not produce.
