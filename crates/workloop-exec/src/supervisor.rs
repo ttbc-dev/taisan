@@ -1537,7 +1537,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // or an unpinned base.
             let (verification_egress_hosts, pinned_base) =
                 match tx.worker_request_body(&invocation.request_id)? {
-                    Some(body) if body.verifies() => {
+                    Some(body) => {
+                        if !body.verifies() {
+                            return Err(StoreError::Internal {
+                                detail: "worker request body fails integrity verification".into(),
+                            });
+                        }
                         let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
                             .map_err(|e| StoreError::Internal {
                             detail: format!("worker request body unreadable: {e}"),
@@ -1547,7 +1552,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             req.base.object,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    None => (Vec::new(), String::new()),
                 };
             Ok(Some((
                 invocation.clone(),
