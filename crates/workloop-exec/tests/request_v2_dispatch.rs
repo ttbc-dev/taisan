@@ -306,7 +306,7 @@ fn retained_issue_source(
         body,
         digest,
     );
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     bodies
         .retain_at(
             store,
@@ -322,7 +322,7 @@ fn retained_issue_source(
 
 fn dispatch_profile(state_root: &Path, src: &Path) -> V2Dispatch {
     V2Dispatch {
-        bodies: BodyStore::new(state_root.join("bodies")),
+        bodies: BodyStore::new(state_root.to_path_buf()),
         sources: vec![RepositorySource {
             repository: repo(),
             path: src.to_path_buf(),
@@ -771,6 +771,14 @@ fn coding_dispatch_materializes_the_request_and_per_invocation_io() {
     assert_eq!(wire.spec.revision, 1);
     assert!(matches!(wire.task, TaskBody::Coding { .. }));
     assert!(!wire.workspace.read_only);
+    assert!(
+        !wire
+            .required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the writer grant never requires the read-only capability"
+    );
 
     let invocation = invocation_for(&store, &rid).expect("invocation recorded");
     let io_root = invocation_io_root(&root.join("ws"));
@@ -967,7 +975,7 @@ fn a_snapshot_disagreeing_with_the_spec_is_stale_never_dispatched() {
         "body",
         "digest-5",
     );
-    BodyStore::new(state_root.join("bodies"))
+    BodyStore::new(state_root.to_path_buf())
         .retain_at(
             &store,
             CAS_CATEGORY,
@@ -999,7 +1007,7 @@ fn a_corrupt_snapshot_file_is_body_corrupt_never_partial_input() {
     let (source, snapshot) = retained_issue_source(&store, &state_root, 6, "rev-6", "t", "b");
     // Tamper with the retained bytes behind the catalogue's back: the
     // row still says `present`, the file no longer recomputes.
-    let file = state_root.join("bodies").join(snapshot.retained_path());
+    let file = state_root.join(snapshot.retained_path());
     std::fs::write(&file, b"tampered").unwrap();
     let (w, _e, rid) = admit(&store, "v2-corrupt", vec![source]);
     let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
@@ -1297,6 +1305,13 @@ fn invariant_check_binds_the_approved_set_read_only() {
     let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
     assert_eq!(wire.role, InvocationRole::InvariantCheck);
     assert!(wire.workspace.read_only, "the check grant is read-only");
+    assert!(
+        wire.required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the check requires the read-only capability so an adapter that lacks it fails negotiation"
+    );
     let TaskBody::InvariantCheck {
         artifact,
         invariant_set,
@@ -1393,6 +1408,13 @@ fn review_dispatch_binds_the_current_target_and_review_source() {
     let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
     assert_eq!(wire.role, InvocationRole::Review);
     assert!(wire.workspace.read_only, "the review grant is read-only");
+    assert!(
+        wire.required_capabilities
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace_read_only"),
+        "the review requires the read-only capability so an adapter that lacks it fails negotiation"
+    );
     let TaskBody::CodeReview {
         target,
         review_source,
@@ -1437,6 +1459,45 @@ fn a_review_without_a_current_target_is_head_stale_never_dispatched() {
     let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
     publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
     // No opened change, no head: there is no accepted diff target.
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+#[test]
+fn a_review_whose_target_head_moved_past_the_produced_commit_is_head_stale() {
+    let root = tmp_root("review-moved");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-reviewmoved", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // The accepted target head is the base commit — the produced
+    // commit the workspace pins no longer matches the current head.
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), base.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
     let rid1 = format!("{}:inv:1", e.0);
     insert_request(
         &store,
@@ -1705,7 +1766,7 @@ fn a_leftover_io_tree_from_a_crashed_attempt_is_rebuilt_never_trusted() {
     let TaskBody::Coding { goal, .. } = &wire.task else {
         panic!("expected coding task")
     };
-    let resolved = BodyStore::new(state_root.join("bodies"))
+    let resolved = BodyStore::new(state_root.to_path_buf())
         .resolve_at(store.body_catalog(), CAS_CATEGORY, &goal.body_ref)
         .unwrap()
         .expect("goal body resolves");
@@ -1861,6 +1922,117 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
     assert!(
         !pending_ids(&store).contains(&rid1),
         "the consumed request is terminal for its binding"
+    );
+}
+
+/// The review leg launches inside the shared writer checkout — a
+/// refused or abandoned review launch must never release `ws-<work>`,
+/// the artifact and recovery source `run_recovery_scoped` and
+/// `drive_handoffs` still read. The racing stop lands the same
+/// abandonment the refuse paths take; the checkout outlives it.
+#[test]
+fn an_abandoned_review_launch_never_releases_the_shared_checkout() {
+    let root = tmp_root("review-ws-kept");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-review-race", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), produced.clone()).unwrap();
+    open_change_target(&store, &w, &change, &head, "main");
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    // The checkout the review would have run in — a surviving marker
+    // proves the abandonment released nothing.
+    let ws = sup.workspace_of(&w);
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("artifact.json"), b"{}").unwrap();
+
+    // The pause lands after the post-consume `Ready` read: the
+    // review's workspace resolves, then the spawn-boundary
+    // authorization read sees the stopped Execution.
+    let racing = PauseAfterConsumeRead {
+        inner: &store,
+        request_id: rid1.clone(),
+        execution_id: e.clone(),
+        invocation_seen: std::cell::Cell::new(false),
+        flipped: std::cell::Cell::new(false),
+    };
+    sup.consume_requests(&racing, NOW).unwrap();
+
+    assert!(
+        racing.flipped.get(),
+        "the racing pause committed inside the launch window"
+    );
+    let invocation = invocation_for(&store, &rid1).expect("review invocation");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert!(
+        ws.join("artifact.json").is_file(),
+        "the abandoned review launch never releases the shared checkout"
+    );
+}
+
+/// A request deadline that elapses while the launch is still being
+/// prepared — declaration, materialization, workspace — is caught at
+/// the spawn boundary: the recorded Invocation abandons and no
+/// worker process starts. The tick deadline is unset so the pass's
+/// only clock read is the spawn-boundary recheck itself; `now` built
+/// the request body while the deadline still held.
+#[test]
+fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("racing-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-deadline", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+
+    let mut clock = || i64::MAX;
+    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
+        .unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert!(
+        !pending_ids(&store).contains(&rid),
+        "the consumed request is terminal for its binding"
+    );
+    assert!(
+        !sup.workspace_of(&_w).exists(),
+        "the prepared writer workspace is released — its receipt is bound \
+         to the abandoned request and would wedge a Coding retry"
+    );
+    let receipt = sup
+        .workspace_of(&_w)
+        .parent()
+        .expect("the workspace has a control-area parent")
+        .join(".prepare")
+        .join(format!(
+            "{}.receipt.json",
+            workloop_exec::isolation::sanitize_key(&_w.0)
+        ));
+    assert!(
+        !receipt.exists(),
+        "the receipt goes with the workspace — a surviving receipt still \
+         refuses the retry on 'receipt belongs to another request'"
     );
 }
 
@@ -2229,35 +2401,6 @@ fn a_lost_v2_launch_is_rebound_by_its_transport_signature() {
     );
 }
 
-/// A request deadline that elapses while the launch is still being
-/// prepared — declaration, materialization, workspace — is caught at
-/// the spawn boundary: the recorded Invocation abandons and no
-/// worker process starts. The tick deadline is unset so the pass's
-/// only clock read is the spawn-boundary recheck itself; `now` built
-/// the request body while the deadline still held.
-#[test]
-fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
-    let root = tmp_root("racing-deadline");
-    let state_root = root.join("state");
-    std::fs::create_dir_all(&state_root).unwrap();
-    let store = SqliteStore::in_memory(1).unwrap();
-    let (src, _base, _newer) = git_source(&root);
-    let (_w, _e, rid) = admit(&store, "v2-deadline", vec![]);
-    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
-
-    let mut clock = || i64::MAX;
-    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
-        .unwrap();
-
-    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
-    assert_eq!(invocation.state, InvocationState::Abandoned);
-    assert!(invocation.process_identity.is_none(), "no process started");
-    assert!(
-        !pending_ids(&store).contains(&rid),
-        "the consumed request is terminal for its binding"
-    );
-}
-
 // === Worker report evidence collection (`taisan.worker.report/2`,
 // docs/v0.3.md §6) ==============================================
 
@@ -2367,7 +2510,7 @@ fn a_finished_v2_invocation_records_classified_report_evidence() {
     let report = report.as_ref().expect("report bytes retained");
     assert!(!report.truncated);
     assert!(report.bytes > 0);
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     let resolved = bodies
         .resolve(store.body_catalog(), &report.body_id)
         .unwrap()
@@ -2474,7 +2617,7 @@ fn a_malformed_report_is_invalid_with_its_raw_bytes_retained() {
         "malformed reason recorded: {reasons:?}"
     );
     let report = report.as_ref().expect("invalid raw bytes retained");
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     let resolved = bodies
         .resolve(store.body_catalog(), &report.body_id)
         .unwrap()
@@ -2531,7 +2674,7 @@ fn an_oversize_report_is_invalid_before_parsing() {
     let report = report.as_ref().expect("bounded prefix retained");
     assert!(report.truncated);
     assert_eq!(report.bytes, 1 << 20, "the dispatch max_report_bytes");
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     let resolved = bodies
         .resolve(store.body_catalog(), &report.body_id)
         .unwrap()
@@ -2561,6 +2704,34 @@ fn a_symlinked_report_is_unsafe_never_followed() {
         "unsafe_path reason recorded: {reasons:?}"
     );
     assert!(report.is_none(), "a symlink is never read as evidence");
+    assert!(log.is_some(), "the regular runtime.log is still kept");
+}
+
+#[test]
+fn an_unreadable_report_is_invalid_and_the_invocation_still_finishes() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("unreadable", "clean-exit", &["--report-mode", "unreadable"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        log,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.unreadable"),
+        "unreadable reason recorded: {reasons:?}"
+    );
+    assert!(
+        report.is_none(),
+        "no bytes retained from an unreadable file"
+    );
     assert!(log.is_some(), "the regular runtime.log is still kept");
 }
 
@@ -2689,7 +2860,7 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
         .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
     let report_path = io_dir.join("out").join("report.json");
     wait_for(|| report_path.is_file(), "report.json on disk");
-    let bodies = BodyStore::new(state_root.join("bodies"));
+    let bodies = BodyStore::new(state_root.to_path_buf());
     let ws_root = root.join("ws");
     let collect = |store: &SqliteStore| {
         workloop_exec::report_v2::collect(
@@ -2953,7 +3124,8 @@ fn a_v2_coding_invocation_hands_off_the_produced_commit() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -2990,7 +3162,8 @@ fn a_v2_coding_invocation_hands_off_the_produced_commit() {
         "the produced commit is in the promoted object set: {changes}"
     );
     assert!(workloop_exec::handoff::reclaimable(&lay, &row));
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let again = handoff_row(&store, &inv.id);
     assert_eq!(again.produced, Some(produced));
     assert_eq!(again.state, HandoffState::Acknowledged);
@@ -3015,7 +3188,8 @@ fn a_claimed_head_matching_the_produced_commit_records_agreement() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let facts = claim_facts(&store, &e);
     assert_eq!(facts.len(), 1, "one verdict fact: {facts:?}");
@@ -3056,7 +3230,8 @@ fn a_claimed_head_disagreeing_with_produced_is_retained_never_adopted() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -3161,7 +3336,8 @@ fn a_produced_commit_not_descending_from_the_pinned_base_is_invalid() {
         ],
     );
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
     assert_eq!(row.state, HandoffState::Invalid, "{row:?}");
@@ -3204,7 +3380,8 @@ fn an_unresolvable_produced_commit_fails_closed_never_promotes() {
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     for _ in 0..8 {
-        sup.drive_handoffs(&store).unwrap();
+        sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+            .unwrap();
         if handoff_row(&store, &inv.id).state == HandoffState::Invalid {
             break;
         }
@@ -3270,7 +3447,8 @@ fn an_interrupted_v2_handoff_resumes_from_its_durable_stage() {
         })
         .unwrap();
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let row = handoff_row(&store, &inv.id);
     assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
     let ws = managed_workspace(&root, &w);
@@ -3300,7 +3478,8 @@ fn a_post_acknowledgement_workspace_mutation_cannot_move_the_artifact() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -3326,7 +3505,8 @@ fn a_post_acknowledgement_workspace_mutation_cannot_move_the_artifact() {
     let moved = git(&ws, &["rev-parse", &format!("work/{}", w.0)]);
     assert_ne!(moved, produced, "the branch really moved");
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let again = handoff_row(&store, &inv.id);
     assert_eq!(again.state, HandoffState::Acknowledged);
     assert_eq!(again.produced.as_deref(), Some(produced.as_str()));
@@ -3378,7 +3558,8 @@ fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -4535,7 +4716,8 @@ fn a_cancel_with_pending_verification_accounts_for_the_owned_child_before_releas
     // declared verification — the owned child runs inside its
     // bounded call and its result is recorded as evidence before any
     // release.
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let aid = format!("{}/artifact.json", inv.id.0);
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
@@ -4562,4 +4744,49 @@ fn a_cancel_with_pending_verification_accounts_for_the_owned_child_before_releas
     // duplicates the child or its evidence.
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1, "recorded terminal results are final");
+}
+/// §14.5 bounds the 30 min verification profile by the Execution
+/// deadline: the immutable wire `deadline_unix_seconds` clamps the
+/// per-command timeout, so a command can never outlive the budget the
+/// request granted. A spent deadline bounds the run to zero — the
+/// command times out immediately and records `Inconclusive`, the same
+/// evidence a real timeout reports, never a pass.
+#[test]
+fn v2_verification_timeout_is_bounded_by_the_execution_deadline() {
+    let root = tmp_root("verify-v2-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let argv: Vec<Vec<String>> = vec![vec!["sh".into(), "-c".into(), "true".into()]];
+    let (_w, _e, rid) = admit_ex(&store, "v2-verify-deadline", vec![], argv);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid).canonical_body).unwrap();
+    let deadline = wire.budget.deadline_unix_seconds;
+
+    let bounds = |now| {
+        workloop_exec::handoff::verification_bounds(&store, &row.artifact_id, now)
+            .unwrap()
+            .0
+    };
+    // The request's whole budget remains: the full 30 min profile.
+    assert_eq!(bounds(NOW), Duration::from_secs(30 * 60));
+    // One second remains: the deadline clamps below the profile.
+    assert_eq!(bounds(deadline - 1), Duration::from_secs(1));
+    // The deadline is spent: no command may run at all.
+    assert_eq!(bounds(deadline), Duration::ZERO);
+    assert_eq!(bounds(deadline + 600), Duration::ZERO);
 }

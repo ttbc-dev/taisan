@@ -309,20 +309,34 @@ fn current_provider_digest(path: &Option<PathBuf>) -> Result<String, std::io::Er
     }
 }
 
+/// Bounded-memory digest of one file's full content: every byte feeds
+/// the digest through fixed-size chunks, so a same-size edit anywhere
+/// in the file changes the identity without buffering the file.
+fn file_content_digest(path: &Path) -> Result<String, std::io::Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut chunks = String::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        chunks.push_str(&sha256_hex("provider-config-chunk-v1", &buf[..n]));
+    }
+    Ok(sha256_hex("provider-config-file-v1", chunks.as_bytes()))
+}
+
 /// Bounded content digest of a provider-config path for the boundary
-/// identity: a file hashes its bytes (capped); a directory hashes a
-/// sorted manifest of member names, kinds, and per-member content
-/// digests — enough that any edit re-proves the gate without hashing
-/// unbounded trees.
+/// identity: a file hashes its full bytes; a directory hashes a
+/// sorted manifest of member names, kinds, sizes, and content
+/// digests — enough that any edit, including a same-size one,
+/// re-proves the gate without hashing unbounded trees.
 fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
     const MAX_ENTRIES: usize = 256;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
-        use std::io::Read;
-        let file = std::fs::File::open(path)?;
-        let mut buf = Vec::new();
-        file.take(MAX_PROVIDER_FILE).read_to_end(&mut buf)?;
-        return Ok(sha256_hex("provider-config-file-v1", &buf));
+        return file_content_digest(path);
     }
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
@@ -339,19 +353,12 @@ fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
     ))
 }
 
-/// Per-member read bound for [`collect_manifest`]: a member file's
-/// digest covers at most its first 1 MiB, and the member count is
-/// capped at the caller's budget — the manifest stays bounded however
-/// large the config tree is.
-const MAX_PROVIDER_FILE: u64 = 1024 * 1024;
-
 fn collect_manifest(
     root: &Path,
     dir: &Path,
     out: &mut Vec<String>,
     budget: usize,
 ) -> Result<(), std::io::Error> {
-    use std::io::Read;
     if out.len() >= budget {
         return Ok(());
     }
@@ -379,11 +386,8 @@ fn collect_manifest(
         } else if file_type.is_file() {
             // Content, not name+size: a same-size edit is an identity
             // change the gate must re-prove.
-            let file = std::fs::File::open(&path)?;
-            let mut buf = Vec::new();
-            file.take(MAX_PROVIDER_FILE).read_to_end(&mut buf)?;
-            let digest = sha256_hex("provider-config-member-v1", &buf);
-            out.push(format!("file:{rel}:{}:{}", entry.metadata()?.len(), digest));
+            let digest = file_content_digest(&path)?;
+            out.push(format!("file:{rel}:{}:{digest}", entry.metadata()?.len()));
         }
     }
     Ok(())
@@ -561,6 +565,23 @@ mod tests {
         std::fs::write(dir.join("other.toml"), "x = 1\n").unwrap();
         std::os::unix::fs::symlink(dir.join("other.toml"), cfg_dir.join("b.toml")).unwrap();
         assert_ne!(linked, provider_config_digest(&cfg_dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A same-size edit inside a provider-config directory changes the
+    /// content identity — the manifest hashes member bytes, not only
+    /// names and sizes.
+    #[test]
+    fn a_same_size_dir_edit_changes_the_provider_config_digest() {
+        let dir = tmp("samesize");
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let member = cfg_dir.join("provider.toml");
+        std::fs::write(&member, "token = \"aaaa\"\n").unwrap();
+        let d1 = provider_config_digest(&cfg_dir).unwrap();
+        std::fs::write(&member, "token = \"bbbb\"\n").unwrap();
+        let d2 = provider_config_digest(&cfg_dir).unwrap();
+        assert_ne!(d1, d2, "same-size content edits move the digest");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

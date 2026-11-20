@@ -168,6 +168,18 @@ impl ScriptedProcessControl {
         self.state.lock().unwrap().spawn_calls
     }
 
+    /// The command line each spawn was given, in spawn order — the
+    /// argv a mount-plan assertion reads the bound flags from.
+    pub fn commands(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .procs
+            .values()
+            .map(|proc| proc.command.clone())
+            .collect()
+    }
+
     /// Every recorded signal, in order.
     pub fn signals(&self) -> Vec<SignalRecord> {
         self.state.lock().unwrap().signals.clone()
@@ -665,7 +677,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         "runtime_version": "scripted-1.0.0",
                         "protocol_versions": ["taisan.worker/1"],
                         "roles": ["coding", "fix", "invariant_check", "review"],
-                        "capabilities": ["workspace_write", "artifact_json", "process_control"],
+                        "capabilities": ["workspace_write", "workspace_read_only", "artifact_json", "process_control"],
                     })
                     .to_string()
                     .into_bytes(),

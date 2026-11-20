@@ -3108,8 +3108,8 @@ impl workloop_core::store::BodyCatalog for SqliteStore {
                     ),
                 });
             }
-            // A replay over a non-`present` row is a re-observation:
-            // `present` is restored, not replayed — the caller
+            // A re-observed body whose row the sweep already moved out
+            // of `present` is restored, not replayed: the caller
             // re-wrote the file under the bodies root before
             // registering, so keeping the stale reclaim state would
             // resolve the live body as permanently Unavailable.

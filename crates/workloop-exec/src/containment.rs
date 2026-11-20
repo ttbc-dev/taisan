@@ -68,10 +68,15 @@ pub const SANDBOX_TOOLCHAIN: &str = "/taisan/toolchain";
 /// The fixed read-only system binds every contained launch gets —
 /// the runtime and toolchain surface, never an owner home, another
 /// workspace, the store, the handoff repository, or installation
-/// config (`docs/v0.3.md` §14.3). Only directories that exist on the
-/// host are bound; a merged-usr layout binds `/bin`/`/sbin` as the
-/// symlinks they are.
-const SYSTEM_BINDS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"];
+/// config (`docs/v0.3.md` §14.3). `/etc` and `/opt` are excluded on
+/// the same rule: they are host configuration and third-party
+/// install trees, not the runtime — a world-readable host secret or
+/// site config there must stay invisible to the sandbox, and a state
+/// or workspace root beneath one of those prefixes must never leak
+/// into the worker's view (OPS-04). Only directories that exist on
+/// the host are bound; a merged-usr layout binds `/bin`/`/sbin` as
+/// the symlinks they are.
+const SYSTEM_BINDS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64"];
 
 /// How long a failed proof suppresses re-probing: an operator fixes
 /// the environment, the next window re-proves. Successful evidence
@@ -190,7 +195,10 @@ pub enum Gate {
         /// The resolved `bwrap` path the outer argv leads with.
         primitive: PathBuf,
         /// The resolved worker executable path the mount plan binds.
-        worker: PathBuf,
+        /// `None` only for a verification gate, whose argv[0] may be a
+        /// worktree-relative command that resolves inside the sandbox
+        /// — launches always carry `Some`.
+        worker: Option<PathBuf>,
     },
 }
 
@@ -724,10 +732,14 @@ fn run_named_probe(
                 if trimmed.is_empty() {
                     String::new()
                 } else {
-                    // Bound by characters: a byte slice can split a
-                    // multibyte codepoint and panic on worker output.
-                    let bounded: String = trimmed.chars().take(200).collect();
-                    format!(": {bounded}")
+                    // The 200-byte detail bound lands on a char
+                    // boundary — a lossy-rendered probe output can
+                    // carry multi-byte characters there.
+                    let mut end = trimmed.len().min(200);
+                    while !trimmed.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!(": {}", &trimmed[..end])
                 }
             }),
         ),
@@ -825,7 +837,7 @@ fn run_battery(
     workspace_root: &Path,
     profile: &IsolationProfile,
     primitive: &Path,
-    worker: &Path,
+    worker: Option<&Path>,
 ) -> Result<Vec<ProbeRecord>, GateError> {
     // The probe scratch lives under `.isolation/probe-containment` —
     // inside the sweep's `probe-*` prefix so a crashed battery never
@@ -864,7 +876,7 @@ fn run_battery(
         caches: vec![],
         extra_binds: vec![],
         extra_rw_binds: vec![],
-        worker: Some(worker.to_path_buf()),
+        worker: worker.map(Path::to_path_buf),
         mask_roots: vec![workspace_root.to_path_buf()],
         masked_files: vec![],
     };
@@ -1013,24 +1025,28 @@ fn run_battery(
         &mut records,
     );
     // The worker executable resolves inside the sandbox at its bound
-    // path — the mount plan's worker bind is proven, not assumed.
-    run_named_probe(
-        port,
-        primitive,
-        &plan,
-        &[
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "test -x \"$1\"".to_string(),
-            "sh".to_string(),
-            worker.to_string_lossy().into_owned(),
-        ],
-        "/tmp",
-        &env,
-        &scratch,
-        "worker-binary-visible",
-        &mut records,
-    );
+    // path — the mount plan's worker bind is proven, not assumed. A
+    // verification gate binds no worker binary, so there is nothing
+    // to prove.
+    if let Some(worker) = worker {
+        run_named_probe(
+            port,
+            primitive,
+            &plan,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test -x \"$1\"".to_string(),
+                "sh".to_string(),
+                worker.to_string_lossy().into_owned(),
+            ],
+            "/tmp",
+            &env,
+            &scratch,
+            "worker-binary-visible",
+            &mut records,
+        );
+    }
     // `describe`-era argv elements that are absolute host paths stay
     // reachable read-only — the same surface `extra_binds` grants.
     // (The battery plan binds none; the launch plans add them per
@@ -1063,6 +1079,34 @@ pub fn gate(
         worker_argv,
         boundary_digest,
         now_unix_seconds,
+        true,
+        &resolve_on_path,
+        &resolve_worker,
+    )
+}
+
+/// The gate for a contained verification command. Unlike a worker
+/// launch, the submission's argv[0] need not resolve to a host
+/// executable: a worktree-relative command (`./gradlew test`)
+/// resolves inside the sandbox against the bound worktree — an
+/// unresolvable argv[0] is an honest in-sandbox failure, never a
+/// gate refusal (`docs/v0.3.md` §14.5; `MountPlan.worker`).
+pub fn gate_for_verification(
+    port: &dyn ProcessControlPort,
+    workspace_root: &Path,
+    profile: &IsolationProfile,
+    argv: &[String],
+    boundary_digest: Option<&str>,
+    now_unix_seconds: i64,
+) -> Result<Gate, GateError> {
+    gate_with_resolvers(
+        port,
+        workspace_root,
+        profile,
+        argv,
+        boundary_digest,
+        now_unix_seconds,
+        false,
         &resolve_on_path,
         &resolve_worker,
     )
@@ -1070,7 +1114,8 @@ pub fn gate(
 
 /// `gate` with the host lookups injected — the deterministic seam the
 /// suite uses to prove evidence reuse, refusal, and re-proof without
-/// a real `bwrap` on the host.
+/// a real `bwrap` on the host. `worker_required` keeps argv[0]
+/// resolution fail-closed for launches; verification passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gate_with_resolvers(
     port: &dyn ProcessControlPort,
@@ -1079,6 +1124,7 @@ pub(crate) fn gate_with_resolvers(
     worker_argv: &[String],
     boundary_digest: Option<&str>,
     now_unix_seconds: i64,
+    worker_required: bool,
     resolve_primitive: &dyn Fn(&str) -> Option<PathBuf>,
     resolve_worker: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<Gate, GateError> {
@@ -1096,12 +1142,16 @@ pub(crate) fn gate_with_resolvers(
             profile.id
         ))
     })?;
-    let worker = resolve_worker(&worker_argv[0]).ok_or_else(|| {
-        refused(format!(
-            "isolation.worker_unresolvable: worker argv[0] '{}' does not resolve to an executable file",
-            worker_argv[0]
-        ))
-    })?;
+    let worker = match resolve_worker(&worker_argv[0]) {
+        Some(worker) => Some(worker),
+        None if worker_required => {
+            return Err(refused(format!(
+                "isolation.worker_unresolvable: worker argv[0] '{}' does not resolve to an executable file",
+                worker_argv[0]
+            )));
+        }
+        None => None,
+    };
     let kernel = kernel_release();
     let version = primitive_version(port, &primitive, workspace_root)?;
 
@@ -1134,7 +1184,7 @@ pub(crate) fn gate_with_resolvers(
         }
     }
 
-    let records = run_battery(port, workspace_root, profile, &primitive, &worker)?;
+    let records = run_battery(port, workspace_root, profile, &primitive, worker.as_deref())?;
     let failures: Vec<String> = records
         .iter()
         .filter(|record| !record.passed)
@@ -1323,10 +1373,10 @@ mod tests {
     /// bound prefix itself) needs no mask.
     #[test]
     fn a_system_bind_covered_masked_file_is_shadowed_with_dev_null() {
-        // /etc/hosts exists on every unix layout this suite runs on
-        // and lives beneath the /etc system bind.
-        let covered = Path::new("/etc/hosts");
-        assert!(covered.is_file(), "test assumes /etc/hosts exists");
+        // /bin/sh exists on every unix layout this suite runs on and
+        // lives beneath the /bin system bind.
+        let covered = Path::new("/bin/sh");
+        assert!(covered.is_file(), "test assumes /bin/sh exists");
         let mut plan = plan_fixture();
         plan.masked_files = vec![covered.to_path_buf()];
         let args = bwrap_args(
@@ -1430,6 +1480,56 @@ mod tests {
         ];
         let binds = extra_binds(&argv, Some(worker));
         assert_eq!(binds, vec![real.clone()]);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn sandbox_mount_shadowing_covers_both_directions() {
+        for denied in [
+            "/",
+            "/taisan",
+            "/taisan/request.json",
+            "/taisan/out/nested",
+            "/workspace",
+            "/workspace/managed/file",
+            "/tmp",
+            "/run",
+            "/home",
+            "/proc",
+            "/dev",
+        ] {
+            assert!(shadows_sandbox_mount(Path::new(denied)), "{denied}");
+        }
+        for allowed in [
+            "/opt/worker.py",
+            "/usr/bin/env",
+            "/etc/ssl/cert.pem",
+            "/var/lib/cache",
+            "/taisanevil/x",
+            "/tmp/host-file",
+            "/home/user/.cache/toolchain",
+        ] {
+            assert!(!shadows_sandbox_mount(Path::new(allowed)), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn extra_binds_skip_spellings_that_cover_the_sandbox_surface() {
+        let worker = Path::new("/opt/worker");
+        // `/` and `/tmp` exist on every host, so the skip is the
+        // guard's doing — not the missing-path skip. `/etc` is a
+        // same-spelling system bind and still collects.
+        let real = std::env::temp_dir().join("workloop-extra-bind-shadow");
+        std::fs::write(&real, "x").unwrap();
+        let argv = vec![
+            "worker".into(),
+            "/".into(),
+            "/tmp".into(),
+            "/etc".into(),
+            real.to_string_lossy().into_owned(),
+        ];
+        let binds = extra_binds(&argv, Some(worker));
+        assert_eq!(binds, vec![PathBuf::from("/etc"), real.clone()]);
         let _ = std::fs::remove_file(&real);
     }
 
@@ -1605,6 +1705,7 @@ mod tests {
             &argv,
             None,
             1_000,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1622,6 +1723,7 @@ mod tests {
             &argv,
             None,
             1_001,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1643,6 +1745,7 @@ mod tests {
             &["/bin/sh".to_string(), "--other".to_string()],
             None,
             1_002,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1681,6 +1784,7 @@ mod tests {
             &argv,
             None,
             2_000,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1699,6 +1803,7 @@ mod tests {
             &argv,
             None,
             2_001,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1709,6 +1814,74 @@ mod tests {
             probes + 1,
             "no battery re-probe inside the window"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A verification argv whose argv[0] is worktree-relative
+    /// (`./gradlew test`) never resolves to a host executable — and
+    /// must not: it resolves inside the sandbox against the bound
+    /// worktree. The verification gate proves the same boundary with
+    /// no worker bind instead of refusing `worker_unresolvable`;
+    /// the launch gate stays fail-closed on the same argv.
+    #[test]
+    fn the_verification_gate_does_not_require_a_resolved_worker() {
+        let root = std::env::temp_dir().join(format!(
+            "wl-gate-verify-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let port = ScriptedProcessControl::new();
+        for _ in 0..16 {
+            port.push_probe(success_probe());
+        }
+        let profile = IsolationProfile {
+            id: "test-contained-v0.1",
+            env_passthrough: &[],
+            sandbox_primitive: Some("bwrap"),
+        };
+        let argv = vec!["./gradlew".to_string(), "test".to_string()];
+        // Worker resolution fails for a relative path with a
+        // separator — the launch gate refuses.
+        let err = gate_with_resolvers(
+            &port,
+            &root,
+            &profile,
+            &argv,
+            None,
+            1_000,
+            true,
+            &|_| Some(PathBuf::from("/usr/bin/bwrap")),
+            &|_| None,
+        )
+        .expect_err("a launch still refuses an unresolvable worker");
+        assert!(
+            matches!(err, GateError::Refused(ref r) if r.contains("isolation.worker_unresolvable")),
+            "{err:?}"
+        );
+        // The verification gate proves the boundary and reports no
+        // worker bind.
+        let gate = gate_with_resolvers(
+            &port,
+            &root,
+            &profile,
+            &argv,
+            None,
+            1_001,
+            false,
+            &|_| Some(PathBuf::from("/usr/bin/bwrap")),
+            &|_| None,
+        )
+        .expect("the verification gate proves without a worker");
+        match gate {
+            Gate::Ready { worker, .. } => {
+                assert_eq!(worker, None, "no worker bind for a relative argv")
+            }
+            _ => panic!("expected a ready gate"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

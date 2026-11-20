@@ -50,31 +50,43 @@ enum BoundedRead {
         retained: Vec<u8>,
         truncated: bool,
     },
+    /// The path could not be read — a stat, open, or read failure on
+    /// the worker-owned surface (an unreadable `out` tree, a
+    /// permission-denied `report.json`). Classified like the unsafe
+    /// case: the worker's output is invalid, never an infrastructure
+    /// fault that would wedge the finish path on every pass.
+    Unreadable,
 }
 
 /// Read `path` as a regular file capped at `bound + 1` bytes. The
 /// metadata check runs on the link itself (`symlink_metadata`) so a
-/// symlink is classified unsafe before any open follows it.
-fn read_bounded(path: &Path, bound: u64) -> Result<BoundedRead, ExecError> {
+/// symlink is classified unsafe before any open follows it. Read
+/// errors on the untrusted surface classify, they do not propagate —
+/// a worker that made its report unreadable produced an invalid
+/// report, and the Invocation still finishes.
+fn read_bounded(path: &Path, bound: u64) -> BoundedRead {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BoundedRead::Absent),
-        Err(e) => return Err(ExecError::Io(e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BoundedRead::Absent,
+        Err(_) => return BoundedRead::Unreadable,
     };
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return Ok(BoundedRead::Unsafe);
+        return BoundedRead::Unsafe;
     }
-    let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
-    file.take(bound.saturating_add(1)).read_to_end(&mut bytes)?;
+    let read = std::fs::File::open(path)
+        .and_then(|file| file.take(bound.saturating_add(1)).read_to_end(&mut bytes));
+    if read.is_err() {
+        return BoundedRead::Unreadable;
+    }
     let truncated = bytes.len() as u64 > bound;
     let keep = (bound as usize).min(bytes.len());
     let retained = bytes[..keep].to_vec();
-    Ok(BoundedRead::Present {
+    BoundedRead::Present {
         bytes,
         retained,
         truncated,
-    })
+    }
 }
 
 /// The out directory must itself be a real directory — a symlinked or
@@ -163,21 +175,36 @@ pub fn collect(
     let out_dir: PathBuf = invocation_io_root(workspace_root)
         .join(isolation::sanitize_key(&invocation.id.0))
         .join("out");
-    let safe = out_dir_safe(&out_dir)?;
+    // The worker-owned out surface is untrusted: a stat failure on
+    // the directory itself is the same invalid-report outcome as a
+    // symlinked one — classified, never an abort that wedges the
+    // finish path.
+    let out_reason = match out_dir_safe(&out_dir) {
+        Ok(true) => None,
+        Ok(false) => Some("report.unsafe_path"),
+        Err(ExecError::Io(_)) => Some("report.unreadable"),
+        Err(e) => return Err(e),
+    };
 
-    let (classification, report_evidence) = if !safe {
+    let (classification, report_evidence) = if let Some(reason) = out_reason {
         (
             ReportClassification::Invalid {
-                reasons: vec!["report.unsafe_path".into()],
+                reasons: vec![reason.into()],
             },
             None,
         )
     } else {
-        match read_bounded(&out_dir.join("report.json"), wire.budget.max_report_bytes)? {
+        match read_bounded(&out_dir.join("report.json"), wire.budget.max_report_bytes) {
             BoundedRead::Absent => (ReportClassification::Absent, None),
             BoundedRead::Unsafe => (
                 ReportClassification::Invalid {
                     reasons: vec!["report.unsafe_path".into()],
+                },
+                None,
+            ),
+            BoundedRead::Unreadable => (
+                ReportClassification::Invalid {
+                    reasons: vec!["report.unreadable".into()],
                 },
                 None,
             ),
@@ -204,10 +231,10 @@ pub fn collect(
     };
 
     // The log is auxiliary evidence collected under its own bound —
-    // an absent or unsafe log never changes the report's class; the
-    // measured retention is what the fact records.
-    let log_evidence = if safe {
-        match read_bounded(&out_dir.join("runtime.log"), wire.budget.max_log_bytes)? {
+    // an absent, unsafe, or unreadable log never changes the report's
+    // class; the measured retention is what the fact records.
+    let log_evidence = if out_reason.is_none() {
+        match read_bounded(&out_dir.join("runtime.log"), wire.budget.max_log_bytes) {
             BoundedRead::Present {
                 retained,
                 truncated,
