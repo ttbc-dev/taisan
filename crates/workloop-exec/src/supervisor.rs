@@ -31,7 +31,7 @@ use workloop_core::worker_v2::{
 };
 
 use crate::adapter;
-use crate::bodies::BodyStore;
+use crate::bodies::{BodyError, BodyStore};
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -1318,20 +1318,36 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let Some(produced) = handoff.produced.clone() else {
             return Ok(());
         };
-        let report_fact = store.transact(|tx| {
-            Ok::<_, StoreError>(
-                tx.observations_for_execution(&invocation.execution_id)?
-                    .into_iter()
-                    .find(|o| {
-                        matches!(
-                            &o.fact,
-                            ObservationFact::WorkerReport { invocation_id, .. }
-                                if invocation_id == &invocation.id
-                        )
-                    })
-                    .map(|o| o.fact),
+        let observations =
+            store.transact(|tx| tx.observations_for_execution(&invocation.execution_id))?;
+        // A verdict for this exact produced commit is already durable:
+        // the acknowledged row is re-seeded every pass while its
+        // Execution stays nonterminal, and re-resolving the evidence
+        // to repeat a recorded verdict buys nothing — and makes a
+        // later CAS reclamation fault the whole handoff sweep.
+        if observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ClaimedHeadCheck {
+                    invocation_id,
+                    artifact_id: a,
+                    produced: p,
+                    ..
+                } if invocation_id == &invocation.id && a == artifact_id && p == &produced
             )
-        })?;
+        }) {
+            return Ok(());
+        }
+        let report_fact = observations
+            .into_iter()
+            .find(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::WorkerReport { invocation_id, .. }
+                        if invocation_id == &invocation.id
+                )
+            })
+            .map(|o| o.fact);
         let Some(ObservationFact::WorkerReport {
             classification,
             report: Some(report_evidence),
@@ -1360,14 +1376,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 "worker report claim check requires the CAS body store".into(),
             ));
         };
-        let resolved = bodies
-            .resolve(store.body_catalog(), &report_evidence.body_id)
-            .map_err(|e| ExecError::Fault(format!("resolve worker report body: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Err(ExecError::Fault(format!(
-                "worker report body {} is missing from the catalog",
-                report_evidence.body_id
-            )));
+        let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+            Ok(Some(resolved)) => resolved,
+            // The verdict is advisory evidence for later gates, never
+            // authority over the artifact: a body the retention sweep
+            // already reclaimed — or that never catalogued — records
+            // no verdict, never a pass-aborting fault.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(()),
+            Err(e) => {
+                return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+            }
         };
         let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
             .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
