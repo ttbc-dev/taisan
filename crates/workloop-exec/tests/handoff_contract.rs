@@ -1679,6 +1679,35 @@ fn contained_verification_refuses_a_model_api_egress_host() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A request declaring verification egress hosts while the
+/// installation configures no verification sandbox is refused, never
+/// run with the host's unrestricted network — a declared grant with
+/// no proxy to honour it is an open-network fallback (§14.5).
+#[test]
+fn declared_egress_hosts_without_a_sandbox_are_refused() {
+    let root = tmp_root("verify-egress-nosb");
+    let (store, layout, scratch, aid) = acknowledged(&root, "vc-egress-nosb");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "echo never".into()],
+        &scratch,
+        &["deps.example".into()],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output
+            .contains("verification.egress_declared_without_sandbox"),
+        "{}",
+        res.output
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn contained_verification_refuses_a_missing_toolchain() {
     let root = tmp_root("verify-notoolchain");

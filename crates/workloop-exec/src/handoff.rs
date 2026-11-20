@@ -943,6 +943,15 @@ fn prepare_enforcement(
     declared_egress_hosts: &[String],
 ) -> Result<Enforcement, String> {
     let Some(sandbox) = &layout.verification else {
+        // Declared egress with no installed sandbox is a grant with
+        // no proxy to honour it — refuse rather than let the command
+        // run on the host's unrestricted network.
+        if declared_egress_hosts.iter().any(|h| !h.trim().is_empty()) {
+            return Err(
+                "verification.egress_declared_without_sandbox: declared egress hosts but no verification sandbox is configured"
+                    .into(),
+            );
+        }
         return Ok(Enforcement::Hygiene);
     };
     // Configured paths must exist before the first dispatch — a
