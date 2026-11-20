@@ -259,6 +259,20 @@ pub trait ProcessControlPort {
         Err("process signature enumeration unsupported".into())
     }
 
+    /// Every live process whose working directory is inside `dir` —
+    /// `dir` is compared canonically, so callers pass an already
+    /// canonical path. A vanished launch's escaped descendant keeps
+    /// the leader's working directory after leaving the argv
+    /// signature, so this is the only handle left to prove nothing
+    /// unexplained still runs in the launch directory. A process
+    /// whose cwd the port cannot read is simply absent from the
+    /// result — it cannot be placed inside `dir` — while a failed
+    /// enumeration returns `Err`, never an empty proof set.
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        let _ = dir;
+        Err("directory process enumeration unsupported".into())
+    }
+
     /// Read the current state of one recorded identity.
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence;
 

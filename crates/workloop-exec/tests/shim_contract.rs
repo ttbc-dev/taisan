@@ -386,6 +386,62 @@ fn an_unidentified_launch_without_a_writer_is_abandoned_after_the_window() {
     assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
 }
 
+/// Absence is not just "no argv signature match": a lost launch's
+/// escaped descendant keeps the leader's working directory after
+/// leaving the signature, so the launch directory must itself be
+/// clear before `Exited`/`Abandoned` — otherwise a replacement writer
+/// would run alongside the still-running escapee. A failed directory
+/// scan fails closed the same way.
+#[test]
+fn an_escaped_descendant_in_the_launch_dir_blocks_the_absence_proof() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-escapee");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-7");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone, but its escaped descendant — a
+    // different argv, the same launch directory — keeps running.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let escapee =
+        port.adopt_child_with(leader, "fixture-worker escaped-writer --file heartbeat.log");
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain
+    );
+    // Past the window the signature scan sees nothing, but the
+    // directory still holds an unexplained process: no absence. A
+    // failed directory scan fails closed identically.
+    port.fail_next_directory_scan("lsof unavailable");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared,
+        "an unexplained directory occupant is never declared absent"
+    );
+    assert!(only_invocation(&store, &eid).process_identity.is_none());
+    // The escapee exiting clears the directory; the next pass proves
+    // absence and abandons the launch.
+    port.exit(escapee, 0);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
 /// A process-table read that fails is never absence proof: the launch
 /// stays uncertain however long the window, and the next readable scan
 /// resolves it normally.

@@ -404,6 +404,43 @@ fn signature_scan_never_reaps_a_zombie_match() {
     );
 }
 
+/// The directory scan is the absence proof's last handle: it finds a
+/// process by working directory alone — the shape an escaped
+/// descendant takes after leaving the launch argv signature.
+#[test]
+fn directory_scan_finds_an_occupant_by_cwd_alone() {
+    let root = tmp_root("dir-scan");
+    let port = PosixProcessControl;
+    let identity = port
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
+        .expect("spawn");
+    let occupants = port.processes_in_directory(&root).expect("scan");
+    assert!(
+        occupants.iter().any(|m| m.identity.pid == identity.pid),
+        "a live process inside the directory is reported by cwd alone"
+    );
+    // The scan is scoped to the directory: the same process is not
+    // an occupant of an unrelated empty directory.
+    let other = tmp_root("dir-scan-other");
+    assert!(
+        !port
+            .processes_in_directory(&other)
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == identity.pid),
+        "the scan is scoped to the directory"
+    );
+    port.signal_verified(&identity, libc::SIGKILL);
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "stopped after signal",
+    );
+}
+
 #[test]
 fn setsid_escapee_is_in_the_snapshot_and_signaled() {
     let root = tmp_root("setsid");

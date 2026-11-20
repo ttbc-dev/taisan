@@ -176,7 +176,7 @@ fn cwd_of(pid: i32) -> Option<PathBuf> {
 /// Whether a child's reported cwd is the launch directory or inside it.
 /// Both sides are canonicalized so symlinked temp roots and `.`/`..`
 /// spellings compare equal; an unresolvable cwd is never a match.
-fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
+pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
@@ -487,6 +487,66 @@ impl ProcessControlPort for PosixProcessControl {
                 },
                 cwd: cwd_of(pid),
                 command: Some(actual),
+            });
+        }
+        Ok(out)
+    }
+
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        // One `lsof -d cwd` pass maps every inspectable pid to its
+        // working directory — per-pid lookups would not scale to a
+        // system-wide absence proof. Field output (`p`/`n` pairs) is
+        // parsed positionally: a process lsof cannot inspect simply
+        // has no `n` line and cannot be placed inside `dir`.
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let out = Command::new("lsof")
+            .args(["-d", "cwd", "-F", "pn"])
+            .output()
+            .map_err(|e| format!("directory process scan failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "lsof failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut occupants = Vec::new();
+        let mut pid: Option<i32> = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.strip_prefix('p') {
+                pid = rest.trim().parse().ok();
+            } else if let Some(path) = line.strip_prefix('n')
+                && let Some(pid) = pid
+            {
+                occupants.push((pid, PathBuf::from(path)));
+            }
+        }
+        let mut out = Vec::new();
+        for (pid, cwd) in occupants {
+            if !cwd_within(Some(&cwd), &dir) {
+                continue;
+            }
+            // Same re-verification as the signature scan: a pid that
+            // exited between the lsof pass and now drops out, and a
+            // start-time lookup failure fails the whole scan — a
+            // partial table can never authorize absence.
+            let started_at = match lstart_of(pid) {
+                LstartLookup::Present(s) => s,
+                LstartLookup::Absent => continue,
+                LstartLookup::Failed(reason) => return Err(reason),
+            };
+            if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
+                continue;
+            }
+            let pgid = unsafe { libc::getpgid(pid) };
+            out.push(ProcessMatch {
+                identity: ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: if pgid > 0 { Some(pgid) } else { None },
+                },
+                cwd: Some(cwd),
+                command: None,
             });
         }
         Ok(out)
@@ -1933,9 +1993,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Absence is proven only when NO unrecorded signature
                 // match remains — a writer that left its launch
                 // directory still matches the argv and keeps the launch
-                // uncertain. And only after the bounded window: a
-                // process inside its fork-exec visibility gap is never
-                // declared absent. The anchor is the Execution's
+                // uncertain — AND the launch directory itself holds no
+                // unexplained process: an escaped descendant keeps the
+                // leader's cwd after leaving the argv signature, so the
+                // signature scan alone cannot prove the writer's whole
+                // tree is gone. The directory scan runs only once the
+                // bounded window has elapsed — before that the answer
+                // is Unknown regardless. The anchor is the Execution's
                 // `uncertain_since`, set on the transition into
                 // `uncertain` and never refreshed by repeat `Unknown`
                 // reports; an unidentified Prepared is the only
@@ -1946,7 +2010,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let absence_proven = unrecorded.is_empty()
                     && execution.uncertain_since_unix_seconds.is_some_and(|since| {
                         now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
-                    });
+                    })
+                    && self.launch_dir_clear(&canonical_dir, &recorded);
                 if absence_proven {
                     self.report(
                         store,
@@ -1971,6 +2036,21 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // More than one attributable child is ambiguous — never
             // guess which spawn produced which process.
             _ => self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds),
+        }
+    }
+
+    /// Whether the launch directory holds no process the store cannot
+    /// account for. An escaped descendant keeps the leader's working
+    /// directory after leaving the argv signature, so directory
+    /// occupancy is the only remaining evidence that the vanished
+    /// writer's tree is really gone. A failed enumeration proves
+    /// nothing — fail closed, stay uncertain.
+    fn launch_dir_clear(&self, dir: &Path, recorded: &HashSet<(i32, String)>) -> bool {
+        match self.port.processes_in_directory(dir) {
+            Ok(occupants) => occupants
+                .iter()
+                .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
+            Err(_) => false,
         }
     }
 

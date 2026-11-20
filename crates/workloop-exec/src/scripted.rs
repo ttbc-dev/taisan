@@ -99,6 +99,10 @@ struct State {
     /// enumeration that cannot complete must never authorize an
     /// absence claim.
     scan_errors: VecDeque<String>,
+    /// Queued `processes_in_directory` failures consumed FIFO — a
+    /// separate tool from the signature scan (`lsof` vs `ps`), so its
+    /// failures are queued separately.
+    dir_scan_errors: VecDeque<String>,
     /// Every accepted signal, in order — the write history a scenario
     /// audits without pattern-matching internals.
     signals: Vec<SignalRecord>,
@@ -206,14 +210,29 @@ impl ScriptedProcessControl {
     /// Register a write-capable descendant of `leader` (e.g. a
     /// setsid-escaped writer) so `snapshot_descendants` reports it.
     pub fn adopt_child(&self, leader: i32) -> i32 {
+        let command = self
+            .state
+            .lock()
+            .unwrap()
+            .procs
+            .get(&leader)
+            .map(|p| p.command.clone());
+        self.adopt_child_with(leader, command.as_deref().unwrap_or_default())
+    }
+
+    /// Register a live process that shares `leader`'s working
+    /// directory but carries its own command line — the
+    /// escaped-descendant shape the launch signature cannot see but
+    /// the directory scan still finds.
+    pub fn adopt_child_with(&self, leader: i32, command: &str) -> i32 {
         let mut s = self.state.lock().unwrap();
         let pid = s.next_pid;
         s.next_pid += 1;
         // A descendant shares its leader's launch context in the model.
-        let (cwd, command) = s
+        let cwd = s
             .procs
             .get(&leader)
-            .map(|p| (p.cwd.clone(), p.command.clone()))
+            .map(|p| p.cwd.clone())
             .unwrap_or_default();
         s.procs.insert(
             pid,
@@ -221,7 +240,7 @@ impl ScriptedProcessControl {
                 started_at: format!("scripted-lstart-{pid}"),
                 pgid: Some(pid), // escaped its leader's group
                 cwd,
-                command,
+                command: command.to_string(),
                 alive: true,
                 exit_code: None,
                 inspect_unknown: None,
@@ -251,6 +270,17 @@ impl ScriptedProcessControl {
             .lock()
             .unwrap()
             .scan_errors
+            .push_back(reason.to_string());
+    }
+
+    /// The next `processes_in_directory` scan fails with this reason —
+    /// an unreadable directory enumeration that must never prove a
+    /// vanished launch's tree is gone.
+    pub fn fail_next_directory_scan(&self, reason: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .dir_scan_errors
             .push_back(reason.to_string());
     }
 
@@ -448,6 +478,31 @@ impl ProcessControlPort for ScriptedProcessControl {
                     pgid: p.pgid,
                 },
                 cwd: (!p.cwd_unreadable).then(|| p.cwd.clone()),
+                command: Some(p.command.clone()),
+            })
+            .collect())
+    }
+
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.dir_scan_errors.pop_front() {
+            return Err(reason);
+        }
+        // The model's cwd is provable unless flagged; an
+        // unreadable-cwd process cannot be placed inside `dir`,
+        // exactly like a real enumeration that never lists it.
+        Ok(s.procs
+            .iter()
+            .filter(|(_, p)| {
+                p.alive && !p.cwd_unreadable && crate::supervisor::cwd_within(Some(&p.cwd), dir)
+            })
+            .map(|(pid, p)| ProcessMatch {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    started_at: p.started_at.clone(),
+                    pgid: p.pgid,
+                },
+                cwd: Some(p.cwd.clone()),
                 command: Some(p.command.clone()),
             })
             .collect())

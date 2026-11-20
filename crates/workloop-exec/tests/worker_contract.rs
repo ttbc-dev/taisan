@@ -27,7 +27,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -366,6 +366,9 @@ impl ProcessControlPort for CountingPosix {
     }
     fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
         PosixProcessControl.matching_processes(command)
+    }
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        PosixProcessControl.processes_in_directory(dir)
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
