@@ -36,7 +36,8 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
+    WorkerEnv,
 };
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -325,6 +326,7 @@ struct CountingPosix {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
     fail_next: Rc<Cell<bool>>,
+    unknown_next: Rc<Cell<bool>>,
 }
 
 impl ProcessControlPort for CountingPosix {
@@ -342,11 +344,28 @@ impl ProcessControlPort for CountingPosix {
                 reason: "adapter declined the request".into(),
             });
         }
+        if self.unknown_next.replace(false) {
+            // The process really starts — what was lost is the identity
+            // capture, exactly the crash window the recovery path
+            // exists for. The orphan stays findable through
+            // `matching_processes`, and `spawned` still records it so
+            // the scenario can clean the writer up.
+            let out = PosixProcessControl.spawn(argv, cwd, env);
+            if let Ok(identity) = &out {
+                self.spawned.borrow_mut().push(identity.clone());
+            }
+            return Err(SpawnError::Unknown {
+                reason: "identity capture lost after spawn".into(),
+            });
+        }
         let out = PosixProcessControl.spawn(argv, cwd, env);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
         }
         out
+    }
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        PosixProcessControl.matching_processes(command)
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
@@ -382,6 +401,7 @@ struct PosixProvider {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
     fail_next: Rc<Cell<bool>>,
+    unknown_next: Rc<Cell<bool>>,
 }
 
 impl PosixProvider {
@@ -391,6 +411,7 @@ impl PosixProvider {
         let spawned = Rc::new(RefCell::new(Vec::new()));
         let calls = Rc::new(Cell::new(0));
         let fail_next = Rc::new(Cell::new(false));
+        let unknown_next = Rc::new(Cell::new(false));
         let mode = match shape {
             WorkerShape::CleanExit => "clean-exit",
             WorkerShape::NoArtifact => "exit-no-artifact",
@@ -402,6 +423,7 @@ impl PosixProvider {
                     spawned: spawned.clone(),
                     calls: calls.clone(),
                     fail_next: fail_next.clone(),
+                    unknown_next: unknown_next.clone(),
                 },
                 tmp_root(tag),
                 vec![bin.to_string(), mode.into()],
@@ -410,20 +432,25 @@ impl PosixProvider {
             spawned,
             calls,
             fail_next,
+            unknown_next,
         }
     }
 }
 
 impl WorkerProvider for PosixProvider {
     fn declares() -> &'static [&'static str] {
-        // Real spawn semantics only: outcomes a process cannot fake
-        // (unknown identity capture, uninspectable liveness) are not
-        // declared, and those rows are skipped — never substituted.
+        // Real spawn semantics plus the one outcome a real process CAN
+        // produce: a genuinely spawned writer whose identity capture is
+        // lost — the orphan stays findable through the real ps/lsof
+        // signature scan. What a process cannot fake (uninspectable
+        // liveness) stays undeclared, and that row is skipped — never
+        // substituted.
         &[
             "clean_exit",
             "no_artifact",
             "resident_writer",
             "spawn_refused",
+            "spawn_unknown",
             "stop_signal",
             "spawn_count",
         ]
@@ -483,7 +510,10 @@ impl WorkerHandle for PosixProvider {
                 self.fail_next.set(true);
             }
             SpawnFail::Unknown => {
-                unreachable!("PosixProvider does not declare spawn_unknown")
+                // Spawn for real, then lose the identity: the orphan
+                // is a genuine process-table entry the signature scan
+                // must find and re-bind.
+                self.unknown_next.set(true);
             }
         }
     }
@@ -751,6 +781,7 @@ fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store:
         ExecutionState::Running,
         "the re-bound writer resumes the Execution — no silent not-started"
     );
+    p.exit_writers();
 }
 
 /// WC-START-03: a definitely-refused start pauses without a writer and
@@ -1236,11 +1267,12 @@ fn run_suite<P: WorkerProvider>(tag: &str) -> (Vec<&'static str>, Vec<&'static s
 fn posix_provider_runs_the_suite_within_its_declared_surface() {
     let (covered, skipped) = run_suite::<PosixProvider>("posix");
     // Outcomes a real process cannot fake are reported skipped, never
-    // substituted: unknown identity capture and uninspectable liveness.
+    // substituted: uninspectable liveness and the surviving-signal gap.
+    // A lost identity capture IS covered — the orphan is a real
+    // process-table entry the signature scan re-binds.
     assert_eq!(
         skipped,
         vec![
-            "WC-START-02 unknown start outcome blocks a second writer",
             "WC-LIVE-01 unknown liveness is not death",
             "WC-STOP-02 a delivered signal is not stop proof",
         ]

@@ -1089,3 +1089,69 @@ fn seed_change(store: &SqliteStore, work_id: &WorkId, head: &str, observed_at: i
         ],
     );
 }
+
+/// #287 review: the unidentified-launch absence window anchors on
+/// `uncertain_since`, which is set on the transition into `uncertain`,
+/// never refreshed by repeat `Unknown` reports, cleared on the way
+/// out, and re-anchored by the next episode — so a stale anchor can
+/// neither wedge the launch forever nor shorten a later window.
+#[test]
+fn uncertain_since_re_anchors_each_episode_and_never_refreshes() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) = submit_work(&store, "anchor");
+    set_state(
+        &store,
+        &e1,
+        ExecutionState::Queued,
+        ExecutionState::Ready,
+        None,
+    );
+    let process_fact = |state: ProcessStateFact| ObservationFact::ProcessState {
+        invocation_id: InvocationId("anchor-inv".into()),
+        process_identity: "1@1".into(),
+        state,
+        exit_code: None,
+    };
+    let report = |fact: ObservationFact, at: i64| {
+        handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e1.clone()),
+                fact,
+                observed_unix_seconds: at,
+            },
+            at,
+        )
+        .unwrap();
+    };
+    // First episode: the anchor is the transition time, and a repeated
+    // Unknown report while already uncertain never refreshes it.
+    report(process_fact(ProcessStateFact::Unknown), NOW);
+    assert_eq!(
+        execution(&store, &e1).uncertain_since_unix_seconds,
+        Some(NOW)
+    );
+    report(process_fact(ProcessStateFact::Unknown), NOW + 5);
+    assert_eq!(
+        execution(&store, &e1).uncertain_since_unix_seconds,
+        Some(NOW),
+        "a repeated Unknown report does not refresh the anchor"
+    );
+    // Leaving uncertain clears the anchor; the next episode re-anchors
+    // at its own transition — a stale T0 cannot shorten the window.
+    report(process_fact(ProcessStateFact::Running), NOW + 10);
+    let running = execution(&store, &e1);
+    assert_eq!(running.state, ExecutionState::Running);
+    assert_eq!(running.uncertain_since_unix_seconds, None);
+    report(process_fact(ProcessStateFact::Unknown), NOW + 20);
+    let again = execution(&store, &e1);
+    assert_eq!(again.state, ExecutionState::Uncertain);
+    assert_eq!(
+        again.uncertain_since_unix_seconds,
+        Some(NOW + 20),
+        "each uncertain episode anchors at its own transition"
+    );
+}

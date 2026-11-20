@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
-use workloop_core::ports::{ProcessControlPort, WorkerEnv};
+use workloop_core::ports::{ProcessControlPort, SpawnError, WorkerEnv};
 use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
@@ -363,6 +363,16 @@ fn an_unidentified_launch_without_a_writer_is_abandoned_after_the_window() {
         ExecutionState::Uncertain
     );
     assert!(only_invocation(&store, &eid).process_identity.is_none());
+    // Dense polling never shortens the window: `uncertain_since` is
+    // set on the transition into `uncertain` and repeated `Unknown`
+    // reports do not refresh it, so the bound is measured from the
+    // first lost launch, not the latest pass.
+    sup.poll_invocations(&store, NOW + 15).unwrap();
+    sup.poll_invocations(&store, NOW + 29).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
     // Past the window, proven absence abandons the launch — `abandoned`,
     // not `done`: nothing ran to finish — and the slot is released.
     sup.poll_invocations(&store, NOW + 31).unwrap();
@@ -445,6 +455,55 @@ fn ambiguous_signature_matches_keep_the_launch_uncertain() {
     );
 }
 
+/// A signature match whose cwd cannot be read can be neither bound
+/// nor ruled out: while one exists, an in-directory match might be a
+/// foreign process and the unreadable one the real orphan — the
+/// launch stays uncertain rather than adopt the wrong writer. Once
+/// the cwd reads again the orphan is attributable and binds.
+#[test]
+fn an_unattributable_candidate_blocks_the_bind() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-cwd-none");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (w, eid) = submit_and_admit(&store, "k-shim-10");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The orphan's cwd is unreadable (denied lsof) — and a second live
+    // process carries the same argv inside the launch directory. The
+    // in-directory match alone would look bindable; the unreadable
+    // candidate makes every bind a guess.
+    let orphan_pid = port.spawned().last().unwrap().pid;
+    port.set_cwd_unreadable(orphan_pid, true);
+    let ws = sup.workspace_of(&w);
+    let foreign = port
+        .spawn(&["fixture-worker".into()], &ws, &WorkerEnv::default())
+        .expect("the in-directory candidate spawns");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "an unreadable candidate is never resolved by guessing"
+    );
+    // The foreign process exits and the orphan's cwd reads again: the
+    // orphan is the single attributable match and binds normally.
+    port.exit(foreign.pid, 0);
+    port.set_cwd_unreadable(orphan_pid, false);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
 /// A signature match the store already records — another Work's live
 /// writer — is never re-bound as this launch's orphan, and never blocks
 /// the orphan that IS this launch's.
@@ -486,4 +545,27 @@ fn a_recorded_writer_is_never_rebound_as_the_orphan() {
         "A's writer keeps its own recorded identity"
     );
     assert_eq!(inv_a.state, InvocationState::Running);
+}
+
+/// The scripted port's `spawned()` is the process-table view: a
+/// `SpawnPlan::Unknown` outcome still records the leader identity —
+/// the process exists even though its spawn response was lost.
+/// `spawn_calls` stays the no-second-writer counter.
+#[test]
+fn scripted_unknown_plan_records_the_lost_identity() {
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture lost after spawn".into(),
+    });
+    let ws = tmp_root("scripted-unknown-spawned");
+    assert!(matches!(
+        port.spawn(&["fixture-worker".into()], &ws, &WorkerEnv::default()),
+        Err(SpawnError::Unknown { .. })
+    ));
+    assert_eq!(
+        port.spawned().len(),
+        1,
+        "the orphan is in the process table even though the response was lost"
+    );
+    assert_eq!(port.spawn_calls(), 1);
 }

@@ -69,6 +69,10 @@ struct Proc {
     /// writing — models the realizable gap between signal delivery and
     /// the process actually dying.
     survives_signal: bool,
+    /// When set, `matching_processes` reports `cwd: None` — a process
+    /// whose working directory the platform cannot prove (denied
+    /// lsof, minimal image). It can be neither bound nor ruled out.
+    cwd_unreadable: bool,
 }
 
 #[derive(Debug, Default)]
@@ -132,7 +136,11 @@ impl ScriptedProcessControl {
         self.state.lock().unwrap().default_plan = Some(plan);
     }
 
-    /// Spawned leader identities in spawn order.
+    /// Every process the model spawned, in spawn order — the
+    /// process-table view, not the "identity the caller received"
+    /// view: a `SpawnPlan::Unknown` outcome still records its leader
+    /// because the process exists even though the spawn response was
+    /// lost. `spawn_calls` remains the no-second-writer counter.
     pub fn spawned(&self) -> Vec<ProcessIdentity> {
         self.state.lock().unwrap().spawned.clone()
     }
@@ -185,6 +193,16 @@ impl ScriptedProcessControl {
         }
     }
 
+    /// Make `matching_processes` report `cwd: None` for the pid until
+    /// cleared — an lsof-denied or minimal-image process whose launch
+    /// attribution cannot be proven either way.
+    pub fn set_cwd_unreadable(&self, pid: i32, on: bool) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.cwd_unreadable = on;
+        }
+    }
+
     /// Register a write-capable descendant of `leader` (e.g. a
     /// setsid-escaped writer) so `snapshot_descendants` reports it.
     pub fn adopt_child(&self, leader: i32) -> i32 {
@@ -208,6 +226,7 @@ impl ScriptedProcessControl {
                 exit_code: None,
                 inspect_unknown: None,
                 survives_signal: false,
+                cwd_unreadable: false,
             },
         );
         s.children.entry(leader).or_default().push(pid);
@@ -301,6 +320,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         exit_code: None,
                         inspect_unknown: None,
                         survives_signal: false,
+                        cwd_unreadable: false,
                     },
                 );
                 s.spawned.push(identity);
@@ -352,6 +372,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         exit_code,
                         inspect_unknown: None,
                         survives_signal: false,
+                        cwd_unreadable: false,
                     },
                 );
                 s.spawned.push(identity.clone());
@@ -426,7 +447,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                     started_at: p.started_at.clone(),
                     pgid: p.pgid,
                 },
-                cwd: Some(p.cwd.clone()),
+                cwd: (!p.cwd_unreadable).then(|| p.cwd.clone()),
                 command: Some(p.command.clone()),
             })
             .collect())

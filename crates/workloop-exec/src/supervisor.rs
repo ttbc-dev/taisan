@@ -470,10 +470,12 @@ impl ProcessControlPort for PosixProcessControl {
                 LstartLookup::Absent => continue,
                 LstartLookup::Failed(reason) => return Err(reason),
             };
-            // A zombie is dead: it cannot write. Reap it when it is
-            // still our child; either way it is not a live match.
+            // A zombie is dead: it cannot write. It is not a live
+            // match — and the scan must not reap it either: reaping
+            // here could consume another Invocation's exit status
+            // before its own inspect reads it. Enumeration stays
+            // read-only; the owning path reaps.
             if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
-                let _ = self.reap(pid);
                 continue;
             }
             let pgid = unsafe { libc::getpgid(pid) };
@@ -1848,6 +1850,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
             .iter()
             .filter(|m| !recorded.contains(&(m.identity.pid, m.identity.started_at.clone())))
             .collect();
+        // A candidate whose cwd cannot be read can be neither bound
+        // nor ruled out: while one exists, no bind is provable — the
+        // in-directory match might be a foreign process and the
+        // unreadable one the real orphan. Stay uncertain rather than
+        // adopt the wrong writer. (Absence is already blocked: the
+        // candidate counts in `unrecorded` either way.)
+        if unrecorded.iter().any(|m| m.cwd.is_none()) {
+            return self.report_unidentified_unknown(
+                store,
+                request,
+                &invocation.id,
+                now_unix_seconds,
+            );
+        }
         let attributable: Vec<&&ProcessMatch> = unrecorded
             .iter()
             .filter(|m| cwd_within(m.cwd.as_deref(), &canonical_dir))
@@ -1919,7 +1935,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // directory still matches the argv and keeps the launch
                 // uncertain. And only after the bounded window: a
                 // process inside its fork-exec visibility gap is never
-                // declared absent.
+                // declared absent. The anchor is the Execution's
+                // `uncertain_since`, set on the transition into
+                // `uncertain` and never refreshed by repeat `Unknown`
+                // reports; an unidentified Prepared is the only
+                // unresolved Invocation that can hold its Execution
+                // `ready`, so the anchor always postdates this launch's
+                // commit — the measured window covers the whole
+                // spawn-to-visible gap plus poll lag.
                 let absence_proven = unrecorded.is_empty()
                     && execution.uncertain_since_unix_seconds.is_some_and(|since| {
                         now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS

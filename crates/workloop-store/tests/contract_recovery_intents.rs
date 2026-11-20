@@ -737,6 +737,61 @@ fn repeated_repair_pauses_keep_one_pending_requeue_intent() {
     );
 }
 
+/// #288 lost-wakeup interleaving: a pending `requeue` whose Execution
+/// resumes and re-pauses *before* the intent is evaluated must still
+/// fire — dedupe keeps the one pending intent and the firing guards
+/// revalidate the live `paused` state, so the pause is never stranded.
+#[test]
+fn a_pending_requeue_survives_a_resume_and_fires_on_the_next_pause() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let cfg = config_with_issue_read();
+    let (work_id, eid) = submit_with_source(
+        &store,
+        &cfg,
+        "k-interleave",
+        SourceSnapshot {
+            issue: issue(1),
+            source_revision: "rev-1".into(),
+            content_digest: "digest-1".into(),
+        },
+    );
+    issue_read(
+        &store,
+        &cfg,
+        &work_id,
+        1,
+        "rev-1",
+        "digest-1",
+        IssueState::Unavailable,
+    );
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Paused);
+    // Resume, then re-pause through the real admit path — all before
+    // the recovery pass evaluates the intent.
+    set_state(&store, &eid, ExecutionState::Paused, ExecutionState::Queued);
+    store
+        .transact(|tx| workloop_core::work::admit_queued(tx, &cfg, &eid, NOW).map(|_| ()))
+        .unwrap();
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Paused);
+    assert_eq!(pending_requeues(&store, &eid), 1);
+    // The source recovers before the recovery pass: the recorded
+    // `SourceRead` prerequisite is met, so the surviving intent fires
+    // against the new pause — consumed, and the Execution re-enters
+    // the queue. The pause is never stranded.
+    issue_read(
+        &store,
+        &cfg,
+        &work_id,
+        1,
+        "rev-1",
+        "digest-1",
+        IssueState::Open,
+    );
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.consumed, 1);
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Queued);
+    assert_eq!(pending_requeues(&store, &eid), 0);
+}
+
 /// #288: intents left pending by executions that already resumed used
 /// to sit at the head of the due list forever, each consuming a slot of
 /// the per-tick bound. They are now retired on evaluation — the dead
