@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use workloop_core::domain::ProcessIdentity;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
+    WorkerEnv,
 };
 
 /// What the next `spawn` produces.
@@ -53,6 +54,12 @@ pub struct SignalRecord {
 struct Proc {
     started_at: String,
     pgid: Option<i32>,
+    /// The cwd the spawn ran under — the evidence `matching_processes`
+    /// reports for launch-outcome attribution.
+    cwd: PathBuf,
+    /// The argv the spawn was given, whitespace-joined like a process
+    /// table's command column.
+    command: String,
     alive: bool,
     exit_code: Option<i32>,
     /// When set, `inspect` reports `Unknown` — an uninspectable process,
@@ -84,6 +91,10 @@ struct State {
     children: BTreeMap<i32, Vec<i32>>,
     /// Queued snapshot failures consumed FIFO.
     snapshot_errors: VecDeque<String>,
+    /// Queued `matching_processes` failures consumed FIFO — an
+    /// enumeration that cannot complete must never authorize an
+    /// absence claim.
+    scan_errors: VecDeque<String>,
     /// Every accepted signal, in order — the write history a scenario
     /// audits without pattern-matching internals.
     signals: Vec<SignalRecord>,
@@ -180,11 +191,19 @@ impl ScriptedProcessControl {
         let mut s = self.state.lock().unwrap();
         let pid = s.next_pid;
         s.next_pid += 1;
+        // A descendant shares its leader's launch context in the model.
+        let (cwd, command) = s
+            .procs
+            .get(&leader)
+            .map(|p| (p.cwd.clone(), p.command.clone()))
+            .unwrap_or_default();
         s.procs.insert(
             pid,
             Proc {
                 started_at: format!("scripted-lstart-{pid}"),
                 pgid: Some(pid), // escaped its leader's group
+                cwd,
+                command,
                 alive: true,
                 exit_code: None,
                 inspect_unknown: None,
@@ -202,6 +221,17 @@ impl ScriptedProcessControl {
             .lock()
             .unwrap()
             .snapshot_errors
+            .push_back(reason.to_string());
+    }
+
+    /// The next `matching_processes` scan fails with this reason —
+    /// an unreadable process table that must never prove a writer
+    /// absent.
+    pub fn fail_next_process_scan(&self, reason: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .scan_errors
             .push_back(reason.to_string());
     }
 
@@ -232,13 +262,14 @@ impl ScriptedProcessControl {
 impl ProcessControlPort for ScriptedProcessControl {
     fn spawn(
         &self,
-        _argv: &[String],
+        argv: &[String],
         cwd: &Path,
         env: &WorkerEnv,
     ) -> Result<ProcessIdentity, SpawnError> {
         let mut s = self.state.lock().unwrap();
         s.spawn_calls += 1;
         s.spawn_envs.push(env.clone());
+        let command = argv.join(" ");
         let plan = s
             .plans
             .pop_front()
@@ -249,20 +280,30 @@ impl ProcessControlPort for ScriptedProcessControl {
             SpawnPlan::Unknown { reason } => {
                 // The process exists in the model — a real spawn that
                 // crashed before identity capture leaves a live writer.
+                // Its leader identity is still recorded: the process
+                // was spawned even though the response was lost.
                 let pid = s.next_pid;
                 s.next_pid += 1;
                 let started_at = format!("scripted-lstart-{pid}");
+                let identity = ProcessIdentity {
+                    pid,
+                    started_at: started_at.clone(),
+                    pgid: Some(pid),
+                };
                 s.procs.insert(
                     pid,
                     Proc {
-                        started_at: started_at.clone(),
-                        pgid: Some(pid),
+                        started_at,
+                        pgid: identity.pgid,
+                        cwd: cwd.to_path_buf(),
+                        command,
                         alive: true,
                         exit_code: None,
                         inspect_unknown: None,
                         survives_signal: false,
                     },
                 );
+                s.spawned.push(identity);
                 Err(SpawnError::Unknown { reason })
             }
             SpawnPlan::Resident | SpawnPlan::ExitAfterWrite { .. } => {
@@ -305,6 +346,8 @@ impl ProcessControlPort for ScriptedProcessControl {
                     Proc {
                         started_at: identity.started_at.clone(),
                         pgid: identity.pgid,
+                        cwd: cwd.to_path_buf(),
+                        command,
                         alive,
                         exit_code,
                         inspect_unknown: None,
@@ -359,6 +402,32 @@ impl ProcessControlPort for ScriptedProcessControl {
                 pid: *pid,
                 started_at: p.started_at.clone(),
                 pgid: p.pgid,
+            })
+            .collect())
+    }
+
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.scan_errors.pop_front() {
+            return Err(reason);
+        }
+        let expected = crate::supervisor::normalize_lstart(command);
+        // The model's process table is system-wide like the real one:
+        // every live process whose command matches is a candidate,
+        // parentage irrelevant — a reparented orphan still matches.
+        // Dead rows are not matches — `alive` is the model's liveness
+        // read, and an uninspectable row still counts as live.
+        Ok(s.procs
+            .iter()
+            .filter(|(_, p)| p.alive && crate::supervisor::normalize_lstart(&p.command) == expected)
+            .map(|(pid, p)| ProcessMatch {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    started_at: p.started_at.clone(),
+                    pgid: p.pgid,
+                },
+                cwd: Some(p.cwd.clone()),
+                command: Some(p.command.clone()),
             })
             .collect())
     }

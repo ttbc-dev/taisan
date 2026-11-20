@@ -718,15 +718,19 @@ fn duplicate_request_delivery_starts_no_second_writer(
 }
 
 /// WC-START-02: a start whose outcome was lost leaves the writer
-/// uncertain — never a silent not-started that permits a replacement.
-/// Repeated loop passes reconcile the unidentifiable Invocation through
-/// the poll path: uncertainty is re-reported, a second start never is.
+/// unproven until the poll path resolves it — never a silent
+/// not-started that permits a replacement, and never a second start.
+/// The orphaned writer still carries the recorded launch signature, so
+/// reconciliation re-binds its identity through the same durable commit
+/// a normal launch uses; the Execution returns to `running` with
+/// exactly one writer.
 fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (_w, eid) = submit_and_admit(store, &config(), "wc-start-2");
     p.fail_next_spawn(SpawnFail::Unknown);
     p.consume(store);
-    // Re-drive the loop: the poll path re-reports the unidentifiable
-    // Invocation as unknown — reconciliation, never a second start.
+    // Re-drive the loop: the poll path finds the orphaned writer by
+    // its launch signature and re-binds it — reconciliation, never a
+    // second start.
     p.pass(store);
     p.pass(store);
     assert_eq!(
@@ -737,15 +741,15 @@ fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store:
     let invocations = invocations(store, &eid);
     assert_eq!(invocations.len(), 1);
     assert!(
-        invocations[0].state == InvocationState::Prepared
-            && invocations[0].process_identity.is_none(),
-        "an unrecorded start never claims a writer identity: {:?}",
+        invocations[0].state == InvocationState::Running
+            && invocations[0].process_identity.is_some(),
+        "the orphaned writer is re-bound, not guessed at: {:?}",
         invocations[0].state
     );
     assert_eq!(
         execution(store, &eid).state,
-        ExecutionState::Uncertain,
-        "the Execution stays uncertain — never silently not-started"
+        ExecutionState::Running,
+        "the re-bound writer resumes the Execution — no silent not-started"
     );
 }
 

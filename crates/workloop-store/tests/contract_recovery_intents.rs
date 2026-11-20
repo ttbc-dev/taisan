@@ -246,6 +246,102 @@ fn execution(store: &SqliteStore, execution_id: &ExecutionId) -> Execution {
         .unwrap()
 }
 
+fn issue(number: u64) -> IssueRef {
+    IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted(format!("issue-{number}")),
+        display_number: Some(number),
+    }
+}
+
+fn config_with_issue_read() -> WorkloopConfig {
+    let mut c = config();
+    c.declared_capabilities
+        .insert(workloop_core::identity::HostCapability::IssueRead);
+    c
+}
+
+fn submit_with_source(
+    store: &SqliteStore,
+    cfg: &WorkloopConfig,
+    key: &str,
+    source: SourceSnapshot,
+) -> (WorkId, ExecutionId) {
+    let d = handle_command(
+        store,
+        cfg,
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: key.into(),
+            body: CommandBody::Submit {
+                intent: format!("intent-{key}"),
+                sources: vec![source],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let CommandDecision::Accepted {
+        work_id,
+        effect: CommandEffect::WorkCreated { execution_id },
+        ..
+    } = d
+    else {
+        panic!("submit {key}: {d:?}")
+    };
+    (work_id.unwrap(), execution_id)
+}
+
+/// One authoritative issue read, delivered as an observation — the same
+/// fact shape the run loop records from the host.
+fn issue_read(
+    store: &SqliteStore,
+    cfg: &WorkloopConfig,
+    work_id: &WorkId,
+    number: u64,
+    revision: &str,
+    digest: &str,
+    state: IssueState,
+) {
+    handle_observation(
+        store,
+        cfg,
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::Issue {
+                issue: issue(number),
+                source_revision: revision.into(),
+                content_digest: digest.into(),
+                state,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+fn pending_requeues(store: &SqliteStore, execution_id: &ExecutionId) -> usize {
+    store
+        .transact(|tx| {
+            Ok(tx
+                .recovery_intents()?
+                .iter()
+                .filter(|i| {
+                    i.execution_id.as_ref() == Some(execution_id)
+                        && i.state == RecoveryIntentState::Pending
+                        && i.kind == "requeue"
+                })
+                .count())
+        })
+        .unwrap()
+}
+
 #[test]
 fn due_requeue_requeues_a_paused_execution_and_consumes_the_intent() {
     let store = SqliteStore::in_memory(2).unwrap();
@@ -540,22 +636,148 @@ fn unmet_repair_prerequisites_hold_the_intent() {
 }
 
 #[test]
-fn an_already_progressing_execution_holds_the_intent() {
+fn a_progressing_execution_retires_the_intent() {
     let store = SqliteStore::in_memory(2).unwrap();
     let (work_id, execution_id) = submit(&store, "k-active");
     let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
 
+    // The Execution is `queued` — resumed by another path while the
+    // intent was pending. The requeue can never fire, so it is retired
+    // rather than left pending to consume the per-tick budget forever.
     let scan = consume(&store, NOW, None, None, 16);
     assert_eq!(scan.consumed, 0);
+    assert_eq!(scan.retired, 1);
+    let row = intent(&store, &intent_id);
+    assert_eq!(row.state, RecoveryIntentState::Retired);
+    assert_eq!(
+        row.retirement_reason.as_deref(),
+        Some("execution_progressing"),
+        "retirement records why the intent can never fire"
+    );
+    assert_eq!(
+        execution(&store, &execution_id).state,
+        ExecutionState::Queued
+    );
+}
+
+/// A pause still resolving keeps its intent: `stopping`/`uncertain`
+/// heading for `paused` is exactly the state the requeue exists for.
+#[test]
+fn a_pause_still_resolving_holds_the_intent() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (work_id, execution_id) = submit(&store, "k-resolving");
+    set_state(
+        &store,
+        &execution_id,
+        ExecutionState::Queued,
+        ExecutionState::Stopping,
+    );
+    let intent_id = schedule(&store, &work_id, Some(&execution_id), "requeue", NOW);
+
+    let scan = consume(&store, NOW, None, None, 16);
+    assert_eq!(scan.consumed, 0);
+    assert_eq!(scan.retired, 0);
     assert!(
         scan.held
             .iter()
             .any(|(id, reason)| id == &intent_id && reason == "execution_active")
     );
     assert_eq!(
-        execution(&store, &execution_id).state,
-        ExecutionState::Queued
+        intent(&store, &intent_id).state,
+        RecoveryIntentState::Pending
     );
+}
+
+/// #288: every `pause_for_repair` used to insert a fresh `requeue`
+/// intent unconditionally. Repeated pause→resume cycles — here driven
+/// through the real source-gate pause and re-admission — must keep at
+/// most one pending `requeue` per Execution, parity with the `retry`
+/// dedupe guard.
+#[test]
+fn repeated_repair_pauses_keep_one_pending_requeue_intent() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let cfg = config_with_issue_read();
+    let (work_id, eid) = submit_with_source(
+        &store,
+        &cfg,
+        "k-dedupe",
+        SourceSnapshot {
+            issue: issue(1),
+            source_revision: "rev-1".into(),
+            content_digest: "digest-1".into(),
+        },
+    );
+    // An unavailable authoritative read pauses the queued Execution for
+    // repair — the first real `pause_for_repair` of the cycle.
+    issue_read(
+        &store,
+        &cfg,
+        &work_id,
+        1,
+        "rev-1",
+        "digest-1",
+        IssueState::Unavailable,
+    );
+    assert_eq!(execution(&store, &eid).state, ExecutionState::Paused);
+    assert_eq!(pending_requeues(&store, &eid), 1);
+    // Each cycle is a real resume→admit→pause: the Execution returns to
+    // `queued`, admission re-reads the still-unavailable source gate and
+    // pauses it again through `pause_for_repair`.
+    for _ in 0..8 {
+        set_state(&store, &eid, ExecutionState::Paused, ExecutionState::Queued);
+        store
+            .transact(|tx| workloop_core::work::admit_queued(tx, &cfg, &eid, NOW).map(|_| ()))
+            .unwrap();
+        assert_eq!(execution(&store, &eid).state, ExecutionState::Paused);
+    }
+    assert_eq!(
+        pending_requeues(&store, &eid),
+        1,
+        "pause/resume cycles never accumulate pending requeue intents"
+    );
+}
+
+/// #288: intents left pending by executions that already resumed used
+/// to sit at the head of the due list forever, each consuming a slot of
+/// the per-tick bound. They are now retired on evaluation — the dead
+/// rows cost budget once, and live intents for other Works fire.
+#[test]
+fn stale_requeue_intents_retire_instead_of_starving_the_tick() {
+    let store = SqliteStore::in_memory(24).unwrap();
+    // The pre-fix accumulation shape: many pending requeue intents
+    // whose Executions are already progressing again — they can never
+    // fire. They are due earlier, so they sit at the head of the due
+    // list on every pass.
+    for i in 0..20 {
+        let (w, e) = submit(&store, &format!("k-stale-{i}"));
+        set_state(&store, &e, ExecutionState::Queued, ExecutionState::Running);
+        schedule(&store, &w, Some(&e), "requeue", NOW - 1);
+    }
+    // Two live paused Works with due intents behind them in the queue.
+    let (w1, e1) = submit(&store, "k-live-1");
+    pause(&store, &e1, vec![]);
+    let i1 = schedule(&store, &w1, Some(&e1), "requeue", NOW);
+    let (w2, e2) = submit(&store, "k-live-2");
+    pause(&store, &e2, vec![]);
+    let i2 = schedule(&store, &w2, Some(&e2), "requeue", NOW);
+
+    // Pass 1 evaluates the head of the due list: the 16 oldest stale
+    // intents are retired, never held pending. Under the old behavior
+    // they stayed pending and re-consumed this budget on every pass —
+    // with 20 stale intents above the limit of 16, the live intents
+    // behind them were never evaluated at all.
+    let s1 = consume(&store, NOW, None, None, 16);
+    assert_eq!(s1.retired, 16, "dead intents retire on first evaluation");
+    // Pass 2 reaches the live intents: the remaining stale rows retire
+    // and both live intents fire — dead intents never starve live
+    // recovery again.
+    let s2 = consume(&store, NOW, None, None, 16);
+    assert_eq!(s2.retired, 4);
+    assert_eq!(s2.consumed, 2);
+    assert_eq!(intent(&store, &i1).state, RecoveryIntentState::Consumed);
+    assert_eq!(intent(&store, &i2).state, RecoveryIntentState::Consumed);
+    assert_eq!(execution(&store, &e1).state, ExecutionState::Queued);
+    assert_eq!(execution(&store, &e2).state, ExecutionState::Queued);
 }
 
 #[test]

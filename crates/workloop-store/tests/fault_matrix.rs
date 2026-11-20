@@ -645,7 +645,9 @@ fn lp_25_persisted_schedule_fires_exactly_once() {
     assert_eq!(execution(&store, &e1).state, ExecutionState::Queued);
 
     // Concurrent manual intervention wins the race: a Resume Command
-    // before the pass leaves the intent holding, never double-fired.
+    // before the pass leaves the Execution progressing, and the intent
+    // — which can now never fire — is retired rather than held pending
+    // to consume every later tick's budget.
     let store2 = SqliteStore::in_memory(1).unwrap();
     let (w2, e2) = submit_work(&store2, "lp25b");
     set_state(
@@ -674,17 +676,18 @@ fn lp_25_persisted_schedule_fires_exactly_once() {
     let scan2 = consume(&store2, NOW);
     assert_eq!(scan2.consumed, 0);
     assert_eq!(scan2.requeued, 0);
+    assert_eq!(scan2.retired, 1);
+    assert!(scan2.held.is_empty());
+    let stale = intent(&store2, &intent_id2);
+    assert_eq!(stale.state, RecoveryIntentState::Retired);
     assert_eq!(
-        scan2.held,
-        vec![(intent_id2.clone(), "execution_active".into())]
-    );
-    assert_eq!(
-        intent(&store2, &intent_id2).state,
-        RecoveryIntentState::Pending
+        stale.retirement_reason.as_deref(),
+        Some("execution_progressing")
     );
 
     // A pending intent whose Execution goes terminal is retired, not
     // fired: retirement is durable and idempotent across restarts.
+    let intent_id3 = seed_intent(&store2, &w2, Some(&e2), "requeue", NOW + 1);
     set_state(
         &store2,
         &e2,
@@ -695,7 +698,7 @@ fn lp_25_persisted_schedule_fires_exactly_once() {
     let scan3 = consume(&store2, NOW + 2);
     assert_eq!(scan3.consumed, 0);
     assert_eq!(scan3.retired, 1);
-    let retired = intent(&store2, &intent_id2);
+    let retired = intent(&store2, &intent_id3);
     assert_eq!(retired.state, RecoveryIntentState::Retired);
     assert_eq!(
         retired.retirement_reason.as_deref(),
