@@ -115,21 +115,24 @@ fn run_once_emits_one_eight_phase_tick_report_and_persists_it() {
 }
 
 #[test]
-fn the_retention_boundary_is_the_state_root_not_the_callers_cwd() {
+fn the_retention_boundary_is_the_bodies_root_not_the_callers_cwd() {
     let state = root("retention-state");
     let elsewhere = root("retention-cwd");
     let out = run_cli(&state, &["work-list"]);
     assert!(out.status.success());
 
     let store = store(&state);
-    let state_body = state.join("workspaces").join("case-1.blob");
+    // Every retain writes under `<state_root>/bodies` and catalogues a
+    // root-relative path — that root is the containment boundary, not
+    // the caller's cwd.
+    let state_body = state.join("bodies").join("case-1.blob");
     std::fs::create_dir_all(state_body.parent().unwrap()).unwrap();
     std::fs::write(&state_body, b"body").unwrap();
     store
         .register_body(&CatalogBody {
             body_id: "state-body".into(),
             category: "cas".into(),
-            path: state_body.to_string_lossy().into_owned(),
+            path: "case-1.blob".into(),
             bytes: 4,
             registered_unix_seconds: NOW - 100,
             eligible_after_unix_seconds: Some(NOW - 10),
@@ -160,11 +163,11 @@ fn the_retention_boundary_is_the_state_root_not_the_callers_cwd() {
     );
     assert!(
         !state_body.exists(),
-        "a body under the installation state root is reclaimed regardless of the caller's cwd"
+        "a body under <state_root>/bodies is reclaimed regardless of the caller's cwd"
     );
     assert!(
         foreign_body.exists(),
-        "a body under the caller's cwd is outside the installation state root"
+        "a body under the caller's cwd is outside the bodies root"
     );
     let report: serde_json::Value =
         serde_json::from_str(&store.events("tick_report").unwrap()[0]).unwrap();
@@ -404,9 +407,9 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
 
     let store = store(&dir);
     // A catalog row pointing at each of the installation's own files:
-    // the live store, its WAL sidecar and the config. The state root
-    // contains all of them, so containment alone must not authorize
-    // the sweep to delete them.
+    // the live store, its WAL sidecar and the config. They live under
+    // the state root but outside `<state_root>/bodies`, so containment
+    // alone must not authorize the sweep to delete them.
     for (body_id, path) in [
         ("store-file", dir.join("workloop.db")),
         ("store-wal", dir.join("workloop.db-wal")),
@@ -424,16 +427,17 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
             })
             .unwrap();
     }
-    // A managed body beside them is still reclaimed: the exclusion is
-    // the installation's own files, not the whole state root.
-    let body = dir.join("workspaces").join("case-1.blob");
+    // A managed body under the bodies root is still reclaimed: the
+    // exclusion is the installation's own files, not every catalogued
+    // path.
+    let body = dir.join("bodies").join("case-1.blob");
     std::fs::create_dir_all(body.parent().unwrap()).unwrap();
     std::fs::write(&body, b"body").unwrap();
     store
         .register_body(&CatalogBody {
             body_id: "reclaimable".into(),
             category: "cas".into(),
-            path: body.to_string_lossy().into_owned(),
+            path: "case-1.blob".into(),
             bytes: 4,
             registered_unix_seconds: NOW - 90,
             eligible_after_unix_seconds: Some(NOW - 10),
@@ -458,7 +462,7 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
         .filter_map(|v| v.as_str())
         .collect();
     for id in ["store-file", "store-wal", "config-file"] {
-        let entry = format!("{id}:protected_path");
+        let entry = format!("{id}:outside_root");
         assert!(
             held.contains(&entry.as_str()),
             "expected {entry} held, got {held:?}"
