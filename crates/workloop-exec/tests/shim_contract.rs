@@ -560,6 +560,60 @@ fn an_unattributable_candidate_blocks_the_bind() {
     assert_eq!(invocation.state, InvocationState::Running);
 }
 
+/// A signature match outside the launch directory can be the real
+/// writer after it chdir'd away — which makes the in-directory
+/// lookalike unattributable. The same never-guess rule the unreadable
+/// cwd guard enforces applies to a readable out-of-directory
+/// candidate: the launch stays uncertain rather than adopt the wrong
+/// writer. Once the out-of-directory candidate exits, the in-directory
+/// orphan is the single candidate and binds normally.
+#[test]
+fn an_out_of_directory_candidate_blocks_the_bind() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-outdir");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root.clone(), None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-11");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost writer carries the signature inside the launch
+    // directory — and a second live, unrecorded process carries the
+    // identical argv outside it: a foreign run, or the real writer
+    // after a chdir. Either way the in-directory match might be the
+    // wrong writer, so no bind is provable.
+    let elsewhere = tmp_root("unidentified-outdir-elsewhere");
+    let outsider = port
+        .spawn(
+            &["fixture-worker".into()],
+            &elsewhere,
+            &WorkerEnv::default(),
+        )
+        .expect("the out-of-directory candidate spawns");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "a same-signature candidate outside the launch directory keeps \
+         every bind a guess"
+    );
+    // The outsider exits: the orphan is the only unrecorded match,
+    // attributable, and binds on the next pass.
+    port.exit(outsider.pid, 0);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
 /// A signature match the store already records — another Work's live
 /// writer — is never re-bound as this launch's orphan, and never blocks
 /// the orphan that IS this launch's.

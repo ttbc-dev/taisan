@@ -29,6 +29,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
@@ -407,6 +408,10 @@ struct PosixProvider {
     unknown_next: Rc<Cell<bool>>,
 }
 
+/// Per-provider counter making every bound launch signature unique
+/// within this test process — see `PosixProvider::make_bound`.
+static SIGNATURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl PosixProvider {
     /// A Posix provider bound to one worker binary — the only variable
     /// the recorded U4.6b rerun changes between implementations.
@@ -420,6 +425,18 @@ impl PosixProvider {
             WorkerShape::NoArtifact => "exit-no-artifact",
             WorkerShape::Resident => "hang",
         };
+        // Each provider instance launches under a signature only it can
+        // own: the signature scan is system-wide, so a stale or foreign
+        // process carrying this suite's argv — a leftover writer from
+        // an earlier run, or a concurrent suite's writer — is an
+        // unrecorded match the re-bind path must never guess past.
+        // `--runtime-version` is declaration-only in both bound worker
+        // binaries: it changes the argv signature, never the mode.
+        let signature = format!(
+            "sig-{tag}-{}-{}",
+            SIGNATURE_SEQ.fetch_add(1, Ordering::Relaxed),
+            std::process::id()
+        );
         PosixProvider {
             sup: Supervisor::new(
                 CountingPosix {
@@ -429,7 +446,12 @@ impl PosixProvider {
                     unknown_next: unknown_next.clone(),
                 },
                 tmp_root(tag),
-                vec![bin.to_string(), mode.into()],
+                vec![
+                    bin.to_string(),
+                    mode.into(),
+                    "--runtime-version".into(),
+                    signature,
+                ],
                 config.clone(),
             ),
             spawned,

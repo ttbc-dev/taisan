@@ -1833,15 +1833,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// The orphaned writer, if it exists, still carries the recorded
     /// launch signature: scan the process table for the bound argv,
     /// exclude every identity the store already records, and either
-    /// re-bind the single attributable match — command equal and cwd
-    /// inside the launch directory — through the same durable commit a
-    /// normal launch uses, or report the proven absence that lets
-    /// `work` abandon the launch. Absence requires BOTH no unrecorded
-    /// signature match (a chdir'd writer still matches the argv) AND
-    /// the bounded uncertain window (a process inside its fork-exec
-    /// visibility gap is never declared absent). Anything else keeps
-    /// reporting `Unknown`: an ambiguous or unreadable answer is never
-    /// a guess.
+    /// re-bind the only unrecorded match — command equal, cwd inside
+    /// the launch directory, and no second same-signature candidate
+    /// that could be the real writer instead — through the same
+    /// durable commit a normal launch uses, or report the proven
+    /// absence that lets `work` abandon the launch. Absence requires
+    /// BOTH no unrecorded signature match (a chdir'd writer still
+    /// matches the argv) AND the bounded uncertain window (a process
+    /// inside its fork-exec visibility gap is never declared absent).
+    /// Anything else keeps reporting `Unknown`: an ambiguous or
+    /// unreadable answer is never a guess.
     fn resolve_unidentified_launch(
         &self,
         store: &impl Store,
@@ -1924,12 +1925,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             );
         }
-        let attributable: Vec<&&ProcessMatch> = unrecorded
-            .iter()
-            .filter(|m| cwd_within(m.cwd.as_deref(), &canonical_dir))
-            .collect();
-        match attributable.as_slice() {
-            [child] => {
+        // A bind is provable only when the candidate is the ONLY
+        // unrecorded signature match AND its cwd lands inside the
+        // launch directory. Any second same-signature process keeps
+        // the launch uncertain: inside the directory the matches
+        // cannot be told apart, and outside it the match might be the
+        // real writer after a chdir — which makes the in-directory
+        // lookalike a foreign process that must not be adopted,
+        // inspected, or signaled as this launch's writer.
+        match unrecorded.as_slice() {
+            [child] if cwd_within(child.cwd.as_deref(), &canonical_dir) => {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -2033,8 +2038,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     )
                 }
             }
-            // More than one attributable child is ambiguous — never
-            // guess which spawn produced which process.
+            // Anything else is ambiguous — more than one candidate,
+            // or a single candidate outside the launch directory.
+            // Never guess which process is this launch's writer.
             _ => self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds),
         }
     }
