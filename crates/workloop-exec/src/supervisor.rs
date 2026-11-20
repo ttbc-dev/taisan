@@ -493,6 +493,38 @@ impl ProcessControlPort for PosixProcessControl {
     }
 
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        // Enumerate this user's processes before the `lsof` pass: the
+        // absence proof is only as strong as the table's completeness
+        // — a live process whose cwd cannot be mapped could be inside
+        // `dir`, so the scan is `Err` whenever a same-user live
+        // process has no readable cwd. Reading the pid list first
+        // means a process born between the two reads is never misread
+        // as a gap; one that exits between them drops out on the
+        // liveness re-verify below. Another user's unreadable process
+        // cannot be this supervisor's spawn and stays the documented
+        // residual.
+        let euid = unsafe { libc::geteuid() };
+        let table =
+            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
+        let mut same_user_pids = Vec::new();
+        for line in table.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
+                return Err(format!("incomplete process-table row: {line}"));
+            };
+            let pid: i32 = pid
+                .parse()
+                .map_err(|_| format!("invalid process-table row: {line}"))?;
+            let uid: u32 = uid
+                .parse()
+                .map_err(|_| format!("invalid process-table row: {line}"))?;
+            if uid == euid {
+                same_user_pids.push(pid);
+            }
+        }
         // One `lsof -d cwd` pass maps every inspectable pid to its
         // working directory — per-pid lookups would not scale to a
         // system-wide absence proof. Field output (`p`/`n` pairs) is
@@ -510,6 +542,7 @@ impl ProcessControlPort for PosixProcessControl {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
+        let mut mapped = HashSet::new();
         let mut occupants = Vec::new();
         let mut pid: Option<i32> = None;
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -518,8 +551,36 @@ impl ProcessControlPort for PosixProcessControl {
             } else if let Some(path) = line.strip_prefix('n')
                 && let Some(pid) = pid
             {
+                mapped.insert(pid);
                 occupants.push((pid, PathBuf::from(path)));
             }
+        }
+        // Completeness gate before any occupant answer: a live
+        // same-user process lsof could not map to a cwd makes the
+        // whole enumeration partial — its cwd might be inside `dir`,
+        // so the table can never authorize absence.
+        for pid in same_user_pids {
+            if mapped.contains(&pid) {
+                continue;
+            }
+            match lstart_of(pid) {
+                // Exited between the pid-list and lsof reads — not a
+                // gap, just a process that was already gone.
+                LstartLookup::Absent => continue,
+                LstartLookup::Failed(reason) => return Err(reason),
+                LstartLookup::Present(_) => {}
+            }
+            // Gone between the liveness check and the stat read, or a
+            // zombie — either way it cannot write inside `dir`.
+            let Some(stat) = stat_of(pid) else {
+                continue;
+            };
+            if stat.contains('Z') {
+                continue;
+            }
+            return Err(format!(
+                "directory scan incomplete: live process {pid} has no readable cwd"
+            ));
         }
         let mut out = Vec::new();
         for (pid, cwd) in occupants {
@@ -2049,8 +2110,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// account for. An escaped descendant keeps the leader's working
     /// directory after leaving the argv signature, so directory
     /// occupancy is the only remaining evidence that the vanished
-    /// writer's tree is really gone. A failed enumeration proves
-    /// nothing — fail closed, stay uncertain.
+    /// writer's tree is really gone. A failed OR INCOMPLETE
+    /// enumeration — a live process whose cwd the port cannot map is
+    /// a possible occupant — proves nothing: fail closed, stay
+    /// uncertain.
     fn launch_dir_clear(&self, dir: &Path, recorded: &HashSet<(i32, String)>) -> bool {
         match self.port.processes_in_directory(dir) {
             Ok(occupants) => occupants

@@ -442,6 +442,66 @@ fn an_escaped_descendant_in_the_launch_dir_blocks_the_absence_proof() {
     assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
 }
 
+/// A process-table read that TRUNCATES is never absence proof either:
+/// an escaped descendant that left the argv signature AND has an
+/// unreadable cwd is invisible to both scans, so the directory
+/// enumeration errs — an incomplete table is never "clear". When the
+/// cwd reads again the occupant itself blocks; once it exits, absence
+/// is proven and the slot releases.
+#[test]
+fn an_unreadable_directory_occupant_keeps_absence_unproven() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-dir-unreadable");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-12");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone; its escaped descendant — a different
+    // argv, the same launch directory — keeps running, but the
+    // platform cannot prove its cwd. A directory table that cannot
+    // map it must never read as clear.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let escapee =
+        port.adopt_child_with(leader, "fixture-worker escaped-writer --file heartbeat.log");
+    port.set_cwd_unreadable(escapee, true);
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "an incomplete directory enumeration is never absence proof"
+    );
+    // The cwd reads again: the escapee is a visible unrecorded
+    // occupant and keeps blocking absence on its own.
+    port.set_cwd_unreadable(escapee, false);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
+    // The escapee exits: the directory is provably clear and the
+    // launch abandons, releasing the slot.
+    port.exit(escapee, 0);
+    sup.poll_invocations(&store, NOW + 33).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
 /// A process-table read that fails is never absence proof: the launch
 /// stays uncertain however long the window, and the next readable scan
 /// resolves it normally.

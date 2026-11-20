@@ -71,7 +71,8 @@ struct Proc {
     survives_signal: bool,
     /// When set, `matching_processes` reports `cwd: None` — a process
     /// whose working directory the platform cannot prove (denied
-    /// lsof, minimal image). It can be neither bound nor ruled out.
+    /// lsof, minimal image). It can be neither bound nor ruled out,
+    /// and `processes_in_directory` errs on the incomplete table.
     cwd_unreadable: bool,
 }
 
@@ -199,7 +200,9 @@ impl ScriptedProcessControl {
 
     /// Make `matching_processes` report `cwd: None` for the pid until
     /// cleared — an lsof-denied or minimal-image process whose launch
-    /// attribution cannot be proven either way.
+    /// attribution cannot be proven either way. While it is live it
+    /// also makes `processes_in_directory` fail: an unmappable cwd is
+    /// an enumeration gap, never a silent absence.
     pub fn set_cwd_unreadable(&self, pid: i32, on: bool) {
         let mut s = self.state.lock().unwrap();
         if let Some(p) = s.procs.get_mut(&pid) {
@@ -488,14 +491,17 @@ impl ProcessControlPort for ScriptedProcessControl {
         if let Some(reason) = s.dir_scan_errors.pop_front() {
             return Err(reason);
         }
-        // The model's cwd is provable unless flagged; an
-        // unreadable-cwd process cannot be placed inside `dir`,
-        // exactly like a real enumeration that never lists it.
+        // The model's cwd is provable unless flagged; a live process
+        // the scan cannot map makes the whole enumeration incomplete —
+        // like a real table read that cannot prove every row, the
+        // scan errs rather than return a truncated set an absence
+        // proof would read as clear.
+        if s.procs.values().any(|p| p.alive && p.cwd_unreadable) {
+            return Err("directory scan incomplete: process cwd unreadable".into());
+        }
         Ok(s.procs
             .iter()
-            .filter(|(_, p)| {
-                p.alive && !p.cwd_unreadable && crate::supervisor::cwd_within(Some(&p.cwd), dir)
-            })
+            .filter(|(_, p)| p.alive && crate::supervisor::cwd_within(Some(&p.cwd), dir))
             .map(|(pid, p)| ProcessMatch {
                 identity: ProcessIdentity {
                     pid: *pid,
