@@ -279,6 +279,21 @@ enum Commands {
         #[command(subcommand)]
         command: EvidenceCommands,
     },
+    /// Internal: the in-sandbox CONNECT relay (`docs/v0.3.md` §14.4).
+    /// Spawned by the containment wrapper as the sandbox init —
+    /// hidden, never invoked by operators, and dispatched before any
+    /// installation or store setup.
+    #[command(name = "__sandbox-relay", hide = true)]
+    SandboxRelay {
+        /// Host-side proxy Unix socket bind-mounted at this path.
+        proxy_sock: PathBuf,
+        /// Loopback listen address inside the sandbox's network
+        /// namespace.
+        listen: String,
+        /// `--` then the wrapped command argv.
+        #[arg(last = true, num_args = 1..)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -472,6 +487,17 @@ pub(crate) fn main() {
 }
 
 fn run(cli: Cli) -> i32 {
+    // The in-sandbox CONNECT relay is spawned by the containment
+    // wrapper as the sandbox init: it must run before any
+    // installation or store setup and never touches either.
+    if let Commands::SandboxRelay {
+        proxy_sock,
+        listen,
+        command,
+    } = &cli.command
+    {
+        return workloop_exec::egress::relay_main(proxy_sock, listen, command);
+    }
     // Setup and preflight operate on the TOML installation profile via
     // the fixed flag → env → XDG precedence. They must never touch the
     // legacy JSON installation record (which would auto-create it) or
@@ -1656,6 +1682,11 @@ fn run(cli: Cli) -> i32 {
         Commands::Init { .. } | Commands::Check { .. } => {
             unreachable!("setup commands dispatch before store initialization")
         }
+        // The in-sandbox relay returned before any setup — it never
+        // reaches store-backed dispatch.
+        Commands::SandboxRelay { .. } => {
+            unreachable!("the sandbox relay dispatches before store initialization")
+        }
     }
 }
 
@@ -1995,12 +2026,58 @@ fn build_supervisor(
     // The isolation profile resolves fail-closed against the approved
     // registry: an unapproved name in the installation file refuses
     // supervisor construction — no dispatch can run unprofiled (U2.3).
-    let supervisor = supervisor.with_isolation_profile(installation.worker_isolation_profile()?);
+    let isolation_profile = installation.worker_isolation_profile()?;
+    let supervisor = supervisor.with_isolation_profile(isolation_profile.clone());
+    // The runtime credential/egress boundary (`docs/v0.3.md`
+    // §14.3–§14.4): configuration names references, never values. The
+    // boundary resolves lazily at the first contained launch or
+    // declaration probe; every failure is a typed refusal recorded as
+    // a launch repair — never an ambient credential or an
+    // unrestricted network.
+    let egress = installation.worker_egress()?;
+    let egress_dir = workspace_root.join(".egress");
+    let relay_exe =
+        std::env::current_exe().map_err(|e| format!("sandbox relay executable: {e}"))?;
+    let supervisor = supervisor.with_runtime_boundary(
+        workloop_exec::boundary::RuntimeBoundary::new(workloop_exec::boundary::BoundaryConfig {
+            credential_ref: egress.credential_ref,
+            provider_config: egress.provider_config,
+            model_api_hosts: egress.model_api_hosts.clone(),
+            runtime_dir: workspace_root.join(".runtime"),
+            egress_dir: egress_dir.clone(),
+            relay_exe: relay_exe.clone(),
+        }),
+    );
+    // The §14.5 verification sandbox installs only when the
+    // installation declares any verification boundary — an
+    // unconfigured installation keeps the recorded hygiene-only
+    // runner. Verification gets the separate declared-host egress
+    // policy, the read-only toolchain/caches, and no runtime
+    // credential or Worker model-API proxy.
+    let verification_boundary = installation.verification_boundary()?;
+    let verification = if verification_boundary.toolchain.is_some()
+        || !verification_boundary.cache_paths.is_empty()
+        || !verification_boundary.egress_allowlist.is_empty()
+    {
+        Some(workloop_exec::handoff::VerificationSandbox {
+            port: std::sync::Arc::new(PosixProcessControl),
+            profile: isolation_profile,
+            toolchain: verification_boundary.toolchain,
+            caches: verification_boundary.cache_paths,
+            egress_allowlist: verification_boundary.egress_allowlist,
+            model_api_hosts: egress.model_api_hosts,
+            egress_dir,
+            relay_exe,
+        })
+    } else {
+        None
+    };
     Ok(Some(supervisor.with_handoff(
         workloop_exec::handoff::HandoffLayout {
             repository,
             workspace_root,
             out_root: handoff_root.join("out"),
+            verification,
         },
     )))
 }
@@ -2204,6 +2281,18 @@ mod tests {
             retention: Default::default(),
             protected_paths: Vec::new(),
         };
+        // Phase 1 retains issue snapshot bodies under
+        // `<state_root>/bodies`; a test pass gets its own root rather
+        // than writing into the process working directory.
+        let state_root = std::env::temp_dir().join(format!(
+            "workloop-tick-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_root).unwrap();
         run_pass(
             &mut Pass {
                 store,
@@ -2211,7 +2300,7 @@ mod tests {
                 settings: &settings,
                 supervisor: None,
                 host,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             None,
             &mut now,

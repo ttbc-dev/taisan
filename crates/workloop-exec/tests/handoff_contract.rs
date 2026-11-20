@@ -213,6 +213,7 @@ fn layout(root: &Path, work_id: &WorkId) -> (HandoffLayout, PathBuf) {
             repository: bare_repo(root),
             workspace_root: ws_root.clone(),
             out_root,
+            verification: None,
         },
         ws_root.join(format!("ws-{}", work_id.0)),
     )
@@ -225,6 +226,7 @@ fn seed(invocation: &Invocation, work_id: &WorkId, base: &str) -> HandoffSeed {
         branch: format!("work/{}", work_id.0),
         work_id: work_id.clone(),
         verification_argv: vec![],
+        verification_egress_hosts: vec![],
     }
 }
 
@@ -595,6 +597,7 @@ fn verification_runs_on_the_handed_off_commit() {
         "verification_argv[0]",
         &["git".into(), "rev-parse".into(), "HEAD".into()],
         &scratch,
+        &[],
     )
     .unwrap();
     assert_eq!(pass.result, VerificationOutcome::Pass);
@@ -608,6 +611,7 @@ fn verification_runs_on_the_handed_off_commit() {
         "verification_argv[1]",
         &["sh".into(), "-c".into(), "exit 3".into()],
         &scratch,
+        &[],
     )
     .unwrap();
     assert_eq!(fail.result, VerificationOutcome::Fail);
@@ -621,6 +625,7 @@ fn verification_runs_on_the_handed_off_commit() {
             "verification_argv[0]",
             &["true".into()],
             &scratch,
+            &[],
         )
         .is_err()
     );
@@ -656,6 +661,7 @@ fn multibyte_verification_output_truncates_without_a_panic() {
             "yes 'ああ' | head -c 70000".into(),
         ],
         &scratch,
+        &[],
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass);
@@ -685,6 +691,7 @@ fn only_a_proven_dead_invocation_exports() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
         .with_handoff(layout);
@@ -943,6 +950,7 @@ fn a_stale_worktree_registration_does_not_wedge_verification() {
         "verification_argv[0]",
         &["git".into(), "rev-parse".into(), "HEAD".into()],
         &scratch,
+        &[],
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass);
@@ -1003,6 +1011,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &["sh".into(), "-c".into(), "sleep 5".into()],
         &scratch,
         Duration::from_millis(200),
+        &[],
     )
     .unwrap();
     assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);
@@ -1016,6 +1025,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &["sh".into(), "-c".into(), "kill -9 $$".into()],
         &scratch,
         Duration::from_secs(10),
+        &[],
     )
     .unwrap();
     assert_eq!(killed.result, VerificationOutcome::Inconclusive);
@@ -1030,6 +1040,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         &[],
         &scratch,
         Duration::from_secs(10),
+        &[],
     )
     .unwrap();
     assert_eq!(empty.result, VerificationOutcome::Inconclusive);
@@ -1048,6 +1059,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         ],
         &scratch,
         Duration::from_secs(30),
+        &[],
     )
     .unwrap();
     assert_eq!(loud.result, VerificationOutcome::Pass);
@@ -1077,6 +1089,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
         ],
         &scratch,
         Duration::from_millis(200),
+        &[],
     )
     .unwrap();
     assert_eq!(group.result, VerificationOutcome::Inconclusive);
@@ -1168,6 +1181,7 @@ fn a_source_bound_work_derives_base_from_the_workspace() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], cfg)
         .with_handoff(layout.clone());
@@ -1232,6 +1246,7 @@ fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
     let invocation = done_invocation(&e, "inv-badbase");
@@ -1292,4 +1307,396 @@ fn a_stale_handoff_write_is_a_conflict_not_a_regression() {
     let h2 = row(&store, &aid).unwrap();
     assert_eq!(h2.state, HandoffState::Acknowledged);
     assert_eq!(h2.recorded_seq, h.recorded_seq);
+}
+
+// ---------------------------------------------------------------------
+// §14.5 contained verification (docs/v0.3.md)
+// ---------------------------------------------------------------------
+
+/// A fake `bwrap`/`relay` pair for the contained-verification contract:
+/// each script logs its argv — bwrap also logs the proxy env — to a
+/// per-test file, then execs the argv after `--`. The containment
+/// gate's negative probes ran through the scripted port; this proves
+/// the composed outer argv, environment, and relay wrap end-to-end on
+/// hosts without the real primitive.
+fn fake_sandbox_scripts(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let bwrap_log = dir.join("bwrap.log");
+    let relay_log = dir.join("relay.log");
+    let bwrap = dir.join("fake-bwrap");
+    let relay = dir.join("fake-relay");
+    let script = |log: &Path, dump_env: bool| {
+        let mut text = format!(
+            "#!/bin/sh\nlog='{}'\n: > \"$log\"\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$log\"; done\n",
+            log.display()
+        );
+        if dump_env {
+            text.push_str("env | grep -i proxy >> \"$log\" || true\n");
+        }
+        text.push_str(
+            "while [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+             [ \"$1\" = \"--\" ] && shift\nexec \"$@\"\n",
+        );
+        text
+    };
+    std::fs::write(&bwrap, script(&bwrap_log, true)).unwrap();
+    std::fs::write(&relay, script(&relay_log, false)).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in [&bwrap, &relay] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    (bwrap, relay, bwrap_log, relay_log)
+}
+
+/// The profile the contained-verification tests bind: the sandbox
+/// primitive is named by absolute path so the host's real `bwrap` —
+/// or its absence — can never change which executable the gate
+/// resolves.
+fn contained_profile(primitive: &Path) -> workloop_core::worker::IsolationProfile {
+    workloop_core::worker::IsolationProfile {
+        id: "test-verification-contained",
+        env_passthrough: &["PATH"],
+        sandbox_primitive: Some(Box::leak(
+            primitive.to_string_lossy().into_owned().into_boxed_str(),
+        )),
+    }
+}
+
+/// Admit, hand off, and acknowledge one artifact; returns the store,
+/// layout, scratch dir, and artifact id for `verify` calls.
+fn acknowledged(root: &Path, tag: &str) -> (SqliteStore, HandoffLayout, PathBuf, String) {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, &format!("h-{tag}"));
+    let (layout, ws_dir) = layout(root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, &format!("inv-{tag}"));
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    (store, layout, root.join("scratch"), aid)
+}
+
+/// Install the §14.5 sandbox on `layout` with the fake primitive and
+/// relay; returns the argv/env evidence logs.
+fn install_sandbox(
+    layout: &mut HandoffLayout,
+    root: &Path,
+    port: workloop_exec::scripted::ScriptedProcessControl,
+    egress_allowlist: Vec<String>,
+    model_api_hosts: Vec<String>,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (bwrap, relay, bwrap_log, relay_log) = fake_sandbox_scripts(root);
+    let toolchain = root.join("toolchain");
+    let cache = root.join("deps-cache");
+    std::fs::create_dir_all(&toolchain).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    layout.verification = Some(workloop_exec::handoff::VerificationSandbox {
+        port: std::sync::Arc::new(port),
+        profile: contained_profile(&bwrap),
+        toolchain: Some(toolchain),
+        caches: vec![cache],
+        egress_allowlist,
+        model_api_hosts,
+        egress_dir: root.join("egress"),
+        relay_exe: relay.clone(),
+    });
+    (bwrap, relay, bwrap_log, relay_log)
+}
+
+#[test]
+fn contained_verification_binds_the_declared_sandbox_shape() {
+    let root = tmp_root("verify-contained");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-shape");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, relay_log) = install_sandbox(
+        &mut layout,
+        &root,
+        port,
+        vec!["deps.example".into()],
+        vec!["model.example".into()],
+    );
+    let marker = root.join("proof-marker.txt");
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo verified > '{}'", marker.display()),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &["extra.example".into()],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "verified",
+        "the declared argv ran to completion"
+    );
+
+    let log = std::fs::read_to_string(&bwrap_log).unwrap();
+    let ws = layout.workspace_root.clone();
+    // Toolchain and caches bind read-only — the toolchain at both its
+    // own path and the profile-owned /taisan/toolchain.
+    assert!(
+        log.contains(&format!(
+            "--ro-bind\n{}\n/taisan/toolchain",
+            root.join("toolchain").display()
+        )),
+        "toolchain canonical bind missing:\n{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "--ro-bind\n{}\n{}",
+            root.join("deps-cache").display(),
+            root.join("deps-cache").display()
+        )),
+        "cache own-path bind missing:\n{log}"
+    );
+    // The produced tree and handoff repository bind read-only at
+    // their own paths; the worktree's own gitdir is the single
+    // writable metadata bind.
+    assert!(
+        log.contains(&format!(
+            "--ro-bind\n{}\n{}",
+            layout.repository.display(),
+            layout.repository.display()
+        )),
+        "repository read-only bind missing:\n{log}"
+    );
+    assert!(
+        log.contains("--bind\n") && log.contains("worktrees"),
+        "the worktree gitdir writable bind is missing:\n{log}"
+    );
+    // The separate verification proxy binds its own socket — never
+    // the Worker model-API proxy, never a runtime credential mount.
+    assert!(
+        log.contains("/taisan/proxy.sock"),
+        "the verification proxy socket bind is missing:\n{log}"
+    );
+    assert!(
+        !log.contains("runtime-auth"),
+        "no runtime credential mount:\n{log}"
+    );
+    assert!(
+        !log.contains("provider-config"),
+        "no provider config mount:\n{log}"
+    );
+    // Egress variables point at the in-sandbox relay only.
+    assert!(log.contains("HTTPS_PROXY=http://127.0.0.1:18080"), "{log}");
+    assert!(log.contains("https_proxy=http://127.0.0.1:18080"), "{log}");
+
+    // The relay wrap carries the sandbox socket path and listen
+    // address, then the declared argv verbatim.
+    let relay_log = std::fs::read_to_string(&relay_log).unwrap();
+    for expected in [
+        "__sandbox-relay",
+        "/taisan/proxy.sock",
+        "127.0.0.1:18080",
+        "/bin/sh",
+        "-c",
+    ] {
+        assert!(
+            relay_log.contains(expected),
+            "relay argv missing {expected}:\n{relay_log}"
+        );
+    }
+    let _ = ws;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn contained_verification_without_egress_grants_no_proxy() {
+    let root = tmp_root("verify-noegress");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-noegress");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let marker = root.join("proof-marker.txt");
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo verified > '{}'", marker.display()),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+
+    let log = std::fs::read_to_string(&bwrap_log).unwrap();
+    assert!(!log.contains("/taisan/proxy.sock"), "no proxy bind:\n{log}");
+    assert!(!log.contains("HTTPS_PROXY"), "no proxy env:\n{log}");
+    assert!(!log.contains("https_proxy"), "no proxy env:\n{log}");
+    // No relay wrap: the declared argv follows `--` directly.
+    let tail = log.rsplit("--\n").next().unwrap_or("");
+    assert!(tail.starts_with("/bin/sh\n-c\n"), "unwrapped argv:\n{log}");
+    assert!(
+        !relay_log.exists(),
+        "the relay never ran without an egress grant"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The submission's argv is not a mount declaration: an
+/// absolute-path element that exists on the host is never bound
+/// into the verification sandbox — the sandbox's mount set is the
+/// installation-declared surface (worktree, repository, toolchain,
+/// caches) and nothing the submitted argv names.
+#[test]
+fn contained_verification_never_binds_a_path_the_submission_argv_names() {
+    let root = tmp_root("verify-noargbind");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-noargbind");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let canary = root.join("host-only-canary.txt");
+    std::fs::write(&canary, "host bytes").unwrap();
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("cat '{}'", canary.display()),
+        canary.to_string_lossy().into_owned(),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+    let log = std::fs::read_to_string(&bwrap_log).unwrap();
+    assert!(
+        !log.contains(&format!("--ro-bind\n{}", canary.display())),
+        "the submission argv element mounted a host file:\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn contained_verification_refuses_a_model_api_egress_host() {
+    let root = tmp_root("verify-denied");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-denied");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) = install_sandbox(
+        &mut layout,
+        &root,
+        port,
+        vec!["deps.example".into()],
+        vec!["model.example".into()],
+    );
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "true".into()],
+        &scratch,
+        // A declared host that names a Worker model-API destination is
+        // an admission gap — refused, never granted.
+        &["model.example".into()],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output.contains("verification.egress_denied"),
+        "{}",
+        res.output
+    );
+    assert!(
+        !bwrap_log.exists(),
+        "the sandbox never launched on a refused egress host"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn contained_verification_refuses_a_missing_toolchain() {
+    let root = tmp_root("verify-notoolchain");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-notoolchain");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    // Point the toolchain at a path that does not exist: a missing
+    // toolchain is a preflight failure, never a download at
+    // verification time.
+    if let Some(sandbox) = layout.verification.as_mut() {
+        sandbox.toolchain = Some(root.join("absent-toolchain"));
+    }
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "true".into()],
+        &scratch,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output.contains("verification.toolchain_missing"),
+        "{}",
+        res.output
+    );
+    assert!(!bwrap_log.exists(), "no launch on a missing toolchain");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn contained_verification_refuses_when_the_containment_gate_fails() {
+    let root = tmp_root("verify-gatefail");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-gatefail");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    // Every probe — version and battery — fails: the negative
+    // preflight cannot be skipped by trusting the profile name.
+    port.set_default_probe(Ok(workloop_core::ports::ProbeOutcome::Exited {
+        stdout: vec![],
+        success: false,
+    }));
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "true".into()],
+        &scratch,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output.contains("verification.containment"),
+        "{}",
+        res.output
+    );
+    assert!(
+        !bwrap_log.exists(),
+        "the declared argv never ran under a failed gate"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -56,6 +56,23 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these swap-recovery tests.
+fn fixture_sup<P: ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 fn host() -> HostInstanceId {
     HostInstanceId::trusted("swap-recovery-host")
 }
@@ -584,7 +601,7 @@ fn u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindin
     // fixture writers; both Executions run mid-flight.
     let in_flight = {
         let store = SqliteStore::open(&db, 4).unwrap();
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             CountingPosix {
                 calls: spawns.clone(),
             },
@@ -626,7 +643,7 @@ fn u46c_restart_after_worker_argv_change_reconciles_in_flight_on_recorded_bindin
     // The config change and the restart: a fresh supervisor over the
     // reopened durable store, bound to the new worker_argv.
     let store = SqliteStore::open(&db, 4).unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         CountingPosix {
             calls: spawns.clone(),
         },
@@ -884,6 +901,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         repository: repo_dir.clone(),
         workspace_root: ws_root.clone(),
         out_root: out_root.clone(),
+        verification: None,
     };
     let spawns = Rc::new(Cell::new(0usize));
     let prior_argv = vec![fixture_bin(), "clean-exit".into()];
@@ -894,7 +912,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
     // configured here: the rows must not exist before the restart.
     let phase_one = {
         let store = SqliteStore::open(&db, 4).unwrap();
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             CountingPosix {
                 calls: spawns.clone(),
             },
@@ -958,7 +976,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
     // Config change + restart: a fresh supervisor over the reopened
     // store, bound to the new worker_argv, carrying the handoff layout.
     let store = SqliteStore::open(&db, 4).unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         CountingPosix {
             calls: spawns.clone(),
         },
@@ -1267,6 +1285,7 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
         repository: repo_dir.clone(),
         workspace_root: ws_root.clone(),
         out_root: out_root.clone(),
+        verification: None,
     };
     let spawns = Rc::new(Cell::new(0usize));
     let prior_argv = vec![fixture_bin(), "clean-exit".into()];
@@ -1277,7 +1296,7 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
     // recollection must happen after the config change.
     let phase_one = {
         let store = SqliteStore::open(&db, 4).unwrap();
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             CountingPosix {
                 calls: spawns.clone(),
             },
@@ -1325,7 +1344,7 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
     // Config changed mid-Execution: the Execution is still waiting when
     // the restarted supervisor runs under the new worker_argv.
     let store = SqliteStore::open(&db, 4).unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         CountingPosix {
             calls: spawns.clone(),
         },

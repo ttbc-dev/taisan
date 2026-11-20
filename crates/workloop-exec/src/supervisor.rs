@@ -26,9 +26,13 @@ use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
     default_isolation_profile, export_request_id,
 };
+use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
+use crate::boundary::{BoundaryGrant, RuntimeBoundary};
+use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
+use crate::request_v2::V2Dispatch;
 
 /// How long an unidentified launch must stay unexplained — no found
 /// writer and no unexplained child — before its absence is reported.
@@ -813,6 +817,10 @@ impl ProcessControlPort for PosixProcessControl {
 pub enum ExecError {
     Store(StoreError),
     Io(std::io::Error),
+    /// An infrastructure fault outside the store/IO channels — the
+    /// pass fails and every durable row stays pending for the next
+    /// one rather than recording a degraded launch.
+    Fault(String),
 }
 
 impl std::fmt::Display for ExecError {
@@ -820,6 +828,7 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Fault(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -892,6 +901,21 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// Durable artifact-handoff layout; `None` keeps the file-artifact
     /// path only (fixture harnesses without git workspaces).
     pub handoff: Option<crate::handoff::HandoffLayout>,
+    /// The v2 dispatch profile (`docs/v0.3.md` §4): when set, every
+    /// pending request is materialized as an immutable
+    /// `taisan.worker.request/2` body and launched through the
+    /// `run --request/--out` transport. `None` keeps the legacy v1
+    /// consume path — a deployment never mixes the two for one
+    /// request because the recorded Invocation decides the replay.
+    pub v2: Option<V2Dispatch>,
+    /// The runtime credential/egress boundary (`docs/v0.3.md`
+    /// §14.3–§14.4): resolved lazily at the first contained launch or
+    /// `describe` probe and shared by every launch after. `None`
+    /// leaves contained launches with no credential, provider config,
+    /// or proxy binds — the v1-compatible empty boundary; the
+    /// composition root always installs one built from the approved
+    /// installation configuration.
+    pub runtime_boundary: Option<RuntimeBoundary>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -909,6 +933,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
             config,
             isolation_profile: default_isolation_profile(),
             handoff: None,
+            v2: None,
+            runtime_boundary: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -927,6 +953,25 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// root) for Workspaces carrying git objects.
     pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
         self.handoff = Some(layout);
+        self
+    }
+
+    /// Enable the v2 consume path: pending requests materialize as
+    /// immutable `taisan.worker.request/2` bodies under this dispatch
+    /// profile. Requests already consumed under v1 keep replaying
+    /// their recorded Invocation — the format is fixed at consumption,
+    /// never upgraded in place.
+    pub fn with_v2_dispatch(mut self, dispatch: V2Dispatch) -> Self {
+        self.v2 = Some(dispatch);
+        self
+    }
+
+    /// Install the runtime credential/egress boundary every contained
+    /// launch and `describe` probe resolves through. The boundary is
+    /// resolved lazily on first contained use; a resolution failure is
+    /// a typed launch refusal, never an ambient fallback.
+    pub fn with_runtime_boundary(mut self, boundary: RuntimeBoundary) -> Self {
+        self.runtime_boundary = Some(boundary);
         self
     }
 
@@ -985,6 +1030,164 @@ impl<P: ProcessControlPort> Supervisor<P> {
     fn check_workspace(&self, invocation_id: &str) -> PathBuf {
         isolation::scratch_root(&self.workspace_root)
             .join(format!("check-{}", isolation::sanitize_key(invocation_id)))
+    }
+
+    /// The containment decision for one launch argv: the profile's
+    /// `sandbox_primitive` resolved through the recorded
+    /// negative-probe evidence. `Ok(Err(reason))` is a typed refusal
+    /// the caller carries as a launch repair — containment never
+    /// degrades to the unwrapped launch; `Err(ExecError)` is an
+    /// infrastructure fault that leaves the request pending. Public
+    /// so the pass-level prebind probe proves the same boundary the
+    /// consume path launches under.
+    pub fn containment_gate(
+        &self,
+        worker_argv: &[String],
+        now_unix_seconds: i64,
+    ) -> Result<Result<Gate, String>, ExecError> {
+        // The boundary identity joins the gate identity only for a
+        // contained profile: an unreadable provider config or an
+        // unresolvable boundary identity is itself a refusal, and an
+        // uncontained profile never resolves the boundary at all.
+        let boundary_digest = if self.isolation_profile.sandbox_primitive.is_some() {
+            match &self.runtime_boundary {
+                Some(boundary) => match boundary.identity_digest() {
+                    Ok(digest) => Some(digest),
+                    Err(reason) => return Ok(Err(reason)),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        match containment::gate(
+            &self.port,
+            &self.workspace_root,
+            &self.isolation_profile,
+            worker_argv,
+            boundary_digest.as_deref(),
+            now_unix_seconds,
+        ) {
+            Ok(gate) => Ok(Ok(gate)),
+            Err(containment::GateError::Refused(reason)) => Ok(Err(reason)),
+            Err(containment::GateError::Fault(detail)) => Err(ExecError::Fault(detail)),
+        }
+    }
+
+    /// Resolve the runtime boundary for one contained launch or probe.
+    /// `Ok(None)` when no boundary is installed — the contained launch
+    /// then binds no credential, provider config, or proxy (the
+    /// v1-compatible empty boundary). `Err` is a typed refusal
+    /// (`credential.*`, `provider_config.*`, `egress.*`) the caller
+    /// carries as a launch repair — never an ambient fallback.
+    fn boundary_grant(&self) -> Result<Option<BoundaryGrant>, String> {
+        match &self.runtime_boundary {
+            Some(boundary) => boundary.ensure().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Turn a worker-level argv plus a caller-filled mount plan into
+    /// the contained outer argv and environment — the single place the
+    /// runtime boundary becomes sandbox binds. The plan's boundary
+    /// fields (`runtime_auth`, `provider_config`, `proxy_sock`) are
+    /// filled from the grant here; a proxy grant also relay-wraps the
+    /// inner argv and exports `HTTPS_PROXY`. `Err` is a typed boundary
+    /// refusal; there is no unwrapped fallback.
+    fn contained_exec(
+        &self,
+        primitive: &Path,
+        mut plan: MountPlan,
+        inner_argv: &[String],
+        inner_cwd: &str,
+        env: &WorkerEnv,
+    ) -> Result<(Vec<String>, WorkerEnv), String> {
+        let grant = self.boundary_grant()?;
+        let proxy_granted = grant
+            .as_ref()
+            .is_some_and(|grant| grant.proxy_sock.is_some());
+        if let Some(grant) = &grant {
+            plan.runtime_auth = grant.credential_file.clone();
+            plan.provider_config = grant.provider_config.clone();
+            plan.proxy_sock = grant.proxy_sock.clone();
+        }
+        let (exec_argv, egress_proxy) = if proxy_granted {
+            // The proxy socket is bound at `/taisan/proxy.sock`; the
+            // relay is the sandbox init that serves `HTTPS_PROXY` on
+            // loopback and splices to it. The relay executable is an
+            // absolute argv path — bound read-only like every other
+            // named path.
+            let relay_exe = self
+                .runtime_boundary
+                .as_ref()
+                .map(|boundary| boundary.relay_exe().to_path_buf())
+                .ok_or_else(|| "egress.relay_unavailable: no boundary installed".to_string())?;
+            if relay_exe.is_absolute()
+                && relay_exe.exists()
+                && !plan.extra_binds.contains(&relay_exe)
+            {
+                plan.extra_binds.push(relay_exe.clone());
+            }
+            (
+                containment::relay_wrapped(inner_argv, &relay_exe),
+                Some(crate::egress::RELAY_PROXY_URL),
+            )
+        } else {
+            (inner_argv.to_vec(), None)
+        };
+        if let Some(reason) = containment::plan_denial(&plan) {
+            return Err(reason);
+        }
+        Ok((
+            containment::bwrap_args(primitive, &plan, &exec_argv, inner_cwd),
+            containment::contained_env(env, egress_proxy),
+        ))
+    }
+
+    /// Wrap a `describe` probe for the gate's answer: a contained
+    /// profile produces the bwrap outer argv, the sandbox env, and a
+    /// mount plan binding the workspace read-only when it exists;
+    /// `Uncontained` passes the plain argv/env through. `probe_argv`
+    /// is the worker-level argv — the recorded binding surface never
+    /// sees the launcher. Public for the same reason as
+    /// [`Self::containment_gate`]. `Err` is a typed boundary refusal —
+    /// the caller records it like a gate refusal.
+    pub fn contained_probe(
+        &self,
+        gate: &Gate,
+        probe_argv: &[String],
+        workspace: Option<&Path>,
+        gitconfig: &Path,
+        env: &WorkerEnv,
+    ) -> Result<(Vec<String>, WorkerEnv), String> {
+        let inner_argv = adapter::describe_argv(probe_argv);
+        match gate {
+            Gate::Uncontained => Ok((inner_argv, env.clone())),
+            Gate::Ready { primitive, worker } => {
+                let workspace_bound = workspace.filter(|path| path.is_dir());
+                let plan = MountPlan {
+                    workspace: workspace_bound.map(|path| (path.to_path_buf(), true)),
+                    request: None,
+                    input: None,
+                    out: None,
+                    gitconfig: Some(gitconfig.to_path_buf()),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
+                    extra_rw_binds: vec![],
+                    worker: worker.clone(),
+                };
+                let inner_cwd = if workspace_bound.is_some() {
+                    containment::SANDBOX_WORKSPACE
+                } else {
+                    "/tmp"
+                };
+                self.contained_exec(primitive, plan, &inner_argv, inner_cwd, env)
+            }
+        }
     }
 
     /// Copy the producing workspace into the check's scratch tree and
@@ -1056,6 +1259,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
         self.sweep_isolation_scratch(store)?;
+        self.sweep_invocation_io(store)?;
         Ok(deadline_reached(clock, deadline))
     }
 
@@ -1208,14 +1412,32 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
                 return Ok(None);
             };
+            // The Work-declared verification egress hosts live in the
+            // immutable v2 request body; a v1 dispatch or an absent
+            // body declares none. An unverifiable body is corrupt
+            // durable state — the parse failure is a fault, never a
+            // silently empty grant.
+            let verification_egress_hosts = match tx.worker_request_body(&invocation.request_id)? {
+                Some(body) if body.verifies() => serde_json::from_slice::<
+                    workloop_core::worker_v2::WorkerRequestV2,
+                >(&body.canonical_body)
+                .map(|req| req.required_capabilities.verification_egress_hosts)
+                .map_err(|e| StoreError::Internal {
+                    detail: format!("worker request body unreadable: {e}"),
+                })?,
+                _ => Vec::new(),
+            };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
                 spec.payload.verification_argv.clone(),
+                verification_egress_hosts,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
-        let Some((invocation, work_id, verification_argv, bound)) = found else {
+        let Some((invocation, work_id, verification_argv, verification_egress_hosts, bound)) =
+            found
+        else {
             return Ok(None);
         };
         // The handoff base is derived inside the bounded export stage
@@ -1233,6 +1455,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 branch,
                 work_id,
                 verification_argv,
+                verification_egress_hosts,
             },
             bound,
         )))
@@ -1324,6 +1547,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return Ok(());
         }
 
+        // The v2 consume path materializes the immutable request body
+        // from durable state before any Invocation exists; a request
+        // already consumed above replays its recorded Invocation
+        // regardless of which profile is configured now.
+        if self.v2.is_some() {
+            return self.start_v2(store, request, now_unix_seconds);
+        }
+
         // The Execution state gates the describe probe too: a request
         // that can never launch never starts the worker binary, not even
         // the effect-free declaration probe.
@@ -1340,11 +1571,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // request selects now and records the binding in the consume
         // commit. A failed `describe` is fail-closed: the adapter is not
         // selectable and the request does not dispatch.
-        let (binding, repair_reason) = if exec_state != Some(ExecutionState::Ready) {
-            (None, None)
+        let (binding, repair_reason, gate) = if exec_state != Some(ExecutionState::Ready) {
+            (None, None, None)
         } else {
             let workspace = self.workspace_of(&request.work_id);
             std::fs::create_dir_all(&workspace)?;
+            // The containment gate covers the describe probe and the
+            // launch alike; a refused proof is a configuration repair,
+            // never a degraded launch.
+            let probe_argv = request
+                .adapter_binding
+                .as_ref()
+                .map(|binding| binding.argv.clone())
+                .unwrap_or_else(|| self.worker_argv.clone());
+            let gate = self.containment_gate(&probe_argv, now_unix_seconds)?;
             // The probe runs under the profile's environment — an
             // untrusted adapter binary sees no host credential even
             // during the effect-free declaration. A preparation failure
@@ -1356,47 +1596,80 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 isolation::sanitize_key(&request.request_id)
             ));
             let probe_env = isolation::prepare(&self.isolation_profile, &probe_scratch);
-            match probe_env {
-                Err(why) => (
+            let selected = match (&gate, probe_env) {
+                (Err(reason), _) => (
+                    None,
+                    Some(format!("isolation.containment_refused: {reason}")),
+                ),
+                (Ok(_), Err(why)) => (
                     None,
                     Some(format!("isolation.environment_preparation_failed: {why}")),
                 ),
-                Ok(env) => {
-                    let selected = match &request.adapter_binding {
-                        Some(stored) => match adapter::observe_worker_declaration(
-                            &self.port,
-                            &stored.argv,
-                            &workspace,
-                            &env,
-                        ) {
-                            Ok(observed) => match adapter::select_adapter(&observed, stored) {
-                                adapter::AdapterSelection::Ready(binding) => (Some(binding), None),
-                                adapter::AdapterSelection::ConfigurationRepair { reason } => {
-                                    (None, Some(reason))
+                (Ok(gate), Ok(env)) => {
+                    // The probe gets the same containment the launch
+                    // will: the workspace bound read-only, the
+                    // generated gitconfig, no writable surfaces — and
+                    // the same runtime boundary. A boundary refusal is
+                    // a configuration repair like a refused gate.
+                    match self.contained_probe(
+                        gate,
+                        &probe_argv,
+                        Some(&workspace),
+                        &probe_scratch.join("gitconfig"),
+                        &env,
+                    ) {
+                        Err(reason) => (
+                            None,
+                            Some(format!("isolation.containment_refused: {reason}")),
+                        ),
+                        Ok((probe_exec_argv, probe_exec_env)) => match &request.adapter_binding {
+                            Some(stored) => {
+                                match adapter::observe_worker_declaration_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &workspace,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok(observed) => {
+                                        match adapter::select_adapter(&observed, stored) {
+                                            adapter::AdapterSelection::Ready(binding) => {
+                                                (Some(binding), None)
+                                            }
+                                            adapter::AdapterSelection::ConfigurationRepair {
+                                                reason,
+                                            } => (None, Some(reason)),
+                                        }
+                                    }
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
                                 }
-                            },
-                            Err(why) => (
-                                None,
-                                Some(format!("adapter.declaration_unavailable: {why}")),
-                            ),
+                            }
+                            None => {
+                                match adapter::observe_worker_declaration_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &workspace,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok(observed) => (Some(observed.binding(&probe_argv)), None),
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
+                                }
+                            }
                         },
-                        None => match adapter::observe_worker_declaration(
-                            &self.port,
-                            &self.worker_argv,
-                            &workspace,
-                            &env,
-                        ) {
-                            Ok(observed) => (Some(observed.binding(&self.worker_argv)), None),
-                            Err(why) => (
-                                None,
-                                Some(format!("adapter.declaration_unavailable: {why}")),
-                            ),
-                        },
-                    };
-                    isolation::release(&probe_scratch);
-                    selected
+                    }
                 }
-            }
+            };
+            // The probe process is gone once `run_probe` returned, so
+            // the scratch tree is reclaimed on every arm — a refused
+            // gate or a failed preparation leaves nothing behind.
+            isolation::release(&probe_scratch);
+            let (binding, repair_reason) = selected;
+            (binding, repair_reason, gate.ok())
         };
 
         // First consumption: persist the WorkerRequest export and the
@@ -1543,14 +1816,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // The bound argv is the recorded selection — a `worker_argv`
         // change after binding never retargets this request, and the
         // launchable gate above already proved a binding was recorded.
-        let argv = binding
+        // Under containment the worker sees the sandbox layout instead:
+        // the workspace at `/workspace` (read-only for assessment
+        // roles), the generated gitconfig, and no host credential —
+        // never the unwrapped argv.
+        let Some(gate) = gate else {
+            self.refuse_launch(
+                store,
+                request,
+                &invocation,
+                "isolation.containment_refused: gate not evaluated".into(),
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        };
+        let inner_argv = binding
             .map(|binding| binding.argv)
             .expect("a launch requires a recorded binding");
         // The launch runs under the profile's environment — a
         // preparation failure refuses the launch through the same path
         // as a refused spawn; there is no degrade-to-inherited-env
         // fallback.
-        let launch_env = match isolation::prepare(
+        let launch_env_base = match isolation::prepare(
             &self.isolation_profile,
             &self.launch_scratch(&invocation.id.0),
         ) {
@@ -1564,6 +1851,53 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     now_unix_seconds,
                 )?;
                 return Ok(());
+            }
+        };
+        let (argv, launch_env) = match &gate {
+            Gate::Uncontained => (inner_argv, launch_env_base),
+            Gate::Ready { primitive, worker } => {
+                let plan = MountPlan {
+                    workspace: Some((
+                        workspace.clone(),
+                        // §14.6: assessment roles bind the workspace
+                        // read-only; writers keep read-write.
+                        matches!(
+                            request.role,
+                            InvocationRole::InvariantCheck | InvocationRole::Review
+                        ),
+                    )),
+                    request: None,
+                    input: None,
+                    out: None,
+                    gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
+                    extra_rw_binds: vec![],
+                    worker: worker.clone(),
+                };
+                match self.contained_exec(
+                    primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &launch_env_base,
+                ) {
+                    Ok(contained) => contained,
+                    Err(reason) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("isolation.containment_refused: {reason}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
             }
         };
         match self.port.spawn(&argv, &workspace, &launch_env) {
@@ -1631,13 +1965,566 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
+    /// The v2 consume path (`docs/v0.3.md` §4): materialize the
+    /// immutable request body and the per-Invocation input/output tree
+    /// from durable state, record the body in the same commit that
+    /// consumes the request, negotiate the declaration, then launch
+    /// `<argv> run --request <request.json> --out <out/>`. Every
+    /// refusal is typed and lands before any process exists; an
+    /// infrastructure fault fails the pass so the request stays
+    /// pending for the next one.
+    fn start_v2(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let dispatch = self
+            .v2
+            .as_ref()
+            .expect("start_v2 requires the v2 dispatch profile");
+
+        // The Execution state gates everything, exactly as the v1
+        // probe gate: a request that can never launch is consumed
+        // without spending a build, a probe, or a process on it.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+        if exec_state != Some(ExecutionState::Ready) {
+            self.mark_consumed(store, &request.request_id)?;
+            return Ok(());
+        }
+
+        let invocation_id = InvocationId(store.transact(|tx| tx.alloc_id("inv"))?);
+
+        let body = match crate::request_v2::build_request_body(
+            store,
+            dispatch,
+            request,
+            &invocation_id.0,
+            now_unix_seconds,
+        ) {
+            Ok(body) => body,
+            Err(crate::request_v2::BuildError::Refusal(refusal)) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    refusal,
+                    now_unix_seconds,
+                );
+            }
+            Err(crate::request_v2::BuildError::Fault(detail)) => {
+                return Err(ExecError::Fault(detail));
+            }
+        };
+
+        // The builder validates its own output, but the launch path
+        // parses the durable bytes again — negotiation reads the wire
+        // request, never the builder's in-memory value.
+        let wire = match WorkerRequestV2::parse(&body.canonical_body) {
+            Ok(wire) => wire,
+            Err(e) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    DispatchRefusal::BodyCorrupt {
+                        detail: format!("built request does not parse: {e}"),
+                    },
+                    now_unix_seconds,
+                );
+            }
+        };
+
+        // Every required input body re-resolves through the catalogue
+        // and re-verifies before the consume commit — a body reclaimed
+        // or corrupted since the build refuses here, still before any
+        // process exists.
+        let io = match crate::request_v2::materialize_invocation_io(
+            store,
+            dispatch,
+            &crate::request_v2::invocation_io_root(&self.workspace_root),
+            &invocation_id.0,
+            &body,
+        ) {
+            Ok(io) => io,
+            Err(crate::request_v2::MaterializeError::Refusal(refusal)) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    refusal,
+                    now_unix_seconds,
+                );
+            }
+            Err(crate::request_v2::MaterializeError::Fault(detail)) => {
+                return Err(ExecError::Fault(detail));
+            }
+        };
+
+        // The containment gate covers the describe probe and the
+        // launch alike: one negative-probe proof per `(profile,
+        // worker argv)` identity, replayed from recorded evidence.
+        // A refused proof is a configuration repair carried through
+        // the consume commit — never a degraded launch.
+        let launch_argv = request
+            .adapter_binding
+            .as_ref()
+            .map(|binding| binding.argv.clone())
+            .unwrap_or_else(|| self.worker_argv.clone());
+        let gate = self.containment_gate(&launch_argv, now_unix_seconds)?;
+
+        // Declaration probe plus the exact §5.2 negotiation, under the
+        // same fail-closed shape as the v1 probe: a stored binding is
+        // re-verified verbatim, an unbound request selects now, and
+        // every failure is a configuration repair carried through the
+        // consume commit — never a degraded launch.
+        let (binding, repair_reason) = match &gate {
+            Err(reason) => (
+                None,
+                Some(format!("isolation.containment_refused: {reason}")),
+            ),
+            Ok(gate) => {
+                let probe_scratch = isolation::scratch_root(&self.workspace_root).join(format!(
+                    "probe-{}",
+                    isolation::sanitize_key(&request.request_id)
+                ));
+                // `describe` is effect-free: it runs in a scratch cwd, never
+                // the managed workspace — creating `ws-<id>` here would
+                // leave an empty directory `workspace::prepare` later reads
+                // as an unreceipted conflict.
+                let probe_cwd = probe_scratch.join("cwd");
+                let probe_env = isolation::prepare(&self.isolation_profile, &probe_scratch);
+                match probe_env {
+                    Err(why) => (
+                        None,
+                        Some(format!("isolation.environment_preparation_failed: {why}")),
+                    ),
+                    Ok(env) => {
+                        if let Err(e) = std::fs::create_dir_all(&probe_cwd) {
+                            isolation::release(&probe_scratch);
+                            return Err(ExecError::Fault(format!(
+                                "create probe cwd {}: {e}",
+                                probe_cwd.display()
+                            )));
+                        }
+                        let probe_argv = request
+                            .adapter_binding
+                            .as_ref()
+                            .map(|binding| binding.argv.clone())
+                            .unwrap_or_else(|| self.worker_argv.clone());
+                        // The probe gets the same containment the
+                        // launch will: the workspace bound read-only
+                        // when it exists, the generated gitconfig, and
+                        // no writable surfaces — `describe` answers
+                        // inside the boundary it declares for, runtime
+                        // credential and egress profile included.
+                        let probe_workspace = self.workspace_of(&request.work_id);
+                        let selected = match self.contained_probe(
+                            gate,
+                            &probe_argv,
+                            Some(&probe_workspace),
+                            &probe_scratch.join("gitconfig"),
+                            &env,
+                        ) {
+                            Err(reason) => (
+                                None,
+                                Some(format!("isolation.containment_refused: {reason}")),
+                            ),
+                            Ok((probe_exec_argv, probe_exec_env)) => {
+                                match adapter::observe_worker_declaration_v2_with_argv(
+                                    &self.port,
+                                    &probe_exec_argv,
+                                    &probe_cwd,
+                                    &probe_exec_env,
+                                ) {
+                                    Ok((declared, surface)) => match declared.negotiate_v2(&wire) {
+                                        Ok(()) => match &request.adapter_binding {
+                                            Some(stored) => {
+                                                match adapter::select_adapter(&surface, stored)
+                                                    {
+                                                        adapter::AdapterSelection::Ready(binding) => {
+                                                            (Some(binding), None)
+                                                        }
+                                                        adapter::AdapterSelection::ConfigurationRepair {
+                                                            reason,
+                                                        } => (None, Some(reason)),
+                                                    }
+                                            }
+                                            None => (Some(surface.binding(&probe_argv)), None),
+                                        },
+                                        Err(why) => (None, Some(why.to_string())),
+                                    },
+                                    Err(why) => (
+                                        None,
+                                        Some(format!("adapter.declaration_unavailable: {why}")),
+                                    ),
+                                }
+                            }
+                        };
+                        isolation::release(&probe_scratch);
+                        selected
+                    }
+                }
+            }
+        };
+
+        // First consumption: the Invocation, the consumed mark, the
+        // first adapter binding, and the canonical request body land
+        // in one commit — a restart replays the stored bytes verbatim
+        // and never rebuilds from mutable configuration. There is no
+        // v1 WorkerRequest export for a v2 request: the durable body
+        // row is the launch record.
+        let invocation = Invocation {
+            id: invocation_id.clone(),
+            request_id: request.request_id.clone(),
+            execution_id: request.execution_id.clone(),
+            role: request.role.clone(),
+            state: InvocationState::Prepared,
+            process_identity: None,
+            descendants: vec![],
+            required_artifacts: required_artifacts(request),
+            evidence_refs: vec![],
+        };
+        store.transact(|tx| {
+            if request.adapter_binding.is_none()
+                && let Some(binding) = &binding
+            {
+                tx.apply(&Effect::BindRequestAdapter {
+                    request_id: request.request_id.clone(),
+                    binding: binding.clone(),
+                })?;
+            }
+            tx.apply(&Effect::InsertWorkerRequestBody { body: body.clone() })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })?;
+
+        if let Some(reason) = repair_reason {
+            // A declaration that cannot negotiate the request — or no
+            // answer at all — is a configuration repair: the attempt is
+            // recorded and abandoned, but no worker starts. The
+            // consumed request is terminal for its binding.
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.release_invocation_io(&invocation.id.0);
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchRefused {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+
+        // The pre-build Execution-state read is stale by up to the
+        // build and probe bounds: re-read it after the consume commit
+        // so a stop or cancel committed meanwhile still blocks the
+        // spawn — the request is consumed, so blocking the launch
+        // abandons the recorded Invocation.
+        let launchable = binding.is_some()
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !launchable {
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.release_invocation_io(&invocation.id.0);
+            return Ok(());
+        }
+
+        let work_id = request.work_id.clone();
+        // Writer roles launch inside the exact prepared workspace —
+        // `workspace::prepare` re-validates the durable body, the
+        // pins, the reservations, and the predecessor against live git
+        // state and refuses rather than approximating. Read roles keep
+        // their existing launch trees: the check's per-Invocation
+        // snapshot and the review's managed workspace (mount-level
+        // read-only enforcement is the containment slice).
+        let workspace = match request.role {
+            InvocationRole::Coding | InvocationRole::Fix => {
+                let work = store.transact(|tx| tx.work(&work_id))?.ok_or_else(|| {
+                    ExecError::Fault(format!("request {} names no work", request.request_id))
+                })?;
+                let Some(source) = dispatch.source_for(&work.binding.repository) else {
+                    // The build already refused a missing source;
+                    // reaching here means the configuration changed
+                    // mid-pass — refuse the launch, never guess a
+                    // checkout.
+                    self.refuse_launch(
+                        store,
+                        request,
+                        &invocation,
+                        "repository source is no longer configured".into(),
+                        now_unix_seconds,
+                    )?;
+                    return Ok(());
+                };
+                match self.prepare_workspace(store, &request.request_id, source, now_unix_seconds) {
+                    Ok(prepared) => prepared.path,
+                    Err(why) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("workspace preparation refused: {why}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            InvocationRole::InvariantCheck => {
+                match self.snapshot_check_workspace(&invocation, &work_id) {
+                    Ok(path) => path,
+                    Err(why) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("invariant check workspace snapshot failed: {why}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            InvocationRole::Review => self.workspace_of(&work_id),
+        };
+        std::fs::create_dir_all(&workspace)?;
+
+        // The bound argv is the recorded selection; the approved v2
+        // transport appends the request/out pair — no shell, no stdin
+        // protocol, no fallback argv. Under containment the worker sees
+        // the sandbox paths (`/taisan/request.json`, `/taisan/out`);
+        // uncontained launches keep the host paths they always had.
+        let gate = match gate {
+            Ok(gate) => gate,
+            Err(reason) => {
+                // Unreachable in practice — a refused gate already
+                // carried its reason through `repair_reason` — but the
+                // launch never proceeds on an unproven boundary.
+                self.refuse_launch(
+                    store,
+                    request,
+                    &invocation,
+                    format!("isolation.containment_refused: {reason}"),
+                    now_unix_seconds,
+                )?;
+                return Ok(());
+            }
+        };
+        let contained = matches!(gate, Gate::Ready { .. });
+        let mut inner_argv = binding
+            .map(|binding| binding.argv)
+            .expect("a launch requires a recorded binding");
+        inner_argv.push("run".into());
+        inner_argv.push("--request".into());
+        inner_argv.push(if contained {
+            containment::SANDBOX_REQUEST.to_string()
+        } else {
+            io.request_path.to_string_lossy().into_owned()
+        });
+        inner_argv.push("--out".into());
+        inner_argv.push(if contained {
+            containment::SANDBOX_OUT.to_string()
+        } else {
+            io.out_dir.to_string_lossy().into_owned()
+        });
+
+        let launch_env_base = match isolation::prepare(
+            &self.isolation_profile,
+            &self.launch_scratch(&invocation.id.0),
+        ) {
+            Ok(env) => env,
+            Err(why) => {
+                self.refuse_launch(
+                    store,
+                    request,
+                    &invocation,
+                    format!("isolation.environment_preparation_failed: {why}"),
+                    now_unix_seconds,
+                )?;
+                return Ok(());
+            }
+        };
+        let (argv, launch_env) = match &gate {
+            Gate::Uncontained => (inner_argv, launch_env_base),
+            Gate::Ready { primitive, worker } => {
+                let plan = MountPlan {
+                    workspace: Some((workspace.clone(), wire.workspace.read_only)),
+                    request: Some(io.request_path.clone()),
+                    input: Some(io.input_dir.clone()),
+                    out: Some(io.out_dir.clone()),
+                    gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
+                    extra_rw_binds: vec![],
+                    worker: worker.clone(),
+                };
+                match self.contained_exec(
+                    primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &launch_env_base,
+                ) {
+                    Ok(contained) => contained,
+                    Err(reason) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("isolation.containment_refused: {reason}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        match self.port.spawn(&argv, &workspace, &launch_env) {
+            Ok(identity) => {
+                let descendants = self
+                    .port
+                    .snapshot_descendants(identity.pid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.pid != identity.pid)
+                    .collect();
+                store.transact(|tx| {
+                    let mut next = invocation.clone();
+                    next.state = InvocationState::Running;
+                    next.process_identity = Some(identity.clone());
+                    next.descendants = descendants;
+                    tx.apply(&Effect::UpdateInvocation {
+                        invocation: next,
+                        expected_state: InvocationState::Prepared,
+                    })?;
+                    Ok(())
+                })?;
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: invocation.id.clone(),
+                        process_identity: format!("{}@{}", identity.pid, identity.started_at),
+                        state: ProcessStateFact::Running,
+                        exit_code: None,
+                    },
+                    now_unix_seconds,
+                )?;
+            }
+            Err(SpawnError::Refused { reason }) => {
+                self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
+            }
+            Err(SpawnError::Unknown { .. }) => {
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: invocation.id.clone(),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Unknown,
+                        exit_code: None,
+                    },
+                    now_unix_seconds,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a typed dispatch refusal: the `dispatch_refused` fact
+    /// pauses the waiting Execution and the request is marked consumed
+    /// — terminal for its own `request_id`, never silently retried.
+    /// The per-Invocation tree a refused materialization may have
+    /// partially written is reclaimed with the refusal; no worker ever
+    /// ran, so there is nothing to collect from `out/`.
+    fn refuse_dispatch(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation_id: &str,
+        refusal: DispatchRefusal,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        self.release_invocation_io(invocation_id);
+        self.report(
+            store,
+            request,
+            ObservationFact::DispatchRefused {
+                request_id: request.request_id.clone(),
+                code: refusal.code().to_string(),
+                detail: refusal.detail().to_string(),
+            },
+            now_unix_seconds,
+        )?;
+        self.mark_consumed(store, &request.request_id)
+    }
+
+    /// Reclaim one Invocation's input/output tree. Used on every path
+    /// where no worker could have written into `out/` — a refused
+    /// dispatch, a refused launch, an abandoned attempt. Trees of
+    /// resolved Invocations that did run are the retention sweep's
+    /// business, not this helper's.
+    fn release_invocation_io(&self, invocation_id: &str) {
+        let _ = std::fs::remove_dir_all(
+            crate::request_v2::invocation_io_root(&self.workspace_root)
+                .join(isolation::sanitize_key(invocation_id)),
+        );
+    }
+
+    /// Bound `.invocations`: per-Invocation request/input/output trees
+    /// are released with their Invocation's lifecycle, but a refused
+    /// dispatch or a crash between materialization and the consume
+    /// commit leaves orphans no unresolved Invocation names. Once per
+    /// pass, reclaim every tree no unresolved Invocation still owns.
+    pub fn sweep_invocation_io(&self, store: &impl Store) -> Result<(), ExecError> {
+        let root = crate::request_v2::invocation_io_root(&self.workspace_root);
+        let keep: HashSet<PathBuf> = store
+            .transact(|tx| tx.unresolved_invocations())?
+            .iter()
+            .map(|invocation| root.join(isolation::sanitize_key(&invocation.id.0)))
+            .collect();
+        isolation::sweep_orphans(&root, &keep);
+        Ok(())
+    }
+
     /// Record a launch refusal: the consumed request's Invocation is
     /// abandoned and `LaunchRefused` is reported — the request is
     /// terminal for its binding, never retried under a degraded setup.
     /// No process exists for this Invocation, so its scratch tree
     /// (fully built for a refused spawn, partial for a refused
-    /// preparation) and any check-workspace snapshot are reclaimed
-    /// with the refusal.
+    /// preparation), any check-workspace snapshot, and any v2
+    /// input/output tree are reclaimed with the refusal.
     fn refuse_launch(
         &self,
         store: &impl Store,
@@ -1648,6 +2535,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
     ) -> Result<(), ExecError> {
         isolation::release(&self.launch_scratch(&invocation.id.0));
         isolation::release(&self.check_workspace(&invocation.id.0));
+        self.release_invocation_io(&invocation.id.0);
         store.transact(|tx| {
             let mut next = invocation.clone();
             next.state = InvocationState::Abandoned;
@@ -3542,5 +4430,170 @@ mod tests {
             "a same-group straggler must be killed with the probe leader"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// An empty mount plan for `contained_exec` boundary tests — the
+    /// boundary fields start unset; the grant fills them.
+    fn empty_mount_plan() -> MountPlan {
+        MountPlan {
+            workspace: None,
+            request: None,
+            input: None,
+            out: None,
+            gitconfig: None,
+            runtime_auth: None,
+            provider_config: None,
+            proxy_sock: None,
+            toolchain: None,
+            caches: vec![],
+            extra_binds: vec![],
+            extra_rw_binds: vec![],
+            worker: None,
+        }
+    }
+
+    fn boundary_config(dir: &Path) -> crate::boundary::BoundaryConfig {
+        crate::boundary::BoundaryConfig {
+            credential_ref: None,
+            provider_config: None,
+            model_api_hosts: vec![],
+            runtime_dir: dir.join("runtime"),
+            egress_dir: dir.join("egress"),
+            relay_exe: PathBuf::from("/bin/sh"),
+        }
+    }
+
+    /// A boundary that cannot resolve its credential is a typed
+    /// refusal carried as launch evidence — never an ambient
+    /// credential and never an unwrapped launch.
+    #[test]
+    fn contained_exec_boundary_refusal_is_typed() {
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = boundary_config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_DEFINITELY_UNSET".into());
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        )
+        .with_runtime_boundary(crate::boundary::RuntimeBoundary::new(cfg));
+        let err = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains("credential.unresolvable"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resolved boundary becomes sandbox binds: the staged
+    /// credential and provider config mount read-only, the proxy
+    /// socket mounts and relay-wraps the inner argv, and the
+    /// environment exports only the relay proxy URL — the secret
+    /// value itself appears in neither argv nor env.
+    #[test]
+    fn contained_exec_grants_credential_config_and_relay() {
+        // SAFETY: test-only env mutation; the name is unique to this
+        // test so parallel tests cannot observe it.
+        unsafe { std::env::set_var("TAISAN_CONTAINED_EXEC_TOKEN", "sekrit-test-value") };
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_config = dir.join("provider.toml");
+        std::fs::write(&provider_config, "model = \"demo\"\n").unwrap();
+        let mut cfg = boundary_config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_TOKEN".into());
+        cfg.provider_config = Some(provider_config.clone());
+        cfg.model_api_hosts = vec!["model.example".into()];
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        )
+        .with_runtime_boundary(crate::boundary::RuntimeBoundary::new(cfg));
+        let (argv, env) = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap();
+        let joined = argv.join("\n");
+        assert!(joined.contains("/taisan/runtime-auth"), "{joined}");
+        assert!(joined.contains("/taisan/provider-config"), "{joined}");
+        assert!(joined.contains("/taisan/proxy.sock"), "{joined}");
+        assert!(joined.contains("__sandbox-relay"), "{joined}");
+        assert!(
+            env.vars
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://127.0.0.1:18080"),
+            "{:?}",
+            env.vars
+        );
+        assert!(
+            !joined.contains("sekrit-test-value")
+                && !env
+                    .vars
+                    .iter()
+                    .any(|(_, v)| v.contains("sekrit-test-value")),
+            "the credential value never enters argv or env"
+        );
+        unsafe { std::env::remove_var("TAISAN_CONTAINED_EXEC_TOKEN") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No boundary installed is the v1-compatible empty boundary:
+    /// contained argv carries no credential, provider config, proxy,
+    /// or relay — and no proxy variables.
+    #[test]
+    fn contained_exec_without_boundary_binds_nothing_extra() {
+        let dir =
+            std::env::temp_dir().join(format!("taisan-boundary-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sup = Supervisor::new(
+            crate::scripted::ScriptedProcessControl::new(),
+            dir.clone(),
+            vec![],
+            scripted_config(),
+        );
+        let (argv, env) = sup
+            .contained_exec(
+                Path::new("/opt/bwrap"),
+                empty_mount_plan(),
+                &["/bin/sh".into(), "-c".into(), "true".into()],
+                "/tmp",
+                &WorkerEnv::default(),
+            )
+            .unwrap();
+        let joined = argv.join("\n");
+        for absent in [
+            "runtime-auth",
+            "provider-config",
+            "proxy.sock",
+            "__sandbox-relay",
+        ] {
+            assert!(!joined.contains(absent), "{joined}");
+        }
+        assert!(
+            !env.vars
+                .iter()
+                .any(|(k, _)| k.contains("PROXY") || k.contains("proxy")),
+            "{:?}",
+            env.vars
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

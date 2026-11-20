@@ -50,6 +50,14 @@ pub struct IsolationProfile {
     /// is absent from the worker's environment — the environment is an
     /// allowlist, never an inheritance.
     pub env_passthrough: &'static [&'static str],
+    /// The sandbox primitive this profile's launches must run under,
+    /// when the profile declares one (`docs/v0.3.md` §14, OP-1). `None`
+    /// marks the contract-harness profile: its launches are test
+    /// evidence only and never prove namespace enforcement. A profile
+    /// that names a primitive refuses dispatch when the primitive or
+    /// its recorded preflight evidence is absent — never a hygiene-only
+    /// substitute.
+    pub sandbox_primitive: Option<&'static str>,
 }
 
 /// The names every approved profile lets through: enough for process
@@ -63,10 +71,12 @@ const APPROVED_PROFILES: &[IsolationProfile] = &[
     IsolationProfile {
         id: DEFAULT_ISOLATION_PROFILE_ID,
         env_passthrough: ENV_PASSTHROUGH,
+        sandbox_primitive: Some("bwrap"),
     },
     IsolationProfile {
         id: FIXTURE_ISOLATION_PROFILE_ID,
         env_passthrough: ENV_PASSTHROUGH,
+        sandbox_primitive: None,
     },
 ];
 

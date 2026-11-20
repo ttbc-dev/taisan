@@ -1098,6 +1098,8 @@ impl GitHubApi for GhCliApi {
             source_revision: source_revision.to_string(),
             content_digest: workloop_selector::issue_content_digest(title, body),
             state,
+            title: title.to_string(),
+            body: body.to_string(),
         })
     }
 

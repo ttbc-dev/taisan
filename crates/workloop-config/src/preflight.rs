@@ -1129,15 +1129,14 @@ fn stage_worker_runtime(profile: &Profile, options: &CheckOptions) -> Vec<Diagno
     }
 }
 
-/// The sandbox primitive an approved profile requires at preflight.
-/// The reference profile needs `bwrap`; the contract-harness profile
-/// launches without an external primitive. The registry itself stays
-/// closed in `workloop-core` — an unapproved id never reaches here.
+/// The sandbox primitive an approved profile requires at preflight —
+/// the profile registry's own declaration, so config validation and
+/// the supervisor's launch gate can never disagree about what the
+/// profile demands. The contract-harness profile declares none: its
+/// launches are test evidence only. The registry itself stays closed
+/// in `workloop-core` — an unapproved id never reaches here.
 fn required_isolation_primitive(profile_id: &str) -> Option<&'static str> {
-    match profile_id {
-        DEFAULT_ISOLATION_PROFILE_ID => Some("bwrap"),
-        _ => None,
-    }
+    isolation_profile(profile_id).and_then(|profile| profile.sandbox_primitive)
 }
 
 /// Stage (6): the declared sandbox mechanism is present. Only a

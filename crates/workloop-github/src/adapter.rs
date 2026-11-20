@@ -869,7 +869,10 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         scope: Option<&WorkId>,
     ) -> Result<SourceRefreshReport, StoreError> {
         let now = clock();
-        let mut report = SourceRefreshReport::default();
+        let mut report = SourceRefreshReport {
+            now_unix_seconds: now,
+            ..SourceRefreshReport::default()
+        };
         if let Some(d) = deadline {
             let remaining = d.saturating_sub(now).max(0) as u64;
             self.client
@@ -894,14 +897,32 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             // wrong remote's state.
             let served = canonical_host_instance(source.issue.repository.host.as_str())
                 == canonical_host_instance(config.host.repository.host.as_str());
-            let (revision, digest, state) = if !served {
-                (String::new(), String::new(), IssueState::Unavailable)
+            let remote = if !served {
+                None
             } else {
-                match self.client.read_issue(&source.issue) {
-                    Ok(remote) => (remote.source_revision, remote.content_digest, remote.state),
-                    Err(_) => (String::new(), String::new(), IssueState::Unavailable),
-                }
+                self.client.read_issue(&source.issue).ok()
             };
+            let (revision, digest, state) = match &remote {
+                Some(remote) => (
+                    remote.source_revision.clone(),
+                    remote.content_digest.clone(),
+                    remote.state.clone(),
+                ),
+                None => (String::new(), String::new(), IssueState::Unavailable),
+            };
+            // Every completed authoritative read is carried out for
+            // retention — even when the recorded observation is
+            // unchanged — so the composition root can (re)retain the
+            // immutable snapshot body a bound request resolves.
+            if let Some(remote) = &remote {
+                report.snapshots.push(crate::api::IssueSnapshotRead {
+                    issue: source.issue.clone(),
+                    source_revision: remote.source_revision.clone(),
+                    content_digest: remote.content_digest.clone(),
+                    title: remote.title.clone(),
+                    body: remote.body.clone(),
+                });
+            }
             let latest = latest_recorded_issue(store, &work_id, &source.issue)?;
             if latest.as_ref() == Some(&(revision.clone(), digest.clone(), state.clone())) {
                 report.unchanged += 1;

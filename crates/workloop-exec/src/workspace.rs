@@ -177,6 +177,15 @@ fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, Preparati
     }
 }
 
+/// The source repository's current `HEAD` commit — the base a fresh
+/// Coding workspace pins at dispatch-materialization time. Read under
+/// the same scrubbed git environment every other supervisor-side git
+/// call uses; the result is a commit id the durable request body then
+/// freezes, never a live re-read at launch.
+pub(crate) fn git_head(dir: &Path) -> Result<String, PreparationError> {
+    git(dir, &["rev-parse", "HEAD"])
+}
+
 fn is_hex_sha1(s: &str) -> bool {
     s.len() == 40
         && s.bytes()
@@ -674,6 +683,14 @@ fn gates(
         }
     }
     for inv in tx.unresolved_invocations()? {
+        // The Invocation this preparation exists to launch was recorded
+        // by the same consume commit that stored the durable request
+        // body these gates validate — it is the expected writer, not a
+        // competing one. Any OTHER unresolved writer for the work
+        // still refuses.
+        if inv.request_id == request_id {
+            continue;
+        }
         if let Some(owner) = tx.execution(&inv.execution_id)?
             && owner.work_id == work.id
         {

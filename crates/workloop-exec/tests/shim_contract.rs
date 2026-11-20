@@ -11,12 +11,14 @@ use std::path::PathBuf;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
-use workloop_core::ports::{ProcessControlPort, SpawnError, WorkerEnv};
-use workloop_core::store::Store;
+use workloop_core::observation::ObservationFact;
+use workloop_core::ports::{ProbeOutcome, ProcessControlPort, SpawnError, WorkerEnv};
+use workloop_core::store::{Effect, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
-    DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, Unsupported, WorkerRequest,
-    WorkerRequestExportState, WorkerRequestKind, export_request_id, isolation_profile,
+    DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, IsolationProfile, Unsupported,
+    WorkerRequest, WorkerRequestExportState, WorkerRequestKind, export_request_id,
+    isolation_profile,
 };
 use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
 use workloop_exec::supervisor::Supervisor;
@@ -205,7 +207,7 @@ fn a_duplicate_start_for_one_invocation_spawns_exactly_one_writer() {
     let root = tmp_root("duplicate");
     let port = ScriptedProcessControl::new();
     port.set_default_plan(SpawnPlan::Resident);
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-2");
     sup.consume_requests(&store, NOW).unwrap();
     // Replay: a duplicated delivery of the same start plus full
@@ -267,7 +269,7 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "timeout between spawn and response".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-4");
     sup.consume_requests(&store, NOW).unwrap();
     // The supervision pass that owns the lost-start window: it must
@@ -307,7 +309,7 @@ fn an_unbound_export_holds_the_invocation_uncertain() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-5");
     sup.consume_requests(&store, NOW).unwrap();
     sup.consume_requests(&store, NOW).unwrap();
@@ -331,6 +333,42 @@ fn an_unbound_export_holds_the_invocation_uncertain() {
     assert_eq!(export.state, WorkerRequestExportState::Exported);
 }
 
+/// A profile that declares a sandbox primitive the host cannot
+/// resolve refuses the launch outright: the consumed request records
+/// a `LaunchRefused` repair and no process ever exists. There is no
+/// hygiene-only substitute for proven containment.
+#[test]
+fn an_unresolvable_containment_primitive_refuses_the_launch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("no-primitive");
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    let sup = Supervisor::new(port.clone(), root, vec!["fixture-worker".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-unresolvable-primitive",
+            env_passthrough: &[],
+            sandbox_primitive: Some("definitely-not-a-real-primitive-xyz"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-shim-ns");
+    sup.consume_requests(&store, NOW).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        0,
+        "no process exists without proven containment"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    let refused = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .any(|o| matches!(o.fact, ObservationFact::LaunchRefused { .. }));
+    assert!(
+        refused,
+        "the containment refusal is a recorded launch repair"
+    );
+}
+
 /// The fault boundary #287 names: the consume commit landed
 /// (`Prepared`, no identity, request consumed, export `Exported`) and
 /// the launch commit never did. With no live process carrying the
@@ -345,7 +383,7 @@ fn an_unidentified_launch_without_a_writer_is_abandoned_after_the_window() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-6");
     sup.consume_requests(&store, NOW).unwrap();
     // The ambiguous spawn produced no live process: the scripted
@@ -400,7 +438,7 @@ fn an_escaped_descendant_in_the_launch_dir_blocks_the_absence_proof() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-7");
     sup.consume_requests(&store, NOW).unwrap();
     // The lost leader is gone, but its escaped descendant — a
@@ -456,7 +494,7 @@ fn an_unreadable_directory_occupant_keeps_absence_unproven() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-12");
     sup.consume_requests(&store, NOW).unwrap();
     // The lost leader is gone; its escaped descendant — a different
@@ -513,7 +551,7 @@ fn an_unreadable_process_table_keeps_the_launch_uncertain() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-7");
     sup.consume_requests(&store, NOW).unwrap();
     port.fail_next_process_scan("ps table unavailable");
@@ -548,7 +586,7 @@ fn ambiguous_signature_matches_keep_the_launch_uncertain() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (w, eid) = submit_and_admit(&store, "k-shim-8");
     sup.consume_requests(&store, NOW).unwrap();
     // A second live process carries the identical argv inside the same
@@ -584,7 +622,7 @@ fn an_unattributable_candidate_blocks_the_bind() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (w, eid) = submit_and_admit(&store, "k-shim-10");
     sup.consume_requests(&store, NOW).unwrap();
     // The orphan's cwd is unreadable (denied lsof) — and a second live
@@ -635,7 +673,11 @@ fn an_out_of_directory_candidate_blocks_the_bind() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root.clone(), None);
+    let sup = supervisor(
+        port.clone(),
+        root.clone(),
+        Some(FIXTURE_ISOLATION_PROFILE_ID),
+    );
     let (_w, eid) = submit_and_admit(&store, "k-shim-11");
     sup.consume_requests(&store, NOW).unwrap();
     // The lost writer carries the signature inside the launch
@@ -684,7 +726,7 @@ fn a_recorded_writer_is_never_rebound_as_the_orphan() {
     let root = tmp_root("unidentified-recorded");
     let port = ScriptedProcessControl::new();
     port.set_default_plan(SpawnPlan::Resident);
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w_a, eid_a) = submit_and_admit(&store, "k-shim-9a");
     sup.consume_requests(&store, NOW).unwrap();
     let (_w_b, eid_b) = submit_and_admit(&store, "k-shim-9b");
@@ -738,4 +780,88 @@ fn scripted_unknown_plan_records_the_lost_identity() {
         "the orphan is in the process table even though the response was lost"
     );
     assert_eq!(port.spawn_calls(), 1);
+}
+
+/// §14.6 read-only regression: under a contained profile the mount
+/// decision is per-role — the coding leg binds its workspace
+/// writable, the invariant-check leg binds its snapshot read-only.
+/// The recorded spawn argv carries the bwrap flags themselves:
+/// `--bind` vs `--ro-bind` on `/workspace` is the boundary, not a
+/// field on the request.
+#[test]
+fn a_contained_assessment_binds_the_workspace_read_only() {
+    // Two capacity slots: the writer Execution and the check Execution
+    // are both admitted `ready`.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let root = tmp_root("contained-ro-mount");
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    // Exactly the writer launch's gate: the version probe plus the
+    // nine-probe battery. Every later probe — each `describe` and the
+    // check's own battery — falls through to the scripted
+    // auto-declaration, whose `success: true` output passes a probe
+    // and declares the adapter when the argv asks for one.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    let sup = Supervisor::new(port.clone(), root.clone(), vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-contained-ro-mount",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (work, _eid) = submit_and_admit(&store, "k-ro-mount-writer");
+    let (check_work, check_eid) = submit_and_admit(&store, "k-ro-mount-check");
+    // The check launches only while its Execution stays `ready` — the
+    // orchestrator re-issues it under `waiting → ready`, so it never
+    // shares a pass with a just-spawned writer on the same Execution.
+    // Retire its sibling's coding request so this pass carries a
+    // writer launch and a check launch on separate Executions.
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    let check_coding = pending
+        .iter()
+        .find(|request| request.execution_id == check_eid)
+        .expect("the check Execution's coding request")
+        .request_id
+        .clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: check_coding,
+            })?;
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: format!("{}:inv:check", check_eid.0),
+                    work_id: check_work.clone(),
+                    execution_id: check_eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    spec_revision: 1,
+                    payload: serde_json::json!({"required_artifacts": []}),
+                    adapter_binding: None,
+                },
+            })
+        })
+        .unwrap();
+    sup.consume_requests(&store, NOW).unwrap();
+    let commands = port.commands();
+    assert_eq!(commands.len(), 2, "one writer launch plus the check");
+    let ws = root.join(format!("ws-{}", work.0));
+    assert!(
+        commands[0].contains(&format!("--bind {} /workspace", ws.display())),
+        "the writer binds its workspace writable: {}",
+        commands[0]
+    );
+    assert!(
+        commands[1].contains("--ro-bind") && commands[1].contains(" /workspace"),
+        "the check's snapshot mounts read-only: {}",
+        commands[1]
+    );
+    assert!(
+        !commands[1].contains("--bind "),
+        "no writable bind reaches the read-only check leg: {}",
+        commands[1]
+    );
 }

@@ -4,3 +4,4 @@ edition.workspace = true
 
 [dependencies]
 serde_json = "1"
+workloop-core = { path = "../workloop-core" }

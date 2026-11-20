@@ -84,8 +84,12 @@ pub enum IssueState {
 /// make every selector-admitted Work look `Changed` at the gate.
 /// `revision` (the host's own update marker) and lifecycle `state`
 /// travel separately and never enter the content digest.
+///
+/// The rule itself lives in `workloop_core::domain` so the exec crate's
+/// retained-snapshot verification uses the identical digest; this
+/// wrapper keeps the selector-facing path stable.
 pub fn issue_content_digest(title: &str, body: &str) -> String {
-    sha256_hex("s1-issue-v1", format!("{title}\n{body}").as_bytes())
+    workloop_core::domain::issue_content_digest(title, body)
 }
 
 /// The snapshot/cursor of available source facts a selector run sees.

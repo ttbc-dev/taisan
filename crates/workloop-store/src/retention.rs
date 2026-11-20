@@ -372,6 +372,54 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Extend a registered body's eligibility horizon when `until` is
+    /// later than the recorded one. Re-observation of still-needed
+    /// material refreshes the horizon; it never shortens one, never
+    /// applies to a body that already left `present` (reclaimed is
+    /// terminal), and never turns an unlimited (`NULL`) horizon into a
+    /// bounded one.
+    pub fn extend_body_eligibility(
+        &self,
+        body_id: &str,
+        until_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let mut guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        tx.execute(
+            "UPDATE body_catalog SET eligible_after_unix_seconds=?2 \
+             WHERE body_id=?1 AND state='present' \
+             AND eligible_after_unix_seconds IS NOT NULL \
+             AND eligible_after_unix_seconds < ?2",
+            params![body_id, until_unix_seconds],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    /// Return a re-observed body to `present`. Registration replays
+    /// after the caller has already re-written the body file; a row
+    /// still carrying `reclaiming`/`reclaimed` would keep resolving
+    /// the live body as Unavailable. The stale reclaim reason clears
+    /// with the state so audit reads see the current availability.
+    pub fn restore_body_presence(&self, body_id: &str) -> Result<(), StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        guard
+            .execute(
+                "UPDATE body_catalog SET state='present', reclaim_reason=NULL \
+                 WHERE body_id=?1 AND state != 'present'",
+                params![body_id],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Set or clear ONE protective dependency pin on a registered body.
     /// Pin bookkeeping is the `body_pins` ledger: each live dependency
     /// is its own row, `pinned` is the materialized EXISTS of those
@@ -513,6 +561,88 @@ impl SqliteStore {
             })
         })
         .transpose()
+    }
+
+    /// The full catalogue row the dispatch path resolves bodies
+    /// through: identity, category, stored path, byte size, lifecycle
+    /// state, and pin flag in one read. `None` means never registered.
+    pub fn catalogue_entry(
+        &self,
+        body_id: &str,
+    ) -> Result<Option<workloop_core::store::BodyCatalogEntry>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let row: Option<(String, String, String, i64, String, i64)> = guard
+            .query_row(
+                "SELECT body_id, category, path, bytes, state, pinned \
+                 FROM body_catalog WHERE body_id=?1",
+                params![body_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(row.map(|(body_id, category, path, bytes, state, pinned)| {
+            workloop_core::store::BodyCatalogEntry {
+                body_id,
+                category,
+                path,
+                bytes: bytes.max(0) as u64,
+                state,
+                pinned: pinned != 0,
+            }
+        }))
+    }
+
+    /// The catalogue row for one `(category, path)` pair — the lookup
+    /// retained bodies with deterministic paths (issue snapshots)
+    /// resolve through. `None` means nothing registered at that
+    /// location.
+    pub fn catalogue_entry_at(
+        &self,
+        category: &str,
+        path: &str,
+    ) -> Result<Option<workloop_core::store::BodyCatalogEntry>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let row: Option<(String, String, String, i64, String, i64)> = guard
+            .query_row(
+                "SELECT body_id, category, path, bytes, state, pinned \
+                 FROM body_catalog WHERE category=?1 AND path=?2",
+                params![category, path],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(row.map(|(body_id, category, path, bytes, state, pinned)| {
+            workloop_core::store::BodyCatalogEntry {
+                body_id,
+                category,
+                path,
+                bytes: bytes.max(0) as u64,
+                state,
+                pinned: pinned != 0,
+            }
+        }))
     }
 
     /// Set the catalogue's explicit protective-dependency state. Pin
@@ -2941,5 +3071,75 @@ impl SqliteStore {
             unknown_scan_truncated,
             held: held_protected,
         })
+    }
+}
+
+/// The dispatch-path view of the body catalogue: the same durable rows
+/// the retention sweep owns, exposed through the core port so
+/// `workloop-exec` never names this crate's concrete types.
+impl workloop_core::store::BodyCatalog for SqliteStore {
+    fn body_entry(
+        &self,
+        body_id: &str,
+    ) -> Result<Option<workloop_core::store::BodyCatalogEntry>, StoreError> {
+        self.catalogue_entry(body_id)
+    }
+
+    fn body_entry_at(
+        &self,
+        category: &str,
+        path: &str,
+    ) -> Result<Option<workloop_core::store::BodyCatalogEntry>, StoreError> {
+        self.catalogue_entry_at(category, path)
+    }
+
+    fn register_body(&self, body: &workloop_core::store::NewCatalogBody) -> Result<(), StoreError> {
+        // Content-addressed identity: re-registering the same body is
+        // a replay, conflicting metadata under the same id is refused.
+        if let Some(existing) = self.catalogue_entry(&body.body_id)? {
+            let same = existing.category == body.category
+                && existing.path == body.path
+                && existing.bytes == body.bytes;
+            if !same {
+                return Err(StoreError::ConstraintConflict {
+                    detail: format!(
+                        "body {} already registered with different metadata",
+                        body.body_id
+                    ),
+                });
+            }
+            // A re-observed body whose row the sweep already moved out
+            // of `present` is restored, not replayed: the caller
+            // re-wrote the file under the bodies root before
+            // registering, so keeping the stale reclaim state would
+            // resolve the live body as permanently Unavailable.
+            if existing.state != "present" {
+                self.restore_body_presence(&body.body_id)?;
+            }
+            // Re-observation of still-needed material extends the
+            // eligibility horizon — never shortens it.
+            if let Some(until) = body.eligible_after_unix_seconds {
+                self.extend_body_eligibility(&body.body_id, until)?;
+            }
+            return Ok(());
+        }
+        self.register_body(&CatalogBody {
+            body_id: body.body_id.clone(),
+            category: body.category.clone(),
+            path: body.path.clone(),
+            bytes: body.bytes,
+            registered_unix_seconds: body.registered_unix_seconds,
+            eligible_after_unix_seconds: body.eligible_after_unix_seconds,
+            pinned: body.pinned,
+        })
+    }
+
+    fn set_body_pin(
+        &self,
+        body_id: &str,
+        dependency: &str,
+        pinned: bool,
+    ) -> Result<(), StoreError> {
+        self.set_body_pin(body_id, dependency, pinned)
     }
 }

@@ -201,11 +201,20 @@ or `<db-stem>.config.json` beside `--db` — which carries the host
 binding (`adapter`, `host_instance`, `repository`, `host_actors`,
 `capabilities`, `contract_version` — all required at load), the actor
 binding, `capacity`, `worker_argv`, `worker_isolation_profile`,
-`workspace_root`, `allowed_effects`, and the
+`workspace_root`, `allowed_effects`, the runtime-boundary keys
+`worker_credential_ref`, `worker_provider_config`, and
+`worker_model_api_hosts`, the verification-boundary keys
+`verification_toolchain`, `verification_cache_paths`, and
+`verification_egress_allowlist` ([v0.3 §14.3–§14.5](v0.3.md#14-operational-launch-verification-and-host-composition)),
+and the
 `budget`/`policy`/`retention`/`loop` overrides. The profile's
 `[worker]` section is the declaration `check` stage 5 validates;
 `worker_argv` in the installation record is the launch source
-`taisan run` binds. The guide's
+`taisan run` binds. The boundary keys name references and host
+lists only — credential values resolve at the supervisor boundary
+and never enter the record's consumers beyond the staged
+`/taisan/runtime-auth` mount; absent keys mean no runtime
+credential and deny-all Worker egress. The guide's
 [two-file section](v0.2.md#two-files-the-profile-and-the-installation-record)
 documents the reconciliation an operator performs; `check --probe`
 requests the opt-in adapter capability stage but no probe backend is

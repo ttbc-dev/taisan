@@ -4,9 +4,15 @@
 //! that stays in `work`.
 
 pub mod adapter;
+pub mod bodies;
+pub mod boundary;
 pub mod bounded;
+pub mod containment;
+pub mod credentials;
+pub mod egress;
 pub mod handoff;
 pub mod isolation;
+pub mod request_v2;
 pub mod scripted;
 pub mod supervisor;
 pub mod workspace;

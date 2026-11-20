@@ -33,13 +33,16 @@ use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{
     WorkloopConfig, consume_due_recovery_intents, dispatch_scan, sweep_scoped,
 };
+use workloop_core::worker_v2::{IssueSnapshotBody, WireIssue};
 use workloop_exec::adapter;
+use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
 use workloop_exec::isolation;
 use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
 use workloop_github::adapter::GitHubAdapter;
+use workloop_github::api::IssueSnapshotRead;
 use workloop_github::fixture::{FixtureGithub, OutboxReport, ReconcileReport, SourceRefreshReport};
 use workloop_github::gh_cli::GhCliApi;
-use workloop_store::retention::{SweepParams, SweepReport};
+use workloop_store::retention::{CategoryLimits, SweepParams, SweepReport};
 use workloop_store::sqlite::SqliteStore;
 
 /// The approved phase order; a pass always reports all eight entries.
@@ -423,6 +426,59 @@ pub struct Pass<'a, H: HostDriver = FixtureGithub> {
     pub state_root: &'a Path,
 }
 
+/// Retain every issue snapshot a source refresh read as an immutable
+/// CAS body (`docs/v0.3.md` §4): the envelope's canonical bytes land
+/// under the spec-bound lookup path, so the dispatch builder resolves
+/// the exact retained body without enumerating the catalogue and a
+/// Worker never re-fetches remote context. The body's eligibility
+/// horizon is the CAS category's documented age limit from now —
+/// re-observation on later passes extends it, so a body lives exactly
+/// as long as its source keeps being read plus the retention window.
+/// A retention fault fails the phase: an unretained read is not
+/// dispatchable material, and the next pass re-reads and retries.
+fn retain_issue_snapshots(
+    store: &SqliteStore,
+    state_root: &Path,
+    snapshots: &[IssueSnapshotRead],
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let horizon = CategoryLimits::documented_default(CAS_CATEGORY)
+        .and_then(|limits| limits.max_age)
+        .map(|max_age| now_unix_seconds.saturating_add(max_age));
+    for read in snapshots {
+        let issue = &read.issue;
+        let snapshot = IssueSnapshotBody::new(
+            WireIssue {
+                host: issue.repository.host.as_str().to_string(),
+                repository: issue.repository.repository.as_str().to_string(),
+                issue: issue.issue.as_str().to_string(),
+            },
+            read.source_revision.clone(),
+            read.title.clone(),
+            read.body.clone(),
+            read.content_digest.clone(),
+        );
+        let bytes = snapshot.canonical_bytes();
+        bodies
+            .retain_at(
+                store,
+                CAS_CATEGORY,
+                &snapshot.retained_path(),
+                &bytes,
+                now_unix_seconds,
+                horizon,
+            )
+            .map_err(|e| StoreError::Internal {
+                detail: format!("retain issue snapshot {}: {e}", issue.issue.as_str()),
+            })?;
+    }
+    Ok(())
+}
+
 /// Run exactly one bounded pass over the eight ordered phases.
 /// `clock` is supplied by the caller so tests can script deadlines; in
 /// production it reads the wall clock. `shutdown` is checked at every
@@ -495,7 +551,19 @@ pub fn run_pass<H: HostDriver>(
                 let mut p = PhaseReport::completed(PHASES[0]);
                 p.processed = r.unchanged + r.ingested;
                 p.deferred = r.deferred;
-                p
+                // Retain the immutable snapshot bodies the dispatch
+                // builder resolves — before the phase reports done, so
+                // a retained read is never lost between observation
+                // and request materialization.
+                match retain_issue_snapshots(
+                    pass.store,
+                    pass.state_root,
+                    &r.snapshots,
+                    r.now_unix_seconds,
+                ) {
+                    Ok(()) => p,
+                    Err(e) => PhaseReport::failed(PHASES[0], e),
+                }
             }
             Err(e) => PhaseReport::failed(PHASES[0], e),
         });
@@ -581,20 +649,15 @@ pub fn run_pass<H: HostDriver>(
                     if still_ready.is_empty() {
                         continue;
                     }
-                    // The probe spawns inside the workspace the consume
-                    // path would create before launch; a fresh Work's
-                    // `ws-<work>` does not exist yet, so it is created
-                    // here first — a refused creation fails the phase
-                    // instead of silently skipping the binding.
-                    std::fs::create_dir_all(&workspace).map_err(|e| StoreError::Internal {
-                        detail: format!("create workspace {}: {e}", workspace.display()),
-                    })?;
-                    // The probe runs under the profile's environment —
-                    // a prep failure skips the binding exactly like an
-                    // unanswered describe: the consume path's
-                    // fail-closed selection refuses the launch. The
-                    // shared prebind scratch is reclaimed as soon as
-                    // the probe process is gone, so a fixed key never
+                    // The probe spawns inside the profile's scratch
+                    // tree, never the managed `ws-<work>` directory:
+                    // `describe` is effect-free and a pre-created
+                    // workspace would land `workspace::prepare` on an
+                    // unreceipted conflict when the v2 consume path
+                    // materializes the request. The consume path's own
+                    // probe uses the same scratch-cwd rule.
+                    // The shared prebind scratch is reclaimed as soon
+                    // as the probe process is gone, so a fixed key never
                     // accumulates storage between passes.
                     let prebind_scratch =
                         isolation::scratch_root(&supervisor.workspace_root).join("probe-prebind");
@@ -603,11 +666,43 @@ pub fn run_pass<H: HostDriver>(
                     else {
                         continue;
                     };
-                    let declared = adapter::observe_worker_declaration(
-                        &supervisor.port,
+                    let probe_cwd = prebind_scratch.join("cwd");
+                    if std::fs::create_dir_all(&probe_cwd).is_err() {
+                        isolation::release(&prebind_scratch);
+                        continue;
+                    }
+                    // The prebind probe proves the same boundary the
+                    // consume path launches under: a profile that
+                    // requires containment gets the bwrap argv and the
+                    // workspace bound read-only; a refused or faulted
+                    // gate simply leaves the requests unbound — the
+                    // consume path records the typed refusal.
+                    let gate = match supervisor.containment_gate(&supervisor.worker_argv, clock()) {
+                        Ok(Ok(gate)) => gate,
+                        _ => {
+                            isolation::release(&prebind_scratch);
+                            continue;
+                        }
+                    };
+                    let probed = supervisor.contained_probe(
+                        &gate,
                         &supervisor.worker_argv,
-                        &workspace,
+                        Some(workspace.as_path()),
+                        &prebind_scratch.join("gitconfig"),
                         &env,
+                    );
+                    let Ok((probe_exec_argv, probe_exec_env)) = probed else {
+                        // A boundary refusal is recorded by the consume
+                        // path as a typed repair — the prebind probe
+                        // simply leaves the requests unbound.
+                        isolation::release(&prebind_scratch);
+                        continue;
+                    };
+                    let declared = adapter::observe_worker_declaration_with_argv(
+                        &supervisor.port,
+                        &probe_exec_argv,
+                        &probe_cwd,
+                        &probe_exec_env,
                     );
                     isolation::release(&prebind_scratch);
                     let Ok(declaration) = declared else {
@@ -1305,12 +1400,37 @@ mod tests {
         dir
     }
 
+    /// A unique per-call state root for pass-level tests: phase 1 now
+    /// retains issue snapshot bodies under `<state_root>/bodies`, so a
+    /// pass must never aim that at the process working directory.
+    fn pass_state_root() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "workloop-pass-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn supervisor(mode: &str, root: std::path::PathBuf) -> Supervisor<PosixProcessControl> {
+        // Contract launches are fixture-profile evidence: the
+        // reference profile's bwrap boundary is proven by the
+        // containment suite, not by these pass-level tests.
         Supervisor::new(
             PosixProcessControl,
             root,
             vec![fixture_bin(), mode.to_string()],
             config(),
+        )
+        .with_isolation_profile(
+            workloop_core::worker::isolation_profile(
+                workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+            )
+            .unwrap(),
         )
     }
 
@@ -1324,6 +1444,7 @@ mod tests {
         supervisor: Option<&Supervisor<PosixProcessControl>>,
         clock: &mut dyn FnMut() -> i64,
     ) -> TickReport {
+        let state_root = pass_state_root();
         run_pass(
             &mut Pass {
                 store,
@@ -1331,7 +1452,7 @@ mod tests {
                 settings,
                 supervisor,
                 host,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             None,
             clock,
@@ -1346,6 +1467,7 @@ mod tests {
         clock: &mut dyn FnMut() -> i64,
     ) -> TickReport {
         let mut host = FixtureGithub::new();
+        let state_root = pass_state_root();
         run_pass(
             &mut Pass {
                 store,
@@ -1353,7 +1475,7 @@ mod tests {
                 settings,
                 supervisor: None,
                 host: &mut host,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             scope,
             clock,
@@ -1727,6 +1849,58 @@ mod tests {
         );
     }
 
+    /// Catalogue paths are installation-relative — a managed body
+    /// records a `bodies/…` path under the state root — and the sweep
+    /// resolves them under the same state root. An eligible body loses
+    /// both its bytes and its `present` state; a mismatched resolution
+    /// root would mark the row `reclaimed` as `missing` while the real
+    /// file survives.
+    #[test]
+    fn the_retention_sweep_reclaims_an_eligible_body_under_the_bodies_root() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let settings = settings();
+        let state_root = pass_state_root();
+        let rel = "bodies/issue-snapshot/eligible";
+        let file = state_root.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"snapshot").unwrap();
+        store
+            .register_body(&workloop_store::retention::CatalogBody {
+                body_id: "snap-1".into(),
+                category: "cas".into(),
+                path: rel.into(),
+                bytes: 8,
+                registered_unix_seconds: NOW - 100,
+                eligible_after_unix_seconds: Some(NOW - 10),
+                pinned: false,
+            })
+            .unwrap();
+
+        let mut host = FixtureGithub::new();
+        let report = run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: state_root.as_path(),
+            },
+            None,
+            &mut || NOW,
+            &|| false,
+        );
+
+        let retention = &report.phases[6];
+        assert_eq!(retention.phase, "retention_sweep");
+        assert_eq!(retention.status, "completed");
+        assert!(!file.exists(), "the sweep deletes the body file: {file:?}");
+        let (state, reason, _) = store.body_state("snap-1").unwrap().unwrap();
+        assert_eq!(state, "reclaimed");
+        assert_eq!(reason.as_deref(), Some("age_expired"));
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
     /// Attention derivation always runs and never consults the deadline
     /// itself. The closing clock read must surface a pass that crossed
     /// the deadline while deriving Attention.
@@ -1946,6 +2120,7 @@ mod tests {
             checks.get() > 3
         };
         let mut host = FixtureGithub::new();
+        let state_root = pass_state_root();
         let report = run_pass(
             &mut Pass {
                 store: &store,
@@ -1953,7 +2128,7 @@ mod tests {
                 settings: &settings,
                 supervisor: None,
                 host: &mut host,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             None,
             &mut || NOW,
@@ -2037,6 +2212,90 @@ mod tests {
             store.transact(|tx| tx.slot_holders()).unwrap().is_empty(),
             "the slot is released once no writer can exist"
         );
+    }
+
+    /// Phase 1 retains every successfully-read issue source as an
+    /// immutable snapshot body under the CAS root: the catalogue row
+    /// resolves by the spec-bound lookup path, the file on disk
+    /// verifies against the catalogue identity, and a later pass over
+    /// unchanged state re-registers the same body as a replay.
+    #[test]
+    fn a_source_refresh_retains_the_issue_snapshot_body_for_dispatch() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (_w, _e) = submit_with_sources(&store, "k-snap", vec![source(9, "rev-1", "d-1")]);
+        let settings = settings();
+        let mut host = FixtureGithub::new();
+        host.set_issue_content(
+            &issue(9),
+            "rev-1",
+            "the title",
+            "the body",
+            IssueState::Open,
+        );
+        let state_root = pass_state_root();
+        let mut clock = || NOW;
+        run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: state_root.as_path(),
+            },
+            None,
+            &mut clock,
+            &|| false,
+        );
+
+        let snapshot = IssueSnapshotBody::new(
+            WireIssue {
+                host: "host-local".into(),
+                repository: "local-repo".into(),
+                issue: "issue-9".into(),
+            },
+            "rev-1",
+            "the title",
+            "the body",
+            issue_content_digest("the title", "the body"),
+        );
+        let path = snapshot.retained_path();
+        let entry = store
+            .catalogue_entry_at(CAS_CATEGORY, &path)
+            .unwrap()
+            .expect("the read issue's snapshot is retained");
+        assert_eq!(entry.state, "present");
+        assert_eq!(entry.category, CAS_CATEGORY);
+        // The file under the CAS root resolves to verified bytes.
+        let bodies = BodyStore::new(state_root.clone());
+        let resolved = bodies
+            .resolve_at(&store, CAS_CATEGORY, &path)
+            .unwrap()
+            .expect("present");
+        assert_eq!(resolved.bytes, snapshot.canonical_bytes());
+        assert_eq!(resolved.body_id, entry.body_id);
+
+        // A second pass over unchanged state replays the same body —
+        // no duplicate row, no rewritten file.
+        run_pass(
+            &mut Pass {
+                store: &store,
+                config: &config(),
+                settings: &settings,
+                supervisor: None,
+                host: &mut host,
+                state_root: state_root.as_path(),
+            },
+            None,
+            &mut clock,
+            &|| false,
+        );
+        let entry2 = store
+            .catalogue_entry_at(CAS_CATEGORY, &path)
+            .unwrap()
+            .expect("still retained");
+        assert_eq!(entry2.body_id, entry.body_id);
+        assert_eq!(entry2.bytes, entry.bytes);
     }
 
     /// A crash after the queued→ready commit replays the durable request
@@ -2458,6 +2717,7 @@ mod tests {
         clock: &mut dyn FnMut() -> i64,
     ) -> TickReport {
         let cfg = config();
+        let state_root = pass_state_root();
         run_pass(
             &mut Pass {
                 store,
@@ -2465,7 +2725,7 @@ mod tests {
                 settings,
                 supervisor: None,
                 host: adapter,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             None,
             clock,
@@ -2641,6 +2901,8 @@ mod tests {
                 source_revision: "rev-1".into(),
                 content_digest: "digest-1".into(),
                 state: IssueState::Open,
+                title: String::new(),
+                body: String::new(),
             }),
         );
         let mut adapter = production_adapter(fake);
@@ -2685,6 +2947,8 @@ mod tests {
                 source_revision: "rev-1".into(),
                 content_digest: "d1".into(),
                 state: IssueState::Open,
+                title: String::new(),
+                body: String::new(),
             }),
         );
         run_production(&store, &settings, &mut adapter, &mut || NOW);
@@ -3269,6 +3533,8 @@ mod tests {
                 source_revision: "rev-1".into(),
                 content_digest: "d1".into(),
                 state: IssueState::Open,
+                title: String::new(),
+                body: String::new(),
             }),
         );
         let mut adapter = production_adapter(fake);
@@ -3885,6 +4151,8 @@ mod tests {
                 source_revision: "rev-wrong-host".into(),
                 content_digest: "d-wrong".into(),
                 state: IssueState::Open,
+                title: String::new(),
+                body: String::new(),
             }),
         );
         let mut adapter = production_adapter(fake);

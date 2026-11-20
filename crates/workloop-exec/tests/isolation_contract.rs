@@ -51,6 +51,20 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these environment-hygiene tests.
+fn fixture_sup<P: workloop_core::ports::ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        isolation_profile(workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID).unwrap(),
+    )
+}
+
 fn config() -> WorkloopConfig {
     WorkloopConfig {
         host: HostTemplate {
@@ -259,7 +273,7 @@ fn assert_scrubbed(env: &WorkerEnv, scratch_prefix: &Path) {
 fn a_spawned_worker_runs_under_an_allowlisted_environment() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("spawnenv");
-    let sup: Supervisor<PosixProcessControl> = Supervisor::new(
+    let sup: Supervisor<PosixProcessControl> = fixture_sup(
         PosixProcessControl,
         root.clone(),
         vec![
@@ -336,7 +350,7 @@ fn the_describe_probe_runs_under_the_scrubbed_environment() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("probeenv");
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -551,7 +565,7 @@ fn a_failed_environment_preparation_refuses_the_launch() {
     std::fs::create_dir_all(&iso).unwrap();
     std::fs::write(iso.join("inv-inv-1"), "occupied").unwrap();
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -606,7 +620,7 @@ fn a_failed_probe_environment_fails_closed_before_binding() {
     // probe or launch — can be prepared.
     std::fs::write(root.join(".isolation"), "occupied").unwrap();
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -646,7 +660,7 @@ fn isolation_scratch_trees_are_reclaimed_with_their_lifecycle() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("scratchrelease");
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -692,7 +706,7 @@ fn a_refused_spawn_reclaims_the_launch_scratch() {
     port.push_plan(SpawnPlan::Refused {
         reason: "no slot".into(),
     });
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -735,7 +749,7 @@ fn an_unknown_spawn_outcome_retains_the_launch_scratch() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "identity capture failed".into(),
     });
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -772,7 +786,7 @@ fn a_stop_driven_launch_reclaims_its_scratch_tree() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("stoprelease");
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],
@@ -839,7 +853,7 @@ fn isolation_scratch_orphans_are_swept_but_live_trees_are_kept() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("orphansweep");
     let port = ScriptedProcessControl::new();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         port.clone(),
         root.clone(),
         vec!["fixture-worker".into()],

@@ -521,7 +521,7 @@ pub(crate) fn applied_opened_change(
 /// the change request its `open_change_request` receipt opened, the
 /// latest observed head for it, and the latest target-branch revision.
 /// `None` until the change request exists.
-pub(crate) fn current_target(
+pub fn current_target(
     tx: &dyn ReadView,
     work_id: &WorkId,
 ) -> Result<Option<DiffTarget>, StoreError> {
@@ -582,7 +582,7 @@ pub(crate) fn current_target(
 /// Rounds are immutable per-target evidence: an out-of-order review for
 /// a superseded target is recorded, but it never masks the current
 /// target's evidence surface.
-pub(crate) fn latest_round_for_target(
+pub fn latest_round_for_target(
     tx: &dyn ReadView,
     work_id: &WorkId,
     target: &DiffTarget,
@@ -2742,6 +2742,29 @@ fn assess(
                 let mut next = execution.clone();
                 next.state = ExecutionState::Paused;
                 next.pause_reason = Some("repair: launch refused before spawn".into());
+                next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+                next.paused_since_unix_seconds = Some(now_unix_seconds);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: ExecutionState::Ready,
+                })?;
+                tx.apply(&Effect::ReleaseSlot {
+                    execution_id: execution.id.clone(),
+                })?;
+            }
+            Ok(())
+        }
+        ObservationFact::DispatchRefused { code, detail, .. } => {
+            // No Invocation ever existed for the request: the refusal
+            // is proven before spawn, so — like `LaunchRefused` — it
+            // resolves the waiting Execution only from `ready` and
+            // never resurrects a cancelled or settled one. The
+            // durable refusal record keeps the typed code for audit;
+            // the pause reason carries it verbatim for the operator.
+            if execution.state == ExecutionState::Ready {
+                let mut next = execution.clone();
+                next.state = ExecutionState::Paused;
+                next.pause_reason = Some(format!("repair: dispatch refused {code}: {detail}"));
                 next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
                 next.paused_since_unix_seconds = Some(now_unix_seconds);
                 tx.apply(&Effect::UpdateExecution {

@@ -269,6 +269,11 @@ pub struct IssueRead {
     pub source_revision: String,
     pub content_digest: String,
     pub state: IssueState,
+    /// The issue title exactly as the remote reports it — carried into
+    /// the retained snapshot body a dispatch request binds.
+    pub title: String,
+    /// The issue body exactly as the remote reports it.
+    pub body: String,
 }
 
 /// The remote's record of a repository's default-branch head.
@@ -368,13 +373,24 @@ pub enum RemoteMutation {
 }
 
 /// What one source-refresh pass read: head movements ingested, heads
-/// already matching the recorded facts, and sources left for the next
-/// pass because the tick/source deadline stopped the read.
+/// already matching the recorded facts, sources left for the next
+/// pass because the tick/source deadline stopped the read, and the
+/// full content of every issue source successfully read — carried out
+/// so the composition root can retain the immutable snapshot bodies a
+/// dispatch request binds (`docs/v0.3.md` §4).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SourceRefreshReport {
     pub unchanged: usize,
     pub ingested: usize,
     pub deferred: Vec<String>,
+    /// Every issue source whose authoritative read completed this
+    /// pass, whether or not the recorded observation changed — the
+    /// retained body must exist even when the gate already matched.
+    pub snapshots: Vec<crate::api::IssueSnapshotRead>,
+    /// The pass's own clock reading at refresh start — the timestamp
+    /// retention stamps on the bodies this report's snapshots produce,
+    /// so downstream work never needs a second clock call.
+    pub now_unix_seconds: i64,
 }
 
 /// What one host-outbox pass attempted, with the untouched remainder.
@@ -550,6 +566,37 @@ impl FixtureGithub {
                 source_revision: source_revision.to_string(),
                 content_digest: content_digest.to_string(),
                 state,
+                title: String::new(),
+                body: String::new(),
+            },
+        );
+        self.bump(&ReadSubject::Issue {
+            issue: issue.clone(),
+        });
+    }
+
+    /// Plant an issue read whose title/body are self-consistent: the
+    /// recorded `content_digest` is the canonical
+    /// `issue_content_digest(title, body)`, exactly what a real
+    /// transport reports. Dispatch-path tests need this shape — the
+    /// retained snapshot body verifies the digest against the content.
+    pub fn set_issue_content(
+        &mut self,
+        issue: &IssueRef,
+        source_revision: &str,
+        title: &str,
+        body: &str,
+        state: IssueState,
+    ) {
+        let content_digest = workloop_selector::issue_content_digest(title, body);
+        self.issues.insert(
+            issue.to_string(),
+            IssueRead {
+                source_revision: source_revision.to_string(),
+                content_digest,
+                state,
+                title: title.to_string(),
+                body: body.to_string(),
             },
         );
         self.bump(&ReadSubject::Issue {
@@ -2027,7 +2074,10 @@ impl FixtureGithub {
         scope: Option<&WorkId>,
     ) -> Result<SourceRefreshReport, StoreError> {
         let now = clock();
-        let mut report = SourceRefreshReport::default();
+        let mut report = SourceRefreshReport {
+            now_unix_seconds: now,
+            ..SourceRefreshReport::default()
+        };
         // Authoritative reads of the declared issue sources feed the
         // source gate: a matching read unblocks admission, a changed or
         // closed source and an unreadable one both hold dispatch. Only
@@ -2042,7 +2092,8 @@ impl FixtureGithub {
                     continue;
                 }
             }
-            let (revision, digest, state) = match self.issues.get(&key) {
+            let read = self.issues.get(&key);
+            let (revision, digest, state) = match read {
                 Some(read) => (
                     read.source_revision.clone(),
                     read.content_digest.clone(),
@@ -2050,6 +2101,19 @@ impl FixtureGithub {
                 ),
                 None => (String::new(), String::new(), IssueState::Unavailable),
             };
+            // Every completed authoritative read is carried out for
+            // retention — even when the recorded observation is
+            // unchanged — so the composition root can (re)retain the
+            // immutable snapshot body a bound request resolves.
+            if let Some(read) = read {
+                report.snapshots.push(crate::api::IssueSnapshotRead {
+                    issue: source.issue.clone(),
+                    source_revision: read.source_revision.clone(),
+                    content_digest: read.content_digest.clone(),
+                    title: read.title.clone(),
+                    body: read.body.clone(),
+                });
+            }
             let latest = latest_recorded_issue(store, &work_id, &source.issue)?;
             if latest.as_ref() == Some(&(revision.clone(), digest.clone(), state.clone())) {
                 report.unchanged += 1;

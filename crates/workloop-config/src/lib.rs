@@ -150,6 +150,40 @@ pub struct Installation {
     /// no override, not no profile.
     #[serde(default)]
     pub worker_isolation_profile: Option<String>,
+    /// The single runtime credential the contained Worker may receive,
+    /// as an `env:`/`file:`/`command:` provider reference — never a
+    /// secret value (`docs/v0.3.md` §14.3). Resolved once at the
+    /// supervisor boundary and delivered only through the approved
+    /// `/taisan/runtime-auth` path; absent means the Worker gets no
+    /// runtime credential.
+    #[serde(default)]
+    pub worker_credential_ref: Option<String>,
+    /// Absolute path to a non-secret provider configuration file or
+    /// directory, bound read-only at `/taisan/provider-config`. It
+    /// must not contain the resolved credential value; the supervisor
+    /// validates before mounting.
+    #[serde(default)]
+    pub worker_provider_config: Option<String>,
+    /// Bare host names the Worker CONNECT proxy may reach on port 443
+    /// (`docs/v0.3.md` §14.4). Empty denies all Worker egress — the
+    /// strictest profile, never a wildcard grant. Entries must be bare
+    /// host names disjoint from the repository host and the
+    /// verification allowlist.
+    #[serde(default)]
+    pub worker_model_api_hosts: Vec<String>,
+    /// Absolute path to the pinned verification toolchain, bound
+    /// read-only into the verification sandbox (`docs/v0.3.md` §14.5).
+    #[serde(default)]
+    pub verification_toolchain: Option<String>,
+    /// Absolute read-only dependency caches for the verification
+    /// sandbox.
+    #[serde(default)]
+    pub verification_cache_paths: Vec<String>,
+    /// Installation default verification egress hosts; the effective
+    /// per-command set adds the request's declared
+    /// `verification_egress_hosts` and never contains a model-API host.
+    #[serde(default)]
+    pub verification_egress_allowlist: Vec<String>,
     #[serde(default = "default_workspace_root")]
     pub workspace_root: String,
     #[serde(default)]
@@ -176,6 +210,32 @@ pub struct Installation {
     /// authority and its absence blocks nothing.
     #[serde(default)]
     pub selector: Option<serde_json::Value>,
+}
+
+/// The validated Worker credential/egress surface returned by
+/// [`Installation::worker_egress`]. Paths are absolute; host names are
+/// lowercased bare host names.
+#[derive(Debug, Clone)]
+pub struct WorkerEgress {
+    /// `env:`/`file:`/`command:` provider reference — shape-validated,
+    /// never a resolved value.
+    pub credential_ref: Option<String>,
+    /// Absolute path to the non-secret provider configuration.
+    pub provider_config: Option<PathBuf>,
+    /// Bare host names the Worker CONNECT proxy may reach on 443.
+    pub model_api_hosts: Vec<String>,
+}
+
+/// The validated verification sandbox surface returned by
+/// [`Installation::verification_boundary`].
+#[derive(Debug, Clone)]
+pub struct VerificationBoundary {
+    /// Absolute path to the pinned toolchain, when configured.
+    pub toolchain: Option<PathBuf>,
+    /// Absolute read-only dependency cache paths.
+    pub cache_paths: Vec<PathBuf>,
+    /// Installation-default verification egress hosts.
+    pub egress_allowlist: Vec<String>,
 }
 
 /// The selector binding for alternate admission. Presence selects the
@@ -464,6 +524,12 @@ fn load_or_create_with(
         capacity: default_capacity(),
         worker_argv: vec![],
         worker_isolation_profile: None,
+        worker_credential_ref: None,
+        worker_provider_config: None,
+        worker_model_api_hosts: vec![],
+        verification_toolchain: None,
+        verification_cache_paths: vec![],
+        verification_egress_allowlist: vec![],
         workspace_root: default_workspace_root(),
         allowed_effects: None,
         budget: None,
@@ -528,6 +594,15 @@ impl Installation {
     ) -> Result<workloop_core::worker::IsolationProfile, String> {
         match &self.worker_isolation_profile {
             None => Ok(workloop_core::worker::default_isolation_profile()),
+            // The contract-harness profile declares no sandbox
+            // primitive: an installation naming it would run every
+            // launch uncontained — test evidence only, never a
+            // production boundary (`docs/v0.3.md` §14).
+            Some(id) if id == workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID => Err(format!(
+                "installation worker_isolation_profile '{id}' names the contract-harness \
+                     profile, whose launches never prove namespace enforcement — production \
+                     installs must name a profile with a sandbox primitive"
+            )),
             Some(id) => workloop_core::worker::isolation_profile(id).ok_or_else(|| {
                 let approved: Vec<&str> =
                     workloop_core::worker::approved_isolation_profile_ids().collect();
@@ -538,6 +613,117 @@ impl Installation {
                 )
             }),
         }
+    }
+
+    /// The validated Worker credential/egress surface
+    /// (`docs/v0.3.md` §14.3–§14.4). Every entry is shape-checked at
+    /// this boundary: the credential reference must parse as a known
+    /// provider (its value is never resolved or echoed here), the
+    /// provider config must be an absolute path, and every egress entry
+    /// must be a bare host name disjoint from the verification
+    /// allowlist and the bound repository host — overlap is a
+    /// configuration error, never a widened grant. Absent credential
+    /// and empty hosts are valid: they mean no runtime credential and
+    /// deny-all Worker egress, the strictest profile.
+    pub fn worker_egress(&self) -> Result<WorkerEgress, String> {
+        if let Some(reference) = &self.worker_credential_ref {
+            workloop_core::credential::CredentialProvider::parse_str(reference)
+                .map_err(|rule| format!("installation worker_credential_ref: {rule}"))?;
+        }
+        let provider_config = match &self.worker_provider_config {
+            None => None,
+            Some(path) => {
+                let path = std::path::PathBuf::from(path);
+                if !path.is_absolute() {
+                    return Err(
+                        "installation worker_provider_config: must be an absolute path".into(),
+                    );
+                }
+                Some(path)
+            }
+        };
+        let mut model_api_hosts = Vec::new();
+        for entry in &self.worker_model_api_hosts {
+            let host = entry.trim().to_lowercase();
+            if !crate::profile::is_bare_host_name(&host) {
+                return Err(format!(
+                    "installation worker_model_api_hosts: '{entry}' is not a bare host name"
+                ));
+            }
+            if !model_api_hosts.contains(&host) {
+                model_api_hosts.push(host);
+            }
+        }
+        let repository_host = canonical_host_instance(&self.host_instance).to_lowercase();
+        if model_api_hosts.contains(&repository_host) {
+            return Err(
+                "installation worker_model_api_hosts: a model-API host may not name the \
+                 bound repository host"
+                    .into(),
+            );
+        }
+        for entry in &self.verification_egress_allowlist {
+            let host = entry.trim().to_lowercase();
+            if model_api_hosts.contains(&host) {
+                return Err(format!(
+                    "installation worker_model_api_hosts: '{host}' is also a verification \
+                     egress host — the two policies must be disjoint"
+                ));
+            }
+        }
+        Ok(WorkerEgress {
+            credential_ref: self.worker_credential_ref.clone(),
+            provider_config,
+            model_api_hosts,
+        })
+    }
+
+    /// The validated verification sandbox surface
+    /// (`docs/v0.3.md` §14.5): absolute toolchain/cache paths and the
+    /// installation-default egress allowlist of bare host names. The
+    /// effective per-command set adds the request's declared
+    /// `verification_egress_hosts` at dispatch; it never contains a
+    /// model-API host (checked by [`Self::worker_egress`]).
+    pub fn verification_boundary(&self) -> Result<VerificationBoundary, String> {
+        let toolchain = match &self.verification_toolchain {
+            None => None,
+            Some(path) => {
+                let path = std::path::PathBuf::from(path);
+                if !path.is_absolute() {
+                    return Err(
+                        "installation verification_toolchain: must be an absolute path".into(),
+                    );
+                }
+                Some(path)
+            }
+        };
+        let mut cache_paths = Vec::new();
+        for entry in &self.verification_cache_paths {
+            let path = std::path::PathBuf::from(entry);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "installation verification_cache_paths: '{entry}' must be an absolute path"
+                ));
+            }
+            cache_paths.push(path);
+        }
+        let mut allowlist = Vec::new();
+        for entry in &self.verification_egress_allowlist {
+            let host = entry.trim().to_lowercase();
+            if !crate::profile::is_bare_host_name(&host) {
+                return Err(format!(
+                    "installation verification_egress_allowlist: '{entry}' is not a bare host name"
+                ));
+            }
+            if !allowlist.contains(&host) {
+                allowlist.push(host);
+            }
+        }
+        Ok(VerificationBoundary {
+            toolchain,
+            cache_paths,
+            egress_allowlist: allowlist,
+        })
     }
 
     /// The bound host instance identity: the configured `host_instance`
@@ -840,6 +1026,120 @@ mod tests {
         assert_eq!(
             read(&path).unwrap().unwrap().actor_id,
             *ids.iter().next().unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A default installation record plus its temp root for the
+    /// boundary-accessor tests.
+    fn installation(tag: &str) -> (PathBuf, Installation) {
+        let dir = temp_root(tag);
+        let path = dir.join("config.json");
+        let installation = load_or_create(&path).unwrap();
+        (dir, installation)
+    }
+
+    /// Absent credential/egress keys are the strictest profile: no
+    /// runtime credential, no provider config, deny-all model egress —
+    /// and they validate cleanly so an unconfigured installation can
+    /// still launch contained Workers.
+    #[test]
+    fn worker_egress_defaults_to_deny_all() {
+        let (dir, installation) = installation("egress-default");
+        let egress = installation.worker_egress().unwrap();
+        assert!(egress.credential_ref.is_none());
+        assert!(egress.provider_config.is_none());
+        assert!(egress.model_api_hosts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A credential reference is shape-checked at this boundary: an
+    /// unknown provider spelling refuses, a known one passes without
+    /// its value ever being resolved or echoed.
+    #[test]
+    fn worker_egress_validates_the_credential_reference_shape() {
+        let (dir, mut installation) = installation("egress-cred");
+        installation.worker_credential_ref = Some("not-a-provider".into());
+        let err = installation.worker_egress().unwrap_err();
+        assert!(err.contains("worker_credential_ref"), "{err}");
+
+        installation.worker_credential_ref = Some("env:TAISAN_MODEL_TOKEN".into());
+        assert!(installation.worker_egress().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provider config must be absolute; model-API hosts must be bare
+    /// host names — a scheme, port, or path is a load error, and
+    /// entries normalize to lowercase.
+    #[test]
+    fn worker_egress_validates_provider_config_and_host_shape() {
+        let (dir, mut installation) = installation("egress-shape");
+        installation.worker_provider_config = Some("relative/provider.toml".into());
+        let err = installation.worker_egress().unwrap_err();
+        assert!(err.contains("worker_provider_config"), "{err}");
+
+        installation.worker_provider_config = None;
+        installation.worker_model_api_hosts = vec!["https://api.example.com".into()];
+        let err = installation.worker_egress().unwrap_err();
+        assert!(err.contains("bare host name"), "{err}");
+
+        installation.worker_model_api_hosts =
+            vec!["API.Example.COM ".into(), "api.example.com".into()];
+        let egress = installation.worker_egress().unwrap();
+        assert_eq!(egress.model_api_hosts, vec!["api.example.com".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The model-API set is disjoint from both the bound repository
+    /// host and the verification allowlist — overlap is a
+    /// configuration error, never a widened grant.
+    #[test]
+    fn worker_egress_refuses_host_overlap() {
+        let (dir, mut installation) = installation("egress-overlap");
+        // The default host_instance is "host-local".
+        installation.worker_model_api_hosts = vec!["host-local".into()];
+        let err = installation.worker_egress().unwrap_err();
+        assert!(err.contains("repository host"), "{err}");
+
+        installation.worker_model_api_hosts = vec!["shared.example".into()];
+        installation.verification_egress_allowlist = vec!["shared.example".into()];
+        let err = installation.worker_egress().unwrap_err();
+        assert!(err.contains("disjoint"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verification boundary paths must be absolute and allowlist
+    /// entries bare host names; valid input normalizes and dedups.
+    #[test]
+    fn verification_boundary_validates_paths_and_hosts() {
+        let (dir, mut installation) = installation("verify-boundary");
+        installation.verification_toolchain = Some("relative/toolchain".into());
+        let err = installation.verification_boundary().unwrap_err();
+        assert!(err.contains("verification_toolchain"), "{err}");
+
+        installation.verification_toolchain = Some("/opt/taisan/toolchain".into());
+        installation.verification_cache_paths = vec!["deps".into()];
+        let err = installation.verification_boundary().unwrap_err();
+        assert!(err.contains("verification_cache_paths"), "{err}");
+
+        installation.verification_cache_paths = vec!["/var/cache/taisan/deps".into()];
+        installation.verification_egress_allowlist = vec!["crates.io:443".into()];
+        let err = installation.verification_boundary().unwrap_err();
+        assert!(err.contains("bare host name"), "{err}");
+
+        installation.verification_egress_allowlist = vec![
+            "Crates.IO ".into(),
+            "crates.io".into(),
+            "static.crates.io".into(),
+        ];
+        let boundary = installation.verification_boundary().unwrap();
+        assert_eq!(
+            boundary.egress_allowlist,
+            vec!["crates.io".to_string(), "static.crates.io".to_string()]
+        );
+        assert_eq!(
+            boundary.toolchain.as_deref(),
+            Some(std::path::Path::new("/opt/taisan/toolchain"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
