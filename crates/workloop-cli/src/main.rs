@@ -2077,6 +2077,13 @@ fn build_supervisor(
     } else {
         None
     };
+    // Finished v2 Invocations retain their report evidence into the
+    // CAS root regardless of the current `worker_dispatch` section —
+    // collection follows the recorded request body, so the store is
+    // installed whenever a state root exists.
+    let supervisor = supervisor.with_body_store(workloop_exec::bodies::BodyStore::new(
+        state_root.to_path_buf(),
+    ));
     // The v2 dispatch profile (`docs/v0.3.md` §4/§14.8): a validated
     // `worker_dispatch` section means requests not yet consumed launch
     // through the complete bound-request transport — the durable
@@ -2100,7 +2107,7 @@ fn build_supervisor(
                 ));
             }
             let dispatch = workloop_exec::request_v2::V2Dispatch {
-                bodies: workloop_exec::bodies::BodyStore::new(state_root.join("bodies")),
+                bodies: workloop_exec::bodies::BodyStore::new(state_root.to_path_buf()),
                 sources: vec![workloop_exec::workspace::RepositorySource {
                     repository: config.host.repository.clone(),
                     path: profile.source_path,
@@ -2495,7 +2502,7 @@ mod tests {
             .unwrap()
             .expect("worker_argv configured");
         let dispatch = supervisor.v2.as_ref().expect("v2 dispatch attached");
-        assert_eq!(dispatch.bodies.root(), state_root.join("bodies"));
+        assert_eq!(dispatch.bodies.root(), state_root);
         assert_eq!(dispatch.sources.len(), 1);
         assert_eq!(dispatch.sources[0].repository, config().host.repository);
         assert_eq!(
@@ -2556,8 +2563,10 @@ mod tests {
 
         // A dispatch section under a profile that declares no sandbox
         // primitive refuses composition (docs/v0.3.md OPS-02): the v2
-        // launch never degrades to hygiene-only, and the v1 argv-only
-        // path under the same profile stays composed.
+        // launch never degrades to hygiene-only — and the
+        // contract-harness profile itself is refused at composition
+        // regardless of the dispatch section, so the v1 argv-only path
+        // under it never composes either.
         installation.worker_argv = vec!["/opt/worker/bin/worker".into()];
         installation.worker_isolation_profile =
             Some(workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID.to_string());
@@ -2566,10 +2575,10 @@ mod tests {
             .expect("v2 dispatch under a primitive-free profile refuses");
         assert!(err.contains("sandbox primitive"), "{err}");
         installation.worker_dispatch = None;
-        let supervisor = build_supervisor(&config(), &installation, &state_root)
-            .unwrap()
-            .expect("the v1 path under the harness profile still composes");
-        assert!(supervisor.v2.is_none());
+        let err = build_supervisor(&config(), &installation, &state_root)
+            .err()
+            .expect("the v1 path under the harness profile also refuses");
+        assert!(err.contains("sandbox primitive"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

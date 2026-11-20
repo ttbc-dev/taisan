@@ -32,6 +32,15 @@ struct Args {
     decl_file: Option<String>,
     request: Option<String>,
     out: Option<String>,
+    /// Test-only report shaping for the v2 `run` transport: the worker
+    /// status/reason to emit, or a supervisor-classification scenario
+    /// (`skip`, `malformed`, `oversize`, `symlink`, `unreadable`,
+    /// `wrong_identity`).
+    /// `None` emits the default success report. Declaration probes
+    /// ignore it — it never changes the declared surface.
+    report_mode: Option<String>,
+    /// Test-only runtime.log size pad for truncation scenarios.
+    log_bytes: Option<u64>,
 }
 
 fn parse() -> Args {
@@ -44,6 +53,8 @@ fn parse() -> Args {
     let mut decl_file = None;
     let mut request = None;
     let mut out = None;
+    let mut report_mode = None;
+    let mut log_bytes = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -64,6 +75,10 @@ fn parse() -> Args {
             "--decl-file" => decl_file = it.next(),
             "--request" => request = it.next(),
             "--out" => out = it.next(),
+            "--report-mode" => report_mode = it.next(),
+            "--log-bytes" => {
+                log_bytes = it.next().and_then(|v| v.parse().ok());
+            }
             other => positionals.push(other.to_string()),
         }
     }
@@ -93,6 +108,8 @@ fn parse() -> Args {
         decl_file,
         request,
         out,
+        report_mode,
+        log_bytes,
     }
 }
 
@@ -193,50 +210,104 @@ fn run_request(args: &Args, ws: &Path) {
     let out = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&out).expect("create out dir");
     let log_path = out.join("runtime.log");
-    std::fs::write(&log_path, format!("fixture worker run {request_path}\n"))
-        .expect("write runtime.log");
+    let mut log_content = format!("fixture worker run {request_path}\n");
+    if let Some(target) = args.log_bytes {
+        let pad = target.saturating_sub(log_content.len() as u64) as usize;
+        log_content.push_str(&"x".repeat(pad));
+    }
+    std::fs::write(&log_path, &log_content).expect("write runtime.log");
     let log_bytes = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     let log_digest = workloop_core::domain::sha256_hex(
         "worker-runtime-log-v1",
         &std::fs::read(&log_path).unwrap_or_default(),
     );
-    // The report echoes the exact request binding; `report_digest`
-    // covers the canonical body minus the member, computed with the
-    // same helpers the supervisor's classifier uses.
-    let mut report = serde_json::json!({
-        "format_version": "taisan.worker.report/2",
-        "request_id": request.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
-        "invocation_id": request.get("invocation_id").cloned().unwrap_or(serde_json::Value::Null),
-        "request_digest": request.get("request_digest").cloned().unwrap_or(serde_json::Value::Null),
-        "role": request.get("role").cloned().unwrap_or(serde_json::Value::Null),
-        "status": "success",
-        "reason": {"code": "completed"},
-        "claimed_head": null,
-        "claimed_checks": [],
-        "findings": [],
-        "invariant_items": [],
-        "continuation": {"workspace_commit": null, "report_refs": []},
-        "runtime_usage": {
-            "turns": 1,
-            "elapsed_ms": 1,
-            "runtime_product": "fixture-runtime",
-        },
-        "log": {
-            "path": "runtime.log",
-            "bytes": log_bytes,
-            "truncated": false,
-            "digest": log_digest,
-        },
-    });
-    let digest = workloop_core::worker_v2::report_v2_digest(
-        &workloop_core::worker_v2::report_canonical_body(&report),
-    );
-    report["report_digest"] = serde_json::Value::String(digest);
-    std::fs::write(
-        out.join("report.json"),
-        workloop_core::domain::canonical_json(&report),
-    )
-    .expect("write report.json");
+    let report_path = out.join("report.json");
+    match args.report_mode.as_deref().unwrap_or("success") {
+        // No report at all — the supervisor's `absent` class.
+        "skip" => {}
+        // Bytes that are not the envelope — `invalid(report.malformed)`.
+        "malformed" => {
+            std::fs::write(&report_path, b"{not json").expect("write malformed report");
+        }
+        // A link where the contract wants a regular file — the
+        // supervisor must classify `invalid(report.unsafe_path)`
+        // without ever following it.
+        "symlink" => {
+            let _ = std::fs::remove_file(&report_path);
+            std::os::unix::fs::symlink(&request_path, &report_path).expect("symlink report.json");
+        }
+        // A regular file no reader may open — the supervisor must
+        // classify `invalid(report.unreadable)` and still finish the
+        // Invocation rather than wedging on the read error.
+        "unreadable" => {
+            std::fs::write(&report_path, b"{}").expect("write unreadable report");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&report_path, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000 report.json");
+        }
+        mode => {
+            // The report echoes the exact request binding;
+            // `report_digest` covers the canonical body minus the
+            // member, computed with the same helpers the supervisor's
+            // classifier uses.
+            let (status, reason_code) = match mode {
+                "negative" => ("negative", "checks_failed"),
+                "unavailable" => ("unavailable", "missing_required_input"),
+                "refused" => ("refused", "provider_refused"),
+                "limit_reached" => ("limit_reached", "deadline_reached"),
+                "failed" => ("failed", "internal_error"),
+                "oversize" => ("success", "completed"),
+                "wrong_identity" => ("success", "completed"),
+                _ => ("success", "completed"),
+            };
+            let mut report = serde_json::json!({
+                "format_version": "taisan.worker.report/2",
+                "request_id": request.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
+                "invocation_id": request.get("invocation_id").cloned().unwrap_or(serde_json::Value::Null),
+                "request_digest": request.get("request_digest").cloned().unwrap_or(serde_json::Value::Null),
+                "role": request.get("role").cloned().unwrap_or(serde_json::Value::Null),
+                "status": status,
+                "reason": {"code": reason_code},
+                "claimed_head": null,
+                "claimed_checks": [],
+                "findings": [],
+                "invariant_items": [],
+                "continuation": {"workspace_commit": null, "report_refs": []},
+                "runtime_usage": {
+                    "turns": 1,
+                    "elapsed_ms": 1,
+                    "runtime_product": "fixture-runtime",
+                },
+                "log": {
+                    "path": "runtime.log",
+                    "bytes": log_bytes,
+                    "truncated": false,
+                    "digest": log_digest,
+                },
+            });
+            if mode == "wrong_identity" {
+                report["invocation_id"] = serde_json::Value::String("inv-not-this-one".to_string());
+            }
+            if mode == "oversize" {
+                // Pad past the request's own `max_report_bytes` — the
+                // supervisor must classify `invalid(report.oversize)`
+                // before parsing.
+                let bound = request
+                    .pointer("/budget/max_report_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1 << 20);
+                report["findings"] = serde_json::json!([
+                    {"pad": "x".repeat((bound as usize).min(64 << 20))}
+                ]);
+            }
+            let digest = workloop_core::worker_v2::report_v2_digest(
+                &workloop_core::worker_v2::report_canonical_body(&report),
+            );
+            report["report_digest"] = serde_json::Value::String(digest);
+            std::fs::write(&report_path, workloop_core::domain::canonical_json(&report))
+                .expect("write report.json");
+        }
+    }
     // The base mode's workspace behavior still applies: `clean-exit`
     // produces the artifact, `exit-no-artifact` does not, `hang` keeps
     // the process alive for the stop paths.

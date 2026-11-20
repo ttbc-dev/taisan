@@ -23,7 +23,8 @@ use workloop_core::store::{
     BodyCatalog, Effect, HostAction, HostActionIntent, Store, StoreError, TxView,
 };
 use workloop_core::work::{
-    HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
+    HostTemplate, WorkloopConfig, admit_queued, classify_failure, handle_command,
+    handle_observation, material_progress_basis,
 };
 use workloop_core::worker_v2::*;
 use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
@@ -2309,4 +2310,566 @@ fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
     assert_eq!(invocations[0].state, InvocationState::Prepared);
     assert!(invocations[0].process_identity.is_none());
     assert!(!pending_ids(&store).contains(&rid));
+}
+
+// === Worker report evidence collection (`taisan.worker.report/2`,
+// docs/v0.3.md §6) ==============================================
+
+/// The `WorkerReport`/`WorkerReportConflict` facts recorded against
+/// one Execution, in observation order.
+fn report_facts(store: &SqliteStore, execution_id: &ExecutionId) -> Vec<ObservationFact> {
+    store
+        .transact(|tx| tx.observations_for_execution(execution_id))
+        .unwrap()
+        .into_iter()
+        .map(|o| o.fact)
+        .filter(|f| {
+            matches!(
+                f,
+                ObservationFact::WorkerReport { .. } | ObservationFact::WorkerReportConflict { .. }
+            )
+        })
+        .collect()
+}
+
+/// Drive passes until the Invocation resolves `Done` — the same loop
+/// the materialization test uses.
+fn drive_to_done(sup: &Supervisor<PosixProcessControl>, store: &SqliteStore, rid: &str) {
+    for _ in 0..100 {
+        sup.run_once(store, NOW).unwrap();
+        if invocation_state(store, rid) == Some(InvocationState::Done) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("invocation {rid} did not resolve Done");
+}
+
+/// Fixture argv for the v2 transport plus report-shaping flags:
+/// `[fixture, <mode>, --wire v2, <extra>...]`.
+fn v2_argv(mode: &str, extra: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        fixture_bin(),
+        mode.to_string(),
+        "--wire".into(),
+        "v2".into(),
+    ];
+    for flag in extra {
+        argv.push((*flag).to_string());
+    }
+    argv
+}
+
+/// Run one v2 dispatch whose fixture worker shapes its report via
+/// `--report-mode`, drive it to `Done`, and return the recorded
+/// report facts plus the handles a caller needs to resolve evidence.
+fn run_report_mode(
+    tag: &str,
+    mode: &str,
+    extra: &[&str],
+) -> (
+    SqliteStore,
+    PathBuf,
+    WorkId,
+    ExecutionId,
+    String,
+    Vec<ObservationFact>,
+) {
+    let root = tmp_root(tag);
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, &format!("v2-report-{tag}"), vec![]);
+    let sup = supervisor_v2_argv(&root, &state_root, &src, v2_argv(mode, extra));
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    let facts = report_facts(&store, &e);
+    (store, state_root, w, e, rid, facts)
+}
+
+/// The single accepted `WorkerReport` fact, panicking on anything
+/// else — every class test asserts exactly one report observation.
+fn the_report_fact(facts: &[ObservationFact]) -> &ObservationFact {
+    assert_eq!(facts.len(), 1, "exactly one report fact: {facts:?}");
+    match &facts[0] {
+        ObservationFact::WorkerReport { .. } => &facts[0],
+        other => panic!("expected WorkerReport, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_finished_v2_invocation_records_classified_report_evidence() {
+    let (store, state_root, _w, e, rid, facts) = run_report_mode("ok", "clean-exit", &[]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        invocation_id,
+        request_id,
+        classification,
+        report,
+        log,
+    } = fact
+    else {
+        unreachable!()
+    };
+    assert_eq!(request_id, &rid);
+    assert_eq!(*classification, ReportClassification::Success);
+    assert!(invocation_id.0.starts_with("inv-"));
+
+    // The retained report bytes resolve through the CAS and parse as
+    // the exact envelope the worker wrote — echoing this request.
+    let report = report.as_ref().expect("report bytes retained");
+    assert!(!report.truncated);
+    assert!(report.bytes > 0);
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let resolved = bodies
+        .resolve(store.body_catalog(), &report.body_id)
+        .unwrap()
+        .expect("retained report body resolves");
+    let reparsed: WorkerReportV2 = serde_json::from_slice(&resolved.bytes).unwrap();
+    assert_eq!(reparsed.status, WorkerReportStatus::Success);
+    assert_eq!(reparsed.request_id, rid);
+    assert_eq!(reparsed.invocation_id, invocation_id.0);
+
+    // The measured runtime.log retention is recorded alongside.
+    let log = log.as_ref().expect("runtime.log retained");
+    assert!(!log.truncated);
+    assert!(log.bytes > 0);
+
+    // Report evidence carries no lifecycle authority: it is neither
+    // material progress nor a failure class — exit-zero and worker
+    // claims cannot move the Execution by themselves.
+    assert_eq!(material_progress_basis(fact), None);
+    assert_eq!(classify_failure(fact), None);
+    let _ = e;
+}
+
+#[test]
+fn a_negative_report_is_recorded_distinct_from_success() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("neg", "clean-exit", &["--report-mode", "negative"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    assert_eq!(*classification, ReportClassification::Negative);
+    assert!(report.is_some(), "the negative envelope is retained");
+}
+
+#[test]
+fn an_unavailable_report_is_recorded_distinct_from_negative() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("unavail", "clean-exit", &["--report-mode", "unavailable"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(*classification, ReportClassification::Unavailable);
+}
+
+#[test]
+fn a_provider_refusal_is_a_typed_failure_not_a_retry() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("refused", "clean-exit", &["--report-mode", "refused"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Failure {
+            code: "provider_refused".into()
+        }
+    );
+}
+
+#[test]
+fn a_missing_report_is_absent_never_empty_success() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("skip", "clean-exit", &["--report-mode", "skip"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        log,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    assert_eq!(*classification, ReportClassification::Absent);
+    assert!(report.is_none(), "absent carries no report body");
+    assert!(log.is_some(), "the runtime.log evidence is still kept");
+}
+
+#[test]
+fn a_malformed_report_is_invalid_with_its_raw_bytes_retained() {
+    let (store, state_root, _w, _e, _rid, facts) =
+        run_report_mode("malformed", "clean-exit", &["--report-mode", "malformed"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r.starts_with("report.malformed")),
+        "malformed reason recorded: {reasons:?}"
+    );
+    let report = report.as_ref().expect("invalid raw bytes retained");
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let resolved = bodies
+        .resolve(store.body_catalog(), &report.body_id)
+        .unwrap()
+        .expect("retained invalid body resolves");
+    assert_eq!(resolved.bytes, b"{not json");
+}
+
+#[test]
+fn a_report_for_another_invocation_is_invalid_and_never_adopted() {
+    let (_store, _state_root, _w, _e, _rid, facts) = run_report_mode(
+        "wrongid",
+        "clean-exit",
+        &["--report-mode", "wrong_identity"],
+    );
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.wrong_invocation"),
+        "wrong_invocation reason recorded: {reasons:?}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r == "report.wrong_request"),
+        "the request binding itself matched: {reasons:?}"
+    );
+}
+
+#[test]
+fn an_oversize_report_is_invalid_before_parsing() {
+    let (store, state_root, _w, _e, _rid, facts) =
+        run_report_mode("oversize", "clean-exit", &["--report-mode", "oversize"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.oversize"),
+        "oversize reason recorded: {reasons:?}"
+    );
+    // Only the bounded prefix is retained, marked truncated — never
+    // the unbounded tail.
+    let report = report.as_ref().expect("bounded prefix retained");
+    assert!(report.truncated);
+    assert_eq!(report.bytes, 1 << 20, "the dispatch max_report_bytes");
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let resolved = bodies
+        .resolve(store.body_catalog(), &report.body_id)
+        .unwrap()
+        .expect("prefix body resolves");
+    assert_eq!(resolved.bytes.len() as u64, 1 << 20);
+}
+
+#[test]
+fn a_symlinked_report_is_unsafe_never_followed() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("symlink", "clean-exit", &["--report-mode", "symlink"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        log,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.unsafe_path"),
+        "unsafe_path reason recorded: {reasons:?}"
+    );
+    assert!(report.is_none(), "a symlink is never read as evidence");
+    assert!(log.is_some(), "the regular runtime.log is still kept");
+}
+
+#[test]
+fn an_unreadable_report_is_invalid_and_the_invocation_still_finishes() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("unreadable", "clean-exit", &["--report-mode", "unreadable"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        log,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.unreadable"),
+        "unreadable reason recorded: {reasons:?}"
+    );
+    assert!(
+        report.is_none(),
+        "no bytes retained from an unreadable file"
+    );
+    assert!(log.is_some(), "the regular runtime.log is still kept");
+}
+
+#[test]
+fn an_overbound_log_is_retained_truncated_and_marked() {
+    let root = tmp_root("logcap");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, e, rid) = admit(&store, "v2-logcap", vec![]);
+    let mut dispatch = dispatch_profile(&state_root, &src);
+    dispatch.budget.max_log_bytes = 256;
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        PosixProcessControl,
+        handoff.workspace_root.clone(),
+        v2_argv("clean-exit", &["--log-bytes", "4096"]),
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch);
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let facts = report_facts(&store, &e);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { log, .. } = fact else {
+        unreachable!()
+    };
+    let log = log.as_ref().expect("log retained");
+    assert!(log.truncated, "the over-bound log is marked truncated");
+    assert_eq!(log.bytes, 256, "only the bounded prefix is kept");
+}
+
+#[test]
+fn a_report_is_not_ingested_before_the_process_tree_proves_stopped() {
+    let root = tmp_root("report-gate");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-report-gate", vec![]);
+    // `hang` writes report.json/runtime.log and then loops forever —
+    // the out dir is complete on disk while the writer still lives.
+    let sup = supervisor_v2(&root, &state_root, &src, "hang", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    wait_for(
+        || io_dir.join("out").join("report.json").is_file(),
+        "report.json on disk",
+    );
+
+    // Poll passes observe the live writer but must not ingest the
+    // report — collection begins only after the tree proves stopped.
+    for _ in 0..5 {
+        sup.poll_invocations(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        report_facts(&store, &e).is_empty(),
+        "no report evidence while the writer lives"
+    );
+
+    // Cancel drives the stop path; the proven exit collects the
+    // already-written report exactly once.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "v2-report-gate-cancel".into(),
+            body: CommandBody::Cancel {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    for _ in 0..60 {
+        sup.drive_stops(&store, NOW).unwrap();
+        if !execution_invocation(&store, &e, &invocation.id)
+            .state
+            .is_unresolved_writer()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let facts = report_facts(&store, &e);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Success,
+        "the completed report is collected at the proven stop"
+    );
+}
+
+#[test]
+fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict() {
+    let root = tmp_root("report-conflict");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-report-conflict", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let request = store
+        .transact(|tx| tx.request(&rid))
+        .unwrap()
+        .expect("request recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    let report_path = io_dir.join("out").join("report.json");
+    wait_for(|| report_path.is_file(), "report.json on disk");
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let ws_root = root.join("ws");
+    let collect = |store: &SqliteStore| {
+        workloop_exec::report_v2::collect(
+            store,
+            Some(&bodies),
+            &ws_root,
+            &invocation,
+            &request,
+            NOW,
+        )
+    };
+
+    // First collection yields the accepted WorkerReport fact; deliver
+    // it through the same observation path the supervisor uses.
+    let first = collect(&store)
+        .unwrap()
+        .expect("first collection produces the report fact");
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e.clone()),
+            fact: first,
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    // Identical bytes re-collect to nothing — idempotent replay.
+    assert!(
+        collect(&store).unwrap().is_none(),
+        "identical evidence is never re-recorded"
+    );
+
+    // Different bytes under the same identity — here the same
+    // semantic report with a trailing byte — are a retained conflict;
+    // the accepted evidence is never overwritten.
+    let mut changed = std::fs::read(&report_path).unwrap();
+    changed.push(b' ');
+    std::fs::write(&report_path, &changed).unwrap();
+    let conflict = collect(&store)
+        .unwrap()
+        .expect("changed bytes produce a conflict fact");
+    let ObservationFact::WorkerReportConflict {
+        accepted_report,
+        observed_report,
+        ..
+    } = &conflict
+    else {
+        panic!("expected WorkerReportConflict, got {conflict:?}")
+    };
+    assert!(accepted_report.is_some(), "accepted evidence named");
+    assert!(observed_report.is_some(), "conflicting evidence named");
+    assert_ne!(
+        accepted_report, observed_report,
+        "the conflict names two different byte identities"
+    );
+    // The conflicting bytes themselves are retained in the CAS.
+    let observed = observed_report.as_ref().unwrap();
+    let resolved = bodies
+        .resolve(store.body_catalog(), &observed.body_id)
+        .unwrap()
+        .expect("conflicting body resolves");
+    assert_eq!(resolved.bytes, changed);
+
+    // Deliver the conflict through the observation path — it is
+    // retained as evidence, never a replacement for the accepted
+    // report.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e.clone()),
+            fact: conflict.clone(),
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let facts = report_facts(&store, &e);
+    let reports = facts
+        .iter()
+        .filter(|f| matches!(f, ObservationFact::WorkerReport { .. }))
+        .count();
+    assert_eq!(reports, 1, "one accepted report fact survives");
+    assert!(
+        facts
+            .iter()
+            .any(|f| matches!(f, ObservationFact::WorkerReportConflict { .. })),
+        "the conflict is retained as evidence"
+    );
+
+    // Let the pass finish the Invocation; the automatic collection at
+    // the proven stop sees the same conflict and dedupes against it.
+    drive_to_done(&sup, &store, &rid);
 }
