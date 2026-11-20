@@ -384,6 +384,80 @@ fn reaped_identity_inspects_stopped_and_signals_already_gone() {
     );
 }
 
+/// Signature enumeration is read-only: a zombie match is skipped, but
+/// the scan must never reap one — the exit status belongs to the
+/// invocation that owns the pid, and the owning path's `reap` still
+/// reads it after a scan.
+#[test]
+fn signature_scan_never_reaps_a_zombie_match() {
+    let root = tmp_root("scan-zombie");
+    let port = PosixProcessControl;
+    let signature = format!("{} clean-exit", fixture_bin());
+    let identity = port
+        .spawn(
+            &[fixture_bin(), "clean-exit".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
+        .expect("spawn");
+    // The writer exits and stays an unreaped zombie of this test
+    // process — `inspect` proves the stop without consuming it.
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "writer exited",
+    );
+    // A full signature scan runs over the live table; whether or not
+    // the platform still shows the zombie's argv, the scan is
+    // enumeration only — it cannot consume the exit status.
+    let matches = port.matching_processes(&signature).expect("scan");
+    assert!(
+        !matches.iter().any(|m| m.identity.pid == identity.pid),
+        "a zombie is never a live signature match"
+    );
+    assert_eq!(
+        port.reap(identity.pid),
+        Some(0),
+        "the scan left the zombie's exit status for its owner"
+    );
+}
+
+/// The directory scan is the absence proof's last handle: it finds a
+/// process by working directory alone — the shape an escaped
+/// descendant takes after leaving the launch argv signature.
+#[test]
+fn directory_scan_finds_an_occupant_by_cwd_alone() {
+    let root = tmp_root("dir-scan");
+    let port = PosixProcessControl;
+    let identity = port
+        .spawn(
+            &[fixture_bin(), "hang".into()],
+            &root,
+            &WorkerEnv::default(),
+        )
+        .expect("spawn");
+    let occupants = port.processes_in_directory(&root).expect("scan");
+    assert!(
+        occupants.iter().any(|m| m.identity.pid == identity.pid),
+        "a live process inside the directory is reported by cwd alone"
+    );
+    // The scan is scoped to the directory: the same process is not
+    // an occupant of an unrelated empty directory.
+    let other = tmp_root("dir-scan-other");
+    assert!(
+        !port
+            .processes_in_directory(&other)
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == identity.pid),
+        "the scan is scoped to the directory"
+    );
+    port.signal_verified(&identity, libc::SIGKILL);
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "stopped after signal",
+    );
+}
+
 #[test]
 fn setsid_escapee_is_in_the_snapshot_and_signaled() {
     let root = tmp_root("setsid");
