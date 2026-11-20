@@ -267,17 +267,17 @@ impl Drop for RuntimeBoundary {
 
 /// Bounded content digest of a provider-config path for the boundary
 /// identity: a file hashes its bytes (capped); a directory hashes a
-/// sorted manifest of member names, kinds, and sizes — enough that any
-/// edit re-proves the gate without hashing unbounded trees.
+/// sorted manifest of member names, kinds, and per-member content
+/// digests — enough that any edit re-proves the gate without hashing
+/// unbounded trees.
 fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
-    const MAX_FILE: u64 = 1024 * 1024;
     const MAX_ENTRIES: usize = 256;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
         let mut buf = Vec::new();
-        file.take(MAX_FILE).read_to_end(&mut buf)?;
+        file.take(MAX_PROVIDER_FILE).read_to_end(&mut buf)?;
         return Ok(sha256_hex("provider-config-file-v1", &buf));
     }
     if !metadata.is_dir() {
@@ -295,12 +295,19 @@ fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
     ))
 }
 
+/// Per-member read bound for [`collect_manifest`]: a member file's
+/// digest covers at most its first 1 MiB, and the member count is
+/// capped at the caller's budget — the manifest stays bounded however
+/// large the config tree is.
+const MAX_PROVIDER_FILE: u64 = 1024 * 1024;
+
 fn collect_manifest(
     root: &Path,
     dir: &Path,
     out: &mut Vec<String>,
     budget: usize,
 ) -> Result<(), std::io::Error> {
+    use std::io::Read;
     if out.len() >= budget {
         return Ok(());
     }
@@ -315,12 +322,24 @@ fn collect_manifest(
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        // Never follow a member link: a symlink's identity is its
+        // target path, and recursing or hashing through it would
+        // fold an outside tree into this config's identity.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path)?.to_string_lossy().into_owned();
+            out.push(format!("link:{rel}:{target}"));
+        } else if file_type.is_dir() {
             out.push(format!("dir:{rel}"));
             collect_manifest(root, &path, out, budget)?;
-        } else if metadata.is_file() {
-            out.push(format!("file:{rel}:{}", metadata.len()));
+        } else if file_type.is_file() {
+            // Content, not name+size: a same-size edit is an identity
+            // change the gate must re-prove.
+            let file = std::fs::File::open(&path)?;
+            let mut buf = Vec::new();
+            file.take(MAX_PROVIDER_FILE).read_to_end(&mut buf)?;
+            let digest = sha256_hex("provider-config-member-v1", &buf);
+            out.push(format!("file:{rel}:{}:{}", entry.metadata()?.len(), digest));
         }
     }
     Ok(())
@@ -451,6 +470,31 @@ mod tests {
         // identity_digest re-reads the file each call.
         let d2 = boundary.identity_digest().unwrap();
         assert_ne!(d1, d2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_same_size_member_edit_changes_the_directory_identity() {
+        let dir = tmp("dirmanifest");
+        let cfg_dir = dir.join("provider.d");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m1\"\n").unwrap();
+        let digest_before = provider_config_digest(&cfg_dir).unwrap();
+        // Same byte length, different content.
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m2\"\n").unwrap();
+        let digest_after = provider_config_digest(&cfg_dir).unwrap();
+        assert_ne!(
+            digest_before, digest_after,
+            "a same-size content edit must re-prove the boundary"
+        );
+        // A re-pointed member link is an identity change too.
+        std::fs::write(dir.join("real.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.toml"), cfg_dir.join("b.toml")).unwrap();
+        let linked = provider_config_digest(&cfg_dir).unwrap();
+        std::fs::remove_file(cfg_dir.join("b.toml")).unwrap();
+        std::fs::write(dir.join("other.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("other.toml"), cfg_dir.join("b.toml")).unwrap();
+        assert_ne!(linked, provider_config_digest(&cfg_dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

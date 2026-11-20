@@ -578,7 +578,10 @@ fn run_named_probe(
                 if trimmed.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", &trimmed[..trimmed.len().min(200)])
+                    // Bound by characters: a byte slice can split a
+                    // multibyte codepoint and panic on worker output.
+                    let bounded: String = trimmed.chars().take(200).collect();
+                    format!(": {bounded}")
                 }
             }),
         ),

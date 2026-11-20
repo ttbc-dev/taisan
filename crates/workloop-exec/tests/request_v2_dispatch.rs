@@ -2791,6 +2791,102 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
     drive_to_done(&sup, &store, &rid);
 }
 
+/// An `absent` first report followed by an unreadable report path is
+/// not an idempotent replay: both observations carry no report
+/// evidence, but the classification changed, and the fact record must
+/// retain the conflict rather than silently dropping the second read.
+#[test]
+fn an_absent_then_unreadable_report_is_a_conflict_not_a_replay() {
+    let root = tmp_root("report-class-conflict");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-report-class-conflict", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let request = store
+        .transact(|tx| tx.request(&rid))
+        .unwrap()
+        .expect("request recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    let out_dir = io_dir.join("out");
+    let report_path = out_dir.join("report.json");
+    wait_for(|| report_path.is_file(), "report.json on disk");
+    let bodies = BodyStore::new(state_root.join("bodies"));
+    let ws_root = root.join("ws");
+    let collect = |store: &SqliteStore| {
+        workloop_exec::report_v2::collect(
+            store,
+            Some(&bodies),
+            &ws_root,
+            &invocation,
+            &request,
+            NOW,
+        )
+    };
+
+    // Remove the report before the first collection: the accepted
+    // fact is `absent` with no retained evidence.
+    std::fs::remove_file(&report_path).unwrap();
+    let first = collect(&store)
+        .unwrap()
+        .expect("first collection produces the absent report fact");
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = &first
+    else {
+        panic!("expected WorkerReport, got {first:?}")
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Absent,
+        "a missing report file classifies absent"
+    );
+    assert!(report.is_none(), "absent carries no report evidence");
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(_w.clone()),
+            subject_execution_id: Some(_e.clone()),
+            fact: first,
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    // Replace the out directory with a link: the second read is
+    // `report.unsafe_path` — also evidence-free, but a different
+    // class. Equal evidence under a different class is a conflict.
+    std::fs::remove_dir_all(&out_dir).unwrap();
+    let elsewhere = root.join("elsewhere-out");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &out_dir).unwrap();
+    let conflict = collect(&store)
+        .unwrap()
+        .expect("a class change with equal evidence is a conflict fact");
+    let ObservationFact::WorkerReportConflict {
+        accepted_report,
+        observed_report,
+        ..
+    } = &conflict
+    else {
+        panic!("expected WorkerReportConflict, got {conflict:?}")
+    };
+    assert!(accepted_report.is_none(), "the accepted class was absent");
+    assert!(
+        observed_report.is_none(),
+        "an unsafe path retains no report evidence"
+    );
+}
+
 // === Produced-commit handoff and independent verification
 // (docs/v0.3.md §6.3) ==============================================
 
