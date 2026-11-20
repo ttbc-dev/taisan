@@ -185,6 +185,21 @@ impl BodyStore {
     ) -> Result<String, BodyError> {
         let id = content_id(bytes);
         let file = self.managed(path)?;
+        // A lookup path is single-tenant: if the catalogue already binds
+        // this `(category, path)` to different content, the deterministic
+        // identity collided or the row was tampered with — refuse before
+        // any filesystem cost rather than leave bytes at a path another
+        // body's row resolves through.
+        if let Some(existing) = catalog.body_entry_at(category, path)?
+            && existing.body_id != id
+        {
+            return Err(BodyError::UnsafePath {
+                detail: format!(
+                    "catalogue path {path:?} is already bound to body {}",
+                    existing.body_id
+                ),
+            });
+        }
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 BodyError::Fault(format!("create bodies dir {}: {e}", parent.display()))
@@ -233,20 +248,6 @@ impl BodyStore {
         // sync is harmless and keeps the publish path uniform.
         if let Some(parent) = file.parent() {
             fsync_dir(parent)?;
-        }
-        // A lookup path is single-tenant: if the catalogue already binds
-        // this `(category, path)` to different content, the deterministic
-        // identity collided or the row was tampered with — refuse rather
-        // than register an ambiguous second body at one path.
-        if let Some(existing) = catalog.body_entry_at(category, path)?
-            && existing.body_id != id
-        {
-            return Err(BodyError::UnsafePath {
-                detail: format!(
-                    "catalogue path {path:?} is already bound to body {}",
-                    existing.body_id
-                ),
-            });
         }
         catalog.register_body(&NewCatalogBody {
             body_id: id.clone(),
@@ -611,6 +612,46 @@ mod tests {
             ),
             Err(BodyError::UnsafePath { .. }) | Err(BodyError::Fault(_))
         ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_at_refuses_a_bound_lookup_path_before_touching_the_file() {
+        let root = tmp("bound-refuse");
+        let store = BodyStore::new(root.clone());
+        let catalog = MemCatalog::default();
+        let bytes = b"snapshot-envelope".to_vec();
+        store
+            .retain_at(
+                &catalog,
+                CAS_CATEGORY,
+                "issue-snapshot/abc",
+                &bytes,
+                100,
+                None,
+            )
+            .expect("retain_at");
+        // The row survives but its file is gone — the state a sweep
+        // leaves behind. Writing different bytes here before the
+        // single-tenant check would leave them at a path another
+        // body's row resolves through.
+        let file = root.join("issue-snapshot/abc");
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(
+            store.retain_at(
+                &catalog,
+                CAS_CATEGORY,
+                "issue-snapshot/abc",
+                b"other",
+                100,
+                None
+            ),
+            Err(BodyError::UnsafePath { .. })
+        ));
+        assert!(
+            !file.exists(),
+            "the refused write left no bytes at the bound path"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
