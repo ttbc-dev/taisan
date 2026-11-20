@@ -34,6 +34,31 @@ pub enum ApiError {
     Unknown { reason: String },
 }
 
+/// The credential's repository permission bits — the read behind a
+/// capability report's `authorization` axis. A transport that cannot
+/// answer reports the read as failed; the adapter records
+/// `unknown`, never a guessed grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryPermissions {
+    /// Write-level access: ref updates, change-request writes,
+    /// comments, and review/thread mutations.
+    pub push: bool,
+    /// Read-level access: repository, branch, change-request, review,
+    /// check, and issue reads.
+    pub pull: bool,
+}
+
+impl Default for RepositoryPermissions {
+    /// No access: a transport that cannot answer must never default
+    /// to a grant.
+    fn default() -> Self {
+        Self {
+            push: false,
+            pull: false,
+        }
+    }
+}
+
 /// A pull request as GitHub reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePull {
@@ -145,6 +170,16 @@ pub trait GitHubApi {
     /// repository-level read that establishes the configured
     /// repository is reachable before any subject read.
     fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError>;
+
+    /// The credential's permission bits on `repository` — the
+    /// authoritative read behind a capability report's
+    /// `authorization` axis. Every transport must answer honestly:
+    /// `Err` means the bits could not be confirmed, and the caller
+    /// records `unknown`, never a guessed grant.
+    fn read_permissions(
+        &mut self,
+        repository: &RepositoryRef,
+    ) -> Result<RepositoryPermissions, ApiError>;
 
     /// The current head of `branch`, or `None` when the ref is absent.
     fn read_branch(

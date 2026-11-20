@@ -2670,6 +2670,15 @@ fn assess(
     {
         seal_round(tx, obs, work_id, now_unix_seconds)?;
     }
+    // A capability report is host-scoped evidence with no work or
+    // execution subject of its own, but it is the only event that can
+    // turn a capability-blocked publish chain loose: re-drive every
+    // Waiting execution on the reported host. `maybe_publish`
+    // re-checks each precondition itself, so the sweep is safe on
+    // every report — changed or not.
+    if let ObservationFact::CapabilityReport { host, .. } = &obs.fact {
+        redrive_capability_waiters(tx, config, host, now_unix_seconds)?;
+    }
     // Material progress resets the equivalent-failure streak and stamps
     // the no-progress clock with its durable basis.
     if let Some(basis) = material_progress_basis(&obs.fact)
@@ -3814,6 +3823,34 @@ fn assess_artifact(
         }
         _ => Ok(()),
     }
+}
+
+/// Re-drive `maybe_publish` for every Waiting execution whose Work
+/// binds the reported host. A capability report carries no work or
+/// execution subject, so without this sweep a publish chain blocked
+/// on `capability_held` would wait for an unrelated observation to
+/// re-fire — the level-triggered gap that left authorized work
+/// parked at `waiting` with zero intents.
+fn redrive_capability_waiters(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    host: &HostInstanceId,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    for work in tx.works()? {
+        if canonical_host_instance(work.binding.repository.host.as_str())
+            != canonical_host_instance(host.as_str())
+        {
+            continue;
+        }
+        let Some(execution) = crate::projection::current_execution(tx, &work.id)? else {
+            continue;
+        };
+        if execution.state == ExecutionState::Waiting {
+            maybe_publish(tx, config, &execution, now_unix_seconds)?;
+        }
+    }
+    Ok(())
 }
 
 /// Once the producing Invocation's evidence is complete — and, when

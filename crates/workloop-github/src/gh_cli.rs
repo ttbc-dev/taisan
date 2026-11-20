@@ -38,7 +38,7 @@ use workloop_core::observation::{CheckConclusion, IssueState};
 
 use crate::api::{
     ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-    RemoteReviewFinding,
+    RemoteReviewFinding, RepositoryPermissions,
 };
 
 /// Default per-call ceiling for one `gh` subprocess. A hung transport
@@ -606,6 +606,25 @@ impl GitHubApi for GhCliApi {
                 reason: "repository response missing default_branch".into(),
             })?;
         self.read_branch(repository, default_branch)
+    }
+
+    fn read_permissions(
+        &mut self,
+        repository: &RepositoryRef,
+    ) -> Result<RepositoryPermissions, ApiError> {
+        let slug = Self::slug(repository)?;
+        let repo = self.api("GET", &format!("repos/{slug}"), None)?;
+        // Absent bits are not granted: only an explicit `true` in the
+        // host's own permissions object authorizes a capability.
+        let bit = |name: &str| {
+            repo.pointer(&format!("/permissions/{name}"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        };
+        Ok(RepositoryPermissions {
+            push: bit("push"),
+            pull: bit("pull"),
+        })
     }
 
     fn read_branch(

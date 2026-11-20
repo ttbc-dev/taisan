@@ -9,7 +9,7 @@ use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
 use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::api::{
     ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-    RemoteReviewFinding,
+    RemoteReviewFinding, RepositoryPermissions,
 };
 
 /// One pull request the in-memory remote stores.
@@ -79,12 +79,30 @@ pub struct InMemoryGitHub {
     /// `operation` → lost response returned *after* the effect landed
     /// (or, for a read, instead of answering). One-shot per arming.
     lost: BTreeMap<String, ApiError>,
+    /// The permission bits `read_permissions` reports — the fake
+    /// credential's repository access.
+    permissions: RepositoryPermissions,
     next_comment: u64,
 }
 
 impl InMemoryGitHub {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            // The fake credential holds full access unless a test
+            // narrows it — the same standing every other fake read
+            // assumes.
+            permissions: RepositoryPermissions {
+                push: true,
+                pull: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Test control: narrow or widen the permission bits the
+    /// capability report's authorization axis reads.
+    pub fn set_permissions(&mut self, push: bool, pull: bool) {
+        self.permissions = RepositoryPermissions { push, pull };
     }
 
     /// The mutation history, in order — what the adapter's receipts
@@ -313,6 +331,19 @@ impl GitHubApi for InMemoryGitHub {
             return Err(err);
         }
         Ok(self.branch_head(repository, "main"))
+    }
+
+    fn read_permissions(
+        &mut self,
+        _repository: &RepositoryRef,
+    ) -> Result<RepositoryPermissions, ApiError> {
+        if let Some(err) = self.take_refusal("read_permissions") {
+            return Err(err);
+        }
+        if let Some(err) = self.take_lost("read_permissions") {
+            return Err(err);
+        }
+        Ok(self.permissions)
     }
 
     fn read_branch(
