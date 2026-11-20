@@ -225,23 +225,101 @@ fn kernel_release() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+/// In-sandbox destinations a bind spelled by its own host path must
+/// never cover or enter. The sealed trees hold supervisor-mounted
+/// content whose sandbox spelling differs from the host path — a bind
+/// landing inside them serves host content where the boundary
+/// contract promised the supervisor's mount (a `/taisan/request.json`
+/// argv element on a host that has one would shadow the
+/// digest-verified request; `/taisan/out` likewise). The covered
+/// mounts are the kernel/tmpfs views and fixed bind destinations: an
+/// equal or ancestor spelling covers the mount outright — a `/` argv
+/// element or configured path would re-mount the host root over the
+/// whole sandbox.
+const SEALED_TREES: &[&str] = &[SANDBOX_WORKSPACE, "/taisan"];
+const COVERED_MOUNTS: &[&str] = &["/tmp", "/run", "/home", "/proc", "/dev"];
+
+/// Whether `candidate` — a bind destination spelled at its own host
+/// path — covers or enters the supervisor-owned sandbox surface.
+/// Component-wise: `/taisanevil` is outside `/taisan`, while `/` is
+/// an ancestor of every fixed destination.
+fn shadows_sandbox_mount(candidate: &Path) -> bool {
+    SEALED_TREES
+        .iter()
+        .chain(COVERED_MOUNTS)
+        .any(|mount| Path::new(mount).starts_with(candidate))
+        || SEALED_TREES
+            .iter()
+            .any(|sealed| candidate.starts_with(sealed))
+}
+
 /// Absolute-path argv elements that exist on the host become
 /// read-only binds at their own path. Flags, sandbox paths (which do
 /// not exist on the host), bare names, and missing paths are skipped
 /// — a path the worker needs but that is absent fails honestly inside
-/// the sandbox, never silently on the host. `worker` names the one
-/// executable the plan binds separately; it is excluded here so the
-/// same path is never bound twice.
+/// the sandbox, never silently on the host. Spellings that cover or
+/// enter the supervisor-owned surface are skipped too: these binds
+/// render after the `/taisan` and `/workspace` mounts, so an argv
+/// element could otherwise shadow them (`/taisan/request.json` and
+/// `/taisan/out` are always present in a contained v2 argv; `/`
+/// re-mounts the host root). `worker` names the one executable the
+/// plan binds separately; it is excluded here so the same path is
+/// never bound twice.
 pub fn extra_binds(inner_argv: &[String], worker: Option<&Path>) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = worker.map(Path::to_path_buf).into_iter().collect();
     let mut binds = Vec::new();
     for arg in inner_argv.iter().skip(1) {
         let path = Path::new(arg);
-        if path.is_absolute() && path.exists() && seen.insert(path.to_path_buf()) {
+        if path.is_absolute()
+            && !shadows_sandbox_mount(path)
+            && path.exists()
+            && seen.insert(path.to_path_buf())
+        {
             binds.push(path.to_path_buf());
         }
     }
     binds
+}
+
+/// Refuse a mount plan whose binds would cover or enter the
+/// supervisor-owned sandbox surface. Every bind the plan mounts at
+/// its own spelling is checked — caches, argv-derived binds, the
+/// writable metadata binds, the toolchain's own-path bind, and the
+/// worker — and the toolchain source must not resolve to the host
+/// root, which would mount the whole host filesystem read-only under
+/// `/taisan/toolchain`. `Some(reason)` is a typed boundary refusal;
+/// `None` admits the plan. Callers check before rendering argv: a
+/// refused plan never reaches `bwrap`.
+pub fn plan_denial(plan: &MountPlan) -> Option<String> {
+    if let Some(toolchain) = &plan.toolchain {
+        let resolved = toolchain
+            .canonicalize()
+            .unwrap_or_else(|_| toolchain.clone());
+        if resolved.parent().is_none() {
+            return Some(format!(
+                "verification toolchain '{}' resolves to the host root — \
+                 the toolchain mount must name a directory below it",
+                toolchain.display()
+            ));
+        }
+    }
+    let own_path_binds = plan
+        .toolchain
+        .iter()
+        .chain(plan.caches.iter())
+        .chain(plan.extra_binds.iter())
+        .chain(plan.extra_rw_binds.iter())
+        .chain(plan.worker.iter());
+    for bind in own_path_binds {
+        let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
+        if shadows_sandbox_mount(bind) || shadows_sandbox_mount(&resolved) {
+            return Some(format!(
+                "mount plan bind '{}' covers a supervisor-owned sandbox path",
+                bind.display()
+            ));
+        }
+    }
+    None
 }
 
 /// Wrap `inner_argv` in the in-sandbox CONNECT relay
@@ -1130,6 +1208,88 @@ mod tests {
         let binds = extra_binds(&argv, Some(worker));
         assert_eq!(binds, vec![real.clone()]);
         let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn sandbox_mount_shadowing_covers_both_directions() {
+        for denied in [
+            "/",
+            "/taisan",
+            "/taisan/request.json",
+            "/taisan/out/nested",
+            "/workspace",
+            "/workspace/managed/file",
+            "/tmp",
+            "/run",
+            "/home",
+            "/proc",
+            "/dev",
+        ] {
+            assert!(shadows_sandbox_mount(Path::new(denied)), "{denied}");
+        }
+        for allowed in [
+            "/opt/worker.py",
+            "/usr/bin/env",
+            "/etc/ssl/cert.pem",
+            "/var/lib/cache",
+            "/taisanevil/x",
+            "/tmp/host-file",
+            "/home/user/.cache/toolchain",
+        ] {
+            assert!(!shadows_sandbox_mount(Path::new(allowed)), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn extra_binds_skip_spellings_that_cover_the_sandbox_surface() {
+        let worker = Path::new("/opt/worker");
+        // `/` and `/tmp` exist on every host, so the skip is the
+        // guard's doing — not the missing-path skip. `/etc` is a
+        // same-spelling system bind and still collects.
+        let real = std::env::temp_dir().join("workloop-extra-bind-shadow");
+        std::fs::write(&real, "x").unwrap();
+        let argv = vec![
+            "worker".into(),
+            "/".into(),
+            "/tmp".into(),
+            "/etc".into(),
+            real.to_string_lossy().into_owned(),
+        ];
+        let binds = extra_binds(&argv, Some(worker));
+        assert_eq!(binds, vec![PathBuf::from("/etc"), real.clone()]);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn plan_denial_refuses_a_root_toolchain() {
+        let mut plan = plan_fixture();
+        plan.toolchain = Some(PathBuf::from("/"));
+        let reason = plan_denial(&plan).expect("a root toolchain refuses");
+        assert!(reason.contains("host root"), "{reason}");
+        // Spellings that resolve to the root refuse identically.
+        plan.toolchain = Some(PathBuf::from("/."));
+        assert!(plan_denial(&plan).is_some());
+        // A named directory admits.
+        plan.toolchain = Some(PathBuf::from("/opt/toolchain"));
+        assert!(plan_denial(&plan).is_none());
+    }
+
+    #[test]
+    fn plan_denial_refuses_binds_over_the_sandbox_surface() {
+        let mut plan = plan_fixture();
+        plan.caches = vec![PathBuf::from("/")];
+        assert!(plan_denial(&plan).is_some());
+        plan.caches = vec![PathBuf::from("/taisan")];
+        assert!(plan_denial(&plan).is_some());
+        plan.caches = vec![];
+        plan.extra_binds = vec![PathBuf::from("/taisan/request.json")];
+        assert!(plan_denial(&plan).is_some());
+        plan.extra_binds = vec![];
+        plan.extra_rw_binds = vec![PathBuf::from("/workspace")];
+        assert!(plan_denial(&plan).is_some());
+        // The fixture plan itself admits.
+        plan.extra_rw_binds = vec![];
+        assert!(plan_denial(&plan).is_none());
     }
 
     /// A profile that declares a primitive which cannot resolve —

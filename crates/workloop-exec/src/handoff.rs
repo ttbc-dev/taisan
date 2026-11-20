@@ -1023,6 +1023,9 @@ fn prove_verification_mounts(
         worker: None,
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
+    if let Some(reason) = containment::plan_denial(&plan) {
+        return Err(format!("verification.toolchain_preflight_failed: {reason}"));
+    }
     let outer = containment::bwrap_args(primitive, &plan, &argv, "/tmp");
     match ctx.port.run_probe(
         &outer,
@@ -1171,6 +1174,9 @@ fn run_verification_contained(
         worker: Some(worker.clone()),
     };
     let _ = std::fs::create_dir_all(scratch_out);
+    if let Some(reason) = containment::plan_denial(&plan) {
+        return VerificationRun::Refused(format!("verification.containment_refused: {reason}"));
+    }
     let inner_cwd = worktree.to_string_lossy().into_owned();
     let outer = containment::bwrap_args(&primitive, &plan, &exec_argv, &inner_cwd);
     let env = containment::contained_env(&env, proxy_url);
