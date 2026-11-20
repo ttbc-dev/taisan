@@ -73,6 +73,41 @@ fn an_eligible_unpinned_body_is_reclaimed_and_metadata_survives() {
 }
 
 #[test]
+fn re_observing_a_reclaimed_body_restores_presence() {
+    let dir = root("restore");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let path = register(&store, &dir, "b1", NOW - 100, Some(NOW - 10), false, 8);
+    let report = store.retention_sweep(&params(), &dir, NOW).unwrap();
+    assert_eq!(report.reclaimed.len(), 1);
+    assert_eq!(store.body_state("b1").unwrap().unwrap().0, "reclaimed");
+
+    // The dispatch path re-observed the body — write_at re-created
+    // the file, then the catalogue registration replays with the same
+    // metadata. A row that stays `reclaimed` resolves the live body
+    // as permanently Unavailable, so the replay must restore
+    // `present` (and only then may the eligibility horizon extend).
+    std::fs::write(&path, vec![0u8; 8]).unwrap();
+    use workloop_core::store::{BodyCatalog, NewCatalogBody};
+    BodyCatalog::register_body(
+        &store,
+        &NewCatalogBody {
+            body_id: "b1".into(),
+            category: "cas".into(),
+            path: path.to_string_lossy().into_owned(),
+            bytes: 8,
+            registered_unix_seconds: NOW,
+            eligible_after_unix_seconds: Some(NOW + 1000),
+            pinned: false,
+        },
+    )
+    .unwrap();
+    let (state, reason, _) = store.body_state("b1").unwrap().unwrap();
+    assert_eq!(state, "present");
+    assert!(reason.is_none(), "the stale reclaim reason clears");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_cadence_gate_holds_a_second_pass_within_the_interval() {
     let dir = root("cadence");
     let store = SqliteStore::in_memory(1).unwrap();

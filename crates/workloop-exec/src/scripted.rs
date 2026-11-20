@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use workloop_core::domain::ProcessIdentity;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
+    WorkerEnv,
 };
 
 /// What the next `spawn` produces.
@@ -53,6 +54,12 @@ pub struct SignalRecord {
 struct Proc {
     started_at: String,
     pgid: Option<i32>,
+    /// The cwd the spawn ran under — the evidence `matching_processes`
+    /// reports for launch-outcome attribution.
+    cwd: PathBuf,
+    /// The argv the spawn was given, whitespace-joined like a process
+    /// table's command column.
+    command: String,
     alive: bool,
     exit_code: Option<i32>,
     /// When set, `inspect` reports `Unknown` — an uninspectable process,
@@ -62,6 +69,11 @@ struct Proc {
     /// writing — models the realizable gap between signal delivery and
     /// the process actually dying.
     survives_signal: bool,
+    /// When set, `matching_processes` reports `cwd: None` — a process
+    /// whose working directory the platform cannot prove (denied
+    /// lsof, minimal image). It can be neither bound nor ruled out,
+    /// and `processes_in_directory` errs on the incomplete table.
+    cwd_unreadable: bool,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +96,14 @@ struct State {
     children: BTreeMap<i32, Vec<i32>>,
     /// Queued snapshot failures consumed FIFO.
     snapshot_errors: VecDeque<String>,
+    /// Queued `matching_processes` failures consumed FIFO — an
+    /// enumeration that cannot complete must never authorize an
+    /// absence claim.
+    scan_errors: VecDeque<String>,
+    /// Queued `processes_in_directory` failures consumed FIFO — a
+    /// separate tool from the signature scan (`lsof` vs `ps`), so its
+    /// failures are queued separately.
+    dir_scan_errors: VecDeque<String>,
     /// Every accepted signal, in order — the write history a scenario
     /// audits without pattern-matching internals.
     signals: Vec<SignalRecord>,
@@ -121,7 +141,11 @@ impl ScriptedProcessControl {
         self.state.lock().unwrap().default_plan = Some(plan);
     }
 
-    /// Spawned leader identities in spawn order.
+    /// Every process the model spawned, in spawn order — the
+    /// process-table view, not the "identity the caller received"
+    /// view: a `SpawnPlan::Unknown` outcome still records its leader
+    /// because the process exists even though the spawn response was
+    /// lost. `spawn_calls` remains the no-second-writer counter.
     pub fn spawned(&self) -> Vec<ProcessIdentity> {
         self.state.lock().unwrap().spawned.clone()
     }
@@ -130,6 +154,18 @@ impl ScriptedProcessControl {
     /// no-second-writer counter.
     pub fn spawn_calls(&self) -> usize {
         self.state.lock().unwrap().spawn_calls
+    }
+
+    /// The command line each spawn was given, in spawn order — the
+    /// argv a mount-plan assertion reads the bound flags from.
+    pub fn commands(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .procs
+            .values()
+            .map(|proc| proc.command.clone())
+            .collect()
     }
 
     /// Every recorded signal, in order.
@@ -174,21 +210,57 @@ impl ScriptedProcessControl {
         }
     }
 
+    /// Make `matching_processes` report `cwd: None` for the pid until
+    /// cleared — an lsof-denied or minimal-image process whose launch
+    /// attribution cannot be proven either way. While it is live it
+    /// also makes `processes_in_directory` fail: an unmappable cwd is
+    /// an enumeration gap, never a silent absence.
+    pub fn set_cwd_unreadable(&self, pid: i32, on: bool) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.cwd_unreadable = on;
+        }
+    }
+
     /// Register a write-capable descendant of `leader` (e.g. a
     /// setsid-escaped writer) so `snapshot_descendants` reports it.
     pub fn adopt_child(&self, leader: i32) -> i32 {
+        let command = self
+            .state
+            .lock()
+            .unwrap()
+            .procs
+            .get(&leader)
+            .map(|p| p.command.clone());
+        self.adopt_child_with(leader, command.as_deref().unwrap_or_default())
+    }
+
+    /// Register a live process that shares `leader`'s working
+    /// directory but carries its own command line — the
+    /// escaped-descendant shape the launch signature cannot see but
+    /// the directory scan still finds.
+    pub fn adopt_child_with(&self, leader: i32, command: &str) -> i32 {
         let mut s = self.state.lock().unwrap();
         let pid = s.next_pid;
         s.next_pid += 1;
+        // A descendant shares its leader's launch context in the model.
+        let cwd = s
+            .procs
+            .get(&leader)
+            .map(|p| p.cwd.clone())
+            .unwrap_or_default();
         s.procs.insert(
             pid,
             Proc {
                 started_at: format!("scripted-lstart-{pid}"),
                 pgid: Some(pid), // escaped its leader's group
+                cwd,
+                command: command.to_string(),
                 alive: true,
                 exit_code: None,
                 inspect_unknown: None,
                 survives_signal: false,
+                cwd_unreadable: false,
             },
         );
         s.children.entry(leader).or_default().push(pid);
@@ -202,6 +274,28 @@ impl ScriptedProcessControl {
             .lock()
             .unwrap()
             .snapshot_errors
+            .push_back(reason.to_string());
+    }
+
+    /// The next `matching_processes` scan fails with this reason —
+    /// an unreadable process table that must never prove a writer
+    /// absent.
+    pub fn fail_next_process_scan(&self, reason: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .scan_errors
+            .push_back(reason.to_string());
+    }
+
+    /// The next `processes_in_directory` scan fails with this reason —
+    /// an unreadable directory enumeration that must never prove a
+    /// vanished launch's tree is gone.
+    pub fn fail_next_directory_scan(&self, reason: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .dir_scan_errors
             .push_back(reason.to_string());
     }
 
@@ -232,13 +326,14 @@ impl ScriptedProcessControl {
 impl ProcessControlPort for ScriptedProcessControl {
     fn spawn(
         &self,
-        _argv: &[String],
+        argv: &[String],
         cwd: &Path,
         env: &WorkerEnv,
     ) -> Result<ProcessIdentity, SpawnError> {
         let mut s = self.state.lock().unwrap();
         s.spawn_calls += 1;
         s.spawn_envs.push(env.clone());
+        let command = argv.join(" ");
         let plan = s
             .plans
             .pop_front()
@@ -249,20 +344,31 @@ impl ProcessControlPort for ScriptedProcessControl {
             SpawnPlan::Unknown { reason } => {
                 // The process exists in the model — a real spawn that
                 // crashed before identity capture leaves a live writer.
+                // Its leader identity is still recorded: the process
+                // was spawned even though the response was lost.
                 let pid = s.next_pid;
                 s.next_pid += 1;
                 let started_at = format!("scripted-lstart-{pid}");
+                let identity = ProcessIdentity {
+                    pid,
+                    started_at: started_at.clone(),
+                    pgid: Some(pid),
+                };
                 s.procs.insert(
                     pid,
                     Proc {
-                        started_at: started_at.clone(),
-                        pgid: Some(pid),
+                        started_at,
+                        pgid: identity.pgid,
+                        cwd: cwd.to_path_buf(),
+                        command,
                         alive: true,
                         exit_code: None,
                         inspect_unknown: None,
                         survives_signal: false,
+                        cwd_unreadable: false,
                     },
                 );
+                s.spawned.push(identity);
                 Err(SpawnError::Unknown { reason })
             }
             SpawnPlan::Resident | SpawnPlan::ExitAfterWrite { .. } => {
@@ -305,10 +411,13 @@ impl ProcessControlPort for ScriptedProcessControl {
                     Proc {
                         started_at: identity.started_at.clone(),
                         pgid: identity.pgid,
+                        cwd: cwd.to_path_buf(),
+                        command,
                         alive,
                         exit_code,
                         inspect_unknown: None,
                         survives_signal: false,
+                        cwd_unreadable: false,
                     },
                 );
                 s.spawned.push(identity.clone());
@@ -359,6 +468,60 @@ impl ProcessControlPort for ScriptedProcessControl {
                 pid: *pid,
                 started_at: p.started_at.clone(),
                 pgid: p.pgid,
+            })
+            .collect())
+    }
+
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.scan_errors.pop_front() {
+            return Err(reason);
+        }
+        let expected = crate::supervisor::normalize_lstart(command);
+        // The model's process table is system-wide like the real one:
+        // every live process whose command matches is a candidate,
+        // parentage irrelevant — a reparented orphan still matches.
+        // Dead rows are not matches — `alive` is the model's liveness
+        // read, and an uninspectable row still counts as live.
+        Ok(s.procs
+            .iter()
+            .filter(|(_, p)| p.alive && crate::supervisor::normalize_lstart(&p.command) == expected)
+            .map(|(pid, p)| ProcessMatch {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    started_at: p.started_at.clone(),
+                    pgid: p.pgid,
+                },
+                cwd: (!p.cwd_unreadable).then(|| p.cwd.clone()),
+                command: Some(p.command.clone()),
+            })
+            .collect())
+    }
+
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.dir_scan_errors.pop_front() {
+            return Err(reason);
+        }
+        // The model's cwd is provable unless flagged; a live process
+        // the scan cannot map makes the whole enumeration incomplete —
+        // like a real table read that cannot prove every row, the
+        // scan errs rather than return a truncated set an absence
+        // proof would read as clear.
+        if s.procs.values().any(|p| p.alive && p.cwd_unreadable) {
+            return Err("directory scan incomplete: process cwd unreadable".into());
+        }
+        Ok(s.procs
+            .iter()
+            .filter(|(_, p)| p.alive && crate::supervisor::cwd_within(Some(&p.cwd), dir))
+            .map(|(pid, p)| ProcessMatch {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    started_at: p.started_at.clone(),
+                    pgid: p.pgid,
+                },
+                cwd: Some(p.cwd.clone()),
+                command: Some(p.command.clone()),
             })
             .collect())
     }
@@ -492,7 +655,7 @@ impl ProcessControlPort for ScriptedProcessControl {
                         "runtime_version": "scripted-1.0.0",
                         "protocol_versions": ["taisan.worker/1"],
                         "roles": ["coding", "fix", "invariant_check", "review"],
-                        "capabilities": ["workspace_write", "artifact_json", "process_control"],
+                        "capabilities": ["workspace_write", "workspace_read_only", "artifact_json", "process_control"],
                     })
                     .to_string()
                     .into_bytes(),
