@@ -2447,6 +2447,34 @@ fn a_symlinked_report_is_unsafe_never_followed() {
 }
 
 #[test]
+fn an_unreadable_report_is_invalid_and_the_invocation_still_finishes() {
+    let (_store, _state_root, _w, _e, _rid, facts) =
+        run_report_mode("unreadable", "clean-exit", &["--report-mode", "unreadable"]);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        log,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    let ReportClassification::Invalid { reasons } = classification else {
+        panic!("expected invalid, got {classification:?}")
+    };
+    assert!(
+        reasons.iter().any(|r| r == "report.unreadable"),
+        "unreadable reason recorded: {reasons:?}"
+    );
+    assert!(
+        report.is_none(),
+        "no bytes retained from an unreadable file"
+    );
+    assert!(log.is_some(), "the regular runtime.log is still kept");
+}
+
+#[test]
 fn an_overbound_log_is_retained_truncated_and_marked() {
     let root = tmp_root("logcap");
     let state_root = root.join("state");

@@ -34,7 +34,8 @@ struct Args {
     out: Option<String>,
     /// Test-only report shaping for the v2 `run` transport: the worker
     /// status/reason to emit, or a supervisor-classification scenario
-    /// (`skip`, `malformed`, `oversize`, `symlink`, `wrong_identity`).
+    /// (`skip`, `malformed`, `oversize`, `symlink`, `unreadable`,
+    /// `wrong_identity`).
     /// `None` emits the default success report. Declaration probes
     /// ignore it — it never changes the declared surface.
     report_mode: Option<String>,
@@ -233,6 +234,15 @@ fn run_request(args: &Args, ws: &Path) {
         "symlink" => {
             let _ = std::fs::remove_file(&report_path);
             std::os::unix::fs::symlink(&request_path, &report_path).expect("symlink report.json");
+        }
+        // A regular file no reader may open — the supervisor must
+        // classify `invalid(report.unreadable)` and still finish the
+        // Invocation rather than wedging on the read error.
+        "unreadable" => {
+            std::fs::write(&report_path, b"{}").expect("write unreadable report");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&report_path, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000 report.json");
         }
         mode => {
             // The report echoes the exact request binding;
