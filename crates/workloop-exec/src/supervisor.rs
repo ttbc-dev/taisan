@@ -1047,6 +1047,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         if deadline_reached(clock, deadline) {
             return Ok(true);
         }
+        self.bind_v2_assessments_scoped(store, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
         self.sweep_isolation_scratch(store)?;
         self.sweep_invocation_io(store)?;
@@ -1200,6 +1204,74 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     return Err(ExecError::Store(e));
                 }
                 Err(crate::handoff::HandoffError::Io(e)) => return Err(ExecError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-derive gate evidence (`Assessment`/`Review` facts) from
+    /// finished v2 assessment-role Invocations. Binding is a pure
+    /// function of durable state — the verified request body, the
+    /// retained report envelope, the acknowledged handoff rows, and
+    /// the current accepted target — so every pass retries whatever
+    /// does not yet bind: a pre-publication InvariantCheck emits once
+    /// its artifact becomes the accepted head, and a review whose
+    /// target moved simply never binds. Identical facts dedupe on
+    /// delivery identity; nothing the Worker claims can mark its own
+    /// assessment complete.
+    pub fn bind_v2_assessments(&self, store: &impl Store) -> Result<(), ExecError> {
+        self.bind_v2_assessments_scoped(
+            store,
+            None,
+            &mut || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            },
+            None,
+        )
+    }
+
+    /// `bind_v2_assessments` restricted to one Work for a diagnostic
+    /// `--work` pass.
+    fn bind_v2_assessments_scoped(
+        &self,
+        store: &impl Store,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
+        let bodies = self
+            .body_store
+            .as_ref()
+            .or(self.v2.as_ref().map(|d| &d.bodies));
+        for execution in store.transact(|tx| tx.nonterminal_executions())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
+            for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
+                if deadline_reached(clock, deadline) {
+                    break;
+                }
+                if invocation.state != InvocationState::Done
+                    || !matches!(
+                        invocation.role,
+                        InvocationRole::InvariantCheck | InvocationRole::Review
+                    )
+                {
+                    continue;
+                }
+                let Some((request, fact)) = crate::assessment_v2::bind(store, bodies, &invocation)?
+                else {
+                    continue;
+                };
+                self.report(store, &request, fact, clock())?;
             }
         }
         Ok(())

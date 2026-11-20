@@ -1561,6 +1561,131 @@ pub fn classify_report(
     }
 }
 
+// ---------------------------------------------------------------------
+// Report member claims (`findings`, `invariant_items`)
+//
+// The envelope keeps these arrays as `serde_json::Value` — their member
+// shape belongs to the evidence gates (§6), not the wire contract. The
+// closed member types below are that shape: the supervisor parses each
+// retained member strictly and never guesses. A member that fails to
+// parse is malformed evidence — it can degrade a review to `partial`
+// or an assessment to `complete: false`, never upgrade one.
+// ---------------------------------------------------------------------
+
+/// Upper bound on `findings`/`invariant_items` members one report may
+/// carry into gate evidence. The report byte bound already caps the
+/// wire; this caps the parsed fan-out so a tiny-member flood cannot
+/// inflate a sealed round or an assessment without bound.
+pub const MAX_REPORT_MEMBERS: usize = 128;
+/// Per-string bounds inside a member claim.
+pub const MAX_MEMBER_KEY: usize = 256;
+pub const MAX_MEMBER_SUMMARY: usize = 4096;
+pub const MAX_MEMBER_TAG: usize = 256;
+/// Upper bound on `refs` entries one invariant item may cite.
+pub const MAX_MEMBER_REFS: usize = 16;
+
+/// One `findings[]` member — a review-finding claim bound to the exact
+/// review source the request materialized. `key` is the source-stable
+/// identity the sealed round's `source_key` carries; `summary` is the
+/// human-readable claim. Every field is a Worker claim: the supervisor
+/// derives `content_digest` itself and never trusts a supplied one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportFinding {
+    pub key: String,
+    pub summary: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+impl ReportFinding {
+    /// Parse one retained `findings[]` member strictly: the closed
+    /// field set, nonempty bounded `key`/`summary`, bounded optional
+    /// tags. `Err` names why the member is malformed evidence.
+    pub fn parse_member(value: &serde_json::Value) -> Result<Self, String> {
+        let member: Self = serde_json::from_value(value.clone())
+            .map_err(|e| format!("finding member malformed: {e}"))?;
+        if member.key.is_empty() || member.key.chars().count() > MAX_MEMBER_KEY {
+            return Err("finding key empty or over bound".into());
+        }
+        if member.summary.is_empty() || member.summary.chars().count() > MAX_MEMBER_SUMMARY {
+            return Err("finding summary empty or over bound".into());
+        }
+        for tag in [&member.severity, &member.position, &member.thread_id]
+            .into_iter()
+            .flatten()
+        {
+            if tag.chars().count() > MAX_MEMBER_TAG {
+                return Err("finding tag over bound".into());
+            }
+        }
+        Ok(member)
+    }
+}
+
+/// The closed verdict vocabulary of one `invariant_items[]` member —
+/// the per-invariant claim the assessment gate maps to a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportItemVerdict {
+    Conforms,
+    Violates,
+    Inconclusive,
+}
+
+/// One `invariant_items[]` member — the Work's verdict claim for
+/// exactly one approved invariant id. `refs` optionally cites evidence
+/// (artifact or log digests); it is retained verbatim as claim
+/// evidence and never resolves authority by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportInvariantItem {
+    pub id: String,
+    pub verdict: ReportItemVerdict,
+    #[serde(default)]
+    pub refs: Vec<crate::identity::EvidenceRef>,
+}
+
+impl ReportInvariantItem {
+    /// Parse one retained `invariant_items[]` member strictly: closed
+    /// fields, a nonempty bounded `id`, a known verdict, and a bounded
+    /// `refs` list.
+    pub fn parse_member(value: &serde_json::Value) -> Result<Self, String> {
+        let member: Self = serde_json::from_value(value.clone())
+            .map_err(|e| format!("invariant item malformed: {e}"))?;
+        if member.id.is_empty() || member.id.chars().count() > MAX_MEMBER_KEY {
+            return Err("invariant id empty or over bound".into());
+        }
+        if member.refs.len() > MAX_MEMBER_REFS {
+            return Err("invariant item refs over bound".into());
+        }
+        for evidence in &member.refs {
+            if evidence.id.is_empty()
+                || evidence.id.chars().count() > MAX_MEMBER_KEY
+                || evidence.digest.chars().count() > MAX_MEMBER_KEY * 2
+            {
+                return Err("invariant item ref malformed".into());
+            }
+        }
+        Ok(member)
+    }
+}
+
+/// The supervisor-derived content identity of one parsed member claim —
+/// SHA-256 over the canonical encoding of the closed member. Workers
+/// never supply it; two different claims can never collide into one
+/// occurrence or assessment-item identity.
+pub fn member_claim_digest<T: Serialize>(member: &T) -> String {
+    sha256_hex(
+        "worker-claim-v1",
+        &canonical_json(&serde_json::to_value(member).expect("member claim serializes")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

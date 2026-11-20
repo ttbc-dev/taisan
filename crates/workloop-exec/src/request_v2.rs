@@ -199,7 +199,7 @@ fn body_error_to_refusal(
 /// produced artifact every follow-on role binds. `produced` and
 /// `manifest_digest` must both be recorded: an acknowledged row
 /// without them cannot name an exact artifact.
-fn latest_acknowledged_handoff(
+pub(crate) fn latest_acknowledged_handoff(
     tx: &dyn ReadView,
     work_id: &WorkId,
 ) -> Result<Option<ArtifactHandoff>, StoreError> {

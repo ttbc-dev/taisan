@@ -48,6 +48,16 @@ struct Args {
     /// workspace at report time (`HEAD` names the commit
     /// `--git-commit` just made), or a literal string claim.
     claim_head: Option<String>,
+    /// Test-only verbatim `findings[]`/`invariant_items[]` arrays for
+    /// the v2 report — JSON array text injected member-for-member so
+    /// tests shape claims (valid, malformed, coverage-breaking)
+    /// without re-deriving the envelope digest. The `-file` variants
+    /// read the array from a path at report time, so a test can change
+    /// claims between sequential Invocations under one argv.
+    findings: Option<serde_json::Value>,
+    invariant_items: Option<serde_json::Value>,
+    findings_file: Option<String>,
+    invariant_items_file: Option<String>,
 }
 
 fn parse() -> Args {
@@ -64,6 +74,10 @@ fn parse() -> Args {
     let mut log_bytes = None;
     let mut git_commit = false;
     let mut claim_head = None;
+    let mut findings = None;
+    let mut invariant_items = None;
+    let mut findings_file = None;
+    let mut invariant_items_file = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -90,6 +104,12 @@ fn parse() -> Args {
             }
             "--git-commit" => git_commit = true,
             "--claim-head" => claim_head = it.next(),
+            "--findings" => findings = Some(member_array(it.next(), "--findings")),
+            "--invariant-items" => {
+                invariant_items = Some(member_array(it.next(), "--invariant-items"));
+            }
+            "--findings-file" => findings_file = it.next(),
+            "--invariant-items-file" => invariant_items_file = it.next(),
             other => positionals.push(other.to_string()),
         }
     }
@@ -123,7 +143,51 @@ fn parse() -> Args {
         log_bytes,
         git_commit,
         claim_head,
+        findings,
+        invariant_items,
+        findings_file,
+        invariant_items_file,
     }
+}
+
+/// A `--findings`/`--invariant-items` value must be a JSON array —
+/// anything else is a test-authoring error, refused before launch.
+fn member_array(raw: Option<String>, flag: &str) -> serde_json::Value {
+    let text = raw.unwrap_or_else(|| {
+        eprintln!("{flag} requires a JSON array argument");
+        std::process::exit(2);
+    });
+    member_array_text(&text, flag)
+}
+
+fn member_array_text(text: &str, flag: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|e| {
+        eprintln!("{flag} is not valid JSON: {e}");
+        std::process::exit(2);
+    });
+    if !value.is_array() {
+        eprintln!("{flag} must be a JSON array");
+        std::process::exit(2);
+    }
+    value
+}
+
+/// Resolve one member-claim array: the `-file` variant reads at report
+/// time (so sequential Invocations under one argv can carry different
+/// claims); the inline variant was already parsed at launch.
+fn member_claims(
+    inline: &Option<serde_json::Value>,
+    file: &Option<String>,
+    flag: &str,
+) -> Option<serde_json::Value> {
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("{flag} file {path}: {e}");
+            std::process::exit(1);
+        });
+        return Some(member_array_text(&text, flag));
+    }
+    inline.clone()
 }
 
 fn workspace() -> PathBuf {
@@ -344,6 +408,8 @@ fn run_request(args: &Args, ws: &Path) {
             // classifier uses.
             let (status, reason_code) = match mode {
                 "negative" => ("negative", "checks_failed"),
+                "findings" => ("negative", "findings_reported"),
+                "violated" => ("negative", "invariant_violated"),
                 "unavailable" => ("unavailable", "missing_required_input"),
                 "refused" => ("refused", "provider_refused"),
                 "limit_reached" => ("limit_reached", "deadline_reached"),
@@ -371,8 +437,14 @@ fn run_request(args: &Args, ws: &Path) {
                 "reason": {"code": reason_code},
                 "claimed_head": claimed_head,
                 "claimed_checks": [],
-                "findings": [],
-                "invariant_items": [],
+                "findings": member_claims(&args.findings, &args.findings_file, "--findings")
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "invariant_items": member_claims(
+                    &args.invariant_items,
+                    &args.invariant_items_file,
+                    "--invariant-items",
+                )
+                .unwrap_or_else(|| serde_json::json!([])),
                 "continuation": {"workspace_commit": null, "report_refs": []},
                 "runtime_usage": {
                     "turns": 1,
