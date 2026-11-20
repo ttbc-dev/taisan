@@ -233,6 +233,7 @@ fn seal_review(store: &SqliteStore, work_id: &WorkId, object: &str, source_keys:
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: None,
                 })
                 .collect(),
         },

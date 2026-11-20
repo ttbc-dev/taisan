@@ -17,14 +17,15 @@ use workloop_core::command::{
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
-    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact,
+    AssessmentVerdict, BranchState, Completeness, HostActionStatus, IssueState,
+    NormalizedEffectFact, Observation, ObservationFact,
 };
 use workloop_core::store::{
     BodyCatalog, Effect, HostAction, HostActionIntent, Store, StoreError, TxView,
 };
 use workloop_core::work::{
-    HostTemplate, WorkloopConfig, admit_queued, classify_failure, handle_command,
-    handle_observation, material_progress_basis,
+    HostTemplate, WorkloopConfig, admit_queued, admit_queued_role, classify_failure,
+    handle_command, handle_observation, material_progress_basis,
 };
 use workloop_core::worker_v2::*;
 use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
@@ -201,7 +202,19 @@ fn admit_ex(
     sources: Vec<SourceSnapshot>,
     verification_argv: Vec<Vec<String>>,
 ) -> (WorkId, ExecutionId, String) {
-    let cfg = config();
+    admit_ex_cfg(store, key, sources, verification_argv, &config())
+}
+
+/// `admit_ex` under a caller-shaped config — lane policy and host
+/// bindings are spec inputs a test must be able to vary.
+fn admit_ex_cfg(
+    store: &SqliteStore,
+    key: &str,
+    sources: Vec<SourceSnapshot>,
+    verification_argv: Vec<Vec<String>>,
+    cfg: &WorkloopConfig,
+) -> (WorkId, ExecutionId, String) {
+    let cfg = cfg.clone();
     let d = handle_command(
         store,
         &cfg,
@@ -618,6 +631,7 @@ fn judged_round(
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: Some(format!("summary for {key}")),
                 })
                 .collect();
             let judgment = RoundJudgment {
@@ -717,6 +731,28 @@ fn open_change_target(
         NOW,
     )
     .unwrap();
+    // The target-branch state a poller records before any review can
+    // dispatch: an absent revision is ignorance, never a bound target.
+    handle_observation(
+        store,
+        &cfg,
+        &obs(ObservationFact::BranchState {
+            repository: cfg.host.repository.clone(),
+            branch: target_branch.into(),
+            state: BranchState::At {
+                revision: fixture_target_revision(),
+            },
+        }),
+        NOW,
+    )
+    .unwrap();
+}
+
+/// The fixture's observed target-branch revision. Dispatch refuses
+/// while the branch state is unobserved — an opened change is only a
+/// dispatchable target once the poller has pinned where `main` sits.
+fn fixture_target_revision() -> CommitRevision {
+    CommitRevision::new(repo(), "0".repeat(40)).unwrap()
 }
 
 fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
@@ -1149,7 +1185,7 @@ fn current_diff_target(
         change: change.clone(),
         head: head.clone(),
         base: None,
-        target_revision: None,
+        target_revision: Some(fixture_target_revision()),
     }
 }
 
@@ -1213,6 +1249,11 @@ fn a_review_origin_fix_binds_the_judged_findings() {
     assert_eq!(findings[0].source, "find-1");
     assert_eq!(findings[0].digest, digest);
     assert_eq!(findings[0].order, 0);
+    assert_eq!(
+        findings[0].summary.as_deref(),
+        Some("summary for find-1"),
+        "the sealed claim's finding text reaches the Fix worker"
+    );
 }
 
 #[test]
@@ -2257,8 +2298,8 @@ fn scripted_v2_declaration() -> String {
 /// A spawn whose outcome is lost — `SpawnError::Unknown` — leaves the
 /// recorded Invocation `Prepared` with no process identity: unknown,
 /// never retried. A later pass reconciles the recorded Invocation and
-/// reports the unknown writer again; it cannot start a second writer
-/// for the consumed request.
+/// re-binds the orphaned writer its launch signature still names; it
+/// cannot start a second writer for the consumed request.
 #[test]
 fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
     use workloop_core::ports::ProbeOutcome;
@@ -2305,8 +2346,10 @@ fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
         "the unknown outcome consumed exactly one start attempt"
     );
 
-    // Reconciliation and further passes replay the recorded
-    // Invocation — the unknown writer is reported, never replaced.
+    // Reconciliation finds the orphaned writer by the v2 transport
+    // signature and re-binds it through the same durable commit a
+    // normal launch uses — the unknown writer is recovered, never
+    // replaced.
     sup.consume_requests(&store, NOW + 1).unwrap();
     sup.run_once(&store, NOW + 2).unwrap();
     assert_eq!(
@@ -2318,9 +2361,130 @@ fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
         .transact(|tx| tx.invocations_for_execution(&e))
         .unwrap();
     assert_eq!(invocations.len(), 1, "exactly one Invocation ever");
-    assert_eq!(invocations[0].state, InvocationState::Prepared);
-    assert!(invocations[0].process_identity.is_none());
+    assert_eq!(
+        invocations[0].state,
+        InvocationState::Running,
+        "the orphaned writer is re-bound, not left unidentified"
+    );
+    assert!(invocations[0].process_identity.is_some());
     assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A lost v2 launch is re-bound by the command line the spawn
+/// actually exec'd — `argv run --request <path> --out <path>`, never
+/// the bare adapter argv. Searching only the bare argv leaves the
+/// orphaned writer unmatchable: never re-bound, and eventually
+/// declared absent on directory occupancy alone while still running.
+#[test]
+fn a_lost_v2_launch_is_rebound_by_its_transport_signature() {
+    use workloop_core::ports::ProbeOutcome;
+    use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
+
+    let root = tmp_root("v2-orphan-rebind");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-orphan", vec![]);
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: scripted_v2_declaration().into_bytes(),
+        success: true,
+    }));
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        port.clone(),
+        handoff.workspace_root.clone(),
+        vec!["scripted-worker".into()],
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(&state_root, &src));
+
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+
+    // The orphaned writer is still live carrying the v2 transport
+    // command line — reconciliation re-binds it through the same
+    // durable commit a normal launch uses.
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Running,
+        "the orphan is re-bound, never replaced"
+    );
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "re-binding never starts a second writer"
+    );
+}
+
+/// A lost v2 launch never re-binds a process running the bare
+/// adapter argv: the spawn exec'd only the transport-shaped line, so
+/// the bare argv is not a signature — a foreign process carrying just
+/// those words inside the launch directory stays an unexplained
+/// occupant, never adopted, inspected, or signaled as this launch's
+/// writer.
+#[test]
+fn a_lost_v2_launch_never_binds_a_bare_argv_lookalike() {
+    use workloop_core::ports::ProbeOutcome;
+    use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
+
+    let root = tmp_root("v2-orphan-lookalike");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-lookalike", vec![]);
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: scripted_v2_declaration().into_bytes(),
+        success: true,
+    }));
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        port.clone(),
+        handoff.workspace_root.clone(),
+        vec!["scripted-worker".into()],
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(&state_root, &src));
+
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    // The real writer is gone; a foreign process running just the
+    // bare adapter argv inside the launch directory is the only live
+    // lookalike.
+    port.exit_all(0);
+    let lost = port.spawned()[0].pid;
+    port.adopt_child_with(lost, "scripted-worker");
+
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert!(
+        invocation.process_identity.is_none(),
+        "a bare-argv lookalike is never this launch's writer"
+    );
+    assert_ne!(
+        invocation.state,
+        InvocationState::Running,
+        "the lookalike was never re-bound"
+    );
 }
 
 // === Worker report evidence collection (`taisan.worker.report/2`,
@@ -3450,6 +3614,911 @@ fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
     .unwrap();
     assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);
     assert!(timed_out.output.contains("exceeded"));
+}
+
+// -------------------------------------------------------------------
+// Issue #264 — v2 assessment binding: IC/Review reports → gate facts
+// -------------------------------------------------------------------
+
+/// Shared rig for assessment-role tests: an admitted Work whose first
+/// request is already consumed by a synthetic acknowledged handoff
+/// (`base`→`produced`), the published artifact ref, and — when asked —
+/// the accepted diff target (`open_change_target`) a bound fact needs.
+struct AssessRig {
+    store: SqliteStore,
+    sup: Supervisor<PosixProcessControl>,
+    work_id: WorkId,
+    execution_id: ExecutionId,
+    base: String,
+    produced: String,
+    change: ChangeRequestRef,
+    head: CommitRevision,
+}
+
+fn assess_rig(tag: &str, argv: Vec<String>, with_target: bool) -> AssessRig {
+    assess_rig_cfg(tag, argv, with_target, &config())
+}
+
+fn assess_rig_cfg(
+    tag: &str,
+    argv: Vec<String>,
+    with_target: bool,
+    cfg: &WorkloopConfig,
+) -> AssessRig {
+    let root = tmp_root(tag);
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit_ex_cfg(&store, &format!("v2-assess-{tag}"), vec![], vec![], cfg);
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    let head = CommitRevision::new(repo(), produced.clone()).unwrap();
+    if with_target {
+        open_change_target(&store, &w, &change, &head, "main");
+    }
+    AssessRig {
+        store,
+        sup,
+        work_id: w,
+        execution_id: e,
+        base,
+        produced,
+        change,
+        head,
+    }
+}
+
+/// Dispatch one assessment-role request through the v2 transport and
+/// drive its worker to `Done`. InvariantCheck snapshots the producing
+/// workspace, so the durable predecessor's tree must exist first —
+/// exactly what a real handoff leaves behind.
+fn run_assessment_role(rig: &AssessRig, seq: u64, role: InvocationRole) -> String {
+    if role == InvocationRole::InvariantCheck {
+        std::fs::create_dir_all(rig.sup.workspace_of(&rig.work_id)).unwrap();
+    }
+    let rid = format!("{}:inv:{seq}", rig.execution_id.0);
+    insert_request(
+        &rig.store,
+        &rig.work_id,
+        &rig.execution_id,
+        &rid,
+        role,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    drive_to_done(&rig.sup, &rig.store, &rid);
+    rid
+}
+
+/// `(complete, [(item id, verdict)])` for every `Assessment` fact the
+/// Work carries, in observation order.
+fn assessment_facts(
+    store: &SqliteStore,
+    work_id: &WorkId,
+) -> Vec<(bool, Vec<(String, AssessmentVerdict)>)> {
+    store
+        .transact(|tx| tx.observations_for_work(work_id))
+        .unwrap()
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::Assessment {
+                complete, items, ..
+            } => Some((
+                complete,
+                items
+                    .into_iter()
+                    .map(|i| (i.id, i.verdict))
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(completeness, occurrence count)` for every `Review` fact.
+fn review_facts(store: &SqliteStore, work_id: &WorkId) -> Vec<(Completeness, usize)> {
+    store
+        .transact(|tx| tx.observations_for_work(work_id))
+        .unwrap()
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::Review {
+                completeness,
+                occurrences,
+                ..
+            } => Some((completeness, occurrences.len())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn sealed_rounds(store: &SqliteStore, work_id: &WorkId) -> Vec<ReviewRound> {
+    store.transact(|tx| tx.rounds_for_work(work_id)).unwrap()
+}
+
+/// The v2 argv for an InvariantCheck whose report claims `items` as
+/// its `invariant_items` members.
+fn ic_argv(items_json: &str) -> Vec<String> {
+    v2_argv("clean-exit", &["--invariant-items", items_json])
+}
+
+/// Both approved set ids (`no-todo`, `tests-pass`) conforming.
+const IC_CONFORMS: &str =
+    r#"[{"id":"no-todo","verdict":"conforms"},{"id":"tests-pass","verdict":"conforms"}]"#;
+
+#[test]
+fn an_invariant_check_binds_assessment_only_once_its_artifact_is_the_current_head() {
+    // No accepted target yet: the check ran pre-publication, so its
+    // evidence cannot bind — and must not be lost either.
+    let rig = assess_rig("ic-bind", ic_argv(IC_CONFORMS), false);
+    run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+    assert!(
+        assessment_facts(&rig.store, &rig.work_id).is_empty(),
+        "no target, no binding"
+    );
+
+    // Publication makes the produced commit the accepted head; the
+    // next pass binds the retained report to it — deferred, never
+    // dropped, never duplicated.
+    open_change_target(&rig.store, &rig.work_id, &rig.change, &rig.head, "main");
+    rig.sup.run_once(&rig.store, NOW).unwrap();
+    let facts = assessment_facts(&rig.store, &rig.work_id);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    let (complete, items) = &facts[0];
+    assert!(*complete, "exact coverage is complete: {items:?}");
+    assert_eq!(
+        items.as_slice(),
+        [
+            ("no-todo".to_string(), AssessmentVerdict::Positive),
+            ("tests-pass".to_string(), AssessmentVerdict::Positive),
+        ],
+        "items bind in the approved set's declared order"
+    );
+    // The fact binds the exact accepted target and the approved set's
+    // wire digest.
+    let bound = rig
+        .store
+        .transact(|tx| tx.observations_for_work(&rig.work_id))
+        .unwrap()
+        .into_iter()
+        .find_map(|o| match o.fact {
+            ObservationFact::Assessment {
+                target, set_digest, ..
+            } => Some((target, set_digest)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(bound.0.head.object, rig.produced);
+    let set = InvariantSetBody::new(
+        "invariants-1",
+        1,
+        vec!["no-todo".into(), "tests-pass".into()],
+    );
+    assert_eq!(bound.1, set.wire_digest());
+
+    // Replays dedupe: another pass records no second assessment.
+    rig.sup.run_once(&rig.store, NOW).unwrap();
+    assert_eq!(assessment_facts(&rig.store, &rig.work_id).len(), 1);
+}
+
+#[test]
+fn an_invariant_check_with_incomplete_coverage_records_complete_false() {
+    // Missing member: `tests-pass` is never claimed.
+    let rig = assess_rig(
+        "ic-missing",
+        ic_argv(r#"[{"id":"no-todo","verdict":"conforms"}]"#),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+    let facts = assessment_facts(&rig.store, &rig.work_id);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(!facts[0].0, "missing coverage is never complete");
+    assert_eq!(
+        facts[0].1.as_slice(),
+        [("no-todo".to_string(), AssessmentVerdict::Positive)]
+    );
+}
+
+#[test]
+fn an_invariant_check_with_unknown_or_duplicate_members_records_incomplete() {
+    for (tag, items) in [
+        (
+            "ic-unknown",
+            r#"[{"id":"no-todo","verdict":"conforms"},{"id":"tests-pass","verdict":"conforms"},{"id":"bogus","verdict":"conforms"}]"#,
+        ),
+        (
+            "ic-dup",
+            r#"[{"id":"no-todo","verdict":"conforms"},{"id":"no-todo","verdict":"violates"}]"#,
+        ),
+        // A member outside the closed grammar is malformed evidence.
+        (
+            "ic-malformed",
+            r#"[{"id":"no-todo","verdict":"maybe"},{"id":"tests-pass","verdict":"conforms"}]"#,
+        ),
+    ] {
+        let rig = assess_rig(tag, ic_argv(items), true);
+        run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+        let facts = assessment_facts(&rig.store, &rig.work_id);
+        assert_eq!(facts.len(), 1, "{tag}: {facts:?}");
+        assert!(
+            !facts[0].0,
+            "{tag}: unverifiable coverage is never complete"
+        );
+    }
+}
+
+#[test]
+fn invariant_item_verdicts_map_to_assessment_verdicts() {
+    let rig = assess_rig(
+        "ic-verdicts",
+        ic_argv(
+            r#"[{"id":"no-todo","verdict":"violates"},{"id":"tests-pass","verdict":"inconclusive"}]"#,
+        ),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+    let facts = assessment_facts(&rig.store, &rig.work_id);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(facts[0].0, "coverage is exact — the verdicts are the claim");
+    assert_eq!(
+        facts[0].1.as_slice(),
+        [
+            ("no-todo".to_string(), AssessmentVerdict::Negative),
+            ("tests-pass".to_string(), AssessmentVerdict::Inconclusive),
+        ]
+    );
+}
+
+#[test]
+fn an_invariant_check_on_a_moved_head_never_binds() {
+    let rig = assess_rig("ic-stale", ic_argv(IC_CONFORMS), true);
+    // Split dispatch from completion: the accepted head moves to a
+    // different commit while the check worker runs — the check covered
+    // `produced`, not this head, so its evidence binds nothing.
+    std::fs::create_dir_all(rig.sup.workspace_of(&rig.work_id)).unwrap();
+    let rid = format!("{}:inv:1", rig.execution_id.0);
+    insert_request(
+        &rig.store,
+        &rig.work_id,
+        &rig.execution_id,
+        &rid,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    let moved = CommitRevision::new(repo(), rig.base.clone()).unwrap();
+    open_change_target(&rig.store, &rig.work_id, &rig.change, &moved, "main");
+    drive_to_done(&rig.sup, &rig.store, &rid);
+    for _ in 0..3 {
+        rig.sup.run_once(&rig.store, NOW).unwrap();
+    }
+    assert!(
+        assessment_facts(&rig.store, &rig.work_id).is_empty(),
+        "a stale artifact's assessment never binds the moved head"
+    );
+}
+
+#[test]
+fn invalid_and_absent_reports_emit_no_assessment_facts() {
+    for (tag, mode) in [("ic-invalid", "malformed"), ("ic-absent", "skip")] {
+        let argv = v2_argv(
+            "clean-exit",
+            &["--report-mode", mode, "--invariant-items", IC_CONFORMS],
+        );
+        let rig = assess_rig(tag, argv, true);
+        run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+        for _ in 0..3 {
+            rig.sup.run_once(&rig.store, NOW).unwrap();
+        }
+        assert!(
+            assessment_facts(&rig.store, &rig.work_id).is_empty(),
+            "{tag}: {mode} classification emits no gate fact"
+        );
+    }
+}
+
+#[test]
+fn a_code_review_with_findings_seals_occurrences_for_judgment() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "findings",
+            "--findings",
+            r#"[{"key":"f-1","summary":"off by one in the bound check","severity":"high","position":"handoff.rs:12"}]"#,
+        ],
+    );
+    let rig = assess_rig("review-findings", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].0, Completeness::Complete);
+    assert_eq!(reviews[0].1, 1);
+
+    // The fact sealed an immutable round whose occurrence carries the
+    // supervisor-derived content digest a judgment/Fix origin binds.
+    let rounds = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    let round = &rounds[0];
+    assert_eq!(round.completeness, "complete");
+    assert_eq!(round.target.head.object, rig.produced);
+    let occurrences = rig.store.transact(|tx| tx.occurrences(&round.id)).unwrap();
+    assert_eq!(occurrences.len(), 1);
+    assert_eq!(occurrences[0].source_key, "f-1");
+    assert_eq!(occurrences[0].severity.as_deref(), Some("high"));
+    assert_eq!(
+        occurrences[0].summary.as_deref(),
+        Some("off by one in the bound check")
+    );
+    let digest = occurrences[0]
+        .content_digest
+        .clone()
+        .expect("worker findings carry a content digest");
+    assert_eq!(digest.len(), 64);
+}
+
+#[test]
+fn a_clean_code_review_seals_a_zero_finding_round() {
+    let rig = assess_rig("review-clean", v2_argv("clean-exit", &[]), true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0], (Completeness::Complete, 0));
+    let rounds = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].completeness, "complete");
+    assert!(
+        rig.store
+            .transact(|tx| tx.occurrences(&rounds[0].id))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_review_with_malformed_findings_records_partial_and_never_seals() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "findings",
+            // `summary` missing — outside the closed member grammar.
+            "--findings",
+            r#"[{"key":"f-1"},{"key":"f-2","summary":"ok"}]"#,
+        ],
+    );
+    let rig = assess_rig("review-partial", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(reviews[0].0, Completeness::Partial { .. }),
+        "malformed members degrade to partial: {:?}",
+        reviews[0].0
+    );
+    assert!(
+        sealed_rounds(&rig.store, &rig.work_id).is_empty(),
+        "a partial review never seals a round"
+    );
+}
+
+#[test]
+fn a_review_reported_unavailable_records_unavailable_never_seals() {
+    let rig = assess_rig(
+        "review-unavailable",
+        v2_argv("clean-exit", &["--report-mode", "unavailable"]),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(reviews[0].0, Completeness::Unavailable { .. }),
+        "{:?}",
+        reviews[0].0
+    );
+    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+#[test]
+fn a_review_for_a_moved_head_emits_no_gate_fact() {
+    let rig = assess_rig("review-stale", v2_argv("clean-exit", &[]), true);
+    // Dispatch binds the target current *now*; the head moves before
+    // the report binds — the review covers a superseded target.
+    let rid = format!("{}:inv:1", rig.execution_id.0);
+    insert_request(
+        &rig.store,
+        &rig.work_id,
+        &rig.execution_id,
+        &rid,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    let moved = CommitRevision::new(repo(), rig.base.clone()).unwrap();
+    open_change_target(&rig.store, &rig.work_id, &rig.change, &moved, "main");
+    drive_to_done(&rig.sup, &rig.store, &rid);
+    for _ in 0..3 {
+        rig.sup.run_once(&rig.store, NOW).unwrap();
+    }
+    assert!(
+        review_facts(&rig.store, &rig.work_id).is_empty(),
+        "a stale-head review binds no gate fact"
+    );
+    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+/// A Negative report is the check's own failure claim — all-conform
+/// member coverage can never turn it into a completed assessment.
+#[test]
+fn a_negative_invariant_report_is_never_a_complete_assessment() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "violated",
+            "--invariant-items",
+            IC_CONFORMS,
+        ],
+    );
+    let rig = assess_rig("ic-negative", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+    let facts = assessment_facts(&rig.store, &rig.work_id);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(!facts[0].0, "a negative report is never complete");
+    assert_eq!(
+        facts[0].1.as_slice(),
+        [
+            ("no-todo".to_string(), AssessmentVerdict::Positive),
+            ("tests-pass".to_string(), AssessmentVerdict::Positive),
+        ],
+        "member claims stay recorded evidence"
+    );
+}
+
+/// A Negative review report that names no findings — `checks_failed`
+/// or `invariant_violated` — records partial evidence under its own
+/// reason code and never seals a clean round, so a report that
+/// explicitly failed can never authorize completion. A negative
+/// report carrying findings still seals them as occurrences: the
+/// lane then stands on the judgment path, never the report's claim.
+#[test]
+fn a_negative_review_report_is_partial_and_never_seals_a_round() {
+    let rig = assess_rig(
+        "review-negative",
+        v2_argv("clean-exit", &["--report-mode", "negative"]),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "checks_failed"),
+        "{:?}",
+        reviews[0].0
+    );
+    assert_eq!(reviews[0].1, 0);
+    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+/// A Negative review report whose reason is not `findings_reported`
+/// but which still carries findings seals those members for the
+/// judgment path — the reason code describes the report's claim, not
+/// the member set's disposition. Silently dropping the members would
+/// lose real findings a judgment must answer.
+#[test]
+fn a_negative_review_report_with_findings_seals_them_as_occurrences() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "negative",
+            "--findings",
+            r#"[{"key":"f-1","summary":"dropped bound check","severity":"high"}]"#,
+        ],
+    );
+    let rig = assess_rig("review-negative-findings", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].0, Completeness::Complete, "{:?}", reviews[0].0);
+    assert_eq!(reviews[0].1, 1, "the member seals as an occurrence");
+    let rounds = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    let occurrences = rig
+        .store
+        .transact(|tx| tx.occurrences(&rounds[0].id))
+        .unwrap();
+    assert_eq!(occurrences.len(), 1);
+    assert_eq!(occurrences[0].source_key, "f-1");
+}
+
+/// Over the member cap the whole `findings[]` set is malformed
+/// evidence: the fact records `partial` and parses no member into an
+/// occurrence — the cap bounds the retained fan-out, matching the
+/// invariant-items treatment.
+#[test]
+fn a_review_over_the_member_cap_records_partial_and_no_occurrences() {
+    let flood = serde_json::Value::Array(
+        (0..=MAX_REPORT_MEMBERS)
+            .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "s"}))
+            .collect(),
+    )
+    .to_string();
+    // A success report carrying more members than the cap: the
+    // completeness check reads the flood as malformed evidence.
+    let argv = v2_argv("clean-exit", &["--findings", &flood]);
+    let rig = assess_rig("review-flood", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "too_many_findings"),
+        "{:?}",
+        reviews[0].0
+    );
+    assert_eq!(reviews[0].1, 0, "no member parses past the cap");
+    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+/// Record a target-branch revision observation — the axis
+/// `DiffTarget.target_revision` tracks so a target-branch-only move
+/// changes the diff target.
+fn observe_branch_state(store: &SqliteStore, work_id: &WorkId, revision: &CommitRevision) {
+    let cfg = config();
+    handle_observation(
+        store,
+        &cfg,
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::BranchState {
+                repository: cfg.host.repository.clone(),
+                branch: "main".into(),
+                state: BranchState::At {
+                    revision: revision.clone(),
+                },
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// The review binds the exact dispatch-time target — including the
+/// target-branch revision: a target-branch-only move supersedes it
+/// just as a head move does, and the retained report seals no round
+/// for a target it never examined.
+#[test]
+fn a_review_binds_only_to_the_dispatch_time_target_revision() {
+    let rev_a = CommitRevision::new(repo(), "a".repeat(40)).unwrap();
+    let rev_b = CommitRevision::new(repo(), "b".repeat(40)).unwrap();
+
+    // Control: the dispatch-time revision still holds at bind time.
+    let rig = assess_rig("review-rev-stable", v2_argv("clean-exit", &[]), true);
+    observe_branch_state(&rig.store, &rig.work_id, &rev_a);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    assert_eq!(
+        review_facts(&rig.store, &rig.work_id),
+        vec![(Completeness::Complete, 0)]
+    );
+    assert_eq!(sealed_rounds(&rig.store, &rig.work_id).len(), 1);
+
+    // Same change and head, a new target-branch revision: the report
+    // binds nothing.
+    let rig = assess_rig("review-rev-moved", v2_argv("clean-exit", &[]), true);
+    observe_branch_state(&rig.store, &rig.work_id, &rev_a);
+    let rid = format!("{}:inv:1", rig.execution_id.0);
+    insert_request(
+        &rig.store,
+        &rig.work_id,
+        &rig.execution_id,
+        &rid,
+        InvocationRole::Review,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    observe_branch_state(&rig.store, &rig.work_id, &rev_b);
+    drive_to_done(&rig.sup, &rig.store, &rid);
+    for _ in 0..3 {
+        rig.sup.run_once(&rig.store, NOW).unwrap();
+    }
+    assert!(
+        review_facts(&rig.store, &rig.work_id).is_empty(),
+        "a target-branch-only move supersedes the review's target"
+    );
+    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+/// Drive the real human-judgment path over the newest sealed round:
+/// `JudgeFindings` with one decision per occurrence (in sealed
+/// order), then `ReleaseJudgment` — leaving the Execution `queued`
+/// for the next admission exactly as an operator release does.
+fn judge_and_release(rig: &AssessRig, choices: &[FindingChoice]) {
+    // Undecided findings pause gracefully: `Stopping` drains to
+    // `Paused` on the stop sweep, and only `Paused` releases.
+    for _ in 0..100 {
+        let state = rig
+            .store
+            .transact(|tx| tx.execution(&rig.execution_id))
+            .unwrap()
+            .unwrap()
+            .state;
+        if state == ExecutionState::Paused {
+            break;
+        }
+        rig.sup.run_once(&rig.store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let state = rig
+        .store
+        .transact(|tx| tx.execution(&rig.execution_id))
+        .unwrap()
+        .unwrap()
+        .state;
+    assert_eq!(state, ExecutionState::Paused, "findings pause for judgment");
+
+    let (version, head, occurrences) = rig
+        .store
+        .transact(|tx| {
+            let work = tx.work(&rig.work_id)?.unwrap();
+            let round = tx.latest_round(&rig.work_id)?.unwrap();
+            let occurrences = tx.occurrences(&round.id)?;
+            Ok::<_, StoreError>((work.version, round.target.head, occurrences))
+        })
+        .unwrap();
+    assert_eq!(
+        occurrences.len(),
+        choices.len(),
+        "one decision per occurrence"
+    );
+    let d = handle_command(
+        &rig.store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "judge-1".into(),
+            body: CommandBody::JudgeFindings {
+                work_id: rig.work_id.clone(),
+                expected_work_version: version,
+                expected_head: head,
+                decisions: occurrences
+                    .iter()
+                    .zip(choices.iter())
+                    .map(|(occ, choice)| FindingDecision {
+                        occurrence_id: occ.id.clone(),
+                        // `dismiss`/`accept` dispositions must record
+                        // their rationale verbatim.
+                        rationale: matches!(choice, FindingChoice::Accept | FindingChoice::Dismiss)
+                            .then(|| "operator reviewed the claim".to_string()),
+                        choice: choice.clone(),
+                    })
+                    .collect(),
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+
+    let version = rig
+        .store
+        .transact(|tx| tx.work(&rig.work_id).map(|w| w.unwrap().version))
+        .unwrap();
+    let head = rig
+        .store
+        .transact(|tx| {
+            tx.latest_round(&rig.work_id)
+                .map(|r| r.unwrap().target.head)
+        })
+        .unwrap();
+    let d = handle_command(
+        &rig.store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "release-1".into(),
+            body: CommandBody::ReleaseJudgment {
+                work_id: rig.work_id.clone(),
+                expected_work_version: version,
+                expected_head: head,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+}
+
+/// The request id `admit_queued*` just created for the Execution.
+fn admitted_request_id(rig: &AssessRig) -> String {
+    rig.store
+        .transact(|tx| tx.pending_requests())
+        .unwrap()
+        .into_iter()
+        .find(|r| r.execution_id == rig.execution_id)
+        .expect("admission left a pending request")
+        .request_id
+}
+
+#[test]
+fn same_head_finding_growth_seals_a_new_round() {
+    // `--findings-file` is read at report time, so two sequential
+    // review Invocations under one argv can carry different claims.
+    let root = tmp_root("review-growth");
+    let findings_path = root.join("findings.json");
+    std::fs::write(&findings_path, r#"[{"key":"f-1","summary":"first"}]"#).unwrap();
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "findings",
+            "--findings-file",
+            findings_path.to_str().unwrap(),
+        ],
+    );
+    let rig = assess_rig("review-growth", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let first = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(first.len(), 1);
+    // Undecided findings on the current target stop the Execution
+    // for human judgment — the gate the second review must pass
+    // through, not around.
+    let state = rig
+        .store
+        .transact(|tx| tx.execution(&rig.execution_id))
+        .unwrap()
+        .unwrap()
+        .state;
+    assert!(
+        matches!(state, ExecutionState::Stopping | ExecutionState::Paused),
+        "findings stop the Execution for judgment, got {state:?}"
+    );
+
+    // Same head, more findings: the operator accepts round 1's
+    // finding, releases the judgment gate, and Core admits another
+    // review — the occurrence set differs, so the seal records a NEW
+    // round, never a silent overwrite of the judged one.
+    judge_and_release(&rig, &[FindingChoice::Accept]);
+    rig.store
+        .transact(|tx| {
+            admit_queued_role(
+                tx,
+                &config(),
+                &rig.execution_id,
+                InvocationRole::Review,
+                NOW,
+            )
+        })
+        .unwrap();
+    std::fs::write(
+        &findings_path,
+        r#"[{"key":"f-1","summary":"first"},{"key":"f-2","summary":"second"}]"#,
+    )
+    .unwrap();
+    let rid2 = admitted_request_id(&rig);
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    drive_to_done(&rig.sup, &rig.store, &rid2);
+
+    let rounds = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(rounds.len(), 2, "{rounds:?}");
+    let latest = rounds
+        .iter()
+        .max_by_key(|r| r.generation)
+        .expect("a latest round");
+    assert_eq!(latest.generation, 1);
+    assert_ne!(
+        latest.set_digest, first[0].set_digest,
+        "different occurrence sets seal different rounds"
+    );
+    assert_eq!(
+        rig.store
+            .transact(|tx| tx.occurrences(&latest.id))
+            .unwrap()
+            .len(),
+        2
+    );
+    // Both review facts bind the same accepted target.
+    assert_eq!(review_facts(&rig.store, &rig.work_id).len(), 2);
+}
+
+#[test]
+fn sealed_findings_feed_the_bounded_fix_origin() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "findings",
+            "--findings",
+            r#"[{"key":"f-1","summary":"off by one","severity":"high"}]"#,
+        ],
+    );
+    let rig = assess_rig("review-fix", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let round = sealed_rounds(&rig.store, &rig.work_id)
+        .into_iter()
+        .next()
+        .expect("findings sealed a round");
+    let occurrences = rig.store.transact(|tx| tx.occurrences(&round.id)).unwrap();
+    assert_eq!(occurrences.len(), 1);
+
+    // The real human path: the operator judges the finding for repair,
+    // releases the gate, and admission routes the bounded Fix request.
+    judge_and_release(&rig, &[FindingChoice::Fix]);
+    let admitted = rig
+        .store
+        .transact(|tx| admit_queued(tx, &config(), &rig.execution_id, NOW))
+        .unwrap();
+    assert!(admitted.is_some(), "fix disposition admits a Fix request");
+    let rid2 = admitted_request_id(&rig);
+    rig.sup.consume_requests(&rig.store, NOW).unwrap();
+    let wire = WorkerRequestV2::parse(&request_body(&rig.store, &rid2).canonical_body).unwrap();
+    let TaskBody::Fix { origin, .. } = &wire.task else {
+        panic!("expected fix task: {:?}", wire.task)
+    };
+    let FixOrigin::Review {
+        round: bound_round,
+        judgment,
+        findings,
+        ..
+    } = origin.as_ref()
+    else {
+        panic!("expected review origin: {origin:?}")
+    };
+    let recorded = rig
+        .store
+        .transact(|tx| tx.judgment_for_round(&round.id))
+        .unwrap()
+        .expect("the judgment is durable");
+    assert_eq!(bound_round, &round.id);
+    assert_eq!(judgment.as_str(), recorded.id.as_str());
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].occurrence, occurrences[0].id);
+    assert_eq!(
+        findings[0].digest,
+        occurrences[0].content_digest.clone().unwrap(),
+        "the Fix origin binds the worker-derived occurrence digest"
+    );
+}
+
+#[test]
+fn assessment_facts_bind_identically_with_lanes_disabled() {
+    // Lane policy lives in the completion gate, not the binder: with
+    // both lanes off the spec records it, and the same durable report
+    // still binds the same evidence — the gate alone decides whether
+    // the lane requires it.
+    let mut cfg = config();
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let rig = assess_rig_cfg("lanes-off", ic_argv(IC_CONFORMS), true, &cfg);
+    run_assessment_role(&rig, 1, InvocationRole::InvariantCheck);
+    let facts = assessment_facts(&rig.store, &rig.work_id);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(facts[0].0);
+    let spec = rig
+        .store
+        .transact(|tx| {
+            let work = tx.work(&rig.work_id)?.unwrap();
+            tx.spec(&rig.work_id, Some(work.approved_spec))
+        })
+        .unwrap()
+        .unwrap();
+    assert!(!spec.payload.lanes.invariant_check);
+    assert!(!spec.payload.lanes.code_review);
 }
 
 /// §14.5 bounds the 30 min verification profile by the Execution

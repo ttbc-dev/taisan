@@ -1653,6 +1653,11 @@ fn parse_findings(body: &str) -> Result<Vec<OccurrenceInput>, String> {
                 severity: it["severity"].as_str().map(str::to_string),
                 position: it["position"].as_str().map(str::to_string),
                 thread_id: None,
+                summary: if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary.to_string())
+                },
             }
         })
         .collect())
