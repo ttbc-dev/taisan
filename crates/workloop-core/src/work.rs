@@ -4911,7 +4911,9 @@ pub struct RecoveryScan {
     /// Of those, Executions settled terminal instead (spent budget or
     /// Work-wide automatic-time ceiling).
     pub failed_terminal: usize,
-    /// Intents retired because terminal evidence invalidated them.
+    /// Intents retired because recorded evidence shows they can never
+    /// fire — terminal evidence, a progressing Execution, or a missing
+    /// target.
     pub retired: usize,
     /// Intents left `pending`, with the recorded reason.
     pub held: Vec<(String, String)>,
@@ -4923,12 +4925,14 @@ pub struct RecoveryScan {
 /// One bounded recovery-scheduling pass (loop phase 6): consume due
 /// `recovery_intents` with revalidation before any firing, ≤ `limit`
 /// items per tick. A due `requeue` intent re-enters the same paused
-/// Execution only when every recorded hold still allows it; terminal
-/// evidence retires the intent instead. Intents whose hold cannot be
-/// discharged (operator decision, unmet repair prerequisite, an
-/// Execution already progressing) stay `pending` with a reason — an
-/// automatic pass never overrules an explicit hold, never guesses an
-/// unknown `kind`, and never fires an intent twice.
+/// Execution only when every recorded hold still allows it; evidence
+/// that the intent can never fire — terminal evidence, or an
+/// Execution already progressing under another path — retires it
+/// instead. Intents whose hold cannot be discharged (operator
+/// decision, unmet repair prerequisite, a pause still settling) stay
+/// `pending` with a reason — an automatic pass never overrules an
+/// explicit hold, never guesses an unknown `kind`, and never fires an
+/// intent twice.
 ///
 /// Every intent fires under its OWN store transaction (the per-Work
 /// isolation the loop design requires): a conflict on one intent's

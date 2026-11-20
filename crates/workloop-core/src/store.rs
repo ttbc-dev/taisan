@@ -558,7 +558,8 @@ pub enum RecoveryIntentState {
 /// A durable recovery intent persisted in the deciding transaction:
 /// `(kind, due_at, generation, evidence_basis)` under one Work, fired at
 /// most once by the recovery-scheduling phase, retired with a reason
-/// and the evidence generation when terminal evidence invalidates it.
+/// and the evidence generation when recorded evidence shows it can
+/// never fire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryIntent {
     pub intent_id: String,
