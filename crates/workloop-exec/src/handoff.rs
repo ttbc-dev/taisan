@@ -1023,6 +1023,9 @@ fn prove_verification_mounts(
         worker: None,
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
+    if let Some(reason) = containment::plan_denial(&plan) {
+        return Err(format!("verification.toolchain_preflight_failed: {reason}"));
+    }
     let outer = containment::bwrap_args(primitive, &plan, &argv, "/tmp");
     match ctx.port.run_probe(
         &outer,
@@ -1070,7 +1073,7 @@ fn run_verification_contained(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let gate = match containment::gate(
+    let gate = match containment::gate_for_verification(
         ctx.port.as_ref(),
         &layout.workspace_root,
         &ctx.profile,
@@ -1146,9 +1149,13 @@ fn run_verification_contained(
     // repository binds read-only for objects and refs; the worktree's
     // own gitdir is the single writable metadata bind so `git status`
     // can refresh its index — it can never reach another artifact's
-    // refs or objects.
+    // refs or objects. The submission's argv is not a mount
+    // declaration: unlike the operator-configured worker argv, an
+    // absolute-path element here names a host file the submission
+    // cannot be allowed to read — nothing is derived from it, so a
+    // missing path fails honestly inside the sandbox and the captured
+    // output can never carry host bytes.
     let mut extra_binds = vec![worktree.to_path_buf(), layout.repository.clone()];
-    extra_binds.extend(containment::extra_binds(&exec_argv, Some(&worker)));
     if proxy.is_some() {
         let relay = ctx.relay_exe.clone();
         if relay.is_absolute() && relay.exists() && !extra_binds.contains(&relay) {
@@ -1168,9 +1175,12 @@ fn run_verification_contained(
         caches: ctx.caches.clone(),
         extra_binds,
         extra_rw_binds: vec![gitdir.to_path_buf()],
-        worker: Some(worker.clone()),
+        worker: worker.clone(),
     };
     let _ = std::fs::create_dir_all(scratch_out);
+    if let Some(reason) = containment::plan_denial(&plan) {
+        return VerificationRun::Refused(format!("verification.containment_refused: {reason}"));
+    }
     let inner_cwd = worktree.to_string_lossy().into_owned();
     let outer = containment::bwrap_args(&primitive, &plan, &exec_argv, &inner_cwd);
     let env = containment::contained_env(&env, proxy_url);

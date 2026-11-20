@@ -160,6 +160,7 @@ fn declare(args: &Args) {
                 "roles": ["coding", "fix", "invariant_check", "review"],
                 "capabilities": [
                     "workspace_write",
+                    "workspace_read_only",
                     "artifact_json",
                     "process_control",
                 ],
