@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod egress;
 pub mod handoff;
 pub mod isolation;
+pub mod report_v2;
 pub mod request_v2;
 pub mod scripted;
 pub mod supervisor;

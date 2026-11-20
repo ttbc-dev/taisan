@@ -29,7 +29,7 @@ use workloop_core::worker::{
 use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
-use crate::bodies::CAS_CATEGORY;
+use crate::bodies::BodyStore;
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -917,6 +917,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// composition root always installs one built from the approved
     /// installation configuration.
     pub runtime_boundary: Option<RuntimeBoundary>,
+    /// The CAS body store worker report evidence is retained into.
+    /// Independent of `v2`: report collection follows the *recorded*
+    /// request body, so a finished v2 Invocation keeps its evidence
+    /// even after the dispatch profile is removed from configuration.
+    /// `None` fails report collection for v2 invocations rather than
+    /// recording evidence that cannot resolve.
+    pub body_store: Option<BodyStore>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -936,6 +943,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             handoff: None,
             v2: None,
             runtime_boundary: None,
+            body_store: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -963,7 +971,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// their recorded Invocation — the format is fixed at consumption,
     /// never upgraded in place.
     pub fn with_v2_dispatch(mut self, dispatch: V2Dispatch) -> Self {
+        // Report collection retains into the same CAS root the
+        // dispatch profile writes request bodies to, unless the
+        // composition root installed a body store explicitly.
+        if self.body_store.is_none() {
+            self.body_store = Some(dispatch.bodies.clone());
+        }
         self.v2 = Some(dispatch);
+        self
+    }
+
+    /// Install the CAS body store finished v2 Invocations retain their
+    /// report evidence into. The composition root sets this whenever a
+    /// state root exists — independent of `worker_dispatch`, because
+    /// collection follows the recorded request body, not the current
+    /// dispatch configuration.
+    pub fn with_body_store(mut self, bodies: BodyStore) -> Self {
+        self.body_store = Some(bodies);
         self
     }
 
@@ -3313,14 +3337,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             )?;
         }
-        // The worker's own report is the only copy of its declared
-        // status and reason: retain it content-addressed before the
-        // exit fact resolves the Invocation — the per-Invocation tree
-        // is reclaimed with resolution, so a report retained nowhere
-        // is evidence destroyed un-ingested. A v1 request writes no
-        // report; an absent or oversized one is honest absence, never
-        // a refusal of the exit fact itself.
-        self.retain_report(store, invocation, now_unix_seconds)?;
+        // The process tree is proven stopped before this runs, so the
+        // Invocation-owned out directory is final: collect the v2
+        // report evidence now, before the exit fact resolves the
+        // writer — a crash after the exit commit could never retry the
+        // collection. v1 requests collect nothing.
+        if let Some(fact) = crate::report_v2::collect(
+            store,
+            self.body_store
+                .as_ref()
+                .or(self.v2.as_ref().map(|d| &d.bodies)),
+            &self.workspace_root,
+            invocation,
+            &request,
+            now_unix_seconds,
+        )? {
+            self.report(store, &request, fact, now_unix_seconds)?;
+        }
         self.report(
             store,
             &request,
@@ -3336,61 +3369,6 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             now_unix_seconds,
         )?;
-        Ok(())
-    }
-
-    /// Retain the v2 worker's `report.json` in the content-addressed
-    /// body store so the declared status and reason survive the
-    /// per-Invocation tree's reclamation — the report is the only
-    /// copy of that evidence, and the io sweep's keep set names only
-    /// unresolved Invocations. Retention happens while the Invocation
-    /// still owns its tree; the report's own consumer classifies the
-    /// retained bytes, not this transport slice. No-op without a v2
-    /// dispatch, without a report, or for a report above the wire
-    /// bound — absent or out-of-contract bytes keep no claim.
-    fn retain_report(
-        &self,
-        store: &impl Store,
-        invocation: &Invocation,
-        now_unix_seconds: i64,
-    ) -> Result<(), ExecError> {
-        let Some(dispatch) = &self.v2 else {
-            return Ok(());
-        };
-        let report = crate::request_v2::invocation_io_root(&self.workspace_root)
-            .join(isolation::sanitize_key(&invocation.id.0))
-            .join("out")
-            .join("report.json");
-        let Ok(metadata) = std::fs::metadata(&report) else {
-            return Ok(());
-        };
-        // The wire bound caps the report envelope (budget
-        // `max_report_bytes`); retaining beyond a generous headroom
-        // protects the catalogue without ever refusing the exit fact.
-        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
-            return Ok(());
-        }
-        let Ok(bytes) = std::fs::read(&report) else {
-            return Ok(());
-        };
-        let horizon = workloop_store::retention::CategoryLimits::documented_default(CAS_CATEGORY)
-            .and_then(|limits| limits.max_age)
-            .map(|max_age| now_unix_seconds.saturating_add(max_age));
-        dispatch
-            .bodies
-            .retain_at(
-                store.body_catalog(),
-                CAS_CATEGORY,
-                &format!("bodies/report/{}", invocation.id.0),
-                &bytes,
-                now_unix_seconds,
-                horizon,
-            )
-            .map_err(|e| {
-                ExecError::Store(StoreError::Internal {
-                    detail: format!("retain report body: {e}"),
-                })
-            })?;
         Ok(())
     }
 
