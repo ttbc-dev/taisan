@@ -1028,6 +1028,21 @@ impl WorkerRequestV2 {
         request_v2_digest(&self.canonical_body())
     }
 
+    /// The verification commands the task pins — only the writer
+    /// tasks (`coding`/`fix`) declare any; the read tasks verify
+    /// through their own evidence shape and return an empty slice.
+    pub fn verification_argv(&self) -> &[Vec<String>] {
+        match &self.task {
+            TaskBody::Coding {
+                verification_argv, ..
+            }
+            | TaskBody::Fix {
+                verification_argv, ..
+            } => verification_argv,
+            _ => &[],
+        }
+    }
+
     /// Parse a request body and validate it: exact format version,
     /// closed envelope, role/task agreement, capability role echo,
     /// `read_only` by role, continuation/verification bounds, ordered

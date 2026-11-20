@@ -1526,16 +1526,27 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(work) = tx.work(&execution.work_id)? else {
                 return Ok(None);
             };
-            let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
+            let Some(request) = tx.request(&invocation.request_id)? else {
                 return Ok(None);
             };
-            // The Work-declared verification egress hosts and the
-            // workspace fork point live in the immutable v2 request
-            // body; a v1 dispatch or an absent body declares neither.
-            // An unverifiable body is corrupt durable state — the
-            // parse failure is a fault, never a silently empty grant
-            // or an unpinned base.
-            let (verification_egress_hosts, pinned_base) =
+            // Verification reads the spec revision the request was
+            // bound at — a later approved revision moves `work.spec`
+            // and must never silently re-bind an in-flight launch's
+            // verification commands.
+            let Some(spec) = tx.spec(&work.id, Some(request.spec_revision))? else {
+                return Ok(None);
+            };
+            // The verification argv, egress hosts, and workspace fork
+            // point a v2 dispatch runs are the immutable request
+            // body's — the bound spec the Worker was launched against,
+            // never the Work's current spec revision, which a re-edit
+            // could move mid-flight and silently re-bind verification
+            // to commands the dispatch never approved. A v1 dispatch
+            // or an absent body declares neither, and keeps the
+            // recorded spec argv it always had. An unverifiable body
+            // is corrupt durable state — a fault, never a silently
+            // empty grant or an unpinned base.
+            let (verification_argv, verification_egress_hosts, pinned_base) =
                 match tx.worker_request_body(&invocation.request_id)? {
                     Some(body) if body.verifies() => {
                         let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
@@ -1543,16 +1554,29 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             detail: format!("worker request body unreadable: {e}"),
                         })?;
                         (
+                            req.verification_argv().to_vec(),
                             req.required_capabilities.verification_egress_hosts,
                             req.base.object,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (
+                        spec.payload.verification_argv.clone(),
+                        Vec::new(),
+                        String::new(),
+                    ),
                 };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
-                spec.payload.verification_argv.clone(),
+                verification_argv,
                 verification_egress_hosts,
                 pinned_base,
                 execution.budget.artifact_recovery_attempts,
@@ -1728,7 +1752,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             {
                 continue;
             }
-            self.reconcile_or_start(store, &request, now_unix_seconds)?;
+            self.reconcile_or_start(store, &request, now_unix_seconds, clock)?;
         }
         Ok(())
     }
@@ -1738,6 +1762,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let lock = self.lock_for(&request.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1781,7 +1806,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // already consumed above replays its recorded Invocation
         // regardless of which profile is configured now.
         if self.v2.is_some() {
-            return self.start_v2(store, request, now_unix_seconds);
+            return self.start_v2(store, request, now_unix_seconds, clock);
         }
 
         // The Execution state gates the describe probe too: a request
@@ -2199,6 +2224,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         store: &impl Store,
         request: &InvocationRequest,
         now_unix_seconds: i64,
+        clock: &mut dyn FnMut() -> i64,
     ) -> Result<(), ExecError> {
         let dispatch = self
             .v2
@@ -2636,10 +2662,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // at the spawn boundary itself — the Execution still Ready and
         // the request's own deadline unexpired — so a stop, deadline,
         // or cancel committed during declaration, materialization, or
-        // preparation still blocks the launch. The recorded Invocation
-        // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > now_unix_seconds
+        // preparation still blocks the launch. The deadline is read
+        // from the live clock, not the pass-start timestamp: elapsed
+        // preparation time counts against the request's bound exactly
+        // as it would against a running writer. The recorded
+        // Invocation abandons exactly as the earlier gate does; no
+        // late writer starts after authorization expires.
+        let authorized = wire.budget.deadline_unix_seconds > clock()
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);
@@ -3092,11 +3121,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // signature an unrecorded writer can still be found by. A
         // request with no recorded binding has no signature to search:
         // nothing can be proven, so it stays uncertain.
-        let Some(expected_command) = request
-            .adapter_binding
-            .as_ref()
-            .map(|binding| binding.argv.join(" "))
-        else {
+        let Some(binding) = request.adapter_binding.as_ref() else {
             return self.report_unidentified_unknown(
                 store,
                 request,
@@ -3104,19 +3129,57 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             );
         };
-        let matches = match self.port.matching_processes(&expected_command) {
-            Ok(matches) => matches,
-            // An unreadable process table proves nothing in either
-            // direction — stay uncertain.
-            Err(_) => {
-                return self.report_unidentified_unknown(
-                    store,
-                    request,
-                    &invocation.id,
-                    now_unix_seconds,
-                );
+        // The signature is the full command line the spawn actually
+        // exec'd, which is the bare argv only for v1. A v2 launch
+        // appended the `run --request/--out` transport pair — the
+        // sandbox paths under containment, the host io paths
+        // uncontained — and the durable record does not name which
+        // gate the spawn took, so every shape the line could have
+        // taken is a signature. Missing the v2 shapes would leave a
+        // v2 writer unmatchable: never re-bound, and eventually
+        // declared absent on directory occupancy alone.
+        let mut signatures = vec![binding.argv.join(" ")];
+        if store
+            .transact(|tx| tx.worker_request_body(&request.request_id))?
+            .is_some()
+        {
+            let mut contained = binding.argv.clone();
+            contained.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                containment::SANDBOX_REQUEST.to_string(),
+                "--out".to_string(),
+                containment::SANDBOX_OUT.to_string(),
+            ]);
+            signatures.push(contained.join(" "));
+            let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
+                .join(crate::isolation::sanitize_key(&invocation.id.0));
+            let mut host = binding.argv.clone();
+            host.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                io_dir.join("request.json").to_string_lossy().into_owned(),
+                "--out".to_string(),
+                io_dir.join("out").to_string_lossy().into_owned(),
+            ]);
+            signatures.push(host.join(" "));
+        }
+        let mut matches = Vec::new();
+        for signature in &signatures {
+            match self.port.matching_processes(signature) {
+                Ok(found) => matches.extend(found),
+                // An unreadable process table proves nothing in either
+                // direction — stay uncertain.
+                Err(_) => {
+                    return self.report_unidentified_unknown(
+                        store,
+                        request,
+                        &invocation.id,
+                        now_unix_seconds,
+                    );
+                }
             }
-        };
+        }
         // Every signature match the store does not already account for.
         // A recorded writer — another work's live process, a snapshotted
         // descendant, a stop-proof identity — is never this launch's
@@ -3186,10 +3249,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation: next,
                         expected_state: invocation.state.clone(),
                     })?;
-                    tx.apply(&Effect::BindWorkerRequestExport {
-                        request_id: bound_request_id,
-                        process_identity: bound_identity.clone(),
-                    })?;
+                    // A v1 launch binds its export row to the spawned
+                    // handle. A v2 request has no export — its durable
+                    // body is the launch record and the running
+                    // Invocation carries the identity — so the bind
+                    // applies only when the export row exists;
+                    // requiring it would reject the whole commit.
+                    if tx.worker_request_export(&bound_request_id)?.is_some() {
+                        tx.apply(&Effect::BindWorkerRequestExport {
+                            request_id: bound_request_id,
+                            process_identity: bound_identity.clone(),
+                        })?;
+                    }
                     Ok(Some(()))
                 }) {
                     Ok(Some(())) => self.report(

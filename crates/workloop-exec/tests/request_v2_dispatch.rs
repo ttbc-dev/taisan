@@ -2098,8 +2098,8 @@ fn scripted_v2_declaration() -> String {
 /// A spawn whose outcome is lost — `SpawnError::Unknown` — leaves the
 /// recorded Invocation `Prepared` with no process identity: unknown,
 /// never retried. A later pass reconciles the recorded Invocation and
-/// reports the unknown writer again; it cannot start a second writer
-/// for the consumed request.
+/// re-binds the orphaned writer its launch signature still names; it
+/// cannot start a second writer for the consumed request.
 #[test]
 fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
     use workloop_core::ports::ProbeOutcome;
@@ -2146,8 +2146,10 @@ fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
         "the unknown outcome consumed exactly one start attempt"
     );
 
-    // Reconciliation and further passes replay the recorded
-    // Invocation — the unknown writer is reported, never replaced.
+    // Reconciliation finds the orphaned writer by the v2 transport
+    // signature and re-binds it through the same durable commit a
+    // normal launch uses — the unknown writer is recovered, never
+    // replaced.
     sup.consume_requests(&store, NOW + 1).unwrap();
     sup.run_once(&store, NOW + 2).unwrap();
     assert_eq!(
@@ -2159,9 +2161,100 @@ fn an_unknown_spawn_outcome_stays_unknown_and_never_starts_a_second_writer() {
         .transact(|tx| tx.invocations_for_execution(&e))
         .unwrap();
     assert_eq!(invocations.len(), 1, "exactly one Invocation ever");
-    assert_eq!(invocations[0].state, InvocationState::Prepared);
-    assert!(invocations[0].process_identity.is_none());
+    assert_eq!(
+        invocations[0].state,
+        InvocationState::Running,
+        "the orphaned writer is re-bound, not left unidentified"
+    );
+    assert!(invocations[0].process_identity.is_some());
     assert!(!pending_ids(&store).contains(&rid));
+}
+
+/// A lost v2 launch is re-bound by the command line the spawn
+/// actually exec'd — `argv run --request <path> --out <path>`, never
+/// the bare adapter argv. Searching only the bare argv leaves the
+/// orphaned writer unmatchable: never re-bound, and eventually
+/// declared absent on directory occupancy alone while still running.
+#[test]
+fn a_lost_v2_launch_is_rebound_by_its_transport_signature() {
+    use workloop_core::ports::ProbeOutcome;
+    use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
+
+    let root = tmp_root("v2-orphan-rebind");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-orphan", vec![]);
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: scripted_v2_declaration().into_bytes(),
+        success: true,
+    }));
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        port.clone(),
+        handoff.workspace_root.clone(),
+        vec!["scripted-worker".into()],
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(&state_root, &src));
+
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+
+    // The orphaned writer is still live carrying the v2 transport
+    // command line — reconciliation re-binds it through the same
+    // durable commit a normal launch uses.
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(
+        invocation.state,
+        InvocationState::Running,
+        "the orphan is re-bound, never replaced"
+    );
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "re-binding never starts a second writer"
+    );
+}
+
+/// A request deadline that elapses while the launch is still being
+/// prepared — declaration, materialization, workspace — is caught at
+/// the spawn boundary: the recorded Invocation abandons and no
+/// worker process starts. The tick deadline is unset so the pass's
+/// only clock read is the spawn-boundary recheck itself; `now` built
+/// the request body while the deadline still held.
+#[test]
+fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
+    let root = tmp_root("racing-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-deadline", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+
+    let mut clock = || i64::MAX;
+    sup.consume_requests_scoped(&store, NOW, None, &mut clock, None)
+        .unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert!(
+        !pending_ids(&store).contains(&rid),
+        "the consumed request is terminal for its binding"
+    );
 }
 
 // === Worker report evidence collection (`taisan.worker.report/2`,
