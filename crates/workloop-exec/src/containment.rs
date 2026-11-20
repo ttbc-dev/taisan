@@ -688,6 +688,24 @@ fn run_named_probe(
     });
 }
 
+/// The temp-dir fallback canary — the only candidate the probe
+/// creates and owns: the workspace `.containment` dir is the evidence
+/// store and `/sys` is shared, so this is the one path cleanup may
+/// remove.
+fn canary_fallback() -> PathBuf {
+    std::env::temp_dir().join(format!("workloop-canary-{}", std::process::id()))
+}
+
+/// Reclaim the probe canary — but only the temp-dir fallback: the
+/// workspace `.containment` dir is the evidence store
+/// (`evidence_path` writes under it) and `/sys` is shared, so
+/// removing either here would erase recorded proofs or worse.
+fn reclaim_canary(canary: &Path) {
+    if canary == canary_fallback() {
+        let _ = std::fs::remove_dir_all(canary);
+    }
+}
+
 /// A real host path the rendered argv provably never mounts, for the
 /// `unmounted-path-invisible` and `symlink-escape-denied` probes. The
 /// workspace-local canary is preferred, but a state root beneath a
@@ -731,7 +749,7 @@ fn invisible_canary(workspace_root: &Path, plan: &MountPlan) -> PathBuf {
     };
     for candidate in [
         workspace_root.join(".containment"),
-        std::env::temp_dir().join(format!("workloop-canary-{}", std::process::id())),
+        canary_fallback(),
         PathBuf::from("/sys/kernel"),
     ] {
         if !covered(&candidate) {
@@ -865,11 +883,9 @@ fn run_battery(
         "unmounted-path-invisible",
         &mut records,
     );
-    // The canary falls back to the host temp dir when no declared
-    // bind covers the workspace `.containment` dir — reclaim it so a
-    // first-launch proof never leaks `workloop-canary-<pid>` on the
-    // host.
-    let _ = std::fs::remove_dir_all(&canary);
+    // The temp-dir fallback is the probe's own path — reclaim it so a
+    // proof never leaks `workloop-canary-<pid>` on the host.
+    reclaim_canary(&canary);
     // tmpfs scratch is writable at /tmp and the fresh /home.
     run_named_probe(
         port,
@@ -1374,6 +1390,29 @@ mod tests {
             plan_denial(&plan).is_none(),
             "a directory below the root admits"
         );
+    }
+
+    /// The canary cleanup reclaims only the probe's own temp-dir
+    /// fallback — the workspace `.containment` dir is the evidence
+    /// store and must survive the battery.
+    #[test]
+    fn reclaim_canary_removes_only_the_temp_fallback() {
+        let evidence = tmp("evidence-dir").join(".containment");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::write(evidence.join("proof.json"), "{}").unwrap();
+        reclaim_canary(&evidence);
+        assert!(
+            evidence.join("proof.json").exists(),
+            "the evidence directory is never the canary's cleanup target"
+        );
+        let fallback = canary_fallback();
+        std::fs::create_dir_all(&fallback).unwrap();
+        reclaim_canary(&fallback);
+        assert!(
+            !fallback.exists(),
+            "the temp fallback is reclaimed after the probe"
+        );
+        let _ = std::fs::remove_dir_all(tmp("evidence-dir"));
     }
 
     /// The invisibility canary never lives under a bound prefix: a
