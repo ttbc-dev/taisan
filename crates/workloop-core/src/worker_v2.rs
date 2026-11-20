@@ -106,6 +106,13 @@ pub struct DiffTarget {
     /// 40 lowercase hex.
     pub head: String,
     pub diff_digest: String,
+    /// The target-branch revision the dispatch bound (40 lowercase
+    /// hex when observed). A target-branch-only move invalidates the
+    /// review just as a head move does — two assessments compare only
+    /// on an identical target. Absent on bodies minted before the
+    /// binding existed, which can never prove a revision match.
+    #[serde(default)]
+    pub target_revision: Option<String>,
 }
 
 /// One sealed review-finding occurrence selected for a review-origin
@@ -1747,6 +1754,7 @@ mod tests {
                             base: "0123456789abcdef0123456789abcdef01234567".into(),
                             head: "89abcdef0123456789abcdef0123456789abcdef".into(),
                             diff_digest: "d".repeat(64),
+                            target_revision: None,
                         },
                         round: "round-3".into(),
                         judgment: "judgment-9".into(),
@@ -1784,6 +1792,7 @@ mod tests {
                         base: "0123456789abcdef0123456789abcdef01234567".into(),
                         head: "89abcdef0123456789abcdef0123456789abcdef".into(),
                         diff_digest: "d".repeat(64),
+                        target_revision: None,
                     },
                     review_source: ReviewSourceRef {
                         source: "review-source-3".into(),
@@ -2027,6 +2036,7 @@ mod tests {
                 base: "0".repeat(40),
                 head: "1".repeat(40),
                 diff_digest: "d".repeat(64),
+                target_revision: None,
             },
             review_source: ReviewSourceRef {
                 source: "review-source-3".into(),

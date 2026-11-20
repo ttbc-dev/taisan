@@ -280,6 +280,7 @@ fn wire_target(
         base: base.to_string(),
         head: target.head.object.clone(),
         diff_digest: snapshot.snapshot_id(),
+        target_revision: target.target_revision.as_ref().map(|r| r.object.clone()),
     })
 }
 
