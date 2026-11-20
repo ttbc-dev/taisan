@@ -9,3 +9,4 @@ pub mod handoff;
 pub mod isolation;
 pub mod scripted;
 pub mod supervisor;
+pub mod workspace;

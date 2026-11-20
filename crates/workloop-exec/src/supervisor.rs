@@ -714,6 +714,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
         self.workspace_root.join(format!("ws-{}", work_id.0))
     }
 
+    pub fn prepare_workspace(
+        &self,
+        store: &impl Store,
+        request_id: &str,
+        source: &crate::workspace::RepositorySource,
+        now_unix_seconds: i64,
+    ) -> Result<crate::workspace::PreparedWorkspace, crate::workspace::PreparationError> {
+        crate::workspace::prepare(
+            store,
+            &self.workspace_root,
+            self.handoff.as_ref(),
+            request_id,
+            source,
+            now_unix_seconds,
+        )
+    }
+
     /// The scratch tree one Invocation's launch environment is built
     /// under — its writer's `HOME`/`TMPDIR`, reclaimed when the
     /// Invocation finishes or the launch is refused.
