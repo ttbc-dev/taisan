@@ -1552,6 +1552,46 @@ fn contained_verification_without_egress_grants_no_proxy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The submission's argv is not a mount declaration: an
+/// absolute-path element that exists on the host is never bound
+/// into the verification sandbox — the sandbox's mount set is the
+/// installation-declared surface (worktree, repository, toolchain,
+/// caches) and nothing the submitted argv names.
+#[test]
+fn contained_verification_never_binds_a_path_the_submission_argv_names() {
+    let root = tmp_root("verify-noargbind");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-noargbind");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let canary = root.join("host-only-canary.txt");
+    std::fs::write(&canary, "host bytes").unwrap();
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("cat '{}'", canary.display()),
+        canary.to_string_lossy().into_owned(),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+    let log = std::fs::read_to_string(&bwrap_log).unwrap();
+    assert!(
+        !log.contains(&format!("--ro-bind\n{}", canary.display())),
+        "the submission argv element mounted a host file:\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn contained_verification_refuses_a_model_api_egress_host() {
     let root = tmp_root("verify-denied");

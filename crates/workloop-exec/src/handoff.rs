@@ -1149,9 +1149,13 @@ fn run_verification_contained(
     // repository binds read-only for objects and refs; the worktree's
     // own gitdir is the single writable metadata bind so `git status`
     // can refresh its index — it can never reach another artifact's
-    // refs or objects.
+    // refs or objects. The submission's argv is not a mount
+    // declaration: unlike the operator-configured worker argv, an
+    // absolute-path element here names a host file the submission
+    // cannot be allowed to read — nothing is derived from it, so a
+    // missing path fails honestly inside the sandbox and the captured
+    // output can never carry host bytes.
     let mut extra_binds = vec![worktree.to_path_buf(), layout.repository.clone()];
-    extra_binds.extend(containment::extra_binds(&exec_argv, Some(&worker)));
     if proxy.is_some() {
         let relay = ctx.relay_exe.clone();
         if relay.is_absolute() && relay.exists() && !extra_binds.contains(&relay) {
