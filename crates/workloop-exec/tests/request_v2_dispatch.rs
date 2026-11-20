@@ -3619,6 +3619,31 @@ fn a_clean_code_review_seals_a_zero_finding_round() {
 }
 
 #[test]
+fn a_negative_review_report_is_partial_and_never_seals_a_round() {
+    // `checks_failed` is the writer-role negative vocabulary — a
+    // Review worker reporting it claims checks failed, not that a
+    // review ran. It must never seal a complete zero-occurrence
+    // round that satisfies the review gate.
+    let rig = assess_rig(
+        "review-negative",
+        v2_argv("clean-exit", &["--report-mode", "negative"]),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(reviews[0].0, Completeness::Partial { .. }),
+        "a non-review negative is partial, never complete: {:?}",
+        reviews[0].0
+    );
+    assert!(
+        sealed_rounds(&rig.store, &rig.work_id).is_empty(),
+        "a negative report never seals a round"
+    );
+}
+
+#[test]
 fn a_review_with_malformed_findings_records_partial_and_never_seals() {
     let argv = v2_argv(
         "clean-exit",

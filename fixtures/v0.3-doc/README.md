@@ -34,11 +34,14 @@ Every file was produced by a real `taisan` invocation against:
 ## What these captures prove — and do not prove
 
 They prove the command surface, the durable record shapes, the
-fail-closed preflight ordering, and the publish boundary: the run
-ended with the Execution `waiting` and **zero**
-`host_action_intents` rows, because no in-process driver emits
-`CapabilityReport` evidence on this tree (tracked as
-[#355](https://github.com/shimpeiws/taisan/issues/355)).
+fail-closed preflight ordering, and the publish boundary as captured:
+the run ended with the Execution `waiting` and **zero**
+`host_action_intents` rows — the capture predates the in-process
+`github` driver's `CapabilityReport` evidence, the composition gap
+closed by
+[#355](https://github.com/shimpeiws/taisan/issues/355). On this tree
+the driver now emits a report every source pass, so a live run
+records publish intents once that report lands.
 
 They are **automated fixture/contract evidence**. They never prove
 live Worker behavior, live model calls, live host reads or writes, or
