@@ -71,9 +71,11 @@ pub const SANDBOX_TOOLCHAIN: &str = "/taisan/toolchain";
 /// config (`docs/v0.3.md` §14.3). `/etc` and `/opt` are excluded on
 /// the same rule: they are host configuration and third-party
 /// install trees, not the runtime — a world-readable host secret or
-/// site config there must stay invisible to the sandbox (OPS-04).
-/// Only directories that exist on the host are bound; a merged-usr
-/// layout binds `/bin`/`/sbin` as the symlinks they are.
+/// site config there must stay invisible to the sandbox, and a state
+/// or workspace root beneath one of those prefixes must never leak
+/// into the worker's view (OPS-04). Only directories that exist on
+/// the host are bound; a merged-usr layout binds `/bin`/`/sbin` as
+/// the symlinks they are.
 const SYSTEM_BINDS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64"];
 
 /// How long a failed proof suppresses re-probing: an operator fixes
@@ -155,7 +157,10 @@ pub enum Gate {
         /// The resolved `bwrap` path the outer argv leads with.
         primitive: PathBuf,
         /// The resolved worker executable path the mount plan binds.
-        worker: PathBuf,
+        /// `None` only for a verification gate, whose argv[0] may be a
+        /// worktree-relative command that resolves inside the sandbox
+        /// — launches always carry `Some`.
+        worker: Option<PathBuf>,
     },
 }
 
@@ -228,23 +233,106 @@ fn kernel_release() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+/// In-sandbox destinations a bind spelled by its own host path must
+/// never cover or enter. The sealed trees hold supervisor-mounted
+/// content whose sandbox spelling differs from the host path — a bind
+/// landing inside them serves host content where the boundary
+/// contract promised the supervisor's mount (a `/taisan/request.json`
+/// argv element on a host that has one would shadow the
+/// digest-verified request; `/taisan/out` likewise). The covered
+/// mounts are the kernel/tmpfs views and fixed bind destinations: an
+/// equal or ancestor spelling covers the mount outright — a `/` argv
+/// element or configured path would re-mount the host root over the
+/// whole sandbox.
+const SEALED_TREES: &[&str] = &[SANDBOX_WORKSPACE, "/taisan"];
+const COVERED_MOUNTS: &[&str] = &["/tmp", "/run", "/home", "/proc", "/dev"];
+
+/// Whether `candidate` — a bind destination spelled at its own host
+/// path — covers or enters the supervisor-owned sandbox surface.
+/// Component-wise: `/taisanevil` is outside `/taisan`, while `/` is
+/// an ancestor of every fixed destination.
+fn shadows_sandbox_mount(candidate: &Path) -> bool {
+    SEALED_TREES
+        .iter()
+        .chain(COVERED_MOUNTS)
+        .any(|mount| Path::new(mount).starts_with(candidate))
+        || SEALED_TREES
+            .iter()
+            .any(|sealed| candidate.starts_with(sealed))
+}
+
 /// Absolute-path argv elements that exist on the host become
 /// read-only binds at their own path. Flags, sandbox paths (which do
 /// not exist on the host), bare names, and missing paths are skipped
 /// — a path the worker needs but that is absent fails honestly inside
-/// the sandbox, never silently on the host. `worker` names the one
-/// executable the plan binds separately; it is excluded here so the
-/// same path is never bound twice.
+/// the sandbox, never silently on the host. Spellings that cover or
+/// enter the supervisor-owned surface are skipped too: these binds
+/// render after the `/taisan` and `/workspace` mounts, so an argv
+/// element could otherwise shadow them (`/taisan/request.json` and
+/// `/taisan/out` are always present in a contained v2 argv; `/`
+/// re-mounts the host root). `worker` names the one executable the
+/// plan binds separately; it is excluded here so the same path is
+/// never bound twice.
 pub fn extra_binds(inner_argv: &[String], worker: Option<&Path>) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = worker.map(Path::to_path_buf).into_iter().collect();
     let mut binds = Vec::new();
     for arg in inner_argv.iter().skip(1) {
         let path = Path::new(arg);
-        if path.is_absolute() && path.exists() && seen.insert(path.to_path_buf()) {
+        if path.is_absolute()
+            && !shadows_sandbox_mount(path)
+            && path.exists()
+            && seen.insert(path.to_path_buf())
+        {
             binds.push(path.to_path_buf());
         }
     }
     binds
+}
+
+/// Refuse a mount plan whose binds would cover or enter the
+/// supervisor-owned sandbox surface. Every bind the plan mounts at
+/// its own spelling is checked — caches, argv-derived binds, the
+/// writable metadata binds, the toolchain's own-path bind, and the
+/// worker — and a fixed-destination source (toolchain, provider
+/// config) must not resolve to the host root, which would mount the
+/// whole host filesystem read-only inside the sandbox.
+/// `Some(reason)` is a typed boundary refusal;
+/// `None` admits the plan. Callers check before rendering argv: a
+/// refused plan never reaches `bwrap`.
+pub fn plan_denial(plan: &MountPlan) -> Option<String> {
+    for (source, what) in [
+        (plan.toolchain.as_ref(), "verification toolchain"),
+        (plan.provider_config.as_ref(), "provider config"),
+    ]
+    .into_iter()
+    .filter_map(|(p, what)| p.map(|p| (p, what)))
+    {
+        let resolved = source.canonicalize().unwrap_or_else(|_| source.clone());
+        if resolved.parent().is_none() {
+            return Some(format!(
+                "{what} '{}' resolves to the host root — \
+                 the mount must name a directory below it",
+                source.display()
+            ));
+        }
+    }
+    let own_path_binds = plan
+        .toolchain
+        .iter()
+        .chain(plan.caches.iter())
+        .chain(plan.extra_binds.iter())
+        .chain(plan.extra_rw_binds.iter())
+        .chain(plan.worker.iter());
+    for bind in own_path_binds {
+        let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
+        if shadows_sandbox_mount(bind) || shadows_sandbox_mount(&resolved) {
+            return Some(format!(
+                "mount plan bind '{}' covers a supervisor-owned sandbox path",
+                bind.display()
+            ));
+        }
+    }
+    None
 }
 
 /// Wrap `inner_argv` in the in-sandbox CONNECT relay
@@ -581,10 +669,14 @@ fn run_named_probe(
                 if trimmed.is_empty() {
                     String::new()
                 } else {
-                    // Bound by characters: a byte slice can split a
-                    // multibyte codepoint and panic on worker output.
-                    let bounded: String = trimmed.chars().take(200).collect();
-                    format!(": {bounded}")
+                    // The 200-byte detail bound lands on a char
+                    // boundary — a lossy-rendered probe output can
+                    // carry multi-byte characters there.
+                    let mut end = trimmed.len().min(200);
+                    while !trimmed.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!(": {}", &trimmed[..end])
                 }
             }),
         ),
@@ -599,6 +691,77 @@ fn run_named_probe(
     });
 }
 
+/// The temp-dir fallback canary — the only candidate the probe
+/// creates and owns: the workspace `.containment` dir is the evidence
+/// store and `/sys` is shared, so this is the one path cleanup may
+/// remove.
+fn canary_fallback() -> PathBuf {
+    std::env::temp_dir().join(format!("workloop-canary-{}", std::process::id()))
+}
+
+/// Reclaim the probe canary — but only the temp-dir fallback: the
+/// workspace `.containment` dir is the evidence store
+/// (`evidence_path` writes under it) and `/sys` is shared, so
+/// removing either here would erase recorded proofs or worse.
+fn reclaim_canary(canary: &Path) {
+    if canary == canary_fallback() {
+        let _ = std::fs::remove_dir_all(canary);
+    }
+}
+
+/// A real host path the rendered argv provably never mounts, for the
+/// `unmounted-path-invisible` and `symlink-escape-denied` probes. The
+/// workspace-local canary is preferred, but a state root beneath a
+/// bound prefix — `/opt/taisan` is ro-bound as a system dir — is
+/// visible inside the sandbox and would fail the proof on every
+/// launch. The fallbacks are the host temp dir (the sandbox replaces
+/// `/tmp` with a fresh tmpfs) and sysfs, which no declared bind
+/// carries into the sandbox.
+fn invisible_canary(workspace_root: &Path, plan: &MountPlan) -> PathBuf {
+    let plan_sources: Vec<PathBuf> = [
+        plan.workspace.as_ref().map(|(p, _)| p.clone()),
+        plan.request.clone(),
+        plan.input.clone(),
+        plan.out.clone(),
+        plan.gitconfig.clone(),
+        plan.runtime_auth.clone(),
+        plan.provider_config.clone(),
+        plan.proxy_sock.clone(),
+        plan.toolchain.clone(),
+        plan.worker.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(plan.caches.iter().cloned())
+    .chain(plan.extra_binds.iter().cloned())
+    .chain(plan.extra_rw_binds.iter().cloned())
+    .collect();
+    let covered = |candidate: &Path| {
+        let resolved = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        SYSTEM_BINDS
+            .iter()
+            .filter(|d| Path::new(d).exists())
+            .map(Path::new)
+            .chain(plan_sources.iter().map(PathBuf::as_path))
+            .any(|bound| {
+                let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
+                resolved == bound || resolved.starts_with(&bound)
+            })
+    };
+    for candidate in [
+        workspace_root.join(".containment"),
+        canary_fallback(),
+        PathBuf::from("/sys/kernel"),
+    ] {
+        if !covered(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("no declared bind covers /sys")
+}
+
 /// The negative-probe battery (`docs/v0.3.md` §14 acceptance matrix,
 /// OPS-01…OPS-09 evidence class). Each probe is a tiny `/bin/sh`
 /// program run through the real `bwrap` argv the launches use, so a
@@ -611,7 +774,7 @@ fn run_battery(
     workspace_root: &Path,
     profile: &IsolationProfile,
     primitive: &Path,
-    worker: &Path,
+    worker: Option<&Path>,
 ) -> Result<Vec<ProbeRecord>, GateError> {
     // The probe scratch lives under `.isolation/probe-containment` —
     // inside the sweep's `probe-*` prefix so a crashed battery never
@@ -650,7 +813,7 @@ fn run_battery(
         caches: vec![],
         extra_binds: vec![],
         extra_rw_binds: vec![],
-        worker: Some(worker.to_path_buf()),
+        worker: worker.map(Path::to_path_buf),
     };
     let mut records = Vec::new();
     let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
@@ -687,7 +850,7 @@ fn run_battery(
     // A symlink planted in the workspace cannot reach a host path:
     // the target was never mounted, so resolving through the link
     // lands on nothing inside the sandbox.
-    let canary = workspace_root.join(".containment");
+    let canary = invisible_canary(workspace_root, &plan);
     let _ = std::fs::create_dir_all(&canary);
     let escape_link = probe_ws.join("escape-link");
     let _ = std::os::unix::fs::symlink(&canary, &escape_link);
@@ -723,6 +886,9 @@ fn run_battery(
         "unmounted-path-invisible",
         &mut records,
     );
+    // The temp-dir fallback is the probe's own path — reclaim it so a
+    // proof never leaks `workloop-canary-<pid>` on the host.
+    reclaim_canary(&canary);
     // tmpfs scratch is writable at /tmp and the fresh /home.
     run_named_probe(
         port,
@@ -794,24 +960,28 @@ fn run_battery(
         &mut records,
     );
     // The worker executable resolves inside the sandbox at its bound
-    // path — the mount plan's worker bind is proven, not assumed.
-    run_named_probe(
-        port,
-        primitive,
-        &plan,
-        &[
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "test -x \"$1\"".to_string(),
-            "sh".to_string(),
-            worker.to_string_lossy().into_owned(),
-        ],
-        "/tmp",
-        &env,
-        &scratch,
-        "worker-binary-visible",
-        &mut records,
-    );
+    // path — the mount plan's worker bind is proven, not assumed. A
+    // verification gate binds no worker binary, so there is nothing
+    // to prove.
+    if let Some(worker) = worker {
+        run_named_probe(
+            port,
+            primitive,
+            &plan,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test -x \"$1\"".to_string(),
+                "sh".to_string(),
+                worker.to_string_lossy().into_owned(),
+            ],
+            "/tmp",
+            &env,
+            &scratch,
+            "worker-binary-visible",
+            &mut records,
+        );
+    }
     // `describe`-era argv elements that are absolute host paths stay
     // reachable read-only — the same surface `extra_binds` grants.
     // (The battery plan binds none; the launch plans add them per
@@ -844,6 +1014,34 @@ pub fn gate(
         worker_argv,
         boundary_digest,
         now_unix_seconds,
+        true,
+        &resolve_on_path,
+        &resolve_worker,
+    )
+}
+
+/// The gate for a contained verification command. Unlike a worker
+/// launch, the submission's argv[0] need not resolve to a host
+/// executable: a worktree-relative command (`./gradlew test`)
+/// resolves inside the sandbox against the bound worktree — an
+/// unresolvable argv[0] is an honest in-sandbox failure, never a
+/// gate refusal (`docs/v0.3.md` §14.5; `MountPlan.worker`).
+pub fn gate_for_verification(
+    port: &dyn ProcessControlPort,
+    workspace_root: &Path,
+    profile: &IsolationProfile,
+    argv: &[String],
+    boundary_digest: Option<&str>,
+    now_unix_seconds: i64,
+) -> Result<Gate, GateError> {
+    gate_with_resolvers(
+        port,
+        workspace_root,
+        profile,
+        argv,
+        boundary_digest,
+        now_unix_seconds,
+        false,
         &resolve_on_path,
         &resolve_worker,
     )
@@ -851,7 +1049,8 @@ pub fn gate(
 
 /// `gate` with the host lookups injected — the deterministic seam the
 /// suite uses to prove evidence reuse, refusal, and re-proof without
-/// a real `bwrap` on the host.
+/// a real `bwrap` on the host. `worker_required` keeps argv[0]
+/// resolution fail-closed for launches; verification passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gate_with_resolvers(
     port: &dyn ProcessControlPort,
@@ -860,6 +1059,7 @@ pub(crate) fn gate_with_resolvers(
     worker_argv: &[String],
     boundary_digest: Option<&str>,
     now_unix_seconds: i64,
+    worker_required: bool,
     resolve_primitive: &dyn Fn(&str) -> Option<PathBuf>,
     resolve_worker: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<Gate, GateError> {
@@ -877,12 +1077,16 @@ pub(crate) fn gate_with_resolvers(
             profile.id
         ))
     })?;
-    let worker = resolve_worker(&worker_argv[0]).ok_or_else(|| {
-        refused(format!(
-            "isolation.worker_unresolvable: worker argv[0] '{}' does not resolve to an executable file",
-            worker_argv[0]
-        ))
-    })?;
+    let worker = match resolve_worker(&worker_argv[0]) {
+        Some(worker) => Some(worker),
+        None if worker_required => {
+            return Err(refused(format!(
+                "isolation.worker_unresolvable: worker argv[0] '{}' does not resolve to an executable file",
+                worker_argv[0]
+            )));
+        }
+        None => None,
+    };
     let kernel = kernel_release();
     let version = primitive_version(port, &primitive, workspace_root)?;
 
@@ -915,7 +1119,7 @@ pub(crate) fn gate_with_resolvers(
         }
     }
 
-    let records = run_battery(port, workspace_root, profile, &primitive, &worker)?;
+    let records = run_battery(port, workspace_root, profile, &primitive, worker.as_deref())?;
     let failures: Vec<String> = records
         .iter()
         .filter(|record| !record.passed)
@@ -998,8 +1202,8 @@ mod tests {
         }
     }
 
-    /// A failed probe's detail is bounded by characters, never by a
-    /// raw byte slice — worker output whose bound lands inside a
+    /// A failed probe's detail bound backs off to a character
+    /// boundary — worker output whose 200-byte bound lands inside a
     /// multibyte codepoint must not panic the battery.
     #[test]
     fn a_probe_detail_truncates_on_a_character_boundary() {
@@ -1024,7 +1228,10 @@ mod tests {
         );
         assert_eq!(records.len(), 1);
         assert!(!records[0].passed);
-        assert!(records[0].detail.contains('あ'), "{:?}", records[0].detail);
+        // The bound landed inside 'あ' (bytes 199-201); the detail
+        // backs off to the 199-byte boundary instead of panicking.
+        assert!(records[0].detail.ends_with('a'), "{:?}", records[0].detail);
+        assert!(!records[0].detail.contains('あ'), "{:?}", records[0].detail);
     }
 
     #[test]
@@ -1160,6 +1367,144 @@ mod tests {
         let _ = std::fs::remove_file(&real);
     }
 
+    #[test]
+    fn sandbox_mount_shadowing_covers_both_directions() {
+        for denied in [
+            "/",
+            "/taisan",
+            "/taisan/request.json",
+            "/taisan/out/nested",
+            "/workspace",
+            "/workspace/managed/file",
+            "/tmp",
+            "/run",
+            "/home",
+            "/proc",
+            "/dev",
+        ] {
+            assert!(shadows_sandbox_mount(Path::new(denied)), "{denied}");
+        }
+        for allowed in [
+            "/opt/worker.py",
+            "/usr/bin/env",
+            "/etc/ssl/cert.pem",
+            "/var/lib/cache",
+            "/taisanevil/x",
+            "/tmp/host-file",
+            "/home/user/.cache/toolchain",
+        ] {
+            assert!(!shadows_sandbox_mount(Path::new(allowed)), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn extra_binds_skip_spellings_that_cover_the_sandbox_surface() {
+        let worker = Path::new("/opt/worker");
+        // `/` and `/tmp` exist on every host, so the skip is the
+        // guard's doing — not the missing-path skip. `/etc` is a
+        // same-spelling system bind and still collects.
+        let real = std::env::temp_dir().join("workloop-extra-bind-shadow");
+        std::fs::write(&real, "x").unwrap();
+        let argv = vec![
+            "worker".into(),
+            "/".into(),
+            "/tmp".into(),
+            "/etc".into(),
+            real.to_string_lossy().into_owned(),
+        ];
+        let binds = extra_binds(&argv, Some(worker));
+        assert_eq!(binds, vec![PathBuf::from("/etc"), real.clone()]);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn plan_denial_refuses_a_root_toolchain() {
+        let mut plan = plan_fixture();
+        plan.toolchain = Some(PathBuf::from("/"));
+        let reason = plan_denial(&plan).expect("a root toolchain refuses");
+        assert!(reason.contains("host root"), "{reason}");
+        // Spellings that resolve to the root refuse identically.
+        plan.toolchain = Some(PathBuf::from("/."));
+        assert!(plan_denial(&plan).is_some());
+        // A named directory admits.
+        plan.toolchain = Some(PathBuf::from("/opt/toolchain"));
+        assert!(plan_denial(&plan).is_none());
+    }
+
+    #[test]
+    fn plan_denial_refuses_binds_over_the_sandbox_surface() {
+        let mut plan = plan_fixture();
+        plan.caches = vec![PathBuf::from("/")];
+        assert!(plan_denial(&plan).is_some());
+        plan.caches = vec![PathBuf::from("/taisan")];
+        assert!(plan_denial(&plan).is_some());
+        plan.caches = vec![];
+        plan.extra_binds = vec![PathBuf::from("/taisan/request.json")];
+        assert!(plan_denial(&plan).is_some());
+        plan.extra_binds = vec![];
+        plan.extra_rw_binds = vec![PathBuf::from("/workspace")];
+        assert!(plan_denial(&plan).is_some());
+        // The fixture plan itself admits.
+        plan.extra_rw_binds = vec![];
+        assert!(plan_denial(&plan).is_none());
+    }
+
+    /// A fixed-destination source that resolves to the host root
+    /// mounts the whole filesystem read-only inside the sandbox —
+    /// the provider config gets the same root guard the toolchain has.
+    #[test]
+    fn plan_denial_refuses_a_root_provider_config() {
+        let mut plan = plan_fixture();
+        plan.provider_config = Some(PathBuf::from("/"));
+        let reason = plan_denial(&plan).expect("a root provider config refuses");
+        assert!(reason.contains("provider config"), "{reason}");
+        plan.provider_config = Some(PathBuf::from("/etc/ssl"));
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a directory below the root admits"
+        );
+    }
+
+    /// The canary cleanup reclaims only the probe's own temp-dir
+    /// fallback — the workspace `.containment` dir is the evidence
+    /// store and must survive the battery.
+    #[test]
+    fn reclaim_canary_removes_only_the_temp_fallback() {
+        let evidence = tmp("evidence-dir").join(".containment");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::write(evidence.join("proof.json"), "{}").unwrap();
+        reclaim_canary(&evidence);
+        assert!(
+            evidence.join("proof.json").exists(),
+            "the evidence directory is never the canary's cleanup target"
+        );
+        let fallback = canary_fallback();
+        std::fs::create_dir_all(&fallback).unwrap();
+        reclaim_canary(&fallback);
+        assert!(
+            !fallback.exists(),
+            "the temp fallback is reclaimed after the probe"
+        );
+        let _ = std::fs::remove_dir_all(tmp("evidence-dir"));
+    }
+
+    /// The invisibility canary never lives under a bound prefix: a
+    /// state root below a ro-bound system dir (`/usr` exists on every
+    /// probe host) falls back to a real path the argv cannot carry in.
+    #[test]
+    fn invisible_canary_never_sits_under_a_bound_prefix() {
+        let plan = plan_fixture();
+        let free = tmp("canary-free").join("ws-root");
+        assert_eq!(invisible_canary(&free, &plan), free.join(".containment"));
+        let bound_root = Path::new("/usr").join("workloop-canary-test");
+        let picked = invisible_canary(&bound_root, &plan);
+        assert_ne!(picked, bound_root.join(".containment"));
+        assert!(
+            !picked.starts_with("/usr"),
+            "the fallback is never under a bound system dir: {picked:?}"
+        );
+    }
+
     /// A profile that declares a primitive which cannot resolve —
     /// deterministic on every host.
     fn primitive_profile() -> IsolationProfile {
@@ -1244,6 +1589,7 @@ mod tests {
             &argv,
             None,
             1_000,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1261,6 +1607,7 @@ mod tests {
             &argv,
             None,
             1_001,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1282,6 +1629,7 @@ mod tests {
             &["/bin/sh".to_string(), "--other".to_string()],
             None,
             1_002,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1320,6 +1668,7 @@ mod tests {
             &argv,
             None,
             2_000,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1338,6 +1687,7 @@ mod tests {
             &argv,
             None,
             2_001,
+            true,
             &|_| Some(PathBuf::from("/usr/bin/bwrap")),
             &|_| Some(PathBuf::from("/bin/sh")),
         )
@@ -1348,6 +1698,74 @@ mod tests {
             probes + 1,
             "no battery re-probe inside the window"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A verification argv whose argv[0] is worktree-relative
+    /// (`./gradlew test`) never resolves to a host executable — and
+    /// must not: it resolves inside the sandbox against the bound
+    /// worktree. The verification gate proves the same boundary with
+    /// no worker bind instead of refusing `worker_unresolvable`;
+    /// the launch gate stays fail-closed on the same argv.
+    #[test]
+    fn the_verification_gate_does_not_require_a_resolved_worker() {
+        let root = std::env::temp_dir().join(format!(
+            "wl-gate-verify-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let port = ScriptedProcessControl::new();
+        for _ in 0..16 {
+            port.push_probe(success_probe());
+        }
+        let profile = IsolationProfile {
+            id: "test-contained-v0.1",
+            env_passthrough: &[],
+            sandbox_primitive: Some("bwrap"),
+        };
+        let argv = vec!["./gradlew".to_string(), "test".to_string()];
+        // Worker resolution fails for a relative path with a
+        // separator — the launch gate refuses.
+        let err = gate_with_resolvers(
+            &port,
+            &root,
+            &profile,
+            &argv,
+            None,
+            1_000,
+            true,
+            &|_| Some(PathBuf::from("/usr/bin/bwrap")),
+            &|_| None,
+        )
+        .expect_err("a launch still refuses an unresolvable worker");
+        assert!(
+            matches!(err, GateError::Refused(ref r) if r.contains("isolation.worker_unresolvable")),
+            "{err:?}"
+        );
+        // The verification gate proves the boundary and reports no
+        // worker bind.
+        let gate = gate_with_resolvers(
+            &port,
+            &root,
+            &profile,
+            &argv,
+            None,
+            1_001,
+            false,
+            &|_| Some(PathBuf::from("/usr/bin/bwrap")),
+            &|_| None,
+        )
+        .expect("the verification gate proves without a worker");
+        match gate {
+            Gate::Ready { worker, .. } => {
+                assert_eq!(worker, None, "no worker bind for a relative argv")
+            }
+            _ => panic!("expected a ready gate"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

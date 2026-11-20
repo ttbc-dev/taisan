@@ -81,8 +81,9 @@ pub struct InvariantSetConfig {
 /// requires.
 #[derive(Debug, Clone)]
 pub struct V2Dispatch {
-    /// The content-addressed retained-body store
-    /// (`<state_root>/bodies`).
+    /// The content-addressed retained-body store rooted at the
+    /// installation state root — managed bodies record `bodies/…`
+    /// catalogue paths.
     pub bodies: BodyStore,
     /// Local repository sources matched by the Work's recorded
     /// repository binding — the supervisor-side read path for base
@@ -255,8 +256,29 @@ fn artifact_ref(handoff: &ArtifactHandoff) -> Result<ArtifactRef, DispatchRefusa
 fn wire_target(
     work: &Work,
     target: &CoreDiffTarget,
-    base: &str,
+    handoff: &ArtifactHandoff,
 ) -> Result<workloop_core::worker_v2::DiffTarget, DispatchRefusal> {
+    let base = &handoff.base;
+    let produced =
+        handoff
+            .produced
+            .as_deref()
+            .ok_or_else(|| DispatchRefusal::ArtifactUnavailable {
+                detail: format!("handoff {} has no produced commit", handoff.artifact_id),
+            })?;
+    // The workspace this request launches into is pinned at the
+    // acknowledged handoff's produced commit; a current target whose
+    // head has moved past it names code the mounted workspace does
+    // not contain — refuse HeadStale so a later pass binds the new
+    // head from a fresh handoff instead.
+    if target.head.object != produced {
+        return Err(DispatchRefusal::HeadStale {
+            detail: format!(
+                "the current target head {} moved past the produced commit {produced} the workspace pins",
+                target.head.object
+            ),
+        });
+    }
     if target.change.repository != work.binding.repository {
         return Err(DispatchRefusal::HeadStale {
             detail: "the current target names a foreign repository".into(),
@@ -375,7 +397,7 @@ fn retain_derived(
             detail: format!("retained {prefix} body is {} bytes", bytes.len()),
         }));
     }
-    let path = format!("{prefix}/{digest}");
+    let path = format!("bodies/{prefix}/{digest}");
     bodies
         .retain_at(
             catalog,
@@ -599,7 +621,7 @@ pub fn build_request_body(
             }));
         }
         Some(GoalRef {
-            body_ref: format!("goal/{goal_digest}"),
+            body_ref: format!("bodies/goal/{goal_digest}"),
             media_type: "text/markdown".into(),
             bytes: resolved.bytes.len() as u64,
             digest: goal_digest,
@@ -722,7 +744,7 @@ pub fn build_request_body(
                             })
                         })?;
                         Some(FixOrigin::Review {
-                            target: wire_target(&durable.work, target, &handoff.base)?,
+                            target: wire_target(&durable.work, target, handoff)?,
                             round: round.id.clone(),
                             judgment: judgment.id.clone(),
                             findings,
@@ -847,7 +869,7 @@ pub fn build_request_body(
                     detail: "no acknowledged handoff records the review base".into(),
                 })
             })?;
-            let wire = wire_target(&durable.work, target, &handoff.base)?;
+            let wire = wire_target(&durable.work, target, handoff)?;
             // Prior-review context: the newest sealed round across all
             // targets, with its occurrence set and exact-set judgment —
             // read back fresh because the gather collected identities
@@ -919,6 +941,17 @@ pub fn build_request_body(
         && !capabilities.iter().any(|c| c == "workspace_write")
     {
         capabilities.push("workspace_write".into());
+    }
+    if matches!(
+        request.role,
+        InvocationRole::InvariantCheck | InvocationRole::Review
+    ) && !capabilities.iter().any(|c| c == "workspace_read_only")
+    {
+        // A read-only assessment requires the adapter to declare the
+        // read-only workspace capability (docs/v0.3.md §5/§7.5): an
+        // adapter that lacks it must fail negotiation, not launch a
+        // check or review it never agreed to contain.
+        capabilities.push("workspace_read_only".into());
     }
     let required_capabilities = RequiredCapabilities {
         role: request.role.clone(),
@@ -1265,7 +1298,7 @@ pub fn materialize_invocation_io(
             // freezes the identities. Nothing to materialize.
         }
         TaskBody::InvariantCheck { invariant_set, .. } => {
-            let path = format!("invariant-set/{}", invariant_set.digest);
+            let path = format!("bodies/invariant-set/{}", invariant_set.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,
@@ -1298,7 +1331,7 @@ pub fn materialize_invocation_io(
                 .map_err(|e| mat_fault(e.to_string()))?;
         }
         TaskBody::CodeReview { review_source, .. } => {
-            let path = format!("review-source/{}", review_source.digest);
+            let path = format!("bodies/review-source/{}", review_source.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,
@@ -1332,7 +1365,7 @@ pub fn materialize_invocation_io(
         && let FixOrigin::Prepublication { failed_evidence } = origin.as_ref()
     {
         for (index, evidence) in failed_evidence.iter().enumerate() {
-            let path = format!("failed-evidence/{}", evidence.digest);
+            let path = format!("bodies/failed-evidence/{}", evidence.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
                 catalog,

@@ -122,9 +122,8 @@ fn the_retention_boundary_is_the_bodies_root_not_the_callers_cwd() {
     assert!(out.status.success());
 
     let store = store(&state);
-    // Every retain writes under `<state_root>/bodies` and catalogues a
-    // root-relative path — that root is the containment boundary, not
-    // the caller's cwd.
+    // Every retain catalogues a `bodies/…` path under the state root —
+    // that root is the containment boundary, not the caller's cwd.
     let state_body = state.join("bodies").join("case-1.blob");
     std::fs::create_dir_all(state_body.parent().unwrap()).unwrap();
     std::fs::write(&state_body, b"body").unwrap();
@@ -132,7 +131,7 @@ fn the_retention_boundary_is_the_bodies_root_not_the_callers_cwd() {
         .register_body(&CatalogBody {
             body_id: "state-body".into(),
             category: "cas".into(),
-            path: "case-1.blob".into(),
+            path: "bodies/case-1.blob".into(),
             bytes: 4,
             registered_unix_seconds: NOW - 100,
             eligible_after_unix_seconds: Some(NOW - 10),
@@ -407,9 +406,9 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
 
     let store = store(&dir);
     // A catalog row pointing at each of the installation's own files:
-    // the live store, its WAL sidecar and the config. They live under
-    // the state root but outside `<state_root>/bodies`, so containment
-    // alone must not authorize the sweep to delete them.
+    // the live store, its WAL sidecar and the config. They resolve
+    // inside the state root, so the protected-paths list — not mere
+    // containment — is what must hold them against the sweep.
     for (body_id, path) in [
         ("store-file", dir.join("workloop.db")),
         ("store-wal", dir.join("workloop.db-wal")),
@@ -437,7 +436,7 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
         .register_body(&CatalogBody {
             body_id: "reclaimable".into(),
             category: "cas".into(),
-            path: "case-1.blob".into(),
+            path: "bodies/case-1.blob".into(),
             bytes: 4,
             registered_unix_seconds: NOW - 90,
             eligible_after_unix_seconds: Some(NOW - 10),
@@ -462,7 +461,7 @@ fn the_sweep_never_reclaims_the_store_or_the_config() {
         .filter_map(|v| v.as_str())
         .collect();
     for id in ["store-file", "store-wal", "config-file"] {
-        let entry = format!("{id}:outside_root");
+        let entry = format!("{id}:protected_path");
         assert!(
             held.contains(&entry.as_str()),
             "expected {entry} held, got {held:?}"
