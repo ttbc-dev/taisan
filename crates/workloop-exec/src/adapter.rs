@@ -147,8 +147,8 @@ pub fn select_adapter(
 
 /// Run the effect-free `describe` operation through the process-control
 /// port (own process group, bounded wait, group signalled on timeout —
-/// the same containment a writer gets) and parse the declaration. Every
-/// failure is `Err`: no probe answer means no declaration and no
+/// the same containment a writer gets) and return its stdout bytes.
+/// Every failure is `Err`: no probe answer means no declaration and no
 /// selection, so a failed `describe` never produces a synthetic
 /// declaration that is then compared or dispatched on.
 /// `env` is the allowlisted environment the adapter runs under — the
@@ -163,13 +163,18 @@ pub fn observe_worker_declaration(
     observe_worker_declaration_within(port, argv, cwd, env, Duration::from_secs(5))
 }
 
-fn observe_worker_declaration_within(
+/// The raw `describe` probe both declaration eras share: spawn the
+/// bound argv plus `describe`, wait bounded, and hand back stdout.
+/// Spawn refusal, non-zero exit, and an over-bound wait are all
+/// `Err` — the caller decides which declaration grammar the bytes
+/// must satisfy.
+fn run_describe_probe(
     port: &impl ProcessControlPort,
     argv: &[String],
     cwd: &Path,
     env: &WorkerEnv,
     timeout: Duration,
-) -> Result<WorkerDeclaration, String> {
+) -> Result<Vec<u8>, String> {
     let mut probe_argv = argv.to_vec();
     probe_argv.push("describe".into());
     let outcome = port
@@ -178,18 +183,90 @@ fn observe_worker_declaration_within(
             SpawnError::Refused { reason } => format!("describe spawn refused: {reason}"),
             SpawnError::Unknown { reason } => format!("describe spawn unknown: {reason}"),
         })?;
-    let stdout = match outcome {
+    match outcome {
         ProbeOutcome::Exited {
             stdout,
             success: true,
-        } => stdout,
-        ProbeOutcome::Exited { success: false, .. } => {
-            return Err("describe exited non-zero".into());
-        }
-        ProbeOutcome::Bounded => {
-            return Err(format!("describe did not answer within {timeout:?}"));
-        }
-    };
+        } => Ok(stdout),
+        ProbeOutcome::Exited { success: false, .. } => Err("describe exited non-zero".into()),
+        ProbeOutcome::Bounded => Err(format!("describe did not answer within {timeout:?}")),
+    }
+}
+
+/// The v2-era `describe`: same probe, strict
+/// `taisan.worker.declaration/1` parse. Returns the wire declaration
+/// for `negotiate_v2` plus the capability-digest surface the durable
+/// binding records — the two views of one answer, never two probes.
+pub fn observe_worker_declaration_v2(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+) -> Result<
+    (
+        workloop_core::worker_v2::WorkerDeclarationV1,
+        WorkerDeclaration,
+    ),
+    String,
+> {
+    observe_worker_declaration_v2_within(port, argv, cwd, env, Duration::from_secs(5))
+}
+
+fn observe_worker_declaration_v2_within(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+    timeout: Duration,
+) -> Result<
+    (
+        workloop_core::worker_v2::WorkerDeclarationV1,
+        WorkerDeclaration,
+    ),
+    String,
+> {
+    let stdout = run_describe_probe(port, argv, cwd, env, timeout)?;
+    let declared = workloop_core::worker_v2::WorkerDeclarationV1::parse(&stdout)
+        .map_err(|e| format!("describe declaration refused: {e}"))?;
+    let surface = declaration_v1_surface(&declared)?;
+    Ok((declared, surface))
+}
+
+/// The digest/binding view of a v2 declaration: the same fields the
+/// v1 `WorkerDeclaration` capability digest covers, mapped one-to-one
+/// so a stored `WorkerAdapterBinding` compares like-for-like across
+/// the cutover. The adapter identity is untrusted worker output and
+/// passes the same `check_opaque` rules `AdapterId::new` enforces.
+fn declaration_v1_surface(
+    declared: &workloop_core::worker_v2::WorkerDeclarationV1,
+) -> Result<WorkerDeclaration, String> {
+    let adapter = AdapterId::new(declared.adapter.clone())
+        .map_err(|why| format!("describe declared an invalid adapter identity: {why}"))?;
+    Ok(WorkerDeclaration {
+        adapter,
+        adapter_version: declared.adapter_version.clone(),
+        runtime_product: declared.runtime.product.clone(),
+        runtime_version: declared.runtime.version.clone(),
+        protocol_versions: declared.protocol_versions.clone(),
+        roles: declared.roles.clone(),
+        capabilities: declared.capabilities.clone(),
+        declared_surface: serde_json::json!({
+            "resume": declared.resume,
+            "checkpoints": declared.checkpoints,
+            "runtime_artifact_store": declared.runtime_artifact_store,
+            "local_retries": declared.local_retries,
+        }),
+    })
+}
+
+fn observe_worker_declaration_within(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+    timeout: Duration,
+) -> Result<WorkerDeclaration, String> {
+    let stdout = run_describe_probe(port, argv, cwd, env, timeout)?;
     let value = serde_json::from_slice::<serde_json::Value>(&stdout)
         .map_err(|e| format!("describe output is not JSON: {e}"))?;
     let adapter = value

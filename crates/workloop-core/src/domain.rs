@@ -71,6 +71,17 @@ pub fn sha256_hex(tag: &str, bytes: &[u8]) -> String {
         })
 }
 
+/// The canonical issue-content digest every source identity shares —
+/// spec `SourceSnapshot.content_digest`, selector proposal bindings,
+/// and retained issue-snapshot bodies all compare over this one rule:
+/// SHA-256 over the `s1-issue-v1` tag, one colon, and `title\nbody`.
+/// The host's own `source_revision` and lifecycle `state` travel
+/// separately and never enter the digest, so two adapters computing it
+/// can never disagree about what "the same issue content" means.
+pub fn issue_content_digest(title: &str, body: &str) -> String {
+    sha256_hex("s1-issue-v1", format!("{title}\n{body}").as_bytes())
+}
+
 /// Canonical JSON encoding: object keys sorted recursively, UTF-8, no
 /// insignificant whitespace. Every externally supplied payload is hashed
 /// and compared over this encoding.

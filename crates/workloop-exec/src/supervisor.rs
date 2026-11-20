@@ -26,9 +26,11 @@ use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
     default_isolation_profile,
 };
+use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
 use crate::isolation;
+use crate::request_v2::V2Dispatch;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -579,6 +581,10 @@ impl ProcessControlPort for PosixProcessControl {
 pub enum ExecError {
     Store(StoreError),
     Io(std::io::Error),
+    /// An infrastructure fault outside the store/IO channels — the
+    /// pass fails and every durable row stays pending for the next
+    /// one rather than recording a degraded launch.
+    Fault(String),
 }
 
 impl std::fmt::Display for ExecError {
@@ -586,6 +592,7 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Fault(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -658,6 +665,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// Durable artifact-handoff layout; `None` keeps the file-artifact
     /// path only (fixture harnesses without git workspaces).
     pub handoff: Option<crate::handoff::HandoffLayout>,
+    /// The v2 dispatch profile (`docs/v0.3.md` §4): when set, every
+    /// pending request is materialized as an immutable
+    /// `taisan.worker.request/2` body and launched through the
+    /// `run --request/--out` transport. `None` keeps the legacy v1
+    /// consume path — a deployment never mixes the two for one
+    /// request because the recorded Invocation decides the replay.
+    pub v2: Option<V2Dispatch>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -675,6 +689,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             config,
             isolation_profile: default_isolation_profile(),
             handoff: None,
+            v2: None,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -693,6 +708,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// root) for Workspaces carrying git objects.
     pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
         self.handoff = Some(layout);
+        self
+    }
+
+    /// Enable the v2 consume path: pending requests materialize as
+    /// immutable `taisan.worker.request/2` bodies under this dispatch
+    /// profile. Requests already consumed under v1 keep replaying
+    /// their recorded Invocation — the format is fixed at consumption,
+    /// never upgraded in place.
+    pub fn with_v2_dispatch(mut self, dispatch: V2Dispatch) -> Self {
+        self.v2 = Some(dispatch);
         self
     }
 
@@ -822,6 +847,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
         self.sweep_isolation_scratch(store)?;
+        self.sweep_invocation_io(store)?;
         Ok(deadline_reached(clock, deadline))
     }
 
@@ -1088,6 +1114,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
             return Ok(());
+        }
+
+        // The v2 consume path materializes the immutable request body
+        // from durable state before any Invocation exists; a request
+        // already consumed above replays its recorded Invocation
+        // regardless of which profile is configured now.
+        if self.v2.is_some() {
+            return self.start_v2(store, request, now_unix_seconds);
         }
 
         // The Execution state gates the describe probe too: a request
@@ -1397,13 +1431,458 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
+    /// The v2 consume path (`docs/v0.3.md` §4): materialize the
+    /// immutable request body and the per-Invocation input/output tree
+    /// from durable state, record the body in the same commit that
+    /// consumes the request, negotiate the declaration, then launch
+    /// `<argv> run --request <request.json> --out <out/>`. Every
+    /// refusal is typed and lands before any process exists; an
+    /// infrastructure fault fails the pass so the request stays
+    /// pending for the next one.
+    fn start_v2(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let dispatch = self
+            .v2
+            .as_ref()
+            .expect("start_v2 requires the v2 dispatch profile");
+
+        // The Execution state gates everything, exactly as the v1
+        // probe gate: a request that can never launch is consumed
+        // without spending a build, a probe, or a process on it.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+        if exec_state != Some(ExecutionState::Ready) {
+            self.mark_consumed(store, &request.request_id)?;
+            return Ok(());
+        }
+
+        let invocation_id = InvocationId(store.transact(|tx| tx.alloc_id("inv"))?);
+
+        let body = match crate::request_v2::build_request_body(
+            store,
+            dispatch,
+            request,
+            &invocation_id.0,
+            now_unix_seconds,
+        ) {
+            Ok(body) => body,
+            Err(crate::request_v2::BuildError::Refusal(refusal)) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    refusal,
+                    now_unix_seconds,
+                );
+            }
+            Err(crate::request_v2::BuildError::Fault(detail)) => {
+                return Err(ExecError::Fault(detail));
+            }
+        };
+
+        // The builder validates its own output, but the launch path
+        // parses the durable bytes again — negotiation reads the wire
+        // request, never the builder's in-memory value.
+        let wire = match WorkerRequestV2::parse(&body.canonical_body) {
+            Ok(wire) => wire,
+            Err(e) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    DispatchRefusal::BodyCorrupt {
+                        detail: format!("built request does not parse: {e}"),
+                    },
+                    now_unix_seconds,
+                );
+            }
+        };
+
+        // Every required input body re-resolves through the catalogue
+        // and re-verifies before the consume commit — a body reclaimed
+        // or corrupted since the build refuses here, still before any
+        // process exists.
+        let io = match crate::request_v2::materialize_invocation_io(
+            store,
+            dispatch,
+            &crate::request_v2::invocation_io_root(&self.workspace_root),
+            &invocation_id.0,
+            &body,
+        ) {
+            Ok(io) => io,
+            Err(crate::request_v2::MaterializeError::Refusal(refusal)) => {
+                return self.refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    refusal,
+                    now_unix_seconds,
+                );
+            }
+            Err(crate::request_v2::MaterializeError::Fault(detail)) => {
+                return Err(ExecError::Fault(detail));
+            }
+        };
+
+        // Declaration probe plus the exact §5.2 negotiation, under the
+        // same fail-closed shape as the v1 probe: a stored binding is
+        // re-verified verbatim, an unbound request selects now, and
+        // every failure is a configuration repair carried through the
+        // consume commit — never a degraded launch.
+        let (binding, repair_reason) = {
+            let probe_scratch = isolation::scratch_root(&self.workspace_root).join(format!(
+                "probe-{}",
+                isolation::sanitize_key(&request.request_id)
+            ));
+            // `describe` is effect-free: it runs in a scratch cwd, never
+            // the managed workspace — creating `ws-<id>` here would
+            // leave an empty directory `workspace::prepare` later reads
+            // as an unreceipted conflict.
+            let probe_cwd = probe_scratch.join("cwd");
+            let probe_env = isolation::prepare(&self.isolation_profile, &probe_scratch);
+            match probe_env {
+                Err(why) => (
+                    None,
+                    Some(format!("isolation.environment_preparation_failed: {why}")),
+                ),
+                Ok(env) => {
+                    if let Err(e) = std::fs::create_dir_all(&probe_cwd) {
+                        isolation::release(&probe_scratch);
+                        return Err(ExecError::Fault(format!(
+                            "create probe cwd {}: {e}",
+                            probe_cwd.display()
+                        )));
+                    }
+                    let probe_argv = request
+                        .adapter_binding
+                        .as_ref()
+                        .map(|binding| binding.argv.clone())
+                        .unwrap_or_else(|| self.worker_argv.clone());
+                    let selected = match adapter::observe_worker_declaration_v2(
+                        &self.port,
+                        &probe_argv,
+                        &probe_cwd,
+                        &env,
+                    ) {
+                        Ok((declared, surface)) => match declared.negotiate_v2(&wire) {
+                            Ok(()) => match &request.adapter_binding {
+                                Some(stored) => match adapter::select_adapter(&surface, stored) {
+                                    adapter::AdapterSelection::Ready(binding) => {
+                                        (Some(binding), None)
+                                    }
+                                    adapter::AdapterSelection::ConfigurationRepair { reason } => {
+                                        (None, Some(reason))
+                                    }
+                                },
+                                None => (Some(surface.binding(&probe_argv)), None),
+                            },
+                            Err(why) => (None, Some(why.to_string())),
+                        },
+                        Err(why) => (
+                            None,
+                            Some(format!("adapter.declaration_unavailable: {why}")),
+                        ),
+                    };
+                    isolation::release(&probe_scratch);
+                    selected
+                }
+            }
+        };
+
+        // First consumption: the Invocation, the consumed mark, the
+        // first adapter binding, and the canonical request body land
+        // in one commit — a restart replays the stored bytes verbatim
+        // and never rebuilds from mutable configuration. There is no
+        // v1 WorkerRequest export for a v2 request: the durable body
+        // row is the launch record.
+        let invocation = Invocation {
+            id: invocation_id.clone(),
+            request_id: request.request_id.clone(),
+            execution_id: request.execution_id.clone(),
+            role: request.role.clone(),
+            state: InvocationState::Prepared,
+            process_identity: None,
+            descendants: vec![],
+            required_artifacts: required_artifacts(request),
+            evidence_refs: vec![],
+        };
+        store.transact(|tx| {
+            if request.adapter_binding.is_none()
+                && let Some(binding) = &binding
+            {
+                tx.apply(&Effect::BindRequestAdapter {
+                    request_id: request.request_id.clone(),
+                    binding: binding.clone(),
+                })?;
+            }
+            tx.apply(&Effect::InsertWorkerRequestBody { body: body.clone() })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            Ok(())
+        })?;
+
+        if let Some(reason) = repair_reason {
+            // A declaration that cannot negotiate the request — or no
+            // answer at all — is a configuration repair: the attempt is
+            // recorded and abandoned, but no worker starts. The
+            // consumed request is terminal for its binding.
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.release_invocation_io(&invocation.id.0);
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchRefused {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )?;
+            return Ok(());
+        }
+
+        // The pre-build Execution-state read is stale by up to the
+        // build and probe bounds: re-read it after the consume commit
+        // so a stop or cancel committed meanwhile still blocks the
+        // spawn — the request is consumed, so blocking the launch
+        // abandons the recorded Invocation.
+        let launchable = binding.is_some()
+            && store
+                .transact(|tx| tx.execution(&request.execution_id))?
+                .is_some_and(|e| e.state == ExecutionState::Ready);
+        if !launchable {
+            store.transact(|tx| {
+                let mut next = invocation.clone();
+                next.state = InvocationState::Abandoned;
+                tx.apply(&Effect::UpdateInvocation {
+                    invocation: next,
+                    expected_state: InvocationState::Prepared,
+                })?;
+                Ok(())
+            })?;
+            self.release_invocation_io(&invocation.id.0);
+            return Ok(());
+        }
+
+        let work_id = request.work_id.clone();
+        // Writer roles launch inside the exact prepared workspace —
+        // `workspace::prepare` re-validates the durable body, the
+        // pins, the reservations, and the predecessor against live git
+        // state and refuses rather than approximating. Read roles keep
+        // their existing launch trees: the check's per-Invocation
+        // snapshot and the review's managed workspace (mount-level
+        // read-only enforcement is the containment slice).
+        let workspace = match request.role {
+            InvocationRole::Coding | InvocationRole::Fix => {
+                let work = store.transact(|tx| tx.work(&work_id))?.ok_or_else(|| {
+                    ExecError::Fault(format!("request {} names no work", request.request_id))
+                })?;
+                let Some(source) = dispatch.source_for(&work.binding.repository) else {
+                    // The build already refused a missing source;
+                    // reaching here means the configuration changed
+                    // mid-pass — refuse the launch, never guess a
+                    // checkout.
+                    self.refuse_launch(
+                        store,
+                        request,
+                        &invocation,
+                        "repository source is no longer configured".into(),
+                        now_unix_seconds,
+                    )?;
+                    return Ok(());
+                };
+                match self.prepare_workspace(store, &request.request_id, source, now_unix_seconds) {
+                    Ok(prepared) => prepared.path,
+                    Err(why) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("workspace preparation refused: {why}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            InvocationRole::InvariantCheck => {
+                match self.snapshot_check_workspace(&invocation, &work_id) {
+                    Ok(path) => path,
+                    Err(why) => {
+                        self.refuse_launch(
+                            store,
+                            request,
+                            &invocation,
+                            format!("invariant check workspace snapshot failed: {why}"),
+                            now_unix_seconds,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            InvocationRole::Review => self.workspace_of(&work_id),
+        };
+        std::fs::create_dir_all(&workspace)?;
+
+        // The bound argv is the recorded selection; the approved v2
+        // transport appends the request/out pair — no shell, no stdin
+        // protocol, no fallback argv.
+        let mut argv = binding
+            .map(|binding| binding.argv)
+            .expect("a launch requires a recorded binding");
+        argv.push("run".into());
+        argv.push("--request".into());
+        argv.push(io.request_path.to_string_lossy().into_owned());
+        argv.push("--out".into());
+        argv.push(io.out_dir.to_string_lossy().into_owned());
+
+        let launch_env = match isolation::prepare(
+            &self.isolation_profile,
+            &self.launch_scratch(&invocation.id.0),
+        ) {
+            Ok(env) => env,
+            Err(why) => {
+                self.refuse_launch(
+                    store,
+                    request,
+                    &invocation,
+                    format!("isolation.environment_preparation_failed: {why}"),
+                    now_unix_seconds,
+                )?;
+                return Ok(());
+            }
+        };
+        match self.port.spawn(&argv, &workspace, &launch_env) {
+            Ok(identity) => {
+                let descendants = self
+                    .port
+                    .snapshot_descendants(identity.pid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.pid != identity.pid)
+                    .collect();
+                store.transact(|tx| {
+                    let mut next = invocation.clone();
+                    next.state = InvocationState::Running;
+                    next.process_identity = Some(identity.clone());
+                    next.descendants = descendants;
+                    tx.apply(&Effect::UpdateInvocation {
+                        invocation: next,
+                        expected_state: InvocationState::Prepared,
+                    })?;
+                    Ok(())
+                })?;
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: invocation.id.clone(),
+                        process_identity: format!("{}@{}", identity.pid, identity.started_at),
+                        state: ProcessStateFact::Running,
+                        exit_code: None,
+                    },
+                    now_unix_seconds,
+                )?;
+            }
+            Err(SpawnError::Refused { reason }) => {
+                self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
+            }
+            Err(SpawnError::Unknown { .. }) => {
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: invocation.id.clone(),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Unknown,
+                        exit_code: None,
+                    },
+                    now_unix_seconds,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a typed dispatch refusal: the `dispatch_refused` fact
+    /// pauses the waiting Execution and the request is marked consumed
+    /// — terminal for its own `request_id`, never silently retried.
+    /// The per-Invocation tree a refused materialization may have
+    /// partially written is reclaimed with the refusal; no worker ever
+    /// ran, so there is nothing to collect from `out/`.
+    fn refuse_dispatch(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation_id: &str,
+        refusal: DispatchRefusal,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        self.release_invocation_io(invocation_id);
+        self.report(
+            store,
+            request,
+            ObservationFact::DispatchRefused {
+                request_id: request.request_id.clone(),
+                code: refusal.code().to_string(),
+                detail: refusal.detail().to_string(),
+            },
+            now_unix_seconds,
+        )?;
+        self.mark_consumed(store, &request.request_id)
+    }
+
+    /// Reclaim one Invocation's input/output tree. Used on every path
+    /// where no worker could have written into `out/` — a refused
+    /// dispatch, a refused launch, an abandoned attempt. Trees of
+    /// resolved Invocations that did run are the retention sweep's
+    /// business, not this helper's.
+    fn release_invocation_io(&self, invocation_id: &str) {
+        let _ = std::fs::remove_dir_all(
+            crate::request_v2::invocation_io_root(&self.workspace_root)
+                .join(isolation::sanitize_key(invocation_id)),
+        );
+    }
+
+    /// Bound `.invocations`: per-Invocation request/input/output trees
+    /// are released with their Invocation's lifecycle, but a refused
+    /// dispatch or a crash between materialization and the consume
+    /// commit leaves orphans no unresolved Invocation names. Once per
+    /// pass, reclaim every tree no unresolved Invocation still owns.
+    pub fn sweep_invocation_io(&self, store: &impl Store) -> Result<(), ExecError> {
+        let root = crate::request_v2::invocation_io_root(&self.workspace_root);
+        let keep: HashSet<PathBuf> = store
+            .transact(|tx| tx.unresolved_invocations())?
+            .iter()
+            .map(|invocation| root.join(isolation::sanitize_key(&invocation.id.0)))
+            .collect();
+        isolation::sweep_orphans(&root, &keep);
+        Ok(())
+    }
+
     /// Record a launch refusal: the consumed request's Invocation is
     /// abandoned and `LaunchRefused` is reported — the request is
     /// terminal for its binding, never retried under a degraded setup.
     /// No process exists for this Invocation, so its scratch tree
     /// (fully built for a refused spawn, partial for a refused
-    /// preparation) and any check-workspace snapshot are reclaimed
-    /// with the refusal.
+    /// preparation), any check-workspace snapshot, and any v2
+    /// input/output tree are reclaimed with the refusal.
     fn refuse_launch(
         &self,
         store: &impl Store,
@@ -1414,6 +1893,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
     ) -> Result<(), ExecError> {
         isolation::release(&self.launch_scratch(&invocation.id.0));
         isolation::release(&self.check_workspace(&invocation.id.0));
+        self.release_invocation_io(&invocation.id.0);
         store.transact(|tx| {
             let mut next = invocation.clone();
             next.state = InvocationState::Abandoned;

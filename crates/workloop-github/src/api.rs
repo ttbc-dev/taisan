@@ -112,6 +112,26 @@ pub struct RemoteIssue {
     pub source_revision: String,
     pub content_digest: String,
     pub state: IssueState,
+    /// The issue title exactly as the host reported it — retained into
+    /// the immutable snapshot body a dispatch request binds; never
+    /// re-fetched by a Worker.
+    pub title: String,
+    /// The issue body exactly as the host reported it (empty when the
+    /// host reports none).
+    pub body: String,
+}
+
+/// One successfully-read issue source carried out of a refresh pass:
+/// the full content a retained snapshot body is built from. The
+/// composition root persists these as immutable bodies; the refresh
+/// itself never writes them — it reports what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueSnapshotRead {
+    pub issue: IssueRef,
+    pub source_revision: String,
+    pub content_digest: String,
+    pub title: String,
+    pub body: String,
 }
 
 /// The transport seam. A live implementation issues HTTPS calls; the

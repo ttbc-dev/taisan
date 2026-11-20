@@ -810,6 +810,7 @@ name = "workloop-fixture-worker"
 version = "0.0.0"
 dependencies = [
  "serde_json",
+ "workloop-core",
 ]
 
 [[package]]

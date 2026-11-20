@@ -77,6 +77,16 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         reason: String,
     },
+    /// The supervisor refused dispatch before any Invocation existed:
+    /// a required input body was missing, stale, corrupt, oversized,
+    /// or otherwise undeliverable. `code` is one of the closed
+    /// `request.*` dispatch-refusal codes; no process ever ran for
+    /// the request.
+    DispatchRefused {
+        request_id: String,
+        code: String,
+        detail: String,
+    },
     /// An authoritative read of a source issue. Drives the source gate:
     /// compared against the approved spec snapshot, never trusted by
     /// position or timestamp alone.

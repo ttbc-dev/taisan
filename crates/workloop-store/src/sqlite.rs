@@ -1023,6 +1023,10 @@ impl Store for SqliteStore {
     ) -> Result<R, StoreError> {
         self.run(TransactionBehavior::Deferred, f)
     }
+
+    fn body_catalog(&self) -> &dyn workloop_core::store::BodyCatalog {
+        self
+    }
 }
 
 impl Tx<'_> {

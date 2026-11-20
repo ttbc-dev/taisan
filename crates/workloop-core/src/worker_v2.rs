@@ -311,6 +311,378 @@ pub struct SpecRef {
     pub digest: String,
 }
 
+// ---------------------------------------------------------------------
+// Retained body formats (`docs/v0.3.md` §4): the immutable contents a
+// request references by digest. Each format is a closed canonical-JSON
+// envelope; the producer retains the exact bytes in the CAS store and
+// the request binds them by the type-tagged wire digest.
+// ---------------------------------------------------------------------
+
+/// The retained issue-snapshot format: the authoritative read of one
+/// source issue at one `source_revision`, retained so a bound request
+/// never re-fetches remote context (§4.3 "A body is never fetched by
+/// the Worker"). `content_digest` is the canonical
+/// `issue_content_digest(title, body)` the spec snapshot recorded.
+pub const ISSUE_SNAPSHOT_FORMAT: &str = "taisan.issue-snapshot/1";
+/// The wire-digest domain tag for [`IssueSnapshotBody`] bytes.
+const ISSUE_SNAPSHOT_DIGEST_TAG: &str = "issue-snapshot-v1";
+/// The catalogue path prefix every issue snapshot retains under; the
+/// lookup suffix is derived from the spec-bound identity only, so
+/// dispatch resolves a snapshot without scanning the catalogue.
+pub const ISSUE_SNAPSHOT_PATH_PREFIX: &str = "issue-snapshot/";
+
+/// The immutable snapshot of one source issue's authoritative read —
+/// the retained body a `GroupedIssue.body` reference resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueSnapshotBody {
+    /// Always [`ISSUE_SNAPSHOT_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub issue: WireIssue,
+    /// The host's own version token for this read — a string, never a
+    /// number, exactly as the source reports it.
+    pub source_revision: String,
+    pub title: String,
+    pub body: String,
+    /// `issue_content_digest(title, body)` at read time.
+    pub content_digest: String,
+}
+
+impl IssueSnapshotBody {
+    /// Build the snapshot for one authoritative read. `content_digest`
+    /// is supplied by the reader (the same value the source gate
+    /// records), never recomputed here — the retained bytes must equal
+    /// what the boundary observed.
+    pub fn new(
+        issue: WireIssue,
+        source_revision: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        content_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            format: ISSUE_SNAPSHOT_FORMAT.into(),
+            issue,
+            source_revision: source_revision.into(),
+            title: title.into(),
+            body: body.into(),
+            content_digest: content_digest.into(),
+        }
+    }
+
+    /// The exact retained bytes: canonical JSON of the envelope.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("snapshot serializes"))
+    }
+
+    /// Parse retained bytes back into the envelope, refusing a wrong
+    /// format or malformed content — corrupt snapshots are never
+    /// dispatched.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("issue snapshot is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != ISSUE_SNAPSHOT_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("issue snapshot malformed: {e}"),
+        })
+    }
+
+    /// The wire digest a `GroupedIssue.body.digest` / `IssueBodyRef`
+    /// carries: SHA-256 over the snapshot's own type tag and its exact
+    /// retained bytes.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(ISSUE_SNAPSHOT_DIGEST_TAG, &self.canonical_bytes())
+    }
+
+    /// The deterministic catalogue path for one snapshot identity —
+    /// derived only from `(issue, source_revision, content_digest)`,
+    /// so the dispatch builder resolves the exact retained body
+    /// without enumerating the catalogue and without holding a body
+    /// value. Two reads that differ in any bound field get different
+    /// paths; identical identity replays to the same body.
+    pub fn lookup_path(issue: &WireIssue, source_revision: &str, content_digest: &str) -> String {
+        let lookup = canonical_json(&serde_json::json!({
+            "issue": {
+                "host": issue.host,
+                "repository": issue.repository,
+                "issue": issue.issue,
+            },
+            "source_revision": source_revision,
+            "content_digest": content_digest,
+        }));
+        format!(
+            "{}{}",
+            ISSUE_SNAPSHOT_PATH_PREFIX,
+            sha256_hex("issue-snapshot-lookup-v1", &lookup)
+        )
+    }
+
+    /// The deterministic catalogue path this snapshot retains under —
+    /// [`Self::lookup_path`] over this body's own bound identity.
+    pub fn retained_path(&self) -> String {
+        Self::lookup_path(&self.issue, &self.source_revision, &self.content_digest)
+    }
+}
+
+/// The retained goal format: the exact goal/constraints text one
+/// writer Invocation executes against, rendered deterministically
+/// from the approved spec payload. Unlike the JSON envelopes above
+/// the retained bytes are Markdown (`GoalRef.media_type` is
+/// `text/markdown`); the digest still tags the body type.
+pub const GOAL_BODY_DIGEST_TAG: &str = "goal-v1";
+
+/// Render the goal body for one role: the approved intent plus the
+/// spec's constraints as Markdown. The role is named so a Coding and
+/// a Fix goal over the same spec are distinct retained bodies — the
+/// fix goal is the repair goal Core froze at judgment time, never the
+/// original coding brief re-labelled.
+pub fn goal_body_bytes(role: InvocationRole, intent: &str, constraints: &[String]) -> Vec<u8> {
+    let mut out = format!("# Goal — {role:?}\n\n{intent}\n");
+    if !constraints.is_empty() {
+        out.push_str("\n## Constraints\n");
+        for constraint in constraints {
+            out.push_str("- ");
+            out.push_str(constraint);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+/// The wire digest a `GoalRef.digest` carries: SHA-256 over the goal
+/// body's type tag and its exact retained bytes.
+pub fn goal_body_digest(bytes: &[u8]) -> String {
+    sha256_hex(GOAL_BODY_DIGEST_TAG, bytes)
+}
+
+/// The retained invariant-set format: the approved set of invariant
+/// identities an InvariantCheck Invocation assesses, versioned by the
+/// installation that approved it.
+pub const INVARIANT_SET_FORMAT: &str = "taisan.invariant-set/1";
+const INVARIANT_SET_DIGEST_TAG: &str = "invariant-set-v1";
+
+/// The approved invariant set — immutable once retained; a changed
+/// set is a new `(id, revision)` pair, never an edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantSetBody {
+    /// Always [`INVARIANT_SET_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub id: String,
+    pub revision: u64,
+    /// The invariant identities the check must assess, in declared
+    /// order — order is significant and readers never sort it.
+    pub items: Vec<String>,
+}
+
+impl InvariantSetBody {
+    pub fn new(id: impl Into<String>, revision: u64, items: Vec<String>) -> Self {
+        Self {
+            format: INVARIANT_SET_FORMAT.into(),
+            id: id.into(),
+            revision,
+            items,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("invariant set serializes"))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("invariant set is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != INVARIANT_SET_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("invariant set malformed: {e}"),
+        })
+    }
+
+    /// The wire digest an `InvariantSetRef.digest` carries.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(INVARIANT_SET_DIGEST_TAG, &self.canonical_bytes())
+    }
+}
+
+/// The retained review-source format: the complete review task
+/// snapshot the supervisor materializes for one CodeReview request —
+/// the exact target plus the sealed round/judgment context the
+/// reviewer needs, so the Worker never fetches remote review input.
+pub const REVIEW_SOURCE_FORMAT: &str = "taisan.review-source/1";
+const REVIEW_SOURCE_DIGEST_TAG: &str = "review-source-v1";
+
+/// One sealed finding occurrence inside a review source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceOccurrence {
+    pub id: String,
+    pub source_key: String,
+    pub content_digest: Option<String>,
+    pub severity: Option<String>,
+    pub position: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// The judgment context a re-review binds: the exact-set decision
+/// record over the sealed round, never a mutable projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceJudgment {
+    pub id: String,
+    pub set_digest: String,
+    pub decisions: Vec<crate::command::FindingDecision>,
+}
+
+/// The sealed round context inside a review source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceRound {
+    pub id: String,
+    pub source: String,
+    pub source_revision: Option<String>,
+    pub completeness: String,
+    pub set_digest: String,
+    /// The exact diff target the round was sealed against — prior
+    /// findings belong to that target, which may be superseded.
+    pub target: serde_json::Value,
+    pub occurrences: Vec<ReviewSourceOccurrence>,
+    pub judgment: Option<ReviewSourceJudgment>,
+}
+
+/// The materialized review input for one CodeReview request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceBody {
+    /// Always [`REVIEW_SOURCE_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub work_id: String,
+    /// The wire review target this source was materialized for —
+    /// `change`/`base`/`head`/`diff_digest` exactly as the request
+    /// binds them.
+    pub target: serde_json::Value,
+    /// The newest sealed round for the target, when one exists —
+    /// prior-review context, never the request's own output.
+    pub prior_round: Option<ReviewSourceRound>,
+}
+
+impl ReviewSourceBody {
+    pub fn new(
+        work_id: impl Into<String>,
+        target: serde_json::Value,
+        prior_round: Option<ReviewSourceRound>,
+    ) -> Self {
+        Self {
+            format: REVIEW_SOURCE_FORMAT.into(),
+            work_id: work_id.into(),
+            target,
+            prior_round,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("review source serializes"))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("review source is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != REVIEW_SOURCE_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("review source malformed: {e}"),
+        })
+    }
+
+    /// The wire digest a `ReviewSourceRef.digest` carries.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(REVIEW_SOURCE_DIGEST_TAG, &self.canonical_bytes())
+    }
+}
+
+/// The retained failed-evidence format: one recorded mechanical
+/// failure a pre-publication Fix repairs — the durable verification
+/// result rendered as immutable evidence, never a live re-read.
+pub const FAILED_EVIDENCE_FORMAT: &str = "taisan.failed-evidence/1";
+const FAILED_EVIDENCE_DIGEST_TAG: &str = "failed-evidence-v1";
+
+/// One failed verification/invariant record bound into a Fix request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedEvidenceBody {
+    /// Always [`FAILED_EVIDENCE_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub work_id: String,
+    pub artifact_id: String,
+    /// The durable evidence identity (`FailedEvidence.evidence_id`).
+    pub evidence_id: String,
+    /// The evidence kind — `verification` today.
+    pub kind: String,
+    /// The declared requirement the run was bound to.
+    pub requirement: String,
+    pub argv: Vec<String>,
+    /// The exact commit the run materialized.
+    pub produced: String,
+    /// The recorded outcome token (`fail`, `inconclusive`, ...).
+    pub result: String,
+    /// The bounded captured output tail, verbatim.
+    pub output: String,
+}
+
+impl FailedEvidenceBody {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("failed evidence serializes"))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("failed evidence is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != FAILED_EVIDENCE_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("failed evidence malformed: {e}"),
+        })
+    }
+
+    /// The wire digest a `FailedEvidence.digest` carries.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(FAILED_EVIDENCE_DIGEST_TAG, &self.canonical_bytes())
+    }
+}
+
 /// Why a request body is not executable. Codes are the closed set the
 /// dispatch record carries (`docs/v0.3.md` §4.3, §9.2); provider prose
 /// never enters a code.
@@ -347,6 +719,123 @@ impl std::fmt::Display for RequestInvalid {
 }
 
 impl std::error::Error for RequestInvalid {}
+
+/// Why a durable dispatch request cannot be materialized into an
+/// executable v2 body (`docs/v0.3.md` §4.3). Codes are the closed set
+/// the `dispatch_refused` fact carries; provider prose never enters a
+/// code. A refused request is terminal for its own `request_id` — the
+/// Work needs a new Core-authorized request, not a silent retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchRefusal {
+    /// A required retained body is absent from the catalogue or its
+    /// file cannot be read — including a body the retention sweep
+    /// already reclaimed.
+    SnapshotMissing { detail: String },
+    /// The retained body's recomputed source digest or recorded
+    /// revision disagrees with the approved spec snapshot.
+    SnapshotStale { detail: String },
+    /// The request's base object is not present in the source
+    /// repository or is not the workspace's recorded start.
+    BaseUnavailable { detail: String },
+    /// The wire spec revision/digest disagrees with the recorded
+    /// approved revision.
+    SpecMismatch { detail: String },
+    /// The predecessor artifact handoff is absent, unacknowledged, or
+    /// does not resolve to its recorded `produced` commit.
+    ArtifactUnavailable { detail: String },
+    /// A required failed-evidence body digest does not resolve.
+    EvidenceMissing { detail: String },
+    /// Failed evidence resolves but is stale for this request.
+    EvidenceStale { detail: String },
+    /// The review/fix target head is not the current accepted head.
+    HeadStale { detail: String },
+    /// A selected finding occurrence does not belong to the sealed
+    /// judgment snapshot.
+    FindingMissing { detail: String },
+    /// The round/judgment the fix binds is stale or released.
+    JudgmentStale { detail: String },
+    /// The approved invariant-set body is absent.
+    InvariantSetMissing { detail: String },
+    /// The invariant set resolves but its revision/digest disagrees
+    /// with the approved set.
+    InvariantSetStale { detail: String },
+    /// The materialized review-source body is absent.
+    ReviewSourceUnavailable { detail: String },
+    /// The review source resolves but its digest or source revision
+    /// disagrees with the requested snapshot.
+    ReviewSourceStale { detail: String },
+    /// A `required: true` continuation body is absent or mismatched.
+    ContinuationMissing { detail: String },
+    /// A retained body exceeds the per-Invocation input bound.
+    BodyOversize { detail: String },
+    /// A retained body's bytes fail digest or schema verification —
+    /// corrupt content is never dispatched.
+    BodyCorrupt { detail: String },
+    /// The durable request row itself is inconsistent (missing work,
+    /// execution, spec, or role/task disagreement) — the request
+    /// cannot be built at all.
+    RequestInvalid { detail: String },
+}
+
+impl DispatchRefusal {
+    /// The `request.*` reason code the `dispatch_refused` fact and any
+    /// retained diagnostic carry.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SnapshotMissing { .. } => "request.snapshot_missing",
+            Self::SnapshotStale { .. } => "request.snapshot_stale",
+            Self::BaseUnavailable { .. } => "request.base_unavailable",
+            Self::SpecMismatch { .. } => "request.spec_mismatch",
+            Self::ArtifactUnavailable { .. } => "request.artifact_unavailable",
+            Self::EvidenceMissing { .. } => "request.evidence_missing",
+            Self::EvidenceStale { .. } => "request.evidence_stale",
+            Self::HeadStale { .. } => "request.head_stale",
+            Self::FindingMissing { .. } => "request.finding_missing",
+            Self::JudgmentStale { .. } => "request.judgment_stale",
+            Self::InvariantSetMissing { .. } => "request.invariant_set_missing",
+            Self::InvariantSetStale { .. } => "request.invariant_set_stale",
+            Self::ReviewSourceUnavailable { .. } => "request.review_source_unavailable",
+            Self::ReviewSourceStale { .. } => "request.review_source_stale",
+            Self::ContinuationMissing { .. } => "request.continuation_missing",
+            Self::BodyOversize { .. } => "request.body_oversize",
+            Self::BodyCorrupt { .. } => "request.body_corrupt",
+            Self::RequestInvalid { .. } => "request.invalid",
+        }
+    }
+
+    /// The detail half of the refusal — provider/store prose that
+    /// never enters the closed `request.*` code.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::SnapshotMissing { detail }
+            | Self::SnapshotStale { detail }
+            | Self::BaseUnavailable { detail }
+            | Self::SpecMismatch { detail }
+            | Self::ArtifactUnavailable { detail }
+            | Self::EvidenceMissing { detail }
+            | Self::EvidenceStale { detail }
+            | Self::HeadStale { detail }
+            | Self::FindingMissing { detail }
+            | Self::JudgmentStale { detail }
+            | Self::InvariantSetMissing { detail }
+            | Self::InvariantSetStale { detail }
+            | Self::ReviewSourceUnavailable { detail }
+            | Self::ReviewSourceStale { detail }
+            | Self::ContinuationMissing { detail }
+            | Self::BodyOversize { detail }
+            | Self::BodyCorrupt { detail }
+            | Self::RequestInvalid { detail } => detail.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code(), self.detail())
+    }
+}
+
+impl std::error::Error for DispatchRefusal {}
 
 /// The store's durable record of one canonical v2 request body: the
 /// verbatim bytes replayed to the worker across restarts. The body is

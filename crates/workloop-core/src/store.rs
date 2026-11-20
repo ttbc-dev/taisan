@@ -895,6 +895,42 @@ pub trait TxView: ReadView {
     ) -> Result<(), StoreError>;
 }
 
+/// A catalogue that resolves nothing: stores without retained-body
+/// support hand this to [`Store::body_catalog`], so a v2 dispatch on
+/// such a store refuses `request.snapshot_missing` — fail-closed —
+/// rather than silently skipping body verification.
+struct NoBodyCatalog;
+
+static NO_BODY_CATALOG: NoBodyCatalog = NoBodyCatalog;
+
+impl BodyCatalog for NoBodyCatalog {
+    fn body_entry(&self, _body_id: &str) -> Result<Option<BodyCatalogEntry>, StoreError> {
+        Ok(None)
+    }
+    fn body_entry_at(
+        &self,
+        _category: &str,
+        _path: &str,
+    ) -> Result<Option<BodyCatalogEntry>, StoreError> {
+        Ok(None)
+    }
+    fn register_body(&self, _body: &NewCatalogBody) -> Result<(), StoreError> {
+        Err(StoreError::Internal {
+            detail: "this store has no retained-body catalogue".into(),
+        })
+    }
+    fn set_body_pin(
+        &self,
+        _body_id: &str,
+        _dependency: &str,
+        _pinned: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Internal {
+            detail: "this store has no retained-body catalogue".into(),
+        })
+    }
+}
+
 /// The store port. `work` calls `transact` once per Command; the closure may
 /// run more than once if the implementation retries serialization errors,
 /// so it must be deterministic over the view it reads.
@@ -903,6 +939,15 @@ pub trait Store {
         &self,
         f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
     ) -> Result<R, StoreError>;
+
+    /// The retained-body catalogue backing this store, when it has
+    /// one. The v2 dispatch path resolves required input bodies
+    /// through it; a store without catalogue support resolves every
+    /// body as absent, which the dispatch builder turns into a typed
+    /// refusal rather than a skipped check.
+    fn body_catalog(&self) -> &dyn BodyCatalog {
+        &NO_BODY_CATALOG
+    }
 
     /// A transaction that starts deferred: while the closure only reads,
     /// it holds no writer lock, so a Query or `preview` neither blocks a
@@ -917,4 +962,64 @@ pub trait Store {
     ) -> Result<R, StoreError> {
         self.transact(f)
     }
+}
+
+/// One retained-body catalogue row as the dispatch path reads it:
+/// durable metadata plus the availability state the retention sweep
+/// owns. `path` is the body file's location relative to the configured
+/// bodies root; `state` is the catalogue lifecycle
+/// (`present`/`reclaiming`/`reclaimed`/`unavailable`) — anything but
+/// `present` means the bytes must not be dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyCatalogEntry {
+    pub body_id: String,
+    pub category: String,
+    pub path: String,
+    pub bytes: u64,
+    pub state: String,
+    pub pinned: bool,
+}
+
+/// A body a producer registers: the catalogue metadata plus the file
+/// the producer already wrote under the bodies root. Registration is
+/// durable metadata only — it never touches the filesystem, so callers
+/// write the file first and register second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCatalogBody {
+    pub body_id: String,
+    pub category: String,
+    pub path: String,
+    pub bytes: u64,
+    pub registered_unix_seconds: i64,
+    pub eligible_after_unix_seconds: Option<i64>,
+    pub pinned: bool,
+}
+
+/// The retained-body catalogue port (`docs/retention-policy.md` CAS
+/// objects). Separate from [`Store`]: catalogue rows are producer-side
+/// metadata that outlive any one transaction, so reads and writes go
+/// through this port rather than `TxView`. Resolution is fail-closed —
+/// an absent entry, a non-`present` state, or unreadable bytes all
+/// refuse dispatch.
+pub trait BodyCatalog {
+    /// The catalogue row for `body_id`, or `None` when never
+    /// registered.
+    fn body_entry(&self, body_id: &str) -> Result<Option<BodyCatalogEntry>, StoreError>;
+    /// The catalogue row for one `(category, path)` pair, or `None`.
+    /// Retained bodies whose identity is a deterministic lookup path —
+    /// issue snapshots resolve by the spec-bound identity, not by
+    /// content address — are found through this read.
+    fn body_entry_at(
+        &self,
+        category: &str,
+        path: &str,
+    ) -> Result<Option<BodyCatalogEntry>, StoreError>;
+    /// Register a produced body. Re-registering identical metadata is
+    /// a replay; conflicting metadata for the same `body_id` is a
+    /// `ConstraintConflict` — a content address never changes.
+    fn register_body(&self, body: &NewCatalogBody) -> Result<(), StoreError>;
+    /// Add or remove one protective dependency on a body. Pin
+    /// creation on a body that already left `present` is refused.
+    fn set_body_pin(&self, body_id: &str, dependency: &str, pinned: bool)
+    -> Result<(), StoreError>;
 }

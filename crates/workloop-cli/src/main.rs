@@ -2204,6 +2204,18 @@ mod tests {
             retention: Default::default(),
             protected_paths: Vec::new(),
         };
+        // Phase 1 retains issue snapshot bodies under
+        // `<state_root>/bodies`; a test pass gets its own root rather
+        // than writing into the process working directory.
+        let state_root = std::env::temp_dir().join(format!(
+            "workloop-tick-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_root).unwrap();
         run_pass(
             &mut Pass {
                 store,
@@ -2211,7 +2223,7 @@ mod tests {
                 settings: &settings,
                 supervisor: None,
                 host,
-                state_root: std::path::Path::new("."),
+                state_root: state_root.as_path(),
             },
             None,
             &mut now,

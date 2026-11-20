@@ -149,6 +149,8 @@ impl InMemoryGitHub {
                 source_revision: source_revision.to_string(),
                 content_digest: content_digest.to_string(),
                 state,
+                title: String::new(),
+                body: String::new(),
             },
         );
     }

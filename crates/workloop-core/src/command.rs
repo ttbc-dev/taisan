@@ -125,7 +125,7 @@ impl CommandBody {
 /// A per-occurrence disposition over one sealed review round. `decisions`
 /// submitted to `JudgeFindings` must cover the round's occurrence set
 /// exactly — omissions and unknown occurrences are `invalid_request`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingDecision {
     /// The install-scoped occurrence id from the sealed round.
     pub occurrence_id: String,
