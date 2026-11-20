@@ -3130,9 +3130,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // gate the spawn took, so every shape the line could have
         // taken is a signature. Missing the v2 shapes would leave a
         // v2 writer unmatchable: never re-bound, and eventually
-        // declared absent on directory occupancy alone.
-        let mut signatures = vec![binding.argv.join(" ")];
+        // declared absent on directory occupancy alone. The bare argv
+        // alone is never a v2 signature either — the spawn exec'd none
+        // of it, so a foreign process running just those words must
+        // neither adopt the launch nor hold absence open forever.
         let body = store.transact(|tx| tx.worker_request_body(&request.request_id))?;
+        let mut signatures = Vec::new();
+        if body.is_none() {
+            signatures.push(binding.argv.join(" "));
+        }
         let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
             .join(crate::isolation::sanitize_key(&invocation.id.0));
         if body.is_some() {

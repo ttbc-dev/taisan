@@ -2251,6 +2251,65 @@ fn a_lost_v2_launch_is_rebound_by_its_transport_signature() {
     );
 }
 
+/// A lost v2 launch never re-binds a process running the bare
+/// adapter argv: the spawn exec'd only the transport-shaped line, so
+/// the bare argv is not a signature — a foreign process carrying just
+/// those words inside the launch directory stays an unexplained
+/// occupant, never adopted, inspected, or signaled as this launch's
+/// writer.
+#[test]
+fn a_lost_v2_launch_never_binds_a_bare_argv_lookalike() {
+    use workloop_core::ports::ProbeOutcome;
+    use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
+
+    let root = tmp_root("v2-orphan-lookalike");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-lookalike", vec![]);
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: scripted_v2_declaration().into_bytes(),
+        success: true,
+    }));
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let handoff = layout(&root);
+    std::fs::create_dir_all(&handoff.workspace_root).unwrap();
+    let sup = fixture_sup(
+        port.clone(),
+        handoff.workspace_root.clone(),
+        vec!["scripted-worker".into()],
+        config(),
+    )
+    .with_handoff(handoff)
+    .with_v2_dispatch(dispatch_profile(&state_root, &src));
+
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    // The real writer is gone; a foreign process running just the
+    // bare adapter argv inside the launch directory is the only live
+    // lookalike.
+    port.exit_all(0);
+    let lost = port.spawned()[0].pid;
+    port.adopt_child_with(lost, "scripted-worker");
+
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert!(
+        invocation.process_identity.is_none(),
+        "a bare-argv lookalike is never this launch's writer"
+    );
+    assert_ne!(
+        invocation.state,
+        InvocationState::Running,
+        "the lookalike was never re-bound"
+    );
+}
+
 // === Worker report evidence collection (`taisan.worker.report/2`,
 // docs/v0.3.md §6) ==============================================
 
@@ -3843,6 +3902,38 @@ fn a_negative_review_report_is_partial_and_never_seals_a_round() {
     );
     assert_eq!(reviews[0].1, 0);
     assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+}
+
+/// A Negative review report whose reason is not `findings_reported`
+/// but which still carries findings seals those members for the
+/// judgment path — the reason code describes the report's claim, not
+/// the member set's disposition. Silently dropping the members would
+/// lose real findings a judgment must answer.
+#[test]
+fn a_negative_review_report_with_findings_seals_them_as_occurrences() {
+    let argv = v2_argv(
+        "clean-exit",
+        &[
+            "--report-mode",
+            "negative",
+            "--findings",
+            r#"[{"key":"f-1","summary":"dropped bound check","severity":"high"}]"#,
+        ],
+    );
+    let rig = assess_rig("review-negative-findings", argv, true);
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].0, Completeness::Complete, "{:?}", reviews[0].0);
+    assert_eq!(reviews[0].1, 1, "the member seals as an occurrence");
+    let rounds = sealed_rounds(&rig.store, &rig.work_id);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    let occurrences = rig
+        .store
+        .transact(|tx| tx.occurrences(&rounds[0].id))
+        .unwrap();
+    assert_eq!(occurrences.len(), 1);
+    assert_eq!(occurrences[0].source_key, "f-1");
 }
 
 /// Over the member cap the whole `findings[]` set is malformed

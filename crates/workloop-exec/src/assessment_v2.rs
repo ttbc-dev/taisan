@@ -487,14 +487,18 @@ fn bind_review(
         }
     } else if matches!(gathered.classification, ReportClassification::Negative)
         && gathered.report.reason.code != "findings_reported"
+        && gathered.report.findings.is_empty()
     {
         // A negative claim that reports no findings seals a clean
         // round with nothing to disposition — the report's own
         // failure claim is never a completed review; its reason is
-        // the recorded evidence. `findings_reported` is the review's
-        // normal negative shape: its members seal as occurrences for
-        // judgment, and the completeness check still degrades an
-        // empty or malformed member set to partial.
+        // the recorded evidence. A negative report that *does* carry
+        // findings — whatever its reason code — falls through to the
+        // member check so the members still seal as occurrences for
+        // judgment: the lane then stands on the judgment path, never
+        // the report's claim. `findings_reported` is the review's
+        // normal negative shape; a malformed member set still
+        // degrades to partial.
         Completeness::Partial {
             reason: gathered.report.reason.code.clone(),
         }
