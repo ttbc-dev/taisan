@@ -1176,9 +1176,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1875,9 +1875,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2385,9 +2385,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,

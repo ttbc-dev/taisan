@@ -1073,7 +1073,7 @@ fn run_verification_contained(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let gate = match containment::gate(
+    let gate = match containment::gate_for_verification(
         ctx.port.as_ref(),
         &layout.workspace_root,
         &ctx.profile,
@@ -1175,7 +1175,7 @@ fn run_verification_contained(
         caches: ctx.caches.clone(),
         extra_binds,
         extra_rw_binds: vec![gitdir.to_path_buf()],
-        worker: Some(worker.clone()),
+        worker: worker.clone(),
     };
     let _ = std::fs::create_dir_all(scratch_out);
     if let Some(reason) = containment::plan_denial(&plan) {

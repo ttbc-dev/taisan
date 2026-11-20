@@ -594,6 +594,15 @@ impl Installation {
     ) -> Result<workloop_core::worker::IsolationProfile, String> {
         match &self.worker_isolation_profile {
             None => Ok(workloop_core::worker::default_isolation_profile()),
+            // The contract-harness profile declares no sandbox
+            // primitive: an installation naming it would run every
+            // launch uncontained — test evidence only, never a
+            // production boundary (`docs/v0.3.md` §14).
+            Some(id) if id == workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID => Err(format!(
+                "installation worker_isolation_profile '{id}' names the contract-harness \
+                     profile, whose launches never prove namespace enforcement — production \
+                     installs must name a profile with a sandbox primitive"
+            )),
             Some(id) => workloop_core::worker::isolation_profile(id).ok_or_else(|| {
                 let approved: Vec<&str> =
                     workloop_core::worker::approved_isolation_profile_ids().collect();
