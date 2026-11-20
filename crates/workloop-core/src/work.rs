@@ -2274,13 +2274,17 @@ pub fn admit_queued_role(
 
     let seq = tx.alloc_seq()?;
     let mut payload = serde_json::to_value(&execution.input).unwrap_or_default();
-    if role == InvocationRole::InvariantCheck
-        && let serde_json::Value::Object(map) = &mut payload
+    if matches!(
+        role,
+        InvocationRole::InvariantCheck | InvocationRole::Review
+    ) && let serde_json::Value::Object(map) = &mut payload
     {
-        // The check is read-only: it declares no workspace artifact,
-        // so its durable record carries an explicitly empty required
-        // set rather than the writer default. Its evidence is the
-        // Invocation lifecycle plus receipts, never a produced diff.
+        // The check and the review are read-only: neither declares a
+        // workspace artifact, so the durable record carries an
+        // explicitly empty required set rather than the writer
+        // default. Their evidence is the Invocation lifecycle plus
+        // receipts, never a produced diff — a non-empty set would seed
+        // an artifact handoff for a role that produces nothing.
         map.insert("required_artifacts".into(), serde_json::json!([]));
     }
     let request = InvocationRequest {

@@ -1673,6 +1673,12 @@ fn review_admission_never_exceeds_max_review_rounds() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].role, InvocationRole::Review);
     assert_eq!(requests[0].request_id, format!("{}:inv:0", e1.0));
+    assert_eq!(
+        requests[0].payload["required_artifacts"],
+        serde_json::json!([]),
+        "the read-only review records an explicitly empty required set, \
+         never the writer default that would seed an artifact handoff"
+    );
 
     force_state(&store, &e1, ExecutionState::Queued);
     store
