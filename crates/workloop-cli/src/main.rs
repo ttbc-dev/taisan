@@ -2133,14 +2133,22 @@ fn build_supervisor(
         }
         None => supervisor,
     };
-    Ok(Some(supervisor.with_handoff(
-        workloop_exec::handoff::HandoffLayout {
-            repository,
-            workspace_root,
-            out_root: handoff_root.join("out"),
-            verification,
-        },
-    )))
+    // A contained launch shadows the installation state root and the
+    // workspace root with a fresh tmpfs whenever a fixed system bind
+    // covers them — otherwise `/opt/taisan`-style layouts would hand
+    // every worker the store, the handoff repository, and the staged
+    // runtime credential read-only (§14.3).
+    Ok(Some(
+        supervisor
+            .with_sandbox_mask_roots(vec![state_root.to_path_buf(), workspace_root.clone()])
+            .with_handoff(workloop_exec::handoff::HandoffLayout {
+                repository,
+                workspace_root,
+                out_root: handoff_root.join("out"),
+                state_root: Some(state_root.to_path_buf()),
+                verification,
+            }),
+    ))
 }
 
 /// Resolve an installation-relative path against the one state root.

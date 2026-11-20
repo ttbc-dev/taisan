@@ -926,6 +926,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// `None` fails report collection for v2 invocations rather than
     /// recording evidence that cannot resolve.
     pub body_store: Option<BodyStore>,
+    /// Installation-owned roots a contained launch masks with a fresh
+    /// tmpfs when a fixed system bind would otherwise expose them —
+    /// the state root holding the store and the workspace root
+    /// holding workspaces, the handoff repository, and credential
+    /// staging (`docs/v0.3.md` §14.3). Defaults to the workspace
+    /// root; the composition root adds the state root.
+    pub sandbox_mask_roots: Vec<PathBuf>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -936,6 +943,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         worker_argv: Vec<String>,
         config: workloop_core::work::WorkloopConfig,
     ) -> Self {
+        let sandbox_mask_roots = vec![workspace_root.clone()];
         Self {
             port,
             workspace_root,
@@ -946,6 +954,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             v2: None,
             runtime_boundary: None,
             body_store: None,
+            sandbox_mask_roots,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -964,6 +973,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// root) for Workspaces carrying git objects.
     pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
         self.handoff = Some(layout);
+        self
+    }
+
+    /// Installation-owned roots a contained launch masks when a fixed
+    /// system bind would expose them — the composition root passes
+    /// the state root beside the workspace root the default names.
+    pub fn with_sandbox_mask_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.sandbox_mask_roots = roots;
         self
     }
 
@@ -1206,6 +1223,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
                     extra_rw_binds: vec![],
                     worker: Some(worker.clone()),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1549,17 +1567,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // recorded spec argv it always had. An unverifiable body
             // is corrupt durable state — a fault, never a silently
             // empty grant or an unpinned base.
-            let (verification_argv, verification_egress_hosts, pinned_base) =
+            let (verification_argv, verification_egress_hosts, pinned_base, branch_start) =
                 match tx.worker_request_body(&invocation.request_id)? {
                     Some(body) if body.verifies() => {
                         let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
                             .map_err(|e| StoreError::Internal {
                             detail: format!("worker request body unreadable: {e}"),
                         })?;
+                        // The branch start a no-op check measures
+                        // against: a Fix workspace branches at its
+                        // predecessor's produced commit, every other
+                        // role at the request's pinned base.
+                        let start = match &req.task {
+                            workloop_core::worker_v2::TaskBody::Fix { predecessor, .. } => {
+                                predecessor.produced.clone()
+                            }
+                            _ => req.base.object.clone(),
+                        };
                         (
                             req.verification_argv().to_vec(),
                             req.required_capabilities.verification_egress_hosts,
                             req.base.object,
+                            start,
                         )
                     }
                     Some(_) => {
@@ -1574,6 +1603,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         spec.payload.verification_argv.clone(),
                         Vec::new(),
                         String::new(),
+                        String::new(),
                     ),
                 };
             Ok(Some((
@@ -1582,6 +1612,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 verification_argv,
                 verification_egress_hosts,
                 pinned_base,
+                branch_start,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
@@ -1591,6 +1622,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             verification_argv,
             verification_egress_hosts,
             pinned_base,
+            branch_start,
             bound,
         )) = found
         else {
@@ -1612,6 +1644,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             crate::handoff::HandoffSeed {
                 invocation,
                 base,
+                branch_start,
                 branch,
                 work_id,
                 verification_argv,
@@ -2114,7 +2147,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
-                    workspace: Some((workspace.clone(), false)),
+                    // Assessment roles read the produced state; only a
+                    // writer mounts the workspace read-write.
+                    workspace: Some((
+                        workspace.clone(),
+                        matches!(
+                            request.role,
+                            InvocationRole::InvariantCheck | InvocationRole::Review
+                        ),
+                    )),
                     request: None,
                     input: None,
                     out: None,
@@ -2127,6 +2168,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
                     extra_rw_binds: vec![],
                     worker: Some(worker.clone()),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2638,6 +2680,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
                     extra_rw_binds: vec![],
                     worker: Some(worker.clone()),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -3216,9 +3259,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // cannot be told apart, and outside it the match might be the
         // real writer after a chdir — which makes the in-directory
         // lookalike a foreign process that must not be adopted,
-        // inspected, or signaled as this launch's writer.
+        // inspected, or signaled as this launch's writer. A contained
+        // worker's cwd reads as the sandbox mount `SANDBOX_WORKSPACE`
+        // instead of the host launch dir — its namespace's `/workspace`
+        // is exactly the launch's workspace bind, so it satisfies the
+        // same "inside the launch directory" rule.
         match unrecorded.as_slice() {
-            [child] if cwd_within(child.cwd.as_deref(), &canonical_dir) => {
+            [child]
+                if cwd_within(child.cwd.as_deref(), &canonical_dir)
+                    || child.cwd.as_deref()
+                        == Some(std::path::Path::new(containment::SANDBOX_WORKSPACE)) =>
+            {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -4792,6 +4843,7 @@ mod tests {
             extra_binds: vec![],
             extra_rw_binds: vec![],
             worker: None,
+            mask_roots: vec![],
         }
     }
 

@@ -78,6 +78,10 @@ pub struct HandoffLayout {
     pub workspace_root: PathBuf,
     /// Root containing per-Invocation out directories.
     pub out_root: PathBuf,
+    /// The installation state root holding the store — masked inside
+    /// a contained verification sandbox beside `workspace_root` when
+    /// a fixed system bind covers it. `None` names no separate root.
+    pub state_root: Option<PathBuf>,
     /// The §14.5 verification sandbox; `None` is the recorded
     /// hygiene-only runner.
     pub verification: Option<VerificationSandbox>,
@@ -86,6 +90,19 @@ pub struct HandoffLayout {
 impl HandoffLayout {
     fn workspace_of(&self, work_id: &WorkId) -> PathBuf {
         self.workspace_root.join(format!("ws-{}", work_id.0))
+    }
+
+    /// The installation-owned roots a contained verification sandbox
+    /// masks when a fixed system bind would otherwise expose them.
+    pub(crate) fn mask_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(2);
+        if let Some(state) = &self.state_root {
+            roots.push(state.clone());
+        }
+        if !roots.contains(&self.workspace_root) {
+            roots.push(self.workspace_root.clone());
+        }
+        roots
     }
 
     fn out_dir_of(&self, handoff: &ArtifactHandoff) -> PathBuf {
@@ -366,6 +383,13 @@ pub struct HandoffSeed {
     /// [`derive_base`]) — the revision `produced` must descend from.
     /// Empty when the workspace records no base branch.
     pub base: String,
+    /// The revision the managed branch was started at — `base` for a
+    /// fresh Coding workspace, the predecessor's produced commit for
+    /// a Fix (the workspace branches at produced, not the fork
+    /// point). Empty for a v1 dispatch, where `base` is the only
+    /// recorded start. `produced == branch_start` means the writer
+    /// committed nothing.
+    pub branch_start: String,
     /// Work branch the worker committed on (`work/<work_id>`).
     pub branch: String,
     pub work_id: WorkId,
@@ -494,13 +518,22 @@ fn export_stage(
         return mark_invalid(store, handoff, "stale_base");
     }
 
-    // A branch that never moved past base produced nothing — for a
-    // Coding/Fix writer that is an absent artifact, not a handoff.
+    // A branch that never moved past the revision it was started at
+    // produced nothing — for a Coding/Fix writer that is an absent
+    // artifact, not a handoff. A Fix branch starts at its
+    // predecessor's produced commit, not the fork point, so the
+    // no-op check reads `branch_start` whenever the launch recorded
+    // one.
+    let branch_start = if seed.branch_start.is_empty() {
+        handoff.base.as_str()
+    } else {
+        seed.branch_start.as_str()
+    };
     if matches!(
         seed.invocation.role,
         InvocationRole::Coding | InvocationRole::Fix
-    ) && !handoff.base.is_empty()
-        && produced == handoff.base
+    ) && !branch_start.is_empty()
+        && produced == branch_start
     {
         return mark_invalid(store, handoff, "nothing_produced");
     }
@@ -998,6 +1031,7 @@ fn prepare_enforcement(
 /// only on a clean exit; every other outcome is a typed refusal.
 fn prove_verification_mounts(
     ctx: &ContainedVerification,
+    layout: &HandoffLayout,
     primitive: &Path,
     env: &WorkerEnv,
 ) -> Result<(), String> {
@@ -1033,6 +1067,7 @@ fn prove_verification_mounts(
         extra_binds: vec![],
         extra_rw_binds: vec![],
         worker: None,
+        mask_roots: layout.mask_roots(),
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
     if let Some(reason) = containment::plan_denial(&plan) {
@@ -1116,7 +1151,7 @@ fn run_verification_contained(
         }
     };
     let contained = containment::contained_env(&env, None);
-    if let Err(reason) = prove_verification_mounts(ctx, &primitive, &contained) {
+    if let Err(reason) = prove_verification_mounts(ctx, layout, &primitive, &contained) {
         return VerificationRun::Refused(reason);
     }
     // The separate declared dependency-host policy: a per-command
@@ -1184,6 +1219,7 @@ fn run_verification_contained(
         extra_binds,
         extra_rw_binds: vec![gitdir.to_path_buf()],
         worker: Some(worker.clone()),
+        mask_roots: layout.mask_roots(),
     };
     let _ = std::fs::create_dir_all(scratch_out);
     if let Some(reason) = containment::plan_denial(&plan) {
