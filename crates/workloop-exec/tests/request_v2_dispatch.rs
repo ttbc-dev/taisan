@@ -1326,6 +1326,60 @@ fn invariant_check_binds_the_approved_set_read_only() {
     );
 }
 
+/// The recorded Assessment binds `artifact.produced`: the check's
+/// snapshot must be that commit's tree even when the producing
+/// workspace holds uncommitted follow-on edits.
+#[test]
+fn an_invariant_check_snapshots_the_produced_commit_not_the_live_tree() {
+    let root = tmp_root("ic-prod");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-icp", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    // The producing checkout carries `produced` plus uncommitted
+    // edits a follow-on writer left behind.
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    std::fs::write(ws.join("seed.txt"), "dirty").unwrap();
+    std::fs::write(ws.join("uncommitted.txt"), "x").unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(snap.join("seed.txt")).unwrap(),
+        "newer",
+        "the snapshot is the produced commit's tree, not the dirty state"
+    );
+    assert!(
+        !snap.join("uncommitted.txt").exists(),
+        "uncommitted files never enter the checked tree"
+    );
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
+}
+
 #[test]
 fn an_invariant_check_without_an_approved_set_refuses_dispatch() {
     let root = tmp_root("ic-noset");

@@ -1221,6 +1221,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         &self,
         invocation: &Invocation,
         work_id: &WorkId,
+        produced: Option<&str>,
     ) -> Result<PathBuf, ExecError> {
         let source = self.workspace_of(work_id);
         let dest = self.check_workspace(&invocation.id.0);
@@ -1228,6 +1229,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
             std::fs::remove_dir_all(&dest)?;
         }
         copy_workspace_tree(&source, &dest)?;
+        // The v2 check's evidence binds the artifact's produced
+        // commit — in a git-backed world the snapshot must be that
+        // tree, not whatever uncommitted state the live producing
+        // workspace happens to hold when this launch finally runs. A
+        // commit the copied object store does not carry refuses
+        // through the same path as a snapshot that could not be
+        // taken. A non-git workspace has no produced commit to check
+        // out — the raw copy is the only state the world carries.
+        if let Some(produced) = produced
+            && dest.join(".git").is_dir()
+        {
+            run_git(&dest, &["checkout", "-f", "--detach", produced])?;
+            run_git(&dest, &["clean", "-fdxq"])?;
+        }
         Ok(dest)
     }
 
@@ -2025,7 +2040,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // workspace.
         let workspace = match request.role {
             InvocationRole::InvariantCheck => {
-                match self.snapshot_check_workspace(&invocation, &work_id) {
+                match self.snapshot_check_workspace(&invocation, &work_id, None) {
                     Ok(path) => path,
                     Err(why) => {
                         self.refuse_launch(
@@ -2519,7 +2534,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
             InvocationRole::InvariantCheck => {
-                match self.snapshot_check_workspace(&invocation, &work_id) {
+                // The recorded Assessment binds `artifact.produced`;
+                // the snapshot must be that commit's tree — a
+                // role/task mismatch is impossible, the builder
+                // proved the wire before consume.
+                let produced = match &wire.task {
+                    workloop_core::worker_v2::TaskBody::InvariantCheck { artifact, .. } => {
+                        artifact.produced.as_str()
+                    }
+                    _ => unreachable!("invariant check request carries a different task"),
+                };
+                match self.snapshot_check_workspace(&invocation, &work_id, Some(produced)) {
                     Ok(path) => path,
                     Err(why) => {
                         self.refuse_launch(
@@ -4232,6 +4257,25 @@ fn copy_workspace_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
         } else {
             std::fs::copy(&from, &to)?;
         }
+    }
+    Ok(())
+}
+
+/// `git -C dir <args>` with stderr carried into the fault — the check
+/// snapshot's checkout/clean the launch refusal reports.
+fn run_git(dir: &Path, args: &[&str]) -> Result<(), ExecError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| ExecError::Fault(format!("git {}: {e}", args.join(" "))))?;
+    if !out.status.success() {
+        return Err(ExecError::Fault(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
     Ok(())
 }
