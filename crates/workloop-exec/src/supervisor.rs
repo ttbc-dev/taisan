@@ -3090,7 +3090,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
             InvocationRole::InvariantCheck => self.check_workspace(&invocation.id.0),
             _ => self.workspace_of(&request.work_id),
         };
-        let canonical_dir = std::fs::canonicalize(&launch_dir).unwrap_or(launch_dir);
+        let canonical_dir =
+            std::fs::canonicalize(&launch_dir).unwrap_or_else(|_| launch_dir.clone());
         // Every process identity the store already accounts for —
         // leaders, descendant snapshots, and stop-intent proofs across
         // all nonterminal executions — so a recorded writer is never
@@ -3118,10 +3119,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // v2 writer unmatchable: never re-bound, and eventually
         // declared absent on directory occupancy alone.
         let mut signatures = vec![binding.argv.join(" ")];
-        if store
-            .transact(|tx| tx.worker_request_body(&request.request_id))?
-            .is_some()
-        {
+        let body = store.transact(|tx| tx.worker_request_body(&request.request_id))?;
+        let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
+            .join(crate::isolation::sanitize_key(&invocation.id.0));
+        if body.is_some() {
             let mut contained = binding.argv.clone();
             contained.extend([
                 "run".to_string(),
@@ -3131,17 +3132,93 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 containment::SANDBOX_OUT.to_string(),
             ]);
             signatures.push(contained.join(" "));
-            let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
-                .join(crate::isolation::sanitize_key(&invocation.id.0));
             let mut host = binding.argv.clone();
             host.extend([
                 "run".to_string(),
-                "--request".to_string(),
+                "--request".into(),
                 io_dir.join("request.json").to_string_lossy().into_owned(),
-                "--out".to_string(),
+                "--out".into(),
                 io_dir.join("out").to_string_lossy().into_owned(),
             ]);
             signatures.push(host.join(" "));
+        }
+        // A contained launch exec'd none of those lines — the spawn
+        // ran the bwrap outer argv `bwrap_args` produced. Re-evaluate
+        // the recorded binding's gate and rebuild the exact plan the
+        // launch used: `Uncontained` means no wrapped argv could
+        // exist; a refused gate or an unresolvable boundary means the
+        // wrapped argv cannot be reconstructed — the orphan's
+        // signature is then unprovable, so stay uncertain rather than
+        // declare absence on an incomplete search.
+        match self.containment_gate(&binding.argv, now_unix_seconds)? {
+            Ok(Gate::Uncontained) => {}
+            Err(_) => {
+                return self.report_unidentified_unknown(
+                    store,
+                    request,
+                    &invocation.id,
+                    now_unix_seconds,
+                );
+            }
+            Ok(Gate::Ready { primitive, worker }) => {
+                let (inner_argv, workspace_read_only, mounts_io) = if let Some(body) = &body {
+                    // A durable body that no longer parses is corrupt
+                    // evidence, not a v1 request — the contained shape
+                    // cannot be reconstructed either, so stay
+                    // uncertain.
+                    let Ok(wire) = WorkerRequestV2::parse(&body.canonical_body) else {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    };
+                    let mut inner = binding.argv.clone();
+                    inner.extend([
+                        "run".to_string(),
+                        "--request".to_string(),
+                        containment::SANDBOX_REQUEST.to_string(),
+                        "--out".to_string(),
+                        containment::SANDBOX_OUT.to_string(),
+                    ]);
+                    (inner, wire.workspace.read_only, true)
+                } else {
+                    (binding.argv.clone(), false, false)
+                };
+                let plan = MountPlan {
+                    workspace: Some((launch_dir.clone(), workspace_read_only)),
+                    request: mounts_io.then(|| io_dir.join("request.json")),
+                    input: mounts_io.then(|| io_dir.join("input")),
+                    out: mounts_io.then(|| io_dir.join("out")),
+                    gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, Some(worker.as_path())),
+                    extra_rw_binds: vec![],
+                    worker: Some(worker.clone()),
+                };
+                match self.contained_exec(
+                    &primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &WorkerEnv::default(),
+                ) {
+                    Ok((argv, _)) => signatures.push(argv.join(" ")),
+                    Err(_) => {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    }
+                }
+            }
         }
         let mut matches = Vec::new();
         for signature in &signatures {
