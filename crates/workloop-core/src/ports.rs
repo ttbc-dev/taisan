@@ -2,7 +2,7 @@
 //! `ProcessControlPort` (POSIX supervisor in `workloop-exec`) and the
 //! GitHub-integration port (fixture in `workloop-github`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::domain::ProcessIdentity;
@@ -28,6 +28,26 @@ pub enum ProcessEvidence {
     Unknown {
         reason: String,
     },
+}
+
+/// One live process whose command line matches a launch signature,
+/// with the evidence needed to attribute an unidentified spawn: the
+/// recorded `pid + start time` identity, the working directory the
+/// process runs in, and the argv the process table reports. The match
+/// is system-wide, not limited to this supervisor's children — a
+/// supervisor restart reparents an orphaned writer away from us, and
+/// only the launch signature can still find it. `cwd` and `command`
+/// are `None` when the platform cannot prove them — an unreadable
+/// value is never guessed, and a `None` can only make a match *less*
+/// attributable, never more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessMatch {
+    pub identity: ProcessIdentity,
+    /// The process's current working directory, when readable.
+    pub cwd: Option<PathBuf>,
+    /// The process's argv as the process table reports it (whitespace
+    /// normalized), when readable.
+    pub command: Option<String>,
 }
 
 /// Why a spawn could not produce a recorded identity.
@@ -224,6 +244,38 @@ pub trait ProcessControlPort {
     /// recorded group. A failed enumeration is an error — never an empty
     /// proof set — so a gap cannot masquerade as "nothing left".
     fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String>;
+
+    /// Every live process whose command line equals `command`
+    /// (whitespace-normalized on both sides), each with a re-verified
+    /// `pid + start time` identity. A spawn whose outcome was never
+    /// recorded leaves a writer findable only by its launch signature —
+    /// and proving no match exists is the only way to prove it absent.
+    /// The enumeration must be complete: a process-table read that
+    /// fails or truncates returns `Err`, because a partial match list
+    /// can never authorize an absence claim. An unsupported
+    /// enumeration returns `Err` for the same reason.
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        let _ = command;
+        Err("process signature enumeration unsupported".into())
+    }
+
+    /// Every live process whose working directory is inside `dir` —
+    /// `dir` is compared canonically, so callers pass an already
+    /// canonical path. A vanished launch's escaped descendant keeps
+    /// the leader's working directory after leaving the argv
+    /// signature, so this is the only handle left to prove nothing
+    /// unexplained still runs in the launch directory. The
+    /// enumeration must be complete to authorize absence: a live
+    /// process the port cannot map to a working directory — an
+    /// unreadable cwd could be inside `dir` — fails the whole read,
+    /// never a truncated proof set, the same rule
+    /// `matching_processes` applies. A process the port cannot even
+    /// observe (e.g. one that changed uid) is the documented
+    /// residual.
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        let _ = dir;
+        Err("directory process enumeration unsupported".into())
+    }
 
     /// Read the current state of one recorded identity.
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence;
