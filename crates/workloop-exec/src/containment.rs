@@ -87,6 +87,25 @@ const EVIDENCE_RETRY_SECONDS: i64 = 300;
 /// wedged sandbox answers `Bounded` and fails the battery.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Whether a host path would be exposed inside the sandbox by a fixed
+/// system bind: strictly beneath an existing `SYSTEM_BINDS` member.
+/// The path must exist on the host — masking a path absent inside the
+/// bind could fail the mount outright.
+fn system_bind_covers(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    SYSTEM_BINDS
+        .iter()
+        .filter(|d| Path::new(d).exists())
+        .map(Path::new)
+        .any(|bound| {
+            let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
+            resolved.starts_with(&bound) && resolved != bound
+        })
+}
+
 /// What one contained launch binds into the sandbox. Every field is a
 /// host path the supervisor owns; the sandbox side is fixed by the
 /// constants above.
@@ -141,6 +160,13 @@ pub struct MountPlan {
     /// inner argv is not a single resolved executable (verification
     /// commands resolve through PATH or `extra_binds`).
     pub worker: Option<PathBuf>,
+    /// Individual host files that must never be visible inside the
+    /// sandbox: a `file:` credential source beneath a bound system
+    /// prefix would otherwise stay readable at its original path even
+    /// though the contract exposes only the staged
+    /// `/taisan/runtime-auth`. Each covered file is shadowed with a
+    /// read-only `/dev/null` bind.
+    pub masked_files: Vec<PathBuf>,
 }
 
 /// The gate's answer for one launch argv.
@@ -388,6 +414,21 @@ pub fn bwrap_args(
                 "--ro-bind".to_string(),
                 (*dir).to_string(),
                 (*dir).to_string(),
+            ]);
+        }
+    }
+    // A host file beneath a bound system prefix — a `file:` credential
+    // source — stays visible through the wholesale bind unless it is
+    // shadowed: ro-bind /dev/null over it. The mask is emitted before
+    // every plan bind, so a path the plan legitimately names is still
+    // mounted by its own bind.
+    for file in &plan.masked_files {
+        if system_bind_covers(file) {
+            let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
+            args.extend([
+                "--ro-bind".to_string(),
+                "/dev/null".to_string(),
+                s(&resolved),
             ]);
         }
     }
@@ -814,6 +855,7 @@ fn run_battery(
         extra_binds: vec![],
         extra_rw_binds: vec![],
         worker: worker.map(Path::to_path_buf),
+        masked_files: vec![],
     };
     let mut records = Vec::new();
     let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
@@ -1199,6 +1241,7 @@ mod tests {
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
             extra_rw_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
+            masked_files: vec![],
         }
     }
 
@@ -1256,6 +1299,46 @@ mod tests {
         // No host home, store, or credential path is ever bound: the
         // only binds are the fixed system set plus the plan's own.
         assert!(!text.contains("/Users/"), "{text}");
+    }
+
+    /// A host file beneath a system bind — a `file:` credential
+    /// source — is shadowed with a read-only `/dev/null` bind so the
+    /// staged `/taisan/runtime-auth` is the only credential surface
+    /// inside the sandbox. A file outside every system bind needs no
+    /// mask.
+    #[test]
+    fn a_system_bind_covered_masked_file_is_shadowed_with_dev_null() {
+        // /bin/sh exists on every unix layout this suite runs on and
+        // lives beneath the /bin system bind.
+        let covered = Path::new("/bin/sh");
+        assert!(covered.is_file(), "test assumes /bin/sh exists");
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![covered.to_path_buf()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let resolved = covered.canonicalize().unwrap();
+        assert!(
+            text.contains(&format!("--ro-bind /dev/null {}", resolved.display())),
+            "the covered credential source is masked: {text}"
+        );
+        // A masked file outside every system bind emits nothing.
+        let uncovered = tmp("uncovered-file");
+        std::fs::create_dir_all(&uncovered).unwrap();
+        plan.masked_files = vec![uncovered.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        assert!(!text.contains("uncovered-file"), "{text}");
+        let _ = std::fs::remove_dir_all(&uncovered);
     }
 
     #[test]

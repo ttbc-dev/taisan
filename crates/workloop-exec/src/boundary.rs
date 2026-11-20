@@ -67,6 +67,10 @@ pub struct BoundaryConfig {
 pub struct BoundaryGrant {
     /// The staged credential file → `/taisan/runtime-auth`.
     pub credential_file: Option<PathBuf>,
+    /// For a `file:` provider, the host path the value was read from —
+    /// masked inside the sandbox when a fixed system bind covers it,
+    /// so the staged file is the only credential surface.
+    pub credential_source: Option<PathBuf>,
     /// The validated provider config → `/taisan/provider-config`.
     pub provider_config: Option<PathBuf>,
     /// The proxy's host-side Unix socket → `/taisan/proxy.sock`.
@@ -75,6 +79,7 @@ pub struct BoundaryGrant {
 
 struct BoundaryReady {
     credential_file: Option<PathBuf>,
+    credential_source: Option<PathBuf>,
     provider_config: Option<PathBuf>,
     /// The provider-config content identity captured at resolution —
     /// `ensure` re-checks it so a post-resolution edit re-runs the
@@ -166,6 +171,7 @@ impl RuntimeBoundary {
         match &*state {
             BoundaryState::Ready(ready) => Ok(BoundaryGrant {
                 credential_file: ready.credential_file.clone(),
+                credential_source: ready.credential_source.clone(),
                 provider_config: ready.provider_config.clone(),
                 proxy_sock: ready
                     .proxy
@@ -180,11 +186,13 @@ impl RuntimeBoundary {
     /// config → validated, proxy → started when hosts are configured.
     fn resolve(&self) -> Result<BoundaryReady, String> {
         let mut credential_bytes: Option<Vec<u8>> = None;
+        let mut credential_source: Option<PathBuf> = None;
         let credential_file = match &self.config.credential_ref {
             None => None,
             Some(reference) => {
                 let resolved = credentials::resolve(reference).map_err(|e| e.to_string())?;
                 credential_bytes = Some(resolved.bytes().to_vec());
+                credential_source = resolved.source_path().map(Path::to_path_buf);
                 Some(self.stage_credential(&resolved)?)
             }
         };
@@ -207,6 +215,7 @@ impl RuntimeBoundary {
         };
         Ok(BoundaryReady {
             credential_file,
+            credential_source,
             provider_config: self.config.provider_config.clone(),
             provider_digest,
             proxy,
@@ -441,6 +450,28 @@ mod tests {
         let err = failing.ensure().unwrap_err();
         assert!(err.contains("credential.unresolvable"), "{err}");
         assert!(!err.contains("tok-abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `file:` provider's source path flows into the grant so the
+    /// containment plan can mask it when a fixed system bind would
+    /// expose it — env/command providers carry no host path.
+    #[test]
+    fn a_file_credential_grant_reports_its_source_path() {
+        let dir = tmp("filecred");
+        let token = dir.join("runtime.token");
+        std::fs::write(&token, "file-tok").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", token.display()));
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        assert_eq!(
+            grant.credential_source,
+            Some(token.canonicalize().unwrap()),
+            "the grant carries the credential's canonical source path"
+        );
+        assert!(grant.credential_file.is_some(), "the staged file exists");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1111,6 +1111,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
             plan.runtime_auth = grant.credential_file.clone();
             plan.provider_config = grant.provider_config.clone();
             plan.proxy_sock = grant.proxy_sock.clone();
+            if let Some(source) = &grant.credential_source {
+                plan.masked_files.push(source.clone());
+            }
         }
         let (exec_argv, egress_proxy) = if proxy_granted {
             // The proxy socket is bound at `/taisan/proxy.sock`; the
@@ -1180,6 +1183,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    masked_files: vec![],
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1880,6 +1884,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    masked_files: vec![],
                 };
                 match self.contained_exec(
                     primitive,
@@ -2393,6 +2398,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    masked_files: vec![],
                 };
                 match self.contained_exec(
                     primitive,
@@ -4589,6 +4595,7 @@ mod tests {
             extra_binds: vec![],
             extra_rw_binds: vec![],
             worker: None,
+            masked_files: vec![],
         }
     }
 
