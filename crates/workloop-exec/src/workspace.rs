@@ -1079,9 +1079,7 @@ fn prepare_locked(
                 detail: "receipt belongs to a different pin".into(),
             });
         }
-        if receipt.request_digest == gate.request.request_digest
-            && receipt.head != gate.head
-        {
+        if receipt.request_digest == gate.request.request_digest && receipt.head != gate.head {
             return Err(PreparationError::WorkspaceConflict {
                 detail: "receipt head disagrees with the request pin".into(),
             });
