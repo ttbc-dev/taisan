@@ -37,20 +37,21 @@ The suite parameterizes over two axes:
   each scenario lists the surface it requires. A scenario runs only
   when the declared surface covers all of them, matching the rule that
   a required capability may be absent from a provider but, once
-  declared, may not be weakened. `PosixProvider` does not declare
-  `spawn_unknown`, `liveness_unknown`, `signal_survived`, or
-  `signal_audit` — a real process cannot fake a lost identity
-  capture, an uninspectable liveness read, or a writer scripted to
-  survive its signal, and the POSIX port keeps no signal log — so
-  those rows are reported skipped for it and covered by
-  `ScriptedProvider`.
+  declared, may not be weakened. `PosixProvider` declares
+  `spawn_unknown` — a real spawn whose identity capture is lost
+  leaves a genuine process-table entry the `ps`/`lsof` signature scan
+  re-binds — but does not declare `liveness_unknown`,
+  `signal_survived`, or `signal_audit`: a real process cannot fake an
+  uninspectable liveness read or a writer scripted to survive its
+  signal, and the POSIX port keeps no signal log — so those rows are
+  reported skipped for it and covered by `ScriptedProvider`.
 
 ## Start semantics
 
 | Row | Required semantics | Scenario / coverage |
 | --- | --- | --- |
 | WC-START-01 | A second delivery of the same durable request — the delivered-twice window where a consumer already recorded a writer identity for it — reconciles by request identity: the recorded writer is inspected and re-asserted running, one Invocation, no second spawn. | `duplicate_request_delivery_starts_no_second_writer` (both providers; the first leg spawns through the provider's own port so the recorded identity is real). |
-| WC-START-02 | A start whose outcome was lost (`SpawnError::Unknown`) leaves the writer uncertain — never a silent not-started that permits a replacement. The Invocation records no process identity and no second start is attempted. | `unknown_start_outcome_blocks_a_second_writer` (`ScriptedProvider`; skipped on `PosixProvider` — `spawn_unknown` not declared). |
+| WC-START-02 | A start whose outcome was lost (`SpawnError::Unknown`) leaves the writer unproven until reconciliation — never a silent not-started that permits a replacement, and never a second start. The orphaned writer still carries the recorded launch signature, so the poll path re-binds its identity through the same durable commit a normal launch uses and the Execution returns to `running`; when attribution is unprovable the launch stays uncertain instead of guessing. | `unknown_start_outcome_blocks_a_second_writer` (both providers — `PosixProvider` spawns a real orphan and loses its identity capture, so the re-bind runs through the real `ps`/`lsof` scan). |
 | WC-START-03 | A definitely-refused start (`SpawnError::Refused`) pauses the Execution and produces no writer; the spawn counter observes the refused attempt exactly once and no second attempt follows. Refusal is distinct from uncertainty. | `refused_start_pauses_without_a_writer` (both providers). |
 
 ## Liveness and stop
