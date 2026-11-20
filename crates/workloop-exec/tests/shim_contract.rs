@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
+use workloop_core::ports::{ProcessControlPort, SpawnError, WorkerEnv};
 use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
@@ -281,14 +282,21 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
     assert_eq!(
         e.state,
-        ExecutionState::Uncertain,
-        "a lost start response keeps the Execution uncertain, not restarted"
+        ExecutionState::Running,
+        "the orphaned writer is found by its launch signature and re-bound"
     );
     let invocation = only_invocation(&store, &eid);
-    assert!(invocation.process_identity.is_none());
+    let identity = invocation
+        .process_identity
+        .clone()
+        .expect("the orphaned writer's identity is re-recorded");
     let export = export_for(&store, &invocation);
-    assert_eq!(export.state, WorkerRequestExportState::Exported);
-    assert_eq!(export.process_identity, None);
+    assert_eq!(export.state, WorkerRequestExportState::Bound);
+    assert_eq!(
+        export.process_identity.as_deref(),
+        Some(format!("{}@{}", identity.pid, identity.started_at).as_str()),
+        "the re-bind lands the same request_id → identity binding a normal launch writes"
+    );
 }
 
 #[test]
@@ -321,4 +329,413 @@ fn an_unbound_export_holds_the_invocation_uncertain() {
     let invocation = only_invocation(&store, &eid);
     let export = export_for(&store, &invocation);
     assert_eq!(export.state, WorkerRequestExportState::Exported);
+}
+
+/// The fault boundary #287 names: the consume commit landed
+/// (`Prepared`, no identity, request consumed, export `Exported`) and
+/// the launch commit never did. With no live process carrying the
+/// launch signature, the supervisor must not wedge the Execution
+/// `uncertain` forever — after the bounded window it proves absence,
+/// abandons the launch, and releases the capacity slot.
+#[test]
+fn an_unidentified_launch_without_a_writer_is_abandoned_after_the_window() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-absent");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-6");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The ambiguous spawn produced no live process: the scripted
+    // writer already exited before the first resolution pass.
+    port.exit_all(0);
+    // Inside the bounded window the launch stays uncertain — a process
+    // inside its fork-exec visibility gap is never declared absent.
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain
+    );
+    assert!(only_invocation(&store, &eid).process_identity.is_none());
+    // Dense polling never shortens the window: `uncertain_since` is
+    // set on the transition into `uncertain` and repeated `Unknown`
+    // reports do not refresh it, so the bound is measured from the
+    // first lost launch, not the latest pass.
+    sup.poll_invocations(&store, NOW + 15).unwrap();
+    sup.poll_invocations(&store, NOW + 29).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
+    // Past the window, proven absence abandons the launch — `abandoned`,
+    // not `done`: nothing ran to finish — and the slot is released.
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none());
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// Absence is not just "no argv signature match": a lost launch's
+/// escaped descendant keeps the leader's working directory after
+/// leaving the signature, so the launch directory must itself be
+/// clear before `Exited`/`Abandoned` — otherwise a replacement writer
+/// would run alongside the still-running escapee. A failed directory
+/// scan fails closed the same way.
+#[test]
+fn an_escaped_descendant_in_the_launch_dir_blocks_the_absence_proof() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-escapee");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-7");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone, but its escaped descendant — a
+    // different argv, the same launch directory — keeps running.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let escapee =
+        port.adopt_child_with(leader, "fixture-worker escaped-writer --file heartbeat.log");
+    sup.poll_invocations(&store, NOW + 1).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain
+    );
+    // Past the window the signature scan sees nothing, but the
+    // directory still holds an unexplained process: no absence. A
+    // failed directory scan fails closed identically.
+    port.fail_next_directory_scan("lsof unavailable");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared,
+        "an unexplained directory occupant is never declared absent"
+    );
+    assert!(only_invocation(&store, &eid).process_identity.is_none());
+    // The escapee exiting clears the directory; the next pass proves
+    // absence and abandons the launch.
+    port.exit(escapee, 0);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// A process-table read that TRUNCATES is never absence proof either:
+/// an escaped descendant that left the argv signature AND has an
+/// unreadable cwd is invisible to both scans, so the directory
+/// enumeration errs — an incomplete table is never "clear". When the
+/// cwd reads again the occupant itself blocks; once it exits, absence
+/// is proven and the slot releases.
+#[test]
+fn an_unreadable_directory_occupant_keeps_absence_unproven() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-dir-unreadable");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-12");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone; its escaped descendant — a different
+    // argv, the same launch directory — keeps running, but the
+    // platform cannot prove its cwd. A directory table that cannot
+    // map it must never read as clear.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let escapee =
+        port.adopt_child_with(leader, "fixture-worker escaped-writer --file heartbeat.log");
+    port.set_cwd_unreadable(escapee, true);
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "an incomplete directory enumeration is never absence proof"
+    );
+    // The cwd reads again: the escapee is a visible unrecorded
+    // occupant and keeps blocking absence on its own.
+    port.set_cwd_unreadable(escapee, false);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
+    // The escapee exits: the directory is provably clear and the
+    // launch abandons, releasing the slot.
+    port.exit(escapee, 0);
+    sup.poll_invocations(&store, NOW + 33).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// A process-table read that fails is never absence proof: the launch
+/// stays uncertain however long the window, and the next readable scan
+/// resolves it normally.
+#[test]
+fn an_unreadable_process_table_keeps_the_launch_uncertain() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-scanfail");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-7");
+    sup.consume_requests(&store, NOW).unwrap();
+    port.fail_next_process_scan("ps table unavailable");
+    // Even past the absence window a failed scan proves nothing.
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain
+    );
+    // The next readable scan finds the orphaned writer and re-binds it.
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
+/// Two live processes carrying the same launch signature inside the
+/// launch directory can never be told apart — the launch stays
+/// uncertain rather than guessing which spawn produced which process.
+#[test]
+fn ambiguous_signature_matches_keep_the_launch_uncertain() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-ambiguous");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (w, eid) = submit_and_admit(&store, "k-shim-8");
+    sup.consume_requests(&store, NOW).unwrap();
+    // A second live process carries the identical argv inside the same
+    // workspace — unrecorded, exactly like the orphan.
+    let ws = sup.workspace_of(&w);
+    port.spawn(&["fixture-worker".into()], &ws, &WorkerEnv::default())
+        .expect("the ambiguous candidate spawns");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "ambiguity is never resolved by a guess"
+    );
+}
+
+/// A signature match whose cwd cannot be read can be neither bound
+/// nor ruled out: while one exists, an in-directory match might be a
+/// foreign process and the unreadable one the real orphan — the
+/// launch stays uncertain rather than adopt the wrong writer. Once
+/// the cwd reads again the orphan is attributable and binds.
+#[test]
+fn an_unattributable_candidate_blocks_the_bind() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-cwd-none");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, None);
+    let (w, eid) = submit_and_admit(&store, "k-shim-10");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The orphan's cwd is unreadable (denied lsof) — and a second live
+    // process carries the same argv inside the launch directory. The
+    // in-directory match alone would look bindable; the unreadable
+    // candidate makes every bind a guess.
+    let orphan_pid = port.spawned().last().unwrap().pid;
+    port.set_cwd_unreadable(orphan_pid, true);
+    let ws = sup.workspace_of(&w);
+    let foreign = port
+        .spawn(&["fixture-worker".into()], &ws, &WorkerEnv::default())
+        .expect("the in-directory candidate spawns");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "an unreadable candidate is never resolved by guessing"
+    );
+    // The foreign process exits and the orphan's cwd reads again: the
+    // orphan is the single attributable match and binds normally.
+    port.exit(foreign.pid, 0);
+    port.set_cwd_unreadable(orphan_pid, false);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
+/// A signature match outside the launch directory can be the real
+/// writer after it chdir'd away — which makes the in-directory
+/// lookalike unattributable. The same never-guess rule the unreadable
+/// cwd guard enforces applies to a readable out-of-directory
+/// candidate: the launch stays uncertain rather than adopt the wrong
+/// writer. Once the out-of-directory candidate exits, the in-directory
+/// orphan is the single candidate and binds normally.
+#[test]
+fn an_out_of_directory_candidate_blocks_the_bind() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-outdir");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root.clone(), None);
+    let (_w, eid) = submit_and_admit(&store, "k-shim-11");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost writer carries the signature inside the launch
+    // directory — and a second live, unrecorded process carries the
+    // identical argv outside it: a foreign run, or the real writer
+    // after a chdir. Either way the in-directory match might be the
+    // wrong writer, so no bind is provable.
+    let elsewhere = tmp_root("unidentified-outdir-elsewhere");
+    let outsider = port
+        .spawn(
+            &["fixture-worker".into()],
+            &elsewhere,
+            &WorkerEnv::default(),
+        )
+        .expect("the out-of-directory candidate spawns");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Prepared);
+    assert!(invocation.process_identity.is_none());
+    assert_eq!(
+        store
+            .transact(|tx| tx.execution(&eid))
+            .unwrap()
+            .unwrap()
+            .state,
+        ExecutionState::Uncertain,
+        "a same-signature candidate outside the launch directory keeps \
+         every bind a guess"
+    );
+    // The outsider exits: the orphan is the only unrecorded match,
+    // attributable, and binds on the next pass.
+    port.exit(outsider.pid, 0);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(invocation.process_identity.is_some());
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
+/// A signature match the store already records — another Work's live
+/// writer — is never re-bound as this launch's orphan, and never blocks
+/// the orphan that IS this launch's.
+#[test]
+fn a_recorded_writer_is_never_rebound_as_the_orphan() {
+    // Two capacity slots: both Works run concurrently.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let root = tmp_root("unidentified-recorded");
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    let sup = supervisor(port.clone(), root, None);
+    let (_w_a, eid_a) = submit_and_admit(&store, "k-shim-9a");
+    sup.consume_requests(&store, NOW).unwrap();
+    let (_w_b, eid_b) = submit_and_admit(&store, "k-shim-9b");
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    sup.consume_requests(&store, NOW).unwrap();
+    assert_eq!(port.spawn_calls(), 2);
+    let spawned = port.spawned();
+    assert_eq!(spawned.len(), 2);
+    sup.poll_invocations(&store, NOW).unwrap();
+    // B's orphan — the second spawn — is the only unrecorded match in
+    // B's workspace; A's recorded writer is excluded from consideration.
+    let inv_b = only_invocation(&store, &eid_b);
+    let identity_b = inv_b
+        .process_identity
+        .clone()
+        .expect("B's orphan is re-bound");
+    assert_eq!(
+        identity_b.pid, spawned[1].pid,
+        "the orphan, not the other Work's writer, is bound"
+    );
+    assert_ne!(identity_b.pid, spawned[0].pid);
+    let inv_a = only_invocation(&store, &eid_a);
+    assert_eq!(
+        inv_a.process_identity.as_ref().map(|i| i.pid),
+        Some(spawned[0].pid),
+        "A's writer keeps its own recorded identity"
+    );
+    assert_eq!(inv_a.state, InvocationState::Running);
+}
+
+/// The scripted port's `spawned()` is the process-table view: a
+/// `SpawnPlan::Unknown` outcome still records the leader identity —
+/// the process exists even though its spawn response was lost.
+/// `spawn_calls` stays the no-second-writer counter.
+#[test]
+fn scripted_unknown_plan_records_the_lost_identity() {
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture lost after spawn".into(),
+    });
+    let ws = tmp_root("scripted-unknown-spawned");
+    assert!(matches!(
+        port.spawn(&["fixture-worker".into()], &ws, &WorkerEnv::default()),
+        Err(SpawnError::Unknown { .. })
+    ));
+    assert_eq!(
+        port.spawned().len(),
+        1,
+        "the orphan is in the process table even though the response was lost"
+    );
+    assert_eq!(port.spawn_calls(), 1);
 }

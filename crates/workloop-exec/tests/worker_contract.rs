@@ -27,8 +27,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use workloop_core::command::*;
@@ -36,7 +37,8 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::*;
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
+    WorkerEnv,
 };
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{
@@ -325,6 +327,7 @@ struct CountingPosix {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
     fail_next: Rc<Cell<bool>>,
+    unknown_next: Rc<Cell<bool>>,
 }
 
 impl ProcessControlPort for CountingPosix {
@@ -342,11 +345,31 @@ impl ProcessControlPort for CountingPosix {
                 reason: "adapter declined the request".into(),
             });
         }
+        if self.unknown_next.replace(false) {
+            // The process really starts — what was lost is the identity
+            // capture, exactly the crash window the recovery path
+            // exists for. The orphan stays findable through
+            // `matching_processes`, and `spawned` still records it so
+            // the scenario can clean the writer up.
+            let out = PosixProcessControl.spawn(argv, cwd, env);
+            if let Ok(identity) = &out {
+                self.spawned.borrow_mut().push(identity.clone());
+            }
+            return Err(SpawnError::Unknown {
+                reason: "identity capture lost after spawn".into(),
+            });
+        }
         let out = PosixProcessControl.spawn(argv, cwd, env);
         if let Ok(identity) = &out {
             self.spawned.borrow_mut().push(identity.clone());
         }
         out
+    }
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        PosixProcessControl.matching_processes(command)
+    }
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        PosixProcessControl.processes_in_directory(dir)
     }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
@@ -382,7 +405,12 @@ struct PosixProvider {
     spawned: Rc<RefCell<Vec<ProcessIdentity>>>,
     calls: Rc<Cell<usize>>,
     fail_next: Rc<Cell<bool>>,
+    unknown_next: Rc<Cell<bool>>,
 }
+
+/// Per-provider counter making every bound launch signature unique
+/// within this test process — see `PosixProvider::make_bound`.
+static SIGNATURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl PosixProvider {
     /// A Posix provider bound to one worker binary — the only variable
@@ -391,39 +419,63 @@ impl PosixProvider {
         let spawned = Rc::new(RefCell::new(Vec::new()));
         let calls = Rc::new(Cell::new(0));
         let fail_next = Rc::new(Cell::new(false));
+        let unknown_next = Rc::new(Cell::new(false));
         let mode = match shape {
             WorkerShape::CleanExit => "clean-exit",
             WorkerShape::NoArtifact => "exit-no-artifact",
             WorkerShape::Resident => "hang",
         };
+        // Each provider instance launches under a signature only it can
+        // own: the signature scan is system-wide, so a stale or foreign
+        // process carrying this suite's argv — a leftover writer from
+        // an earlier run, or a concurrent suite's writer — is an
+        // unrecorded match the re-bind path must never guess past.
+        // `--runtime-version` is declaration-only in both bound worker
+        // binaries: it changes the argv signature, never the mode.
+        let signature = format!(
+            "sig-{tag}-{}-{}",
+            SIGNATURE_SEQ.fetch_add(1, Ordering::Relaxed),
+            std::process::id()
+        );
         PosixProvider {
             sup: Supervisor::new(
                 CountingPosix {
                     spawned: spawned.clone(),
                     calls: calls.clone(),
                     fail_next: fail_next.clone(),
+                    unknown_next: unknown_next.clone(),
                 },
                 tmp_root(tag),
-                vec![bin.to_string(), mode.into()],
+                vec![
+                    bin.to_string(),
+                    mode.into(),
+                    "--runtime-version".into(),
+                    signature,
+                ],
                 config.clone(),
             ),
             spawned,
             calls,
             fail_next,
+            unknown_next,
         }
     }
 }
 
 impl WorkerProvider for PosixProvider {
     fn declares() -> &'static [&'static str] {
-        // Real spawn semantics only: outcomes a process cannot fake
-        // (unknown identity capture, uninspectable liveness) are not
-        // declared, and those rows are skipped — never substituted.
+        // Real spawn semantics plus the one outcome a real process CAN
+        // produce: a genuinely spawned writer whose identity capture is
+        // lost — the orphan stays findable through the real ps/lsof
+        // signature scan. What a process cannot fake (uninspectable
+        // liveness) stays undeclared, and that row is skipped — never
+        // substituted.
         &[
             "clean_exit",
             "no_artifact",
             "resident_writer",
             "spawn_refused",
+            "spawn_unknown",
             "stop_signal",
             "spawn_count",
         ]
@@ -483,7 +535,10 @@ impl WorkerHandle for PosixProvider {
                 self.fail_next.set(true);
             }
             SpawnFail::Unknown => {
-                unreachable!("PosixProvider does not declare spawn_unknown")
+                // Spawn for real, then lose the identity: the orphan
+                // is a genuine process-table entry the signature scan
+                // must find and re-bind.
+                self.unknown_next.set(true);
             }
         }
     }
@@ -718,15 +773,19 @@ fn duplicate_request_delivery_starts_no_second_writer(
 }
 
 /// WC-START-02: a start whose outcome was lost leaves the writer
-/// uncertain — never a silent not-started that permits a replacement.
-/// Repeated loop passes reconcile the unidentifiable Invocation through
-/// the poll path: uncertainty is re-reported, a second start never is.
+/// unproven until the poll path resolves it — never a silent
+/// not-started that permits a replacement, and never a second start.
+/// The orphaned writer still carries the recorded launch signature, so
+/// reconciliation re-binds its identity through the same durable commit
+/// a normal launch uses; the Execution returns to `running` with
+/// exactly one writer.
 fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store: &SqliteStore) {
     let (_w, eid) = submit_and_admit(store, &config(), "wc-start-2");
     p.fail_next_spawn(SpawnFail::Unknown);
     p.consume(store);
-    // Re-drive the loop: the poll path re-reports the unidentifiable
-    // Invocation as unknown — reconciliation, never a second start.
+    // Re-drive the loop: the poll path finds the orphaned writer by
+    // its launch signature and re-binds it — reconciliation, never a
+    // second start.
     p.pass(store);
     p.pass(store);
     assert_eq!(
@@ -737,16 +796,17 @@ fn unknown_start_outcome_blocks_a_second_writer(p: &mut dyn WorkerHandle, store:
     let invocations = invocations(store, &eid);
     assert_eq!(invocations.len(), 1);
     assert!(
-        invocations[0].state == InvocationState::Prepared
-            && invocations[0].process_identity.is_none(),
-        "an unrecorded start never claims a writer identity: {:?}",
+        invocations[0].state == InvocationState::Running
+            && invocations[0].process_identity.is_some(),
+        "the orphaned writer is re-bound, not guessed at: {:?}",
         invocations[0].state
     );
     assert_eq!(
         execution(store, &eid).state,
-        ExecutionState::Uncertain,
-        "the Execution stays uncertain — never silently not-started"
+        ExecutionState::Running,
+        "the re-bound writer resumes the Execution — no silent not-started"
     );
+    p.exit_writers();
 }
 
 /// WC-START-03: a definitely-refused start pauses without a writer and
@@ -1232,11 +1292,12 @@ fn run_suite<P: WorkerProvider>(tag: &str) -> (Vec<&'static str>, Vec<&'static s
 fn posix_provider_runs_the_suite_within_its_declared_surface() {
     let (covered, skipped) = run_suite::<PosixProvider>("posix");
     // Outcomes a real process cannot fake are reported skipped, never
-    // substituted: unknown identity capture and uninspectable liveness.
+    // substituted: uninspectable liveness and the surviving-signal gap.
+    // A lost identity capture IS covered — the orphan is a real
+    // process-table entry the signature scan re-binds.
     assert_eq!(
         skipped,
         vec![
-            "WC-START-02 unknown start outcome blocks a second writer",
             "WC-LIVE-01 unknown liveness is not death",
             "WC-STOP-02 a delivered signal is not stop proof",
         ]
