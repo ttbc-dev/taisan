@@ -45,6 +45,23 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these adapter-swap tests.
+fn fixture_sup<P: ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 fn host() -> HostInstanceId {
     HostInstanceId::trusted("swap-host")
 }
@@ -191,7 +208,7 @@ fn drive_until(
 fn ws_20_worker_argv_swap_binds_only_new_requests_in_each_direction() {
     let store = SqliteStore::in_memory(4).unwrap();
     let root = tmp_root("ws20");
-    let mut sup = Supervisor::new(
+    let mut sup = fixture_sup(
         PosixProcessControl,
         root,
         vec![fixture_bin(), "hang".into()],
@@ -295,7 +312,7 @@ fn ws_20_request_binding_survives_a_store_reopen() {
     let (exec, binding, identity) = {
         let store = SqliteStore::open(&db, 2).unwrap();
         let (_work, exec) = submit_and_admit(&store, "ws20-reopen");
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             PosixProcessControl,
             dir.join("ws"),
             vec![fixture_bin(), "hang".into()],
@@ -375,7 +392,7 @@ fn ws_21_runtime_version_mismatch_is_configuration_repair_with_no_start() {
     let port = CountingPosix {
         calls: calls.clone(),
     };
-    let mut sup = Supervisor::new(
+    let mut sup = fixture_sup(
         port,
         root.clone(),
         vec![fixture_bin(), "hang".into()],

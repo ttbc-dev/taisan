@@ -790,6 +790,7 @@ name = "workloop-exec"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "serde",
  "serde_json",
  "workloop-core",
  "workloop-github",

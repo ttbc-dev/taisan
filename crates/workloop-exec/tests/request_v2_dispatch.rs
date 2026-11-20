@@ -48,6 +48,23 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir.canonicalize().unwrap()
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these dispatch tests.
+fn fixture_sup<P: workloop_core::ports::ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 fn host() -> HostInstanceId {
     HostInstanceId::trusted("fixture")
 }
@@ -326,7 +343,7 @@ fn supervisor_v2(
         argv.push("--wire".into());
         argv.push("v2".into());
     }
-    Supervisor::new(
+    fixture_sup(
         PosixProcessControl,
         handoff.workspace_root.clone(),
         argv,
@@ -1480,7 +1497,7 @@ fn without_the_v2_profile_the_v1_path_leaves_no_request_body() {
     let (w, _e, rid) = admit(&store, "v1-compat", vec![]);
     let handoff = layout(&root);
     std::fs::create_dir_all(&handoff.workspace_root).unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         handoff.workspace_root.clone(),
         vec![fixture_bin(), "clean-exit".into()],

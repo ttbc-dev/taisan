@@ -619,7 +619,7 @@ pub fn run_pass<H: HostDriver>(
                         .or_default()
                         .push((request.request_id.clone(), request.execution_id.clone()));
                 }
-                for (_workspace, request_ids) in by_workspace {
+                for (workspace, request_ids) in by_workspace {
                     // Each probe spawns a bounded `describe`, so like
                     // every other item loop the tick deadline is
                     // checked before starting new work — a cut leaves
@@ -671,11 +671,31 @@ pub fn run_pass<H: HostDriver>(
                         isolation::release(&prebind_scratch);
                         continue;
                     }
-                    let declared = adapter::observe_worker_declaration(
-                        &supervisor.port,
+                    // The prebind probe proves the same boundary the
+                    // consume path launches under: a profile that
+                    // requires containment gets the bwrap argv and the
+                    // workspace bound read-only; a refused or faulted
+                    // gate simply leaves the requests unbound — the
+                    // consume path records the typed refusal.
+                    let gate = match supervisor.containment_gate(&supervisor.worker_argv, clock()) {
+                        Ok(Ok(gate)) => gate,
+                        _ => {
+                            isolation::release(&prebind_scratch);
+                            continue;
+                        }
+                    };
+                    let (probe_exec_argv, probe_exec_env) = supervisor.contained_probe(
+                        &gate,
                         &supervisor.worker_argv,
-                        &probe_cwd,
+                        Some(workspace.as_path()),
+                        &prebind_scratch.join("gitconfig"),
                         &env,
+                    );
+                    let declared = adapter::observe_worker_declaration_with_argv(
+                        &supervisor.port,
+                        &probe_exec_argv,
+                        &probe_cwd,
+                        &probe_exec_env,
                     );
                     isolation::release(&prebind_scratch);
                     let Ok(declaration) = declared else {
@@ -1390,11 +1410,20 @@ mod tests {
     }
 
     fn supervisor(mode: &str, root: std::path::PathBuf) -> Supervisor<PosixProcessControl> {
+        // Contract launches are fixture-profile evidence: the
+        // reference profile's bwrap boundary is proven by the
+        // containment suite, not by these pass-level tests.
         Supervisor::new(
             PosixProcessControl,
             root,
             vec![fixture_bin(), mode.to_string()],
             config(),
+        )
+        .with_isolation_profile(
+            workloop_core::worker::isolation_profile(
+                workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+            )
+            .unwrap(),
         )
     }
 

@@ -44,6 +44,23 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these contract-worker tests.
+fn fixture_sup<P: ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 /// Distinct scratch namespace per tested binary — the two suite
 /// invocations run in the same test process and must not share
 /// directories.
@@ -408,7 +425,7 @@ fn contract_worker_is_stopped_through_the_same_stop_proof() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("cw-stop");
     let (w, eid) = admit(&store, "cw-stop-1");
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root.clone(),
         vec![contract_bin(), "hang".into()],

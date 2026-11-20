@@ -6,6 +6,7 @@
 pub mod adapter;
 pub mod bodies;
 pub mod bounded;
+pub mod containment;
 pub mod handoff;
 pub mod isolation;
 pub mod request_v2;

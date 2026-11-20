@@ -64,6 +64,23 @@ fn tmp_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these worker-contract tests.
+fn fixture_sup<P: ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 fn config_with(host_write: bool) -> WorkloopConfig {
     WorkloopConfig {
         host: HostTemplate {
@@ -397,7 +414,7 @@ impl PosixProvider {
             WorkerShape::Resident => "hang",
         };
         PosixProvider {
-            sup: Supervisor::new(
+            sup: fixture_sup(
                 CountingPosix {
                     spawned: spawned.clone(),
                     calls: calls.clone(),
@@ -557,7 +574,7 @@ impl WorkerProvider for ScriptedProvider {
             WorkerShape::Resident => SpawnPlan::Resident,
         });
         ScriptedProvider {
-            sup: Supervisor::new(
+            sup: fixture_sup(
                 port.clone(),
                 tmp_root(tag),
                 vec!["scripted".into()],

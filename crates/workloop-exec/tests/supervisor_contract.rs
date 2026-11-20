@@ -153,8 +153,25 @@ fn submit(key: &str) -> CommandRequest {
     )
 }
 
+/// Contract launches are fixture-profile evidence: the reference
+/// profile's bwrap boundary is proven by the containment suite, not
+/// by these process-lifecycle tests.
+fn fixture_sup<P: ProcessControlPort>(
+    port: P,
+    root: PathBuf,
+    argv: Vec<String>,
+    cfg: WorkloopConfig,
+) -> Supervisor<P> {
+    Supervisor::new(port, root, argv, cfg).with_isolation_profile(
+        workloop_core::worker::isolation_profile(
+            workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID,
+        )
+        .unwrap(),
+    )
+}
+
 fn supervisor(mode: &str, root: PathBuf) -> Supervisor<PosixProcessControl> {
-    Supervisor::new(
+    fixture_sup(
         PosixProcessControl,
         root,
         vec![fixture_bin(), mode.to_string()],
@@ -410,7 +427,7 @@ fn setsid_escapee_is_in_the_snapshot_and_signaled() {
 fn persist_failure_sends_no_signal() {
     let root = tmp_root("nopersist");
     let port = PosixProcessControl;
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root.clone(),
         vec![fixture_bin()],
@@ -808,7 +825,7 @@ fn launch_refused_pauses_and_releases_the_slot() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("refused");
     let (_w, eid) = submit_and_admit(&store, "k-ref1");
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root,
         vec!["/nonexistent/workloop-worker".to_string()],
@@ -977,7 +994,7 @@ fn refresh_unions_recorded_escapees_into_the_live_snapshot() {
             })
         })
         .unwrap();
-    let sup = Supervisor::new(LiveTree(vec![live_child.clone()]), root, vec![], config());
+    let sup = fixture_sup(LiveTree(vec![live_child.clone()]), root, vec![], config());
     sup.run_once(&store, NOW).unwrap();
     let descendants = store
         .transact(|tx| tx.invocations_for_execution(&eid))
@@ -1109,7 +1126,7 @@ fn fresh_stop_snapshot_is_proven_before_settling() {
             })
         })
         .unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         FreshSnapshotEscapee {
             escapee: escapee.clone(),
             inspected: Mutex::new(BTreeSet::new()),
@@ -1253,7 +1270,7 @@ fn an_intent_recorded_escapee_blocks_the_poll_path_exit_fact() {
             })
         })
         .unwrap();
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         IntentEscapee {
             escapee: escapee.clone(),
             signaled: Mutex::new(vec![]),
@@ -1603,7 +1620,7 @@ fn invariant_check_runs_against_a_snapshot_never_the_producing_workspace() {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let (work, eid) = submit_and_admit(&store, "k-ic-snap");
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root.clone(),
         vec![script.to_string_lossy().into_owned()],
@@ -2130,7 +2147,7 @@ fn stale_or_unverified_leader_never_authorizes_a_group_signal() {
             started_at: "original".into(),
             pgid: Some(42),
         };
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             UnverifiedLeader {
                 identity: identity.clone(),
                 condition,
@@ -2246,7 +2263,7 @@ fn stop_receipts_distinguish_delivered_signals_from_stop_proof() {
             evidence_refs: vec![],
             descendants: vec![],
         };
-        let sup = Supervisor::new(
+        let sup = fixture_sup(
             SignalPort(signal),
             PathBuf::from("/unused"),
             vec![],
@@ -2369,7 +2386,7 @@ fn stop_intent_is_durable_before_the_first_signal() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("intent-order");
     let port = PosixProcessControl;
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root.clone(),
         vec![fixture_bin()],
@@ -2445,7 +2462,7 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
         "--interval-ms".into(),
         "1000".into(),
     ];
-    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
+    let sup = fixture_sup(PosixProcessControl, root.clone(), argv.clone(), config());
     sup.consume_requests(&store, NOW).unwrap();
     wait_for(
         || execution(&store, &eid).state == ExecutionState::Running,
@@ -2514,7 +2531,7 @@ fn setsid_escapee_survives_the_group_signal_but_blocks_the_terminal_commit() {
     // group-signal evidence covers the leader only. A supervisor restart
     // (kill -9 between intent and proof) resumes from the durable intent.
     drop(sup);
-    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
+    let restarted = fixture_sup(PosixProcessControl, root, argv, config());
     restarted.drive_stops(&store, NOW).unwrap();
     assert_eq!(
         execution(&store, &eid).state,
@@ -2568,7 +2585,7 @@ fn kill9_after_intent_persisted_resumes_from_the_durable_intent() {
         "--interval-ms".into(),
         "1000".into(),
     ];
-    let sup = Supervisor::new(PosixProcessControl, root.clone(), argv.clone(), config());
+    let sup = fixture_sup(PosixProcessControl, root.clone(), argv.clone(), config());
     sup.consume_requests(&store, NOW).unwrap();
     wait_for(
         || execution(&store, &eid).state == ExecutionState::Running,
@@ -2612,7 +2629,7 @@ fn kill9_after_intent_persisted_resumes_from_the_durable_intent() {
     // The restarted supervisor holds no memory of the stop; the stop
     // pass must resume signaling and inspection from the durable intent
     // alone — never re-deriving the tree and never spawning a writer.
-    let restarted = Supervisor::new(PosixProcessControl, root, argv, config());
+    let restarted = fixture_sup(PosixProcessControl, root, argv, config());
     restarted.drive_stops(&store, NOW).unwrap();
     assert_eq!(
         execution(&store, &eid).state,
@@ -2941,7 +2958,7 @@ fn a_runtime_deadline_expiry_requests_stop_and_releases_nothing() {
     let store = SqliteStore::in_memory(1).unwrap();
     let root = tmp_root("expiry-stop");
     let (_w, eid) = submit_and_admit_with(&store, &cfg, "k-exp1");
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         PosixProcessControl,
         root,
         vec![fixture_bin(), "hang".into()],
@@ -3190,7 +3207,7 @@ fn a_failed_liveness_read_spawns_no_replacement_until_verified() {
         started_at: "recorded".into(),
         pgid: Some(4242),
     };
-    let sup = Supervisor::new(
+    let sup = fixture_sup(
         FlakyPort {
             fail: Cell::new(false),
             identity,

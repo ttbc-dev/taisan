@@ -11,11 +11,13 @@ use std::path::PathBuf;
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
+use workloop_core::observation::ObservationFact;
 use workloop_core::store::Store;
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
-    DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, Unsupported, WorkerRequest,
-    WorkerRequestExportState, WorkerRequestKind, export_request_id, isolation_profile,
+    DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, IsolationProfile, Unsupported,
+    WorkerRequest, WorkerRequestExportState, WorkerRequestKind, export_request_id,
+    isolation_profile,
 };
 use workloop_exec::scripted::{ScriptedProcessControl, SpawnPlan};
 use workloop_exec::supervisor::Supervisor;
@@ -204,7 +206,7 @@ fn a_duplicate_start_for_one_invocation_spawns_exactly_one_writer() {
     let root = tmp_root("duplicate");
     let port = ScriptedProcessControl::new();
     port.set_default_plan(SpawnPlan::Resident);
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-2");
     sup.consume_requests(&store, NOW).unwrap();
     // Replay: a duplicated delivery of the same start plus full
@@ -266,7 +268,7 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "timeout between spawn and response".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-4");
     sup.consume_requests(&store, NOW).unwrap();
     // The supervision pass that owns the lost-start window: it must
@@ -299,7 +301,7 @@ fn an_unbound_export_holds_the_invocation_uncertain() {
     port.push_plan(SpawnPlan::Unknown {
         reason: "crashed between spawn and identity capture".into(),
     });
-    let sup = supervisor(port.clone(), root, None);
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
     let (_w, eid) = submit_and_admit(&store, "k-shim-5");
     sup.consume_requests(&store, NOW).unwrap();
     sup.consume_requests(&store, NOW).unwrap();
@@ -321,4 +323,40 @@ fn an_unbound_export_holds_the_invocation_uncertain() {
     let invocation = only_invocation(&store, &eid);
     let export = export_for(&store, &invocation);
     assert_eq!(export.state, WorkerRequestExportState::Exported);
+}
+
+/// A profile that declares a sandbox primitive the host cannot
+/// resolve refuses the launch outright: the consumed request records
+/// a `LaunchRefused` repair and no process ever exists. There is no
+/// hygiene-only substitute for proven containment.
+#[test]
+fn an_unresolvable_containment_primitive_refuses_the_launch() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("no-primitive");
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    let sup = Supervisor::new(port.clone(), root, vec!["fixture-worker".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-unresolvable-primitive",
+            env_passthrough: &[],
+            sandbox_primitive: Some("definitely-not-a-real-primitive-xyz"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-shim-ns");
+    sup.consume_requests(&store, NOW).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        0,
+        "no process exists without proven containment"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    let refused = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .any(|o| matches!(o.fact, ObservationFact::LaunchRefused { .. }));
+    assert!(
+        refused,
+        "the containment refusal is a recorded launch repair"
+    );
 }

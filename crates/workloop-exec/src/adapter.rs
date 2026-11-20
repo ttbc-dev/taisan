@@ -163,22 +163,29 @@ pub fn observe_worker_declaration(
     observe_worker_declaration_within(port, argv, cwd, env, Duration::from_secs(5))
 }
 
-/// The raw `describe` probe both declaration eras share: spawn the
-/// bound argv plus `describe`, wait bounded, and hand back stdout.
-/// Spawn refusal, non-zero exit, and an over-bound wait are all
-/// `Err` — the caller decides which declaration grammar the bytes
-/// must satisfy.
-fn run_describe_probe(
+/// The argv a `describe` probe runs for a worker argv: the argv plus
+/// the `describe` subcommand. Containment callers build the same
+/// list inside the sandbox argv instead — the helpers taking a
+/// *complete* argv never append it again.
+pub fn describe_argv(argv: &[String]) -> Vec<String> {
+    let mut probe_argv = argv.to_vec();
+    probe_argv.push("describe".into());
+    probe_argv
+}
+
+/// Run a fully-formed probe argv — one that already ends in
+/// `describe` — through the process-control port and return its
+/// stdout. This is the raw half both declaration eras share; the
+/// public observers below own the grammar.
+fn run_probe_argv(
     port: &impl ProcessControlPort,
     argv: &[String],
     cwd: &Path,
     env: &WorkerEnv,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let mut probe_argv = argv.to_vec();
-    probe_argv.push("describe".into());
     let outcome = port
-        .run_probe(&probe_argv, cwd, env, timeout)
+        .run_probe(argv, cwd, env, timeout)
         .map_err(|e| match e {
             SpawnError::Refused { reason } => format!("describe spawn refused: {reason}"),
             SpawnError::Unknown { reason } => format!("describe spawn unknown: {reason}"),
@@ -191,6 +198,21 @@ fn run_describe_probe(
         ProbeOutcome::Exited { success: false, .. } => Err("describe exited non-zero".into()),
         ProbeOutcome::Bounded => Err(format!("describe did not answer within {timeout:?}")),
     }
+}
+
+/// The raw `describe` probe both declaration eras share: spawn the
+/// worker argv plus `describe`, wait bounded, and hand back stdout.
+/// Spawn refusal, non-zero exit, and an over-bound wait are all
+/// `Err` — the caller decides which declaration grammar the bytes
+/// must satisfy.
+fn run_describe_probe(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    run_probe_argv(port, &describe_argv(argv), cwd, env, timeout)
 }
 
 /// The v2-era `describe`: same probe, strict
@@ -212,6 +234,25 @@ pub fn observe_worker_declaration_v2(
     observe_worker_declaration_v2_within(port, argv, cwd, env, Duration::from_secs(5))
 }
 
+/// `describe` over a *complete* probe argv — the containment path's
+/// sandbox argv already ends in `describe`. Same strict
+/// `taisan.worker.declaration/1` parse and fail-closed contract; the
+/// argv is never re-appended.
+pub fn observe_worker_declaration_v2_with_argv(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+) -> Result<
+    (
+        workloop_core::worker_v2::WorkerDeclarationV1,
+        WorkerDeclaration,
+    ),
+    String,
+> {
+    observe_worker_declaration_v2_with_argv_within(port, argv, cwd, env, Duration::from_secs(5))
+}
+
 fn observe_worker_declaration_v2_within(
     port: &impl ProcessControlPort,
     argv: &[String],
@@ -226,7 +267,39 @@ fn observe_worker_declaration_v2_within(
     String,
 > {
     let stdout = run_describe_probe(port, argv, cwd, env, timeout)?;
-    let declared = workloop_core::worker_v2::WorkerDeclarationV1::parse(&stdout)
+    parse_declaration_v2(&stdout)
+}
+
+fn observe_worker_declaration_v2_with_argv_within(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+    timeout: Duration,
+) -> Result<
+    (
+        workloop_core::worker_v2::WorkerDeclarationV1,
+        WorkerDeclaration,
+    ),
+    String,
+> {
+    let stdout = run_probe_argv(port, argv, cwd, env, timeout)?;
+    parse_declaration_v2(&stdout)
+}
+
+/// The strict `taisan.worker.declaration/1` parse plus the
+/// capability-digest surface — one answer, two views, shared by both
+/// probe shapes.
+fn parse_declaration_v2(
+    stdout: &[u8],
+) -> Result<
+    (
+        workloop_core::worker_v2::WorkerDeclarationV1,
+        WorkerDeclaration,
+    ),
+    String,
+> {
+    let declared = workloop_core::worker_v2::WorkerDeclarationV1::parse(stdout)
         .map_err(|e| format!("describe declaration refused: {e}"))?;
     let surface = declaration_v1_surface(&declared)?;
     Ok((declared, surface))
@@ -259,6 +332,18 @@ fn declaration_v1_surface(
     })
 }
 
+/// `describe` over a *complete* probe argv — the containment path's
+/// sandbox argv already ends in `describe`. Same lenient parse and
+/// fail-closed contract; the argv is never re-appended.
+pub fn observe_worker_declaration_with_argv(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+) -> Result<WorkerDeclaration, String> {
+    observe_worker_declaration_with_argv_within(port, argv, cwd, env, Duration::from_secs(5))
+}
+
 fn observe_worker_declaration_within(
     port: &impl ProcessControlPort,
     argv: &[String],
@@ -267,7 +352,23 @@ fn observe_worker_declaration_within(
     timeout: Duration,
 ) -> Result<WorkerDeclaration, String> {
     let stdout = run_describe_probe(port, argv, cwd, env, timeout)?;
-    let value = serde_json::from_slice::<serde_json::Value>(&stdout)
+    parse_declaration_v1(&stdout)
+}
+
+fn observe_worker_declaration_with_argv_within(
+    port: &impl ProcessControlPort,
+    argv: &[String],
+    cwd: &Path,
+    env: &WorkerEnv,
+    timeout: Duration,
+) -> Result<WorkerDeclaration, String> {
+    let stdout = run_probe_argv(port, argv, cwd, env, timeout)?;
+    parse_declaration_v1(&stdout)
+}
+
+/// The lenient declaration parse shared by both probe shapes.
+fn parse_declaration_v1(stdout: &[u8]) -> Result<WorkerDeclaration, String> {
+    let value = serde_json::from_slice::<serde_json::Value>(stdout)
         .map_err(|e| format!("describe output is not JSON: {e}"))?;
     let adapter = value
         .get("adapter")
