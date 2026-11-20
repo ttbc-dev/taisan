@@ -546,6 +546,9 @@ pub struct ReviewSourceOccurrence {
     pub severity: Option<String>,
     pub position: Option<String>,
     pub thread_id: Option<String>,
+    /// The human-readable finding text from the sealed claim.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// The judgment context a re-review binds: the exact-set decision

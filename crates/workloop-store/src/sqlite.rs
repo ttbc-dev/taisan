@@ -414,7 +414,8 @@ impl SqliteStore {
             // invocations.descendants, body_catalog.pin_state,
             // invocation_requests.adapter_binding,
             // work_usage.last_progress_basis,
-            // recovery_intents.retirement_generation, and the pin-ledger
+            // recovery_intents.retirement_generation,
+            // finding_occurrences.summary, and the pin-ledger
             // reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
@@ -496,6 +497,18 @@ impl SqliteStore {
                     "ALTER TABLE recovery_intents ADD COLUMN retirement_generation INTEGER",
                 )
                 .map_err(internal)?;
+            }
+            let has_occurrence_summary: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('finding_occurrences') \
+                     WHERE name='summary')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_occurrence_summary {
+                tx.execute_batch("ALTER TABLE finding_occurrences ADD COLUMN summary TEXT")
+                    .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
@@ -2000,7 +2013,7 @@ impl ReadView for Tx<'_> {
     fn occurrences(&self, round_id: &str) -> Result<Vec<FindingOccurrence>, StoreError> {
         self.query_all(
             "SELECT id, round_id, source_key, content_digest, severity, \
-             position, thread_id FROM finding_occurrences \
+             position, thread_id, summary FROM finding_occurrences \
              WHERE round_id=?1 ORDER BY id",
             params![round_id],
             |row| {
@@ -2012,6 +2025,7 @@ impl ReadView for Tx<'_> {
                     severity: row.get(4)?,
                     position: row.get(5)?,
                     thread_id: row.get(6)?,
+                    summary: row.get(7)?,
                 })
             },
         )
@@ -2895,7 +2909,7 @@ impl TxView for Tx<'_> {
                     self.exec(
                         "INSERT INTO finding_occurrences (id, round_id, \
                          source_key, content_digest, severity, position, \
-                         thread_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                         thread_id, summary) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
                             o.id,
                             o.round_id,
@@ -2904,6 +2918,7 @@ impl TxView for Tx<'_> {
                             o.severity,
                             o.position,
                             o.thread_id,
+                            o.summary,
                         ],
                     )?;
                 }

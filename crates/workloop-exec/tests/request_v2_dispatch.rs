@@ -631,6 +631,7 @@ fn judged_round(
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: None,
                 })
                 .collect();
             let judgment = RoundJudgment {
@@ -730,6 +731,28 @@ fn open_change_target(
         NOW,
     )
     .unwrap();
+    // The target-branch state a poller records before any review can
+    // dispatch: an absent revision is ignorance, never a bound target.
+    handle_observation(
+        store,
+        &cfg,
+        &obs(ObservationFact::BranchState {
+            repository: cfg.host.repository.clone(),
+            branch: target_branch.into(),
+            state: BranchState::At {
+                revision: fixture_target_revision(),
+            },
+        }),
+        NOW,
+    )
+    .unwrap();
+}
+
+/// The fixture's observed target-branch revision. Dispatch refuses
+/// while the branch state is unobserved — an opened change is only a
+/// dispatchable target once the poller has pinned where `main` sits.
+fn fixture_target_revision() -> CommitRevision {
+    CommitRevision::new(repo(), "0".repeat(40)).unwrap()
 }
 
 fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
@@ -1154,7 +1177,7 @@ fn current_diff_target(
         change: change.clone(),
         head: head.clone(),
         base: None,
-        target_revision: None,
+        target_revision: Some(fixture_target_revision()),
     }
 }
 
@@ -3593,6 +3616,10 @@ fn a_code_review_with_findings_seals_occurrences_for_judgment() {
     assert_eq!(occurrences.len(), 1);
     assert_eq!(occurrences[0].source_key, "f-1");
     assert_eq!(occurrences[0].severity.as_deref(), Some("high"));
+    assert_eq!(
+        occurrences[0].summary.as_deref(),
+        Some("off by one in the bound check")
+    );
     let digest = occurrences[0]
         .content_digest
         .clone()

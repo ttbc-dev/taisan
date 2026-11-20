@@ -444,6 +444,11 @@ fn bind_review(
     };
     if target.change.change_request.as_str() != wire_target.change
         || target.head.object != wire_target.head
+        // An absent wire revision proves no match (the wire docs say
+        // bodies minted before the binding existed can never prove
+        // one) — `None == None` is equality of ignorance, never a
+        // bound target.
+        || wire_target.target_revision.is_none()
         || target.target_revision.as_ref().map(|r| r.object.as_str())
             != wire_target.target_revision.as_deref()
     {
@@ -560,6 +565,7 @@ fn review_occurrences(members: &[serde_json::Value]) -> Vec<OccurrenceInput> {
             severity: member.severity,
             position: member.position,
             thread_id: member.thread_id,
+            summary: Some(member.summary),
         });
     }
     occurrences

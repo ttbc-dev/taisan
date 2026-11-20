@@ -230,7 +230,8 @@ CREATE TABLE IF NOT EXISTS finding_occurrences (
     content_digest TEXT,
     severity TEXT,
     position TEXT,
-    thread_id TEXT
+    thread_id TEXT,
+    summary TEXT
 );
 
 -- One immutable exact-set judgment per sealed round.

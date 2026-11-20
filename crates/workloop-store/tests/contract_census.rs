@@ -249,6 +249,7 @@ fn seal_review(
                         severity: None,
                         position: None,
                         thread_id: None,
+                        summary: None,
                     })
                     .collect(),
             },
@@ -295,6 +296,7 @@ fn seal_round_raw(
                         severity: None,
                         position: None,
                         thread_id: None,
+                        summary: None,
                     })
                     .collect(),
             })
