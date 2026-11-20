@@ -1254,7 +1254,18 @@ pub fn verification_bounds(
                     })?;
                     (true, Some(req.budget.deadline_unix_seconds))
                 }
-                _ => (false, None),
+                // A body row that fails integrity is corrupt durable
+                // state — a fault, never a silent downgrade to the
+                // recorded v1 bounds and profile.
+                Some(_) => {
+                    return Err(StoreError::Internal {
+                        detail: format!(
+                            "worker request body for {} is corrupt",
+                            handoff.request_id
+                        ),
+                    });
+                }
+                None => (false, None),
             },
             None => (false, None),
         })
@@ -1365,111 +1376,121 @@ pub fn verify_with_timeout(
     // then add fresh — `worktree add` refuses a registered path.
     let _ = git(&layout.repository, &["worktree", "prune"]);
     let _ = std::fs::remove_dir_all(&worktree);
-    let (result, output) = match (
-        &enforcement,
-        git(
-            &layout.repository,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                worktree.to_str().unwrap_or_default(),
-                &produced,
-            ],
-        ),
-    ) {
-        (Err(reason), _) => (VerificationOutcome::Inconclusive, reason.clone()),
-        (Ok(_), Err(e)) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
-        (Ok(enforcement), Ok(_)) => {
-            let env_root = scratch.join(format!("verify-env-{tag}"));
-            // The worktree's own gitdir is the single writable
-            // metadata bind: `git status` can refresh its index
-            // without ever reaching another artifact's refs.
-            let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    layout
-                        .repository
-                        .join("worktrees")
-                        .join(format!("verify-{tag}"))
-                });
-            let run = match enforcement {
-                Enforcement::Hygiene => {
-                    // The recorded v1 hygiene-only environment:
-                    // allowlisted env, fresh HOME/TMPDIR, git config
-                    // scrubbed of credential helpers — required, not
-                    // sufficient; the namespace slice is the
-                    // contained path below.
-                    let _ = std::fs::create_dir_all(env_root.join("home"));
-                    let _ = std::fs::create_dir_all(env_root.join("tmp"));
-                    let env = WorkerEnv {
-                        vars: vec![
-                            (
-                                "PATH".to_string(),
-                                std::env::var("PATH").unwrap_or_default(),
-                            ),
-                            (
-                                "HOME".to_string(),
-                                env_root.join("home").to_string_lossy().into_owned(),
-                            ),
-                            (
-                                "TMPDIR".to_string(),
-                                env_root.join("tmp").to_string_lossy().into_owned(),
-                            ),
-                            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-                            ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
-                        ],
-                    };
-                    run_verification_command(argv, &worktree, &log_path, &env, timeout)
+    // A spent bound permits no run at all: no worktree is added and
+    // no command spawns — the recorded `Inconclusive` is the same
+    // honest evidence a spent timeout reports.
+    let (result, output) = if timeout.is_zero() {
+        (
+            VerificationOutcome::Inconclusive,
+            "execution deadline elapsed before verification started".to_string(),
+        )
+    } else {
+        match (
+            &enforcement,
+            git(
+                &layout.repository,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    worktree.to_str().unwrap_or_default(),
+                    &produced,
+                ],
+            ),
+        ) {
+            (Err(reason), _) => (VerificationOutcome::Inconclusive, reason.clone()),
+            (Ok(_), Err(e)) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
+            (Ok(enforcement), Ok(_)) => {
+                let env_root = scratch.join(format!("verify-env-{tag}"));
+                // The worktree's own gitdir is the single writable
+                // metadata bind: `git status` can refresh its index
+                // without ever reaching another artifact's refs.
+                let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        layout
+                            .repository
+                            .join("worktrees")
+                            .join(format!("verify-{tag}"))
+                    });
+                let run = match enforcement {
+                    Enforcement::Hygiene => {
+                        // The recorded v1 hygiene-only environment:
+                        // allowlisted env, fresh HOME/TMPDIR, git config
+                        // scrubbed of credential helpers — required, not
+                        // sufficient; the namespace slice is the
+                        // contained path below.
+                        let _ = std::fs::create_dir_all(env_root.join("home"));
+                        let _ = std::fs::create_dir_all(env_root.join("tmp"));
+                        let env = WorkerEnv {
+                            vars: vec![
+                                (
+                                    "PATH".to_string(),
+                                    std::env::var("PATH").unwrap_or_default(),
+                                ),
+                                (
+                                    "HOME".to_string(),
+                                    env_root.join("home").to_string_lossy().into_owned(),
+                                ),
+                                (
+                                    "TMPDIR".to_string(),
+                                    env_root.join("tmp").to_string_lossy().into_owned(),
+                                ),
+                                ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+                                ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+                            ],
+                        };
+                        run_verification_command(argv, &worktree, &log_path, &env, timeout)
+                    }
+                    Enforcement::Contained(ctx) => run_verification_contained(
+                        ctx,
+                        layout,
+                        argv,
+                        &worktree,
+                        &gitdir,
+                        &log_path,
+                        &env_root,
+                        &scratch.join(format!("verify-scratch-{tag}")),
+                        &tag,
+                        timeout,
+                    ),
+                };
+                // Read back only the bounded tail — never the whole file:
+                // a large writer must not size the supervisor's memory.
+                // The cap is the dispatch profile's: 64 KiB recorded v1,
+                // 8 MiB approved v2.
+                let captured = match std::fs::File::open(&log_path) {
+                    Ok(f) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let mut r = std::io::BufReader::new(f);
+                        let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
+                        let mut bytes = Vec::new();
+                        let _ = r.take(output_cap).read_to_end(&mut bytes);
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                    Err(_) => String::new(),
+                };
+                match run {
+                    VerificationRun::Finished(status) => (
+                        match status.code() {
+                            Some(0) => VerificationOutcome::Pass,
+                            Some(_) => VerificationOutcome::Fail,
+                            // A signal-killed runner is incomplete, never a
+                            // fabricated exit code.
+                            None => VerificationOutcome::Inconclusive,
+                        },
+                        captured,
+                    ),
+                    VerificationRun::TimedOut => (
+                        VerificationOutcome::Inconclusive,
+                        format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
+                    ),
+                    VerificationRun::SpawnFailed(e) => {
+                        (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
+                    }
+                    VerificationRun::Refused(reason) => (VerificationOutcome::Inconclusive, reason),
                 }
-                Enforcement::Contained(ctx) => run_verification_contained(
-                    ctx,
-                    layout,
-                    argv,
-                    &worktree,
-                    &gitdir,
-                    &log_path,
-                    &env_root,
-                    &scratch.join(format!("verify-scratch-{tag}")),
-                    &tag,
-                    timeout,
-                ),
-            };
-            // Read back only the bounded tail — never the whole file:
-            // a large writer must not size the supervisor's memory.
-            // The cap is the dispatch profile's: 64 KiB recorded v1,
-            // 8 MiB approved v2.
-            let captured = match std::fs::File::open(&log_path) {
-                Ok(f) => {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let mut r = std::io::BufReader::new(f);
-                    let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
-                    let mut bytes = Vec::new();
-                    let _ = r.take(output_cap).read_to_end(&mut bytes);
-                    String::from_utf8_lossy(&bytes).into_owned()
-                }
-                Err(_) => String::new(),
-            };
-            match run {
-                VerificationRun::Finished(status) => (
-                    match status.code() {
-                        Some(0) => VerificationOutcome::Pass,
-                        Some(_) => VerificationOutcome::Fail,
-                        // A signal-killed runner is incomplete, never a
-                        // fabricated exit code.
-                        None => VerificationOutcome::Inconclusive,
-                    },
-                    captured,
-                ),
-                VerificationRun::TimedOut => (
-                    VerificationOutcome::Inconclusive,
-                    format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
-                ),
-                VerificationRun::SpawnFailed(e) => {
-                    (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
-                }
-                VerificationRun::Refused(reason) => (VerificationOutcome::Inconclusive, reason),
             }
         }
     };

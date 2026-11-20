@@ -1143,6 +1143,56 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
     );
 }
 
+/// A bound spent before the run starts permits no run at all: zero
+/// timeout records `Inconclusive` without a worktree or a spawned
+/// command — the marker the argv would write is never created.
+#[test]
+fn a_spent_deadline_runs_no_command_at_all() {
+    let root = tmp_root("verifyzero");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vz");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vz");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
+
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let marker = scratch.join("command-ran");
+    let res = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[9]",
+        &[
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'", marker.display()),
+        ],
+        &scratch,
+        Duration::ZERO,
+        64 * 1024,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        !marker.exists(),
+        "a spent bound spawns no verification command"
+    );
+    assert!(
+        std::fs::read_dir(&scratch).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("verify-")),
+        "no detached worktree or run log is created for a spent bound"
+    );
+}
+
 /// `source_revision` is a host issue-version token, not a git commit:
 /// a source-bound Work derives the handoff base from the managed
 /// branch's fork point in the workspace, and a valid produced commit

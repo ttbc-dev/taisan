@@ -1241,7 +1241,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             req.base.object,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (Vec::new(), String::new()),
                 };
             Ok(Some((
                 invocation.clone(),
