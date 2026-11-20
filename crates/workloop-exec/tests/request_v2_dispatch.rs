@@ -631,7 +631,7 @@ fn judged_round(
                     severity: None,
                     position: None,
                     thread_id: None,
-                    summary: None,
+                    summary: Some(format!("summary for {key}")),
                 })
                 .collect();
             let judgment = RoundJudgment {
@@ -1241,6 +1241,11 @@ fn a_review_origin_fix_binds_the_judged_findings() {
     assert_eq!(findings[0].source, "find-1");
     assert_eq!(findings[0].digest, digest);
     assert_eq!(findings[0].order, 0);
+    assert_eq!(
+        findings[0].summary.as_deref(),
+        Some("summary for find-1"),
+        "the sealed claim's finding text reaches the Fix worker"
+    );
 }
 
 #[test]

@@ -126,6 +126,10 @@ pub struct FindingOccurrenceRef {
     pub source: String,
     pub digest: String,
     pub order: u64,
+    /// The human-readable finding text the sealed claim carried —
+    /// never identity; `occurrence`/`digest` name it.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// The failed mechanical evidence a pre-publication Fix repairs. It
@@ -1766,6 +1770,7 @@ mod tests {
                             source: "review-source-3".into(),
                             digest: "e".repeat(64),
                             order: 0,
+                            summary: Some("unchecked error return".into()),
                         }],
                     }),
                     constraints: vec!["Address only the selected finding".into()],

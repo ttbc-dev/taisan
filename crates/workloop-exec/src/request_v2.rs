@@ -721,6 +721,7 @@ pub fn build_request_body(
                             source: occurrence.source_key.clone(),
                             digest: content_digest,
                             order: order as u64,
+                            summary: occurrence.summary.clone(),
                         });
                     }
                     if findings.is_empty() {
