@@ -2940,10 +2940,13 @@ fn assess(
             Ok(())
         }
         ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
-        // The handoff acknowledgement this check rides on is the moment
-        // the produced commit became durable: publication may now name
-        // it, so a waiting Execution re-evaluates its stage intents.
-        ObservationFact::ClaimedHeadCheck { .. } if execution.state == ExecutionState::Waiting => {
+        // The handoff acknowledgement these facts ride on is the
+        // moment the produced commit became durable: publication may
+        // now name it, so a waiting Execution re-evaluates its stage
+        // intents.
+        ObservationFact::ClaimedHeadCheck { .. } | ObservationFact::HandoffAcknowledged { .. }
+            if execution.state == ExecutionState::Waiting =>
+        {
             maybe_publish(tx, config, &execution, now_unix_seconds)
         }
         _ => Ok(()),

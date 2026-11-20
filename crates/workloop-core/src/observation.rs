@@ -149,6 +149,17 @@ pub enum ObservationFact {
         /// `claimed == produced`.
         agrees: bool,
     },
+    /// The artifact handoff became durable: `produced` is the commit
+    /// the acknowledged handoff promoted. Recorded when the supervisor
+    /// cannot also form a `ClaimedHeadCheck` verdict — no retained
+    /// Worker report, an `absent`/`invalid` classification,
+    /// unavailable report bytes, or a report without `claimed_head` —
+    /// so the acknowledgement still re-drives publication for a
+    /// waiting Execution.
+    HandoffAcknowledged {
+        artifact_id: String,
+        produced: String,
+    },
     /// An authoritative read of a source issue. Drives the source gate:
     /// compared against the approved spec snapshot, never trusted by
     /// position or timestamp alone.
