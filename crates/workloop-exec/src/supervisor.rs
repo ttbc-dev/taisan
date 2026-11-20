@@ -29,6 +29,7 @@ use workloop_core::worker::{
 use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
 use crate::adapter;
+use crate::bodies::CAS_CATEGORY;
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -3306,6 +3307,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             )?;
         }
+        // The worker's own report is the only copy of its declared
+        // status and reason: retain it content-addressed before the
+        // exit fact resolves the Invocation — the per-Invocation tree
+        // is reclaimed with resolution, so a report retained nowhere
+        // is evidence destroyed un-ingested. A v1 request writes no
+        // report; an absent or oversized one is honest absence, never
+        // a refusal of the exit fact itself.
+        self.retain_report(store, invocation, now_unix_seconds)?;
         self.report(
             store,
             &request,
@@ -3321,6 +3330,61 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             now_unix_seconds,
         )?;
+        Ok(())
+    }
+
+    /// Retain the v2 worker's `report.json` in the content-addressed
+    /// body store so the declared status and reason survive the
+    /// per-Invocation tree's reclamation — the report is the only
+    /// copy of that evidence, and the io sweep's keep set names only
+    /// unresolved Invocations. Retention happens while the Invocation
+    /// still owns its tree; the report's own consumer classifies the
+    /// retained bytes, not this transport slice. No-op without a v2
+    /// dispatch, without a report, or for a report above the wire
+    /// bound — absent or out-of-contract bytes keep no claim.
+    fn retain_report(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let Some(dispatch) = &self.v2 else {
+            return Ok(());
+        };
+        let report = crate::request_v2::invocation_io_root(&self.workspace_root)
+            .join(isolation::sanitize_key(&invocation.id.0))
+            .join("out")
+            .join("report.json");
+        let Ok(metadata) = std::fs::metadata(&report) else {
+            return Ok(());
+        };
+        // The wire bound caps the report envelope (budget
+        // `max_report_bytes`); retaining beyond a generous headroom
+        // protects the catalogue without ever refusing the exit fact.
+        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+            return Ok(());
+        }
+        let Ok(bytes) = std::fs::read(&report) else {
+            return Ok(());
+        };
+        let horizon = workloop_store::retention::CategoryLimits::documented_default(CAS_CATEGORY)
+            .and_then(|limits| limits.max_age)
+            .map(|max_age| now_unix_seconds.saturating_add(max_age));
+        dispatch
+            .bodies
+            .retain_at(
+                store.body_catalog(),
+                CAS_CATEGORY,
+                &format!("bodies/report/{}", invocation.id.0),
+                &bytes,
+                now_unix_seconds,
+                horizon,
+            )
+            .map_err(|e| {
+                ExecError::Store(StoreError::Internal {
+                    detail: format!("retain report body: {e}"),
+                })
+            })?;
         Ok(())
     }
 

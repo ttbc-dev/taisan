@@ -2555,9 +2555,10 @@ mod tests {
         assert!(err.contains("worker_argv"), "{err}");
 
         // A dispatch section under a profile that declares no sandbox
-        // primitive refuses composition (docs/v0.3.md OPS-02): the v2
-        // launch never degrades to hygiene-only, and the v1 argv-only
-        // path under the same profile stays composed.
+        // primitive refuses composition (docs/v0.3.md OPS-02): the
+        // contract-harness profile is refused in production installs
+        // outright, so neither the v2 dispatch nor the v1 argv-only
+        // path composes under it.
         installation.worker_argv = vec!["/opt/worker/bin/worker".into()];
         installation.worker_isolation_profile =
             Some(workloop_core::worker::FIXTURE_ISOLATION_PROFILE_ID.to_string());
@@ -2566,10 +2567,10 @@ mod tests {
             .expect("v2 dispatch under a primitive-free profile refuses");
         assert!(err.contains("sandbox primitive"), "{err}");
         installation.worker_dispatch = None;
-        let supervisor = build_supervisor(&config(), &installation, &state_root)
-            .unwrap()
-            .expect("the v1 path under the harness profile still composes");
-        assert!(supervisor.v2.is_none());
+        let err = build_supervisor(&config(), &installation, &state_root)
+            .err()
+            .expect("the v1 path under the harness profile refuses");
+        assert!(err.contains("sandbox primitive"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

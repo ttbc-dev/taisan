@@ -834,6 +834,34 @@ fn coding_dispatch_materializes_the_request_and_per_invocation_io() {
         !io_dir.exists(),
         "the resolved invocation's io tree is reclaimed"
     );
+    // The worker's report is the only copy of its declared status and
+    // reason — `finish_invocation` retains it content-addressed before
+    // the exit fact resolves the Invocation, so the evidence outlives
+    // the reclaimed io tree and still verifies byte-for-byte.
+    let bodies = BodyStore::new(state_root.clone());
+    let retained = bodies
+        .resolve_at(
+            store.body_catalog(),
+            CAS_CATEGORY,
+            &format!("bodies/report/{}", resolved.id.0),
+        )
+        .unwrap()
+        .expect("the v2 report is retained before the io sweep runs");
+    assert_eq!(
+        classify_report(
+            &retained.bytes,
+            &ReportBinding {
+                request_id: &rid,
+                invocation_id: &resolved.id.0,
+                request_digest: &wire.request_digest,
+                role: InvocationRole::Coding,
+            },
+            1 << 20,
+        )
+        .classification,
+        ReportClassification::Success,
+        "the retained report still classifies against the durable request"
+    );
 }
 
 #[test]

@@ -898,6 +898,18 @@ fn prepare_enforcement(
     declared_egress_hosts: &[String],
 ) -> Result<Enforcement, String> {
     let Some(sandbox) = &layout.verification else {
+        // A request declaring verification egress hosts asks for a
+        // bounded proxy; a hygiene-only runner cannot grant one, so
+        // it refuses rather than degrade to the host's unrestricted
+        // network (§14.5: never an open-network fallback).
+        if declared_egress_hosts.iter().any(|h| !h.trim().is_empty()) {
+            return Err(
+                "verification.egress_declared_without_sandbox: the request declares \
+                 verification egress hosts but the installation configures no \
+                 verification sandbox to grant them through"
+                    .into(),
+            );
+        }
         return Ok(Enforcement::Hygiene);
     };
     // Configured paths must exist before the first dispatch — a
