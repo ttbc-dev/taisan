@@ -1,0 +1,66 @@
+{
+  "schema_version": "1",
+  "status": "error",
+  "command": null,
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "kind": "check",
+    "probe_operations": [],
+    "remote_writes": 0,
+    "stages": [
+      {
+        "diagnostics": [],
+        "stage": "config_parse",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "identity_tuples",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "credential_refs",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "paths",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "worker_runtime",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "isolation_primitives",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "store",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [
+          {
+            "code": "capability.unknown",
+            "key": "probe",
+            "message": "--probe was requested but no adapter probe backend is wired for this installation — probe reads require the host adapter; nothing was probed and nothing was written"
+          }
+        ],
+        "stage": "probe_capabilities",
+        "status": "fail"
+      }
+    ],
+    "success": false
+  },
+  "reason": {
+    "code": "config",
+    "message": "check failed at probe_capabilities: capability.unknown — --probe was requested but no adapter probe backend is wired for this installation — probe reads require the host adapter; nothing was probed and nothing was written"
+  },
+  "evidence_refs": []
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": "cmd-1",
+    "kind": "submit",
+    "actor": "human:actor-doc",
+    "idempotency_key": "doc-submit-1"
+  },
+  "work_id": "w-1",
+  "execution_id": "e-1",
+  "result": {
+    "execution_id": "e-1",
+    "kind": "work_created"
+  },
+  "reason": null,
+  "evidence_refs": []
+}

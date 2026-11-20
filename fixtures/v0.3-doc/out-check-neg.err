@@ -1,0 +1,1 @@
+taisan: config: check failed at credential_refs: credential.missing — credential slot env:TAISAN_GH_TOKEN for role 'discussion' is not set — define it before check can pass

@@ -1,0 +1,36 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": null,
+    "kind": "run",
+    "actor": "human:actor-doc",
+    "idempotency_key": null
+  },
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "items": [
+      {
+        "attention_count": 0,
+        "current_execution_id": "e-1",
+        "evidence": [],
+        "outcome": null,
+        "phase": "waiting",
+        "version": 1,
+        "work_id": "w-1"
+      }
+    ],
+    "next_cursor": null
+  },
+  "reason": null,
+  "evidence_refs": [],
+  "sources": [
+    {
+      "source": "store",
+      "availability": "known",
+      "observed_unix_seconds": null
+    }
+  ],
+  "as_of": 71
+}

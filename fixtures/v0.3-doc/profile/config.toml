@@ -1,0 +1,59 @@
+schema_version = 1
+
+[capabilities.required]
+discussion = ["comment_read", "comment_write"]
+publication = ["repository_read", "branch_read", "push_ref", "change_request_read", "change_request_create", "change_request_update", "comment_write", "ready"]
+review = ["repository_read", "branch_read", "review_feedback", "inline_comment", "thread_reply", "thread_resolve"]
+
+[hosts.h1]
+adapter = "github"
+contract_version = 1
+endpoint = "https://api.github.com"
+
+[[hosts.h1.repositories]]
+id = "123456789"
+use = "publication"
+
+[identity_evidence.discussion]
+host_instance = "github.com"
+login = "example-publisher"
+observed_unix_seconds = 1795180769
+repository = "123456789"
+
+[identity_evidence.publication]
+host_instance = "github.com"
+login = "example-publisher"
+observed_unix_seconds = 1795180769
+repository = "123456789"
+
+[identity_evidence.review]
+host_instance = "github.com"
+login = "example-reviewer"
+observed_unix_seconds = 1795180769
+repository = "123456789"
+
+[installation]
+capacity_slots = 1
+
+[roles.discussion]
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+host = "h1"
+
+[roles.publication]
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+host = "h1"
+
+[roles.review]
+actor = "example-reviewer"
+credential_ref = "file:/tmp/taisan-v03-doc/secrets/reviewer.token"
+host = "h1"
+
+[verification.egress]
+allowlist = ["crates.io", "static.crates.io"]
+
+[worker]
+argv = ["/Users/shin/src/github.com/shimpeiws/taisan-issue-269/target/debug/workloop-fixture-worker", "clean-exit", "--wire", "v2", "--git-commit", "--claim-head", "HEAD"]
+isolation_profile = "fixture-worker-v0.1"
+max_turns = 200

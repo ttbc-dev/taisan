@@ -1,0 +1,54 @@
+{
+    "schema_version": "1",
+    "kind": "tick_report",
+    "started_unix_seconds": 1795181155,
+    "deadline_unix_seconds": 1795181275,
+    "deadline_exceeded": false,
+    "aborted": false,
+    "phases": [
+        {
+            "phase": "source_refresh",
+            "status": "completed",
+            "processed": 0
+        },
+        {
+            "phase": "dispatch_admission",
+            "status": "completed",
+            "processed": 0
+        },
+        {
+            "phase": "in_flight_supervision",
+            "status": "completed",
+            "processed": 0
+        },
+        {
+            "phase": "host_outbox",
+            "status": "completed",
+            "processed": 0,
+            "reason": "reconciled(applied=0 failed=0 unknown=0) applied=0 failed=0 unknown=0 unsupported=0 credential_blocked=0 skipped=0"
+        },
+        {
+            "phase": "timed_sweep",
+            "status": "completed",
+            "processed": 1,
+            "reason": "stops_recorded=0 terminal_failures=0 completed=0"
+        },
+        {
+            "phase": "recovery_scheduling",
+            "status": "completed",
+            "processed": 0,
+            "reason": "requeued=0 failed_terminal=0 retired=0"
+        },
+        {
+            "phase": "retention_sweep",
+            "status": "skipped",
+            "processed": 0,
+            "reason": "cadence"
+        },
+        {
+            "phase": "attention_derivation",
+            "status": "completed",
+            "processed": 0
+        }
+    ]
+}

@@ -1,0 +1,71 @@
+{
+  "schema_version": "1",
+  "status": "error",
+  "command": null,
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "kind": "check",
+    "probe_operations": [],
+    "remote_writes": 0,
+    "stages": [
+      {
+        "diagnostics": [],
+        "stage": "config_parse",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "identity_tuples",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [
+          {
+            "code": "credential.missing",
+            "key": "roles.discussion.credential_ref",
+            "message": "credential slot env:TAISAN_GH_TOKEN for role 'discussion' is not set — define it before check can pass"
+          },
+          {
+            "code": "credential.missing",
+            "key": "roles.publication.credential_ref",
+            "message": "credential slot env:TAISAN_GH_TOKEN for role 'publication' is not set — define it before check can pass"
+          }
+        ],
+        "stage": "credential_refs",
+        "status": "fail"
+      },
+      {
+        "diagnostics": [],
+        "stage": "paths",
+        "status": "not_run"
+      },
+      {
+        "diagnostics": [],
+        "stage": "worker_runtime",
+        "status": "not_run"
+      },
+      {
+        "diagnostics": [],
+        "stage": "isolation_primitives",
+        "status": "not_run"
+      },
+      {
+        "diagnostics": [],
+        "stage": "store",
+        "status": "not_run"
+      },
+      {
+        "diagnostics": [],
+        "stage": "probe_capabilities",
+        "status": "not_run"
+      }
+    ],
+    "success": false
+  },
+  "reason": {
+    "code": "config",
+    "message": "check failed at credential_refs: credential.missing — credential slot env:TAISAN_GH_TOKEN for role 'discussion' is not set — define it before check can pass"
+  },
+  "evidence_refs": []
+}

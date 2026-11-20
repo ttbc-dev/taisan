@@ -1,0 +1,66 @@
+{
+  "schema_version": "1",
+  "status": "error",
+  "command": null,
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "kind": "check",
+    "probe_operations": [],
+    "remote_writes": 0,
+    "stages": [
+      {
+        "diagnostics": [],
+        "stage": "config_parse",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "identity_tuples",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "credential_refs",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "paths",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [],
+        "stage": "worker_runtime",
+        "status": "pass"
+      },
+      {
+        "diagnostics": [
+          {
+            "code": "runtime.missing",
+            "key": "worker.isolation_profile",
+            "message": "isolation primitive 'bwrap' required by profile 'taisan-reference-v0.1' is not present"
+          }
+        ],
+        "stage": "isolation_primitives",
+        "status": "fail"
+      },
+      {
+        "diagnostics": [],
+        "stage": "store",
+        "status": "not_run"
+      },
+      {
+        "diagnostics": [],
+        "stage": "probe_capabilities",
+        "status": "not_run"
+      }
+    ],
+    "success": false
+  },
+  "reason": {
+    "code": "config",
+    "message": "check failed at isolation_primitives: runtime.missing — isolation primitive 'bwrap' required by profile 'taisan-reference-v0.1' is not present"
+  },
+  "evidence_refs": []
+}

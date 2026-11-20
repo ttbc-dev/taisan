@@ -129,7 +129,7 @@ Validation rules:
 
 ## v0.3 operational profile (target schema revision 2)
 
-Status: design selection in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition). The keys below are additive and are not accepted by the current `schema_version = 1` loader. A dependent implementation may choose a different numeric revision, but it must not reinterpret a v1 profile as an operational v2 profile or silently ignore one of these keys. The v1 example above remains the loadable v1 profile.
+Status: design selection in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition). **Implementation note:** the dependent units landed the operational surface on the *installation record* (`store.config.json`) rather than a TOML `schema_version = 2` profile — `worker_credential_ref`, `worker_provider_config`, `worker_model_api_hosts`, `worker_dispatch`, and the `verification_*` boundary keys are JSON-record fields validated by `Installation::worker_dispatch`/`worker_egress`/`verification_boundary`, and the in-process host driver is selected by the record's `adapter` (`github`/`fixture`; anything else fails closed). The TOML block below remains the design selection for a possible future profile revision; it is not the loadable v0.3 surface. The v1 example above remains the loadable v1 profile.
 
 ```toml
 schema_version = 2

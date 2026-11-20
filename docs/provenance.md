@@ -44,15 +44,24 @@ Concretely:
 - The built-in queue, state store, supervisor, CLI, and TUI are
   implemented in this repository's own Rust workspace. They do not call
   any source system.
-- The GitHub integration ships as a fixture adapter and, behind the
-  same port, a real adapter whose every GitHub call goes through a
-  transport seam exercised by an in-memory double — no live network
-  I/O yet, and a live transport remains future work (see issue #17).
-- The Worker port is exercised by `workloop-fixture-worker`, a real local
-  process with scripted failure modes — not by a source-system worker.
-- The Work Selector port is specified in
-  [adapter boundaries](adapter-boundaries.md) but has no implementation
-  yet; the selector repo is the reference behavior, not a dependency.
+- The GitHub integration ships as a fixture adapter for tests and, as
+  the production path, `GitHubAdapter` composed in-process inside
+  `taisan run` behind the `GhCliApi` transport — every GitHub call goes
+  through the `gh` CLI as a bounded subprocess. Bounded reads are scoped
+  to served hosts and active executions; writes reconcile by read-back
+  before retry. Live-verified behavior against a real repository is
+  still pending owner-run acceptance.
+- The Worker port is exercised by `workloop-fixture-worker` and the
+  independent `workloop-contract-worker`, both real local processes
+  implementing the executable
+  `taisan.worker.declaration/1` / `request/2` / `report/2` wire — not
+  by a source-system worker. A real conforming Worker is owner-supplied
+  and validated by the owner-run checklist.
+- The Work Selector port has a reference implementation
+  (`workloop-selector`, shipped as the `public-issue-selector`
+  binary), a fixture selector, and the intake scheduler's
+  configuration-selected argv binding; the selector repo remains the
+  reference behavior, not a dependency.
 
 ## Implementation status
 
@@ -81,14 +90,27 @@ integrations.
   v0.1; these tests do not prove CLI-backed skill delivery or resolve the
   same-head finding-growth gap tracked in issue #24.
 - `workloop-config` — installation config: actor identity, worker argv,
-  capacity, workspace root, and allowed effects.
+  capacity, workspace root, allowed effects, the v0.3 Worker
+  credential/egress keys, and the `worker_dispatch` v2 profile.
+- `workloop-selector` — the reference Work Selector (pure proposal
+  function) shipped as the `public-issue-selector` binary.
+- `workloop-intake` — the internal intake scheduler (settings tick,
+  interval grid, durable runs) driven by `taisan run`.
+- `workloop-contract-worker` — an independent implementation of the
+  executable Worker wire that shares no response construction with
+  `workloop-core`; the unchanged conformance suite runs against it and
+  the fixture worker.
 
 **Fixtures:**
 
-- `workloop-github` — fixture GitHub adapter only; records `PrActionIntent`
-  outbox rows and emits synthetic Observations. No network I/O.
-- `workloop-fixture-worker` — a real local process with argv-driven failure
-  modes, used by contract tests and runnable installations.
+- `workloop-github` fixture adapter — records action intents and emits
+  synthetic Observations for contract tests; the production
+  `GitHubAdapter`/`GhCliApi` path is separate.
+- `workloop-fixture-worker` — a real local process with argv-driven
+  failure modes and the v2 wire, used by contract tests and runnable
+  non-live installations.
+- `workloop-fixture-selector` — deterministic selector fixture for
+  intake contract tests.
 
 **Required agent interface work:**
 
@@ -99,16 +121,20 @@ integrations.
 - The existing TUI is retained but is not an initial-release requirement.
   An MCP server is optional future work.
 
-**Missing integrations:**
+**Missing integrations and open gaps:**
 
-- A live GitHub transport for the real adapter — the adapter and its
-  contract tests exist behind an in-memory transport double; no HTTPS
-  client or live GitHub call yet (tracked by issue #17).
-- A real Worker adapter — e.g. the Claude Code CLI reference worker; the
-  port is exercised only by the fixture worker and arbitrary `worker_argv`
-  processes.
-- A Work Selector implementation (selector adapter or reference
-  selector); the port is specified but unimplemented.
+- Owner-run live acceptance of the real Worker path and the production
+  GitHub driver — the [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
+  defines the scenarios; no live evidence exists yet.
+- A `CapabilityReport` producer for the in-process host driver: publish
+  intents require capability evidence no current `taisan run`
+  composition emits, so Works park at the host-effect boundary
+  (tracked by issue #355).
+- `check --probe` has no wired adapter probe backend; the stage fails
+  closed `capability.unknown` by design.
+- A real, owner-supplied conforming Worker implementation — the wire
+  and conformance suite exist; the production Worker is not in this
+  repository.
 - GitHub comment command adapter and Projects projection.
 - CI pipeline (tracked by issue #28) and the end-to-end v0.1 validation
   against a real GitHub repository.
