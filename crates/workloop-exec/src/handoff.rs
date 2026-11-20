@@ -15,6 +15,7 @@ use workloop_core::domain::*;
 use workloop_core::ports::{ProcessControlPort, WorkerEnv};
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::IsolationProfile;
+use workloop_core::worker_v2::WorkerRequestV2;
 
 use crate::containment::{self, Gate, MountPlan};
 use crate::egress::ConnectProxy;
@@ -250,6 +251,7 @@ pub fn drive(
     artifact_id: &str,
     seed: &HandoffSeed,
     max_attempts: u32,
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<ArtifactHandoff, HandoffError> {
     let existing = store.transact(|tx| tx.artifact_handoff(artifact_id))?;
     let mut handoff = match existing {
@@ -299,7 +301,7 @@ pub fn drive(
         return Err(e);
     }
     if handoff.state == HandoffState::Acknowledged {
-        run_verifications(store, layout, &handoff, seed)?;
+        run_verifications(store, layout, &handoff, seed, clock)?;
     }
     Ok(handoff)
 }
@@ -313,6 +315,7 @@ fn run_verifications(
     layout: &HandoffLayout,
     handoff: &ArtifactHandoff,
     seed: &HandoffSeed,
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<(), HandoffError> {
     if seed.verification_argv.is_empty() {
         return Ok(());
@@ -352,6 +355,7 @@ fn run_verifications(
             argv,
             &scratch,
             &seed.verification_egress_hosts,
+            clock,
         )?;
     }
     Ok(())
@@ -1199,6 +1203,7 @@ fn run_verification_contained(
 /// `declared_egress_hosts` is the request's immutable
 /// `verification_egress_hosts` — the Work-declared half of the §14.5
 /// effective egress set.
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     store: &impl Store,
     layout: &HandoffLayout,
@@ -1207,8 +1212,9 @@ pub fn verify(
     argv: &[String],
     scratch: &Path,
     declared_egress_hosts: &[String],
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<VerificationResult, HandoffError> {
-    let (timeout, output_cap) = verification_bounds(store, artifact_id)?;
+    let (timeout, output_cap) = verification_bounds(store, artifact_id, clock())?;
     verify_with_timeout(
         store,
         layout,
@@ -1228,25 +1234,47 @@ pub fn verify(
 /// recorded 300 s / 64 KiB values. Selection reads durable state
 /// only — the handoff row's own request id decides, so a later
 /// configuration change cannot silently re-bound an in-flight
-/// artifact.
-fn verification_bounds(
+/// artifact. §14.5 bounds the profile timeout by the Execution
+/// deadline: the immutable wire `deadline_unix_seconds` clamps it,
+/// so one command can never overrun the budget the request granted.
+#[doc(hidden)]
+pub fn verification_bounds(
     store: &impl Store,
     artifact_id: &str,
+    now_unix_seconds: i64,
 ) -> Result<(Duration, u64), HandoffError> {
-    let v2 = store.transact(|tx| {
+    let (v2, deadline) = store.transact(|tx| {
         Ok(match tx.artifact_handoff(artifact_id)? {
-            Some(handoff) => matches!(
-                tx.worker_request_body(&handoff.request_id)?,
-                Some(body) if body.verifies()
-            ),
-            None => false,
+            Some(handoff) => match tx.worker_request_body(&handoff.request_id)? {
+                Some(body) if body.verifies() => {
+                    let req = WorkerRequestV2::parse(&body.canonical_body).map_err(|e| {
+                        StoreError::Internal {
+                            detail: format!("worker request body unreadable: {e}"),
+                        }
+                    })?;
+                    (true, Some(req.budget.deadline_unix_seconds))
+                }
+                _ => (false, None),
+            },
+            None => (false, None),
         })
     })?;
-    Ok(if v2 {
+    let (timeout, output_cap) = if v2 {
         (VERIFICATION_TIMEOUT_V2, VERIFICATION_OUTPUT_V2)
     } else {
         (VERIFICATION_TIMEOUT_V1, VERIFICATION_OUTPUT_V1)
-    })
+    };
+    let timeout = match deadline {
+        // A deadline that already passed bounds the run to zero: the
+        // command times out immediately and records `Inconclusive`,
+        // the same honest evidence a spent timeout reports.
+        Some(deadline) => {
+            let remaining = deadline.saturating_sub(now_unix_seconds).max(0) as u64;
+            timeout.min(Duration::from_secs(remaining))
+        }
+        None => timeout,
+    };
+    Ok((timeout, output_cap))
 }
 
 #[doc(hidden)]

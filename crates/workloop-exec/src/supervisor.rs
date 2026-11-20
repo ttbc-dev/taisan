@@ -1185,7 +1185,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,
