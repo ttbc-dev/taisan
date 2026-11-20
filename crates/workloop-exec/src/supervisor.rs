@@ -21,7 +21,7 @@ use workloop_core::ports::{
     ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
     StopReceipt, WorkerEnv,
 };
-use workloop_core::store::{Effect, Store, StoreError};
+use workloop_core::store::{Effect, Store, StoreError, TxView};
 use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
     default_isolation_profile, export_request_id,
@@ -181,6 +181,33 @@ fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
         return false;
     };
     std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
+}
+
+/// Every process identity the store already accounts for — leaders,
+/// descendant snapshots, and stop-intent proofs across all nonterminal
+/// executions — so a recorded writer is never re-bound as an
+/// unidentified launch's orphan. Called inside the caller's
+/// transaction: the bind commit re-verifies against the same snapshot
+/// it writes, so a concurrent resolution cannot double-bind one
+/// process to two invocations.
+fn recorded_process_identities(tx: &dyn TxView) -> Result<HashSet<(i32, String)>, StoreError> {
+    let mut set = HashSet::new();
+    for exec in tx.nonterminal_executions()? {
+        for inv in tx.invocations_for_execution(&exec.id)? {
+            if let Some(id) = &inv.process_identity {
+                set.insert((id.pid, id.started_at.clone()));
+            }
+            for d in &inv.descendants {
+                set.insert((d.pid, d.started_at.clone()));
+            }
+            if let Some(intent) = tx.stop_intent(&inv.id)? {
+                for id in &intent.identities {
+                    set.insert((id.pid, id.started_at.clone()));
+                }
+            }
+        }
+    }
+    Ok(set)
 }
 
 /// The exit status of `pid` without consuming it: `waitid` with
@@ -1779,25 +1806,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // leaders, descendant snapshots, and stop-intent proofs across
         // all nonterminal executions — so a recorded writer is never
         // re-bound as this launch's orphan.
-        let recorded: HashSet<(i32, String)> = store.transact(|tx| {
-            let mut set = HashSet::new();
-            for exec in tx.nonterminal_executions()? {
-                for inv in tx.invocations_for_execution(&exec.id)? {
-                    if let Some(id) = &inv.process_identity {
-                        set.insert((id.pid, id.started_at.clone()));
-                    }
-                    for d in &inv.descendants {
-                        set.insert((d.pid, d.started_at.clone()));
-                    }
-                    if let Some(intent) = tx.stop_intent(&inv.id)? {
-                        for id in &intent.identities {
-                            set.insert((id.pid, id.started_at.clone()));
-                        }
-                    }
-                }
-            }
-            Ok(set)
-        })?;
+        let recorded = store.transact(|tx| recorded_process_identities(tx))?;
         // The bound argv is the recorded selection — the launch
         // signature an unrecorded writer can still be found by. A
         // request with no recorded binding has no signature to search:
@@ -1860,6 +1869,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let bound_identity =
                     format!("{}@{}", child.identity.pid, child.identity.started_at);
                 match store.transact(|tx| {
+                    // Re-verify inside the commit: a concurrent
+                    // resolution of another unidentified launch may
+                    // have bound this same orphan since the scan — the
+                    // snapshot the bind writes against is the one that
+                    // must still show it unrecorded.
+                    if recorded_process_identities(tx)?
+                        .contains(&(child.identity.pid, child.identity.started_at.clone()))
+                    {
+                        return Ok(None);
+                    }
                     let mut next = invocation.clone();
                     next.state = InvocationState::Running;
                     next.process_identity = Some(child.identity.clone());
@@ -1872,9 +1891,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         request_id: bound_request_id,
                         process_identity: bound_identity.clone(),
                     })?;
-                    Ok(())
+                    Ok(Some(()))
                 }) {
-                    Ok(()) => self.report(
+                    Ok(Some(())) => self.report(
                         store,
                         request,
                         ObservationFact::ProcessState {
@@ -1885,10 +1904,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         },
                         now_unix_seconds,
                     ),
-                    // The world moved under the read (e.g. a stop
-                    // settled first): the next pass re-evaluates from
-                    // the committed state — never force the bind.
-                    Err(StoreError::ConstraintConflict { .. }) => Ok(()),
+                    // The orphan was bound by a concurrent resolution
+                    // since the scan, or the world moved under the
+                    // read (e.g. a stop settled first): the next pass
+                    // re-evaluates from the committed state — never
+                    // force the bind.
+                    Ok(None) | Err(StoreError::ConstraintConflict { .. }) => Ok(()),
                     Err(e) => Err(ExecError::Store(e)),
                 }
             }
