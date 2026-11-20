@@ -41,6 +41,14 @@ struct Args {
     report_mode: Option<String>,
     /// Test-only runtime.log size pad for truncation scenarios.
     log_bytes: Option<u64>,
+    /// Test-only: commit the workspace's dirty state on the managed
+    /// branch before writing the report, so `claimed_head` can name
+    /// the produced commit. v2 `run` transport only.
+    git_commit: bool,
+    /// Test-only `claimed_head` value: a git revision resolved in the
+    /// workspace at report time (`HEAD` names the commit
+    /// `--git-commit` just made), or a literal string claim.
+    claim_head: Option<String>,
 }
 
 fn parse() -> Args {
@@ -55,6 +63,8 @@ fn parse() -> Args {
     let mut out = None;
     let mut report_mode = None;
     let mut log_bytes = None;
+    let mut git_commit = false;
+    let mut claim_head = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -79,6 +89,8 @@ fn parse() -> Args {
             "--log-bytes" => {
                 log_bytes = it.next().and_then(|v| v.parse().ok());
             }
+            "--git-commit" => git_commit = true,
+            "--claim-head" => claim_head = it.next(),
             other => positionals.push(other.to_string()),
         }
     }
@@ -110,6 +122,8 @@ fn parse() -> Args {
         out,
         report_mode,
         log_bytes,
+        git_commit,
+        claim_head,
     }
 }
 
@@ -185,11 +199,74 @@ fn declare(args: &Args) {
     );
 }
 
+/// Resolve `rev` inside the workspace to a commit id — `HEAD`,
+/// `HEAD^`, a branch, or an already-literal sha all normalize to the
+/// object id git reports. `None` outside a repository or for a rev
+/// git cannot resolve.
+fn git_rev_parse(ws: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(ws)
+        .args(["rev-parse", "--verify", rev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Stage everything and commit on the managed branch — the produced
+/// commit a real Worker leaves for handoff. A no-op outside a git
+/// worktree; inside one a failed add/commit is a worker-side failure.
+fn git_commit_produced(ws: &Path) {
+    let is_repo = Command::new("git")
+        .arg("-C")
+        .arg(ws)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !is_repo {
+        return;
+    }
+    for argv in [
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.email=fixture@localhost",
+            "-c",
+            "user.name=fixture-worker",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "worker produced",
+        ],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(ws)
+            .args(&argv)
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("git {argv:?} failed to spawn: {e}");
+                std::process::exit(1);
+            });
+        if !status.success() {
+            eprintln!("git {argv:?} failed: {status}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The v2 `run --request <path> --out <dir>` transport: read the
-/// immutable request file, write `report.json`/`runtime.log` into the
-/// Invocation-owned out dir, then apply the base mode's workspace
-/// behavior. An unreadable or non-JSON request is a worker-side
-/// failure — exit non-zero, never a silent pass.
+/// immutable request file, apply the base mode's workspace behavior
+/// (plus the optional produced commit), then write
+/// `report.json`/`runtime.log` into the Invocation-owned out dir —
+/// the report is written after the workspace effect so
+/// `--claim-head HEAD` names the commit the Worker just made. An
+/// unreadable or non-JSON request is a worker-side failure — exit
+/// non-zero, never a silent pass.
 fn run_request(args: &Args, ws: &Path) {
     let request_path = args.request.clone().unwrap_or_else(|| {
         eprintln!("run requires --request");
@@ -209,6 +286,32 @@ fn run_request(args: &Args, ws: &Path) {
     });
     let out = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&out).expect("create out dir");
+    // The base mode's workspace behavior applies first: `clean-exit`
+    // produces the artifact, `exit-no-artifact` does not, `hang`
+    // leaves the tree untouched and keeps the process alive — its
+    // report is still written below before the loop, exactly as the
+    // stop-path tests require.
+    let behavior = if args.mode == "run" {
+        "clean-exit"
+    } else {
+        args.mode.as_str()
+    };
+    match behavior {
+        "clean-exit" => {
+            write_artifact(
+                &ws.join(&args.file),
+                "{\"status\":\"done\",\"worker\":\"fixture\"}\n",
+            );
+        }
+        "exit-no-artifact" | "hang" => {}
+        other => {
+            eprintln!("unknown run behavior {other}\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+    if args.git_commit {
+        git_commit_produced(ws);
+    }
     let log_path = out.join("runtime.log");
     let mut log_content = format!("fixture worker run {request_path}\n");
     if let Some(target) = args.log_bytes {
@@ -260,6 +363,15 @@ fn run_request(args: &Args, ws: &Path) {
                 "wrong_identity" => ("success", "completed"),
                 _ => ("success", "completed"),
             };
+            // `claimed_head` resolves at report time — after the
+            // optional produced commit — so `HEAD` names exactly what
+            // handoff will export. An unresolvable revision stays a
+            // literal claim, which is how disagreement scenarios are
+            // spelled.
+            let claimed_head = args
+                .claim_head
+                .as_deref()
+                .map(|claim| git_rev_parse(ws, claim).unwrap_or_else(|| claim.to_string()));
             let mut report = serde_json::json!({
                 "format_version": "taisan.worker.report/2",
                 "request_id": request.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -268,7 +380,7 @@ fn run_request(args: &Args, ws: &Path) {
                 "role": request.get("role").cloned().unwrap_or(serde_json::Value::Null),
                 "status": status,
                 "reason": {"code": reason_code},
-                "claimed_head": null,
+                "claimed_head": claimed_head,
                 "claimed_checks": [],
                 "findings": [],
                 "invariant_items": [],
@@ -308,28 +420,11 @@ fn run_request(args: &Args, ws: &Path) {
                 .expect("write report.json");
         }
     }
-    // The base mode's workspace behavior still applies: `clean-exit`
-    // produces the artifact, `exit-no-artifact` does not, `hang` keeps
-    // the process alive for the stop paths.
-    let behavior = if args.mode == "run" {
-        "clean-exit"
-    } else {
-        args.mode.as_str()
-    };
-    match behavior {
-        "clean-exit" => {
-            write_artifact(
-                &ws.join(&args.file),
-                "{\"status\":\"done\",\"worker\":\"fixture\"}\n",
-            );
-        }
-        "exit-no-artifact" => {}
-        "hang" => loop {
+    // `hang` is the only behavior left: the report is already on disk
+    // — the stop paths collect it after the proven stop.
+    if behavior == "hang" {
+        loop {
             std::thread::sleep(Duration::from_secs(3600));
-        },
-        other => {
-            eprintln!("unknown run behavior {other}\n{USAGE}");
-            std::process::exit(2);
         }
     }
 }

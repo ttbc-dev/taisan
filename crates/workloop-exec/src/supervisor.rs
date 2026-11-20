@@ -26,10 +26,12 @@ use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
     default_isolation_profile, export_request_id,
 };
-use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
+use workloop_core::worker_v2::{
+    DispatchRefusal, ReportClassification, WorkerReportV2, WorkerRequestV2,
+};
 
 use crate::adapter;
-use crate::bodies::BodyStore;
+use crate::bodies::{BodyError, BodyStore};
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -1316,8 +1318,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// after confirmed exit and stop proof — the point at which a
     /// finished Invocation becomes `Done`.
     pub fn drive_handoffs(&self, store: &impl Store) -> Result<(), ExecError> {
-        // The clock is never consulted: no deadline is set.
-        self.drive_handoffs_scoped(store, None, &mut || 0, None)
+        // No deadline is set, so the clock serves only observation
+        // timestamps — wall time is the honest source here; scoped
+        // passes keep their injected clock.
+        self.drive_handoffs_scoped(
+            store,
+            None,
+            &mut || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            },
+            None,
+        )
     }
 
     /// `drive_handoffs` restricted to one Work for a diagnostic `--work`
@@ -1408,8 +1422,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
-                Ok(_) | Err(crate::handoff::HandoffError::Transport(_)) => {}
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
+                Ok(handoff_row) => {
+                    self.record_claim_check(
+                        store,
+                        &seed.invocation,
+                        &artifact_id,
+                        &handoff_row,
+                        clock(),
+                    )?;
+                }
+                Err(crate::handoff::HandoffError::Transport(_)) => {}
                 Err(crate::handoff::HandoffError::Store(e)) => {
                     return Err(ExecError::Store(e));
                 }
@@ -1437,42 +1460,66 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
                 return Ok(None);
             };
-            // The Work-declared verification egress hosts live in the
-            // immutable v2 request body; a v1 dispatch or an absent
-            // body declares none. An unverifiable body is corrupt
-            // durable state — the parse failure is a fault, never a
-            // silently empty grant.
-            let verification_egress_hosts = match tx.worker_request_body(&invocation.request_id)? {
-                Some(body) if body.verifies() => serde_json::from_slice::<
-                    workloop_core::worker_v2::WorkerRequestV2,
-                >(&body.canonical_body)
-                .map(|req| req.required_capabilities.verification_egress_hosts)
-                .map_err(|e| StoreError::Internal {
-                    detail: format!("worker request body unreadable: {e}"),
-                })?,
-                _ => Vec::new(),
-            };
+            // The Work-declared verification egress hosts and the
+            // workspace fork point live in the immutable v2 request
+            // body; a v1 dispatch or an absent body declares neither.
+            // An unverifiable body is corrupt durable state — the
+            // parse failure is a fault, never a silently empty grant
+            // or an unpinned base.
+            let (verification_egress_hosts, pinned_base) =
+                match tx.worker_request_body(&invocation.request_id)? {
+                    Some(body) if body.verifies() => {
+                        let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
+                            .map_err(|e| StoreError::Internal {
+                            detail: format!("worker request body unreadable: {e}"),
+                        })?;
+                        (
+                            req.required_capabilities.verification_egress_hosts,
+                            req.base.object,
+                        )
+                    }
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (Vec::new(), String::new()),
+                };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
                 spec.payload.verification_argv.clone(),
                 verification_egress_hosts,
+                pinned_base,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
-        let Some((invocation, work_id, verification_argv, verification_egress_hosts, bound)) =
-            found
+        let Some((
+            invocation,
+            work_id,
+            verification_argv,
+            verification_egress_hosts,
+            pinned_base,
+            bound,
+        )) = found
         else {
             return Ok(None);
         };
-        // The handoff base is derived inside the bounded export stage
-        // (the managed branch's fork point against the workspace's
-        // non-work local branch) — never from
-        // `SourceSnapshot.source_revision`, a host issue-version token,
-        // and never here, where a derivation failure would abort the
-        // sweep instead of converging on `recovery_exhausted`.
+        // A v2 dispatch pins the fork point its immutable request
+        // recorded — the stale-base, nothing-produced, and manifest
+        // bounds then read durable state, never a ref the Worker
+        // could rewrite inside its own workspace. Only a v1 dispatch
+        // leaves `base` empty, and the managed branch's fork point is
+        // then derived inside the bounded export stage (never from
+        // `SourceSnapshot.source_revision`, a host issue-version
+        // token, and never here, where a derivation failure would
+        // abort the sweep instead of converging on
+        // `recovery_exhausted`).
         let branch = format!("work/{}", work_id.0);
-        let base = String::new();
+        let base = pinned_base;
         Ok(Some((
             crate::handoff::HandoffSeed {
                 invocation,
@@ -1484,6 +1531,120 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             bound,
         )))
+    }
+
+    /// Compare the retained `claimed_head` of an acknowledged
+    /// artifact's Worker report against the commit the handoff
+    /// actually promoted, and record the verdict as evidence
+    /// (`docs/v0.3.md` §6.3). Runs after `handoff::drive` returns, so
+    /// `produced` is durable. A report classified `invalid` or
+    /// `absent` — or carrying no claim — records nothing: claims are
+    /// evidence for later gates, never authority over the artifact,
+    /// and a `false` verdict never moves or replaces it.
+    fn record_claim_check(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        artifact_id: &str,
+        handoff: &ArtifactHandoff,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        if handoff.state != HandoffState::Acknowledged {
+            return Ok(());
+        }
+        let Some(produced) = handoff.produced.clone() else {
+            return Ok(());
+        };
+        let observations =
+            store.transact(|tx| tx.observations_for_execution(&invocation.execution_id))?;
+        // A verdict for this exact produced commit is already durable:
+        // the acknowledged row is re-seeded every pass while its
+        // Execution stays nonterminal, and re-resolving the evidence
+        // to repeat a recorded verdict buys nothing — and makes a
+        // later CAS reclamation fault the whole handoff sweep.
+        if observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ClaimedHeadCheck {
+                    invocation_id,
+                    artifact_id: a,
+                    produced: p,
+                    ..
+                } if invocation_id == &invocation.id && a == artifact_id && p == &produced
+            )
+        }) {
+            return Ok(());
+        }
+        let report_fact = observations
+            .into_iter()
+            .find(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::WorkerReport { invocation_id, .. }
+                        if invocation_id == &invocation.id
+                )
+            })
+            .map(|o| o.fact);
+        let Some(ObservationFact::WorkerReport {
+            classification,
+            report: Some(report_evidence),
+            ..
+        }) = report_fact
+        else {
+            return Ok(());
+        };
+        // Only a validated envelope's claim is read — `invalid`
+        // retains raw bytes but never a trusted claim, and `absent`
+        // has none.
+        if matches!(
+            classification,
+            ReportClassification::Invalid { .. } | ReportClassification::Absent
+        ) {
+            return Ok(());
+        }
+        let Some(bodies) = self
+            .body_store
+            .as_ref()
+            .or(self.v2.as_ref().map(|d| &d.bodies))
+        else {
+            // Report evidence exists but its CAS root is unconfigured —
+            // the same fault `report_v2::collect` refuses to paper over.
+            return Err(ExecError::Fault(
+                "worker report claim check requires the CAS body store".into(),
+            ));
+        };
+        let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+            Ok(Some(resolved)) => resolved,
+            // The verdict is advisory evidence for later gates, never
+            // authority over the artifact: a body the retention sweep
+            // already reclaimed — or that never catalogued — records
+            // no verdict, never a pass-aborting fault.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(()),
+            Err(e) => {
+                return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+            }
+        };
+        let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
+            .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
+        let Some(claimed) = report.claimed_head else {
+            return Ok(());
+        };
+        let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
+            return Ok(());
+        };
+        let agrees = claimed == produced;
+        self.report(
+            store,
+            &request,
+            ObservationFact::ClaimedHeadCheck {
+                invocation_id: invocation.id.clone(),
+                artifact_id: artifact_id.to_string(),
+                claimed,
+                produced,
+                agrees,
+            },
+            now_unix_seconds,
+        )
     }
 
     /// Replay the durable request log: for each unconsumed request either
