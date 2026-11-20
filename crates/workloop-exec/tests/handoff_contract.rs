@@ -1676,6 +1676,7 @@ fn contained_verification_never_binds_a_path_the_submission_argv_names() {
         &argv,
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
