@@ -2963,7 +2963,8 @@ fn a_v2_coding_invocation_hands_off_the_produced_commit() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -3000,7 +3001,8 @@ fn a_v2_coding_invocation_hands_off_the_produced_commit() {
         "the produced commit is in the promoted object set: {changes}"
     );
     assert!(workloop_exec::handoff::reclaimable(&lay, &row));
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let again = handoff_row(&store, &inv.id);
     assert_eq!(again.produced, Some(produced));
     assert_eq!(again.state, HandoffState::Acknowledged);
@@ -3025,7 +3027,8 @@ fn a_claimed_head_matching_the_produced_commit_records_agreement() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let facts = claim_facts(&store, &e);
     assert_eq!(facts.len(), 1, "one verdict fact: {facts:?}");
@@ -3066,7 +3069,8 @@ fn a_claimed_head_disagreeing_with_produced_is_retained_never_adopted() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -3218,7 +3222,8 @@ fn a_produced_commit_not_descending_from_the_pinned_base_is_invalid() {
         ],
     );
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
     assert_eq!(row.state, HandoffState::Invalid, "{row:?}");
@@ -3261,7 +3266,8 @@ fn an_unresolvable_produced_commit_fails_closed_never_promotes() {
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     for _ in 0..8 {
-        sup.drive_handoffs(&store).unwrap();
+        sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+            .unwrap();
         if handoff_row(&store, &inv.id).state == HandoffState::Invalid {
             break;
         }
@@ -3327,7 +3333,8 @@ fn an_interrupted_v2_handoff_resumes_from_its_durable_stage() {
         })
         .unwrap();
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let row = handoff_row(&store, &inv.id);
     assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
     let ws = managed_workspace(&root, &w);
@@ -3357,7 +3364,8 @@ fn a_post_acknowledgement_workspace_mutation_cannot_move_the_artifact() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -3383,7 +3391,8 @@ fn a_post_acknowledgement_workspace_mutation_cannot_move_the_artifact() {
     let moved = git(&ws, &["rev-parse", &format!("work/{}", w.0)]);
     assert_ne!(moved, produced, "the branch really moved");
 
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
     let again = handoff_row(&store, &inv.id);
     assert_eq!(again.state, HandoffState::Acknowledged);
     assert_eq!(again.produced.as_deref(), Some(produced.as_str()));
@@ -3435,7 +3444,8 @@ fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
     );
     sup.consume_requests(&store, NOW).unwrap();
     drive_to_done(&sup, &store, &rid);
-    sup.drive_handoffs(&store).unwrap();
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
 
     let inv = invocation_for(&store, &rid).expect("invocation recorded");
     let row = handoff_row(&store, &inv.id);
@@ -4217,4 +4227,50 @@ fn assessment_facts_bind_identically_with_lanes_disabled() {
         .unwrap();
     assert!(!spec.payload.lanes.invariant_check);
     assert!(!spec.payload.lanes.code_review);
+}
+
+/// §14.5 bounds the 30 min verification profile by the Execution
+/// deadline: the immutable wire `deadline_unix_seconds` clamps the
+/// per-command timeout, so a command can never outlive the budget the
+/// request granted. A spent deadline bounds the run to zero — the
+/// command times out immediately and records `Inconclusive`, the same
+/// evidence a real timeout reports, never a pass.
+#[test]
+fn v2_verification_timeout_is_bounded_by_the_execution_deadline() {
+    let root = tmp_root("verify-v2-deadline");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let argv: Vec<Vec<String>> = vec![vec!["sh".into(), "-c".into(), "true".into()]];
+    let (_w, _e, rid) = admit_ex(&store, "v2-verify-deadline", vec![], argv);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid).canonical_body).unwrap();
+    let deadline = wire.budget.deadline_unix_seconds;
+
+    let bounds = |now| {
+        workloop_exec::handoff::verification_bounds(&store, &row.artifact_id, now)
+            .unwrap()
+            .0
+    };
+    // The request's whole budget remains: the full 30 min profile.
+    assert_eq!(bounds(NOW), Duration::from_secs(30 * 60));
+    // One second remains: the deadline clamps below the profile.
+    assert_eq!(bounds(deadline - 1), Duration::from_secs(1));
+    // The deadline is spent: no command may run at all.
+    assert_eq!(bounds(deadline), Duration::ZERO);
+    assert_eq!(bounds(deadline + 600), Duration::ZERO);
 }

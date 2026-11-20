@@ -1426,7 +1426,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,
@@ -1550,7 +1550,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             req.base.object,
                         )
                     }
-                    _ => (Vec::new(), String::new()),
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (Vec::new(), String::new()),
                 };
             Ok(Some((
                 invocation.clone(),
@@ -1621,20 +1629,36 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let Some(produced) = handoff.produced.clone() else {
             return Ok(());
         };
-        let report_fact = store.transact(|tx| {
-            Ok::<_, StoreError>(
-                tx.observations_for_execution(&invocation.execution_id)?
-                    .into_iter()
-                    .find(|o| {
-                        matches!(
-                            &o.fact,
-                            ObservationFact::WorkerReport { invocation_id, .. }
-                                if invocation_id == &invocation.id
-                        )
-                    })
-                    .map(|o| o.fact),
+        let observations =
+            store.transact(|tx| tx.observations_for_execution(&invocation.execution_id))?;
+        // A verdict for this exact produced commit is already durable:
+        // the acknowledged row is re-seeded every pass while its
+        // Execution stays nonterminal, and re-resolving the evidence
+        // to repeat a recorded verdict buys nothing — and makes a
+        // later CAS reclamation fault the whole handoff sweep.
+        if observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ClaimedHeadCheck {
+                    invocation_id,
+                    artifact_id: a,
+                    produced: p,
+                    ..
+                } if invocation_id == &invocation.id && a == artifact_id && p == &produced
             )
-        })?;
+        }) {
+            return Ok(());
+        }
+        let report_fact = observations
+            .into_iter()
+            .find(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::WorkerReport { invocation_id, .. }
+                        if invocation_id == &invocation.id
+                )
+            })
+            .map(|o| o.fact);
         let Some(ObservationFact::WorkerReport {
             classification,
             report: Some(report_evidence),
@@ -1676,9 +1700,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
             ));
         };
         let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
-            // Retention may have reclaimed the body since the report
-            // was recorded — unavailable evidence records no verdict,
-            // but the acknowledgement still re-drives publication.
+            Ok(Some(resolved)) => resolved,
+            // The verdict is advisory evidence for later gates, never
+            // authority over the artifact: a body the retention sweep
+            // already reclaimed — or that never catalogued — records
+            // no verdict and never a pass-aborting fault, but the
+            // acknowledgement still re-drives publication.
             Ok(None) | Err(BodyError::Unavailable { .. }) => {
                 return self.report_handoff_acknowledged(
                     store,
@@ -1691,7 +1718,6 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Err(e) => {
                 return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
             }
-            Ok(Some(resolved)) => resolved,
         };
         let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
             .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
