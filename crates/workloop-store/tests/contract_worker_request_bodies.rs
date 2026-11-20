@@ -131,32 +131,90 @@ fn seeded_request(store: &SqliteStore, key: &str) -> String {
     request_id
 }
 
-fn body(request_id: &str, goal: &str) -> WorkerRequestBody {
-    let canonical = format!(
-        "{{\"format_version\":\"taisan.worker.request/2\",\"goal\":\"{goal}\",\"request_id\":\"{request_id}\"}}"
-    );
-    // The recorded digest is the real `request_v2_digest` over the
-    // stored body minus `request_digest` — the read path re-verifies
-    // it, so fixture bodies must carry a genuine digest. The embedded
-    // member carries that same digest: it is excluded from its own
-    // hash, so the read gate re-checks it explicitly.
-    let mut value: serde_json::Value = serde_json::from_slice(canonical.as_bytes()).unwrap();
-    if let Some(map) = value.as_object_mut() {
-        map.remove("request_digest");
-    }
+/// Seal a raw request value into the durable row shape: recompute the
+/// self-referential `request_digest` member and the recorded
+/// `body_digest` over the canonical bytes minus that member. This is
+/// deliberately usable with an incomplete envelope so tests can prove
+/// the store validates more than a self-consistent digest.
+fn seal(request_id: &str, mut value: serde_json::Value) -> WorkerRequestBody {
+    value.as_object_mut().unwrap().remove("request_digest");
     let digest = workloop_core::worker_v2::request_v2_digest(&canonical_json(&value));
-    if let Some(map) = value.as_object_mut() {
-        map.insert(
-            "request_digest".into(),
-            serde_json::Value::String(digest.clone()),
-        );
-    }
+    value.as_object_mut().unwrap().insert(
+        "request_digest".into(),
+        serde_json::Value::String(digest.clone()),
+    );
     WorkerRequestBody {
         request_id: request_id.into(),
         format_version: "taisan.worker.request/2".into(),
         canonical_body: canonical_json(&value),
         body_digest: digest,
     }
+}
+
+/// A complete, valid `taisan.worker.request/2` body — every required
+/// envelope member, a coding task, and a genuine digest. The store
+/// contract requires the whole executable request, not a digest-shaped
+/// fragment.
+fn body(request_id: &str, goal: &str) -> WorkerRequestBody {
+    let value = serde_json::json!({
+        "format_version": "taisan.worker.request/2",
+        "request_id": request_id,
+        "invocation_id": format!("inv-{request_id}"),
+        "store_id": "store-1",
+        "work_id": "work-1",
+        "execution_id": "execution-1",
+        "role": "coding",
+        "repository": {"host": "test-host", "repository": "local-repo"},
+        "base": {
+            "repository": {"host": "test-host", "repository": "local-repo"},
+            "object": "0".repeat(40),
+        },
+        "spec": {"revision": 1, "digest": "a".repeat(64)},
+        "workspace": {
+            "workspace_id": "ws-1",
+            "mount": "/workspace",
+            "read_only": false,
+        },
+        "budget": {
+            "deadline_unix_seconds": NOW + 3600,
+            "max_runtime_seconds": 1800,
+            "max_turns": 200,
+            "max_report_bytes": 1_048_576,
+            "max_log_bytes": 33_554_432,
+            "max_verification_commands": 8,
+            "max_continuation_refs": 4,
+        },
+        "required_capabilities": {
+            "role": "coding",
+            "protocol_versions": ["taisan.worker.request/2"],
+            "capabilities": [],
+            "resume": "unsupported",
+            "verification_egress_hosts": [],
+        },
+        "continuation": [],
+        "task": {
+            "kind": "coding",
+            "goal": {
+                "ref": format!("goal-{request_id}"),
+                "media_type": "text/markdown",
+                "bytes": goal.len() as u64,
+                "digest": "b".repeat(64),
+            },
+            "issues": [],
+            "constraints": [goal],
+            "verification_argv": [],
+        },
+    });
+    seal(request_id, value)
+}
+
+/// Start from a complete body and mutate it, then reseal the digest so
+/// only the intended envelope rule can refuse the result.
+fn reshaped(request_id: &str, mutate: impl FnOnce(&mut serde_json::Value)) -> WorkerRequestBody {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&body(request_id, "goal").canonical_body).unwrap();
+    mutate(&mut value);
+    seal(request_id, value)
 }
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
@@ -339,6 +397,56 @@ fn a_mismatched_request_digest_member_is_refused() {
     let mut value: serde_json::Value = serde_json::from_slice(&bad.canonical_body).unwrap();
     value["request_digest"] = serde_json::Value::String("0".repeat(64));
     bad.canonical_body = canonical_json(&value);
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+/// A digest-consistent body missing the required `task` member is not a
+/// complete request — the write boundary parses the whole envelope, so
+/// the row is refused even though every recorded digest matches.
+#[test]
+fn a_digest_consistent_incomplete_body_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-incomplete");
+    let bad = reshaped(&request_id, |value| {
+        value.as_object_mut().unwrap().remove("task");
+    });
+    assert!(
+        workloop_core::worker_v2::WorkerRequestV2::parse(&bad.canonical_body).is_err(),
+        "the fixture is digest-consistent but not a complete request"
+    );
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_unknown_envelope_member_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-unknown");
+    let bad = reshaped(&request_id, |value| {
+        value["operator_hint"] = serde_json::Value::String("skip checks".into());
+    });
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn a_role_task_disagreement_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-role");
+    let bad = reshaped(&request_id, |value| {
+        value["role"] = serde_json::Value::String("review".into());
+        value["required_capabilities"]["role"] = serde_json::Value::String("review".into());
+        value["workspace"]["read_only"] = serde_json::Value::Bool(true);
+    });
+    expect_refused_then_recovered(&store, &request_id, bad);
+}
+
+#[test]
+fn an_over_budget_body_is_refused() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = seeded_request(&store, "wrb-bounds");
+    let bad = reshaped(&request_id, |value| {
+        value["budget"]["max_verification_commands"] = serde_json::Value::from(0);
+        value["task"]["verification_argv"] = serde_json::json!([["true"]]);
+    });
     expect_refused_then_recovered(&store, &request_id, bad);
 }
 
@@ -557,6 +665,55 @@ fn a_tampered_digest_member_reads_as_corrupt() {
     assert!(
         matches!(err, StoreError::Internal { .. }),
         "the refusal names corruption: {err:?}"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A row corrupted in place into a digest-consistent but incomplete
+/// envelope must fail closed on read — it is never returned as
+/// executable and never silently reported absent.
+#[test]
+fn a_digest_consistent_incomplete_body_reads_as_corrupt() {
+    let root = temp_root("incomplete-body");
+    let db = root.join("store.db");
+    let store = SqliteStore::open(&db, 1).unwrap();
+    let request_id = seeded_request(&store, "body-incomplete-tamper");
+    apply_effects(
+        &store,
+        &[Effect::InsertWorkerRequestBody {
+            body: body(&request_id, "verifiable"),
+        }],
+    );
+    let bad = reshaped(&request_id, |value| {
+        value.as_object_mut().unwrap().remove("task");
+    });
+    let mut stripped: serde_json::Value = serde_json::from_slice(&bad.canonical_body).unwrap();
+    stripped.as_object_mut().unwrap().remove("request_digest");
+    assert_eq!(
+        bad.body_digest,
+        workloop_core::worker_v2::request_v2_digest(&canonical_json(&stripped)),
+        "the corrupted row is digest-consistent, so only envelope validation can refuse it"
+    );
+    assert!(
+        workloop_core::worker_v2::WorkerRequestV2::parse(&bad.canonical_body).is_err(),
+        "the corrupted row is not a complete request"
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE worker_request_bodies SET canonical_body=?1, body_digest=?2 \
+             WHERE request_id=?3",
+            rusqlite::params![bad.canonical_body, bad.body_digest, request_id],
+        )
+        .unwrap();
+    }
+    let err = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .expect_err("an incomplete body is corrupt, not replayable");
+    assert!(
+        matches!(err, StoreError::Internal { .. }),
+        "the refusal names corruption, not absence or a legacy row: {err:?}"
     );
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
