@@ -1077,6 +1077,7 @@ fn prove_verification_mounts(
         extra_rw_binds: vec![],
         worker: None,
         mask_roots: layout.mask_roots(),
+        masked_files: vec![],
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
     if let Some(reason) = containment::plan_denial(&plan) {
@@ -1229,6 +1230,7 @@ fn run_verification_contained(
         extra_rw_binds: vec![gitdir.to_path_buf()],
         worker: Some(worker.clone()),
         mask_roots: layout.mask_roots(),
+        masked_files: vec![],
     };
     let _ = std::fs::create_dir_all(scratch_out);
     if let Some(reason) = containment::plan_denial(&plan) {
