@@ -401,6 +401,25 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Return a re-observed body to `present`. Registration replays
+    /// after the caller has already re-written the body file; a row
+    /// still carrying `reclaiming`/`reclaimed` would keep resolving
+    /// the live body as Unavailable. The stale reclaim reason clears
+    /// with the state so audit reads see the current availability.
+    pub fn restore_body_presence(&self, body_id: &str) -> Result<(), StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        guard
+            .execute(
+                "UPDATE body_catalog SET state='present', reclaim_reason=NULL \
+                 WHERE body_id=?1 AND state != 'present'",
+                params![body_id],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Set or clear ONE protective dependency pin on a registered body.
     /// Pin bookkeeping is the `body_pins` ledger: each live dependency
     /// is its own row, `pinned` is the materialized EXISTS of those
@@ -3088,6 +3107,14 @@ impl workloop_core::store::BodyCatalog for SqliteStore {
                         body.body_id
                     ),
                 });
+            }
+            // A replay over a non-`present` row is a re-observation:
+            // `present` is restored, not replayed — the caller
+            // re-wrote the file under the bodies root before
+            // registering, so keeping the stale reclaim state would
+            // resolve the live body as permanently Unavailable.
+            if existing.state != "present" {
+                self.restore_body_presence(&body.body_id)?;
             }
             // Re-observation of still-needed material extends the
             // eligibility horizon — never shortens it.

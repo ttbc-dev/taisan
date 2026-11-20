@@ -37,8 +37,8 @@ use workloop_core::store::{ReadView, Store, StoreError};
 use workloop_core::work::current_target;
 use workloop_core::worker_v2::{
     InvariantSetBody, MAX_REPORT_MEMBERS, ReportClassification, ReportFinding, ReportInvariantItem,
-    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportV2, WorkerRequestV2,
-    member_claim_digest,
+    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportStatus, WorkerReportV2,
+    WorkerRequestV2, member_claim_digest,
 };
 
 use crate::bodies::{BodyStore, CAS_CATEGORY};
@@ -488,11 +488,22 @@ fn bind_review(
 }
 
 /// Decide the review's completeness from its member claims. Valid
-/// unique members under the closed grammar are `Complete`; a
-/// `findings_reported` reason carrying zero findings is a contradictory
-/// claim, and any malformed/duplicate member is `Partial` — recorded
-/// evidence that can never seal a round.
+/// unique members under the closed grammar are `Complete`; a negative
+/// report whose reason is not `findings_reported` is a writer-role
+/// claim, never a review result; a `findings_reported` reason carrying
+/// zero findings is a contradictory claim, and any malformed/duplicate
+/// member is `Partial` — recorded evidence that can never seal a
+/// round.
 fn review_completeness(report: &WorkerReportV2) -> Completeness {
+    // A negative report whose reason is not `findings_reported` is a
+    // claim about the artifact's checks or invariants — the Worker's
+    // writer-role vocabulary — never a review result: it can neither
+    // seal a round nor stand in for a clean zero-finding review.
+    if report.status == WorkerReportStatus::Negative && report.reason.code != "findings_reported" {
+        return Completeness::Partial {
+            reason: "negative_report_not_a_review".into(),
+        };
+    }
     if report.findings.len() > MAX_REPORT_MEMBERS {
         return Completeness::Partial {
             reason: "too_many_findings".into(),
