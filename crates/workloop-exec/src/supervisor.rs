@@ -18,13 +18,13 @@ use workloop_core::observation::{
     ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
 };
 use workloop_core::ports::{
-    ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, StopReceipt,
-    WorkerEnv,
+    ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
+    StopReceipt, WorkerEnv,
 };
-use workloop_core::store::{Effect, Store, StoreError};
+use workloop_core::store::{Effect, Store, StoreError, TxView};
 use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
-    default_isolation_profile,
+    default_isolation_profile, export_request_id,
 };
 use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
 
@@ -33,6 +33,14 @@ use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
 use crate::request_v2::V2Dispatch;
+
+/// How long an unidentified launch must stay unexplained — no found
+/// writer and no unexplained child — before its absence is reported.
+/// The window only has to outlast the fork-exec visibility gap between
+/// `spawn` returning `Unknown` and the child appearing in the process
+/// table; it is deliberately generous because a false absence is the
+/// one outcome that could admit a second writer.
+const UNIDENTIFIED_LAUNCH_ABSENT_SECONDS: i64 = 30;
 
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
@@ -147,6 +155,63 @@ fn stat_of(pid: i32) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// The working directory `pid` runs in, read through `lsof`. `None` on
+/// any failure — a missing `lsof`, a denied read, or a process with no
+/// reported cwd — never a guessed path. Only ever used to *attribute* a
+/// candidate; `None` makes a child less attributable, never absent-proof.
+fn cwd_of(pid: i32) -> Option<PathBuf> {
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Whether a child's reported cwd is the launch directory or inside it.
+/// Both sides are canonicalized so symlinked temp roots and `.`/`..`
+/// spellings compare equal; an unresolvable cwd is never a match.
+pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
+}
+
+/// Every process identity the store already accounts for — leaders,
+/// descendant snapshots, and stop-intent proofs across all nonterminal
+/// executions — so a recorded writer is never re-bound as an
+/// unidentified launch's orphan. Called inside the caller's
+/// transaction: the bind commit re-verifies against the same snapshot
+/// it writes, so a concurrent resolution cannot double-bind one
+/// process to two invocations.
+fn recorded_process_identities(tx: &dyn TxView) -> Result<HashSet<(i32, String)>, StoreError> {
+    let mut set = HashSet::new();
+    for exec in tx.nonterminal_executions()? {
+        for inv in tx.invocations_for_execution(&exec.id)? {
+            if let Some(id) = &inv.process_identity {
+                set.insert((id.pid, id.started_at.clone()));
+            }
+            for d in &inv.descendants {
+                set.insert((d.pid, d.started_at.clone()));
+            }
+            if let Some(intent) = tx.stop_intent(&inv.id)? {
+                for id in &intent.identities {
+                    set.insert((id.pid, id.started_at.clone()));
+                }
+            }
+        }
+    }
+    Ok(set)
 }
 
 /// The exit status of `pid` without consuming it: `waitid` with
@@ -379,6 +444,175 @@ impl ProcessControlPort for PosixProcessControl {
                     pgid: Some(g),
                 });
             }
+        }
+        Ok(out)
+    }
+
+    fn matching_processes(&self, command: &str) -> Result<Vec<ProcessMatch>, String> {
+        // pid, then the argv tail. `-ww` keeps the command column
+        // untruncated — a truncated row could hide the real writer
+        // behind a false absence. The scan is system-wide, not limited
+        // to this process's children: a supervisor restart reparents an
+        // orphaned writer, and only the launch signature still finds it.
+        let expected = normalize_lstart(command);
+        let table = ps_output(&["-ewwo", "pid=,command="])
+            .map_err(|e| format!("process scan failed: {e}"))?;
+        let mut out = Vec::new();
+        for line in table.lines() {
+            let Some(([pid], actual)) = parse_table_row::<1>(line)? else {
+                continue;
+            };
+            if normalize_lstart(&actual) != expected {
+                continue;
+            }
+            // Re-verify after the snapshot: a matched pid that already
+            // exited drops out instead of polluting the match set, and
+            // a start-time lookup failure fails the whole scan — a
+            // partial table can never authorize absence.
+            let started_at = match lstart_of(pid) {
+                LstartLookup::Present(s) => s,
+                LstartLookup::Absent => continue,
+                LstartLookup::Failed(reason) => return Err(reason),
+            };
+            // A zombie is dead: it cannot write. It is not a live
+            // match — and the scan must not reap it either: reaping
+            // here could consume another Invocation's exit status
+            // before its own inspect reads it. Enumeration stays
+            // read-only; the owning path reaps.
+            if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
+                continue;
+            }
+            let pgid = unsafe { libc::getpgid(pid) };
+            out.push(ProcessMatch {
+                identity: ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: if pgid > 0 { Some(pgid) } else { None },
+                },
+                cwd: cwd_of(pid),
+                command: Some(actual),
+            });
+        }
+        Ok(out)
+    }
+
+    fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        // Enumerate this user's processes before the `lsof` pass: the
+        // absence proof is only as strong as the table's completeness
+        // — a live process whose cwd cannot be mapped could be inside
+        // `dir`, so the scan is `Err` whenever a same-user live
+        // process has no readable cwd. Reading the pid list first
+        // means a process born between the two reads is never misread
+        // as a gap; one that exits between them drops out on the
+        // liveness re-verify below. Another user's unreadable process
+        // cannot be this supervisor's spawn and stays the documented
+        // residual.
+        let euid = unsafe { libc::geteuid() };
+        let table =
+            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
+        let mut same_user_pids = Vec::new();
+        for line in table.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
+                return Err(format!("incomplete process-table row: {line}"));
+            };
+            let pid: i32 = pid
+                .parse()
+                .map_err(|_| format!("invalid process-table row: {line}"))?;
+            let uid: u32 = uid
+                .parse()
+                .map_err(|_| format!("invalid process-table row: {line}"))?;
+            if uid == euid {
+                same_user_pids.push(pid);
+            }
+        }
+        // One `lsof -d cwd` pass maps every inspectable pid to its
+        // working directory — per-pid lookups would not scale to a
+        // system-wide absence proof. Field output (`p`/`n` pairs) is
+        // parsed positionally: a process lsof cannot inspect simply
+        // has no `n` line and cannot be placed inside `dir`.
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let out = Command::new("lsof")
+            .args(["-d", "cwd", "-F", "pn"])
+            .output()
+            .map_err(|e| format!("directory process scan failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "lsof failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut mapped = HashSet::new();
+        let mut occupants = Vec::new();
+        let mut pid: Option<i32> = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.strip_prefix('p') {
+                pid = rest.trim().parse().ok();
+            } else if let Some(path) = line.strip_prefix('n')
+                && let Some(pid) = pid
+            {
+                mapped.insert(pid);
+                occupants.push((pid, PathBuf::from(path)));
+            }
+        }
+        // Completeness gate before any occupant answer: a live
+        // same-user process lsof could not map to a cwd makes the
+        // whole enumeration partial — its cwd might be inside `dir`,
+        // so the table can never authorize absence.
+        for pid in same_user_pids {
+            if mapped.contains(&pid) {
+                continue;
+            }
+            match lstart_of(pid) {
+                // Exited between the pid-list and lsof reads — not a
+                // gap, just a process that was already gone.
+                LstartLookup::Absent => continue,
+                LstartLookup::Failed(reason) => return Err(reason),
+                LstartLookup::Present(_) => {}
+            }
+            // Gone between the liveness check and the stat read, or a
+            // zombie — either way it cannot write inside `dir`.
+            let Some(stat) = stat_of(pid) else {
+                continue;
+            };
+            if stat.contains('Z') {
+                continue;
+            }
+            return Err(format!(
+                "directory scan incomplete: live process {pid} has no readable cwd"
+            ));
+        }
+        let mut out = Vec::new();
+        for (pid, cwd) in occupants {
+            if !cwd_within(Some(&cwd), &dir) {
+                continue;
+            }
+            // Same re-verification as the signature scan: a pid that
+            // exited between the lsof pass and now drops out, and a
+            // start-time lookup failure fails the whole scan — a
+            // partial table can never authorize absence.
+            let started_at = match lstart_of(pid) {
+                LstartLookup::Present(s) => s,
+                LstartLookup::Absent => continue,
+                LstartLookup::Failed(reason) => return Err(reason),
+            };
+            if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
+                continue;
+            }
+            let pgid = unsafe { libc::getpgid(pid) };
+            out.push(ProcessMatch {
+                identity: ProcessIdentity {
+                    pid,
+                    started_at,
+                    pgid: if pgid > 0 { Some(pgid) } else { None },
+                },
+                cwd: Some(cwd),
+                command: None,
+            });
         }
         Ok(out)
     }
@@ -2381,22 +2615,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
             let Some(identity) = invocation.process_identity.clone() else {
-                // Prepared but never identified: a crash near spawn left no
-                // provable answer — report unknown; `work` keeps the
-                // Execution uncertain rather than starting a second writer.
+                // Prepared but never identified: the consume commit
+                // landed but the launch commit did not, so the spawn
+                // outcome is unrecorded. Resolve it — re-bind a found
+                // orphaned writer, prove absence after the bounded
+                // window, or keep the Execution uncertain rather than
+                // starting a second writer.
                 if invocation.state == InvocationState::Prepared
                     && let Some(request) =
                         store.transact(|tx| tx.request(&invocation.request_id))?
                 {
-                    self.report(
+                    self.resolve_unidentified_launch(
                         store,
+                        &invocation,
                         &request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: String::new(),
-                            state: ProcessStateFact::Unknown,
-                            exit_code: None,
-                        },
                         now_unix_seconds,
                     )?;
                 }
@@ -2548,6 +2780,263 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Ok(()) | Err(StoreError::ConstraintConflict { .. }) => Ok(()),
             Err(e) => Err(ExecError::Store(e)),
         }
+    }
+
+    /// Resolve an Invocation recorded `Prepared` with no process
+    /// identity — the crash window between the consume commit and the
+    /// launch commit where the spawn outcome was never written down.
+    /// The orphaned writer, if it exists, still carries the recorded
+    /// launch signature: scan the process table for the bound argv,
+    /// exclude every identity the store already records, and either
+    /// re-bind the only unrecorded match — command equal, cwd inside
+    /// the launch directory, and no second same-signature candidate
+    /// that could be the real writer instead — through the same
+    /// durable commit a normal launch uses, or report the proven
+    /// absence that lets `work` abandon the launch. Absence requires
+    /// BOTH no unrecorded signature match (a chdir'd writer still
+    /// matches the argv) AND the bounded uncertain window (a process
+    /// inside its fork-exec visibility gap is never declared absent).
+    /// Anything else keeps reporting `Unknown`: an ambiguous or
+    /// unreadable answer is never a guess.
+    fn resolve_unidentified_launch(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        request: &InvocationRequest,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let execution = store
+            .transact(|tx| tx.execution(&invocation.execution_id))?
+            .ok_or_else(|| {
+                ExecError::Store(StoreError::Internal {
+                    detail: "invocation without execution".into(),
+                })
+            })?;
+        // The directory this launch ran in — the producing workspace
+        // for a writer, the per-Invocation snapshot for the read-only
+        // check — is the attribution evidence, never the match alone.
+        let launch_dir = match request.role {
+            InvocationRole::InvariantCheck => self.check_workspace(&invocation.id.0),
+            _ => self.workspace_of(&request.work_id),
+        };
+        let canonical_dir = std::fs::canonicalize(&launch_dir).unwrap_or(launch_dir);
+        // Every process identity the store already accounts for —
+        // leaders, descendant snapshots, and stop-intent proofs across
+        // all nonterminal executions — so a recorded writer is never
+        // re-bound as this launch's orphan.
+        let recorded = store.transact(|tx| recorded_process_identities(tx))?;
+        // The bound argv is the recorded selection — the launch
+        // signature an unrecorded writer can still be found by. A
+        // request with no recorded binding has no signature to search:
+        // nothing can be proven, so it stays uncertain.
+        let Some(expected_command) = request
+            .adapter_binding
+            .as_ref()
+            .map(|binding| binding.argv.join(" "))
+        else {
+            return self.report_unidentified_unknown(
+                store,
+                request,
+                &invocation.id,
+                now_unix_seconds,
+            );
+        };
+        let matches = match self.port.matching_processes(&expected_command) {
+            Ok(matches) => matches,
+            // An unreadable process table proves nothing in either
+            // direction — stay uncertain.
+            Err(_) => {
+                return self.report_unidentified_unknown(
+                    store,
+                    request,
+                    &invocation.id,
+                    now_unix_seconds,
+                );
+            }
+        };
+        // Every signature match the store does not already account for.
+        // A recorded writer — another work's live process, a snapshotted
+        // descendant, a stop-proof identity — is never this launch's
+        // orphan. An unrecorded match blocks absence *and* cannot be
+        // bound unless its cwd also lands inside the launch directory:
+        // a process that merely shares the argv (a foreign run, or the
+        // writer after it chdir'd away) keeps the launch uncertain
+        // rather than being guessed at.
+        let unrecorded: Vec<&ProcessMatch> = matches
+            .iter()
+            .filter(|m| !recorded.contains(&(m.identity.pid, m.identity.started_at.clone())))
+            .collect();
+        // A candidate whose cwd cannot be read can be neither bound
+        // nor ruled out: while one exists, no bind is provable — the
+        // in-directory match might be a foreign process and the
+        // unreadable one the real orphan. Stay uncertain rather than
+        // adopt the wrong writer. (Absence is already blocked: the
+        // candidate counts in `unrecorded` either way.)
+        if unrecorded.iter().any(|m| m.cwd.is_none()) {
+            return self.report_unidentified_unknown(
+                store,
+                request,
+                &invocation.id,
+                now_unix_seconds,
+            );
+        }
+        // A bind is provable only when the candidate is the ONLY
+        // unrecorded signature match AND its cwd lands inside the
+        // launch directory. Any second same-signature process keeps
+        // the launch uncertain: inside the directory the matches
+        // cannot be told apart, and outside it the match might be the
+        // real writer after a chdir — which makes the in-directory
+        // lookalike a foreign process that must not be adopted,
+        // inspected, or signaled as this launch's writer.
+        match unrecorded.as_slice() {
+            [child] if cwd_within(child.cwd.as_deref(), &canonical_dir) => {
+                let child = *child;
+                // Descendant coverage starts at re-bind, same as at a
+                // normal launch; a failed table read is not a bind
+                // failure — the stop path re-covers.
+                let descendants = self
+                    .port
+                    .snapshot_descendants(child.identity.pid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.pid != child.identity.pid)
+                    .collect();
+                let bound_request_id = export_request_id(&invocation.id);
+                let bound_identity =
+                    format!("{}@{}", child.identity.pid, child.identity.started_at);
+                match store.transact(|tx| {
+                    // Re-verify inside the commit: a concurrent
+                    // resolution of another unidentified launch may
+                    // have bound this same orphan since the scan — the
+                    // snapshot the bind writes against is the one that
+                    // must still show it unrecorded.
+                    if recorded_process_identities(tx)?
+                        .contains(&(child.identity.pid, child.identity.started_at.clone()))
+                    {
+                        return Ok(None);
+                    }
+                    let mut next = invocation.clone();
+                    next.state = InvocationState::Running;
+                    next.process_identity = Some(child.identity.clone());
+                    next.descendants = descendants;
+                    tx.apply(&Effect::UpdateInvocation {
+                        invocation: next,
+                        expected_state: invocation.state.clone(),
+                    })?;
+                    tx.apply(&Effect::BindWorkerRequestExport {
+                        request_id: bound_request_id,
+                        process_identity: bound_identity.clone(),
+                    })?;
+                    Ok(Some(()))
+                }) {
+                    Ok(Some(())) => self.report(
+                        store,
+                        request,
+                        ObservationFact::ProcessState {
+                            invocation_id: invocation.id.clone(),
+                            process_identity: bound_identity,
+                            state: ProcessStateFact::Running,
+                            exit_code: None,
+                        },
+                        now_unix_seconds,
+                    ),
+                    // The orphan was bound by a concurrent resolution
+                    // since the scan, or the world moved under the
+                    // read (e.g. a stop settled first): the next pass
+                    // re-evaluates from the committed state — never
+                    // force the bind.
+                    Ok(None) | Err(StoreError::ConstraintConflict { .. }) => Ok(()),
+                    Err(e) => Err(ExecError::Store(e)),
+                }
+            }
+            [] => {
+                // Absence is proven only when NO unrecorded signature
+                // match remains — a writer that left its launch
+                // directory still matches the argv and keeps the launch
+                // uncertain — AND the launch directory itself holds no
+                // unexplained process: an escaped descendant keeps the
+                // leader's cwd after leaving the argv signature, so the
+                // signature scan alone cannot prove the writer's whole
+                // tree is gone. The directory scan runs only once the
+                // bounded window has elapsed — before that the answer
+                // is Unknown regardless. The anchor is the Execution's
+                // `uncertain_since`, set on the transition into
+                // `uncertain` and never refreshed by repeat `Unknown`
+                // reports; an unidentified Prepared is the only
+                // unresolved Invocation that can hold its Execution
+                // `ready`, so the anchor always postdates this launch's
+                // commit — the measured window covers the whole
+                // spawn-to-visible gap plus poll lag.
+                let absence_proven = unrecorded.is_empty()
+                    && execution.uncertain_since_unix_seconds.is_some_and(|since| {
+                        now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
+                    })
+                    && self.launch_dir_clear(&canonical_dir, &recorded);
+                if absence_proven {
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::ProcessState {
+                            invocation_id: invocation.id.clone(),
+                            process_identity: String::new(),
+                            state: ProcessStateFact::Exited,
+                            exit_code: None,
+                        },
+                        now_unix_seconds,
+                    )
+                } else {
+                    self.report_unidentified_unknown(
+                        store,
+                        request,
+                        &invocation.id,
+                        now_unix_seconds,
+                    )
+                }
+            }
+            // Anything else is ambiguous — more than one candidate,
+            // or a single candidate outside the launch directory.
+            // Never guess which process is this launch's writer.
+            _ => self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds),
+        }
+    }
+
+    /// Whether the launch directory holds no process the store cannot
+    /// account for. An escaped descendant keeps the leader's working
+    /// directory after leaving the argv signature, so directory
+    /// occupancy is the only remaining evidence that the vanished
+    /// writer's tree is really gone. A failed OR INCOMPLETE
+    /// enumeration — a live process whose cwd the port cannot map is
+    /// a possible occupant — proves nothing: fail closed, stay
+    /// uncertain.
+    fn launch_dir_clear(&self, dir: &Path, recorded: &HashSet<(i32, String)>) -> bool {
+        match self.port.processes_in_directory(dir) {
+            Ok(occupants) => occupants
+                .iter()
+                .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
+            Err(_) => false,
+        }
+    }
+
+    /// Report an unidentified launch as still unknown — the same
+    /// process-state fact the pre-resolution path emitted.
+    fn report_unidentified_unknown(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation_id: &InvocationId,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        self.report(
+            store,
+            request,
+            ObservationFact::ProcessState {
+                invocation_id: invocation_id.clone(),
+                process_identity: String::new(),
+                state: ProcessStateFact::Unknown,
+                exit_code: None,
+            },
+            now_unix_seconds,
+        )
     }
 
     /// The identities whose stop must be proven before the exit fact:

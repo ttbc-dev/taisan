@@ -859,35 +859,31 @@ pub struct WorkerRequestBody {
 }
 
 impl WorkerRequestBody {
-    /// The recorded format and digest re-checked over the stored body
-    /// — `false` marks a corrupt or non-v2 row the reader must refuse
-    /// to launch from.
+    /// The recorded format, digest, and complete v2 envelope re-checked
+    /// over the stored body — `false` marks a corrupt, incomplete, or
+    /// non-v2 row the reader must refuse to launch from.
     pub fn verifies(&self) -> bool {
         if self.format_version != WORKER_REQUEST_V2_FORMAT {
             return false;
         }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.canonical_body) else {
+        // A self-consistent digest is not enough: the bytes must parse
+        // as a complete `WorkerRequestV2`, including every required
+        // member, the closed envelope, role/task agreement, and the
+        // internal bounds. A digest-consistent body missing `task` or
+        // carrying an unknown member is not executable.
+        let Ok(request) = WorkerRequestV2::parse(&self.canonical_body) else {
             return false;
         };
-        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
         // Identity members are covered by the digest, so post-insert
         // tampering already fails it — but a row written with a
         // mismatched key/member pair verifies consistently. The gate
         // therefore re-checks the embedded identity against the row's
-        // own fields, and the self-referential `request_digest`
-        // member, which is excluded from its own digest, against the
-        // recomputed value.
-        self.body_digest == digest
-            && value.get("request_id").and_then(serde_json::Value::as_str)
-                == Some(self.request_id.as_str())
-            && value
-                .get("format_version")
-                .and_then(serde_json::Value::as_str)
-                == Some(self.format_version.as_str())
-            && value
-                .get("request_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(digest.as_str())
+        // own fields, and the row's recorded digest against the parsed
+        // request's own digest (which `parse` already verified against
+        // the embedded `request_digest` member).
+        request.request_id == self.request_id
+            && request.format_version == self.format_version
+            && self.body_digest == request.digest()
     }
 }
 
@@ -1741,6 +1737,21 @@ mod tests {
         assert!(
             !foreign_id.verifies(),
             "a mismatched request_id reads as corrupt"
+        );
+
+        // A digest-consistent but incomplete envelope is not executable
+        // either: complete v2 validation, not just the digest, gates the
+        // durable body.
+        let mut incomplete = body.clone();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&incomplete.canonical_body).unwrap();
+        value.as_object_mut().unwrap().remove("task");
+        incomplete.body_digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(incomplete.body_digest.clone());
+        incomplete.canonical_body = canonical_json(&value);
+        assert!(
+            !incomplete.verifies(),
+            "a digest-consistent incomplete envelope reads as corrupt"
         );
     }
 
