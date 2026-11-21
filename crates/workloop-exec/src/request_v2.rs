@@ -1007,10 +1007,22 @@ pub fn build_request_body(
     };
     wire.request_digest = wire.digest();
     // The builder's own output must pass the same closed-envelope
-    // validation the worker and `workspace::prepare` apply — a body
-    // that cannot parse is a build fault, never a stored refusal.
-    WorkerRequestV2::parse(&wire.to_canonical_bytes())
-        .map_err(|e| BuildError::Fault(format!("built request failed validation: {e}")))?;
+    // validation the worker and `workspace::prepare` apply. A bound
+    // the request's own spec input can exceed — too many verification
+    // commands, an oversized argv, a capability shape — fails the
+    // body as `Invalid`: that is a typed dispatch refusal recorded
+    // against this request, never a fault that wedges the consume
+    // loop on every pass. Only a body the builder itself could never
+    // produce — malformed JSON, an unknown version, a digest
+    // mismatch — stays an infrastructure fault.
+    WorkerRequestV2::parse(&wire.to_canonical_bytes()).map_err(|e| match e {
+        workloop_core::worker_v2::RequestInvalid::Invalid { .. } => {
+            refusal(DispatchRefusal::RequestInvalid {
+                detail: format!("built request failed validation: {e}"),
+            })
+        }
+        other => BuildError::Fault(format!("built request failed validation: {other}")),
+    })?;
     Ok(WorkerRequestBody {
         request_id: request.request_id.clone(),
         format_version: WORKER_REQUEST_V2_FORMAT.into(),

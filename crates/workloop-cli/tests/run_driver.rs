@@ -50,16 +50,6 @@ fn run_cli_from(root: &Path, cwd: Option<&Path>, args: &[&str]) -> std::process:
     command.output().expect("taisan runs")
 }
 
-fn primitive_on_path(name: &str) -> bool {
-    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"] {
-        if Path::new(dir).join(name).is_file() {
-            return true;
-        }
-    }
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-}
-
 fn store(root: &Path) -> SqliteStore {
     SqliteStore::open(&root.join("workloop.db"), 1).unwrap()
 }
@@ -675,6 +665,20 @@ fn git(dir: &Path, args: &[&str]) {
         args.join(" "),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The declared sandbox primitive resolves on this host — the same
+/// fixed-directories-then-PATH lookup the launch gate performs
+/// (`docs/v0.3.md` OPS-01: a host that cannot satisfy it refuses
+/// dispatch, never a substitute).
+fn primitive_on_path(name: &str) -> bool {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"] {
+        if Path::new(dir).join(name).is_file() {
+            return true;
+        }
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
 }
 
 /// The complete v2 wire through the normal driver: a `worker_dispatch`

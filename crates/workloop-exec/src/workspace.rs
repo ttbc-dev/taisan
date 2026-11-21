@@ -156,7 +156,7 @@ fn git_run(dir: &Path, args: &[&str]) -> Result<(String, Option<i32>), Preparati
     bounded_run(&argv, dir, GIT_TIMEOUT)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, PreparationError> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, PreparationError> {
     let (stdout, code) = git_run(dir, args)?;
     if code != Some(0) {
         return Err(PreparationError::Git {

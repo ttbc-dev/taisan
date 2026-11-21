@@ -947,12 +947,15 @@ fn prepare_enforcement(
     declared_egress_hosts: &[String],
 ) -> Result<Enforcement, String> {
     let Some(sandbox) = &layout.verification else {
-        // Declared egress with no installed sandbox is a grant with
-        // no proxy to honour it — refuse rather than let the command
-        // run on the host's unrestricted network.
+        // A request declaring verification egress hosts asks for a
+        // bounded proxy; a hygiene-only runner cannot grant one, so
+        // it refuses rather than degrade to the host's unrestricted
+        // network (§14.5: never an open-network fallback).
         if declared_egress_hosts.iter().any(|h| !h.trim().is_empty()) {
             return Err(
-                "verification.egress_declared_without_sandbox: declared egress hosts but no verification sandbox is configured"
+                "verification.egress_declared_without_sandbox: the request declares \
+                 verification egress hosts but the installation configures no \
+                 verification sandbox to grant them through"
                     .into(),
             );
         }

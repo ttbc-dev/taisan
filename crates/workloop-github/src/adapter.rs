@@ -123,7 +123,6 @@ pub enum WebhookFact {
 /// history assertions drive. Encoding is adapter-internal, matching
 /// the fixtures' so shared-suite assertions need no special case.
 #[derive(Default)]
-
 pub struct GitHubAdapter<C> {
     client: C,
     /// When set, only intents recorded for this host instance are
