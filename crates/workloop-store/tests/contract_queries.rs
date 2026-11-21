@@ -227,6 +227,7 @@ fn seal_review(
                         severity: None,
                         position: None,
                         thread_id: None,
+                        summary: None,
                     })
                     .collect(),
             },
@@ -351,6 +352,7 @@ fn delayed_review_evidence_does_not_misrepresent_the_current_target() {
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: None,
                 }],
             },
             observed_unix_seconds: NOW,

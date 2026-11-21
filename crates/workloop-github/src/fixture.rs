@@ -246,8 +246,10 @@ pub struct FixtureGithub {
     credentials: Option<CredentialBook>,
 }
 
-/// What one pending intent's pass did.
-enum AttemptOutcome {
+/// What one pending intent's pass did. Shared by both host
+/// implementations so the bounded drain reports the same outcome
+/// classes regardless of which adapter performed the attempt.
+pub(crate) enum AttemptOutcome {
     /// No host attempt ran, with why: the intent names another host
     /// instance, the Execution is missing, or its `host_write` grant is
     /// denied.

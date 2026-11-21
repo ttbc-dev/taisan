@@ -4,6 +4,7 @@
 //! that stays in `work`.
 
 pub mod adapter;
+pub mod assessment_v2;
 pub mod bodies;
 pub mod boundary;
 pub mod bounded;

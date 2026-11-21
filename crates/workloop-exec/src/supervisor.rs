@@ -26,10 +26,12 @@ use workloop_core::worker::{
     IsolationProfile, WorkerRequest, WorkerRequestExport, WorkerRequestExportState,
     default_isolation_profile, export_request_id,
 };
-use workloop_core::worker_v2::{DispatchRefusal, WorkerRequestV2};
+use workloop_core::worker_v2::{
+    DispatchRefusal, ReportClassification, WorkerReportV2, WorkerRequestV2,
+};
 
 use crate::adapter;
-use crate::bodies::BodyStore;
+use crate::bodies::{BodyError, BodyStore};
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -589,6 +591,19 @@ impl ProcessControlPort for PosixProcessControl {
         }
         let mut out = Vec::new();
         for (pid, cwd) in occupants {
+            // `cwd_within` canonicalizes the reported path and treats
+            // an unresolvable cwd as "not inside" — but a reported
+            // path spelled inside `dir` cannot be proven outside it
+            // either (a live writer whose cwd was deleted). `mapped`
+            // already holds the pid, so skipping it here would slip
+            // it past the completeness gate: fail the scan instead,
+            // matching the same fail-closed contract.
+            if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
+                return Err(format!(
+                    "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                    cwd.display()
+                ));
+            }
             if !cwd_within(Some(&cwd), &dir) {
                 continue;
             }
@@ -924,6 +939,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// `None` fails report collection for v2 invocations rather than
     /// recording evidence that cannot resolve.
     pub body_store: Option<BodyStore>,
+    /// Installation-owned roots a contained launch masks with a fresh
+    /// tmpfs when a fixed system bind would otherwise expose them —
+    /// the state root holding the store and the workspace root
+    /// holding workspaces, the handoff repository, and credential
+    /// staging (`docs/v0.3.md` §14.3). Defaults to the workspace
+    /// root; the composition root adds the state root.
+    pub sandbox_mask_roots: Vec<PathBuf>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -934,6 +956,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         worker_argv: Vec<String>,
         config: workloop_core::work::WorkloopConfig,
     ) -> Self {
+        let sandbox_mask_roots = vec![workspace_root.clone()];
         Self {
             port,
             workspace_root,
@@ -944,6 +967,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             v2: None,
             runtime_boundary: None,
             body_store: None,
+            sandbox_mask_roots,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -962,6 +986,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// root) for Workspaces carrying git objects.
     pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
         self.handoff = Some(layout);
+        self
+    }
+
+    /// Installation-owned roots a contained launch masks when a fixed
+    /// system bind would expose them — the composition root passes
+    /// the state root beside the workspace root the default names.
+    pub fn with_sandbox_mask_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.sandbox_mask_roots = roots;
         self
     }
 
@@ -1207,6 +1239,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
                 };
                 let inner_cwd = if workspace_bound.is_some() {
@@ -1286,6 +1319,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         if deadline_reached(clock, deadline) {
             return Ok(true);
         }
+        self.bind_v2_assessments_scoped(store, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
         self.run_recovery_scoped(store, now_unix_seconds, scope, clock, deadline)?;
         self.sweep_isolation_scratch(store)?;
         self.sweep_invocation_io(store)?;
@@ -1320,8 +1357,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// after confirmed exit and stop proof — the point at which a
     /// finished Invocation becomes `Done`.
     pub fn drive_handoffs(&self, store: &impl Store) -> Result<(), ExecError> {
-        // The clock is never consulted: no deadline is set.
-        self.drive_handoffs_scoped(store, None, &mut || 0, None)
+        // No deadline is set, so the clock serves only observation
+        // timestamps — wall time is the honest source here; scoped
+        // passes keep their injected clock.
+        self.drive_handoffs_scoped(
+            store,
+            None,
+            &mut || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            },
+            None,
+        )
     }
 
     /// `drive_handoffs` restricted to one Work for a diagnostic `--work`
@@ -1412,12 +1461,89 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
-                Ok(_) | Err(crate::handoff::HandoffError::Transport(_)) => {}
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
+                Ok(handoff_row) => {
+                    self.record_claim_check(
+                        store,
+                        &seed.invocation,
+                        &artifact_id,
+                        &handoff_row,
+                        clock(),
+                    )?;
+                }
+                Err(crate::handoff::HandoffError::Transport(_)) => {}
                 Err(crate::handoff::HandoffError::Store(e)) => {
                     return Err(ExecError::Store(e));
                 }
                 Err(crate::handoff::HandoffError::Io(e)) => return Err(ExecError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-derive gate evidence (`Assessment`/`Review` facts) from
+    /// finished v2 assessment-role Invocations. Binding is a pure
+    /// function of durable state — the verified request body, the
+    /// retained report envelope, the acknowledged handoff rows, and
+    /// the current accepted target — so every pass retries whatever
+    /// does not yet bind: a pre-publication InvariantCheck emits once
+    /// its artifact becomes the accepted head, and a review whose
+    /// target moved simply never binds. Identical facts dedupe on
+    /// delivery identity; nothing the Worker claims can mark its own
+    /// assessment complete.
+    pub fn bind_v2_assessments(&self, store: &impl Store) -> Result<(), ExecError> {
+        self.bind_v2_assessments_scoped(
+            store,
+            None,
+            &mut || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            },
+            None,
+        )
+    }
+
+    /// `bind_v2_assessments` restricted to one Work for a diagnostic
+    /// `--work` pass.
+    fn bind_v2_assessments_scoped(
+        &self,
+        store: &impl Store,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
+        let bodies = self
+            .body_store
+            .as_ref()
+            .or(self.v2.as_ref().map(|d| &d.bodies));
+        for execution in store.transact(|tx| tx.nonterminal_executions())? {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope
+                && execution.work_id != *work_id
+            {
+                continue;
+            }
+            for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
+                if deadline_reached(clock, deadline) {
+                    break;
+                }
+                if invocation.state != InvocationState::Done
+                    || !matches!(
+                        invocation.role,
+                        InvocationRole::InvariantCheck | InvocationRole::Review
+                    )
+                {
+                    continue;
+                }
+                let Some((request, fact)) = crate::assessment_v2::bind(store, bodies, &invocation)?
+                else {
+                    continue;
+                };
+                self.report(store, &request, fact, clock())?;
             }
         }
         Ok(())
@@ -1438,49 +1564,104 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(work) = tx.work(&execution.work_id)? else {
                 return Ok(None);
             };
-            let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
+            let Some(request) = tx.request(&invocation.request_id)? else {
                 return Ok(None);
             };
-            // The Work-declared verification egress hosts live in the
-            // immutable v2 request body; a v1 dispatch or an absent
-            // body declares none. An unverifiable body is corrupt
-            // durable state — the parse failure is a fault, never a
-            // silently empty grant.
-            let verification_egress_hosts = match tx.worker_request_body(&invocation.request_id)? {
-                Some(body) if body.verifies() => serde_json::from_slice::<
-                    workloop_core::worker_v2::WorkerRequestV2,
-                >(&body.canonical_body)
-                .map(|req| req.required_capabilities.verification_egress_hosts)
-                .map_err(|e| StoreError::Internal {
-                    detail: format!("worker request body unreadable: {e}"),
-                })?,
-                _ => Vec::new(),
+            // Verification reads the spec revision the request was
+            // bound at — a later approved revision moves `work.spec`
+            // and must never silently re-bind an in-flight launch's
+            // verification commands.
+            let Some(spec) = tx.spec(&work.id, Some(request.spec_revision))? else {
+                return Ok(None);
             };
+            // The verification argv, egress hosts, and workspace fork
+            // point a v2 dispatch runs are the immutable request
+            // body's — the bound spec the Worker was launched against,
+            // never the Work's current spec revision, which a re-edit
+            // could move mid-flight and silently re-bind verification
+            // to commands the dispatch never approved. A v1 dispatch
+            // or an absent body declares neither, and keeps the
+            // recorded spec argv it always had. An unverifiable body
+            // is corrupt durable state — a fault, never a silently
+            // empty grant or an unpinned base.
+            let (verification_argv, verification_egress_hosts, pinned_base, branch_start) =
+                match tx.worker_request_body(&invocation.request_id)? {
+                    Some(body) if body.verifies() => {
+                        let req = serde_json::from_slice::<WorkerRequestV2>(&body.canonical_body)
+                            .map_err(|e| StoreError::Internal {
+                            detail: format!("worker request body unreadable: {e}"),
+                        })?;
+                        // The branch start a no-op check measures
+                        // against: a Fix workspace branches at its
+                        // predecessor's produced commit, every other
+                        // role at the request's pinned base.
+                        let start = match &req.task {
+                            workloop_core::worker_v2::TaskBody::Fix { predecessor, .. } => {
+                                predecessor.produced.clone()
+                            }
+                            _ => req.base.object.clone(),
+                        };
+                        (
+                            req.verification_argv().to_vec(),
+                            req.required_capabilities.verification_egress_hosts,
+                            req.base.object,
+                            start,
+                        )
+                    }
+                    Some(_) => {
+                        return Err(StoreError::Internal {
+                            detail: format!(
+                                "worker request body for {} is corrupt",
+                                invocation.request_id
+                            ),
+                        });
+                    }
+                    None => (
+                        spec.payload.verification_argv.clone(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
-                spec.payload.verification_argv.clone(),
+                verification_argv,
                 verification_egress_hosts,
+                pinned_base,
+                branch_start,
                 execution.budget.artifact_recovery_attempts,
             )))
         })?;
-        let Some((invocation, work_id, verification_argv, verification_egress_hosts, bound)) =
-            found
+        let Some((
+            invocation,
+            work_id,
+            verification_argv,
+            verification_egress_hosts,
+            pinned_base,
+            branch_start,
+            bound,
+        )) = found
         else {
             return Ok(None);
         };
-        // The handoff base is derived inside the bounded export stage
-        // (the managed branch's fork point against the workspace's
-        // non-work local branch) — never from
-        // `SourceSnapshot.source_revision`, a host issue-version token,
-        // and never here, where a derivation failure would abort the
-        // sweep instead of converging on `recovery_exhausted`.
+        // A v2 dispatch pins the fork point its immutable request
+        // recorded — the stale-base, nothing-produced, and manifest
+        // bounds then read durable state, never a ref the Worker
+        // could rewrite inside its own workspace. Only a v1 dispatch
+        // leaves `base` empty, and the managed branch's fork point is
+        // then derived inside the bounded export stage (never from
+        // `SourceSnapshot.source_revision`, a host issue-version
+        // token, and never here, where a derivation failure would
+        // abort the sweep instead of converging on
+        // `recovery_exhausted`).
         let branch = format!("work/{}", work_id.0);
-        let base = String::new();
+        let base = pinned_base;
         Ok(Some((
             crate::handoff::HandoffSeed {
                 invocation,
                 base,
+                branch_start,
                 branch,
                 work_id,
                 verification_argv,
@@ -1488,6 +1669,178 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             bound,
         )))
+    }
+
+    /// Compare the retained `claimed_head` of an acknowledged
+    /// artifact's Worker report against the commit the handoff
+    /// actually promoted, and record the verdict as evidence
+    /// (`docs/v0.3.md` §6.3). Runs after `handoff::drive` returns, so
+    /// `produced` is durable. A report classified `invalid` or
+    /// `absent` — or carrying no claim — records no verdict but the
+    /// bare `HandoffAcknowledged` fact instead, so publication is
+    /// still re-driven: claims are evidence for later gates, never
+    /// authority over the artifact, and a `false` verdict never moves
+    /// or replaces it.
+    fn record_claim_check(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        artifact_id: &str,
+        handoff: &ArtifactHandoff,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        if handoff.state != HandoffState::Acknowledged {
+            return Ok(());
+        }
+        let Some(produced) = handoff.produced.clone() else {
+            return Ok(());
+        };
+        let observations =
+            store.transact(|tx| tx.observations_for_execution(&invocation.execution_id))?;
+        // A verdict for this exact produced commit is already durable:
+        // the acknowledged row is re-seeded every pass while its
+        // Execution stays nonterminal, and re-resolving the evidence
+        // to repeat a recorded verdict buys nothing — and makes a
+        // later CAS reclamation fault the whole handoff sweep.
+        if observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ClaimedHeadCheck {
+                    invocation_id,
+                    artifact_id: a,
+                    produced: p,
+                    ..
+                } if invocation_id == &invocation.id && a == artifact_id && p == &produced
+            )
+        }) {
+            return Ok(());
+        }
+        let report_fact = observations
+            .into_iter()
+            .find(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::WorkerReport { invocation_id, .. }
+                        if invocation_id == &invocation.id
+                )
+            })
+            .map(|o| o.fact);
+        let Some(ObservationFact::WorkerReport {
+            classification,
+            report: Some(report_evidence),
+            ..
+        }) = report_fact
+        else {
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
+        };
+        // Only a validated envelope's claim is read — `invalid`
+        // retains raw bytes but never a trusted claim, and `absent`
+        // has none.
+        if matches!(
+            classification,
+            ReportClassification::Invalid { .. } | ReportClassification::Absent
+        ) {
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
+        }
+        let Some(bodies) = self
+            .body_store
+            .as_ref()
+            .or(self.v2.as_ref().map(|d| &d.bodies))
+        else {
+            // Report evidence exists but its CAS root is unconfigured —
+            // the same fault `report_v2::collect` refuses to paper over.
+            return Err(ExecError::Fault(
+                "worker report claim check requires the CAS body store".into(),
+            ));
+        };
+        let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+            Ok(Some(resolved)) => resolved,
+            // The verdict is advisory evidence for later gates, never
+            // authority over the artifact: a body the retention sweep
+            // already reclaimed — or that never catalogued — records
+            // no verdict and never a pass-aborting fault, but the
+            // acknowledgement still re-drives publication.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => {
+                return self.report_handoff_acknowledged(
+                    store,
+                    invocation,
+                    artifact_id,
+                    &produced,
+                    now_unix_seconds,
+                );
+            }
+            Err(e) => {
+                return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+            }
+        };
+        let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
+            .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
+        let Some(claimed) = report.claimed_head else {
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
+        };
+        let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
+            return Ok(());
+        };
+        let agrees = claimed == produced;
+        self.report(
+            store,
+            &request,
+            ObservationFact::ClaimedHeadCheck {
+                invocation_id: invocation.id.clone(),
+                artifact_id: artifact_id.to_string(),
+                claimed,
+                produced,
+                agrees,
+            },
+            now_unix_seconds,
+        )
+    }
+
+    /// The acknowledgement itself, without a claim verdict: emitted
+    /// when `record_claim_check` reaches a durable `produced` commit
+    /// but cannot form a `ClaimedHeadCheck` — no retained report, an
+    /// `absent`/`invalid` classification, unavailable report bytes, or
+    /// no `claimed_head`. The fact re-drives `maybe_publish` for the
+    /// waiting Execution the same way the verdict does; without it
+    /// the publish chain would sit until the stage budget expires.
+    fn report_handoff_acknowledged(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        artifact_id: &str,
+        produced: &str,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
+            return Ok(());
+        };
+        self.report(
+            store,
+            &request,
+            ObservationFact::HandoffAcknowledged {
+                artifact_id: artifact_id.to_string(),
+                produced: produced.to_string(),
+            },
+            now_unix_seconds,
+        )
     }
 
     /// Replay the durable request log: for each unconsumed request either
@@ -1887,10 +2240,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
+                    // Assessment roles read the produced state; only a
+                    // writer mounts the workspace read-write (§14.6).
                     workspace: Some((
                         workspace.clone(),
-                        // §14.6: assessment roles bind the workspace
-                        // read-only; writers keep read-write.
                         matches!(
                             request.role,
                             InvocationRole::InvariantCheck | InvocationRole::Review
@@ -1908,6 +2261,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
                 };
                 match self.contained_exec(
@@ -2422,6 +2776,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
                 };
                 match self.contained_exec(
@@ -2451,13 +2806,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // at the spawn boundary itself — the Execution still Ready and
         // the request's own deadline unexpired — so a stop, deadline,
         // or cancel committed during declaration, materialization, or
-        // preparation still blocks the launch. The recorded Invocation
-        // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires. The deadline check
-        // reads the clock again: `now_unix_seconds` is the pass
-        // timestamp `build_request_body` already validated against,
-        // so only a fresh read catches a deadline that elapsed while
-        // the launch was being prepared.
+        // preparation still blocks the launch. The deadline is read
+        // from the live clock, not the pass-start timestamp: elapsed
+        // preparation time counts against the request's bound exactly
+        // as it would against a running writer. The recorded
+        // Invocation abandons exactly as the earlier gate does; no
+        // late writer starts after authorization expires.
         let authorized = wire.budget.deadline_unix_seconds > clock()
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
@@ -2937,7 +3291,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
             InvocationRole::InvariantCheck => self.check_workspace(&invocation.id.0),
             _ => self.workspace_of(&request.work_id),
         };
-        let canonical_dir = std::fs::canonicalize(&launch_dir).unwrap_or(launch_dir);
+        let canonical_dir =
+            std::fs::canonicalize(&launch_dir).unwrap_or_else(|_| launch_dir.clone());
         // Every process identity the store already accounts for —
         // leaders, descendant snapshots, and stop-intent proofs across
         // all nonterminal executions — so a recorded writer is never
@@ -2947,11 +3302,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // signature an unrecorded writer can still be found by. A
         // request with no recorded binding has no signature to search:
         // nothing can be proven, so it stays uncertain.
-        let Some(expected_command) = request
-            .adapter_binding
-            .as_ref()
-            .map(|binding| binding.argv.join(" "))
-        else {
+        let Some(binding) = request.adapter_binding.as_ref() else {
             return self.report_unidentified_unknown(
                 store,
                 request,
@@ -2959,10 +3310,55 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             );
         };
-        let matches = match self.port.matching_processes(&expected_command) {
-            Ok(matches) => matches,
-            // An unreadable process table proves nothing in either
-            // direction — stay uncertain.
+        // The signature is the full command line the spawn actually
+        // exec'd, which is the bare argv only for v1. A v2 launch
+        // appended the `run --request/--out` transport pair — the
+        // sandbox paths under containment, the host io paths
+        // uncontained — and the durable record does not name which
+        // gate the spawn took, so every shape the line could have
+        // taken is a signature. Missing the v2 shapes would leave a
+        // v2 writer unmatchable: never re-bound, and eventually
+        // declared absent on directory occupancy alone. The bare argv
+        // alone is never a v2 signature either — the spawn exec'd none
+        // of it, so a foreign process running just those words must
+        // neither adopt the launch nor hold absence open forever.
+        let body = store.transact(|tx| tx.worker_request_body(&request.request_id))?;
+        let mut signatures = Vec::new();
+        if body.is_none() {
+            signatures.push(binding.argv.join(" "));
+        }
+        let io_dir = crate::request_v2::invocation_io_root(&self.workspace_root)
+            .join(crate::isolation::sanitize_key(&invocation.id.0));
+        if body.is_some() {
+            let mut contained = binding.argv.clone();
+            contained.extend([
+                "run".to_string(),
+                "--request".to_string(),
+                containment::SANDBOX_REQUEST.to_string(),
+                "--out".to_string(),
+                containment::SANDBOX_OUT.to_string(),
+            ]);
+            signatures.push(contained.join(" "));
+            let mut host = binding.argv.clone();
+            host.extend([
+                "run".to_string(),
+                "--request".into(),
+                io_dir.join("request.json").to_string_lossy().into_owned(),
+                "--out".into(),
+                io_dir.join("out").to_string_lossy().into_owned(),
+            ]);
+            signatures.push(host.join(" "));
+        }
+        // A contained launch exec'd none of those lines — the spawn
+        // ran the bwrap outer argv `bwrap_args` produced. Re-evaluate
+        // the recorded binding's gate and rebuild the exact plan the
+        // launch used: `Uncontained` means no wrapped argv could
+        // exist; a refused gate or an unresolvable boundary means the
+        // wrapped argv cannot be reconstructed — the orphan's
+        // signature is then unprovable, so stay uncertain rather than
+        // declare absence on an incomplete search.
+        match self.containment_gate(&binding.argv, now_unix_seconds)? {
+            Ok(Gate::Uncontained) => {}
             Err(_) => {
                 return self.report_unidentified_unknown(
                     store,
@@ -2971,7 +3367,84 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     now_unix_seconds,
                 );
             }
-        };
+            Ok(Gate::Ready { primitive, worker }) => {
+                let (inner_argv, workspace_read_only, mounts_io) = if let Some(body) = &body {
+                    // A durable body that no longer parses is corrupt
+                    // evidence, not a v1 request — the contained shape
+                    // cannot be reconstructed either, so stay
+                    // uncertain.
+                    let Ok(wire) = WorkerRequestV2::parse(&body.canonical_body) else {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    };
+                    let mut inner = binding.argv.clone();
+                    inner.extend([
+                        "run".to_string(),
+                        "--request".to_string(),
+                        containment::SANDBOX_REQUEST.to_string(),
+                        "--out".to_string(),
+                        containment::SANDBOX_OUT.to_string(),
+                    ]);
+                    (inner, wire.workspace.read_only, true)
+                } else {
+                    (binding.argv.clone(), false, false)
+                };
+                let plan = MountPlan {
+                    workspace: Some((launch_dir.clone(), workspace_read_only)),
+                    request: mounts_io.then(|| io_dir.join("request.json")),
+                    input: mounts_io.then(|| io_dir.join("input")),
+                    out: mounts_io.then(|| io_dir.join("out")),
+                    gitconfig: Some(self.launch_scratch(&invocation.id.0).join("gitconfig")),
+                    runtime_auth: None,
+                    provider_config: None,
+                    proxy_sock: None,
+                    toolchain: None,
+                    caches: vec![],
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
+                    extra_rw_binds: vec![],
+                    worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
+                    masked_files: vec![],
+                };
+                match self.contained_exec(
+                    &primitive,
+                    plan,
+                    &inner_argv,
+                    "/workspace",
+                    &WorkerEnv::default(),
+                ) {
+                    Ok((argv, _)) => signatures.push(argv.join(" ")),
+                    Err(_) => {
+                        return self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        );
+                    }
+                }
+            }
+        }
+        let mut matches = Vec::new();
+        for signature in &signatures {
+            match self.port.matching_processes(signature) {
+                Ok(found) => matches.extend(found),
+                // An unreadable process table proves nothing in either
+                // direction — stay uncertain.
+                Err(_) => {
+                    return self.report_unidentified_unknown(
+                        store,
+                        request,
+                        &invocation.id,
+                        now_unix_seconds,
+                    );
+                }
+            }
+        }
         // Every signature match the store does not already account for.
         // A recorded writer — another work's live process, a snapshotted
         // descendant, a stop-proof identity — is never this launch's
@@ -3005,9 +3478,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // cannot be told apart, and outside it the match might be the
         // real writer after a chdir — which makes the in-directory
         // lookalike a foreign process that must not be adopted,
-        // inspected, or signaled as this launch's writer.
+        // inspected, or signaled as this launch's writer. A contained
+        // worker's cwd reads as the sandbox mount `SANDBOX_WORKSPACE`
+        // instead of the host launch dir — its namespace's `/workspace`
+        // is exactly the launch's workspace bind, so it satisfies the
+        // same "inside the launch directory" rule.
         match unrecorded.as_slice() {
-            [child] if cwd_within(child.cwd.as_deref(), &canonical_dir) => {
+            [child]
+                if cwd_within(child.cwd.as_deref(), &canonical_dir)
+                    || child.cwd.as_deref()
+                        == Some(std::path::Path::new(containment::SANDBOX_WORKSPACE)) =>
+            {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -3041,10 +3522,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         invocation: next,
                         expected_state: invocation.state.clone(),
                     })?;
-                    tx.apply(&Effect::BindWorkerRequestExport {
-                        request_id: bound_request_id,
-                        process_identity: bound_identity.clone(),
-                    })?;
+                    // A v1 launch binds its export row to the spawned
+                    // handle. A v2 request has no export — its durable
+                    // body is the launch record and the running
+                    // Invocation carries the identity — so the bind
+                    // applies only when the export row exists;
+                    // requiring it would reject the whole commit.
+                    if tx.worker_request_export(&bound_request_id)?.is_some() {
+                        tx.apply(&Effect::BindWorkerRequestExport {
+                            request_id: bound_request_id,
+                            process_identity: bound_identity.clone(),
+                        })?;
+                    }
                     Ok(Some(()))
                 }) {
                     Ok(Some(())) => self.report(
@@ -4573,6 +5062,7 @@ mod tests {
             extra_binds: vec![],
             extra_rw_binds: vec![],
             worker: None,
+            mask_roots: vec![],
             masked_files: vec![],
         }
     }

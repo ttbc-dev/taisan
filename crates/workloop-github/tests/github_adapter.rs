@@ -240,6 +240,80 @@ fn push_and_open(
     }
 }
 
+/// The ambient credential's verified login binds the write: a token
+/// acting as another identity never authors the bound actor's intent —
+/// the receipt records the real login and the ingest settles
+/// `unknown{actor_mismatch}`, leaving the intent outstanding.
+#[test]
+fn a_foreign_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "viewer-mismatch");
+    let mut gh = InMemoryGitHub::new();
+    gh.set_viewer("other-login");
+    let mut adapter = Adapter::new(gh);
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        },
+        "a foreign credential never records an applied write"
+    );
+    let intent = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == action_id)
+                .map(|i| i.authenticated_actor))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        intent,
+        Some(HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("other-login"),
+        }),
+        "the receipt attests the verified login, not the claim"
+    );
+}
+
+/// A credential whose identity cannot be attested never authors a
+/// write either — an indeterminate actor is fail-closed, retried on
+/// the next pass once `gh api user` answers again.
+#[test]
+fn an_unverifiable_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "viewer-unverifiable");
+    let mut gh = InMemoryGitHub::new();
+    gh.lose_response("viewer");
+    let mut adapter = Adapter::new(gh);
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config(), NOW).unwrap();
+    assert!(matches!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown { .. }
+    ));
+}
+
 fn intent_status_effects(store: &SqliteStore, action_id: &str) -> Vec<NormalizedEffectFact> {
     store
         .transact(|tx| {
@@ -1027,6 +1101,241 @@ fn merge_is_outside_the_adapter_and_never_part_of_succeeded() {
     assert!(
         serde_json::from_value::<HostAction>(serde_json::json!({ "action": "merge" })).is_err(),
         "merge is not in the executable action vocabulary"
+    );
+}
+
+/// The invariant lane binds the **latest** assessment on the current
+/// target: an earlier all-positive assessment is evidence of a state
+/// the lane already superseded — when a later assessment reports the
+/// set incomplete, completion stays closed even though a positive one
+/// exists in the log.
+#[test]
+fn a_superseded_positive_assessment_never_completes_the_invariant_lane() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "stale-assessment");
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    let opened = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: opened.clone(),
+            head: rev("sha-1"),
+        },
+    );
+    let target = |head: &str| DiffTarget {
+        change: opened.clone(),
+        head: rev(head),
+        base: None,
+        target_revision: None,
+    };
+    // The earlier all-positive assessment lands while CI is still
+    // pending — then the lane's next assessment supersedes it with an
+    // incomplete coverage report before the other evidence arrives.
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: false,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Negative,
+                refs: vec![],
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: opened.clone(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Review {
+            target: target("sha-1"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
+
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        execution.state,
+        ExecutionState::Waiting,
+        "the latest assessment is incomplete — a superseded positive \
+         never seals the lane"
+    );
+}
+
+/// The invariant lane binds the **latest** check invocation after the
+/// producing one: an earlier `Done`/exit-0 check is evidence of a state
+/// the lane already superseded — when the newest check exits non-zero,
+/// completion stays closed even though a passed check exists in the
+/// log.
+#[test]
+fn a_superseded_passed_invariant_check_never_completes_the_lane() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "stale-check");
+    // A second, later check invocation exits non-zero: the earlier
+    // pass is superseded and the lane must stay closed.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(format!("{}-invariant-check-2", eid.0)),
+                    request_id: format!("{}:inv:check-2", eid.0),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: obs(
+                    &work_id,
+                    &eid,
+                    None,
+                    NOW,
+                    ObservationFact::ProcessState {
+                        invocation_id: InvocationId(format!("{}-invariant-check-2", eid.0)),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Exited,
+                        exit_code: Some(1),
+                    },
+                ),
+            })
+        })
+        .unwrap();
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    let opened = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: opened.clone(),
+            head: rev("sha-1"),
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: opened.clone(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Review {
+            target: DiffTarget {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                base: None,
+                target_revision: None,
+            },
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: DiffTarget {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                base: None,
+                target_revision: None,
+            },
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_ne!(
+        execution.state,
+        ExecutionState::Succeeded,
+        "the newest check failed — a superseded pass never seals \
+         the lane"
     );
 }
 

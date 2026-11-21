@@ -131,6 +131,39 @@ pub enum ObservationFact {
         /// or its path is unsafe or unreadable).
         observed_report: Option<WorkerReportEvidence>,
     },
+    /// The supervisor's verdict on one retained Worker `claimed_head`
+    /// checked against an acknowledged handoff's `produced` commit
+    /// (`docs/v0.3.md` §6.3). The claim stays evidence: `agrees`
+    /// records whether the claim named the commit the handoff
+    /// actually promoted, and a `false` verdict never moves,
+    /// replaces, or blocks the artifact — the acknowledged ref plus
+    /// supervisor-run verification on that exact commit remain the
+    /// only authority.
+    ClaimedHeadCheck {
+        invocation_id: InvocationId,
+        /// The artifact whose `produced` commit was compared — one
+        /// Invocation may hand off several required artifacts, each
+        /// with its own promoted commit.
+        artifact_id: String,
+        /// The commit the Worker claimed (always present — a report
+        /// carrying no `claimed_head` records no verdict at all).
+        claimed: String,
+        /// The commit the acknowledged handoff promoted.
+        produced: String,
+        /// `claimed == produced`.
+        agrees: bool,
+    },
+    /// The artifact handoff became durable: `produced` is the commit
+    /// the acknowledged handoff promoted. Recorded when the supervisor
+    /// cannot also form a `ClaimedHeadCheck` verdict — no retained
+    /// Worker report, an `absent`/`invalid` classification,
+    /// unavailable report bytes, or a report without `claimed_head` —
+    /// so the acknowledgement still re-drives publication for a
+    /// waiting Execution.
+    HandoffAcknowledged {
+        artifact_id: String,
+        produced: String,
+    },
     /// An authoritative read of a source issue. Drives the source gate:
     /// compared against the approved spec snapshot, never trusted by
     /// position or timestamp alone.
@@ -367,6 +400,13 @@ pub struct OccurrenceInput {
     pub position: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The human-readable finding text the claim carried — what the
+    /// reviewer found, so operators and Fix workers read the sealed
+    /// evidence rather than only its key. Absent on facts recorded
+    /// before the field existed and on adapter-minted occurrences
+    /// that carry no prose.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

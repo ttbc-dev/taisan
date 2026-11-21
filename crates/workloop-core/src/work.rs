@@ -2274,13 +2274,17 @@ pub fn admit_queued_role(
 
     let seq = tx.alloc_seq()?;
     let mut payload = serde_json::to_value(&execution.input).unwrap_or_default();
-    if role == InvocationRole::InvariantCheck
-        && let serde_json::Value::Object(map) = &mut payload
+    if matches!(
+        role,
+        InvocationRole::InvariantCheck | InvocationRole::Review
+    ) && let serde_json::Value::Object(map) = &mut payload
     {
-        // The check is read-only: it declares no workspace artifact,
-        // so its durable record carries an explicitly empty required
-        // set rather than the writer default. Its evidence is the
-        // Invocation lifecycle plus receipts, never a produced diff.
+        // The check and the review are read-only: neither declares a
+        // workspace artifact, so the durable record carries an
+        // explicitly empty required set rather than the writer
+        // default. Their evidence is the Invocation lifecycle plus
+        // receipts, never a produced diff — a non-empty set would seed
+        // an artifact handoff for a role that produces nothing.
         map.insert("required_artifacts".into(), serde_json::json!([]));
     }
     let request = InvocationRequest {
@@ -2940,6 +2944,15 @@ fn assess(
             Ok(())
         }
         ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
+        // The handoff acknowledgement these facts ride on is the
+        // moment the produced commit became durable: publication may
+        // now name it, so a waiting Execution re-evaluates its stage
+        // intents.
+        ObservationFact::ClaimedHeadCheck { .. } | ObservationFact::HandoffAcknowledged { .. }
+            if execution.state == ExecutionState::Waiting =>
+        {
+            maybe_publish(tx, config, &execution, now_unix_seconds)
+        }
         _ => Ok(()),
     }?;
     let Some(current) = tx.execution(&execution.id)? else {
@@ -3477,6 +3490,7 @@ fn seal_round(
             severity: o.severity.clone(),
             position: o.position.clone(),
             thread_id: o.thread_id.clone(),
+            summary: o.summary.clone(),
         })
         .collect();
     tx.apply(&Effect::InsertReviewRound { round, occurrences })?;
@@ -3728,11 +3742,14 @@ fn settle_after_writer_gone(
         .unwrap_or(DesiredAction::Fail);
     // Terminal settlement waits for outstanding outbox effects to
     // reconcile (lifecycle.md): a pending or unknown host write must
-    // not be drained after a recorded cancellation/failure. The
-    // `host_action_result` observation re-drives this settle once the
-    // intent is resolved.
+    // not be drained after a recorded cancellation/failure. A pending
+    // intent counts only while the Work's latest Execution could still
+    // attempt it — under a denied `host_write` grant it can never
+    // deliver an effect, so deferring on it stalls the outcome
+    // forever. The `host_action_result` observation re-drives this
+    // settle once the intent is resolved.
     if matches!(desired, DesiredAction::Cancel | DesiredAction::Fail)
-        && !crate::projection::outstanding_actions(tx, &execution.work_id)?.is_empty()
+        && !crate::projection::settlement_blocking_actions(tx, &execution.work_id)?.is_empty()
     {
         return Ok(());
     }
@@ -3881,6 +3898,14 @@ fn maybe_publish(
     if artifact_digests.is_empty() {
         return Ok(());
     }
+    // `push_ref` publishes the produced *commit*, so the revision must
+    // be the one the durable handoff names — an artifact fact's
+    // payload digest identifies bytes, never a git object, and a
+    // remote ref can never target it. Only an invocation with no
+    // handoff rows at all publishes the recorded digest token.
+    let Some(produced_object) = produced_revision(tx, latest, &artifact_digests)? else {
+        return Ok(());
+    };
     let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
     if !outstanding.is_empty() {
         return Ok(());
@@ -3934,17 +3959,18 @@ fn maybe_publish(
     let intents = tx.action_intents()?;
     let work_intents: Vec<&HostActionIntent> =
         intents.iter().filter(|i| i.work_id == work.id).collect();
-    // Stage 1: push_ref. Produced revision = the published artifact's
-    // digest interpreted as an object id on the bound repository.
+    // Stage 1: push_ref. Produced revision = the produced commit the
+    // acknowledged handoff names (or, with no handoff rows, the
+    // recorded artifact token non-git worlds publish).
     let branch = format!("work/{}", work.id.0);
     // The stage is satisfied only by an applied push that published the
-    // *current* produced revision — a fix Invocation's new artifact
-    // digest re-arms the stage so the branch republishes.
+    // *current* produced revision — a fix Invocation's new produced
+    // commit re-arms the stage so the branch republishes.
     let push_applied = work_intents.iter().any(|i| {
         matches!(
             &i.action,
             HostAction::PushRef { produced, .. }
-                if produced.object == artifact_digests[0]
+                if produced.object == produced_object
         ) && i.status == HostActionStatus::Applied
     });
     if !push_applied {
@@ -3981,7 +4007,7 @@ fn maybe_publish(
             }
         }
         let produced =
-            CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
+            CommitRevision::new(work.binding.repository.clone(), produced_object.clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
         // The guard's expected prior is the freshest remote position
         // this installation observed for the branch, ordered by
@@ -4151,6 +4177,55 @@ fn record_intent(
     })
 }
 
+/// The revision `push_ref` must publish for `invocation`: the produced
+/// commit the newest acknowledged handoff names, or — for a v1
+/// invocation that can never grow a handoff row — the first recorded
+/// artifact digest (the only produced identity non-git artifact
+/// worlds carry). `None` when handoff rows exist but none is
+/// acknowledged yet, and `None` while a v2 invocation has no rows at
+/// all: the row is written by the handoff drive after the exit fact
+/// lands, so an empty row set at that moment means pending, never
+/// absent — falling back would publish the payload digest (a byte
+/// hash, not a git object) as the produced commit. The
+/// acknowledgement's claim check re-drives this stage once the row
+/// is durable.
+fn produced_revision(
+    tx: &dyn ReadView,
+    invocation: &Invocation,
+    artifact_digests: &[String],
+) -> Result<Option<String>, StoreError> {
+    let mut rows = false;
+    let mut newest: Option<ArtifactHandoff> = None;
+    for required in &invocation.required_artifacts {
+        let artifact_id = format!("{}/{}", invocation.id.0, required.kind);
+        let Some(row) = tx.artifact_handoff(&artifact_id)? else {
+            continue;
+        };
+        rows = true;
+        if row.state == HandoffState::Acknowledged
+            && row.produced.is_some()
+            && newest
+                .as_ref()
+                .is_none_or(|b: &ArtifactHandoff| row.recorded_seq > b.recorded_seq)
+        {
+            newest = Some(row);
+        }
+    }
+    Ok(match (rows, newest) {
+        (true, Some(row)) => row.produced,
+        // Handoff rows exist but none is acknowledged: wait for the
+        // sweep's claim check to re-drive publication.
+        (true, None) => None,
+        // A v2 invocation always grows a handoff row after the exit
+        // fact — no rows yet is the pending window between finish and
+        // the handoff drive, not a non-git world. Only a legacy v1
+        // dispatch (no request body row) publishes the recorded
+        // digest token.
+        (false, _) if tx.worker_request_body(&invocation.request_id)?.is_some() => None,
+        (false, _) => artifact_digests.first().cloned(),
+    })
+}
+
 /// The digests of `Present` artifacts covering every required artifact
 /// of the invocation; empty when the set is not yet complete and valid.
 /// A `Present` fact with a missing or mismatched digest is invalid and
@@ -4219,24 +4294,26 @@ fn check_exited_zero(
         }))
 }
 
-/// Whether `candidates` holds an invariant-check Invocation whose own
-/// evidence is positive — `Done` on a proven exit status of 0. This is
-/// the only check result publication and completion may count; both
-/// gates share it so they can never drift apart.
+/// Whether the *latest* invariant-check Invocation's own evidence is
+/// positive — `Done` on a proven exit status of 0. A superseded pass
+/// never satisfies the gate: once a newer check is recorded its
+/// result supersedes every earlier one, so a failed or unresolved
+/// newest check holds the lane closed. This is the only check result
+/// publication and completion may count; both gates share it so they
+/// can never drift apart.
 fn satisfied_invariant_check(
     tx: &dyn ReadView,
     execution_id: &ExecutionId,
     candidates: &[Invocation],
 ) -> Result<bool, StoreError> {
-    for invocation in candidates {
-        if invocation.role == InvocationRole::InvariantCheck
-            && invocation.state == InvocationState::Done
-            && check_exited_zero(tx, execution_id, invocation)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let Some(latest) = candidates
+        .iter()
+        .rev()
+        .find(|i| i.role == InvocationRole::InvariantCheck)
+    else {
+        return Ok(false);
+    };
+    Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
 }
 
 /// `succeeded` requires the required stage effects applied, the declared
@@ -4368,27 +4445,34 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
             }
         }
     }
-    // Invariant lane: a complete assessment on the current target whose
-    // every item is positive AND a completed invariant-check Invocation
-    // recorded after the latest producing Invocation. The assessment
+    // Invariant lane: the *latest* assessment on the current target is
+    // complete with every item positive AND the newest invariant-check
+    // Invocation recorded after the latest producing Invocation exited
+    // 0. A superseded positive assessment never counts — a newer check
+    // reporting a violation, an incomplete run, or nothing at all
+    // displaces it as the lane's deciding evidence. The assessment
     // fact alone never substitutes for the check's own durable record.
     // Disabled lanes count nothing either way.
     if spec.payload.lanes.invariant_check {
-        let ok = observations.iter().any(|o| {
-            matches!(
-                &o.fact,
+        let ok = observations
+            .iter()
+            .rev()
+            .find_map(|o| match &o.fact {
                 ObservationFact::Assessment {
                     target: t,
-                    complete: true,
+                    complete,
                     items,
                     ..
-                } if t == &target
-                    && !items.is_empty()
-                    && items.iter().all(|i| {
-                        i.verdict == crate::observation::AssessmentVerdict::Positive
-                    })
-            )
-        });
+                } if t == &target => Some(
+                    *complete
+                        && !items.is_empty()
+                        && items
+                            .iter()
+                            .all(|i| i.verdict == crate::observation::AssessmentVerdict::Positive),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false);
         let checked = match invocations.iter().rposition(|i| {
             matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
                 && i.state == InvocationState::Done
@@ -4713,14 +4797,16 @@ fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Resu
 /// for outstanding host writes to reconcile (lifecycle.md): intents are
 /// delivery-bound and would still apply under a recorded failure, so the
 /// stall is recorded as `outbox_reconciliation` instead of the terminal
-/// outcome. Returns true while the deferral stands.
+/// outcome. An intent that can never be attempted — `pending` under a
+/// denied `host_write` grant — does not defer: there is no in-flight
+/// effect to wait for. Returns true while the deferral stands.
 fn defer_terminal_while_outstanding(
     tx: &mut dyn TxView,
     work_id: &WorkId,
     execution_id: &ExecutionId,
     terminal_code: &str,
 ) -> Result<bool, StoreError> {
-    if crate::projection::outstanding_actions(tx, work_id)?.is_empty() {
+    if crate::projection::settlement_blocking_actions(tx, work_id)?.is_empty() {
         return Ok(false);
     }
     tx.apply(&Effect::RecordDeferral {

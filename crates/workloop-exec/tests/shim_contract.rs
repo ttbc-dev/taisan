@@ -301,6 +301,57 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
     );
 }
 
+/// A lost CONTAINED launch leaves a writer running under the bwrap
+/// outer argv — the bare bound argv never reaches the process table.
+/// Re-binding must search the wrapped signature the launch actually
+/// exec'd, or the orphan is missed and the launch is later declared
+/// absent on directory occupancy alone.
+#[test]
+fn a_lost_contained_launch_rebinds_by_the_wrapped_signature() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("lost-contained");
+    let port = ScriptedProcessControl::new();
+    // Exactly the launch gate: the version probe plus the nine-probe
+    // battery. Every later probe — `describe` and the recovery pass's
+    // re-proof — falls through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    // Spawn happened; the response was lost — the process may exist.
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "timeout between spawn and response".into(),
+    });
+    let sup = Supervisor::new(port.clone(), root, vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-lost-contained",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-lost-contained");
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.poll_invocations(&store, NOW).unwrap();
+    sup.run_once(&store, NOW + 1).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "the lost start response never produces a second writer"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Running,
+        "the bwrap-wrapped orphan is found by the argv the spawn really exec'd"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert!(
+        invocation.process_identity.is_some(),
+        "the orphaned writer's identity is re-recorded"
+    );
+}
+
 #[test]
 fn an_unbound_export_holds_the_invocation_uncertain() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -714,6 +765,148 @@ fn an_out_of_directory_candidate_blocks_the_bind() {
     let invocation = only_invocation(&store, &eid);
     assert!(invocation.process_identity.is_some());
     assert_eq!(invocation.state, InvocationState::Running);
+}
+
+/// A contained worker runs `--chdir /workspace` inside its mount
+/// namespace, so its reported cwd is the sandbox mount — never the
+/// host launch directory. The same single-match attribution rule
+/// still re-binds it: `/workspace` inside the sandbox IS the launch's
+/// workspace bind.
+#[test]
+fn a_contained_orphan_rebinds_on_its_sandbox_workspace_cwd() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-contained");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(
+        port.clone(),
+        root.clone(),
+        Some(FIXTURE_ISOLATION_PROFILE_ID),
+    );
+    let (_w, eid) = submit_and_admit(&store, "k-shim-contained");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost writer inside the sandbox: the signature matches and
+    // its cwd reads as the sandbox workspace mount — `--chdir
+    // /workspace` inside its own mount namespace, never the host
+    // launch directory.
+    let orphan_pid = port.spawned().last().unwrap().pid;
+    port.set_cwd(orphan_pid, std::path::Path::new("/workspace"));
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert!(
+        invocation.process_identity.is_some(),
+        "the contained orphan re-binds on its sandbox workspace cwd"
+    );
+    assert_eq!(invocation.state, InvocationState::Running);
+}
+
+/// A v1 Review launch mounts the managed workspace read-only: the
+/// assessment reads produced state and a review process must never
+/// mutate the artifact workspace — writers are the only roles that
+/// mount it writable.
+#[test]
+fn a_v1_review_launch_mounts_the_workspace_read_only() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("review-ro");
+    let (w, eid) = submit_and_admit(&store, "k-shim-review");
+    // The execution keeps at most one unresolved invocation: record
+    // the writer request the submit produced as already consumed by a
+    // finished writer, so only the review request is left to start.
+    let writer_request = format!("{}:inv:0", eid.0);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-prev".into()),
+                    request_id: writer_request.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: writer_request.clone(),
+            })
+        })
+        .unwrap();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: format!("{}:inv:7", eid.0),
+                    work_id: w.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Review,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            })
+        })
+        .unwrap();
+    let dir = root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bwrap = dir.join("fake-bwrap");
+    std::fs::write(
+        &bwrap,
+        "#!/bin/sh\n\
+         while [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+         [ \"$1\" = \"--\" ] && shift\n\
+         exec \"$@\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let worker = std::env::current_dir()
+        .unwrap()
+        .join("../../target/debug/workloop-fixture-worker")
+        .canonicalize()
+        .unwrap();
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    let sup = Supervisor::new(
+        port.clone(),
+        root.clone(),
+        vec![worker.to_string_lossy().into_owned(), "clean-exit".into()],
+        config(),
+    )
+    .with_isolation_profile(IsolationProfile {
+        id: "test-review-contained",
+        env_passthrough: &["PATH"],
+        sandbox_primitive: Some(Box::leak(
+            bwrap.to_string_lossy().into_owned().into_boxed_str(),
+        )),
+    });
+    sup.consume_requests(&store, NOW).unwrap();
+    let commands = port.spawned_commands();
+    assert!(
+        !commands.is_empty(),
+        "the review launch (and its describe probe) spawn under bwrap"
+    );
+    let ws = sup.workspace_of(&w);
+    // The describe probe already mounts the workspace read-only; the
+    // regression was the launch itself mounting it writable. Every
+    // workspace bind on this launch path is read-only.
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains(&format!("--ro-bind {} /workspace", ws.display()))),
+        "the review launch mounts the workspace read-only: {commands:?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains(&format!("--bind {} /workspace", ws.display()))),
+        "the review launch never mounts the workspace writable: {commands:?}"
+    );
 }
 
 /// A signature match the store already records — another Work's live

@@ -1029,7 +1029,14 @@ fn prepare_locked(
                     &gate,
                     || Ok(()),
                 )?;
-            } else if gate.predecessor.is_some() {
+            } else {
+                // A different durable request of the same Work may take
+                // over the managed workspace — a retried Execution's
+                // fresh Coding request or a Fix continuing from an
+                // acknowledged predecessor — only after the live tree
+                // proves it still matches this request's pins; the
+                // receipt is then re-bound to the new digest. A dirty
+                // or advanced tree still refuses and preserves WIP.
                 verify_existing(&final_path, &gate.branch, &gate.base, &gate.head)?;
                 let control = control.clone();
                 let work_id = gate.work.id.0.clone();
@@ -1054,10 +1061,6 @@ fn prepare_locked(
                         )
                     },
                 )?;
-            } else {
-                return Err(PreparationError::WorkspaceConflict {
-                    detail: "workspace receipt belongs to another request".into(),
-                });
             }
             return Ok(PreparedWorkspace {
                 path: final_path,
@@ -1076,17 +1079,14 @@ fn prepare_locked(
                 detail: "receipt belongs to a different pin".into(),
             });
         }
-        if receipt.request_digest == gate.request.request_digest {
-            if receipt.head != gate.head {
-                return Err(PreparationError::WorkspaceConflict {
-                    detail: "receipt head disagrees with the request pin".into(),
-                });
-            }
-        } else if gate.predecessor.is_none() {
+        if receipt.request_digest == gate.request.request_digest && receipt.head != gate.head {
             return Err(PreparationError::WorkspaceConflict {
-                detail: "receipt belongs to another request".into(),
+                detail: "receipt head disagrees with the request pin".into(),
             });
         }
+        // A different digest under the same pin rebuilds at this
+        // request's pins: the tree is gone, so there is nothing to
+        // preserve and `build_staging` lands exactly on the gate.
     }
     let staging = unique_staging(&control, &gate.work.id.0);
     std::fs::create_dir(&staging).map_err(PreparationError::Io)?;

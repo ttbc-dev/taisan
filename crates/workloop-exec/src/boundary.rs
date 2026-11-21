@@ -373,13 +373,21 @@ fn collect_manifest(
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        // Never follow a member link: a symlink's identity is its
+        // target path, and recursing or hashing through it would
+        // fold an outside tree into this config's identity.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path)?.to_string_lossy().into_owned();
+            out.push(format!("link:{rel}:{target}"));
+        } else if file_type.is_dir() {
             out.push(format!("dir:{rel}"));
             collect_manifest(root, &path, out, budget)?;
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
+            // Content, not name+size: a same-size edit is an identity
+            // change the gate must re-prove.
             let digest = file_content_digest(&path)?;
-            out.push(format!("file:{rel}:{}:{digest}", metadata.len()));
+            out.push(format!("file:{rel}:{}:{digest}", entry.metadata()?.len()));
         }
     }
     Ok(())
@@ -532,6 +540,31 @@ mod tests {
         // identity_digest re-reads the file each call.
         let d2 = boundary.identity_digest().unwrap();
         assert_ne!(d1, d2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_same_size_member_edit_changes_the_directory_identity() {
+        let dir = tmp("dirmanifest");
+        let cfg_dir = dir.join("provider.d");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m1\"\n").unwrap();
+        let digest_before = provider_config_digest(&cfg_dir).unwrap();
+        // Same byte length, different content.
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m2\"\n").unwrap();
+        let digest_after = provider_config_digest(&cfg_dir).unwrap();
+        assert_ne!(
+            digest_before, digest_after,
+            "a same-size content edit must re-prove the boundary"
+        );
+        // A re-pointed member link is an identity change too.
+        std::fs::write(dir.join("real.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.toml"), cfg_dir.join("b.toml")).unwrap();
+        let linked = provider_config_digest(&cfg_dir).unwrap();
+        std::fs::remove_file(cfg_dir.join("b.toml")).unwrap();
+        std::fs::write(dir.join("other.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("other.toml"), cfg_dir.join("b.toml")).unwrap();
+        assert_ne!(linked, provider_config_digest(&cfg_dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -338,9 +338,6 @@ impl RunHost {
         match config.host.adapter.as_str() {
             "fixture" => Ok(Self::Fixture(Box::new(FixtureGithub::new()))),
             "github" => {
-                if config.allowed_effects.host_write {
-                    return Err("driver.production_effects_unavailable".into());
-                }
                 if config.host.repository.host.as_str() != "github.com"
                     || workloop_core::identity::canonical_host_instance(
                         config.host.repository.host.as_str(),
@@ -1228,8 +1225,8 @@ mod tests {
     use workloop_core::domain::*;
     use workloop_core::identity::*;
     use workloop_core::observation::{
-        CheckConclusion, Completeness, HostActionStatus, IssueState, NormalizedEffectFact,
-        Observation, ObservationFact,
+        BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
+        NormalizedEffectFact, Observation, ObservationFact, ProcessStateFact,
     };
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
@@ -2495,7 +2492,16 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
+    /// A one-shot fault armed on one transport operation: `Refuse`
+    /// answers before any effect lands, `Lose` performs the effect
+    /// and then loses the response — the `unknown` receipt path.
+    #[derive(Clone)]
+    enum ArmedFault {
+        Refuse(ApiError),
+        Lose(ApiError),
+    }
+
+    #[derive(Default, Clone)]
     struct FakeGitHub {
         repo_ok: bool,
         issues: std::collections::HashMap<String, Result<RemoteIssue, ApiError>>,
@@ -2505,6 +2511,19 @@ mod tests {
         reviews: std::collections::HashMap<String, Result<Vec<RemoteReview>, ApiError>>,
         findings: std::collections::HashMap<String, Result<Vec<RemoteReviewFinding>, ApiError>>,
         deadlines: Vec<Option<std::time::Instant>>,
+        /// `(repository, change id)` → posted comments, in order.
+        comments: std::collections::HashMap<String, Vec<RemoteComment>>,
+        /// `child object` → `parent object` — the ancestry
+        /// `contains_revision` walks.
+        parents: std::collections::HashMap<String, String>,
+        pull_seq: u64,
+        comment_seq: u64,
+        /// One-shot armed faults per operation name.
+        armed: std::collections::HashMap<String, ArmedFault>,
+        /// The login `viewer()` attests — the ambient identity the
+        /// double models; `bot-pub` (the suite's bound publisher)
+        /// by default.
+        viewer: Option<String>,
     }
 
     impl FakeGitHub {
@@ -2526,6 +2545,32 @@ mod tests {
                 body: String::new(),
                 merged: false,
             }
+        }
+
+        /// Arm a one-shot fault on `op`: the next call refuses before
+        /// any effect (`Refuse`) or lands the effect and loses the
+        /// response (`Lose`).
+        fn arm(&mut self, op: &str, fault: ArmedFault) {
+            self.armed.insert(op.to_string(), fault);
+        }
+
+        /// Take the armed fault for `op`, if any — one-shot.
+        fn take_fault(&mut self, op: &str) -> Option<ArmedFault> {
+            self.armed.remove(op)
+        }
+
+        /// The branch head the remote records, `None` when absent.
+        fn branch_head(&self, repository: &RepositoryRef, branch: &str) -> Option<String> {
+            match self.branches.get(&format!("{repository}:{branch}")) {
+                Some(Ok(head)) => head.clone(),
+                _ => None,
+            }
+        }
+
+        /// Seed `(repository, branch)` at `head` for write guards.
+        fn seed_branch_head(&mut self, repository: &RepositoryRef, branch: &str, head: &str) {
+            self.branches
+                .insert(format!("{repository}:{branch}"), Ok(Some(head.to_string())));
         }
     }
 
@@ -2560,12 +2605,33 @@ mod tests {
 
         fn write_ref(
             &mut self,
-            _repository: &RepositoryRef,
-            _branch: &str,
-            _new_head: &str,
-            _expected_prior: Option<&str>,
+            repository: &RepositoryRef,
+            branch: &str,
+            new_head: &str,
+            expected_prior: Option<&str>,
         ) -> Result<String, ApiError> {
-            unreachable!("the read-only driver never writes")
+            let fault = self.take_fault("write_ref");
+            let lost = match &fault {
+                Some(ArmedFault::Refuse(e)) => return Err(e.clone()),
+                Some(ArmedFault::Lose(e)) => Some(e.clone()),
+                None => None,
+            };
+            let key = format!("{repository}:{branch}");
+            let current = match self.branches.get(&key) {
+                Some(Ok(head)) => head.clone(),
+                Some(Err(e)) => return Err(e.clone()),
+                None => None,
+            };
+            if current.as_deref() != expected_prior {
+                return Err(ApiError::Refused {
+                    reason: "stale_head".into(),
+                });
+            }
+            self.branches.insert(key, Ok(Some(new_head.to_string())));
+            if let Some(e) = lost {
+                return Err(e);
+            }
+            Ok(new_head.to_string())
         }
 
         fn read_pull(
@@ -2585,51 +2651,159 @@ mod tests {
 
         fn open_pull(
             &mut self,
-            _repository: &RepositoryRef,
-            _source_branch: &str,
-            _target_branch: &str,
-            _title: &str,
-            _body: &str,
+            repository: &RepositoryRef,
+            source_branch: &str,
+            target_branch: &str,
+            title: &str,
+            body: &str,
         ) -> Result<RemotePull, ApiError> {
-            unreachable!("the read-only driver never writes")
+            let fault = self.take_fault("open_pull");
+            let lost = match &fault {
+                Some(ArmedFault::Refuse(e)) => return Err(e.clone()),
+                Some(ArmedFault::Lose(e)) => Some(e.clone()),
+                None => None,
+            };
+            let prefix = format!("{repository}:");
+            let duplicate = self.pulls.iter().any(|(key, p)| {
+                key.starts_with(&prefix)
+                    && matches!(p, Ok(pull)
+                        if pull.source_branch == source_branch
+                            && pull.target_branch == target_branch
+                            && !pull.merged)
+            });
+            if duplicate {
+                return Err(ApiError::Refused {
+                    reason: "pull request already exists".into(),
+                });
+            }
+            self.pull_seq += 1;
+            let head_sha = self
+                .branch_head(repository, source_branch)
+                .unwrap_or_default();
+            let pull = RemotePull {
+                id: format!("pr-{}", self.pull_seq),
+                display_number: self.pull_seq,
+                head_sha,
+                source_branch: source_branch.to_string(),
+                target_branch: target_branch.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+                merged: false,
+            };
+            self.pulls
+                .insert(format!("{repository}:{}", pull.id), Ok(pull.clone()));
+            if let Some(e) = lost {
+                return Err(e);
+            }
+            Ok(pull)
         }
 
         fn update_pull(
             &mut self,
-            _repository: &RepositoryRef,
-            _change_id: &ChangeRequestId,
-            _title: Option<&str>,
-            _body: Option<&str>,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+            title: Option<&str>,
+            body: Option<&str>,
         ) -> Result<RemotePull, ApiError> {
-            unreachable!("the read-only driver never writes")
+            let fault = self.take_fault("update_pull");
+            let lost = match &fault {
+                Some(ArmedFault::Refuse(e)) => return Err(e.clone()),
+                Some(ArmedFault::Lose(e)) => Some(e.clone()),
+                None => None,
+            };
+            let key = format!("{repository}:{}", change_id.as_str());
+            let mut pull = match self.pulls.get(&key) {
+                Some(Ok(pull)) => pull.clone(),
+                Some(Err(e)) => return Err(e.clone()),
+                None => {
+                    return Err(ApiError::Refused {
+                        reason: "pull not found".into(),
+                    });
+                }
+            };
+            if let Some(title) = title {
+                pull.title = title.to_string();
+            }
+            if let Some(body) = body {
+                pull.body = body.to_string();
+            }
+            self.pulls.insert(key, Ok(pull.clone()));
+            if let Some(e) = lost {
+                return Err(e);
+            }
+            Ok(pull)
         }
 
         fn comment_on_pull(
             &mut self,
-            _repository: &RepositoryRef,
-            _change_id: &ChangeRequestId,
-            _marker: &str,
-            _body: &str,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+            marker: &str,
+            body: &str,
         ) -> Result<RemoteComment, ApiError> {
-            unreachable!("the read-only driver never writes")
+            let fault = self.take_fault("comment_on_pull");
+            let lost = match &fault {
+                Some(ArmedFault::Refuse(e)) => return Err(e.clone()),
+                Some(ArmedFault::Lose(e)) => Some(e.clone()),
+                None => None,
+            };
+            self.comment_seq += 1;
+            let comment = RemoteComment {
+                comment_id: format!("c-{}", self.comment_seq),
+                marker: marker.to_string(),
+                body: body.to_string(),
+            };
+            self.comments
+                .entry(format!("{repository}:{}", change_id.as_str()))
+                .or_default()
+                .push(comment.clone());
+            if let Some(e) = lost {
+                return Err(e);
+            }
+            Ok(comment)
         }
 
         fn find_comment(
             &mut self,
-            _repository: &RepositoryRef,
-            _change_id: &ChangeRequestId,
-            _marker: &str,
+            repository: &RepositoryRef,
+            change_id: &ChangeRequestId,
+            marker: &str,
         ) -> Result<Option<RemoteComment>, ApiError> {
-            unreachable!("the read-only driver never reconciles writes")
+            let fault = self.take_fault("find_comment");
+            if let Some(ArmedFault::Refuse(e)) | Some(ArmedFault::Lose(e)) = &fault {
+                return Err(e.clone());
+            }
+            let found = self
+                .comments
+                .get(&format!("{repository}:{}", change_id.as_str()))
+                .and_then(|comments| comments.iter().find(|c| c.marker == marker).cloned());
+            Ok(found)
         }
 
         fn list_pulls_on_branch(
             &mut self,
-            _repository: &RepositoryRef,
-            _source_branch: &str,
-            _head_sha: &str,
+            repository: &RepositoryRef,
+            source_branch: &str,
+            head_sha: &str,
         ) -> Result<Vec<RemotePull>, ApiError> {
-            unreachable!("the read-only driver never reconciles writes")
+            let fault = self.take_fault("list_pulls_on_branch");
+            if let Some(ArmedFault::Refuse(e)) | Some(ArmedFault::Lose(e)) = &fault {
+                return Err(e.clone());
+            }
+            let prefix = format!("{repository}:");
+            Ok(self
+                .pulls
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .filter_map(|(_, p)| match p {
+                    Ok(pull)
+                        if pull.source_branch == source_branch && pull.head_sha == head_sha =>
+                    {
+                        Some(pull.clone())
+                    }
+                    _ => None,
+                })
+                .collect())
         }
 
         fn check_runs(
@@ -2668,10 +2842,24 @@ mod tests {
         fn contains_revision(
             &mut self,
             _repository: &RepositoryRef,
-            _ancestor: &str,
-            _descendant: &str,
+            ancestor: &str,
+            descendant: &str,
         ) -> Result<bool, ApiError> {
-            unreachable!("the read-only driver never compares revisions")
+            let fault = self.take_fault("contains_revision");
+            if let Some(ArmedFault::Refuse(e)) | Some(ArmedFault::Lose(e)) = &fault {
+                return Err(e.clone());
+            }
+            let mut current = descendant.to_string();
+            for _ in 0..=self.parents.len() {
+                if current == ancestor {
+                    return Ok(true);
+                }
+                match self.parents.get(&current) {
+                    Some(parent) => current = parent.clone(),
+                    None => return Ok(false),
+                }
+            }
+            Ok(false)
         }
 
         fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
@@ -2683,6 +2871,10 @@ mod tests {
                         reason: "outage".into(),
                     })
                 })
+        }
+
+        fn viewer(&mut self) -> Result<String, ApiError> {
+            Ok(self.viewer.clone().unwrap_or_else(|| "bot-pub".into()))
         }
 
         fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) {
@@ -2876,10 +3068,9 @@ mod tests {
             RepositoryId::trusted("owner/repo"),
         );
         cfg.allowed_effects.host_write = true;
-        let err = RunHost::from_config(&cfg).err().unwrap();
         assert!(
-            err.contains("production_effects_unavailable"),
-            "github + host_write refuses before any run: {err}"
+            matches!(RunHost::from_config(&cfg), Ok(RunHost::Github(_))),
+            "github + host_write composes the production driver: {cfg:?}"
         );
         cfg.host.adapter = AdapterId::trusted("s1_bridge");
         let err = RunHost::from_config(&cfg).err().unwrap();
@@ -3169,10 +3360,10 @@ mod tests {
     }
 
     #[test]
-    fn production_outbox_with_outstanding_intents_fails_visibly() {
+    fn production_outbox_attempts_pending_intents_through_the_bounded_drain() {
         let store = SqliteStore::in_memory(2).unwrap();
         let (w, _e) = submit(&store, "k-prod-outbox");
-        insert_outbox_intent(
+        let push_id = insert_outbox_intent(
             &store,
             &w,
             HostAction::PushRef {
@@ -3182,21 +3373,32 @@ mod tests {
             },
             HostActionStatus::Pending,
         );
+        // The branch read cannot be answered: the pre-write check is
+        // indeterminate, so the intent records `unknown` and the write
+        // is never attempted blind.
         let mut adapter = production_adapter(FakeGitHub::new());
         let settings = settings();
         let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
         assert_eq!(report.phases[3].phase, "host_outbox");
         assert_eq!(
-            report.phases[3].status, "failed",
-            "a pending production write is a visible unsupported error: {:?}",
+            report.phases[3].status, "completed",
+            "the bounded drain settles the item with a receipt: {:?}",
             report.phases[3]
         );
-        let intents = store.transact(|tx| tx.action_intents()).unwrap();
-        assert_eq!(
-            intents[0].status,
-            HostActionStatus::Pending,
-            "the intent is never attempted"
+        assert!(
+            matches!(
+                intent_status(&store, &push_id),
+                HostActionStatus::Unknown { .. }
+            ),
+            "an indeterminate pre-write read is unknown, never a blind write"
         );
+        // A second pass keeps reconciling the same outstanding intent —
+        // it is never dropped and never re-attempted blind.
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(matches!(
+            intent_status(&store, &push_id),
+            HostActionStatus::Unknown { .. }
+        ));
         let store = SqliteStore::in_memory(2).unwrap();
         submit(&store, "k-prod-empty");
         let mut adapter = production_adapter(FakeGitHub::new());
@@ -4209,6 +4411,470 @@ mod tests {
             head_facts(&store, &w).is_empty(),
             "a finished Work's change is never re-read: {:?}",
             head_facts(&store, &w)
+        );
+    }
+
+    fn intent_status(store: &SqliteStore, action_id: &str) -> HostActionStatus {
+        store
+            .transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .find(|i| i.action_id == action_id)
+                    .map(|i| i.status))
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Every `host_action_result` receipt recorded for the Work, in
+    /// observation order.
+    fn action_receipts(
+        store: &SqliteStore,
+        work_id: &WorkId,
+    ) -> Vec<(String, HostActionStatus, Vec<NormalizedEffectFact>)> {
+        store
+            .transact(|tx| tx.observations_for_work(work_id))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::HostActionResult {
+                    action_id,
+                    status,
+                    effects,
+                    ..
+                } => Some((action_id.clone(), status.clone(), effects.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Push lands and the follow-up create is refused: each stage keeps
+    /// its own receipt — the push `applied`, the create `failed` — and
+    /// the terminal failure is never retried into a duplicate effect.
+    #[test]
+    fn a_production_push_and_a_failed_create_keep_separate_receipts() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-prod-separate");
+        let mut fake = FakeGitHub::new();
+        fake.branches.insert(cfg_key("work/prod"), Ok(None));
+        fake.arm(
+            "open_pull",
+            ArmedFault::Refuse(ApiError::Refused {
+                reason: "validation failed".into(),
+            }),
+        );
+        let push_id = insert_outbox_intent(
+            &store,
+            &w,
+            push_intent("work/prod", "prod-head-1"),
+            HostActionStatus::Pending,
+        );
+        let open_id = insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::OpenChangeRequest {
+                source_branch: "work/prod".into(),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+            HostActionStatus::Pending,
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+
+        assert_eq!(
+            intent_status(&store, &push_id),
+            HostActionStatus::Applied,
+            "the push receipt lands applied"
+        );
+        assert!(
+            matches!(
+                intent_status(&store, &open_id),
+                HostActionStatus::Failed { .. }
+            ),
+            "the refused create is a definite failure, never unknown: {:?}",
+            intent_status(&store, &open_id)
+        );
+        let receipts = action_receipts(&store, &w);
+        assert_eq!(receipts.len(), 2, "one receipt per stage: {receipts:?}");
+        assert!(receipts.iter().any(|(id, status, effects)| {
+            id == &push_id
+                && *status == HostActionStatus::Applied
+                && effects.iter().any(|e| {
+                    matches!(e, NormalizedEffectFact::RefPublished { branch, .. }
+                        if branch == "work/prod")
+                })
+        }));
+        assert!(receipts.iter().any(|(id, status, _)| {
+            id == &open_id && matches!(status, HostActionStatus::Failed { .. })
+        }));
+        assert_eq!(
+            adapter
+                .client()
+                .branch_head(&config().host.repository, "work/prod")
+                .as_deref(),
+            Some("prod-head-1"),
+            "the remote branch carries the produced revision"
+        );
+        assert!(
+            !adapter.client().pulls.values().any(|p| p.is_ok()),
+            "the refused create left no change request"
+        );
+
+        // The failed stage is terminal: the next pass replays nothing.
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(action_receipts(&store, &w).len(), 2);
+        assert!(
+            !adapter.client().pulls.values().any(|p| p.is_ok()),
+            "no blind retry opened a change request"
+        );
+    }
+
+    /// A create whose response was lost lands remotely anyway: after a
+    /// restart the read-only reconcile pass finds the recorded
+    /// revision's matching change and settles `applied` — the original
+    /// action id, payload, and actor are never re-issued.
+    #[test]
+    fn an_unknown_create_reconciles_from_the_remote_after_restart() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-prod-unknown");
+        // The push already settled: it is the recorded source revision
+        // the open's read-back matches against.
+        insert_outbox_intent(
+            &store,
+            &w,
+            push_intent("work/prod", "prod-head-1"),
+            HostActionStatus::Applied,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.seed_branch_head(&config().host.repository, "work/prod", "prod-head-1");
+        let open_id = insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::OpenChangeRequest {
+                source_branch: "work/prod".into(),
+                target_branch: "main".into(),
+                title: "t".into(),
+                body: String::new(),
+            },
+            HostActionStatus::Pending,
+        );
+        // The create lands but its response is lost: `unknown`, and the
+        // remote now holds exactly one matching change request.
+        fake.arm(
+            "open_pull",
+            ArmedFault::Lose(ApiError::Unknown {
+                reason: "response lost".into(),
+            }),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            matches!(
+                intent_status(&store, &open_id),
+                HostActionStatus::Unknown { .. }
+            ),
+            "the lost response is unknown, never failed: {:?}",
+            intent_status(&store, &open_id)
+        );
+        assert_eq!(adapter.client().pull_seq, 1, "one create attempt landed");
+
+        // Restart: a fresh adapter over the same remote state. The
+        // reconcile pass — not a re-issued write — settles the intent.
+        let remote = adapter.client().clone();
+        let mut adapter = production_adapter(remote);
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            intent_status(&store, &open_id),
+            HostActionStatus::Applied,
+            "the read-back adopts the landed change under the original action id"
+        );
+        assert_eq!(
+            adapter.client().pull_seq,
+            1,
+            "reconciliation never issues a second create"
+        );
+        let opened = action_receipts(&store, &w)
+            .into_iter()
+            .flat_map(|(_, _, effects)| effects)
+            .find_map(|e| match e {
+                NormalizedEffectFact::ChangeOpened { change, .. } => Some(change),
+                _ => None,
+            })
+            .expect("the settled receipt carries the opened change");
+        assert_eq!(opened.change_request.as_str(), "pr-1");
+    }
+
+    /// The remote head moved past the recorded prior: the guarded
+    /// write refuses `stale_head`, the receipt is `failed`, and the
+    /// observed remote position is recorded before the refusal so a
+    /// later re-issue derives its guard from fresh evidence.
+    #[test]
+    fn a_stale_expected_head_refuses_the_push_and_records_the_remote_position() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, _e) = submit(&store, "k-prod-stale");
+        let prior = CommitRevision::new(config().host.repository.clone(), "old-head").unwrap();
+        let push_id = insert_outbox_intent(
+            &store,
+            &w,
+            HostAction::PushRef {
+                branch: "work/stale".into(),
+                produced: CommitRevision::new(config().host.repository.clone(), "prod-head-2")
+                    .unwrap(),
+                expected_prior: Some(prior),
+            },
+            HostActionStatus::Pending,
+        );
+        let mut fake = FakeGitHub::new();
+        fake.seed_branch_head(&config().host.repository, "work/stale", "new-head");
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+
+        assert!(
+            matches!(
+                intent_status(&store, &push_id),
+                HostActionStatus::Failed { ref reason } if reason.contains("stale_head")
+            ),
+            "the stale guard is a definite refusal: {:?}",
+            intent_status(&store, &push_id)
+        );
+        let branch_states: Vec<BranchState> = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::BranchState { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            branch_states.iter().any(|s| matches!(
+                s,
+                BranchState::At { revision } if revision.object == "new-head"
+            )),
+            "the fresh remote position is recorded before the refusal: {branch_states:?}"
+        );
+        assert_eq!(
+            adapter
+                .client()
+                .branch_head(&config().host.repository, "work/stale")
+                .as_deref(),
+            Some("new-head"),
+            "the refused write never moved the remote"
+        );
+    }
+
+    /// Permission drift has two honest shapes: a revoked execution
+    /// grant skips the drain without a receipt or a spent attempt, and
+    /// a remote refusal is a definite `failed` — never `unknown`,
+    /// never retried blind.
+    #[test]
+    fn permission_drift_skips_or_fails_never_retries_blind() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-prod-drift");
+        let push_id = insert_outbox_intent(
+            &store,
+            &w,
+            push_intent("work/drift", "prod-head-3"),
+            HostActionStatus::Pending,
+        );
+        // The execution's host_write grant is revoked after admission.
+        store
+            .transact(|tx| {
+                let mut execution = tx.execution(&e)?.unwrap();
+                let expected = execution.state.clone();
+                execution.allowed_effects.host_write = false;
+                tx.apply(&Effect::UpdateExecution {
+                    execution,
+                    expected_state: expected,
+                })
+            })
+            .unwrap();
+        let mut fake = FakeGitHub::new();
+        fake.branches.insert(cfg_key("work/drift"), Ok(None));
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(
+            intent_status(&store, &push_id),
+            HostActionStatus::Pending,
+            "a denied grant leaves the intent pending"
+        );
+        assert!(
+            action_receipts(&store, &w).is_empty(),
+            "no receipt is recorded for an attempt that never reached the host"
+        );
+        assert_eq!(
+            adapter
+                .client()
+                .branch_head(&config().host.repository, "work/drift"),
+            None,
+            "the remote was never touched"
+        );
+        let _ = report;
+
+        // Restore the grant; the remote now refuses the write — a
+        // definite failure recorded once, terminal thereafter.
+        store
+            .transact(|tx| {
+                let mut execution = tx.execution(&e)?.unwrap();
+                let expected = execution.state.clone();
+                execution.allowed_effects.host_write = true;
+                tx.apply(&Effect::UpdateExecution {
+                    execution,
+                    expected_state: expected,
+                })
+            })
+            .unwrap();
+        adapter.client_mut().arm(
+            "write_ref",
+            ArmedFault::Refuse(ApiError::Refused {
+                reason: "permission denied".into(),
+            }),
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            matches!(
+                intent_status(&store, &push_id),
+                HostActionStatus::Failed { ref reason } if reason == "permission denied"
+            ),
+            "the remote refusal is a definite failure: {:?}",
+            intent_status(&store, &push_id)
+        );
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert_eq!(action_receipts(&store, &w).len(), 1);
+    }
+
+    /// A terminal settle waits for the outstanding receipt: with the
+    /// writer proven gone and a cancel recorded, the Execution stays
+    /// `stopping` — no Outcome — while the intent is `unknown`. The
+    /// reconcile pass's `failed` receipt is what lets the settle
+    /// record the cancelled Outcome.
+    #[test]
+    fn a_terminal_settle_waits_for_the_outstanding_receipt() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        let (w, e) = submit(&store, "k-prod-settle");
+        let settings = settings();
+        // A writer exists so its proven exit is the stop proof the
+        // settle requires.
+        let mut adapter = production_adapter(FakeGitHub::new());
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        let request = store
+            .transact(|tx| {
+                Ok(tx
+                    .pending_requests()?
+                    .into_iter()
+                    .next()
+                    .expect("one request"))
+            })
+            .unwrap();
+        let invocation_id = store
+            .transact(|tx| {
+                let inv_id = tx.alloc_id("inv")?;
+                tx.apply(&Effect::InsertInvocation {
+                    invocation: Invocation {
+                        id: InvocationId(inv_id.clone()),
+                        request_id: request.request_id.clone(),
+                        execution_id: e.clone(),
+                        role: InvocationRole::Coding,
+                        state: InvocationState::Prepared,
+                        process_identity: Some(ProcessIdentity {
+                            pid: 4242,
+                            started_at: "boot".into(),
+                            pgid: None,
+                        }),
+                        descendants: vec![],
+                        required_artifacts: vec![],
+                        evidence_refs: vec![],
+                    },
+                })?;
+                Ok(InvocationId(inv_id))
+            })
+            .unwrap();
+        // The push's response was lost: outstanding until reconciled.
+        let push_id = insert_outbox_intent(
+            &store,
+            &w,
+            push_intent("work/settle", "prod-head-4"),
+            HostActionStatus::Unknown {
+                reason: "response lost".into(),
+            },
+        );
+        // Cancel the Work, then prove the writer gone.
+        let version = store
+            .transact(|tx| Ok(tx.work(&w)?.unwrap().version))
+            .unwrap();
+        handle_command(
+            &store,
+            &config(),
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: "k-prod-settle-cancel".into(),
+                body: CommandBody::Cancel {
+                    work_id: w.clone(),
+                    expected_work_version: version,
+                    execution_id: Some(e.clone()),
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(execution(&store, &e).state, ExecutionState::Stopping);
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e.clone()),
+                fact: ObservationFact::ProcessState {
+                    invocation_id,
+                    process_identity: "4242@boot".into(),
+                    state: ProcessStateFact::Exited,
+                    exit_code: Some(0),
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+        let settled = execution(&store, &e);
+        assert_eq!(
+            settled.state,
+            ExecutionState::Stopping,
+            "the outstanding intent blocks the terminal settle"
+        );
+        assert!(settled.outcome.is_none(), "no Outcome before the receipt");
+
+        // The remote branch is definitively absent: reconcile records
+        // `failed`, and that receipt re-drives the deferred settle.
+        adapter
+            .client_mut()
+            .branches
+            .insert(cfg_key("work/settle"), Ok(None));
+        run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            matches!(
+                intent_status(&store, &push_id),
+                HostActionStatus::Failed { .. }
+            ),
+            "definitive absence settles the unknown intent failed"
+        );
+        let settled = execution(&store, &e);
+        assert_eq!(settled.state, ExecutionState::Cancelled);
+        assert_eq!(
+            settled.outcome.map(|o| o.state),
+            Some(ExecutionState::Cancelled),
+            "the Outcome lands only after the receipt and the stop proof"
         );
     }
 }

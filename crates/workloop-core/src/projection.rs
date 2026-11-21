@@ -92,12 +92,16 @@ pub struct ExecutionView {
 }
 
 /// One finding the detail pane displays: the occurrence id a
-/// `JudgeFindings` decision names, plus the source-supplied key for
-/// display. Identity is the occurrence id, never the display text.
+/// `JudgeFindings` decision names, plus the source-supplied key and
+/// the sealed claim's human-readable text for display. Identity is
+/// the occurrence id, never the display text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FindingView {
     pub occurrence_id: String,
     pub source_key: String,
+    /// The sealed claim's finding text — display only.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +466,7 @@ pub fn work_detail(
             findings.push(FindingView {
                 occurrence_id: o.id,
                 source_key: o.source_key,
+                summary: o.summary,
             });
         }
         if let Some(j) = tx.judgment_for_round(&round.id)? {
@@ -940,6 +945,38 @@ pub fn outstanding_actions(tx: &dyn ReadView, work_id: &WorkId) -> Result<Vec<St
                     i.status,
                     HostActionStatus::Pending | HostActionStatus::Unknown { .. }
                 )
+        })
+        .map(|i| i.action_id)
+        .collect())
+}
+
+/// Outstanding effects that still justify deferring a terminal
+/// outcome: `unknown` intents always — the write may already have
+/// landed and only reconciliation settles it — and `pending` intents
+/// only while the Work's latest Execution still grants `host_write`.
+/// Under a denied grant the write drain can never attempt a pending
+/// intent, so deferring on it stalls the terminal outcome forever
+/// with no effect to wait for (the intent record itself stays
+/// `pending` — a denied permission is a deferral, not a verdict).
+pub fn settlement_blocking_actions(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+) -> Result<Vec<String>, StoreError> {
+    let host_write = tx
+        .executions_for_work(work_id)?
+        .into_iter()
+        .max_by_key(|execution| execution.ordinal)
+        .is_some_and(|execution| execution.allowed_effects.host_write);
+    Ok(tx
+        .action_intents()?
+        .into_iter()
+        .filter(|i| {
+            &i.work_id == work_id
+                && match i.status {
+                    HostActionStatus::Pending => host_write,
+                    HostActionStatus::Unknown { .. } => true,
+                    _ => false,
+                }
         })
         .map(|i| i.action_id)
         .collect())

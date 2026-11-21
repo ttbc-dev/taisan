@@ -272,14 +272,19 @@ pub fn collect(
     })?;
     if let Some(prior) = prior {
         let ObservationFact::WorkerReport {
-            report: accepted, ..
+            report: accepted,
+            classification: accepted_classification,
+            ..
         } = prior.fact
         else {
             unreachable!("filtered to WorkerReport facts")
         };
-        if accepted == report_evidence {
-            // Same report identity already accepted — idempotent
-            // replay; a differing measured log is not a new report.
+        if accepted == report_evidence && accepted_classification == classification {
+            // Same report identity and class already accepted —
+            // idempotent replay; a differing measured log is not a
+            // new report. Equal evidence under a different class —
+            // an `absent` first report followed by an unsafe-path
+            // read, both evidence-free — is a conflict, not a replay.
             return Ok(None);
         }
         return Ok(Some(ObservationFact::WorkerReportConflict {

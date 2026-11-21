@@ -15,6 +15,7 @@ use workloop_core::domain::*;
 use workloop_core::ports::{ProcessControlPort, WorkerEnv};
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::IsolationProfile;
+use workloop_core::worker_v2::WorkerRequestV2;
 
 use crate::containment::{self, Gate, MountPlan};
 use crate::egress::ConnectProxy;
@@ -78,6 +79,10 @@ pub struct HandoffLayout {
     pub workspace_root: PathBuf,
     /// Root containing per-Invocation out directories.
     pub out_root: PathBuf,
+    /// The installation state root holding the store — masked inside
+    /// a contained verification sandbox beside `workspace_root` when
+    /// a fixed system bind covers it. `None` names no separate root.
+    pub state_root: Option<PathBuf>,
     /// The §14.5 verification sandbox; `None` is the recorded
     /// hygiene-only runner.
     pub verification: Option<VerificationSandbox>,
@@ -86,6 +91,19 @@ pub struct HandoffLayout {
 impl HandoffLayout {
     fn workspace_of(&self, work_id: &WorkId) -> PathBuf {
         self.workspace_root.join(format!("ws-{}", work_id.0))
+    }
+
+    /// The installation-owned roots a contained verification sandbox
+    /// masks when a fixed system bind would otherwise expose them.
+    pub(crate) fn mask_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(2);
+        if let Some(state) = &self.state_root {
+            roots.push(state.clone());
+        }
+        if !roots.contains(&self.workspace_root) {
+            roots.push(self.workspace_root.clone());
+        }
+        roots
     }
 
     fn out_dir_of(&self, handoff: &ArtifactHandoff) -> PathBuf {
@@ -250,6 +268,7 @@ pub fn drive(
     artifact_id: &str,
     seed: &HandoffSeed,
     max_attempts: u32,
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<ArtifactHandoff, HandoffError> {
     let existing = store.transact(|tx| tx.artifact_handoff(artifact_id))?;
     let mut handoff = match existing {
@@ -299,7 +318,7 @@ pub fn drive(
         return Err(e);
     }
     if handoff.state == HandoffState::Acknowledged {
-        run_verifications(store, layout, &handoff, seed)?;
+        run_verifications(store, layout, &handoff, seed, clock)?;
     }
     Ok(handoff)
 }
@@ -313,6 +332,7 @@ fn run_verifications(
     layout: &HandoffLayout,
     handoff: &ArtifactHandoff,
     seed: &HandoffSeed,
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<(), HandoffError> {
     if seed.verification_argv.is_empty() {
         return Ok(());
@@ -352,6 +372,7 @@ fn run_verifications(
             argv,
             &scratch,
             &seed.verification_egress_hosts,
+            clock,
         )?;
     }
     Ok(())
@@ -366,6 +387,13 @@ pub struct HandoffSeed {
     /// [`derive_base`]) — the revision `produced` must descend from.
     /// Empty when the workspace records no base branch.
     pub base: String,
+    /// The revision the managed branch was started at — `base` for a
+    /// fresh Coding workspace, the predecessor's produced commit for
+    /// a Fix (the workspace branches at produced, not the fork
+    /// point). Empty for a v1 dispatch, where `base` is the only
+    /// recorded start. `produced == branch_start` means the writer
+    /// committed nothing.
+    pub branch_start: String,
     /// Work branch the worker committed on (`work/<work_id>`).
     pub branch: String,
     pub work_id: WorkId,
@@ -494,13 +522,22 @@ fn export_stage(
         return mark_invalid(store, handoff, "stale_base");
     }
 
-    // A branch that never moved past base produced nothing — for a
-    // Coding/Fix writer that is an absent artifact, not a handoff.
+    // A branch that never moved past the revision it was started at
+    // produced nothing — for a Coding/Fix writer that is an absent
+    // artifact, not a handoff. A Fix branch starts at its
+    // predecessor's produced commit, not the fork point, so the
+    // no-op check reads `branch_start` whenever the launch recorded
+    // one.
+    let branch_start = if seed.branch_start.is_empty() {
+        handoff.base.as_str()
+    } else {
+        seed.branch_start.as_str()
+    };
     if matches!(
         seed.invocation.role,
         InvocationRole::Coding | InvocationRole::Fix
-    ) && !handoff.base.is_empty()
-        && produced == handoff.base
+    ) && !branch_start.is_empty()
+        && produced == branch_start
     {
         return mark_invalid(store, handoff, "nothing_produced");
     }
@@ -716,9 +753,21 @@ pub fn reclaimable(layout: &HandoffLayout, handoff: &ArtifactHandoff) -> bool {
     .unwrap_or(false)
 }
 
-/// Wall-clock bound for one verification command (docs/worker-protocol:
-/// the runner is bounded by its own per-command timeout).
-const VERIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+/// Wall-clock bound for one verification command under the recorded
+/// v1 hygiene-only profile (docs/worker-protocol: the runner is
+/// bounded by its own per-command timeout). A dispatch carrying a
+/// verified `taisan.worker.request/2` body selects the approved §14.5
+/// profile instead — the bound follows the durable request record,
+/// never the ambient configuration.
+const VERIFICATION_TIMEOUT_V1: Duration = Duration::from_secs(300);
+/// Captured-output bound under the recorded v1 profile: the 64 KiB
+/// tail read back after the runner settles.
+const VERIFICATION_OUTPUT_V1: u64 = 64 * 1024;
+/// The approved v2 verification profile (`docs/v0.3.md` §14.5): 30
+/// minutes per command — never silently inherited from v1.
+const VERIFICATION_TIMEOUT_V2: Duration = Duration::from_secs(30 * 60);
+/// The approved v2 captured-output bound: an 8 MiB tail.
+const VERIFICATION_OUTPUT_V2: u64 = 8 * 1024 * 1024;
 
 enum VerificationRun {
     Finished(std::process::ExitStatus),
@@ -998,6 +1047,7 @@ fn prepare_enforcement(
 /// only on a clean exit; every other outcome is a typed refusal.
 fn prove_verification_mounts(
     ctx: &ContainedVerification,
+    layout: &HandoffLayout,
     primitive: &Path,
     env: &WorkerEnv,
 ) -> Result<(), String> {
@@ -1033,6 +1083,7 @@ fn prove_verification_mounts(
         extra_binds: vec![],
         extra_rw_binds: vec![],
         worker: None,
+        mask_roots: layout.mask_roots(),
         masked_files: vec![],
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
@@ -1117,7 +1168,7 @@ fn run_verification_contained(
         }
     };
     let contained = containment::contained_env(&env, None);
-    if let Err(reason) = prove_verification_mounts(ctx, &primitive, &contained) {
+    if let Err(reason) = prove_verification_mounts(ctx, layout, &primitive, &contained) {
         return VerificationRun::Refused(reason);
     }
     // The separate declared dependency-host policy: a per-command
@@ -1189,6 +1240,7 @@ fn run_verification_contained(
         extra_binds,
         extra_rw_binds: vec![gitdir.to_path_buf()],
         worker: worker.clone(),
+        mask_roots: layout.mask_roots(),
         masked_files: vec![],
     };
     let _ = std::fs::create_dir_all(scratch_out);
@@ -1211,6 +1263,7 @@ fn run_verification_contained(
 /// `declared_egress_hosts` is the request's immutable
 /// `verification_egress_hosts` — the Work-declared half of the §14.5
 /// effective egress set.
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     store: &impl Store,
     layout: &HandoffLayout,
@@ -1219,7 +1272,9 @@ pub fn verify(
     argv: &[String],
     scratch: &Path,
     declared_egress_hosts: &[String],
+    clock: &mut dyn FnMut() -> i64,
 ) -> Result<VerificationResult, HandoffError> {
+    let (timeout, output_cap) = verification_bounds(store, artifact_id, clock())?;
     verify_with_timeout(
         store,
         layout,
@@ -1227,9 +1282,70 @@ pub fn verify(
         requirement,
         argv,
         scratch,
-        VERIFICATION_COMMAND_TIMEOUT,
+        timeout,
+        output_cap,
         declared_egress_hosts,
     )
+}
+
+/// The per-command bounds the durable dispatch record selects: a
+/// verified `taisan.worker.request/2` body means the approved §14.5
+/// 30 min / 8 MiB profile; a v1 dispatch or an absent body keeps the
+/// recorded 300 s / 64 KiB values. Selection reads durable state
+/// only — the handoff row's own request id decides, so a later
+/// configuration change cannot silently re-bound an in-flight
+/// artifact. §14.5 bounds the profile timeout by the Execution
+/// deadline: the immutable wire `deadline_unix_seconds` clamps it,
+/// so one command can never overrun the budget the request granted.
+#[doc(hidden)]
+pub fn verification_bounds(
+    store: &impl Store,
+    artifact_id: &str,
+    now_unix_seconds: i64,
+) -> Result<(Duration, u64), HandoffError> {
+    let (v2, deadline) = store.transact(|tx| {
+        Ok(match tx.artifact_handoff(artifact_id)? {
+            Some(handoff) => match tx.worker_request_body(&handoff.request_id)? {
+                Some(body) if body.verifies() => {
+                    let req = WorkerRequestV2::parse(&body.canonical_body).map_err(|e| {
+                        StoreError::Internal {
+                            detail: format!("worker request body unreadable: {e}"),
+                        }
+                    })?;
+                    (true, Some(req.budget.deadline_unix_seconds))
+                }
+                // A body row that fails integrity is corrupt durable
+                // state — a fault, never a silent downgrade to the
+                // recorded v1 bounds and profile.
+                Some(_) => {
+                    return Err(StoreError::Internal {
+                        detail: format!(
+                            "worker request body for {} is corrupt",
+                            handoff.request_id
+                        ),
+                    });
+                }
+                None => (false, None),
+            },
+            None => (false, None),
+        })
+    })?;
+    let (timeout, output_cap) = if v2 {
+        (VERIFICATION_TIMEOUT_V2, VERIFICATION_OUTPUT_V2)
+    } else {
+        (VERIFICATION_TIMEOUT_V1, VERIFICATION_OUTPUT_V1)
+    };
+    let timeout = match deadline {
+        // A deadline that already passed bounds the run to zero: the
+        // command times out immediately and records `Inconclusive`,
+        // the same honest evidence a spent timeout reports.
+        Some(deadline) => {
+            let remaining = deadline.saturating_sub(now_unix_seconds).max(0) as u64;
+            timeout.min(Duration::from_secs(remaining))
+        }
+        None => timeout,
+    };
+    Ok((timeout, output_cap))
 }
 
 #[doc(hidden)]
@@ -1242,6 +1358,7 @@ pub fn verify_with_timeout(
     argv: &[String],
     scratch: &Path,
     timeout: Duration,
+    output_cap: u64,
     declared_egress_hosts: &[String],
 ) -> Result<VerificationResult, HandoffError> {
     let handoff = store
@@ -1319,111 +1436,127 @@ pub fn verify_with_timeout(
     // then add fresh — `worktree add` refuses a registered path.
     let _ = git(&layout.repository, &["worktree", "prune"]);
     let _ = std::fs::remove_dir_all(&worktree);
-    let (result, output) = match (
-        &enforcement,
-        git(
-            &layout.repository,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                worktree.to_str().unwrap_or_default(),
-                &produced,
-            ],
-        ),
-    ) {
-        (Err(reason), _) => (VerificationOutcome::Inconclusive, reason.clone()),
-        (Ok(_), Err(e)) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
-        (Ok(enforcement), Ok(_)) => {
-            let env_root = scratch.join(format!("verify-env-{tag}"));
-            // The worktree's own gitdir is the single writable
-            // metadata bind: `git status` can refresh its index
-            // without ever reaching another artifact's refs.
-            let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    layout
-                        .repository
-                        .join("worktrees")
-                        .join(format!("verify-{tag}"))
-                });
-            let run = match enforcement {
-                Enforcement::Hygiene => {
-                    // The recorded v1 hygiene-only environment:
-                    // allowlisted env, fresh HOME/TMPDIR, git config
-                    // scrubbed of credential helpers — required, not
-                    // sufficient; the namespace slice is the
-                    // contained path below.
-                    let _ = std::fs::create_dir_all(env_root.join("home"));
-                    let _ = std::fs::create_dir_all(env_root.join("tmp"));
-                    let env = WorkerEnv {
-                        vars: vec![
-                            (
-                                "PATH".to_string(),
-                                std::env::var("PATH").unwrap_or_default(),
-                            ),
-                            (
-                                "HOME".to_string(),
-                                env_root.join("home").to_string_lossy().into_owned(),
-                            ),
-                            (
-                                "TMPDIR".to_string(),
-                                env_root.join("tmp").to_string_lossy().into_owned(),
-                            ),
-                            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-                            ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
-                        ],
+    // A spent bound permits no run at all: no worktree is added and
+    // no command spawns — the recorded `Inconclusive` is the same
+    // honest evidence a spent timeout reports.
+    let (result, output) = if timeout.is_zero() {
+        (
+            VerificationOutcome::Inconclusive,
+            "execution deadline elapsed before verification started".to_string(),
+        )
+    } else {
+        // A refused enforcement boundary never registers a worktree —
+        // mutating the handoff repository is part of the cost the
+        // refusal exists to avoid, and cleanup below is only
+        // best-effort.
+        match &enforcement {
+            Err(reason) => (VerificationOutcome::Inconclusive, reason.clone()),
+            Ok(enforcement) => match git(
+                &layout.repository,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    worktree.to_str().unwrap_or_default(),
+                    &produced,
+                ],
+            ) {
+                Err(e) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
+                Ok(_) => {
+                    let env_root = scratch.join(format!("verify-env-{tag}"));
+                    // The worktree's own gitdir is the single writable
+                    // metadata bind: `git status` can refresh its index
+                    // without ever reaching another artifact's refs.
+                    let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| {
+                            layout
+                                .repository
+                                .join("worktrees")
+                                .join(format!("verify-{tag}"))
+                        });
+                    let run = match enforcement {
+                        Enforcement::Hygiene => {
+                            // The recorded v1 hygiene-only environment:
+                            // allowlisted env, fresh HOME/TMPDIR, git config
+                            // scrubbed of credential helpers — required, not
+                            // sufficient; the namespace slice is the
+                            // contained path below.
+                            let _ = std::fs::create_dir_all(env_root.join("home"));
+                            let _ = std::fs::create_dir_all(env_root.join("tmp"));
+                            let env = WorkerEnv {
+                                vars: vec![
+                                    (
+                                        "PATH".to_string(),
+                                        std::env::var("PATH").unwrap_or_default(),
+                                    ),
+                                    (
+                                        "HOME".to_string(),
+                                        env_root.join("home").to_string_lossy().into_owned(),
+                                    ),
+                                    (
+                                        "TMPDIR".to_string(),
+                                        env_root.join("tmp").to_string_lossy().into_owned(),
+                                    ),
+                                    ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+                                    ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+                                ],
+                            };
+                            run_verification_command(argv, &worktree, &log_path, &env, timeout)
+                        }
+                        Enforcement::Contained(ctx) => run_verification_contained(
+                            ctx,
+                            layout,
+                            argv,
+                            &worktree,
+                            &gitdir,
+                            &log_path,
+                            &env_root,
+                            &scratch.join(format!("verify-scratch-{tag}")),
+                            &tag,
+                            timeout,
+                        ),
                     };
-                    run_verification_command(argv, &worktree, &log_path, &env, timeout)
+                    // Read back only the bounded tail — never the whole file:
+                    // a large writer must not size the supervisor's memory.
+                    // The cap is the dispatch profile's: 64 KiB recorded v1,
+                    // 8 MiB approved v2.
+                    let captured = match std::fs::File::open(&log_path) {
+                        Ok(f) => {
+                            use std::io::{Read, Seek, SeekFrom};
+                            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                            let mut r = std::io::BufReader::new(f);
+                            let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
+                            let mut bytes = Vec::new();
+                            let _ = r.take(output_cap).read_to_end(&mut bytes);
+                            String::from_utf8_lossy(&bytes).into_owned()
+                        }
+                        Err(_) => String::new(),
+                    };
+                    match run {
+                        VerificationRun::Finished(status) => (
+                            match status.code() {
+                                Some(0) => VerificationOutcome::Pass,
+                                Some(_) => VerificationOutcome::Fail,
+                                // A signal-killed runner is incomplete, never a
+                                // fabricated exit code.
+                                None => VerificationOutcome::Inconclusive,
+                            },
+                            captured,
+                        ),
+                        VerificationRun::TimedOut => (
+                            VerificationOutcome::Inconclusive,
+                            format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
+                        ),
+                        VerificationRun::SpawnFailed(e) => {
+                            (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
+                        }
+                        VerificationRun::Refused(reason) => {
+                            (VerificationOutcome::Inconclusive, reason)
+                        }
+                    }
                 }
-                Enforcement::Contained(ctx) => run_verification_contained(
-                    ctx,
-                    layout,
-                    argv,
-                    &worktree,
-                    &gitdir,
-                    &log_path,
-                    &env_root,
-                    &scratch.join(format!("verify-scratch-{tag}")),
-                    &tag,
-                    timeout,
-                ),
-            };
-            // Read back only the bounded tail — never the whole file:
-            // a large writer must not size the supervisor's memory.
-            const TAIL: u64 = 64 * 1024;
-            let captured = match std::fs::File::open(&log_path) {
-                Ok(f) => {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let mut r = std::io::BufReader::new(f);
-                    let _ = r.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
-                    let mut bytes = Vec::new();
-                    let _ = r.take(TAIL).read_to_end(&mut bytes);
-                    String::from_utf8_lossy(&bytes).into_owned()
-                }
-                Err(_) => String::new(),
-            };
-            match run {
-                VerificationRun::Finished(status) => (
-                    match status.code() {
-                        Some(0) => VerificationOutcome::Pass,
-                        Some(_) => VerificationOutcome::Fail,
-                        // A signal-killed runner is incomplete, never a
-                        // fabricated exit code.
-                        None => VerificationOutcome::Inconclusive,
-                    },
-                    captured,
-                ),
-                VerificationRun::TimedOut => (
-                    VerificationOutcome::Inconclusive,
-                    format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
-                ),
-                VerificationRun::SpawnFailed(e) => {
-                    (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
-                }
-                VerificationRun::Refused(reason) => (VerificationOutcome::Inconclusive, reason),
-            }
+            },
         }
     };
     let _ = git(
