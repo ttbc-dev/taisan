@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 
 use workloop_core::domain::{ExecutionId, WorkId, canonical_json, new_id, sha256_hex};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId, HostActorRef,
-    HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
+    ActorRole, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId,
+    HostActorRef, HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
 };
 use workloop_core::observation::{
     BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
@@ -55,7 +55,20 @@ use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding, RepositoryPermissions};
-use crate::credential::{CredentialError, CredentialProviders, resolve_credential};
+use crate::credential::{
+    CredentialError, CredentialProviders, ResolvedCredential, resolve_credential,
+};
+
+/// Which credential a capability probe binds before reading
+/// permissions.
+enum ProbeCredential {
+    /// The publication role's resolved credential.
+    Resolved(ResolvedCredential),
+    /// The ambient login — the shared `default` slot or no book.
+    Ambient,
+    /// The bound slot cannot resolve — the probe reads nothing.
+    Unresolvable,
+}
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
@@ -110,6 +123,7 @@ pub enum WebhookFact {
 /// history assertions drive. Encoding is adapter-internal, matching
 /// the fixtures' so shared-suite assertions need no special case.
 #[derive(Default)]
+
 pub struct GitHubAdapter<C> {
     client: C,
     /// When set, only intents recorded for this host instance are
@@ -156,22 +170,21 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         self
     }
 
-    /// The adapter-boundary credential gate — the same binding the
     /// The logical comment body a stored comment carries: live
     /// transports append the marker envelope (`{body}\n\n<!--
     /// {marker} -->`) for idempotence, so reconciliation and the
     /// recorded digest both key on the body before the decoration —
-    /// a fixture's raw body strips to itself. A trailing envelope is
-    /// stripped only in the exact `{body}\n\n<!-- {marker} -->` shape;
-    /// anything else is the stored body as-is, and a mismatch stays a
-    /// foreign comment, never an adoption.
+    /// a fixture's raw body strips to itself. Only the exact
+    /// `\n\n<!-- {marker} -->` tail strips; a body that merely ends in
+    /// the envelope markup stays whole — a foreign comment carrying the
+    /// marker without our separator is never adopted as ours.
     fn logical_comment_body<'a>(stored: &'a str, marker: &str) -> &'a str {
         stored
-            .strip_suffix(&format!("<!-- {marker} -->"))
-            .map(|head| head.strip_suffix("\n\n").unwrap_or(head))
+            .strip_suffix(&format!("\n\n<!-- {marker} -->"))
             .unwrap_or(stored)
     }
 
+    /// The adapter-boundary credential gate — the same binding the
     /// fixture's book performs: the intent's recorded role binding
     /// resolves its credential slot at use time and the resolved value
     /// authenticates as the intent's authorized actor before any read
@@ -197,6 +210,33 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     .map(|binding| binding.credential_ref.clone())
             }))
         })?;
+        // `default` is the shared ambient slot: there is no credential
+        // to inject, but the ambient login still proves its actor —
+        // `gh api user` under the transport's own credential answers
+        // who the intent's calls act as, and an unprovable or foreign
+        // ambient identity blocks the intent the same way a resolved
+        // credential would.
+        if reference.as_ref().is_some_and(|r| r.as_str() == "default") {
+            // Ambient first — a credential a previous intent left bound
+            // must not impersonate the ambient login.
+            self.client.set_credential(None);
+            let proven = self.client.viewer().ok().flatten().and_then(|login| {
+                HostActorId::new(login).ok().map(|actor| HostActorRef {
+                    host: intent.host.clone(),
+                    actor,
+                })
+            });
+            return Ok(match proven {
+                Some(actor) if actor == intent.actor => None,
+                Some(actor) => Some(CredentialError::ActorMismatch {
+                    bound: intent.actor.clone(),
+                    authenticated: actor,
+                }),
+                None => Some(CredentialError::unresolvable(
+                    "the ambient credential cannot prove its actor",
+                )),
+            });
+        }
         let bind = resolve_credential(reference.as_ref(), &**providers).and_then(|resolved| {
             let authenticated = self.client.authenticate(&resolved)?;
             if authenticated != intent.actor {
@@ -1187,6 +1227,32 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Ok(())
     }
 
+    /// The credential the capability probe runs under — the
+    /// publication role's bound slot when a credential book is
+    /// installed. The ambient slot and an absent book probe under the
+    /// transport's own login; a slot that cannot resolve probes
+    /// nothing, so the report records `unknown` rather than an
+    /// authorization the adapter cannot prove.
+    fn capability_probe_credential(&self, config: &WorkloopConfig) -> ProbeCredential {
+        let Some(providers) = &self.credentials else {
+            return ProbeCredential::Ambient;
+        };
+        let reference = config
+            .host
+            .actors
+            .iter()
+            .find(|binding| binding.role == ActorRole::Publication)
+            .map(|binding| binding.credential_ref.clone());
+        match reference.as_ref() {
+            None => ProbeCredential::Ambient,
+            Some(r) if r.as_str() == "default" => ProbeCredential::Ambient,
+            Some(_) => match resolve_credential(reference.as_ref(), &**providers) {
+                Ok(resolved) => ProbeCredential::Resolved(resolved),
+                Err(_) => ProbeCredential::Unresolvable,
+            },
+        }
+    }
+
     /// The capability report this adapter can honestly emit, refreshed
     /// once per source pass. `support` is the adapter's own declared
     /// operation surface — the same names `attempt` gates on, mapped
@@ -1202,7 +1268,22 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         now_unix_seconds: i64,
     ) -> Result<(), StoreError> {
         let host = config.host.repository.host.clone();
-        let permissions = self.client.read_permissions(&config.host.repository).ok();
+        // Authorization is probed under the credential that owns the
+        // publish path — the publication role's bound slot — never the
+        // ambient login or a credential a previous intent left bound.
+        // `default` is the ambient slot; an unresolvable slot reports
+        // `unknown` for every entry: unconfirmed is never granted.
+        let permissions = match self.capability_probe_credential(config) {
+            ProbeCredential::Resolved(credential) => {
+                self.client.set_credential(Some(credential));
+                self.client.read_permissions(&config.host.repository).ok()
+            }
+            ProbeCredential::Ambient => {
+                self.client.set_credential(None);
+                self.client.read_permissions(&config.host.repository).ok()
+            }
+            ProbeCredential::Unresolvable => None,
+        };
         let mut capabilities: Vec<CapabilityEntry> = config
             .declared_capabilities
             .iter()
