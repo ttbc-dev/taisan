@@ -1247,6 +1247,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         deadline: Option<i64>,
         scope: Option<&WorkId>,
     ) -> Result<SourceRefreshReport, StoreError> {
+        // Host-level reads are ambient work: the transport's bound
+        // credential is per intent and an earlier attempt's binding
+        // must not leak into capability probing or source reads —
+        // reset to the ambient identity before any refresh read.
+        self.client.set_credential(None);
         let now = clock();
         let mut report = SourceRefreshReport {
             now_unix_seconds: now,
@@ -2320,19 +2325,14 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 )?;
                 return Ok(AttemptOutcome::Attempted);
             }
-            RemoteEffect::Indeterminate { reason } => {
-                self.ingest(
-                    store,
-                    config,
-                    obs(ObservationFact::HostActionResult {
-                        action_id: intent.action_id.clone(),
-                        authenticated_actor: None,
-                        status: HostActionStatus::Unknown { reason },
-                        effects: vec![],
-                    }),
-                    now,
-                )?;
-                return Ok(AttemptOutcome::Attempted);
+            RemoteEffect::Indeterminate { .. } => {
+                // An unreadable pre-write read never fabricates an
+                // `unknown` verdict on a `pending` intent — nothing was
+                // attempted, and the next absent reconcile read would
+                // otherwise settle the never-attempted write `failed`
+                // and spend a transport retry on a read outage. The
+                // intent stays pending for the next pass.
+                return Ok(AttemptOutcome::Skipped("read_indeterminate"));
             }
             RemoteEffect::Absent { .. } => {}
         }
