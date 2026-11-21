@@ -1066,6 +1066,33 @@ fn an_oversized_snapshot_body_refuses_dispatch() {
     assert!(!pending_ids(&store).contains(&rid));
 }
 
+/// Spec input the closed-envelope validation refuses — here a
+/// `verification_argv` count past `max_verification_commands` — is a
+/// typed `request.invalid` dispatch refusal recorded against the
+/// request, never a build fault that leaves the request pending and
+/// wedges every later consume pass.
+#[test]
+fn a_request_failing_envelope_validation_is_a_typed_refusal_never_a_wedge() {
+    let root = tmp_root("invalid");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    // The profile bounds verification commands at 4 — five argv
+    // entries make the built body fail `WorkerRequestV2` validation.
+    let argv: Vec<Vec<String>> = (0..5).map(|i| vec!["true".into(), i.to_string()]).collect();
+    let (w, _e, rid) = admit_ex(&store, "v2-invalid", vec![], argv);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.invalid");
+    assert!(invocation_for(&store, &rid).is_none());
+    assert!(!pending_ids(&store).contains(&rid));
+}
+
 #[test]
 fn fix_dispatch_binds_the_acknowledged_predecessor_and_failed_evidence() {
     let root = tmp_root("fix");
@@ -1368,6 +1395,282 @@ fn invariant_check_binds_the_approved_set_read_only() {
         Some(InvocationState::Done),
         "the check worker resolves Done"
     );
+}
+
+/// The recorded Assessment binds `artifact.produced`: the check's
+/// snapshot must be that commit's tree even when the producing
+/// workspace holds uncommitted follow-on edits.
+#[test]
+fn an_invariant_check_snapshots_the_produced_commit_not_the_live_tree() {
+    let root = tmp_root("ic-prod");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-icp", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    // The producing checkout carries `produced` plus uncommitted
+    // edits a follow-on writer left behind.
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    std::fs::write(ws.join("seed.txt"), "dirty").unwrap();
+    std::fs::write(ws.join("uncommitted.txt"), "x").unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(snap.join("seed.txt")).unwrap(),
+        "newer",
+        "the snapshot is the produced commit's tree, not the dirty state"
+    );
+    assert!(
+        !snap.join("uncommitted.txt").exists(),
+        "uncommitted files never enter the checked tree"
+    );
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
+}
+
+/// A worker-planted executable git hook inside the producing
+/// workspace must never run under the supervisor's own git work: the
+/// snapshot is cloned into a fresh `.git`, so `post-checkout` —
+/// which a copy would carry executable — never executes.
+#[test]
+fn an_invariant_check_snapshot_never_runs_a_planted_workspace_hook() {
+    let root = tmp_root("ic-hook");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-ichook", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    // The planted hook: executable, inside the worker-writable
+    // `.git`, and side-effecting outside the scratch tree — exactly
+    // what a copied `.git` would run during the produced checkout.
+    let marker = root.join("hook-ran");
+    let hook = ws.join(".git").join("hooks").join("post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    assert!(
+        !marker.exists(),
+        "the planted workspace hook never executed under the supervisor"
+    );
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
+}
+
+/// A symlinked `.git` inside the worker-writable workspace can never
+/// retarget the supervisor's clone: the snapshot lstat-proves the
+/// entry is a real directory and refuses the launch rather than
+/// following the link or copying it into the check tree.
+#[test]
+fn an_invariant_check_snapshot_refuses_a_symlinked_git_dir() {
+    let root = tmp_root("ic-gitlink");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-iclink", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    // The worker has write access to its own workspace: swap `.git`
+    // for a symlink whose target a `Path::is_dir()` check would
+    // follow. The target need not even be a repository — the lstat
+    // guard refuses before any git work.
+    let decoy = root.join("decoy-repo");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::remove_dir_all(ws.join(".git")).unwrap();
+    std::os::unix::fs::symlink(&decoy, ws.join(".git")).unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    assert_eq!(invocation.state, InvocationState::Abandoned);
+    assert!(invocation.process_identity.is_none(), "no process started");
+    assert_eq!(
+        launch_refusals(&store, &w).len(),
+        1,
+        "the symlinked .git refused the launch"
+    );
+}
+
+/// A v2 check pins its evidence to the produced commit even when the
+/// producing workspace has lost its repository: the durable handoff
+/// repository — the artifact's own object store, not a
+/// worker-writable surface — supplies the commit, so the snapshot is
+/// still the produced tree and never the uncommitted live state.
+#[test]
+fn an_invariant_check_without_a_workspace_git_uses_the_handoff_repo() {
+    let root = tmp_root("ic-nogit");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-icnogit", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    // The worker has write access to its own workspace — a damaged
+    // or stripped tree can lose `.git` entirely and carry
+    // uncommitted state a copy would wrongly snapshot.
+    let ws = sup.workspace_of(&w);
+    git(
+        &root,
+        &["clone", src.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+    git(&ws, &["checkout", &produced]);
+    std::fs::write(ws.join("seed.txt"), "dirty").unwrap();
+    std::fs::remove_dir_all(ws.join(".git")).unwrap();
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(snap.join("seed.txt")).unwrap(),
+        "newer",
+        "the snapshot is the produced commit's tree, not the dirty live state"
+    );
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
+}
+
+/// The same durable fallback covers a workspace repository that
+/// exists but no longer carries the produced commit — a successor
+/// request re-prepared the workspace at a new base. The launch must
+/// still snapshot the produced tree from the handoff repository
+/// rather than refusing.
+#[test]
+fn an_invariant_check_snapshot_falls_back_when_the_workspace_lost_the_commit() {
+    let root = tmp_root("ic-lostcommit");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-iclost", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+
+    // A real `.git`, but its object store never carried `produced`:
+    // the successor request re-prepared the workspace at a different
+    // base, exactly the gap between "repository present" and
+    // "repository carries the pinned commit".
+    let ws = sup.workspace_of(&w);
+    let other = root.join("other-src");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "--quiet"]);
+    std::fs::write(other.join("other.txt"), "unrelated").unwrap();
+    git(&other, &["add", "other.txt"]);
+    git(
+        &other,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "other",
+        ],
+    );
+    git(
+        &root,
+        &["clone", other.to_str().unwrap(), ws.to_str().unwrap()],
+    );
+
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let snap = workloop_exec::isolation::scratch_root(&root.join("ws")).join(format!(
+        "check-{}",
+        workloop_exec::isolation::sanitize_key(&invocation.id.0)
+    ));
+    assert_eq!(git(&snap, &["rev-parse", "HEAD"]), produced);
 }
 
 #[test]
@@ -1953,10 +2256,11 @@ fn a_stop_racing_launch_preparation_abandons_before_spawn() {
     );
 }
 
-/// The spawn-boundary authorization re-reads the deadline against the
-/// injected clock, not the pass-start timestamp — a request whose
-/// budget elapsed during launch preparation abandons rather than
-/// spawning.
+/// A request deadline that elapses while the launch is being
+/// prepared — after the pass-start read `build_request_body`
+/// validated against — must still block the spawn: the
+/// spawn-boundary recheck reads the clock again, abandons the
+/// recorded Invocation, and no worker process ever exists.
 #[test]
 fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
     let root = tmp_root("race-deadline");
@@ -2005,6 +2309,14 @@ fn a_deadline_elapsed_during_launch_preparation_abandons_before_spawn() {
         "the spawn-boundary deadline recheck abandoned the prepared invocation"
     );
     assert!(invocation.process_identity.is_none(), "no process started");
+    // The consumed request is terminal for its binding — a silent
+    // abandon would park the Execution `Ready` with no observation to
+    // drive it on, so the boundary reports the refusal.
+    assert_eq!(
+        launch_refusals(&store, &w),
+        vec!["request deadline elapsed during launch preparation".to_string()],
+        "the spawn-boundary abandon reports its refusal"
+    );
 }
 
 /// The review leg launches inside the shared writer checkout — a

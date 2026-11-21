@@ -1259,13 +1259,88 @@ impl<P: ProcessControlPort> Supervisor<P> {
         &self,
         invocation: &Invocation,
         work_id: &WorkId,
+        produced: Option<&str>,
     ) -> Result<PathBuf, ExecError> {
         let source = self.workspace_of(work_id);
         let dest = self.check_workspace(&invocation.id.0);
         if dest.exists() {
             std::fs::remove_dir_all(&dest)?;
         }
-        copy_workspace_tree(&source, &dest)?;
+        // The v2 check's evidence binds the artifact's produced
+        // commit — in a git-backed world the snapshot must be that
+        // tree, not whatever uncommitted state the live producing
+        // workspace happens to hold when this launch finally runs.
+        // The snapshot is cloned, never copied: a local clone writes
+        // a fresh `.git` with none of the worker-writable source's
+        // hooks, filter commands, or `core.worktree` redirect, so a
+        // planted `post-checkout` hook or smudge filter can never
+        // execute supervisor-side. The `.git` entry must be a real
+        // directory: the worker has write access to its workspace and
+        // could plant a symlink whose target the supervisor's clone
+        // would follow — `is_dir()` follows links, so lstat the
+        // entry and refuse anything else (a staged workspace is a
+        // real `git init` repository, never a gitfile). Git runs
+        // through `workspace::git`'s scrubbed environment — the same
+        // hardened settings workspace preparation uses. A commit no
+        // repository carries refuses through the same path as a
+        // snapshot that could not be taken. A v2 check pins its
+        // evidence to a produced commit and must never run against
+        // the uncommitted live tree: when the workspace repository
+        // is gone — or a successor request re-prepared it at a new
+        // base so its object store no longer carries the produced
+        // commit — the durable handoff repository (the artifact's own
+        // object store, not a worker-writable surface) supplies the
+        // commit instead; only when no repository carries it does the
+        // launch refuse. The raw copy is the fallback only for a v1
+        // check, which pins no commit.
+        let real_git_dir = match std::fs::symlink_metadata(source.join(".git")) {
+            Ok(meta) if meta.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(ExecError::Fault(
+                    "workspace .git is not a real directory".into(),
+                ));
+            }
+            Err(_) => false,
+        };
+        if let Some(produced) = produced {
+            let clone_source = if real_git_dir
+                && crate::workspace::git(&source, &["cat-file", "-e", produced]).is_ok()
+            {
+                Some(source.clone())
+            } else {
+                self.handoff.as_ref().and_then(|layout| {
+                    crate::workspace::git(&layout.repository, &["cat-file", "-e", produced])
+                        .ok()
+                        .map(|_| layout.repository.clone())
+                })
+            };
+            let Some(clone_source) = clone_source else {
+                return Err(ExecError::Fault(
+                    "check snapshot: no repository carries the produced commit".into(),
+                ));
+            };
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let snapshot_git = |dir: &Path, args: &[&str]| {
+                crate::workspace::git(dir, args).map_err(|e| {
+                    ExecError::Fault(format!("check snapshot git {}: {e}", args.join(" ")))
+                })
+            };
+            snapshot_git(
+                &clone_source,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--no-checkout",
+                    clone_source.to_string_lossy().as_ref(),
+                    &dest.to_string_lossy(),
+                ],
+            )?;
+            snapshot_git(&dest, &["checkout", "--quiet", "-f", "--detach", produced])?;
+        } else {
+            copy_workspace_tree(&source, &dest)?;
+        }
         Ok(dest)
     }
 
@@ -2176,7 +2251,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // workspace.
         let workspace = match request.role {
             InvocationRole::InvariantCheck => {
-                match self.snapshot_check_workspace(&invocation, &work_id) {
+                match self.snapshot_check_workspace(&invocation, &work_id, None) {
                     Ok(path) => path,
                     Err(why) => {
                         self.refuse_launch(
@@ -2681,7 +2756,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
             InvocationRole::InvariantCheck => {
-                match self.snapshot_check_workspace(&invocation, &work_id) {
+                // The recorded Assessment binds `artifact.produced`;
+                // the snapshot must be that commit's tree — a
+                // role/task mismatch is impossible, the builder
+                // proved the wire before consume.
+                let produced = match &wire.task {
+                    workloop_core::worker_v2::TaskBody::InvariantCheck { artifact, .. } => {
+                        artifact.produced.as_str()
+                    }
+                    _ => unreachable!("invariant check request carries a different task"),
+                };
+                match self.snapshot_check_workspace(&invocation, &work_id, Some(produced)) {
                     Ok(path) => path,
                     Err(why) => {
                         self.refuse_launch(
@@ -2808,35 +2893,31 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // timestamp `build_request_body` already validated against,
         // so only a fresh read catches a deadline that elapsed while
         // the launch was being prepared. The recorded Invocation
-        // abandons exactly as the earlier gate does; no late writer
-        // starts after authorization expires.
-        let authorized = wire.budget.deadline_unix_seconds > clock()
+        // abandons with a refusal report exactly as the earlier gate
+        // does; no late writer starts after authorization expires.
+        let deadline_ok = wire.budget.deadline_unix_seconds > clock();
+        let authorized = deadline_ok
             && store
                 .transact(|tx| tx.execution(&request.execution_id))?
                 .is_some_and(|e| e.state == ExecutionState::Ready);
         if !authorized {
-            store.transact(|tx| {
-                let mut next = invocation.clone();
-                next.state = InvocationState::Abandoned;
-                tx.apply(&Effect::UpdateInvocation {
-                    invocation: next,
-                    expected_state: InvocationState::Prepared,
-                })?;
-                Ok(())
-            })?;
             // Unlike the earlier gate this runs after workspace
-            // preparation: the launch scratch, any check snapshot, and
-            // the prepared workspace itself may already exist. A
+            // preparation — and it must still report the refusal: a
+            // consumed request is terminal for its binding, so a
+            // silent abandon would park the Execution `Ready` with no
+            // pending request and no observation to drive it on. A
             // writer workspace must go together with its `.prepare`
-            // receipt — bound to this request's digest, it would
-            // refuse a Coding retry on 'receipt belongs to another
-            // request' — while a read role's workspace is never
-            // released. No process exists, so nothing owns the tree;
-            // a retry re-prepares from source or handoff.
+            // receipt — the tree is pinned to this consumed request's
+            // head, and a re-bindable receipt that outlives the launch
+            // would let a retry adopt a stale tree sight-unseen — while
+            // a read role's workspace is never released.
+            let reason = if deadline_ok {
+                "execution left Ready during launch preparation"
+            } else {
+                "request deadline elapsed during launch preparation"
+            };
             self.release_launch_workspace(request, &workspace);
-            isolation::release(&self.launch_scratch(&invocation.id.0));
-            isolation::release(&self.check_workspace(&invocation.id.0));
-            self.release_invocation_io(&invocation.id.0);
+            self.refuse_launch(store, request, &invocation, reason.into(), now_unix_seconds)?;
             return Ok(());
         }
         // Any refusal below this point also owns the prepared

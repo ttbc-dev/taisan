@@ -1108,6 +1108,7 @@ fn review_role_runs_the_wire(bin: &str, tag: &str) -> WireRun {
     assert_eq!(target.change, "cr-1");
     assert_eq!(target.base, base);
     assert_eq!(target.head, produced);
+    assert_eq!(target.target_revision, Some("0".repeat(40)));
     assert_eq!(review_source.source, "supervisor");
 
     drive_to_done(&sup, &store, &rid1);
