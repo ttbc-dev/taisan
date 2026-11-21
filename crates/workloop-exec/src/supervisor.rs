@@ -31,7 +31,7 @@ use workloop_core::worker_v2::{
 };
 
 use crate::adapter;
-use crate::bodies::BodyStore;
+use crate::bodies::{BodyError, BodyStore};
 use crate::boundary::{BoundaryGrant, RuntimeBoundary};
 use crate::containment::{self, Gate, MountPlan};
 use crate::isolation;
@@ -1162,6 +1162,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             (inner_argv.to_vec(), None)
         };
+        if let Some(reason) = containment::plan_denial(&plan) {
+            return Err(reason);
+        }
         Ok((
             containment::bwrap_args(primitive, &plan, &exec_argv, inner_cwd),
             containment::contained_env(env, egress_proxy),
@@ -1200,9 +1203,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1494,7 +1497,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound) {
+            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,
@@ -1706,20 +1709,36 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let Some(produced) = handoff.produced.clone() else {
             return Ok(());
         };
-        let report_fact = store.transact(|tx| {
-            Ok::<_, StoreError>(
-                tx.observations_for_execution(&invocation.execution_id)?
-                    .into_iter()
-                    .find(|o| {
-                        matches!(
-                            &o.fact,
-                            ObservationFact::WorkerReport { invocation_id, .. }
-                                if invocation_id == &invocation.id
-                        )
-                    })
-                    .map(|o| o.fact),
+        let observations =
+            store.transact(|tx| tx.observations_for_execution(&invocation.execution_id))?;
+        // A verdict for this exact produced commit is already durable:
+        // the acknowledged row is re-seeded every pass while its
+        // Execution stays nonterminal, and re-resolving the evidence
+        // to repeat a recorded verdict buys nothing — and makes a
+        // later CAS reclamation fault the whole handoff sweep.
+        if observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::ClaimedHeadCheck {
+                    invocation_id,
+                    artifact_id: a,
+                    produced: p,
+                    ..
+                } if invocation_id == &invocation.id && a == artifact_id && p == &produced
             )
-        })?;
+        }) {
+            return Ok(());
+        }
+        let report_fact = observations
+            .into_iter()
+            .find(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::WorkerReport { invocation_id, .. }
+                        if invocation_id == &invocation.id
+                )
+            })
+            .map(|o| o.fact);
         let Some(ObservationFact::WorkerReport {
             classification,
             report: Some(report_evidence),
@@ -1748,14 +1767,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 "worker report claim check requires the CAS body store".into(),
             ));
         };
-        let resolved = bodies
-            .resolve(store.body_catalog(), &report_evidence.body_id)
-            .map_err(|e| ExecError::Fault(format!("resolve worker report body: {e}")))?;
-        let Some(resolved) = resolved else {
-            return Err(ExecError::Fault(format!(
-                "worker report body {} is missing from the catalog",
-                report_evidence.body_id
-            )));
+        let resolved = match bodies.resolve(store.body_catalog(), &report_evidence.body_id) {
+            Ok(Some(resolved)) => resolved,
+            // The verdict is advisory evidence for later gates, never
+            // authority over the artifact: a body the retention sweep
+            // already reclaimed — or that never catalogued — records
+            // no verdict, never a pass-aborting fault.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(()),
+            Err(e) => {
+                return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
+            }
         };
         let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
             .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
@@ -2177,7 +2198,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
-                    workspace: Some((workspace.clone(), false)),
+                    workspace: Some((
+                        workspace.clone(),
+                        // §14.6: assessment roles bind the workspace
+                        // read-only; writers keep read-write.
+                        matches!(
+                            request.role,
+                            InvocationRole::InvariantCheck | InvocationRole::Review
+                        ),
+                    )),
                     request: None,
                     input: None,
                     out: None,
@@ -2187,9 +2216,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2650,6 +2679,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Unreachable in practice — a refused gate already
                 // carried its reason through `repair_reason` — but the
                 // launch never proceeds on an unproven boundary.
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2684,6 +2714,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         ) {
             Ok(env) => env,
             Err(why) => {
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(
                     store,
                     request,
@@ -2708,9 +2739,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     proxy_sock: None,
                     toolchain: None,
                     caches: vec![],
-                    extra_binds: containment::extra_binds(&inner_argv, Some(worker)),
+                    extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
-                    worker: Some(worker.clone()),
+                    worker: worker.clone(),
                 };
                 match self.contained_exec(
                     primitive,
@@ -2721,6 +2752,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 ) {
                     Ok(contained) => contained,
                     Err(reason) => {
+                        self.release_launch_workspace(request, &workspace);
                         self.refuse_launch(
                             store,
                             request,
@@ -2755,15 +2787,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // preparation — and it must still report the refusal: a
             // consumed request is terminal for its binding, so a
             // silent abandon would park the Execution `Ready` with no
-            // pending request and no observation to drive it on.
+            // pending request and no observation to drive it on. A
+            // writer workspace must go together with its `.prepare`
+            // receipt — bound to this request's digest, it would
+            // refuse a Coding retry on 'receipt belongs to another
+            // request' — while a read role's workspace is never
+            // released.
             let reason = if deadline_ok {
                 "execution left Ready during launch preparation"
             } else {
                 "request deadline elapsed during launch preparation"
             };
+            self.release_launch_workspace(request, &workspace);
             self.refuse_launch(store, request, &invocation, reason.into(), now_unix_seconds)?;
             return Ok(());
         }
+        // Any refusal below this point also owns the prepared
+        // workspace: the `SpawnError::Refused` arm releases it for
+        // the same receipt-conflict reason.
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
                 let descendants = self
@@ -2797,6 +2838,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 )?;
             }
             Err(SpawnError::Refused { reason }) => {
+                // No process exists; the workspace a writer role
+                // prepared must not wedge a retry on 'receipt belongs
+                // to another request', and a read role's workspace is
+                // never released.
+                self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { .. }) => {
@@ -2854,6 +2900,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
             crate::request_v2::invocation_io_root(&self.workspace_root)
                 .join(isolation::sanitize_key(invocation_id)),
         );
+    }
+
+    /// Reclaim the workspace a refused or abandoned launch owned. A
+    /// writer role's `workspace::prepare` output goes together with
+    /// its `.prepare` receipt — the receipt lives in a sibling
+    /// control area, not inside `ws-<work>`, so a deleted workspace
+    /// alone still refuses the Work's next preparation on 'receipt
+    /// belongs to another request'. The check's per-Invocation
+    /// snapshot is this launch's own scratch. The review leg's
+    /// workspace is the shared writer checkout `ws-<work>` — never
+    /// released here: `run_recovery_scoped`/`drive_handoffs` still
+    /// read the artifact and recovery source from it, so a refused
+    /// review launch must not destroy the producing tree.
+    fn release_launch_workspace(&self, request: &InvocationRequest, workspace: &Path) {
+        match request.role {
+            InvocationRole::Review => {}
+            InvocationRole::InvariantCheck => isolation::release(workspace),
+            _ => {
+                isolation::release(workspace);
+                crate::workspace::release_receipt(&self.workspace_root, &request.work_id.0);
+            }
+        }
     }
 
     /// Bound `.invocations`: per-Invocation request/input/output trees

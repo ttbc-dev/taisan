@@ -307,7 +307,15 @@ fn a_complete_handoff_acknowledges_row_and_ref() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
 
-    let h = handoff::drive(&store, &layout, &aid, &seed(&invocation, &w, &base), 3).unwrap();
+    let h = handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &mut || 0,
+    )
+    .unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert_eq!(h.produced.as_deref(), Some(produced.as_str()));
     assert!(h.manifest_digest.is_some());
@@ -333,7 +341,15 @@ fn absent_invalid_and_acknowledged_stay_distinguishable() {
 
     assert!(row(&store, &aid).is_none(), "absent is no row");
 
-    let h = handoff::drive(&store, &layout, &aid, &seed(&invocation, &w, &base), 3).unwrap();
+    let h = handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &mut || 0,
+    )
+    .unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert!(handoff::reclaimable(&layout, &h));
 
@@ -372,6 +388,7 @@ fn a_stale_base_is_invalid() {
         &artifact_id(&invocation),
         &seed(&invocation, &w, &base),
         3,
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
@@ -396,7 +413,15 @@ fn crash_after_export_started_resumes_from_the_row() {
     let aid = artifact_id(&invocation);
     seed_export_started(&store, &invocation, &w, &base);
 
-    let h = handoff::drive(&store, &layout, &aid, &seed(&invocation, &w, &base), 3).unwrap();
+    let h = handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &mut || 0,
+    )
+    .unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert_eq!(h.produced.as_deref(), Some(produced.as_str()));
 }
@@ -423,7 +448,15 @@ fn a_corrupt_bundle_is_reexported_not_trusted() {
     std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
     std::fs::write(&bundle, b"not-a-bundle").unwrap();
 
-    let h = handoff::drive(&store, &layout, &aid, &seed(&invocation, &w, &base), 3).unwrap();
+    let h = handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &mut || 0,
+    )
+    .unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert_eq!(h.produced.as_deref(), Some(produced.as_str()));
     assert_eq!(
@@ -449,7 +482,7 @@ fn imported_rows_recover_both_sides_of_the_ref_write() {
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
 
-    let complete = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let complete = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(complete.state, HandoffState::Acknowledged);
 
     // Side A: crash after the ref write — row still `imported`, ref
@@ -457,7 +490,7 @@ fn imported_rows_recover_both_sides_of_the_ref_write() {
     let mut row_a = complete.clone();
     row_a.state = HandoffState::Imported;
     persist(&store, &row_a);
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
 
     // Side B: crash before the ref write — `imported` row, no ref.
@@ -468,7 +501,7 @@ fn imported_rows_recover_both_sides_of_the_ref_write() {
     let mut row_b = complete.clone();
     row_b.state = HandoffState::Imported;
     persist(&store, &row_b);
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     assert_eq!(
         git(&layout.repository, &["rev-parse", &artifact_ref(&aid)]),
@@ -490,7 +523,7 @@ fn a_foreign_ref_is_never_overwritten() {
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
 
-    let complete = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let complete = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     // Hand the artifact's ref to a different object.
     let foreign = git(&layout.repository, &["rev-parse", &format!("{produced}^")]);
     git(
@@ -501,7 +534,7 @@ fn a_foreign_ref_is_never_overwritten() {
     imported.state = HandoffState::Imported;
     persist(&store, &imported);
 
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("ref_conflict"));
     assert_eq!(
@@ -525,7 +558,7 @@ fn a_manifest_mismatch_is_invalid() {
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
 
-    let complete = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let complete = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     // Tamper the stored digest and drop the ref so the recreate path
     // must re-verify the manifest first.
     git(
@@ -537,7 +570,7 @@ fn a_manifest_mismatch_is_invalid() {
     tampered.manifest_digest = Some("tampered".into());
     persist(&store, &tampered);
 
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("digest_mismatch"));
     assert!(
@@ -567,7 +600,7 @@ fn recovery_exhaustion_is_a_distinct_reason() {
 
     let mut last = None;
     for _ in 0..4 {
-        last = Some(handoff::drive(&store, &layout, &aid, &s, 3).unwrap());
+        last = Some(handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap());
     }
     let h = last.unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
@@ -587,7 +620,7 @@ fn verification_runs_on_the_handed_off_commit() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
 
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -599,6 +632,7 @@ fn verification_runs_on_the_handed_off_commit() {
         &["git".into(), "rev-parse".into(), "HEAD".into()],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(pass.result, VerificationOutcome::Pass);
@@ -613,6 +647,7 @@ fn verification_runs_on_the_handed_off_commit() {
         &["sh".into(), "-c".into(), "exit 3".into()],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(fail.result, VerificationOutcome::Fail);
@@ -627,6 +662,7 @@ fn verification_runs_on_the_handed_off_commit() {
             &["true".into()],
             &scratch,
             &[],
+            &mut || 0,
         )
         .is_err()
     );
@@ -647,7 +683,7 @@ fn multibyte_verification_output_truncates_without_a_panic() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
 
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -663,6 +699,7 @@ fn multibyte_verification_output_truncates_without_a_panic() {
         ],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass);
@@ -760,19 +797,19 @@ fn transport_failure_charges_the_recovery_bound() {
     std::fs::set_permissions(&out_dir, perms).unwrap();
 
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 2, &mut || 0).unwrap();
     let first = row(&store, &aid).expect("row");
     assert_eq!(first.state, HandoffState::ExportStarted);
     assert_eq!(first.attempt, 1, "one charged failure, one attempt used");
 
-    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 2, &mut || 0).unwrap();
     let second = row(&store, &aid).expect("row");
     assert_eq!(second.state, HandoffState::ExportStarted);
     assert_eq!(second.attempt, 2, "the second attempt still runs");
 
     // The bound refuses attempt N+1 — N charged failures settle the row
     // without a further transport call.
-    handoff::drive(&store, &layout, &aid, &s, 2).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 2, &mut || 0).unwrap();
     let h = row(&store, &aid).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("recovery_exhausted"));
@@ -799,7 +836,7 @@ fn each_required_artifact_gets_its_own_handoff() {
     let s = seed(&invocation, &w, &base);
     for kind in ["patch", "log"] {
         let aid = format!("{}/{kind}", invocation.id.0);
-        let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+        let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
         assert_eq!(h.state, HandoffState::Acknowledged);
         assert_eq!(h.artifact_id, aid);
         assert_eq!(
@@ -825,7 +862,7 @@ fn an_acknowledged_handoff_runs_declared_verification() {
     let mut s = seed(&invocation, &w, &base);
     s.verification_argv = vec![vec!["git".into(), "rev-parse".into(), "HEAD".into()]];
 
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1);
@@ -834,7 +871,7 @@ fn an_acknowledged_handoff_runs_declared_verification() {
     assert_eq!(results[0].produced, produced);
 
     // Re-driving the acknowledged row records nothing twice.
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(
         store
             .transact(|tx| tx.verification_results(&aid))
@@ -868,7 +905,7 @@ fn a_branch_that_never_moved_is_nothing_produced() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let h = row(&store, &aid).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("nothing_produced"));
@@ -909,7 +946,7 @@ fn a_fix_branch_sitting_on_its_start_is_nothing_produced() {
     let aid = artifact_id(&invocation);
     let mut s = seed(&invocation, &w, &base);
     s.branch_start = start;
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let h = row(&store, &aid).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("nothing_produced"));
@@ -933,7 +970,7 @@ fn a_present_ref_with_a_stale_digest_is_not_acknowledged() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert!(ref_exists(&layout.repository, &artifact_ref(&aid)));
 
     // The crash window: ref present, row still `imported` — with a
@@ -942,7 +979,7 @@ fn a_present_ref_with_a_stale_digest_is_not_acknowledged() {
     h.state = HandoffState::Imported;
     h.manifest_digest = Some("stale".into());
     persist(&store, &h);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let h = row(&store, &aid).unwrap();
     assert_eq!(h.state, HandoffState::Invalid);
     assert_eq!(h.invalid_reason.as_deref(), Some("digest_mismatch"));
@@ -962,7 +999,7 @@ fn a_stale_worktree_registration_does_not_wedge_verification() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
 
     // Recreate the crash residue: `worktree add` registered the path,
     // then the process died before `worktree remove`; the directory was
@@ -993,6 +1030,7 @@ fn a_stale_worktree_registration_does_not_wedge_verification() {
         &["git".into(), "rev-parse".into(), "HEAD".into()],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass);
@@ -1015,13 +1053,13 @@ fn an_inconclusive_verification_is_retried() {
 
     let mut s = seed(&invocation, &w, &base);
     s.verification_argv = vec![vec!["no-such-verification-binary".into()]];
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
 
     s.verification_argv = vec![vec!["git".into(), "rev-parse".into(), "HEAD".into()]];
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1, "one row per requirement");
     assert_eq!(results[0].result, VerificationOutcome::Pass);
@@ -1041,7 +1079,7 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
 
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -1144,6 +1182,56 @@ fn a_timed_out_or_killed_runner_is_inconclusive() {
     assert!(
         !sentinel.exists(),
         "the runner's grandchildren are killed with it"
+    );
+}
+
+/// A bound spent before the run starts permits no run at all: zero
+/// timeout records `Inconclusive` without a worktree or a spawned
+/// command — the marker the argv would write is never created.
+#[test]
+fn a_spent_deadline_runs_no_command_at_all() {
+    let root = tmp_root("verifyzero");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vz");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vz");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
+
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let marker = scratch.join("command-ran");
+    let res = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[9]",
+        &[
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'", marker.display()),
+        ],
+        &scratch,
+        Duration::ZERO,
+        64 * 1024,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        !marker.exists(),
+        "a spent bound spawns no verification command"
+    );
+    assert!(
+        std::fs::read_dir(&scratch).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("verify-")),
+        "no detached worktree or run log is created for a spent bound"
     );
 }
 
@@ -1260,13 +1348,13 @@ fn a_changed_verification_argv_is_rerun() {
     let aid = artifact_id(&invocation);
     let mut s = seed(&invocation, &w, &base);
     s.verification_argv = vec![vec!["sh".into(), "-c".into(), "true".into()]];
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results[0].result, VerificationOutcome::Pass);
 
     // The spec now declares a different command for the same slot.
     s.verification_argv = vec![vec!["sh".into(), "-c".into(), "exit 7".into()]];
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1, "the new argv replaces the stale row");
     assert_eq!(results[0].argv, vec!["sh", "-c", "exit 7"]);
@@ -1332,7 +1420,7 @@ fn a_stale_handoff_write_is_a_conflict_not_a_regression() {
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    let h = handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     assert_eq!(h.state, HandoffState::Acknowledged);
 
     // A writer holding a stale read writes back a regressed row — the
@@ -1421,7 +1509,7 @@ fn acknowledged(root: &Path, tag: &str) -> (SqliteStore, HandoffLayout, PathBuf,
     insert_invocation(&store, &invocation);
     let aid = artifact_id(&invocation);
     let s = seed(&invocation, &w, &base);
-    handoff::drive(&store, &layout, &aid, &s, 3).unwrap();
+    handoff::drive(&store, &layout, &aid, &s, 3, &mut || 0).unwrap();
     (store, layout, root.join("scratch"), aid)
 }
 
@@ -1479,6 +1567,7 @@ fn contained_verification_binds_the_declared_sandbox_shape() {
         &argv,
         &scratch,
         &["extra.example".into()],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
@@ -1581,6 +1670,7 @@ fn contained_verification_without_egress_grants_no_proxy() {
         &argv,
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
@@ -1595,6 +1685,47 @@ fn contained_verification_without_egress_grants_no_proxy() {
     assert!(
         !relay_log.exists(),
         "the relay never ran without an egress grant"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The submission's argv is not a mount declaration: an
+/// absolute-path element that exists on the host is never bound
+/// into the verification sandbox — the sandbox's mount set is the
+/// installation-declared surface (worktree, repository, toolchain,
+/// caches) and nothing the submitted argv names.
+#[test]
+fn contained_verification_never_binds_a_path_the_submission_argv_names() {
+    let root = tmp_root("verify-noargbind");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-noargbind");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let canary = root.join("host-only-canary.txt");
+    std::fs::write(&canary, "host bytes").unwrap();
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("cat '{}'", canary.display()),
+        canary.to_string_lossy().into_owned(),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &[],
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+    let log = std::fs::read_to_string(&bwrap_log).unwrap();
+    assert!(
+        !log.contains(&format!("--ro-bind\n{}", canary.display())),
+        "the submission argv element mounted a host file:\n{log}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1622,6 +1753,7 @@ fn contained_verification_refuses_a_model_api_egress_host() {
         // A declared host that names a Worker model-API destination is
         // an admission gap — refused, never granted.
         &["model.example".into()],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Inconclusive);
@@ -1659,6 +1791,7 @@ fn contained_verification_refuses_a_missing_toolchain() {
         &["/bin/sh".into(), "-c".into(), "true".into()],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Inconclusive);
@@ -1693,6 +1826,7 @@ fn contained_verification_refuses_when_the_containment_gate_fails() {
         &["/bin/sh".into(), "-c".into(), "true".into()],
         &scratch,
         &[],
+        &mut || 0,
     )
     .unwrap();
     assert_eq!(res.result, VerificationOutcome::Inconclusive);

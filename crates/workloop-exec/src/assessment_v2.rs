@@ -343,7 +343,7 @@ fn resolve_invariant_set(
     bodies: &BodyStore,
     invariant_set: &workloop_core::worker_v2::InvariantSetRef,
 ) -> Result<Option<InvariantSetBody>, ExecError> {
-    let path = format!("invariant-set/{}", invariant_set.digest);
+    let path = format!("bodies/invariant-set/{}", invariant_set.digest);
     let resolved = bodies
         .resolve_at(store.body_catalog(), CAS_CATEGORY, &path)
         .map_err(|e| ExecError::Fault(format!("resolve invariant set body: {e}")))?;
