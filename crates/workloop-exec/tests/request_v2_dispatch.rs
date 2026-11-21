@@ -3628,6 +3628,53 @@ fn a_claimed_head_disagreeing_with_produced_is_retained_never_adopted() {
     let _ = w;
 }
 
+/// A report carrying no `claimed_head` records no verdict — but the
+/// acknowledgement itself is still observed as `HandoffAcknowledged`,
+/// so the waiting Execution's publish chain is re-driven instead of
+/// sitting until the stage budget expires.
+#[test]
+fn a_report_without_claimed_head_still_records_the_acknowledgement() {
+    let root = tmp_root("claim-none");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, e, rid) = admit(&store, "v2-claim-none", vec![]);
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    sup.drive_handoffs(&store).unwrap();
+
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let row = handoff_row(&store, &inv.id);
+    assert_eq!(row.state, HandoffState::Acknowledged, "{row:?}");
+
+    let facts = claim_facts(&store, &e);
+    assert_eq!(facts.len(), 0, "no claim means no verdict: {facts:?}");
+    let acks: Vec<_> = store
+        .transact(|tx| tx.observations_for_execution(&e))
+        .unwrap()
+        .into_iter()
+        .map(|o| o.fact)
+        .filter(|f| matches!(f, ObservationFact::HandoffAcknowledged { .. }))
+        .collect();
+    assert_eq!(acks.len(), 1, "one acknowledgement fact: {acks:?}");
+    let ObservationFact::HandoffAcknowledged {
+        artifact_id,
+        produced,
+    } = &acks[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(artifact_id, &row.artifact_id);
+    assert_eq!(produced, &row.produced.clone().unwrap());
+}
+
 /// A produced commit on foreign root history — with a worker-planted
 /// `aaa-decoy` branch that a *derived* base would prefer over
 /// `taisan-base` — is `stale_base` invalid: the pinned request base

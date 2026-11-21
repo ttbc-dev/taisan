@@ -240,6 +240,120 @@ fn push_and_open(
     }
 }
 
+/// The ambient credential's verified login binds the write: a token
+/// acting as another identity never authors the bound actor's intent —
+/// the receipt records the real login and the ingest settles
+/// `unknown{actor_mismatch}`, leaving the intent outstanding.
+#[test]
+fn a_foreign_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "viewer-mismatch");
+    let mut gh = InMemoryGitHub::new();
+    gh.set_viewer("other-login");
+    let mut adapter = Adapter::new(gh);
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        },
+        "a foreign credential never records an applied write"
+    );
+    let intent = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == action_id)
+                .map(|i| i.authenticated_actor))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        intent,
+        Some(HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("other-login"),
+        }),
+        "the receipt attests the verified login, not the claim"
+    );
+}
+
+/// A credential whose identity cannot be attested never authors a
+/// write either — an indeterminate actor is fail-closed, reported
+/// `credential_blocked` and retried on the next pass once `gh api
+/// user` answers again.
+#[test]
+fn an_unverifiable_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut config = config();
+    config.host.actors[0].credential_ref = CredentialRef::trusted("default");
+    let d = handle_command(
+        &store,
+        &config,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "viewer-unverifiable".into(),
+            body: CommandBody::Submit {
+                intent: "do the thing".into(),
+                sources: vec![],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let CommandDecision::Accepted { work_id, .. } = d else {
+        panic!("submit: {d:?}")
+    };
+    let work_id = work_id.unwrap();
+    let mut gh = InMemoryGitHub::new();
+    gh.lose_response("viewer");
+    let mut adapter = Adapter::new(gh)
+        .with_credentials(Box::new(workloop_github::fixture::CredentialBook::new()));
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    let report = adapter
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .credential_blocked
+            .iter()
+            .any(|b| b.action_id == action_id && b.code == "credential.unresolvable"),
+        "{report:?}"
+    );
+    assert!(
+        adapter.client().writes().is_empty(),
+        "an unattested credential never writes"
+    );
+    assert!(
+        matches!(intent_status(&store, &action_id), HostActionStatus::Pending),
+        "a blocked intent stays pending for the next pass"
+    );
+}
+
 fn intent_status_effects(store: &SqliteStore, action_id: &str) -> Vec<NormalizedEffectFact> {
     store
         .transact(|tx| {

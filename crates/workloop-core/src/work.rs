@@ -2279,10 +2279,12 @@ pub fn admit_queued_role(
         InvocationRole::InvariantCheck | InvocationRole::Review
     ) && let serde_json::Value::Object(map) = &mut payload
     {
-        // Both read-only roles declare no workspace artifact, so their
-        // durable record carries an explicitly empty required set
-        // rather than the writer default. Their evidence is the
-        // Invocation lifecycle plus receipts, never a produced diff.
+        // The check and the review are read-only: neither declares a
+        // workspace artifact, so the durable record carries an
+        // explicitly empty required set rather than the writer
+        // default. Their evidence is the Invocation lifecycle plus
+        // receipts, never a produced diff — a non-empty set would seed
+        // an artifact handoff for a role that produces nothing.
         map.insert("required_artifacts".into(), serde_json::json!([]));
     }
     let request = InvocationRequest {
@@ -2942,6 +2944,15 @@ fn assess(
             Ok(())
         }
         ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
+        // The handoff acknowledgement these facts ride on is the
+        // moment the produced commit became durable: publication may
+        // now name it, so a waiting Execution re-evaluates its stage
+        // intents.
+        ObservationFact::ClaimedHeadCheck { .. } | ObservationFact::HandoffAcknowledged { .. }
+            if execution.state == ExecutionState::Waiting =>
+        {
+            maybe_publish(tx, config, &execution, now_unix_seconds)
+        }
         _ => Ok(()),
     }?;
     let Some(current) = tx.execution(&execution.id)? else {
@@ -3892,6 +3903,14 @@ fn maybe_publish(
     if artifact_digests.is_empty() {
         return Ok(());
     }
+    // `push_ref` publishes the produced *commit*, so the revision must
+    // be the one the durable handoff names — an artifact fact's
+    // payload digest identifies bytes, never a git object, and a
+    // remote ref can never target it. Only an invocation with no
+    // handoff rows at all publishes the recorded digest token.
+    let Some(produced_object) = produced_revision(tx, latest, &artifact_digests)? else {
+        return Ok(());
+    };
     let outstanding = crate::projection::outstanding_actions(tx, &execution.work_id)?;
     if !outstanding.is_empty() {
         return Ok(());
@@ -3945,17 +3964,18 @@ fn maybe_publish(
     let intents = tx.action_intents()?;
     let work_intents: Vec<&HostActionIntent> =
         intents.iter().filter(|i| i.work_id == work.id).collect();
-    // Stage 1: push_ref. Produced revision = the published artifact's
-    // digest interpreted as an object id on the bound repository.
+    // Stage 1: push_ref. Produced revision = the produced commit the
+    // acknowledged handoff names (or, with no handoff rows, the
+    // recorded artifact token non-git worlds publish).
     let branch = format!("work/{}", work.id.0);
     // The stage is satisfied only by an applied push that published the
-    // *current* produced revision — a fix Invocation's new artifact
-    // digest re-arms the stage so the branch republishes.
+    // *current* produced revision — a fix Invocation's new produced
+    // commit re-arms the stage so the branch republishes.
     let push_applied = work_intents.iter().any(|i| {
         matches!(
             &i.action,
             HostAction::PushRef { produced, .. }
-                if produced.object == artifact_digests[0]
+                if produced.object == produced_object
         ) && i.status == HostActionStatus::Applied
     });
     if !push_applied {
@@ -3992,7 +4012,7 @@ fn maybe_publish(
             }
         }
         let produced =
-            CommitRevision::new(work.binding.repository.clone(), artifact_digests[0].clone())
+            CommitRevision::new(work.binding.repository.clone(), produced_object.clone())
                 .map_err(|e| StoreError::Internal { detail: e })?;
         // The guard's expected prior is the freshest remote position
         // this installation observed for the branch, ordered by
@@ -4159,6 +4179,55 @@ fn record_intent(
     tx.apply(&Effect::UpdateExecution {
         execution: next,
         expected_state: execution.state.clone(),
+    })
+}
+
+/// The revision `push_ref` must publish for `invocation`: the produced
+/// commit the newest acknowledged handoff names, or — for a v1
+/// invocation that can never grow a handoff row — the first recorded
+/// artifact digest (the only produced identity non-git artifact
+/// worlds carry). `None` when handoff rows exist but none is
+/// acknowledged yet, and `None` while a v2 invocation has no rows at
+/// all: the row is written by the handoff drive after the exit fact
+/// lands, so an empty row set at that moment means pending, never
+/// absent — falling back would publish the payload digest (a byte
+/// hash, not a git object) as the produced commit. The
+/// acknowledgement's claim check re-drives this stage once the row
+/// is durable.
+fn produced_revision(
+    tx: &dyn ReadView,
+    invocation: &Invocation,
+    artifact_digests: &[String],
+) -> Result<Option<String>, StoreError> {
+    let mut rows = false;
+    let mut newest: Option<ArtifactHandoff> = None;
+    for required in &invocation.required_artifacts {
+        let artifact_id = format!("{}/{}", invocation.id.0, required.kind);
+        let Some(row) = tx.artifact_handoff(&artifact_id)? else {
+            continue;
+        };
+        rows = true;
+        if row.state == HandoffState::Acknowledged
+            && row.produced.is_some()
+            && newest
+                .as_ref()
+                .is_none_or(|b: &ArtifactHandoff| row.recorded_seq > b.recorded_seq)
+        {
+            newest = Some(row);
+        }
+    }
+    Ok(match (rows, newest) {
+        (true, Some(row)) => row.produced,
+        // Handoff rows exist but none is acknowledged: wait for the
+        // sweep's claim check to re-drive publication.
+        (true, None) => None,
+        // A v2 invocation always grows a handoff row after the exit
+        // fact — no rows yet is the pending window between finish and
+        // the handoff drive, not a non-git world. Only a legacy v1
+        // dispatch (no request body row) publishes the recorded
+        // digest token.
+        (false, _) if tx.worker_request_body(&invocation.request_id)?.is_some() => None,
+        (false, _) => artifact_digests.first().cloned(),
     })
 }
 
