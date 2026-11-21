@@ -67,6 +67,10 @@ pub struct BoundaryConfig {
 pub struct BoundaryGrant {
     /// The staged credential file → `/taisan/runtime-auth`.
     pub credential_file: Option<PathBuf>,
+    /// For a `file:` provider, the host path the value was read from —
+    /// masked inside the sandbox when a fixed system bind covers it,
+    /// so the staged file is the only credential surface.
+    pub credential_source: Option<PathBuf>,
     /// The validated provider config → `/taisan/provider-config`.
     pub provider_config: Option<PathBuf>,
     /// The proxy's host-side Unix socket → `/taisan/proxy.sock`.
@@ -75,6 +79,7 @@ pub struct BoundaryGrant {
 
 struct BoundaryReady {
     credential_file: Option<PathBuf>,
+    credential_source: Option<PathBuf>,
     provider_config: Option<PathBuf>,
     /// The provider-config content identity captured at resolution —
     /// `ensure` re-checks it so a post-resolution edit re-runs the
@@ -166,6 +171,7 @@ impl RuntimeBoundary {
         match &*state {
             BoundaryState::Ready(ready) => Ok(BoundaryGrant {
                 credential_file: ready.credential_file.clone(),
+                credential_source: ready.credential_source.clone(),
                 provider_config: ready.provider_config.clone(),
                 proxy_sock: ready
                     .proxy
@@ -180,11 +186,13 @@ impl RuntimeBoundary {
     /// config → validated, proxy → started when hosts are configured.
     fn resolve(&self) -> Result<BoundaryReady, String> {
         let mut credential_bytes: Option<Vec<u8>> = None;
+        let mut credential_source: Option<PathBuf> = None;
         let credential_file = match &self.config.credential_ref {
             None => None,
             Some(reference) => {
                 let resolved = credentials::resolve(reference).map_err(|e| e.to_string())?;
                 credential_bytes = Some(resolved.bytes().to_vec());
+                credential_source = resolved.source_path().map(Path::to_path_buf);
                 Some(self.stage_credential(&resolved)?)
             }
         };
@@ -207,6 +215,7 @@ impl RuntimeBoundary {
         };
         Ok(BoundaryReady {
             credential_file,
+            credential_source,
             provider_config: self.config.provider_config.clone(),
             provider_digest,
             proxy,
@@ -364,13 +373,21 @@ fn collect_manifest(
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        // Never follow a member link: a symlink's identity is its
+        // target path, and recursing or hashing through it would
+        // fold an outside tree into this config's identity.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path)?.to_string_lossy().into_owned();
+            out.push(format!("link:{rel}:{target}"));
+        } else if file_type.is_dir() {
             out.push(format!("dir:{rel}"));
             collect_manifest(root, &path, out, budget)?;
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
+            // Content, not name+size: a same-size edit is an identity
+            // change the gate must re-prove.
             let digest = file_content_digest(&path)?;
-            out.push(format!("file:{rel}:{}:{digest}", metadata.len()));
+            out.push(format!("file:{rel}:{}:{digest}", entry.metadata()?.len()));
         }
     }
     Ok(())
@@ -444,6 +461,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `file:` provider's source path flows into the grant so the
+    /// containment plan can mask it when a fixed system bind would
+    /// expose it — env/command providers carry no host path.
+    #[test]
+    fn a_file_credential_grant_reports_its_source_path() {
+        let dir = tmp("filecred");
+        let token = dir.join("runtime.token");
+        std::fs::write(&token, "file-tok").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", token.display()));
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        assert_eq!(
+            grant.credential_source,
+            Some(token.canonicalize().unwrap()),
+            "the grant carries the credential's canonical source path"
+        );
+        assert!(grant.credential_file.is_some(), "the staged file exists");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn model_api_hosts_start_the_proxy_and_grant_its_socket() {
         let dir = tmp("proxy");
@@ -501,6 +540,31 @@ mod tests {
         // identity_digest re-reads the file each call.
         let d2 = boundary.identity_digest().unwrap();
         assert_ne!(d1, d2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_same_size_member_edit_changes_the_directory_identity() {
+        let dir = tmp("dirmanifest");
+        let cfg_dir = dir.join("provider.d");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m1\"\n").unwrap();
+        let digest_before = provider_config_digest(&cfg_dir).unwrap();
+        // Same byte length, different content.
+        std::fs::write(cfg_dir.join("a.toml"), "model = \"m2\"\n").unwrap();
+        let digest_after = provider_config_digest(&cfg_dir).unwrap();
+        assert_ne!(
+            digest_before, digest_after,
+            "a same-size content edit must re-prove the boundary"
+        );
+        // A re-pointed member link is an identity change too.
+        std::fs::write(dir.join("real.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real.toml"), cfg_dir.join("b.toml")).unwrap();
+        let linked = provider_config_digest(&cfg_dir).unwrap();
+        std::fs::remove_file(cfg_dir.join("b.toml")).unwrap();
+        std::fs::write(dir.join("other.toml"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("other.toml"), cfg_dir.join("b.toml")).unwrap();
+        assert_ne!(linked, provider_config_digest(&cfg_dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
