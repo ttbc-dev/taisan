@@ -375,6 +375,12 @@ impl InMemoryGitHub {
 
 impl GitHubApi for InMemoryGitHub {
     fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+        if let Some(err) = self.take_refusal("viewer") {
+            return Err(err);
+        }
+        if let Some(err) = self.take_lost("viewer") {
+            return Err(err);
+        }
         if let Some(value) = &self.active_credential {
             return Ok(self
                 .credential_seats

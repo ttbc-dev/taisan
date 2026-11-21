@@ -2525,6 +2525,9 @@ mod tests {
         armed: std::collections::HashMap<String, ArmedFault>,
         /// The permission bits `read_permissions` reports.
         permissions: RepositoryPermissions,
+        /// The login `viewer()` attests — the ambient identity the
+        /// double models; the suite's bound publisher by default.
+        viewer: Option<String>,
     }
 
     impl FakeGitHub {
@@ -2888,6 +2891,12 @@ mod tests {
                         reason: "outage".into(),
                     })
                 })
+        }
+
+        fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+            Ok(Some(
+                self.viewer.clone().unwrap_or_else(|| "bot-pub".into()),
+            ))
         }
 
         fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) {
