@@ -525,10 +525,14 @@ impl ProcessControlPort for PosixProcessControl {
             let pid: i32 = pid
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
-            let uid: u32 = uid
+            // `ps` prints some kernel/nobody uids as negatives on macOS
+            // (nobody is -2); a signed parse keeps those legitimate
+            // rows and they can never equal the non-negative euid, so
+            // the comparison stays fail-closed.
+            let uid: i64 = uid
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
-            if uid == euid {
+            if uid == euid as i64 {
                 same_user_pids.push(pid);
             }
         }
