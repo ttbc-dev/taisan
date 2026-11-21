@@ -2291,6 +2291,70 @@ fn a_marker_match_with_a_different_body_never_settles_a_comment_intent() {
     );
 }
 
+/// A comment this adapter already posted carries the marker envelope
+/// (`{body}\n\n<!-- {marker} -->`) on live transports — reconcile
+/// must recognize the stored body as this intent's effect and settle
+/// it `applied` after a lost response, not hold it `unknown` forever.
+#[test]
+fn a_stored_comment_with_the_marker_envelope_settles_applied() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, opened_head) = push_and_open(&mut adapter, &store, &config, "cmtenv");
+    adapter.client_mut().seed_comment(
+        &repo(),
+        change.change_request.as_str(),
+        "workloop",
+        "hello\n\n<!-- workloop -->",
+    );
+
+    let unknown_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PostComment {
+            change: change.clone(),
+            expected_head: opened_head.clone(),
+            marker: "workloop".into(),
+            body: "hello".into(),
+        },
+    );
+    adapter
+        .ingest(
+            &store,
+            &config,
+            Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id: unknown_id.clone(),
+                    authenticated_actor: Some(publisher()),
+                    status: HostActionStatus::Unknown {
+                        reason: "response lost".into(),
+                    },
+                    effects: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    let resolved = adapter
+        .reconcile_outstanding(&store, &config, NOW + 10)
+        .unwrap();
+    assert!(
+        resolved.contains(&unknown_id),
+        "the stored envelope still proves this intent's effect"
+    );
+    assert!(
+        matches!(
+            intent_status(&store, &unknown_id),
+            HostActionStatus::Applied
+        ),
+        "the lost-response comment settles applied"
+    );
+}
+
 /// The adapter-boundary credential gate (parity with the fixture's
 /// book): a pending write resolves the role binding's `credential_ref`
 /// and the resolved value authenticates as the intent's authorized
