@@ -602,9 +602,11 @@ fn deadline_reports_limit_reached_and_kills_tree() {
         ReportClassification::Failure { .. }
     ));
     // The runtime ran in its own process group (`$$` == pgid); after
-    // the kill, no member of that group may still exist. Members linger
-    // in the table briefly as unreaped zombies, so poll for the group
-    // to be fully gone instead of checking a single instant.
+    // the kill, no member of that group may still be *alive*. Killed
+    // members can linger in the table indefinitely as zombies until
+    // their new parent reaps them — CI's PID 1 does not — so a bare
+    // `kill -0 -pgid` probe is not the right check. Scan the table and
+    // require every remaining member to be a zombie.
     let pgid: i32 = fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -612,19 +614,25 @@ fn deadline_reports_limit_reached_and_kills_tree() {
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let alive = Command::new("kill")
-            .args(["-0", &format!("-{pgid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        if !alive {
+        let table = Command::new("ps")
+            .args(["-eo", "pgid=,stat="])
+            .output()
+            .unwrap();
+        let live: Vec<String> = String::from_utf8_lossy(&table.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                let p: i64 = cols.next()?.parse().ok()?;
+                let stat = cols.next()?;
+                (p == pgid as i64 && !stat.starts_with('Z')).then(|| line.trim().to_string())
+            })
+            .collect();
+        if live.is_empty() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "runtime process group {pgid} survived"
+            "runtime process group {pgid} survived: {live:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
