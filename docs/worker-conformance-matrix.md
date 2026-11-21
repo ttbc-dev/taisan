@@ -182,3 +182,70 @@ record names full tested/base commit ids, transcribes every retained
 scenario record under that tested revision, and verifies the cited
 commit contains the exercised suite and is on the branch history to
 `HEAD`).
+
+## Executable wire boundary (U4.7)
+
+`worker_wire_contract.rs` extends the shared conformance suite to the
+executable `taisan.worker.request/2` / `taisan.worker.report/2`
+boundary (`docs/v0.3.md` §4): the identical scenario table runs
+unchanged against every supplied conforming Worker implementation —
+the reference `workloop-fixture-worker` and the independent
+`workloop-contract-worker` — through the real dispatch path. Durable
+request materialization, `describe` declaration negotiation, the
+`run --request <path> --out <dir>` process launch, bounded report
+collection and classification, artifact handoff and declared
+verification, stop proof and restart recovery, and the config-only
+`worker_argv` swap are all exercised by a real spawned process; no
+scenario branches on which implementation is bound.
+
+The contract Worker is an independent implementation of the public
+wire: it depends on `serde_json` and `sha2` but not on
+`workloop-core`, and it builds canonical JSON, the tagged request and
+report digests, the declaration envelope, and the report envelope
+itself — the suite therefore proves the contract is implementable
+without sharing the host's response construction, not merely that a
+second binary echoes the fixture's bytes. Rows a real process cannot
+express (a lost spawn identity, an uninspectable liveness read) stay
+in the provider-model suite above; every other row here is covered
+by a spawned process on both implementations — WW-DECL-01 alone binds
+`/bin/false` in both runs, because its row proves the supervisor's
+refusal on a worker that never answers `describe`, which is identical
+for either implementation.
+
+Outcome equality is asserted on an adapter-neutral signature —
+invocation states, writer-identity presence, report classifications,
+launch/dispatch refusal codes, handoff states, claim verdicts, spawn
+counts, and pending depth — never on worker-authored payloads, so the
+two runs differ only where the wire permits them to. The bound
+adapter identity is compared in exactly one place inside the suite's
+marked identity boundary
+(`the_identical_wire_suite_passes_under_each_implementation` plus
+`wire_suite_source_has_no_adapter_name_branch`, which scans the
+source for adapter-name literals and identity-revealing identifiers
+outside that boundary); at least one row must bind a real declaration
+in both runs for the comparison to count. When the checkout yields a
+faithful revision stamp the run retains one record per
+implementation to `target/worker-wire-contract.json`; a dirty or
+non-git checkout runs the identical suite and assertions but retains
+nothing.
+
+One pass also runs through the normal driver:
+`workloop-cli/tests/run_driver.rs::
+a_v2_worker_runs_the_complete_wire_through_the_driver` submits Work
+through the CLI and drives bounded `run` ticks against an installation
+whose `worker_dispatch` section composes the v2 transport — the
+durable request body verifies, the declaration probe records the
+binding, both the Coding writer and the pre-publication
+InvariantCheck launch and resolve `Done` with `Success` reports, the
+produced commit hands off `Acknowledged` with the declared
+verification `Pass` on the exact commit, and the agreeing
+`claimed_head` is recorded as evidence. The Execution then waits in
+`reconciliation`: no CapabilityReport ever reaches this in-process
+driver, so `push_ref` stays unconfirmed and `record_intent` records no
+publish intent at all — the capability gate holding publication, which
+is the correct terminal state for this configuration.
+
+These are fixture/contract evidence rows only: they prove the wire
+contract is implementable and enforced end-to-end inside the
+supervisor and the normal driver. They do not claim live-provider
+integration, and no row here substitutes for one.

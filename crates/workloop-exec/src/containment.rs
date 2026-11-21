@@ -971,19 +971,62 @@ fn run_battery(
         "tmpfs-scratch-writable",
         &mut records,
     );
-    // /home is an empty tmpfs — the host home is not merely unmounted,
-    // it is shadowed. POSIX glob, no external tool required.
-    run_named_probe(
-        port,
-        primitive,
-        &plan,
-        &sh("set -- /home/*; [ \"$1\" = \"/home/*\" ]"),
-        "/tmp",
-        &env,
-        &scratch,
-        "sandbox-home-is-fresh",
-        &mut records,
-    );
+    // No host home content survives inside: a canary written into the
+    // host HOME never resolves — the fresh tmpfs /home shadows it.
+    // Mount-point scaffolding an own-path bind creates (a worker binary
+    // under a home checkout leaves only its bound file reachable) is
+    // inert — only real host content failing to appear would pass, and
+    // that is exactly what the canary denies. POSIX, no external tool.
+    // Unique per probe invocation — parallel callers must not remove
+    // one another's canary out from under the existence check.
+    static HOME_CANARY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let home_canary = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| {
+            PathBuf::from(home).join(format!(
+                "workloop-home-canary-{}-{}",
+                std::process::id(),
+                HOME_CANARY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+        });
+    // The probe only proves isolation when the host canary actually
+    // exists — an unset HOME or a failed write records a failure,
+    // never a vacuous pass.
+    let canary_ready = home_canary
+        .as_ref()
+        .map(|canary| std::fs::write(canary, b"canary").is_ok() && canary.is_file())
+        .unwrap_or(false);
+    if canary_ready {
+        run_named_probe(
+            port,
+            primitive,
+            &plan,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "test -d /home && test ! -e \"$1\"".to_string(),
+                "sh".to_string(),
+                home_canary
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ],
+            "/tmp",
+            &env,
+            &scratch,
+            "sandbox-home-is-fresh",
+            &mut records,
+        );
+    } else {
+        records.push(ProbeRecord {
+            name: "sandbox-home-is-fresh".to_string(),
+            passed: false,
+            detail: "host HOME canary could not be planted".to_string(),
+        });
+    }
+    if let Some(canary) = &home_canary {
+        let _ = std::fs::remove_file(canary);
+    }
     // The PID namespace reaps escaped descendants: a `setsid` child —
     // outside the process group — must die with the namespace init
     // before its delayed marker write lands in the bound out dir.

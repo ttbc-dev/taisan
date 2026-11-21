@@ -353,6 +353,9 @@ fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
     ))
 }
 
+/// Per-member read bound for [`collect_manifest`]: a member file's
+/// digest covers the member's full content — the manifest stays
+/// bounded by the file count cap however large the config tree is.
 fn collect_manifest(
     root: &Path,
     dir: &Path,
@@ -543,6 +546,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A directory provider-config's identity covers member *content*:
+    /// a same-size edit is still an identity change — the gate re-proves
+    /// rather than riding on stale preflight evidence.
     #[test]
     fn a_same_size_member_edit_changes_the_directory_identity() {
         let dir = tmp("dirmanifest");

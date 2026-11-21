@@ -20,6 +20,7 @@
 //! and is never fabricated.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -203,14 +204,36 @@ fn resolve_file(path: &Path) -> Result<ResolvedCredential, CredentialError> {
 /// evidence. Stdout is drained on a reader thread so a provider that
 /// fills the pipe cannot deadlock the bounded wait.
 fn resolve_command(argv: &[String]) -> Result<ResolvedCredential, CredentialError> {
+    resolve_command_bounded(argv, COMMAND_TIMEOUT)
+}
+
+fn resolve_command_bounded(
+    argv: &[String],
+    bound: Duration,
+) -> Result<ResolvedCredential, CredentialError> {
     let program = argv.first().expect("parse guarantees a non-empty argv");
     let mut child = std::process::Command::new(program)
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Its own process group: a provider that forks a descendant
+        // holding the stdout pipe is reaped as a unit on timeout — the
+        // reader thread and the fd never leak on a dead child's pipe.
+        .process_group(0)
         .spawn()
         .map_err(|_| unresolvable("command provider: failed to start"))?;
+    let kill_group = |child: &std::process::Child| {
+        // SAFETY: the child spawned in its own process group, so the
+        // negative pid targets exactly that group.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    };
+    // The reader reports through a channel rather than a join: a
+    // provider that exits but leaves a forked descendant holding the
+    // stdout pipe open would otherwise wedge `join` forever — the
+    // bounded lookup must never hang on a pipe the dead child no
+    // longer owns.
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
     let reader = child.stdout.take().map(|mut stdout| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -218,17 +241,17 @@ fn resolve_command(argv: &[String]) -> Result<ResolvedCredential, CredentialErro
                 .by_ref()
                 .take(MAX_CREDENTIAL_BYTES + 1)
                 .read_to_end(&mut bytes);
-            bytes
+            let _ = output_tx.send(bytes);
         })
     });
     // Bounded wait: poll try_wait like the verification runner — a
     // provider that wedges past the bound is killed and refused.
-    let deadline = std::time::Instant::now() + COMMAND_TIMEOUT;
+    let deadline = std::time::Instant::now() + bound;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_group(&child);
                 let _ = child.wait();
                 return Err(unresolvable(
                     "command provider: did not answer within the bound",
@@ -243,6 +266,12 @@ fn resolve_command(argv: &[String]) -> Result<ResolvedCredential, CredentialErro
         }
     };
     if !status.success() {
+        // A non-zero exit still owes the bound: a descendant can
+        // outlive the child holding the stdout pipe open, so reap
+        // the group and drain the reader before refusing — the
+        // same cleanup the timeout and output paths perform.
+        kill_group(&child);
+        let _ = output_rx.recv_timeout(bound);
         return Err(unresolvable(format!(
             "command provider: exited with {}",
             status
@@ -251,9 +280,19 @@ fn resolve_command(argv: &[String]) -> Result<ResolvedCredential, CredentialErro
                 .unwrap_or_else(|| "a signal".into())
         )));
     }
-    let bytes = reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    let bytes = match reader {
+        Some(_) => match output_rx.recv_timeout(bound) {
+            Ok(bytes) => bytes,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                kill_group(&child);
+                return Err(unresolvable(
+                    "command provider: output did not close within the bound",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
     if bytes.is_empty() {
         return Err(unresolvable("command provider: produced no output"));
     }
@@ -399,6 +438,30 @@ mod tests {
         assert_eq!(failed.class, "credential.unresolvable");
         let silent = resolve("command:true").unwrap_err();
         assert_eq!(silent.class, "credential.unresolvable");
+    }
+
+    /// A provider that exits but leaves a forked descendant holding
+    /// the stdout pipe open must refuse within the bound — the dead
+    /// child's pipe staying open is unresolvable evidence, never a
+    /// hang.
+    #[test]
+    fn command_provider_output_held_open_past_the_bound_refuses() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 5 & printf leaked".to_string(),
+        ];
+        let started = std::time::Instant::now();
+        let err = match resolve_command_bounded(&argv, Duration::from_millis(300)) {
+            Ok(_) => panic!("a pipe held open past the bound must not resolve"),
+            Err(e) => e,
+        };
+        assert_eq!(err.class, "credential.unresolvable");
+        assert!(err.to_string().contains("did not close"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the lookup hung on the inherited pipe"
+        );
     }
 
     #[test]

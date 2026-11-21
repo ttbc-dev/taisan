@@ -2340,18 +2340,13 @@ impl FixtureGithub {
                 )?;
                 return Ok(AttemptOutcome::Attempted);
             }
-            ObservedEffect::Indeterminate { reason } => {
-                self.emit(
-                    store,
-                    config,
-                    obs(result(
-                        intent.action_id,
-                        HostActionStatus::Unknown { reason },
-                        vec![],
-                    )),
-                    now,
-                )?;
-                return Ok(AttemptOutcome::Attempted);
+            ObservedEffect::Indeterminate { .. } => {
+                // Parity with the production adapter: an unreadable
+                // pre-write read never fabricates an `unknown` verdict
+                // on a `pending` intent — nothing was attempted, and
+                // the next absent reconcile read would otherwise
+                // settle the never-attempted write `failed`.
+                return Ok(AttemptOutcome::Skipped("read_indeterminate"));
             }
             ObservedEffect::Absent => {}
         }

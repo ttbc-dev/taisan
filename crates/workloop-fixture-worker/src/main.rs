@@ -354,7 +354,13 @@ fn run_request(args: &Args, ws: &Path) {
     // produces the artifact, `exit-no-artifact` does not, `hang`
     // leaves the tree untouched and keeps the process alive — its
     // report is still written below before the loop, exactly as the
-    // stop-path tests require.
+    // stop-path tests require. A read-only grant (review, invariant
+    // check) produces no workspace writes at all — the report is the
+    // only output.
+    let read_only = request
+        .pointer("/workspace/read_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let behavior = if args.mode == "run" {
         "clean-exit"
     } else {
@@ -362,10 +368,12 @@ fn run_request(args: &Args, ws: &Path) {
     };
     match behavior {
         "clean-exit" => {
-            write_artifact(
-                &ws.join(&args.file),
-                "{\"status\":\"done\",\"worker\":\"fixture\"}\n",
-            );
+            if !read_only {
+                write_artifact(
+                    &ws.join(&args.file),
+                    "{\"status\":\"done\",\"worker\":\"fixture\"}\n",
+                );
+            }
         }
         "exit-no-artifact" | "hang" => {}
         other => {
@@ -373,7 +381,7 @@ fn run_request(args: &Args, ws: &Path) {
             std::process::exit(2);
         }
     }
-    if args.git_commit {
+    if args.git_commit && !read_only {
         git_commit_produced(ws);
     }
     let log_path = out.join("runtime.log");

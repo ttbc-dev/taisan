@@ -47,6 +47,18 @@ jobs:
       - name: Build
         run: cargo build --locked --workspace
 
+      # The reference isolation profile declares bwrap: installs it so
+      # contained-launch contract tests gather real namespace evidence
+      # instead of skipping (docs/v0.3.md OPS-01). Ubuntu restricts
+      # unprivileged user namespaces via AppArmor by default; the
+      # sysctl lifts that restriction for the runner only.
+      - name: Install the sandbox primitive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --version
+
       # Contract tests spawn target/debug/workloop-fixture-worker, so build
       # must run before test in the same job.
       - name: Test

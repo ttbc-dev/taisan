@@ -651,3 +651,313 @@ fn the_outbox_phase_surfaces_unattemptable_intents_as_held() {
         "{outbox}"
     );
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The declared sandbox primitive resolves on this host — the same
+/// fixed-directories-then-PATH lookup the launch gate performs
+/// (`docs/v0.3.md` OPS-01: a host that cannot satisfy it refuses
+/// dispatch, never a substitute).
+fn primitive_on_path(name: &str) -> bool {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"] {
+        if Path::new(dir).join(name).is_file() {
+            return true;
+        }
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// The complete v2 wire through the normal driver: a `worker_dispatch`
+/// installation section composes the bound-request transport, so a
+/// plain `submit` + bounded `run` admits the Work, probes `describe`,
+/// records the adapter binding, materializes the immutable
+/// `taisan.worker.request/2` body, launches `run --request/--out`,
+/// collects and classifies the report as validated evidence, and
+/// drives the produced commit through durable handoff, declared
+/// verification, and the agreeing-claim verdict — every step a durable
+/// fact inside the eight-phase tick, never a fixture shortcut. The
+/// launch runs under the approved reference profile, which declares
+/// the `bwrap` primitive: on a host without it the contract refuses
+/// dispatch (OPS-01), so the evidence is gathered where the primitive
+/// exists — CI installs it.
+#[test]
+fn a_v2_worker_runs_the_complete_wire_through_the_driver() {
+    if !primitive_on_path("bwrap") {
+        eprintln!("skipping: bwrap is absent on this host; the launch gate would refuse (OPS-01)");
+        return;
+    }
+    let dir = root("v2-driver");
+    // The supervisor-side source repository the Coding request pins at
+    // consume time — a real checkout the workspace is built from.
+    let src = dir.join("source-repo");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "-b", "main"]);
+    git(&src, &["config", "user.email", "t@t"]);
+    git(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join("seed.txt"), "base").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    let source_path = src.canonicalize().unwrap();
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/workloop-fixture-worker")
+        .canonicalize()
+        .expect("build the fixture worker first: cargo build --workspace");
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "actor_id": "op",
+            "actor_kind": "human",
+            "host_instance": "host-local",
+            "repository": "local-repo",
+            "adapter": "fixture",
+            "contract_version": 1,
+            "capabilities": [
+                "repository_read",
+                "push_ref",
+                "change_request_create",
+                "change_request_read",
+                "change_request_update",
+                "comment_write",
+                "checks_read",
+                "review_findings_read",
+                "issue_read"
+            ],
+            "host_actors": { "publication": "fixture-agent" },
+            "host_credentials": {},
+            "required_checks": [],
+            "capacity": 1,
+            "worker_argv": [
+                fixture.to_string_lossy(),
+                "clean-exit",
+                "--wire",
+                "v2",
+                "--git-commit",
+                "--claim-head",
+                "HEAD"
+            ],
+            "worker_isolation_profile": workloop_core::worker::DEFAULT_ISOLATION_PROFILE_ID,
+            "worker_dispatch": {
+                "source_path": source_path.to_string_lossy(),
+                "budget": {
+                    "max_turns": 8,
+                    "max_report_bytes": 1048576,
+                    "max_log_bytes": 33554432,
+                    "max_verification_commands": 4,
+                    "max_continuation_refs": 4
+                },
+                "invariant_set": {
+                    "id": "invariants-1",
+                    "revision": 1,
+                    "items": ["no-todo", "tests-pass"]
+                },
+                "capabilities": ["artifact_json", "process_control"]
+            },
+            "workspace_root": dir.join("workspaces"),
+            "allowed_effects": {
+                "workspace_write": true,
+                "host_write": false,
+                "network": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Submit declares one verification command; the produced commit
+    // must pass it before the handoff acknowledges.
+    let out = run_cli(
+        &dir,
+        &[
+            "submit",
+            "--intent",
+            "v2-driver",
+            "--idempotency-key",
+            "v2-driver",
+            "--verification",
+            "true",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "submit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let submitted: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(submitted["status"], "accepted", "{submitted}");
+    let work_id = submitted["work_id"].as_str().unwrap().to_string();
+
+    // Bounded passes: admission + declaration probe + binding on the
+    // first, consume + launch the same pass, report collection and
+    // handoff on the next.
+    let out = run_cli(&dir, &["run", "--ticks", "5", "--interval", "1"]);
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = store(&dir);
+    let reports = store.events("tick_report").unwrap();
+    assert_eq!(reports.len(), 5, "one durable report per pass");
+    for payload in &reports {
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["aborted"], false, "{value}");
+        assert!(
+            value["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| { p["status"] == "completed" || p["status"] == "skipped" }),
+            "every phase completed or cadence-skipped: {value}"
+        );
+    }
+
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&WorkId(work_id.clone())))
+        .unwrap();
+    assert_eq!(executions.len(), 1, "one Execution admitted");
+    let execution = &executions[0];
+    // The wire boundary completed: the Coding writer and the
+    // pre-publication InvariantCheck both resolved Done. The
+    // Execution itself waits in `reconciliation` — no
+    // CapabilityReport reaches this driver, so the capability gate
+    // records no publish intent and publication holds by design.
+    assert_eq!(
+        execution.state,
+        ExecutionState::Waiting,
+        "{:?}",
+        execution.state
+    );
+    assert_eq!(
+        execution.waiting_reason,
+        Some(WaitingReason::Reconciliation),
+        "{:?}",
+        execution.waiting_reason
+    );
+
+    let invocations = store
+        .transact(|tx| tx.invocations_for_execution(&execution.id))
+        .unwrap();
+    assert_eq!(
+        invocations.len(),
+        2,
+        "the Coding writer and the pre-publication check both launched: {invocations:?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|i| i.state == InvocationState::Done && i.process_identity.is_some()),
+        "every launched Invocation resolved Done with a recorded process identity"
+    );
+    let invocation = invocations
+        .iter()
+        .find(|i| i.role == InvocationRole::Coding)
+        .expect("the Coding invocation");
+
+    // The durable v2 request body verifies and binds this exact
+    // request — the launch record the worker consumed.
+    let request_id = invocation.request_id.clone();
+    let body = store
+        .transact(|tx| tx.worker_request_body(&request_id))
+        .unwrap()
+        .expect("the v2 request body is retained");
+    assert!(body.verifies(), "the stored body verifies");
+    let wire = workloop_core::worker_v2::WorkerRequestV2::parse(&body.canonical_body)
+        .expect("the stored body parses as taisan.worker.request/2");
+    assert_eq!(wire.request_id, request_id);
+    assert_eq!(wire.work_id, work_id);
+    assert_eq!(wire.execution_id, execution.id.0);
+    assert_eq!(wire.role, InvocationRole::Coding);
+
+    // The adapter binding the `describe` probe recorded — configuration
+    // provenance, never worker-authored.
+    let request = store
+        .transact(|tx| tx.request(&request_id))
+        .unwrap()
+        .expect("request row");
+    let binding = request
+        .adapter_binding
+        .expect("the declaration probe recorded a binding");
+    assert_eq!(binding.adapter.as_str(), "workloop-fixture-worker");
+
+    // Every launched Invocation's report classified as validated
+    // evidence — the Coding writer's bound to its own request id.
+    let facts = store
+        .transact(|tx| tx.observations_for_execution(&execution.id))
+        .unwrap();
+    let reports_facts: Vec<&ObservationFact> = facts
+        .iter()
+        .map(|o| &o.fact)
+        .filter(|f| matches!(f, ObservationFact::WorkerReport { .. }))
+        .collect();
+    assert_eq!(
+        reports_facts.len(),
+        2,
+        "one collected report per launched Invocation"
+    );
+    for fact in &reports_facts {
+        let ObservationFact::WorkerReport { classification, .. } = *fact else {
+            unreachable!()
+        };
+        assert_eq!(
+            classification,
+            &workloop_core::worker_v2::ReportClassification::Success
+        );
+    }
+    let coding_report = reports_facts
+        .iter()
+        .find(|f| {
+            matches!(f, ObservationFact::WorkerReport { request_id: r, .. } if *r == request_id)
+        })
+        .expect("the Coding report fact");
+    let ObservationFact::WorkerReport { classification, .. } = coding_report else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        workloop_core::worker_v2::ReportClassification::Success
+    );
+
+    // The produced commit handed off: acknowledged against the bare
+    // repository, verified by the declared command on the exact
+    // produced commit, and the agreeing claim recorded as evidence.
+    let handoff = store
+        .transact(|tx| tx.artifact_handoff(&format!("{}/artifact.json", invocation.id.0)))
+        .unwrap()
+        .expect("handoff row recorded");
+    assert_eq!(handoff.state, HandoffState::Acknowledged, "{handoff:?}");
+    assert!(handoff.produced.is_some(), "produced commit recorded");
+    let results = store
+        .transact(|tx| tx.verification_results(&handoff.artifact_id))
+        .unwrap();
+    assert_eq!(results.len(), 1, "one declared verification ran");
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    let claim_facts: Vec<&ObservationFact> = facts
+        .iter()
+        .map(|o| &o.fact)
+        .filter(|f| matches!(f, ObservationFact::ClaimedHeadCheck { .. }))
+        .collect();
+    assert_eq!(claim_facts.len(), 1, "one claim verdict recorded");
+    let ObservationFact::ClaimedHeadCheck { agrees, .. } = claim_facts[0] else {
+        unreachable!()
+    };
+    assert!(
+        agrees,
+        "the worker's claimed head agreed with the promoted commit"
+    );
+}

@@ -49,20 +49,22 @@ const MAX_REQUEST_HEAD: u64 = 8 * 1024;
 pub fn socket_dir(preferred: &Path) -> std::io::Result<PathBuf> {
     // sun_path is 104 bytes on Linux and macOS; socket names here are
     // at most ~32 bytes, so the directory must stay under ~68.
-    if preferred.as_os_str().len() <= 68 {
-        return Ok(preferred.to_path_buf());
-    }
-    let digest = &workloop_core::domain::sha256_hex(
-        "egress-socket-dir",
-        preferred.as_os_str().as_encoded_bytes(),
-    )[..16];
-    let dir = PathBuf::from("/tmp").join(format!("taisan-egress-{digest}"));
+    let dir = if preferred.as_os_str().len() <= 68 {
+        preferred.to_path_buf()
+    } else {
+        let digest = &workloop_core::domain::sha256_hex(
+            "egress-socket-dir",
+            preferred.as_os_str().as_encoded_bytes(),
+        )[..16];
+        PathBuf::from("/tmp").join(format!("taisan-egress-{digest}"))
+    };
     std::fs::create_dir_all(&dir)?;
-    // The fallback dir is a CONNECT capability: it must be a real
-    // directory owned by the effective user. A pre-created symlink or
-    // foreign-owned directory is refused before any chmod or bind —
-    // `/tmp` is sticky, so once the owner check passes the entry
-    // cannot be swapped out from under us.
+    // The socket directory is a CONNECT capability whichever path it
+    // took: it must be a real directory owned by the effective user.
+    // A pre-created symlink or foreign-owned directory is refused
+    // before any chmod or bind — `/tmp` is sticky, and the preferred
+    // path lives inside the state root, so once the owner check
+    // passes the entry cannot be swapped out from under us.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -658,5 +660,25 @@ mod tests {
         drop(client);
         proxy.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The preferred socket dir is a CONNECT capability just like the
+    /// `/tmp` fallback: it is created owner-only — a pre-existing
+    /// permissive mode is tightened, never trusted.
+    #[test]
+    fn the_preferred_socket_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // The preferred path must fit `sun_path` — a short `/tmp`
+        // name keeps it under the bound on every host.
+        let preferred =
+            PathBuf::from("/tmp").join(format!("taisan-sockdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&preferred);
+        std::fs::create_dir_all(&preferred).unwrap();
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = socket_dir(&preferred).unwrap();
+        assert_eq!(resolved, preferred);
+        let mode = std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the socket dir is never world-connectable");
+        let _ = std::fs::remove_dir_all(&preferred);
     }
 }

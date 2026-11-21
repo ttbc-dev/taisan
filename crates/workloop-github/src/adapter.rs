@@ -55,6 +55,7 @@ use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding};
+use crate::credential::{CredentialError, CredentialProviders, resolve_credential};
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
@@ -108,13 +109,19 @@ pub enum WebhookFact {
 /// What one [`GitHubAdapter`] session applied, in order — the write
 /// history assertions drive. Encoding is adapter-internal, matching
 /// the fixtures' so shared-suite assertions need no special case.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct GitHubAdapter<C> {
     client: C,
     /// When set, only intents recorded for this host instance are
     /// drained; another instance's intents stay `pending` for their
     /// own adapter — an effect never migrates across hosts.
     bound_host: Option<HostInstanceId>,
+    /// The credential providers the adapter resolves `credential_ref`s
+    /// through at the adapter boundary. `None` keeps the transport's
+    /// ambient identity (the construction tests use); production
+    /// installs the OS providers so every intent binds its declared
+    /// credential before any read or write.
+    credentials: Option<Box<dyn CredentialProviders>>,
     applied: Vec<String>,
     poll_records: u64,
 }
@@ -124,6 +131,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Self {
             client,
             bound_host: None,
+            credentials: None,
             applied: Vec::new(),
             poll_records: 0,
         }
@@ -135,8 +143,107 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Self {
             client,
             bound_host: Some(host),
+            credentials: None,
             applied: Vec::new(),
             poll_records: 0,
+        }
+    }
+
+    /// Install the credential providers `credential_ref`s resolve
+    /// through — the adapter-boundary binding gate.
+    pub fn with_credentials(mut self, providers: Box<dyn CredentialProviders>) -> Self {
+        self.credentials = Some(providers);
+        self
+    }
+
+    /// The logical comment body a stored comment carries: live
+    /// transports append the marker envelope (`{body}\n\n<!--
+    /// {marker} -->`) for idempotence, so reconciliation and the
+    /// recorded digest both key on the body before the decoration —
+    /// a fixture's raw body strips to itself. Only the exact
+    /// `\n\n<!-- {marker} -->` tail strips; a body that merely ends in
+    /// the envelope markup stays whole — a foreign comment carrying the
+    /// marker without our separator is never adopted as ours.
+    fn logical_comment_body<'a>(stored: &'a str, marker: &str) -> &'a str {
+        stored
+            .strip_suffix(&format!("\n\n<!-- {marker} -->"))
+            .unwrap_or(stored)
+    }
+
+    /// The adapter-boundary credential gate — the same binding the
+    /// fixture's book performs: the intent's recorded role binding
+    /// resolves its credential slot at use time and the resolved value
+    /// authenticates as the intent's authorized actor before any read
+    /// or write. On success the transport runs under the bound
+    /// credential for the rest of this intent's calls. `Ok(None)` —
+    /// no credential book installed — keeps the ambient identity; a
+    /// `credential.*` failure never rebinds an outstanding action
+    /// under another account.
+    fn bind_intent_credential(
+        &mut self,
+        store: &impl Store,
+        intent: &HostActionIntent,
+    ) -> Result<Option<CredentialError>, StoreError> {
+        // Every intent's binding starts from ambient: a credential a
+        // previous intent installed must never leak into this one —
+        // not when the binding resolves, not when it is blocked, and
+        // not when the intent declares no binding at all.
+        self.client.set_credential(None);
+        let Some(providers) = &self.credentials else {
+            return Ok(None);
+        };
+        let reference = store.transact(|tx| {
+            Ok(tx.work(&intent.work_id)?.and_then(|work| {
+                work.binding
+                    .actors
+                    .iter()
+                    .find(|binding| binding.role == intent.role)
+                    .map(|binding| binding.credential_ref.clone())
+            }))
+        })?;
+        // `default` is the shared ambient slot: there is no credential
+        // to inject, but the ambient login still proves its actor —
+        // `gh api user` under the transport's own credential answers
+        // who the intent's calls act as, and an unprovable or foreign
+        // ambient identity blocks the intent the same way a resolved
+        // credential would.
+        if reference.as_ref().is_some_and(|r| r.as_str() == "default") {
+            // Ambient first — a credential a previous intent left bound
+            // must not impersonate the ambient login.
+            self.client.set_credential(None);
+            let proven = self.client.viewer().ok().flatten().and_then(|login| {
+                HostActorId::new(login).ok().map(|actor| HostActorRef {
+                    host: intent.host.clone(),
+                    actor,
+                })
+            });
+            return Ok(match proven {
+                Some(actor) if actor == intent.actor => None,
+                Some(actor) => Some(CredentialError::ActorMismatch {
+                    bound: intent.actor.clone(),
+                    authenticated: actor,
+                }),
+                None => Some(CredentialError::unresolvable(
+                    "the ambient credential cannot prove its actor",
+                )),
+            });
+        }
+        let bind = resolve_credential(reference.as_ref(), &**providers).and_then(|resolved| {
+            let authenticated = self.client.authenticate(&resolved)?;
+            if authenticated != intent.actor {
+                return Err(CredentialError::ActorMismatch {
+                    bound: intent.actor.clone(),
+                    authenticated,
+                });
+            }
+            Ok(resolved)
+        });
+        match bind {
+            Ok(resolved) => {
+                self.client.set_credential(Some(resolved));
+                Ok(None)
+            }
+            Err(error) => Ok(Some(error)),
         }
     }
 
@@ -242,11 +349,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// intent never starves the ready intents behind it. The
     /// untouched remainder is reported `deferred`, never dropped.
     ///
-    /// Authentication is the transport's ambient credential (`gh`'s
-    /// own login or `GH_TOKEN`): this adapter performs no
-    /// per-credential binding, so `credential_blocked` is never
-    /// populated — the scenario-book credential gate belongs to the
-    /// fixture, not to this driver.
+    /// Credential binding is per intent: [`Self::attempt`] resolves
+    /// the intent's role-bound `credential_ref` and authenticates it
+    /// as the intent's authorized actor before any read or write — a
+    /// `credential.*` failure reports the intent `credential_blocked`
+    /// and leaves it pending for repair.
     pub fn apply_outbox_bounded(
         &mut self,
         store: &impl Store,
@@ -260,11 +367,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // is skipped for the rest of this pass — it neither loops the
         // pass forever nor blocks later independent intents.
         let mut report = OutboxReport::default();
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
+        // The installation-level `host_write` grant denies the whole
+        // drain — the pass still classifies every pending in-scope
+        // intent `host_write_denied` instead of returning an empty
+        // report that hides the held work.
         if !config.allowed_effects.host_write {
+            report.skipped = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| i.status == HostActionStatus::Pending && in_scope(i))
+                    .map(|i| SkippedIntent {
+                        action_id: i.action_id,
+                        reason: "host_write_denied",
+                    })
+                    .collect())
+            })?;
             return Ok(report);
         }
         let now = clock();
-        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
         let mut attempted = HashSet::new();
         loop {
             // Both bounds stop the drain before the next item starts:
@@ -415,6 +537,20 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 continue;
             }
             report.examined += 1;
+            // The same adapter-boundary credential gate `attempt` and
+            // `reconcile_outstanding` run: the intent's role binding
+            // resolves and authenticates as the intent's actor before
+            // any remote read under it. A `credential.*` failure leaves
+            // the intent outstanding — a reconcile read under the
+            // ambient or previously bound credential could settle
+            // somebody else's effect onto this intent.
+            if let Some(error) = self.bind_intent_credential(store, &intent)? {
+                report.credential_blocked.push(CredentialBlock {
+                    action_id,
+                    code: error.code(),
+                });
+                continue;
+            }
             let work_id = intent.work_id.clone();
             let execution_id = store.transact(|tx| {
                 Ok(tx
@@ -1081,6 +1217,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         deadline: Option<i64>,
         scope: Option<&WorkId>,
     ) -> Result<SourceRefreshReport, StoreError> {
+        // Host-level reads are ambient work: the transport's bound
+        // credential is per intent and an earlier attempt's binding
+        // must not leak into capability probing or source reads —
+        // reset to the ambient identity before any refresh read.
+        self.client.set_credential(None);
         let now = clock();
         let mut report = SourceRefreshReport {
             now_unix_seconds: now,
@@ -1450,6 +1591,16 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             .collect();
         let mut resolved = Vec::new();
         for intent in unknown {
+            // The same adapter-boundary credential gate `attempt`
+            // runs: the intent's recorded role binding resolves and
+            // authenticates under the actor authorized at intent
+            // time — a rotated credential that authenticates as
+            // another actor never rebinds or settles the outstanding
+            // action; a `credential.*` failure leaves it unknown and
+            // outstanding for repair.
+            if self.bind_intent_credential(store, &intent)?.is_some() {
+                continue;
+            }
             let execution = store.transact(|tx| {
                 Ok(tx
                     .executions_for_work(&intent.work_id)?
@@ -1621,17 +1772,28 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         // somebody else's change.
                     }
                 }
-                HostAction::PostComment { change, marker, .. } => {
+                HostAction::PostComment {
+                    change,
+                    marker,
+                    body,
+                    ..
+                } => {
                     if let Ok(found) =
                         self.client
                             .find_comment(&intent.repository, &change.change_request, marker)
                     {
                         match found {
-                            Some(comment) => {
+                            Some(comment)
+                                if Self::logical_comment_body(&comment.body, marker)
+                                    == body.as_str() =>
+                            {
                                 let body_digest = sha256_hex(
                                     "comment-v1",
                                     &canonical_json(&serde_json::json!({
-                                        "body": comment.body,
+                                        "body": Self::logical_comment_body(
+                                            &comment.body,
+                                            marker,
+                                        ),
                                     })),
                                 );
                                 terminal = record(
@@ -1658,6 +1820,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                     vec![],
                                 )?;
                             }
+                            // A comment carrying our marker but a
+                            // different stored body cannot be told
+                            // from a foreign post: like a payload
+                            // mismatch on open, the intent stays
+                            // `unknown` and outstanding rather than
+                            // adopting somebody else's comment.
+                            Some(_) => {}
                         }
                     }
                 }
@@ -1673,7 +1842,14 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     {
                         let title_matches = title.as_ref().is_none_or(|t| &pull.title == t);
                         let body_matches = body.as_ref().is_none_or(|b| &pull.body == b);
-                        if title_matches && body_matches {
+                        // The remote head must still be the revision
+                        // the intent bound — a moved head means the
+                        // update ran against a different change than
+                        // the receipt would attest, so the intent
+                        // stays `unknown` and outstanding instead of
+                        // settling `applied` on a fabricated match.
+                        let head_matches = pull.head_sha == expected_head.object;
+                        if title_matches && body_matches && head_matches {
                             let fields_digest = sha256_hex(
                                 "change-meta-v1",
                                 &canonical_json(&serde_json::json!({
@@ -1937,7 +2113,12 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     }),
                 })
             }
-            HostAction::PostComment { change, marker, .. } => {
+            HostAction::PostComment {
+                change,
+                marker,
+                body,
+                ..
+            } => {
                 match self
                     .client
                     .find_comment(&intent.repository, &change.change_request, marker)
@@ -1945,11 +2126,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     Err(_) => Ok(RemoteEffect::Indeterminate {
                         reason: "comment listing failed".into(),
                     }),
+                    // The marker is the idempotence key; a stored body
+                    // that differs from the recorded payload is the
+                    // fixture's `Indeterminate` verdict — our write's
+                    // landing cannot be told from a foreign comment
+                    // carrying the marker.
+                    Ok(Some(comment))
+                        if Self::logical_comment_body(&comment.body, marker) != body.as_str() =>
+                    {
+                        Ok(RemoteEffect::Indeterminate {
+                            reason: "the recorded marker carries a different stored body".into(),
+                        })
+                    }
                     Ok(Some(comment)) => {
                         let body_digest = sha256_hex(
                             "comment-v1",
                             &canonical_json(&serde_json::json!({
-                                "body": comment.body,
+                                "body": Self::logical_comment_body(
+                                    &comment.body,
+                                    marker,
+                                ),
                             })),
                         );
                         Ok(RemoteEffect::Present {
@@ -2022,49 +2218,64 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             fact,
             observed_unix_seconds: now,
         };
-        // Every guarded-write receipt attests only the verified
-        // ambient identity: `gh` acts as whatever login its token
-        // resolves to, so the actor is verified through the host,
-        // never assumed from the intent's claim. `None` records an
-        // unattested identity exactly.
-        let authenticated = self
-            .client
-            .viewer()
-            .ok()
-            .and_then(|login| HostActorId::new(login).ok())
-            .map(|actor| HostActorRef {
-                host: intent.actor.host.clone(),
-                actor,
-            });
-        let result =
-            |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
-                ObservationFact::HostActionResult {
-                    action_id,
-                    authenticated_actor: authenticated.clone(),
-                    status,
-                    effects,
-                }
-            };
-
         // Support is validated distinctly from anything else: an
         // operation outside the declared set is an explicit
         // `unsupported` receipt, never a write and never a permission
-        // verdict.
+        // verdict — and never waits on a credential slot it will not
+        // use. The classification is a terminal settle, so the receipt
+        // attests no actor.
         if !Self::supports(&intent.action) {
             self.ingest(
                 store,
                 config,
-                obs(result(
-                    intent.action_id,
-                    HostActionStatus::Unsupported {
+                obs(ObservationFact::HostActionResult {
+                    action_id: intent.action_id.clone(),
+                    authenticated_actor: None,
+                    status: HostActionStatus::Unsupported {
                         reason: format!("unsupported operation: {}", intent.action.name()),
                     },
-                    vec![],
-                )),
+                    effects: vec![],
+                }),
                 now,
             )?;
             return Ok(AttemptOutcome::Attempted);
         }
+        // The adapter-boundary credential gate — the declared
+        // `credential_ref` for the intent's role resolves at use time
+        // and authenticates as the intent's authorized actor before
+        // any reconcile read or guarded write; a `credential.*`
+        // failure blocks the intent pending repair rather than
+        // writing under the ambient login.
+        if let Some(error) = self.bind_intent_credential(store, &intent)? {
+            return Ok(AttemptOutcome::CredentialBlocked(error.code()));
+        }
+        // The write receipt is authenticated by the transport's proven
+        // identity — `gh api user` — never the intent's configured
+        // actor: a credential acting as another account records that
+        // account so the durable actor-mismatch and drift-rearm checks
+        // see the truth. A transport that cannot prove an identity
+        // records an unauthenticated receipt, never a fabricated one.
+        // `Err` — the transport cannot answer who it acts as — is
+        // distinct from `Ok(None)`, a transport without an identity
+        // surface: only the outage fails the write closed below.
+        let viewer = self.client.viewer();
+        let authenticated_actor = viewer.as_ref().ok().and_then(|login| {
+            login.as_ref().and_then(|login| {
+                HostActorId::new(login).ok().map(|actor| HostActorRef {
+                    host: intent.host.clone(),
+                    actor,
+                })
+            })
+        });
+        let result =
+            |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
+                ObservationFact::HostActionResult {
+                    action_id,
+                    authenticated_actor: authenticated_actor.clone(),
+                    status,
+                    effects,
+                }
+            };
 
         // Reconcile-before-write: an intent whose effect the remote
         // already shows settles from the read — the receipt a crash
@@ -2090,62 +2301,47 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 )?;
                 return Ok(AttemptOutcome::Attempted);
             }
-            RemoteEffect::Indeterminate { reason } => {
-                self.ingest(
-                    store,
-                    config,
-                    obs(ObservationFact::HostActionResult {
-                        action_id: intent.action_id.clone(),
-                        authenticated_actor: None,
-                        status: HostActionStatus::Unknown { reason },
-                        effects: vec![],
-                    }),
-                    now,
-                )?;
-                return Ok(AttemptOutcome::Attempted);
+            RemoteEffect::Indeterminate { .. } => {
+                // An unreadable pre-write read never fabricates an
+                // `unknown` verdict on a `pending` intent — nothing was
+                // attempted, and the next absent reconcile read would
+                // otherwise settle the never-attempted write `failed`
+                // and spend a transport retry on a read outage. The
+                // intent stays pending for the next pass.
+                return Ok(AttemptOutcome::Skipped("read_indeterminate"));
             }
             RemoteEffect::Absent { .. } => {}
         }
 
-        // A write runs only under the verified bound identity: an
-        // unattested credential never authors an effect, and a foreign
-        // one is recorded — the durable ingest settles the receipt
-        // `unknown{actor_mismatch}` and the intent stays outstanding
-        // until the ambient credential matches the binding.
-        match &authenticated {
-            Some(actor) if actor == &intent.actor => {}
-            Some(actor) => {
-                self.ingest(
-                    store,
-                    config,
-                    obs(ObservationFact::HostActionResult {
-                        action_id: intent.action_id.clone(),
-                        authenticated_actor: Some(actor.clone()),
-                        status: HostActionStatus::Unknown {
-                            reason: "actor_mismatch".into(),
-                        },
-                        effects: vec![],
-                    }),
-                    now,
-                )?;
-                return Ok(AttemptOutcome::Attempted);
-            }
-            None => {
-                self.ingest(
-                    store,
-                    config,
-                    obs(ObservationFact::HostActionResult {
-                        action_id: intent.action_id.clone(),
-                        authenticated_actor: None,
-                        status: HostActionStatus::Unknown {
-                            reason: "actor_unverifiable".into(),
-                        },
-                        effects: vec![],
-                    }),
-                    now,
-                )?;
-                return Ok(AttemptOutcome::Attempted);
-            }
+        // The credential gate before any write: the transport's proven
+        // identity must be the actor the intent binds. A `gh` session
+        // acting as another account never pushes, opens, or comments —
+        // the write is refused and the receipt records the proven
+        // actor, so the durable `actor_mismatch` verdict is evidence of
+        // a prevented effect, never a landed one. An outage answering
+        // `viewer` is fail-closed too — `unknown{actor_unverifiable}`
+        // leaves the intent outstanding until the transport answers
+        // again; a transport without an identity surface proceeds
+        // unauthenticated exactly as before.
+        let gate = match (&viewer, &authenticated_actor) {
+            (Err(_), _) => Some("actor_unverifiable"),
+            (Ok(_), Some(actor)) if *actor != intent.actor => Some("actor_mismatch"),
+            _ => None,
+        };
+        if let Some(reason) = gate {
+            self.ingest(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Unknown {
+                        reason: reason.to_string(),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
         }
 
         match &intent.action {
@@ -2582,7 +2778,10 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         let body_digest = sha256_hex(
                             "comment-v1",
                             &canonical_json(&serde_json::json!({
-                                "body": comment.body,
+                                "body": Self::logical_comment_body(
+                                    &comment.body,
+                                    marker,
+                                ),
                             })),
                         );
                         self.ingest(

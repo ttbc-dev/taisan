@@ -3128,17 +3128,25 @@ fn effect_matches(intent: &HostActionIntent, effects: &[NormalizedEffectFact]) -
                 change,
                 expected_head,
                 marker,
-                ..
+                body,
             },
             NormalizedEffectFact::CommentPosted {
                 change: commented,
                 marker: comment_marker,
+                body_digest,
                 target,
                 ..
             },
         ) => {
+            // A marker match alone must not adopt a foreign comment:
+            // the observed body must digest to the intent's own body.
             commented == change
                 && comment_marker == marker
+                && *body_digest
+                    == sha256_hex(
+                        "comment-v1",
+                        &canonical_json(&serde_json::json!({ "body": body })),
+                    )
                 && target.as_ref().is_none_or(|t| &t.head == expected_head)
         }
         (
