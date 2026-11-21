@@ -303,5 +303,13 @@ pub trait GitHubApi {
         })
     }
 
+    /// The host-side login the transport's ambient credential acts
+    /// as — `None` when the transport cannot prove an identity. A
+    /// write receipt is only ever stamped with this proven identity,
+    /// never the intent's configured actor.
+    fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) {}
 }
