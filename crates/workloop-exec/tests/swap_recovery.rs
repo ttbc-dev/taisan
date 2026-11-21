@@ -901,6 +901,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         repository: repo_dir.clone(),
         workspace_root: ws_root.clone(),
         out_root: out_root.clone(),
+        state_root: None,
         verification: None,
     };
     let spawns = Rc::new(Cell::new(0usize));
@@ -1285,6 +1286,7 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
         repository: repo_dir.clone(),
         workspace_root: ws_root.clone(),
         out_root: out_root.clone(),
+        state_root: None,
         verification: None,
     };
     let spawns = Rc::new(Cell::new(0usize));

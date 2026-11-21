@@ -213,6 +213,7 @@ fn layout(root: &Path, work_id: &WorkId) -> (HandoffLayout, PathBuf) {
             repository: bare_repo(root),
             workspace_root: ws_root.clone(),
             out_root,
+            state_root: None,
             verification: None,
         },
         ws_root.join(format!("ws-{}", work_id.0)),
@@ -729,6 +730,7 @@ fn only_a_proven_dead_invocation_exports() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        state_root: None,
         verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
@@ -1316,6 +1318,7 @@ fn a_source_bound_work_derives_base_from_the_workspace() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        state_root: None,
         verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], cfg)
@@ -1381,6 +1384,7 @@ fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
         repository: bare_repo(&root),
         workspace_root: ws_root.clone(),
         out_root: root.join("out"),
+        state_root: None,
         verification: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
@@ -1538,6 +1542,45 @@ fn install_sandbox(
         relay_exe: relay.clone(),
     });
     (bwrap, relay, bwrap_log, relay_log)
+}
+
+/// A refused enforcement boundary records Inconclusive without ever
+/// registering a worktree in the handoff repository — registering the
+/// checkout is part of the cost the refusal exists to avoid, and the
+/// post-run `worktree remove` is only best-effort.
+#[test]
+fn a_refused_enforcement_boundary_registers_no_worktree() {
+    let root = tmp_root("enfrefuse");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vnoadd");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    install_sandbox(
+        &mut layout,
+        &root,
+        port,
+        vec!["deps.example".into()],
+        vec!["model.example".into()],
+    );
+    // A declared egress host that names a model-API host is refused at
+    // the enforcement boundary (§14.5).
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["git".into(), "rev-parse".into(), "HEAD".into()],
+        &scratch,
+        &["model.example".into()],
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(res.output.contains("egress_denied"), "{}", res.output);
+    let listed = git(&layout.repository, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listed.contains("verify-"),
+        "the refused boundary registered a worktree:\n{listed}"
+    );
 }
 
 #[test]
@@ -1765,6 +1808,36 @@ fn contained_verification_refuses_a_model_api_egress_host() {
     assert!(
         !bwrap_log.exists(),
         "the sandbox never launched on a refused egress host"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A request declaring verification egress hosts while the
+/// installation configures no verification sandbox is refused, never
+/// run with the host's unrestricted network — a declared grant with
+/// no proxy to honour it is an open-network fallback (§14.5).
+#[test]
+fn declared_egress_hosts_without_a_sandbox_are_refused() {
+    let root = tmp_root("verify-egress-nosb");
+    let (store, layout, scratch, aid) = acknowledged(&root, "vc-egress-nosb");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "echo never".into()],
+        &scratch,
+        &["deps.example".into()],
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output
+            .contains("verification.egress_declared_without_sandbox"),
+        "{}",
+        res.output
     );
     let _ = std::fs::remove_dir_all(&root);
 }

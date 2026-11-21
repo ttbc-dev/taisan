@@ -2524,7 +2524,8 @@ mod tests {
         /// One-shot armed faults per operation name.
         armed: std::collections::HashMap<String, ArmedFault>,
         /// The login `viewer()` attests — the ambient identity the
-        /// double models; the suite's bound publisher by default.
+        /// double models; `bot-pub` (the suite's bound publisher)
+        /// by default.
         viewer: Option<String>,
     }
 

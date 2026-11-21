@@ -939,6 +939,13 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// `None` fails report collection for v2 invocations rather than
     /// recording evidence that cannot resolve.
     pub body_store: Option<BodyStore>,
+    /// Installation-owned roots a contained launch masks with a fresh
+    /// tmpfs when a fixed system bind would otherwise expose them —
+    /// the state root holding the store and the workspace root
+    /// holding workspaces, the handoff repository, and credential
+    /// staging (`docs/v0.3.md` §14.3). Defaults to the workspace
+    /// root; the composition root adds the state root.
+    pub sandbox_mask_roots: Vec<PathBuf>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -949,6 +956,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         worker_argv: Vec<String>,
         config: workloop_core::work::WorkloopConfig,
     ) -> Self {
+        let sandbox_mask_roots = vec![workspace_root.clone()];
         Self {
             port,
             workspace_root,
@@ -959,6 +967,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             v2: None,
             runtime_boundary: None,
             body_store: None,
+            sandbox_mask_roots,
             locks: Mutex::new(HashMap::new()),
         }
     }
@@ -977,6 +986,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// root) for Workspaces carrying git objects.
     pub fn with_handoff(mut self, layout: crate::handoff::HandoffLayout) -> Self {
         self.handoff = Some(layout);
+        self
+    }
+
+    /// Installation-owned roots a contained launch masks when a fixed
+    /// system bind would expose them — the composition root passes
+    /// the state root beside the workspace root the default names.
+    pub fn with_sandbox_mask_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.sandbox_mask_roots = roots;
         self
     }
 
@@ -1150,6 +1167,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
             plan.runtime_auth = grant.credential_file.clone();
             plan.provider_config = grant.provider_config.clone();
             plan.proxy_sock = grant.proxy_sock.clone();
+            if let Some(source) = &grant.credential_source {
+                plan.masked_files.push(source.clone());
+            }
         }
         let (exec_argv, egress_proxy) = if proxy_granted {
             // The proxy socket is bound at `/taisan/proxy.sock`; the
@@ -1219,6 +1239,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
+                    masked_files: vec![],
                 };
                 let inner_cwd = if workspace_bound.is_some() {
                     containment::SANDBOX_WORKSPACE
@@ -1617,16 +1639,27 @@ impl<P: ProcessControlPort> Supervisor<P> {
             let Some(work) = tx.work(&execution.work_id)? else {
                 return Ok(None);
             };
-            let Some(spec) = tx.spec(&work.id, Some(work.spec))? else {
+            let Some(request) = tx.request(&invocation.request_id)? else {
                 return Ok(None);
             };
-            // The Work-declared verification egress hosts and the
-            // workspace fork point live in the immutable v2 request
-            // body; a v1 dispatch or an absent body declares neither.
-            // An unverifiable body is corrupt durable state — the
-            // parse failure is a fault, never a silently empty grant
-            // or an unpinned base.
-            let (verification_egress_hosts, pinned_base, branch_start) =
+            // Verification reads the spec revision the request was
+            // bound at — a later approved revision moves `work.spec`
+            // and must never silently re-bind an in-flight launch's
+            // verification commands.
+            let Some(spec) = tx.spec(&work.id, Some(request.spec_revision))? else {
+                return Ok(None);
+            };
+            // The verification argv, egress hosts, and workspace fork
+            // point a v2 dispatch runs are the immutable request
+            // body's — the bound spec the Worker was launched against,
+            // never the Work's current spec revision, which a re-edit
+            // could move mid-flight and silently re-bind verification
+            // to commands the dispatch never approved. A v1 dispatch
+            // or an absent body declares neither, and keeps the
+            // recorded spec argv it always had. An unverifiable body
+            // is corrupt durable state — a fault, never a silently
+            // empty grant or an unpinned base.
+            let (verification_argv, verification_egress_hosts, pinned_base, branch_start) =
                 match tx.worker_request_body(&invocation.request_id)? {
                     Some(body) => {
                         if !body.verifies() {
@@ -1649,17 +1682,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             _ => req.base.object.clone(),
                         };
                         (
+                            req.verification_argv().to_vec(),
                             req.required_capabilities.verification_egress_hosts,
                             req.base.object,
                             start,
                         )
                     }
-                    None => (Vec::new(), String::new(), String::new()),
+                    None => (
+                        spec.payload.verification_argv.clone(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                    ),
                 };
             Ok(Some((
                 invocation.clone(),
                 work.id.clone(),
-                spec.payload.verification_argv.clone(),
+                verification_argv,
                 verification_egress_hosts,
                 pinned_base,
                 branch_start,
@@ -2273,10 +2312,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Gate::Uncontained => (inner_argv, launch_env_base),
             Gate::Ready { primitive, worker } => {
                 let plan = MountPlan {
+                    // Assessment roles read the produced state; only a
+                    // writer mounts the workspace read-write (§14.6).
                     workspace: Some((
                         workspace.clone(),
-                        // §14.6: assessment roles bind the workspace
-                        // read-only; writers keep read-write.
                         matches!(
                             request.role,
                             InvocationRole::InvariantCheck | InvocationRole::Review
@@ -2294,6 +2333,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
+                    masked_files: vec![],
                 };
                 match self.contained_exec(
                     primitive,
@@ -2817,6 +2858,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
+                    masked_files: vec![],
                 };
                 match self.contained_exec(
                     primitive,
@@ -3443,6 +3486,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
                     worker: worker.clone(),
+                    mask_roots: self.sandbox_mask_roots.clone(),
+                    masked_files: vec![],
                 };
                 match self.contained_exec(
                     &primitive,
@@ -3512,9 +3557,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // cannot be told apart, and outside it the match might be the
         // real writer after a chdir — which makes the in-directory
         // lookalike a foreign process that must not be adopted,
-        // inspected, or signaled as this launch's writer.
+        // inspected, or signaled as this launch's writer. A contained
+        // worker's cwd reads as the sandbox mount `SANDBOX_WORKSPACE`
+        // instead of the host launch dir — its namespace's `/workspace`
+        // is exactly the launch's workspace bind, so it satisfies the
+        // same "inside the launch directory" rule.
         match unrecorded.as_slice() {
-            [child] if cwd_within(child.cwd.as_deref(), &canonical_dir) => {
+            [child]
+                if cwd_within(child.cwd.as_deref(), &canonical_dir)
+                    || child.cwd.as_deref()
+                        == Some(std::path::Path::new(containment::SANDBOX_WORKSPACE)) =>
+            {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -5088,6 +5141,8 @@ mod tests {
             extra_binds: vec![],
             extra_rw_binds: vec![],
             worker: None,
+            mask_roots: vec![],
+            masked_files: vec![],
         }
     }
 

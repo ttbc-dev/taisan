@@ -21,7 +21,7 @@
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use workloop_core::credential::CredentialProvider;
@@ -36,6 +36,7 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 /// credential value.
 const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SCAN_FILES: usize = 64;
+const MAX_SCAN_DEPTH: u32 = 8;
 
 /// The resolved credential bytes. `Debug`/`Display` are deliberately
 /// absent — the value must never be formattable into a log, an error,
@@ -43,11 +44,21 @@ const MAX_SCAN_FILES: usize = 64;
 #[derive(Clone)]
 pub struct ResolvedCredential {
     bytes: Vec<u8>,
+    /// For a `file:` provider, the canonicalized host path the value
+    /// was read from. The containment plan masks it inside the
+    /// sandbox when a fixed system bind would expose it — the staged
+    /// `/taisan/runtime-auth` file is the only credential surface.
+    source: Option<PathBuf>,
 }
 
 impl ResolvedCredential {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The host path a `file:` provider read, when one exists.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 }
 
@@ -130,7 +141,10 @@ fn resolve_env(name: &str) -> Result<ResolvedCredential, CredentialError> {
                     "env provider: variable '{name}' exceeds the credential bound"
                 )));
             }
-            Ok(ResolvedCredential { bytes })
+            Ok(ResolvedCredential {
+                bytes,
+                source: None,
+            })
         }
     }
 }
@@ -176,7 +190,10 @@ fn resolve_file(path: &Path) -> Result<ResolvedCredential, CredentialError> {
     std::fs::File::open(&resolved)
         .and_then(|mut f| f.read_to_end(&mut bytes))
         .map_err(|_| unresolvable("file provider: read failed"))?;
-    Ok(ResolvedCredential { bytes })
+    Ok(ResolvedCredential {
+        bytes,
+        source: Some(resolved),
+    })
 }
 
 /// `command:` provider: argv split on ASCII whitespace at parse, run
@@ -284,7 +301,10 @@ fn resolve_command_bounded(
             "command provider: output exceeds the credential bound",
         ));
     }
-    Ok(ResolvedCredential { bytes })
+    Ok(ResolvedCredential {
+        bytes,
+        source: None,
+    })
 }
 
 /// Whether `haystack` (a file's bytes) contains the credential value.
@@ -295,12 +315,15 @@ pub fn contains_secret(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Bounded scan of a provider-config path for an embedded credential
-/// value. A regular file is scanned up to [`MAX_SCAN_FILE_BYTES`]; a
-/// directory is scanned one level deep, at most [`MAX_SCAN_FILES`]
-/// regular files. Anything larger or deeper is not scanned — the
-/// mount itself is read-only either way, and the scan is a
-/// configuration-honesty check, not the boundary.
+/// Bounded recursive scan of a provider-config path for an embedded
+/// credential value. A regular file is scanned up to
+/// [`MAX_SCAN_FILE_BYTES`]; a directory is walked to any nesting —
+/// [`MAX_SCAN_FILES`] regular files total and [`MAX_SCAN_DEPTH`]
+/// directories deep. Exceeding a bound is an error: a config the scan
+/// cannot cover cannot be proven credential-free, and the "no
+/// credential value" rule is a configuration contract, not an
+/// advisory check. Symlinks are never followed — the mount carries
+/// only what the directory itself holds.
 pub fn provider_config_contains(path: &Path, needle: &[u8]) -> Result<bool, std::io::Error> {
     if needle.is_empty() {
         return Ok(false);
@@ -311,29 +334,59 @@ pub fn provider_config_contains(path: &Path, needle: &[u8]) -> Result<bool, std:
     }
     if metadata.is_dir() {
         let mut scanned = 0usize;
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
-            }
-            scanned += 1;
-            if scanned > MAX_SCAN_FILES {
-                break;
-            }
-            if scan_file(&entry.path(), needle)? {
+        return scan_dir(path, needle, &mut scanned, 0);
+    }
+    Ok(false)
+}
+
+fn scan_dir(
+    dir: &Path,
+    needle: &[u8],
+    scanned: &mut usize,
+    depth: u32,
+) -> Result<bool, std::io::Error> {
+    if depth > MAX_SCAN_DEPTH {
+        return Err(scan_bound());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if scan_dir(&entry.path(), needle, scanned, depth + 1)? {
                 return Ok(true);
             }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        *scanned += 1;
+        if *scanned > MAX_SCAN_FILES {
+            return Err(scan_bound());
+        }
+        if scan_file(&entry.path(), needle)? {
+            return Ok(true);
         }
     }
     Ok(false)
 }
 
+fn scan_bound() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "scan bound exceeded: the provider config cannot be proven credential-free",
+    )
+}
+
 fn scan_file(path: &Path, needle: &[u8]) -> Result<bool, std::io::Error> {
-    let file = std::fs::File::open(path)?;
-    let mut limited = file.take(MAX_SCAN_FILE_BYTES);
+    let mut file = std::fs::File::open(path)?;
+    // A file larger than the read bound cannot be proven
+    // credential-free — refuse rather than scan a prefix and pass.
+    if file.metadata()?.len() > MAX_SCAN_FILE_BYTES {
+        return Err(scan_bound());
+    }
     let mut buf = Vec::new();
-    limited.read_to_end(&mut buf)?;
+    file.read_to_end(&mut buf)?;
     Ok(contains_secret(&buf, needle))
 }
 
@@ -429,6 +482,67 @@ mod tests {
         std::fs::write(&dirty, "token = \"xxneedlexx\"\n").unwrap();
         assert!(provider_config_contains(&dirty, b"needle").unwrap());
         assert!(!contains_secret(b"", b"needle"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_config_scan_reaches_nested_directories() {
+        let dir = std::env::temp_dir().join(format!("cred-scan-nested-{}", std::process::id()));
+        let nested = dir.join("models").join("providers");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.conf"), "token = \"xxneedlexx\"\n").unwrap();
+        // A credential embedded at any depth is still detected —
+        // top-level-only scanning let nested secrets escape the check.
+        assert!(provider_config_contains(&dir, b"needle").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_config_scan_fails_closed_at_its_bounds() {
+        let dir = std::env::temp_dir().join(format!("cred-scan-bound-{}", std::process::id()));
+        // Nesting past MAX_SCAN_DEPTH cannot be proven credential-free.
+        let mut deep = dir.clone();
+        for i in 0..=(MAX_SCAN_DEPTH + 1) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.conf"), "token = \"x\"\n").unwrap();
+        let err = provider_config_contains(&dir, b"needle").unwrap_err();
+        assert!(err.to_string().contains("scan bound"), "{err}");
+
+        // A file past the byte bound cannot be proven either — a
+        // prefix scan would pass a credential at a deeper offset.
+        let dir2 = std::env::temp_dir().join(format!("cred-scan-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let big = dir2.join("big.conf");
+        std::fs::write(&big, vec![b'x'; (MAX_SCAN_FILE_BYTES + 1) as usize]).unwrap();
+        let err = provider_config_contains(&big, b"needle").unwrap_err();
+        assert!(err.to_string().contains("scan bound"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn file_provider_reports_its_source_path() {
+        let dir = std::env::temp_dir().join(format!("cred-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        std::fs::write(&token, "source-secret").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let resolved = resolve(&format!("file:{}", token.display())).unwrap();
+        assert_eq!(
+            resolved.source_path().map(Path::to_path_buf),
+            Some(token.canonicalize().unwrap()),
+            "the file provider reports the canonical path it read"
+        );
+        // SAFETY: test-only env mutation in a single-threaded test.
+        unsafe { std::env::set_var("TAISAN_TEST_CRED_SOURCE", "env-secret") };
+        assert_eq!(
+            resolve("env:TAISAN_TEST_CRED_SOURCE")
+                .unwrap()
+                .source_path(),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
