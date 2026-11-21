@@ -207,8 +207,12 @@ session handle.
   <acceptEdits|plan>` with the prompt written to the runtime's stdin
   (bound-legal requests can exceed the OS per-argument limit, and a
   prompt on argv is visible in process listings) — writers get
-  `acceptEdits` plus `--allowedTools "Bash(git *)"` (local commits
-  only); a configured `model` is forwarded as `--model`.
+  `acceptEdits` plus an enumerated `--allowedTools` list of
+  local-only `Bash(git <sub>:*)` subcommands (commits, branches,
+  merges and the like; `push`/`fetch`/`pull`/`remote`/`clone`/
+  `config` are not granted, so publication is denied at the tool
+  layer rather than relying on absent credentials); a configured
+  `model` is forwarded as `--model`.
 - **Prompt construction.** The shim translates the request's retained
   inputs into one bounded prompt: the goal body, the ordered Issue
   snapshots, constraints, and declared `verification_argv` for

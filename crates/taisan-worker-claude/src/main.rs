@@ -240,20 +240,54 @@ fn probe_runtime_version(cfg: &Config) -> Result<String, String> {
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    // The probe drains stdout on a reader thread from the start: a
+    // --version that floods past the pipe capacity would otherwise
+    // deadlock the child until the deadline, and a descendant holding
+    // the pipe open must not suspend the probe after the leader exits.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            // Only the first line matters; stop past the cap so a
+            // flood cannot buffer unboundedly, and let the SIGPIPE
+            // fail the probe rather than deadlock it.
+            let mut left = VERSION_OUTPUT_CAP + 8192;
+            let mut chunk = [0u8; 8192];
+            while left > 0 {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            return;
+                        }
+                        left = left.saturating_sub(n);
+                    }
+                }
+            }
+        });
+    } else {
+        drop(tx);
+    }
     let deadline = Instant::now() + Duration::from_secs(VERSION_PROBE_SECONDS);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
             if !status.success() {
                 return Err(format!("--version exited {status}"));
             }
-            let mut out = String::new();
-            child
-                .stdout
-                .take()
-                .map(|s| s.take(VERSION_OUTPUT_CAP as u64).read_to_string(&mut out))
-                .transpose()
-                .map_err(|e| format!("read: {e}"))?;
-            let line = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            // Bounded post-exit grace for bytes already in flight. A
+            // descendant holding the pipe open stops this at the grace
+            // or once a complete first line has arrived — never a hang.
+            let mut out = Vec::new();
+            let collect_until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < collect_until && !out.contains(&b'\n') {
+                match rx.try_recv() {
+                    Ok(b) => out.extend_from_slice(&b),
+                    Err(mpsc::TryRecvError::Empty) => thread::sleep(POLL),
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            out.truncate(VERSION_OUTPUT_CAP);
+            let text = String::from_utf8_lossy(&out);
+            let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             let version: String = line.trim().chars().take(256).collect();
             if version.is_empty() {
                 return Err("empty --version output".into());
@@ -373,7 +407,44 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
         if read_only { "plan" } else { "acceptEdits" }.into(),
     ]);
     if !read_only {
-        argv.extend(["--allowedTools".into(), "Bash(git *)".into()]);
+        // Enumerated local-only git subcommands: `Bash(git *)` would
+        // also admit push/fetch/remote/config, and the "local commits"
+        // promise must hold at the tool layer, not on credentials
+        // being absent.
+        let git_tools = [
+            "add",
+            "apply",
+            "blame",
+            "branch",
+            "cat-file",
+            "checkout",
+            "cherry-pick",
+            "commit",
+            "describe",
+            "diff",
+            "grep",
+            "log",
+            "ls-files",
+            "ls-tree",
+            "merge",
+            "mv",
+            "rebase",
+            "reset",
+            "restore",
+            "rev-parse",
+            "revert",
+            "rm",
+            "shortlog",
+            "show",
+            "stash",
+            "status",
+            "switch",
+            "tag",
+        ];
+        argv.push("--allowedTools".into());
+        for sub in git_tools {
+            argv.push(format!("Bash(git {sub}:*)"));
+        }
     }
     if let Some(model) = provider.model.as_deref() {
         argv.extend(["--model".into(), model.to_string()]);
@@ -720,6 +791,49 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<
     }
 }
 
+/// Append one stream line to the bounded log and, for stdout, to the
+/// event parse buffer — the single ingest path for both the live loop
+/// and the post-exit drain.
+#[allow(clippy::too_many_arguments)]
+fn ingest_stream_line(
+    log: &mut fs::File,
+    log_bytes: &mut u64,
+    log_truncated: &mut bool,
+    log_cap: u64,
+    line_buf: &mut Vec<u8>,
+    last_result: &mut Option<Value>,
+    is_stdout: bool,
+    bytes: &[u8],
+) {
+    if !*log_truncated {
+        if *log_bytes + bytes.len() as u64 > log_cap {
+            let keep = log_cap.saturating_sub(*log_bytes) as usize;
+            let _ = log.write_all(&bytes[..keep]);
+            *log_bytes += keep as u64;
+            *log_truncated = true;
+            let _ = log.write_all(b"\n[taisan] log truncated at bound\n");
+        } else {
+            let _ = log.write_all(bytes);
+            *log_bytes += bytes.len() as u64;
+        }
+    }
+    if is_stdout {
+        line_buf.extend_from_slice(bytes);
+        while let Some(pos) = line_buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = line_buf.drain(..=pos).collect();
+            if line.len() <= MAX_STREAM_LINE
+                && let Ok(v) = serde_json::from_slice::<Value>(&line)
+                && v.get("type").and_then(|t| t.as_str()) == Some("result")
+            {
+                *last_result = Some(v);
+            }
+        }
+        if line_buf.len() > MAX_STREAM_LINE {
+            line_buf.clear();
+        }
+    }
+}
+
 fn run_runtime(
     argv: &[String],
     cwd: &Path,
@@ -778,7 +892,10 @@ fn run_runtime(
         });
     }
 
-    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
+    // Bounded channel: depth × per-line cap bounds in-flight memory —
+    // an unbounded channel would let reader threads buffer far past
+    // max_log_bytes while the main loop polls.
+    let (tx, rx) = mpsc::sync_channel::<(bool, Vec<u8>)>(16);
     let mut streams: Vec<(bool, Box<dyn Read + Send>)> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         streams.push((true, Box::new(stdout)));
@@ -834,35 +951,16 @@ fn run_runtime(
     loop {
         if !pipes_done {
             match rx.recv_timeout(POLL) {
-                Ok((is_stdout, bytes)) => {
-                    if !log_truncated {
-                        if log_bytes + bytes.len() as u64 > log_cap {
-                            let keep = log_cap.saturating_sub(log_bytes) as usize;
-                            let _ = log.write_all(&bytes[..keep]);
-                            log_bytes += keep as u64;
-                            log_truncated = true;
-                            let _ = log.write_all(b"\n[taisan] log truncated at bound\n");
-                        } else {
-                            let _ = log.write_all(&bytes);
-                            log_bytes += bytes.len() as u64;
-                        }
-                    }
-                    if is_stdout {
-                        line_buf.extend_from_slice(&bytes);
-                        while let Some(pos) = line_buf.iter().position(|b| *b == b'\n') {
-                            let line: Vec<u8> = line_buf.drain(..=pos).collect();
-                            if line.len() <= MAX_STREAM_LINE
-                                && let Ok(v) = serde_json::from_slice::<Value>(&line)
-                                && v.get("type").and_then(|t| t.as_str()) == Some("result")
-                            {
-                                last_result = Some(v);
-                            }
-                        }
-                        if line_buf.len() > MAX_STREAM_LINE {
-                            line_buf.clear();
-                        }
-                    }
-                }
+                Ok((is_stdout, bytes)) => ingest_stream_line(
+                    &mut log,
+                    &mut log_bytes,
+                    &mut log_truncated,
+                    log_cap,
+                    &mut line_buf,
+                    &mut last_result,
+                    is_stdout,
+                    &bytes,
+                ),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // Pipe EOF is not process exit: a runtime that closed
                 // its streams, or one whose descendant still holds
@@ -873,6 +971,33 @@ fn run_runtime(
             thread::sleep(POLL);
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
+            // Drain lines the readers already queued — the terminal
+            // result event can arrive after the process exits. Parked
+            // senders on the bounded channel get a short window to
+            // flush before the outcome is read.
+            let mut idle = 0;
+            while idle < 20 {
+                match rx.try_recv() {
+                    Ok((is_stdout, bytes)) => {
+                        idle = 0;
+                        ingest_stream_line(
+                            &mut log,
+                            &mut log_bytes,
+                            &mut log_truncated,
+                            log_cap,
+                            &mut line_buf,
+                            &mut last_result,
+                            is_stdout,
+                            &bytes,
+                        );
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        idle += 1;
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
             break;
         }
         if killed_at.is_none() && Instant::now() > deadline {
@@ -1316,8 +1441,9 @@ fn run_one_check(
     let pgid = child.id() as i32;
 
     // Drain both pipes on reader threads so a verbose check cannot
-    // deadlock on a full pipe while the clock runs.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // deadlock on a full pipe while the clock runs. The bounded
+    // channel applies backpressure instead of buffering unboundedly.
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
     let mut streams: Vec<Box<dyn Read + Send>> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         streams.push(Box::new(stdout));

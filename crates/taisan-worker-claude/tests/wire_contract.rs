@@ -48,6 +48,9 @@ fn tmp(name: &str) -> PathBuf {
 ///   FAKE_WRITE      relative file path to create inside the workspace
 ///   FAKE_COMMIT     when set, `git add -A && git commit` inside cwd
 ///   FAKE_PROMPT_CAPTURE  file that receives the `-p` prompt text
+///   FAKE_ARGV_CAPTURE  file that receives the runtime argv, one per line
+///   FAKE_VERSION_ORPHAN  seconds a backgrounded --version descendant
+///                      sleeps while holding the stdout pipe open
 fn fake_runtime(dir: &Path) -> PathBuf {
     let path = dir.join("fake-claude");
     fs::write(
@@ -55,10 +58,12 @@ fn fake_runtime(dir: &Path) -> PathBuf {
         r#"#!/bin/sh
 for a in "$@"; do
   if [ "$a" = "--version" ]; then
+    if [ -n "$FAKE_VERSION_ORPHAN" ]; then sleep "$FAKE_VERSION_ORPHAN" & fi
     echo "fake-claude 9.9.9"
     exit 0
   fi
 done
+if [ -n "$FAKE_ARGV_CAPTURE" ]; then printf '%s\n' "$@" > "$FAKE_ARGV_CAPTURE"; fi
 if [ -n "$FAKE_PROMPT_CAPTURE" ]; then cat > "$FAKE_PROMPT_CAPTURE"; fi
 if [ -n "$FAKE_PGID_FILE" ]; then echo $$ > "$FAKE_PGID_FILE"; fi
 if [ -n "$FAKE_PWD_FILE" ]; then pwd > "$FAKE_PWD_FILE"; fi
@@ -1466,4 +1471,159 @@ fn a_runtime_that_outlives_its_pipes_is_still_killed() {
     let r = report(&out_dir);
     assert_eq!(r["status"], "limit_reached");
     assert_eq!(r["reason"]["code"], "deadline_reached");
+}
+
+#[test]
+fn a_result_event_queued_at_process_exit_is_not_lost() {
+    // The reader threads can still hold queued lines when the runtime
+    // exits; the terminal result event must survive that drain.
+    let dir = tmp("exit-drain");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let events = events_file(&dir, "done", json!({}));
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("exit-drain", &req, &[("goal.md", "goal\n")]);
+    // Far more lines than the bounded channel's depth, emitted right
+    // before exit, so the result event is still in flight at EOF.
+    // The size is a multiple of the 11-byte "flood line\n" unit so the
+    // event line is never glued to a partial flood line.
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_FLOOD", "66000"),
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out.stderr);
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "success");
+    assert_eq!(r["runtime_usage"]["turns"], 3);
+    assert!(matches!(
+        classified(&out_dir, &req),
+        ReportClassification::Success
+    ));
+}
+
+#[test]
+fn version_probe_is_bounded_when_a_descendant_holds_the_pipe() {
+    // A --version whose orphaned descendant keeps stdout open must
+    // not suspend the probe's post-exit collection.
+    let dir = tmp("probe-orphan");
+    let fake = fake_runtime(&dir);
+    let start = std::time::Instant::now();
+    let out = Command::new(shim())
+        .args(["--runtime"])
+        .arg(&fake)
+        .arg("--version")
+        .env("FAKE_VERSION_ORPHAN", "30")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("fake-claude 9.9.9"), "{text}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "held-open pipe must not suspend the probe: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn writer_role_grants_local_only_git_tools() {
+    // `Bash(git *)` would admit push/fetch/remote/config; the
+    // allowlist must enumerate local subcommands only.
+    let dir = tmp("git-allow");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let capture = dir.join("argv.txt");
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("git-allow", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_ARGV_CAPTURE", capture.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let argv = fs::read_to_string(&capture).unwrap();
+    assert!(argv.contains("Bash(git commit:*)"), "{argv}");
+    assert!(argv.contains("Bash(git status:*)"), "{argv}");
+    for denied in [
+        "*",
+        "push",
+        "fetch",
+        "pull",
+        "remote",
+        "clone",
+        "config",
+        "submodule",
+    ] {
+        assert!(
+            !argv.contains(&format!("Bash(git {denied}")),
+            "git {denied} must not be granted: {argv}"
+        );
+    }
+}
+
+#[test]
+fn reader_role_grants_no_git_bash_tool() {
+    let dir = tmp("git-deny-reader");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let capture = dir.join("argv.txt");
+    let req = request_json(
+        "invariant_check",
+        json!({
+            "kind": "invariant_check",
+            "artifact": {"artifact_id": "art-1", "manifest_digest": hex(0x11), "produced": hex(0x12)},
+            "invariant_set": {"id": "set-1", "revision": 2, "digest": hex(0x13)},
+        }),
+        &ws,
+        true,
+    );
+    let set = canonical_json(&json!({
+        "format": "taisan.invariant-set/1",
+        "id": "set-1",
+        "revision": 2,
+        "items": ["inv-a"],
+    }));
+    let (request_path, _, out_dir) = dispatch(
+        "git-deny-reader",
+        &req,
+        &[("invariant-set.json", std::str::from_utf8(&set).unwrap())],
+    );
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_ARGV_CAPTURE", capture.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let argv = fs::read_to_string(&capture).unwrap();
+    assert!(
+        argv.contains("\nplan\n") || argv.ends_with("\nplan"),
+        "{argv}"
+    );
+    assert!(
+        !argv.contains("Bash("),
+        "reader must get no Bash tool: {argv}"
+    );
+    assert!(!argv.contains("--allowedTools"), "{argv}");
 }
