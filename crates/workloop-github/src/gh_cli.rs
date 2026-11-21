@@ -596,6 +596,16 @@ fn marker_envelope(marker: &str) -> String {
 }
 
 impl GitHubApi for GhCliApi {
+    fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+        let user = self.api("GET", "user", None)?;
+        match user.get("login").and_then(|v| v.as_str()) {
+            Some(login) => Ok(Some(login.to_string())),
+            None => Err(ApiError::Unknown {
+                reason: "gh api user: response missing login".into(),
+            }),
+        }
+    }
+
     fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError> {
         let slug = Self::slug(repository)?;
         let repo = self.api("GET", &format!("repos/{slug}"), None)?;

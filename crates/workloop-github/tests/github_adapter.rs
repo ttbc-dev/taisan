@@ -769,6 +769,87 @@ fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
     );
 }
 
+/// The write receipt is authenticated by the transport's proven
+/// identity, never the intent's configured actor: a credential that
+/// acts as another account records that account, so the durable
+/// `actor_mismatch` verdict fires instead of settling `applied` under
+/// the wrong name. When the transport cannot prove an identity the
+/// receipt is unauthenticated — never a fabricated `intent.actor`.
+#[test]
+fn a_write_receipt_carries_the_proven_actor_not_the_configured_one() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = submit(&store, "foreign-actor");
+    let push_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/foreign".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+
+    // The ambient credential acts as an account that is not the bound
+    // publisher: the write lands, but the receipt authenticates the
+    // foreign login and reconciliation records `actor_mismatch`.
+    adapter.client_mut().set_viewer("foreign-account");
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &push_id),
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        }
+    );
+    let authenticated = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == push_id)
+                .map(|i| i.authenticated_actor))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        authenticated,
+        Some(HostActorRef {
+            host: host(),
+            actor: HostActorId::new("foreign-account".to_string()).unwrap(),
+        }),
+        "the receipt records who the credential actually acted as"
+    );
+
+    // A transport that cannot prove an identity records an
+    // unauthenticated receipt — never the configured actor by
+    // fabrication.
+    adapter.client_mut().clear_viewer();
+    let (work_id2, _eid2) = submit(&store, "unproven-actor");
+    let push_id2 = insert_intent(
+        &store,
+        &work_id2,
+        HostAction::PushRef {
+            branch: "work/unproven".into(),
+            produced: rev("head-2"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(intent_status(&store, &push_id2), HostActionStatus::Applied);
+    let authenticated = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == push_id2)
+                .map(|i| i.authenticated_actor))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(authenticated, None, "an unproven identity is `None`");
+}
+
 #[test]
 fn terminal_cancellation_defers_until_the_unknown_effect_reconciles() {
     let store = SqliteStore::in_memory(1).unwrap();

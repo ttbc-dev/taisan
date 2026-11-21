@@ -79,12 +79,25 @@ pub struct InMemoryGitHub {
     /// `operation` → lost response returned *after* the effect landed
     /// (or, for a read, instead of answering). One-shot per arming.
     lost: BTreeMap<String, ApiError>,
+    /// The login `viewer` reports — the ambient credential's proven
+    /// identity. `None` means the transport cannot prove one.
+    viewer_login: Option<String>,
     next_comment: u64,
 }
 
 impl InMemoryGitHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test control: the login the ambient credential authenticates as.
+    pub fn set_viewer(&mut self, login: &str) {
+        self.viewer_login = Some(login.to_string());
+    }
+
+    /// Test control: the transport can no longer prove an identity.
+    pub fn clear_viewer(&mut self) {
+        self.viewer_login = None;
     }
 
     /// The mutation history, in order — what the adapter's receipts
@@ -308,6 +321,10 @@ impl InMemoryGitHub {
 }
 
 impl GitHubApi for InMemoryGitHub {
+    fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+        Ok(self.viewer_login.clone())
+    }
+
     fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError> {
         if let Some(err) = self.take_lost("read_repository") {
             return Err(err);
