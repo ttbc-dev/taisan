@@ -223,6 +223,7 @@ fn populate(db: &Path) {
                 severity: Some("warn".into()),
                 position: None,
                 thread_id: None,
+                summary: None,
             }],
         },
         Effect::InsertRoundJudgment {
