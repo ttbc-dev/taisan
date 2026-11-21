@@ -25,7 +25,7 @@ use workloop_core::store::{
 };
 use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, admit_queued_role, classify_failure,
-    handle_command, handle_observation, material_progress_basis,
+    handle_command, handle_observation, material_progress_basis, sweep,
 };
 use workloop_core::worker_v2::*;
 use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
@@ -33,7 +33,7 @@ use workloop_exec::handoff::{HandoffLayout, artifact_ref};
 use workloop_exec::request_v2::{
     InvariantSetConfig, V2BudgetBounds, V2Dispatch, invocation_io_root,
 };
-use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
+use workloop_exec::supervisor::{PosixProcessControl, StopRecord, Supervisor};
 use workloop_exec::workspace::RepositorySource;
 use workloop_store::sqlite::SqliteStore;
 
@@ -351,6 +351,7 @@ fn layout(root: &Path) -> HandoffLayout {
         repository: bare,
         workspace_root: root.join("ws"),
         out_root: root.join("out"),
+        state_root: None,
         verification: None,
     }
 }
@@ -3049,6 +3050,102 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
     drive_to_done(&sup, &store, &rid);
 }
 
+/// An `absent` first report followed by an unreadable report path is
+/// not an idempotent replay: both observations carry no report
+/// evidence, but the classification changed, and the fact record must
+/// retain the conflict rather than silently dropping the second read.
+#[test]
+fn an_absent_then_unreadable_report_is_a_conflict_not_a_replay() {
+    let root = tmp_root("report-class-conflict");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-report-class-conflict", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let request = store
+        .transact(|tx| tx.request(&rid))
+        .unwrap()
+        .expect("request recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    let out_dir = io_dir.join("out");
+    let report_path = out_dir.join("report.json");
+    wait_for(|| report_path.is_file(), "report.json on disk");
+    let bodies = BodyStore::new(state_root.join("bodies"));
+    let ws_root = root.join("ws");
+    let collect = |store: &SqliteStore| {
+        workloop_exec::report_v2::collect(
+            store,
+            Some(&bodies),
+            &ws_root,
+            &invocation,
+            &request,
+            NOW,
+        )
+    };
+
+    // Remove the report before the first collection: the accepted
+    // fact is `absent` with no retained evidence.
+    std::fs::remove_file(&report_path).unwrap();
+    let first = collect(&store)
+        .unwrap()
+        .expect("first collection produces the absent report fact");
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = &first
+    else {
+        panic!("expected WorkerReport, got {first:?}")
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Absent,
+        "a missing report file classifies absent"
+    );
+    assert!(report.is_none(), "absent carries no report evidence");
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(_w.clone()),
+            subject_execution_id: Some(_e.clone()),
+            fact: first,
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    // Replace the out directory with a link: the second read is
+    // `report.unsafe_path` — also evidence-free, but a different
+    // class. Equal evidence under a different class is a conflict.
+    std::fs::remove_dir_all(&out_dir).unwrap();
+    let elsewhere = root.join("elsewhere-out");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &out_dir).unwrap();
+    let conflict = collect(&store)
+        .unwrap()
+        .expect("a class change with equal evidence is a conflict fact");
+    let ObservationFact::WorkerReportConflict {
+        accepted_report,
+        observed_report,
+        ..
+    } = &conflict
+    else {
+        panic!("expected WorkerReportConflict, got {conflict:?}")
+    };
+    assert!(accepted_report.is_none(), "the accepted class was absent");
+    assert!(
+        observed_report.is_none(),
+        "an unsafe path retains no report evidence"
+    );
+}
+
 // === Produced-commit handoff and independent verification
 // (docs/v0.3.md §6.3) ==============================================
 
@@ -4566,6 +4663,384 @@ fn assessment_facts_bind_identically_with_lanes_disabled() {
         .unwrap();
     assert!(!spec.payload.lanes.invariant_check);
     assert!(!spec.payload.lanes.code_review);
+}
+
+/// A supervisor that dies after spawn but before report collection
+/// still collects the exited writer's report exactly once: the
+/// restarted supervisor reconciles the recorded identity, proves the
+/// tree stopped, and ingests the same durable report — never a
+/// second writer, never a duplicate fact.
+#[test]
+fn a_restart_before_report_collection_ingests_the_same_report_once() {
+    let root = tmp_root("report-restart");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-report-restart", vec![]);
+    // `hang` writes report.json/runtime.log then loops forever: the
+    // out dir is complete on disk while the writer still lives.
+    let argv = v2_argv("hang", &[]);
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv.clone());
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    wait_for(
+        || invocation_for(&store, &rid).is_some_and(|i| i.process_identity.is_some()),
+        "writer launched",
+    );
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+
+    // The crash: the writer keeps running under the recorded identity
+    // while a fresh supervisor takes over the same store and roots.
+    drop(sup);
+    let restarted = supervisor_v2_argv(&root, &state_root, &src, argv);
+    assert!(
+        report_facts(&store, &e).is_empty(),
+        "no report evidence before the tree proves stopped"
+    );
+
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "v2-report-restart-cancel".into(),
+            body: CommandBody::Cancel {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    for _ in 0..60 {
+        restarted.run_once(&store, NOW).unwrap();
+        if !execution_invocation(&store, &e, &invocation.id)
+            .state
+            .is_unresolved_writer()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !execution_invocation(&store, &e, &invocation.id)
+            .state
+            .is_unresolved_writer(),
+        "the restarted supervisor resolved the same writer"
+    );
+    let facts = report_facts(&store, &e);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Success,
+        "the completed report is collected exactly once after restart"
+    );
+}
+
+/// The stop path persists its intent and descendant snapshot before
+/// the first signal; a supervisor that dies inside that window leaves
+/// the durable intent behind, and the restarted supervisor resumes
+/// signaling and inspection from it — never re-deriving the tree,
+/// never spawning a writer.
+#[test]
+fn a_durable_stop_intent_resumes_the_stop_after_a_supervisor_restart() {
+    let root = tmp_root("stop-restart");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-stop-restart", vec![]);
+    let argv = v2_argv("hang", &[]);
+    let sup = supervisor_v2_argv(&root, &state_root, &src, argv.clone());
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    wait_for(
+        || invocation_for(&store, &rid).is_some_and(|i| i.process_identity.is_some()),
+        "writer launched",
+    );
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let leader = invocation
+        .process_identity
+        .clone()
+        .expect("the writer identity is recorded");
+
+    // Cancel, then crash inside the stop window: the intent — with
+    // the descendant snapshot — is durable but no signal was sent.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "v2-stop-restart-cancel".into(),
+            body: CommandBody::Cancel {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    let record = sup
+        .record_stop_intent(&store, &invocation, &leader)
+        .unwrap();
+    assert!(
+        matches!(record, StopRecord::Recorded(_)),
+        "the intent persisted before the crash: {record:?}"
+    );
+    drop(sup);
+
+    // The restarted supervisor holds no memory of the stop; the stop
+    // pass must resume signaling and inspection from the durable
+    // intent alone — never re-deriving the tree, never spawning.
+    let restarted = supervisor_v2_argv(&root, &state_root, &src, argv);
+    for _ in 0..60 {
+        restarted.run_once(&store, NOW).unwrap();
+        if execution(&store, &e).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        execution(&store, &e).state,
+        ExecutionState::Cancelled,
+        "the durable intent carried the stop across the restart"
+    );
+}
+
+/// A terminally failed Execution keeps its cumulative Work-wide
+/// accounting: charged usage, a retry into a successor Execution,
+/// and a fresh real worker dispatch preserve every counter — nothing
+/// is refunded by the succession — while the failed Execution keeps
+/// surfacing actionable Attention and its collected evidence.
+#[test]
+fn a_retry_launches_a_successor_execution_without_refunding_cumulative_usage() {
+    let root = tmp_root("retry-successor");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-retry-successor", vec![]);
+    // `exit-no-artifact` exits cleanly without producing the required
+    // artifact: bounded recovery exhausts and the Execution fails.
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        sweep(&store, &config(), NOW).unwrap();
+        if execution(&store, &e).state == ExecutionState::Failed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        execution(&store, &e).state,
+        ExecutionState::Failed,
+        "bounded artifact recovery exhausted"
+    );
+
+    // The failure surfaces actionable Attention for the operator.
+    let attention = store
+        .transact(|tx| workloop_core::projection::attention(tx, Some(&w), NOW + 60))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention query found nothing")
+    };
+    assert!(
+        value.iter().any(|a| a.reason == "confirmed_failure"),
+        "the failed Execution surfaces confirmed_failure: {value:?}"
+    );
+
+    // Charge the cumulative counters the way spent transport retries
+    // and fix dispatches would have.
+    store
+        .transact(|tx| {
+            let mut usage = tx.work_usage(&w)?.unwrap();
+            usage.transport_retries_used = 2;
+            usage.fix_invocations_used = 1;
+            usage.equivalent_failure_streak = 1;
+            tx.apply(&Effect::UpdateWorkUsage { usage })
+        })
+        .unwrap();
+
+    // Retry: the successor Execution is a new row on the same Work.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "v2-retry-successor-1".into(),
+            body: CommandBody::Retry {
+                work_id: w.clone(),
+                expected_work_version: version,
+                expected_execution_id: e.clone(),
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let e2 = match d {
+        CommandDecision::Accepted { effect, .. } => match effect {
+            CommandEffect::ExecutionCreated { execution_id } => execution_id,
+            other => panic!("unexpected retry effect {other:?}"),
+        },
+        other => panic!("retry rejected: {other:?}"),
+    };
+    assert_ne!(e2, e, "the successor is a distinct Execution");
+    assert_eq!(
+        execution(&store, &e2).ordinal,
+        execution(&store, &e).ordinal + 1,
+        "the successor advances the Execution ordinal"
+    );
+
+    // The successor admits and dispatches a fresh real worker; its
+    // durable request identity is new, never a replay of the failed
+    // one's.
+    let admitted = store
+        .transact(|tx| admit_queued(tx, &config(), &e2, NOW))
+        .unwrap();
+    assert!(admitted.is_some(), "the successor admits");
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.run_once(&store, NOW).unwrap();
+    for _ in 0..200 {
+        if store
+            .transact(|tx| tx.invocations_for_execution(&e2))
+            .unwrap()
+            .iter()
+            .any(|i| i.process_identity.is_some())
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let successor_invocations = store
+        .transact(|tx| tx.invocations_for_execution(&e2))
+        .unwrap();
+    assert_eq!(successor_invocations.len(), 1);
+    assert!(
+        successor_invocations[0].process_identity.is_some(),
+        "the successor's writer launched"
+    );
+    assert_ne!(
+        successor_invocations[0].request_id, rid,
+        "a fresh durable request identity"
+    );
+
+    // Cumulative Work-wide usage survived the succession untouched.
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.transport_retries_used, 2, "no refund");
+    assert_eq!(usage.fix_invocations_used, 1, "no refund");
+    assert_eq!(usage.equivalent_failure_streak, 1, "no refund");
+    assert_eq!(
+        usage.first_dispatch_unix_seconds,
+        Some(NOW),
+        "the budget anchor is never re-armed"
+    );
+    // The failed Execution's collected report evidence is retained.
+    assert_eq!(report_facts(&store, &e).len(), 1);
+}
+
+/// A cancel committed while declared verification work is pending
+/// does not skip the owned child: the bounded verification run still
+/// executes and records its result while the Execution is stopping,
+/// and the terminal release comes only afterwards — never while a
+/// child could still be running.
+#[test]
+fn a_cancel_with_pending_verification_accounts_for_the_owned_child_before_release() {
+    let root = tmp_root("cancel-verify");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit_ex(
+        &store,
+        "v2-cancel-verify",
+        vec![],
+        vec![vec!["git".into(), "rev-parse".into(), "HEAD".into()]],
+    );
+    let sup = supervisor_v2_argv(
+        &root,
+        &state_root,
+        &src,
+        v2_argv("clean-exit", &["--git-commit"]),
+    );
+    sup.consume_requests(&store, NOW).unwrap();
+    poll_to_done(&sup, &store, &rid);
+
+    // Cancel while the acknowledged artifact's declared verification
+    // has not run yet: the Execution enters stopping but is not
+    // released — the writer proof and the owned child both precede
+    // the terminal commit.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "v2-cancel-verify-1".into(),
+            body: CommandBody::Cancel {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: None,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    assert_ne!(
+        execution(&store, &e).state,
+        ExecutionState::Cancelled,
+        "cancel is not an immediate release"
+    );
+
+    // The handoff sweep still drives the acknowledged artifact's
+    // declared verification — the owned child runs inside its
+    // bounded call and its result is recorded as evidence before any
+    // release.
+    sup.drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .unwrap();
+    let inv = invocation_for(&store, &rid).expect("invocation recorded");
+    let aid = format!("{}/artifact.json", inv.id.0);
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1, "the verification child was accounted");
+    assert_eq!(
+        results[0].result,
+        VerificationOutcome::Pass,
+        "{:?}",
+        results[0]
+    );
+
+    // Only now can the Execution settle: the writer was already
+    // proven stopped and every owned child is accounted.
+    for _ in 0..40 {
+        sup.run_once(&store, NOW).unwrap();
+        sweep(&store, &config(), NOW).unwrap();
+        if execution(&store, &e).state == ExecutionState::Cancelled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(execution(&store, &e).state, ExecutionState::Cancelled);
+    // The recorded verification is final: a later sweep never
+    // duplicates the child or its evidence.
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1, "recorded terminal results are final");
 }
 
 /// §14.5 bounds the 30 min verification profile by the Execution

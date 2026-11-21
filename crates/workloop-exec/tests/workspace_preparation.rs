@@ -291,6 +291,7 @@ fn layout(root: &Path) -> HandoffLayout {
         repository: bare,
         workspace_root: root.join("ws"),
         out_root: root.join("out"),
+        state_root: None,
         verification: None,
     }
 }
@@ -1282,6 +1283,105 @@ fn a_missing_final_with_a_fix_receipt_rebuilds_at_produced_not_base() {
         "rebuilt at produced, not the Coding base"
     );
     assert_clean_pinned(&prepared.path, &format!("work/{}", w.0), &base, &produced);
+}
+
+#[test]
+fn a_successor_request_rebinds_the_receipt_only_while_the_tree_matches() {
+    let root = tmp_root("successor-rebind");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-succ", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    let first = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(first.head, base);
+
+    // A retried Execution's fresh Coding request: same Work, same pin,
+    // different durable identity. The tree still matches the pins, so
+    // preparation re-binds the receipt to the new digest.
+    let rid2 = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Coding);
+    let second_request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Coding,
+        &base,
+        coding_task(vec![]),
+    );
+    insert_body(&store, &second_request);
+    assert_ne!(first.request_digest, second_request.request_digest);
+    let second = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(second.request_digest, second_request.request_digest);
+    assert_clean_pinned(&ws_path(&root, &w), &format!("work/{}", w.0), &base, &base);
+
+    // Once the tree moves, another different-digest request refuses:
+    // the successor cannot claim WIP it did not produce, and the
+    // committed work is preserved untouched.
+    let ws = ws_path(&root, &w);
+    git(&ws, &["config", "user.email", "t@t"]);
+    git(&ws, &["config", "user.name", "t"]);
+    std::fs::write(ws.join("wip.txt"), "wip").unwrap();
+    git(&ws, &["add", "."]);
+    git(&ws, &["commit", "-m", "wip"]);
+    let wip_head = git(&ws, &["rev-parse", "HEAD"]);
+    let rid3 = format!("{}:inv:2", e.0);
+    insert_request_row(&store, &w, &e, &rid3, InvocationRole::Coding);
+    let third_request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid3,
+        InvocationRole::Coding,
+        &base,
+        coding_task(vec![]),
+    );
+    insert_body(&store, &third_request);
+    assert_ne!(second_request.request_digest, third_request.request_digest);
+    let err = sup
+        .prepare_workspace(&store, &rid3, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+    assert!(ws.join("wip.txt").exists(), "the WIP commit is kept");
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), wip_head);
+}
+
+#[test]
+fn a_successor_request_rebuilds_a_missing_workspace_at_the_new_pins() {
+    let root = tmp_root("successor-rebuild");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-sreb", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    std::fs::remove_dir_all(ws_path(&root, &w)).unwrap();
+
+    let rid2 = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Coding);
+    let request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Coding,
+        &base,
+        coding_task(vec![]),
+    );
+    insert_body(&store, &request);
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.head, base);
+    assert_eq!(prepared.request_digest, request.request_digest);
+    assert_clean_pinned(&prepared.path, &format!("work/{}", w.0), &base, &base);
 }
 
 #[test]

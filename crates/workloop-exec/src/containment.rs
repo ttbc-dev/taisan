@@ -87,6 +87,27 @@ const EVIDENCE_RETRY_SECONDS: i64 = 300;
 /// wedged sandbox answers `Bounded` and fails the battery.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Whether a host directory would be exposed inside the sandbox by a
+/// fixed system bind: strictly beneath an existing `SYSTEM_BINDS`
+/// member (a root that *is* a bound prefix needs no mask — it is the
+/// runtime surface, not installation state). The root must exist on
+/// the host, otherwise it is absent inside the bind and masking a
+/// path that does not exist could fail the mount outright.
+fn system_bind_covers(root: &Path) -> bool {
+    if !root.exists() {
+        return false;
+    }
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    SYSTEM_BINDS
+        .iter()
+        .filter(|d| Path::new(d).exists())
+        .map(Path::new)
+        .any(|bound| {
+            let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
+            resolved != bound && resolved.starts_with(&bound)
+        })
+}
+
 /// What one contained launch binds into the sandbox. Every field is a
 /// host path the supervisor owns; the sandbox side is fixed by the
 /// constants above.
@@ -141,6 +162,23 @@ pub struct MountPlan {
     /// inner argv is not a single resolved executable (verification
     /// commands resolve through PATH or `extra_binds`).
     pub worker: Option<PathBuf>,
+    /// Installation-owned roots that must never be visible inside the
+    /// sandbox: the state root holding the store, the handoff
+    /// repository, credential staging, and sibling workspaces. A root
+    /// only needs masking when a fixed system bind covers it — a
+    /// `/usr/local/taisan` state root is otherwise ro-bound wholesale, and
+    /// every contained worker could read it. Each covered root is
+    /// shadowed with a fresh tmpfs; every path the launch legitimately
+    /// needs is re-bound by the plan fields above, so the mask itself
+    /// is never the mount.
+    pub mask_roots: Vec<PathBuf>,
+    /// Individual host files that must never be visible inside the
+    /// sandbox: a `file:` credential source beneath a bound system
+    /// prefix would otherwise stay readable at its original path even
+    /// though the contract exposes only the staged
+    /// `/taisan/runtime-auth`. Each covered file is shadowed with a
+    /// read-only `/dev/null` bind.
+    pub masked_files: Vec<PathBuf>,
 }
 
 /// The gate's answer for one launch argv.
@@ -388,6 +426,31 @@ pub fn bwrap_args(
                 "--ro-bind".to_string(),
                 (*dir).to_string(),
                 (*dir).to_string(),
+            ]);
+        }
+    }
+    // A state root under a bound system prefix is otherwise visible
+    // wholesale: shadow it with a fresh tmpfs. The mask is emitted
+    // before every plan bind, so a toolchain, cache, or worktree the
+    // plan legitimately names under the root is re-mounted by its own
+    // bind — the mask never subtracts a declared mount.
+    for root in &plan.mask_roots {
+        if system_bind_covers(root) {
+            let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
+            args.extend(["--tmpfs".to_string(), s(&resolved)]);
+        }
+    }
+    // A single host file under a bound system prefix is shadowed with
+    // `/dev/null` — emitted with the same ordering guarantee as the
+    // root masks: before every plan bind, so a path the plan
+    // legitimately names is still mounted by its own bind.
+    for file in &plan.masked_files {
+        if system_bind_covers(file) {
+            let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
+            args.extend([
+                "--ro-bind".to_string(),
+                "/dev/null".to_string(),
+                s(&resolved),
             ]);
         }
     }
@@ -712,7 +775,7 @@ fn reclaim_canary(canary: &Path) {
 /// A real host path the rendered argv provably never mounts, for the
 /// `unmounted-path-invisible` and `symlink-escape-denied` probes. The
 /// workspace-local canary is preferred, but a state root beneath a
-/// bound prefix — `/opt/taisan` is ro-bound as a system dir — is
+/// bound prefix — `/usr/local/taisan` is ro-bound as a system dir — is
 /// visible inside the sandbox and would fail the proof on every
 /// launch. The fallbacks are the host temp dir (the sandbox replaces
 /// `/tmp` with a fresh tmpfs) and sysfs, which no declared bind
@@ -814,6 +877,8 @@ fn run_battery(
         extra_binds: vec![],
         extra_rw_binds: vec![],
         worker: worker.map(Path::to_path_buf),
+        mask_roots: vec![workspace_root.to_path_buf()],
+        masked_files: vec![],
     };
     let mut records = Vec::new();
     let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
@@ -1199,6 +1264,8 @@ mod tests {
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
             extra_rw_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
+            mask_roots: vec![],
+            masked_files: vec![],
         }
     }
 
@@ -1288,6 +1355,87 @@ mod tests {
         // No host home, store, or credential path is ever bound: the
         // only binds are the fixed system set plus the plan's own.
         assert!(!text.contains("/Users/"), "{text}");
+    }
+
+    /// A mask root strictly beneath an existing system bind — a
+    /// `/usr/local/taisan`-style state root — is shadowed with a fresh
+    /// tmpfs before every plan bind, so a contained worker can never
+    /// read the store, handoff repository, or staged credential the
+    /// prefix bind would otherwise expose. A root that is not covered
+    /// (and the bound prefix itself) needs no mask.
+    #[test]
+    fn a_system_bind_covered_mask_root_is_shadowed_with_a_tmpfs() {
+        // /usr is bound on every unix layout this suite runs on; the
+        // mask root is a real directory beneath it.
+        let covered = Path::new("/usr/lib");
+        assert!(covered.is_dir(), "test assumes /usr/lib exists");
+        let mut plan = plan_fixture();
+        plan.mask_roots = vec![covered.to_path_buf(), PathBuf::from("/etc")];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let resolved = covered.canonicalize().unwrap();
+        assert!(
+            text.contains(&format!("--tmpfs {}", resolved.display())),
+            "the covered state root is masked: {text}"
+        );
+        // The bound prefix itself is the runtime surface, never a
+        // mask target.
+        assert!(!text.contains("--tmpfs /etc"), "{text}");
+        // A mask root outside every system bind emits nothing.
+        plan.mask_roots = vec![tmp("uncovered-root")];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        assert!(!text.contains("uncovered-root"), "{text}");
+    }
+
+    /// A host file beneath a system bind — a `file:` credential
+    /// source — is shadowed with a read-only `/dev/null` bind so the
+    /// staged `/taisan/runtime-auth` is the only credential surface
+    /// inside the sandbox. A file outside every system bind (and the
+    /// bound prefix itself) needs no mask.
+    #[test]
+    fn a_system_bind_covered_masked_file_is_shadowed_with_dev_null() {
+        // /bin/sh exists on every unix layout this suite runs on and
+        // lives beneath the /bin system bind.
+        let covered = Path::new("/bin/sh");
+        assert!(covered.is_file(), "test assumes /bin/sh exists");
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![covered.to_path_buf()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let resolved = covered.canonicalize().unwrap();
+        assert!(
+            text.contains(&format!("--ro-bind /dev/null {}", resolved.display())),
+            "the covered credential source is masked: {text}"
+        );
+        // A masked file outside every system bind emits nothing.
+        let uncovered = tmp("uncovered-file");
+        std::fs::create_dir_all(&uncovered).unwrap();
+        plan.masked_files = vec![uncovered.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        assert!(!text.contains("uncovered-file"), "{text}");
+        let _ = std::fs::remove_dir_all(&uncovered);
     }
 
     #[test]

@@ -146,6 +146,18 @@ impl ScriptedProcessControl {
     /// view: a `SpawnPlan::Unknown` outcome still records its leader
     /// because the process exists even though the spawn response was
     /// lost. `spawn_calls` remains the no-second-writer counter.
+    /// The command lines the spawn calls recorded, in spawn order —
+    /// the full argv a containment launch wraps, so launch-shape
+    /// assertions can read the mount boundary the worker got.
+    pub fn spawned_commands(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.spawned
+            .iter()
+            .filter_map(|id| s.procs.get(&id.pid))
+            .map(|p| p.command.clone())
+            .collect()
+    }
+
     pub fn spawned(&self) -> Vec<ProcessIdentity> {
         self.state.lock().unwrap().spawned.clone()
     }
@@ -219,6 +231,16 @@ impl ScriptedProcessControl {
         let mut s = self.state.lock().unwrap();
         if let Some(p) = s.procs.get_mut(&pid) {
             p.cwd_unreadable = on;
+        }
+    }
+
+    /// Report a different cwd for `pid` — a contained worker's cwd
+    /// reads as its sandbox mount (`/workspace`), not the host launch
+    /// directory the spawn ran under.
+    pub fn set_cwd(&self, pid: i32, cwd: &std::path::Path) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(p) = s.procs.get_mut(&pid) {
+            p.cwd = cwd.to_path_buf();
         }
     }
 

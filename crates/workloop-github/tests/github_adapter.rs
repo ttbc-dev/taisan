@@ -1104,6 +1104,241 @@ fn merge_is_outside_the_adapter_and_never_part_of_succeeded() {
     );
 }
 
+/// The invariant lane binds the **latest** assessment on the current
+/// target: an earlier all-positive assessment is evidence of a state
+/// the lane already superseded — when a later assessment reports the
+/// set incomplete, completion stays closed even though a positive one
+/// exists in the log.
+#[test]
+fn a_superseded_positive_assessment_never_completes_the_invariant_lane() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "stale-assessment");
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    let opened = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: opened.clone(),
+            head: rev("sha-1"),
+        },
+    );
+    let target = |head: &str| DiffTarget {
+        change: opened.clone(),
+        head: rev(head),
+        base: None,
+        target_revision: None,
+    };
+    // The earlier all-positive assessment lands while CI is still
+    // pending — then the lane's next assessment supersedes it with an
+    // incomplete coverage report before the other evidence arrives.
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: target("sha-1"),
+            set_digest: "invariants".into(),
+            complete: false,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Negative,
+                refs: vec![],
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: opened.clone(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Review {
+            target: target("sha-1"),
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
+
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        execution.state,
+        ExecutionState::Waiting,
+        "the latest assessment is incomplete — a superseded positive \
+         never seals the lane"
+    );
+}
+
+/// The invariant lane binds the **latest** check invocation after the
+/// producing one: an earlier `Done`/exit-0 check is evidence of a state
+/// the lane already superseded — when the newest check exits non-zero,
+/// completion stays closed even though a passed check exists in the
+/// log.
+#[test]
+fn a_superseded_passed_invariant_check_never_completes_the_lane() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, eid) = waiting_with_applied_publish(&store, "stale-check");
+    // A second, later check invocation exits non-zero: the earlier
+    // pass is superseded and the lane must stay closed.
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(format!("{}-invariant-check-2", eid.0)),
+                    request_id: format!("{}:inv:check-2", eid.0),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertObservation {
+                observation: obs(
+                    &work_id,
+                    &eid,
+                    None,
+                    NOW,
+                    ObservationFact::ProcessState {
+                        invocation_id: InvocationId(format!("{}-invariant-check-2", eid.0)),
+                        process_identity: String::new(),
+                        state: ProcessStateFact::Exited,
+                        exit_code: Some(1),
+                    },
+                ),
+            })
+        })
+        .unwrap();
+    let emit = |adapter: &Adapter, fact: ObservationFact| {
+        adapter
+            .ingest(&store, &config, obs(&work_id, &eid, None, NOW, fact), NOW)
+            .unwrap();
+    };
+    let opened = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted("cr-1"),
+        display_number: Some(1),
+    };
+    emit(
+        &adapter,
+        ObservationFact::HostActionResult {
+            action_id: "act-pub-open".into(),
+            authenticated_actor: Some(publisher()),
+            status: HostActionStatus::Applied,
+            effects: vec![NormalizedEffectFact::ChangeOpened {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                source_branch: format!("work/{}", work_id.0),
+                target_branch: "main".into(),
+            }],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::ChangeHead {
+            change: opened.clone(),
+            head: rev("sha-1"),
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Check {
+            change: opened.clone(),
+            head: rev("sha-1"),
+            check_id: "ci".into(),
+            producer: publisher(),
+            conclusion: CheckConclusion::Success,
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Review {
+            target: DiffTarget {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                base: None,
+                target_revision: None,
+            },
+            source: "reviewer".into(),
+            source_revision: None,
+            completeness: Completeness::Complete,
+            occurrences: vec![],
+        },
+    );
+    emit(
+        &adapter,
+        ObservationFact::Assessment {
+            target: DiffTarget {
+                change: opened.clone(),
+                head: rev("sha-1"),
+                base: None,
+                target_revision: None,
+            },
+            set_digest: "invariants".into(),
+            complete: true,
+            items: vec![AssessmentItem {
+                id: "inv-1".into(),
+                verdict: AssessmentVerdict::Positive,
+                refs: vec![],
+            }],
+        },
+    );
+
+    let execution = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_ne!(
+        execution.state,
+        ExecutionState::Succeeded,
+        "the newest check failed — a superseded pass never seals \
+         the lane"
+    );
+}
+
 #[test]
 fn declared_capabilities_are_backed_by_the_transport_surface() {
     // Every declared capability has an executable operation behind it;
