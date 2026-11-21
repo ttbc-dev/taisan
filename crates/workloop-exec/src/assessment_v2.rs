@@ -37,8 +37,8 @@ use workloop_core::store::{ReadView, Store, StoreError};
 use workloop_core::work::current_target;
 use workloop_core::worker_v2::{
     InvariantSetBody, MAX_REPORT_MEMBERS, ReportClassification, ReportFinding, ReportInvariantItem,
-    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportV2,
-    WorkerRequestV2, member_claim_digest,
+    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportV2, WorkerRequestV2,
+    member_claim_digest,
 };
 
 use crate::bodies::{BodyStore, CAS_CATEGORY};
