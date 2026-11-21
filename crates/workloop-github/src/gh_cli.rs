@@ -1,9 +1,12 @@
 //! The `gh` CLI-backed [`GitHubApi`] transport — the live transport for
 //! the current stage. Every trait operation maps onto `gh api` REST
 //! calls (plus one small GraphQL node lookup for change-request id
-//! resolution); authentication is entirely ambient — `gh` reads
-//! `GH_TOKEN`/`GITHUB_TOKEN` or its own stored login, so no credential
-//! value ever appears in this process's argv, logs, or records.
+//! resolution). A credential the adapter binds is injected as
+//! `GH_TOKEN` on each child process — never argv — and `authenticate`
+//! proves the actor that credential executes as through `gh api user`;
+//! with no bound credential `gh` reads `GH_TOKEN`/`GITHUB_TOKEN` or
+//! its own stored login, so no credential value ever appears in this
+//! process's argv, logs, or records.
 //!
 //! Failure classification follows the trait contract:
 //! - a spawn failure or a definite HTTP 4xx is [`ApiError::Refused`] —
