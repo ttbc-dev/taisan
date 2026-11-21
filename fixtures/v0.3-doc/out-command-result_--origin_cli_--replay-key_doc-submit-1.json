@@ -1,0 +1,33 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": null,
+    "kind": "command_result",
+    "actor": "human:actor-doc",
+    "idempotency_key": null
+  },
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "command_id": "cmd-1",
+    "committed_at": 1,
+    "effect": {
+      "execution_id": "e-1",
+      "kind": "work_created"
+    },
+    "status": "accepted",
+    "work_id": "w-1",
+    "work_version": 1
+  },
+  "reason": null,
+  "evidence_refs": [],
+  "sources": [
+    {
+      "source": "store",
+      "availability": "known",
+      "observed_unix_seconds": null
+    }
+  ],
+  "as_of": 59
+}

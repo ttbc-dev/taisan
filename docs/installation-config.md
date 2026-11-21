@@ -1,6 +1,9 @@
 # Installation configuration, credential references, and permission boundaries
 
-Status: concrete design for #53. This document specifies future Rust/configuration behavior; it changes no runtime, installs no credentials, and performs no live checks. It consumes #50's identity/binding model, #51's evidence and repair prerequisites, #52's worker isolation profile, and #54's retention keys. The owner approved the credential-reference provider set, the TOML schema, the role profile defaults, the preflight probe boundary, the XDG layout, the rotation boundary, and the setup command contract recorded below.
+Status: concrete design for #53 — the operational surface it
+specifies has since landed on the installation record (see the v0.3
+implementation note below); this document remains the design
+selection and changes no runtime by itself. It consumes #50's identity/binding model, #51's evidence and repair prerequisites, #52's worker isolation profile, and #54's retention keys. The owner approved the credential-reference provider set, the TOML schema, the role profile defaults, the preflight probe boundary, the XDG layout, the rotation boundary, and the setup command contract recorded below.
 
 ## Owner decisions
 
@@ -129,7 +132,7 @@ Validation rules:
 
 ## v0.3 operational profile (target schema revision 2)
 
-Status: design selection in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition). The keys below are additive and are not accepted by the current `schema_version = 1` loader. A dependent implementation may choose a different numeric revision, but it must not reinterpret a v1 profile as an operational v2 profile or silently ignore one of these keys. The v1 example above remains the loadable v1 profile.
+Status: design selection in [v0.3 §14](v0.3.md#14-operational-launch-verification-and-host-composition). **Implementation note:** the dependent units landed the operational surface on the *installation record* (`store.config.json`) rather than a TOML `schema_version = 2` profile — `worker_credential_ref`, `worker_provider_config`, `worker_model_api_hosts`, `worker_dispatch`, and the `verification_*` boundary keys are JSON-record fields validated by `Installation::worker_dispatch`/`worker_egress`/`verification_boundary`, and the in-process host driver is selected by the record's `adapter` (`github`/`fixture`; anything else fails closed). The TOML block below remains the design selection for a possible future profile revision; it is not the loadable v0.3 surface. The v1 example above remains the loadable v1 profile.
 
 ```toml
 schema_version = 2

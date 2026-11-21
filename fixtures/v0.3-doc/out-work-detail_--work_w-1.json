@@ -1,0 +1,52 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": null,
+    "kind": "work_detail",
+    "actor": "human:actor-doc",
+    "idempotency_key": null
+  },
+  "work_id": "w-1",
+  "execution_id": null,
+  "result": {
+    "attention": [],
+    "current_change": null,
+    "current_execution_id": "e-1",
+    "current_round_id": null,
+    "evidence": [
+      "process:Running",
+      "artifact:artifact.json:Present { digest: \"e7a06d6d8da9bb4bc0ee0d0eea7e2d81ed4cc473fce8e88861faf212d709fa72\" }",
+      "process:Exited",
+      "process:Running",
+      "process:Exited"
+    ],
+    "executions": [
+      {
+        "execution_id": "e-1",
+        "invocation_ids": [
+          "inv-1",
+          "inv-2"
+        ],
+        "outcome": null,
+        "ownership": "confirmed",
+        "state": "waiting"
+      }
+    ],
+    "findings": [],
+    "judged": [],
+    "outcome": null,
+    "version": 1,
+    "work_id": "w-1"
+  },
+  "reason": null,
+  "evidence_refs": [],
+  "sources": [
+    {
+      "source": "store",
+      "availability": "known",
+      "observed_unix_seconds": null
+    }
+  ],
+  "as_of": 59
+}

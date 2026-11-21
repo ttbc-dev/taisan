@@ -2279,12 +2279,10 @@ pub fn admit_queued_role(
         InvocationRole::InvariantCheck | InvocationRole::Review
     ) && let serde_json::Value::Object(map) = &mut payload
     {
-        // The check and the review are read-only: neither declares a
-        // workspace artifact, so the durable record carries an
-        // explicitly empty required set rather than the writer
-        // default. Their evidence is the Invocation lifecycle plus
-        // receipts, never a produced diff — a non-empty set would seed
-        // an artifact handoff for a role that produces nothing.
+        // Both read-only roles declare no workspace artifact, so their
+        // durable record carries an explicitly empty required set
+        // rather than the writer default. Their evidence is the
+        // Invocation lifecycle plus receipts, never a produced diff.
         map.insert("required_artifacts".into(), serde_json::json!([]));
     }
     let request = InvocationRequest {

@@ -1,0 +1,1 @@
+taisan: config: check failed at probe_capabilities: capability.unknown — --probe was requested but no adapter probe backend is wired for this installation — probe reads require the host adapter; nothing was probed and nothing was written

@@ -1,0 +1,55 @@
+{
+  "actor_id": "actor-doc",
+  "actor_kind": "human",
+  "host_instance": "host-local",
+  "repository": "local-repo",
+  "adapter": "fixture",
+  "contract_version": 1,
+  "capabilities": [
+    "repository_read",
+    "push_ref",
+    "change_request_create",
+    "change_request_read",
+    "change_request_update",
+    "comment_write",
+    "checks_read",
+    "review_findings_read",
+    "issue_read"
+  ],
+  "host_actors": { "publication": "fixture-agent" },
+  "host_credentials": {},
+  "required_checks": [],
+  "capacity": 1,
+  "worker_argv": [
+    "<repo>/target/debug/workloop-fixture-worker",
+    "clean-exit",
+    "--wire",
+    "v2",
+    "--git-commit",
+    "--claim-head",
+    "HEAD"
+  ],
+  "worker_isolation_profile": "taisan-reference-v0.1",
+  "worker_dispatch": {
+    "source_path": "/tmp/taisan-v03-doc/source-repo",
+    "budget": {
+      "max_turns": 8,
+      "max_report_bytes": 1048576,
+      "max_log_bytes": 33554432,
+      "max_verification_commands": 4,
+      "max_continuation_refs": 4
+    },
+    "invariant_set": {
+      "id": "invariants-1",
+      "revision": 1,
+      "items": ["no-todo", "tests-pass"]
+    },
+    "capabilities": ["artifact_json", "process_control"]
+  },
+  "workspace_root": "workspaces",
+  "allowed_effects": {
+    "workspace_write": true,
+    "host_write": true,
+    "network": false
+  }
+}

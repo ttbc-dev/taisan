@@ -1,0 +1,64 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": null,
+    "kind": "capacity",
+    "actor": "human:actor-doc",
+    "idempotency_key": null
+  },
+  "work_id": null,
+  "execution_id": null,
+  "result": {
+    "deferred": [],
+    "holders": [
+      {
+        "execution_id": "e-1",
+        "since": 1,
+        "state": "waiting"
+      }
+    ],
+    "limit": 1,
+    "reservations": [
+      {
+        "expires_at_unix_seconds": null,
+        "holder": {
+          "execution_id": "e-1",
+          "kind": "execution"
+        },
+        "resource": {
+          "kind": "workspace",
+          "workspace_id": "ws-w-1"
+        },
+        "resource_key": "[\"v1\",\"workspace\",\"ws-w-1\"]"
+      },
+      {
+        "expires_at_unix_seconds": null,
+        "holder": {
+          "execution_id": "e-1",
+          "kind": "execution"
+        },
+        "resource": {
+          "branch": "work/w-1",
+          "kind": "branch",
+          "repository": {
+            "host": "host-local",
+            "repository": "local-repo"
+          }
+        },
+        "resource_key": "[\"v1\",\"branch\",\"host-local\",\"local-repo\",\"work/w-1\"]"
+      }
+    ],
+    "used": 1
+  },
+  "reason": null,
+  "evidence_refs": [],
+  "sources": [
+    {
+      "source": "store",
+      "availability": "known",
+      "observed_unix_seconds": null
+    }
+  ],
+  "as_of": 59
+}

@@ -837,17 +837,28 @@ fn a_v2_worker_runs_the_complete_wire_through_the_driver() {
     // Execution itself waits in `reconciliation` — no
     // CapabilityReport reaches this driver, so the capability gate
     // records no publish intent and publication holds by design.
+    let observed_facts = || {
+        store
+            .transact(|tx| tx.observations_for_execution(&execution.id))
+            .unwrap()
+            .into_iter()
+            .map(|o| format!("{:?}", o.fact))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert_eq!(
         execution.state,
         ExecutionState::Waiting,
-        "{:?}",
-        execution.state
+        "{:?}\n{}",
+        execution.state,
+        observed_facts()
     );
     assert_eq!(
         execution.waiting_reason,
         Some(WaitingReason::Reconciliation),
-        "{:?}",
-        execution.waiting_reason
+        "{:?}\n{}",
+        execution.waiting_reason,
+        observed_facts()
     );
 
     let invocations = store

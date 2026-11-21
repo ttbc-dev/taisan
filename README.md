@@ -4,7 +4,7 @@
 
 taisan is an adapter-based work orchestration loop for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; taisan coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
-**Status:** design plus a slice-0 implementation. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI against fixtures; real GitHub, worker, and selector integrations are not yet implemented. The agent-agnostic skill ships at `skills/taisan/SKILL.md` with a [walkthrough](docs/skill-walkthrough.md) covering setup, install, submit, inspect, Attention/decision, and recovery against fixtures. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
+**Status:** design plus a working implementation across the v0.1–v0.3 slices. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI; the production GitHub host adapter runs in-process inside `taisan run` through the `gh` CLI transport; Workers launch through the executable `taisan.worker.request/2` / `taisan.worker.report/2` wire with declaration negotiation, immutable bound requests, filesystem/process/network containment, and reference-based credentials; intake runs the internal scheduler with a configuration-selected Selector. Contract and fixture evidence covers the wire, scheduling, recovery, and fail-closed boundaries; owner-run live acceptance of a real Worker and real host effects is still pending — see the [v0.3 installation and acceptance docs](docs/v0.3-installation.md). The agent-agnostic skill ships at `skills/taisan/SKILL.md` with a [walkthrough](docs/skill-walkthrough.md) covering setup, install, submit, inspect, Attention/decision, and recovery against fixtures. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
@@ -49,7 +49,7 @@ The system can make routine implementation decisions within the supplied intent 
 
 ## Build and run
 
-Install Rust with support for edition 2024, then build from source. Real integrations are not yet available.
+Install Rust with support for edition 2024, then build from source. The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance remains owner-run.
 
 ```sh
 git clone https://github.com/shimpeiws/taisan.git
@@ -84,6 +84,9 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [v0.2 installation and operation](docs/v0.2.md) — clean install, one-shot and scheduled intake, configuration-only adapter swap, and the fixture/live evidence boundary.
 - [v0.2 owner-run checklist](docs/v0.2-owner-run-checklist.md) — real-Issue acceptance scenarios and expected results.
 - [v0.2 evidence template](docs/v0.2-evidence-template.md) — labeled fixture/contract versus owner-run live evidence with redaction.
+- [v0.3 installation and operation](docs/v0.3-installation.md) — clean install, the executable Worker wire, pinned delivery, operation with captured non-live output, cutover, drain, and rollback.
+- [v0.3 owner-run checklist](docs/v0.3-owner-acceptance-checklist.md) — real-Worker acceptance scenarios and expected results.
+- [v0.3 evidence template](docs/v0.3-evidence-template.md) — labeled fixture/contract versus owner-run live evidence for the real-Worker run.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 - [Provenance](docs/provenance.md) — source-system origins by role, implementation status, and the audit-record pointer.
 
@@ -94,6 +97,10 @@ The first release aims to run one Work item from the built-in queue through a pu
 ## v0.2 direction
 
 v0.2 adds one configuration-selected Selector adapter, an internal intake scheduler in `taisan run`, durable one-shot `taisan intake`, and intake history Queries. The [installation and operation guide](docs/v0.2.md) covers a clean install, the default 30-minute interval on a 60-second settings tick, the 120-second adapter timeout, the 10-pending-Work limit, and configuration-only adapter replacement without OS timers. The [owner-run checklist](docs/v0.2-owner-run-checklist.md) and [evidence template](docs/v0.2-evidence-template.md) keep automated fixture/contract evidence separate from owner-run live evidence; the implementing documentation task creates no live Issues, enables no normal-installation automation, and launches no real Workers.
+
+## v0.3 direction
+
+v0.3 makes the Worker boundary executable: Workers launch through a versioned wire (`taisan.worker.declaration/1`, `taisan.worker.request/2`, `taisan.worker.report/2`) with immutable per-Invocation requests, declared capabilities, filesystem/process/network containment, and reference-based credentials — never secret values on argv, in requests, or in reports. Reports from Workers stay evidence, not authority: publication, verification, and completion remain Core- and host-adapter-gated. The [installation and operation guide](docs/v0.3-installation.md), [owner-run checklist](docs/v0.3-owner-acceptance-checklist.md), and [evidence template](docs/v0.3-evidence-template.md) prepare real-Worker acceptance without running it; the implementing documentation creates no live Issues, installs no credentials, enables no normal-installation automation, and executes no live models or host effects.
 
 ## Proposals
 

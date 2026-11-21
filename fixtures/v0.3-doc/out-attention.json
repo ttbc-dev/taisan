@@ -1,0 +1,23 @@
+{
+  "schema_version": "1",
+  "status": "accepted",
+  "command": {
+    "id": null,
+    "kind": "attention",
+    "actor": "human:actor-doc",
+    "idempotency_key": null
+  },
+  "work_id": null,
+  "execution_id": null,
+  "result": [],
+  "reason": null,
+  "evidence_refs": [],
+  "sources": [
+    {
+      "source": "store",
+      "availability": "known",
+      "observed_unix_seconds": null
+    }
+  ],
+  "as_of": 59
+}

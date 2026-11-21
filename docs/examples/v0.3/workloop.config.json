@@ -1,0 +1,69 @@
+{
+  "actor_id": "actor-<installation>",
+  "actor_kind": "human",
+  "host_instance": "github.com",
+  "repository": "123456789",
+  "adapter": "github",
+  "contract_version": 1,
+  "capabilities": [
+    "repository_read",
+    "branch_read",
+    "push_ref",
+    "change_request_create",
+    "change_request_read",
+    "change_request_update",
+    "comment_read",
+    "comment_write",
+    "checks_read",
+    "review_findings_read",
+    "review_feedback",
+    "inline_comment",
+    "thread_reply",
+    "thread_resolve",
+    "issue_read",
+    "issue_list",
+    "mark_ready"
+  ],
+  "host_actors": {
+    "publication": "example-publisher",
+    "review": "example-reviewer",
+    "discussion": "example-publisher"
+  },
+  "host_credentials": {
+    "publication": "env:TAISAN_GH_TOKEN",
+    "review": "file:/home/operator/.config/taisan/reviewer.token",
+    "discussion": "env:TAISAN_GH_TOKEN"
+  },
+  "required_checks": [],
+  "capacity": 1,
+  "worker_argv": ["/opt/taisan-worker/example-worker", "--runtime", "example-runtime"],
+  "worker_isolation_profile": "taisan-reference-v0.1",
+  "worker_credential_ref": "env:TAISAN_WORKER_TOKEN",
+  "worker_provider_config": "/home/operator/.config/taisan/worker-provider.json",
+  "worker_model_api_hosts": ["api.example-runtime.example"],
+  "worker_dispatch": {
+    "source_path": "/home/operator/src/example-repository",
+    "budget": {
+      "max_turns": 200,
+      "max_report_bytes": 1048576,
+      "max_log_bytes": 33554432,
+      "max_verification_commands": 8,
+      "max_continuation_refs": 4
+    },
+    "invariant_set": {
+      "id": "invariants-1",
+      "revision": 1,
+      "items": ["no-todo", "tests-pass"]
+    },
+    "capabilities": ["artifact_json", "process_control"]
+  },
+  "verification_toolchain": "/opt/taisan-toolchain",
+  "verification_cache_paths": ["/home/operator/.cache/taisan-cargo"],
+  "verification_egress_allowlist": ["crates.io", "static.crates.io"],
+  "workspace_root": "workspaces",
+  "allowed_effects": {
+    "workspace_write": true,
+    "host_write": true,
+    "network": false
+  }
+}
