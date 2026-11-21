@@ -55,13 +55,7 @@
       "revision": 1,
       "items": ["no-todo", "tests-pass"]
     },
-    "capabilities": [
-      "invocation_transport.argv-v2",
-      "report_json",
-      "workspace_write",
-      "workspace_read_only",
-      "process_control"
-    ]
+    "capabilities": ["artifact_json", "process_control"]
   },
   "verification_toolchain": "/opt/taisan-toolchain",
   "verification_cache_paths": ["/home/operator/.cache/taisan-cargo"],

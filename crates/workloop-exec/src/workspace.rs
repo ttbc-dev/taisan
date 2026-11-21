@@ -985,7 +985,21 @@ fn prepare_locked(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&control).map_err(PreparationError::Io)?;
+            // A racing prepare may create the control area between the
+            // check and the create — AlreadyExists is not a conflict,
+            // but the winner's entry still has to be a real directory.
+            if let Err(e) = std::fs::create_dir(&control) {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let m = std::fs::symlink_metadata(&control).map_err(PreparationError::Io)?;
+                    if m.file_type().is_symlink() || !m.is_dir() {
+                        return Err(PreparationError::WorkspaceConflict {
+                            detail: "control area is a symlink".into(),
+                        });
+                    }
+                } else {
+                    return Err(PreparationError::Io(e));
+                }
+            }
         }
         Err(e) => return Err(PreparationError::Io(e)),
     }

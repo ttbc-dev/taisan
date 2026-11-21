@@ -1,6 +1,9 @@
 # Installation configuration, credential references, and permission boundaries
 
-Status: concrete design for #53. This document specifies future Rust/configuration behavior; it changes no runtime, installs no credentials, and performs no live checks. It consumes #50's identity/binding model, #51's evidence and repair prerequisites, #52's worker isolation profile, and #54's retention keys. The owner approved the credential-reference provider set, the TOML schema, the role profile defaults, the preflight probe boundary, the XDG layout, the rotation boundary, and the setup command contract recorded below.
+Status: concrete design for #53 — the operational surface it
+specifies has since landed on the installation record (see the v0.3
+implementation note below); this document remains the design
+selection and changes no runtime by itself. It consumes #50's identity/binding model, #51's evidence and repair prerequisites, #52's worker isolation profile, and #54's retention keys. The owner approved the credential-reference provider set, the TOML schema, the role profile defaults, the preflight probe boundary, the XDG layout, the rotation boundary, and the setup command contract recorded below.
 
 ## Owner decisions
 
