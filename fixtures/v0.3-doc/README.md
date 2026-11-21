@@ -28,7 +28,7 @@ Every file was produced by a real `taisan` invocation against:
 | `out-attention.json`, `out-attention_--work_w-1.json` | `taisan attention` — empty; no human-gate items |
 | `out-capacity.json` | `taisan capacity` — one occupied slot, workspace/branch reservations held |
 | `out-command-result_--origin_cli_--replay-key_doc-submit-1.json` | `taisan command-result --origin cli --replay-key doc-submit-1` — idempotent replay returns the same decision |
-| `out-run.json`, `out-run2.json`, `out-run2.err` | `taisan run --ticks 6` transcripts — Worker-produced commits (`fe4c03a`, `1944df5`) and per-pass progress lines |
+| `out-run.json`, `out-run2.json`, `out-run2.err` | `taisan run --ticks 8` transcript (`out-run2`) and a `--ticks 6` transcript (`out-run`) — Worker-produced commits (`fe4c03a`, `1944df5`) and per-pass progress lines |
 | `out-tick-report.json` | The last `tick_report` event extracted from `store.db`'s `event_log` |
 
 ## What these captures prove — and do not prove

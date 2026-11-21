@@ -206,8 +206,11 @@ itself — the suite therefore proves the contract is implementable
 without sharing the host's response construction, not merely that a
 second binary echoes the fixture's bytes. Rows a real process cannot
 express (a lost spawn identity, an uninspectable liveness read) stay
-in the provider-model suite above; every row here is covered by a
-spawned process on both implementations.
+in the provider-model suite above; every other row here is covered
+by a spawned process on both implementations — WW-DECL-01 alone binds
+`/bin/false` in both runs, because its row proves the supervisor's
+refusal on a worker that never answers `describe`, which is identical
+for either implementation.
 
 Outcome equality is asserted on an adapter-neutral signature —
 invocation states, writer-identity presence, report classifications,
@@ -237,9 +240,10 @@ InvariantCheck launch and resolve `Done` with `Success` reports, the
 produced commit hands off `Acknowledged` with the declared
 verification `Pass` on the exact commit, and the agreeing
 `claimed_head` is recorded as evidence. The Execution then waits in
-`reconciliation` because the installation denies `host_write` — the
-publish intents are held by design, which is the correct terminal
-state for this configuration.
+`reconciliation`: no CapabilityReport ever reaches this in-process
+driver, so `push_ref` stays unconfirmed and `record_intent` records no
+publish intent at all — the capability gate holding publication, which
+is the correct terminal state for this configuration.
 
 These are fixture/contract evidence rows only: they prove the wire
 contract is implementable and enforced end-to-end inside the
