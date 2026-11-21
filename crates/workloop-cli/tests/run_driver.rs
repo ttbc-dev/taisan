@@ -50,6 +50,16 @@ fn run_cli_from(root: &Path, cwd: Option<&Path>, args: &[&str]) -> std::process:
     command.output().expect("taisan runs")
 }
 
+fn primitive_on_path(name: &str) -> bool {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"] {
+        if Path::new(dir).join(name).is_file() {
+            return true;
+        }
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
 fn store(root: &Path) -> SqliteStore {
     SqliteStore::open(&root.join("workloop.db"), 1).unwrap()
 }
@@ -672,9 +682,17 @@ fn git(dir: &Path, args: &[&str]) {
 /// collects and classifies the report as validated evidence, and
 /// drives the produced commit through durable handoff, declared
 /// verification, and the agreeing-claim verdict — every step a durable
-/// fact inside the eight-phase tick, never a fixture shortcut.
+/// fact inside the eight-phase tick, never a fixture shortcut. The
+/// launch runs under the approved reference profile, which declares
+/// the `bwrap` primitive: on a host without it the contract refuses
+/// dispatch (OPS-01), so the evidence is gathered where the primitive
+/// exists — CI installs it.
 #[test]
 fn a_v2_worker_runs_the_complete_wire_through_the_driver() {
+    if !primitive_on_path("bwrap") {
+        eprintln!("skipping: bwrap is absent on this host; the launch gate would refuse (OPS-01)");
+        return;
+    }
     let dir = root("v2-driver");
     // The supervisor-side source repository the Coding request pins at
     // consume time — a real checkout the workspace is built from.
@@ -725,7 +743,7 @@ fn a_v2_worker_runs_the_complete_wire_through_the_driver() {
                 "--claim-head",
                 "HEAD"
             ],
-            "worker_isolation_profile": "fixture-worker-v0.1",
+            "worker_isolation_profile": workloop_core::worker::DEFAULT_ISOLATION_PROFILE_ID,
             "worker_dispatch": {
                 "source_path": source_path.to_string_lossy(),
                 "budget": {

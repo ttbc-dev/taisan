@@ -12,8 +12,8 @@ use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::ObservationFact;
-use workloop_core::ports::{ProcessControlPort, SpawnError, WorkerEnv};
-use workloop_core::store::Store;
+use workloop_core::ports::{ProbeOutcome, ProcessControlPort, SpawnError, WorkerEnv};
+use workloop_core::store::{Effect, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, admit_queued, handle_command};
 use workloop_core::worker::{
     DEFAULT_ISOLATION_PROFILE_ID, FIXTURE_ISOLATION_PROFILE_ID, IsolationProfile, Unsupported,
@@ -298,6 +298,57 @@ fn a_lost_start_response_reconciles_to_one_writer_on_the_next_pass() {
         export.process_identity.as_deref(),
         Some(format!("{}@{}", identity.pid, identity.started_at).as_str()),
         "the re-bind lands the same request_id → identity binding a normal launch writes"
+    );
+}
+
+/// A lost CONTAINED launch leaves a writer running under the bwrap
+/// outer argv — the bare bound argv never reaches the process table.
+/// Re-binding must search the wrapped signature the launch actually
+/// exec'd, or the orphan is missed and the launch is later declared
+/// absent on directory occupancy alone.
+#[test]
+fn a_lost_contained_launch_rebinds_by_the_wrapped_signature() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("lost-contained");
+    let port = ScriptedProcessControl::new();
+    // Exactly the launch gate: the version probe plus the nine-probe
+    // battery. Every later probe — `describe` and the recovery pass's
+    // re-proof — falls through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    // Spawn happened; the response was lost — the process may exist.
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "timeout between spawn and response".into(),
+    });
+    let sup = Supervisor::new(port.clone(), root, vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-lost-contained",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-lost-contained");
+    sup.consume_requests(&store, NOW).unwrap();
+    sup.poll_invocations(&store, NOW).unwrap();
+    sup.run_once(&store, NOW + 1).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "the lost start response never produces a second writer"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Running,
+        "the bwrap-wrapped orphan is found by the argv the spawn really exec'd"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert!(
+        invocation.process_identity.is_some(),
+        "the orphaned writer's identity is re-recorded"
     );
 }
 
@@ -780,4 +831,88 @@ fn scripted_unknown_plan_records_the_lost_identity() {
         "the orphan is in the process table even though the response was lost"
     );
     assert_eq!(port.spawn_calls(), 1);
+}
+
+/// §14.6 read-only regression: under a contained profile the mount
+/// decision is per-role — the coding leg binds its workspace
+/// writable, the invariant-check leg binds its snapshot read-only.
+/// The recorded spawn argv carries the bwrap flags themselves:
+/// `--bind` vs `--ro-bind` on `/workspace` is the boundary, not a
+/// field on the request.
+#[test]
+fn a_contained_assessment_binds_the_workspace_read_only() {
+    // Two capacity slots: the writer Execution and the check Execution
+    // are both admitted `ready`.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let root = tmp_root("contained-ro-mount");
+    let port = ScriptedProcessControl::new();
+    port.set_default_plan(SpawnPlan::Resident);
+    // Exactly the writer launch's gate: the version probe plus the
+    // nine-probe battery. Every later probe — each `describe` and the
+    // check's own battery — falls through to the scripted
+    // auto-declaration, whose `success: true` output passes a probe
+    // and declares the adapter when the argv asks for one.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    let sup = Supervisor::new(port.clone(), root.clone(), vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-contained-ro-mount",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (work, _eid) = submit_and_admit(&store, "k-ro-mount-writer");
+    let (check_work, check_eid) = submit_and_admit(&store, "k-ro-mount-check");
+    // The check launches only while its Execution stays `ready` — the
+    // orchestrator re-issues it under `waiting → ready`, so it never
+    // shares a pass with a just-spawned writer on the same Execution.
+    // Retire its sibling's coding request so this pass carries a
+    // writer launch and a check launch on separate Executions.
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    let check_coding = pending
+        .iter()
+        .find(|request| request.execution_id == check_eid)
+        .expect("the check Execution's coding request")
+        .request_id
+        .clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: check_coding,
+            })?;
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: format!("{}:inv:check", check_eid.0),
+                    work_id: check_work.clone(),
+                    execution_id: check_eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    spec_revision: 1,
+                    payload: serde_json::json!({"required_artifacts": []}),
+                    adapter_binding: None,
+                },
+            })
+        })
+        .unwrap();
+    sup.consume_requests(&store, NOW).unwrap();
+    let commands = port.commands();
+    assert_eq!(commands.len(), 2, "one writer launch plus the check");
+    let ws = root.join(format!("ws-{}", work.0));
+    assert!(
+        commands[0].contains(&format!("--bind {} /workspace", ws.display())),
+        "the writer binds its workspace writable: {}",
+        commands[0]
+    );
+    assert!(
+        commands[1].contains("--ro-bind") && commands[1].contains(" /workspace"),
+        "the check's snapshot mounts read-only: {}",
+        commands[1]
+    );
+    assert!(
+        !commands[1].contains("--bind "),
+        "no writable bind reaches the read-only check leg: {}",
+        commands[1]
+    );
 }

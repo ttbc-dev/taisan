@@ -211,7 +211,8 @@ the optional v2 dispatch profile `worker_dispatch` —
 `invariant_set`, and a `capabilities` floor; present means requests
 not yet consumed launch through the complete bound-request transport
 ([v0.3 §4, §14.8](v0.3.md)), absent keeps the recorded v1 argv-only
-launch, and a malformed section is a load-time config error — and the
+launch, and a semantically malformed section refuses `taisan run`'s
+supervisor composition (structural errors still fail at load) — and the
 `budget`/`policy`/`retention`/`loop` overrides. The profile's
 `[worker]` section is the declaration `check` stage 5 validates;
 `worker_argv` in the installation record is the launch source

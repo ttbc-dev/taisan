@@ -3485,6 +3485,7 @@ fn seal_round(
             severity: o.severity.clone(),
             position: o.position.clone(),
             thread_id: o.thread_id.clone(),
+            summary: o.summary.clone(),
         })
         .collect();
     tx.apply(&Effect::InsertReviewRound { round, occurrences })?;

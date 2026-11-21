@@ -255,6 +255,7 @@ fn seal_review(
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: None,
                 })
                 .collect(),
         },

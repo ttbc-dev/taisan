@@ -37,8 +37,8 @@ use workloop_core::store::{ReadView, Store, StoreError};
 use workloop_core::work::current_target;
 use workloop_core::worker_v2::{
     InvariantSetBody, MAX_REPORT_MEMBERS, ReportClassification, ReportFinding, ReportInvariantItem,
-    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportStatus, WorkerReportV2,
-    WorkerRequestV2, member_claim_digest,
+    ReportItemVerdict, TaskBody, WORKER_REQUEST_V2_FORMAT, WorkerReportV2, WorkerRequestV2,
+    member_claim_digest,
 };
 
 use crate::bodies::{BodyStore, CAS_CATEGORY};
@@ -326,7 +326,10 @@ fn bind_invariant_check(
     // must still verify against the wire ref, or coverage is
     // unverifiable.
     let set = resolve_invariant_set(store, bodies, invariant_set)?;
-    let (complete, items) = assess_items(&gathered.report.invariant_items, set.as_ref());
+    let (covered, items) = assess_items(&gathered.report.invariant_items, set.as_ref());
+    // A Negative report is the check's own failure claim — never a
+    // completed assessment, whatever its member coverage says.
+    let complete = covered && !matches!(gathered.classification, ReportClassification::Negative);
     Ok(Some(ObservationFact::Assessment {
         target,
         set_digest: invariant_set.digest.clone(),
@@ -343,7 +346,7 @@ fn resolve_invariant_set(
     bodies: &BodyStore,
     invariant_set: &workloop_core::worker_v2::InvariantSetRef,
 ) -> Result<Option<InvariantSetBody>, ExecError> {
-    let path = format!("invariant-set/{}", invariant_set.digest);
+    let path = format!("bodies/invariant-set/{}", invariant_set.digest);
     let resolved = bodies
         .resolve_at(store.body_catalog(), CAS_CATEGORY, &path)
         .map_err(|e| ExecError::Fault(format!("resolve invariant set body: {e}")))?;
@@ -441,9 +444,17 @@ fn bind_review(
     };
     if target.change.change_request.as_str() != wire_target.change
         || target.head.object != wire_target.head
+        // An absent wire revision proves no match (the wire docs say
+        // bodies minted before the binding existed can never prove
+        // one) — `None == None` is equality of ignorance, never a
+        // bound target.
+        || wire_target.target_revision.is_none()
+        || target.target_revision.as_ref().map(|r| r.object.as_str())
+            != wire_target.target_revision.as_deref()
     {
-        // The accepted head or change moved since dispatch — the
-        // review covers a superseded target and binds nothing.
+        // The accepted target moved since dispatch — head, change, or
+        // a target-branch-only revision move — the review covers a
+        // superseded target and binds nothing.
         return Ok(None);
     }
     // The wire triple must be self-consistent: the recorded
@@ -474,6 +485,23 @@ fn bind_review(
         Completeness::Unavailable {
             reason: gathered.report.reason.code.clone(),
         }
+    } else if matches!(gathered.classification, ReportClassification::Negative)
+        && gathered.report.reason.code != "findings_reported"
+        && gathered.report.findings.is_empty()
+    {
+        // A negative claim that reports no findings seals a clean
+        // round with nothing to disposition — the report's own
+        // failure claim is never a completed review; its reason is
+        // the recorded evidence. A negative report that *does* carry
+        // findings — whatever its reason code — falls through to the
+        // member check so the members still seal as occurrences for
+        // judgment: the lane then stands on the judgment path, never
+        // the report's claim. `findings_reported` is the review's
+        // normal negative shape; a malformed member set still
+        // degrades to partial.
+        Completeness::Partial {
+            reason: gathered.report.reason.code.clone(),
+        }
     } else {
         review_completeness(&gathered.report)
     };
@@ -488,22 +516,11 @@ fn bind_review(
 }
 
 /// Decide the review's completeness from its member claims. Valid
-/// unique members under the closed grammar are `Complete`; a negative
-/// report whose reason is not `findings_reported` is a writer-role
-/// claim, never a review result; a `findings_reported` reason carrying
-/// zero findings is a contradictory claim, and any malformed/duplicate
-/// member is `Partial` — recorded evidence that can never seal a
-/// round.
+/// unique members under the closed grammar are `Complete`; a
+/// `findings_reported` reason carrying zero findings is a contradictory
+/// claim, and any malformed/duplicate member is `Partial` — recorded
+/// evidence that can never seal a round.
 fn review_completeness(report: &WorkerReportV2) -> Completeness {
-    // A negative report whose reason is not `findings_reported` is a
-    // claim about the artifact's checks or invariants — the Worker's
-    // writer-role vocabulary — never a review result: it can neither
-    // seal a round nor stand in for a clean zero-finding review.
-    if report.status == WorkerReportStatus::Negative && report.reason.code != "findings_reported" {
-        return Completeness::Partial {
-            reason: "negative_report_not_a_review".into(),
-        };
-    }
     if report.findings.len() > MAX_REPORT_MEMBERS {
         return Completeness::Partial {
             reason: "too_many_findings".into(),
@@ -533,9 +550,14 @@ fn review_completeness(report: &WorkerReportV2) -> Completeness {
 /// Build the occurrence inputs for a review fact. Under `Complete`
 /// every member already parsed — a parse failure here is impossible
 /// and drops the member defensively; under `Partial`/`Unavailable`
-/// the valid subset is retained as claim evidence.
+/// the valid subset is retained as claim evidence. An over-cap member
+/// set is malformed evidence as a whole — nothing inside it parses
+/// into the fact, matching `assess_items`.
 fn review_occurrences(members: &[serde_json::Value]) -> Vec<OccurrenceInput> {
     let mut occurrences = Vec::new();
+    if members.len() > MAX_REPORT_MEMBERS {
+        return occurrences;
+    }
     for value in members {
         let Ok(member) = ReportFinding::parse_member(value) else {
             continue;
@@ -547,6 +569,7 @@ fn review_occurrences(members: &[serde_json::Value]) -> Vec<OccurrenceInput> {
             severity: member.severity,
             position: member.position,
             thread_id: member.thread_id,
+            summary: Some(member.summary),
         });
     }
     occurrences
