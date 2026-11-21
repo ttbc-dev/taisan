@@ -268,5 +268,11 @@ pub trait GitHubApi {
         })
     }
 
+    /// The login the live credential authenticates as — the identity
+    /// attestation a guarded write binds to its receipt. An ambient
+    /// credential (a CLI token) is verified through the host, never
+    /// assumed from the intent that asked for the write.
+    fn viewer(&mut self) -> Result<String, ApiError>;
+
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) {}
 }

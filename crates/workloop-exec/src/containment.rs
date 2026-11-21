@@ -1202,6 +1202,38 @@ mod tests {
         }
     }
 
+    /// A failed probe's detail bound backs off to a character
+    /// boundary — worker output whose 200-byte bound lands inside a
+    /// multibyte codepoint must not panic the battery.
+    #[test]
+    fn a_probe_detail_truncates_on_a_character_boundary() {
+        let port = ScriptedProcessControl::new();
+        let mut stdout = b"a".repeat(199);
+        stdout.extend_from_slice("あいうえお".as_bytes());
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            success: false,
+            stdout,
+        }));
+        let mut records = Vec::new();
+        run_named_probe(
+            &port,
+            Path::new("/usr/bin/bwrap"),
+            &plan_fixture(),
+            &["true".into()],
+            "/workspace",
+            &WorkerEnv::default(),
+            Path::new("/host"),
+            "p",
+            &mut records,
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].passed);
+        // The bound landed inside 'あ' (bytes 199-201); the detail
+        // backs off to the 199-byte boundary instead of panicking.
+        assert!(records[0].detail.ends_with('a'), "{:?}", records[0].detail);
+        assert!(!records[0].detail.contains('あ'), "{:?}", records[0].detail);
+    }
+
     #[test]
     fn bwrap_args_carry_the_namespace_flags_and_fixed_binds() {
         let args = bwrap_args(
