@@ -55,6 +55,7 @@ use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding, RepositoryPermissions};
+use crate::credential::{CredentialError, CredentialProviders, resolve_credential};
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
@@ -108,13 +109,19 @@ pub enum WebhookFact {
 /// What one [`GitHubAdapter`] session applied, in order — the write
 /// history assertions drive. Encoding is adapter-internal, matching
 /// the fixtures' so shared-suite assertions need no special case.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct GitHubAdapter<C> {
     client: C,
     /// When set, only intents recorded for this host instance are
     /// drained; another instance's intents stay `pending` for their
     /// own adapter — an effect never migrates across hosts.
     bound_host: Option<HostInstanceId>,
+    /// The credential providers the adapter resolves `credential_ref`s
+    /// through at the adapter boundary. `None` keeps the transport's
+    /// ambient identity (the construction tests use); production
+    /// installs the OS providers so every intent binds its declared
+    /// credential before any read or write.
+    credentials: Option<Box<dyn CredentialProviders>>,
     applied: Vec<String>,
     poll_records: u64,
 }
@@ -124,6 +131,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Self {
             client,
             bound_host: None,
+            credentials: None,
             applied: Vec::new(),
             poll_records: 0,
         }
@@ -135,8 +143,61 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Self {
             client,
             bound_host: Some(host),
+            credentials: None,
             applied: Vec::new(),
             poll_records: 0,
+        }
+    }
+
+    /// Install the credential providers `credential_ref`s resolve
+    /// through — the adapter-boundary binding gate.
+    pub fn with_credentials(mut self, providers: Box<dyn CredentialProviders>) -> Self {
+        self.credentials = Some(providers);
+        self
+    }
+
+    /// The adapter-boundary credential gate — the same binding the
+    /// fixture's book performs: the intent's recorded role binding
+    /// resolves its credential slot at use time and the resolved value
+    /// authenticates as the intent's authorized actor before any read
+    /// or write. On success the transport runs under the bound
+    /// credential for the rest of this intent's calls. `Ok(None)` —
+    /// no credential book installed — keeps the ambient identity; a
+    /// `credential.*` failure never rebinds an outstanding action
+    /// under another account.
+    fn bind_intent_credential(
+        &mut self,
+        store: &impl Store,
+        intent: &HostActionIntent,
+    ) -> Result<Option<CredentialError>, StoreError> {
+        let Some(providers) = &self.credentials else {
+            return Ok(None);
+        };
+        let reference = store.transact(|tx| {
+            Ok(tx.work(&intent.work_id)?.and_then(|work| {
+                work.binding
+                    .actors
+                    .iter()
+                    .find(|binding| binding.role == intent.role)
+                    .map(|binding| binding.credential_ref.clone())
+            }))
+        })?;
+        let bind = resolve_credential(reference.as_ref(), &**providers).and_then(|resolved| {
+            let authenticated = self.client.authenticate(&resolved)?;
+            if authenticated != intent.actor {
+                return Err(CredentialError::ActorMismatch {
+                    bound: intent.actor.clone(),
+                    authenticated,
+                });
+            }
+            Ok(resolved)
+        });
+        match bind {
+            Ok(resolved) => {
+                self.client.set_credential(Some(resolved));
+                Ok(None)
+            }
+            Err(error) => Ok(Some(error)),
         }
     }
 
@@ -1512,6 +1573,16 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             .collect();
         let mut resolved = Vec::new();
         for intent in unknown {
+            // The same adapter-boundary credential gate `attempt`
+            // runs: the intent's recorded role binding resolves and
+            // authenticates under the actor authorized at intent
+            // time — a rotated credential that authenticates as
+            // another actor never rebinds or settles the outstanding
+            // action; a `credential.*` failure leaves it unknown and
+            // outstanding for repair.
+            if self.bind_intent_credential(store, &intent)?.is_some() {
+                continue;
+            }
             let execution = store.transact(|tx| {
                 Ok(tx
                     .executions_for_work(&intent.work_id)?
@@ -1683,13 +1754,18 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         // somebody else's change.
                     }
                 }
-                HostAction::PostComment { change, marker, .. } => {
+                HostAction::PostComment {
+                    change,
+                    marker,
+                    body,
+                    ..
+                } => {
                     if let Ok(found) =
                         self.client
                             .find_comment(&intent.repository, &change.change_request, marker)
                     {
                         match found {
-                            Some(comment) => {
+                            Some(comment) if comment.body == *body => {
                                 let body_digest = sha256_hex(
                                     "comment-v1",
                                     &canonical_json(&serde_json::json!({
@@ -1720,6 +1796,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                     vec![],
                                 )?;
                             }
+                            // A comment carrying our marker but a
+                            // different stored body cannot be told
+                            // from a foreign post: like a payload
+                            // mismatch on open, the intent stays
+                            // `unknown` and outstanding rather than
+                            // adopting somebody else's comment.
+                            Some(_) => {}
                         }
                     }
                 }
@@ -1999,13 +2082,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     }),
                 })
             }
-            HostAction::PostComment { change, marker, .. } => {
+            HostAction::PostComment {
+                change,
+                marker,
+                body,
+                ..
+            } => {
                 match self
                     .client
                     .find_comment(&intent.repository, &change.change_request, marker)
                 {
                     Err(_) => Ok(RemoteEffect::Indeterminate {
                         reason: "comment listing failed".into(),
+                    }),
+                    // The marker is the idempotence key; a stored body
+                    // that differs from the recorded payload is the
+                    // fixture's `Indeterminate` verdict — our write's
+                    // landing cannot be told from a foreign comment
+                    // carrying the marker.
+                    Ok(Some(comment)) if comment.body != *body => Ok(RemoteEffect::Indeterminate {
+                        reason: "the recorded marker carries a different stored body".into(),
                     }),
                     Ok(Some(comment)) => {
                         let body_digest = sha256_hex(
@@ -2075,6 +2171,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         };
         if !execution.allowed_effects.host_write {
             return Ok(AttemptOutcome::Skipped("host_write_denied"));
+        }
+        // The adapter-boundary credential gate — the declared
+        // `credential_ref` for the intent's role resolves at use time
+        // and authenticates as the intent's authorized actor before
+        // any reconcile read or guarded write; a `credential.*`
+        // failure blocks the intent pending repair rather than
+        // writing under the ambient login.
+        if let Some(error) = self.bind_intent_credential(store, &intent)? {
+            return Ok(AttemptOutcome::CredentialBlocked(error.code()));
         }
         let execution_id = Some(execution.id);
         let obs = |fact: ObservationFact| Observation {

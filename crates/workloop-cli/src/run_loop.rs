@@ -346,10 +346,13 @@ impl RunHost {
                     return Err("driver.host_unsupported".into());
                 }
                 let api = GhCliApi::new().with_hostname("github.com");
-                Ok(Self::Github(Box::new(GitHubAdapter::for_host(
-                    workloop_core::identity::HostInstanceId::trusted("github.com"),
-                    api,
-                ))))
+                Ok(Self::Github(Box::new(
+                    GitHubAdapter::for_host(
+                        workloop_core::identity::HostInstanceId::trusted("github.com"),
+                        api,
+                    )
+                    .with_credentials(Box::new(workloop_github::credential::OsProviders)),
+                )))
             }
             other => Err(format!("unsupported host adapter: {other}")),
         }

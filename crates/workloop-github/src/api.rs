@@ -19,8 +19,10 @@
 //!   blindly.
 
 use std::time::Instant;
-use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::identity::{ChangeRequestId, HostActorRef, IssueRef, RepositoryRef};
 use workloop_core::observation::{CheckConclusion, IssueState};
+
+use crate::credential::{CredentialError, ResolvedCredential};
 
 /// One transport-level failure of a GitHub API call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +311,23 @@ pub trait GitHubApi {
     /// never the intent's configured actor.
     fn viewer(&mut self) -> Result<Option<String>, ApiError> {
         Ok(None)
+    }
+
+    /// Install the credential the transport's calls authenticate
+    /// under — the value the adapter resolved for the current intent's
+    /// role binding. `None` returns to the ambient identity.
+    fn set_credential(&mut self, _credential: Option<ResolvedCredential>) {}
+
+    /// Which host actor a resolved credential authenticates as — the
+    /// adapter's authentication step for `credential_ref` binding. A
+    /// transport without a credential surface never authenticates.
+    fn authenticate(
+        &mut self,
+        _credential: &ResolvedCredential,
+    ) -> Result<HostActorRef, CredentialError> {
+        Err(CredentialError::unresolvable(
+            "this transport cannot authenticate a resolved credential",
+        ))
     }
 
     fn set_read_deadline(&mut self, _deadline: Option<Instant>) {}
