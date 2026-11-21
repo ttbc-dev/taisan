@@ -2135,7 +2135,7 @@ fn build_supervisor(
     };
     // A contained launch shadows the installation state root and the
     // workspace root with a fresh tmpfs whenever a fixed system bind
-    // covers them — otherwise `/opt/taisan`-style layouts would hand
+    // covers them — otherwise `/usr/local/taisan`-style layouts would hand
     // every worker the store, the handoff repository, and the staged
     // runtime credential read-only (§14.3).
     Ok(Some(

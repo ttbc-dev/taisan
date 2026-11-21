@@ -165,8 +165,8 @@ pub struct MountPlan {
     /// Installation-owned roots that must never be visible inside the
     /// sandbox: the state root holding the store, the handoff
     /// repository, credential staging, and sibling workspaces. A root
-    /// only needs masking when a fixed system bind covers it — an
-    /// `/opt/taisan` state root is otherwise ro-bound wholesale, and
+    /// only needs masking when a fixed system bind covers it — a
+    /// `/usr/local/taisan` state root is otherwise ro-bound wholesale, and
     /// every contained worker could read it. Each covered root is
     /// shadowed with a fresh tmpfs; every path the launch legitimately
     /// needs is re-bound by the plan fields above, so the mask itself
@@ -775,7 +775,7 @@ fn reclaim_canary(canary: &Path) {
 /// A real host path the rendered argv provably never mounts, for the
 /// `unmounted-path-invisible` and `symlink-escape-denied` probes. The
 /// workspace-local canary is preferred, but a state root beneath a
-/// bound prefix — `/opt/taisan` is ro-bound as a system dir — is
+/// bound prefix — `/usr/local/taisan` is ro-bound as a system dir — is
 /// visible inside the sandbox and would fail the proof on every
 /// launch. The fallbacks are the host temp dir (the sandbox replaces
 /// `/tmp` with a fresh tmpfs) and sysfs, which no declared bind
@@ -1325,8 +1325,8 @@ mod tests {
         assert!(!text.contains("/Users/"), "{text}");
     }
 
-    /// A mask root strictly beneath an existing system bind — an
-    /// `/opt/taisan`-style state root — is shadowed with a fresh
+    /// A mask root strictly beneath an existing system bind — a
+    /// `/usr/local/taisan`-style state root — is shadowed with a fresh
     /// tmpfs before every plan bind, so a contained worker can never
     /// read the store, handoff repository, or staged credential the
     /// prefix bind would otherwise expose. A root that is not covered
