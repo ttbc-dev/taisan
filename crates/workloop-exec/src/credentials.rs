@@ -249,6 +249,12 @@ fn resolve_command_bounded(
         }
     };
     if !status.success() {
+        // A non-zero exit still owes the bound: a descendant can
+        // outlive the child holding the stdout pipe open, so reap
+        // the group and drain the reader before refusing — the
+        // same cleanup the timeout and output paths perform.
+        kill_group(&child);
+        let _ = output_rx.recv_timeout(bound);
         return Err(unresolvable(format!(
             "command provider: exited with {}",
             status
