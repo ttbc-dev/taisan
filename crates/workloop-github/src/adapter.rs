@@ -2105,6 +2105,32 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             RemoteEffect::Absent { .. } => {}
         }
 
+        // The credential gate before any write: the transport's proven
+        // identity must be the actor the intent binds. A `gh` session
+        // acting as another account never pushes, opens, or comments —
+        // the write is refused and the receipt records the proven
+        // actor, so the durable `actor_mismatch` verdict is evidence of
+        // a prevented effect, never a landed one. An unprovable
+        // identity proceeds unauthenticated: the write's own outcome
+        // settles the intent.
+        if let Some(actor) = &authenticated_actor
+            && *actor != intent.actor
+        {
+            self.ingest(
+                store,
+                config,
+                obs(result(
+                    intent.action_id,
+                    HostActionStatus::Unknown {
+                        reason: "actor_mismatch".into(),
+                    },
+                    vec![],
+                )),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
+
         match &intent.action {
             HostAction::PushRef {
                 branch,
