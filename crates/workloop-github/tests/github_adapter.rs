@@ -2197,3 +2197,218 @@ fn an_empty_stream_with_an_unread_findings_source_records_no_complete_round() {
         "an available source with an empty stream is a meaningful clean round"
     );
 }
+
+/// A comment that carries the intent's marker but a stored body that
+/// differs from the recorded payload is foreign evidence: the guarded
+/// write never posts a duplicate, and a lost-response reconcile never
+/// settles the intent `applied` on somebody else's comment.
+#[test]
+fn a_marker_match_with_a_different_body_never_settles_a_comment_intent() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, change, opened_head) = push_and_open(&mut adapter, &store, &config, "cmtbody");
+    adapter.client_mut().seed_comment(
+        &repo(),
+        change.change_request.as_str(),
+        "workloop",
+        "a foreign body under our marker",
+    );
+
+    // Pending intent: reconcile-before-write sees the marker but a
+    // different stored body — the write must not post a duplicate.
+    let pending_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PostComment {
+            change: change.clone(),
+            expected_head: opened_head.clone(),
+            marker: "workloop".into(),
+            body: "hello".into(),
+        },
+    );
+    let writes_before = adapter.client().writes().len();
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(
+        adapter.client().writes().len(),
+        writes_before,
+        "no duplicate post under a marker a foreign comment already carries"
+    );
+    assert!(
+        !matches!(
+            intent_status(&store, &pending_id),
+            HostActionStatus::Applied
+        ),
+        "a body mismatch never settles the intent applied"
+    );
+
+    // Unknown intent: a lost-response reconcile meets the same foreign
+    // marker and must stay outstanding rather than adopt the comment.
+    let unknown_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PostComment {
+            change: change.clone(),
+            expected_head: opened_head.clone(),
+            marker: "workloop".into(),
+            body: "hello".into(),
+        },
+    );
+    adapter
+        .ingest(
+            &store,
+            &config,
+            Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id: unknown_id.clone(),
+                    authenticated_actor: Some(publisher()),
+                    status: HostActionStatus::Unknown {
+                        reason: "response lost".into(),
+                    },
+                    effects: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    let resolved = adapter
+        .reconcile_outstanding(&store, &config, NOW + 10)
+        .unwrap();
+    assert!(
+        !resolved.contains(&unknown_id),
+        "a marker match with a different body is not this intent's effect"
+    );
+    assert!(
+        matches!(
+            intent_status(&store, &unknown_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "the unreconciled comment stays outstanding"
+    );
+}
+
+/// The adapter-boundary credential gate (parity with the fixture's
+/// book): a pending write resolves the role binding's `credential_ref`
+/// and the resolved value authenticates as the intent's authorized
+/// actor before any write — never the ambient login. A credential the
+/// provider cannot resolve, or one that authenticates as another
+/// actor, blocks the intent without a write.
+#[test]
+fn a_pending_write_binds_the_declared_credential_before_writing() {
+    let submit_with = |store: &SqliteStore, key: &str, config: &WorkloopConfig| {
+        let d = handle_command(
+            store,
+            config,
+            &CommandRequest {
+                actor: Actor {
+                    kind: ActorKind::Human,
+                    external_id: "op".into(),
+                },
+                origin: Origin("cli".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Submit {
+                    intent: "do the thing".into(),
+                    sources: vec![],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        let CommandDecision::Accepted { work_id, .. } = d else {
+            panic!("submit: {d:?}")
+        };
+        work_id.unwrap()
+    };
+    let push = |branch: &str| HostAction::PushRef {
+        branch: branch.into(),
+        produced: rev("head-1"),
+        expected_prior: None,
+    };
+
+    // Happy path: `env:` resolves, the host reports the bound actor,
+    // and the write runs under the resolved credential.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut config = config();
+    config.host.actors[0].credential_ref = CredentialRef::trusted("env:TAISAN_TEST_TOKEN");
+    let mut book = workloop_github::fixture::CredentialBook::new();
+    book.seat_env("TAISAN_TEST_TOKEN", "tok-bound");
+    let mut adapter = Adapter::new(InMemoryGitHub::new()).with_credentials(Box::new(book));
+    adapter
+        .client_mut()
+        .seat_credential("tok-bound", publisher());
+    let work_id = submit_with(&store, "cred-ok", &config);
+    let push_id = insert_intent(&store, &work_id, push("work/cred-ok"));
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert_eq!(intent_status(&store, &push_id), HostActionStatus::Applied);
+    assert!(
+        adapter
+            .client()
+            .writes()
+            .iter()
+            .any(|w| w.starts_with("push_ref")),
+        "the bound credential's write landed"
+    );
+
+    // Mismatch: the resolved value authenticates as another actor —
+    // `credential.actor_mismatch` blocks the intent with no write.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut book = workloop_github::fixture::CredentialBook::new();
+    book.seat_env("TAISAN_TEST_TOKEN", "tok-foreign");
+    let mut adapter = Adapter::new(InMemoryGitHub::new()).with_credentials(Box::new(book));
+    adapter.client_mut().seat_credential(
+        "tok-foreign",
+        HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("someone-else"),
+        },
+    );
+    let work_id = submit_with(&store, "cred-mm", &config);
+    let push_id = insert_intent(&store, &work_id, push("work/cred-mm"));
+    let report = adapter
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .credential_blocked
+            .iter()
+            .any(|b| b.action_id == push_id && b.code == "credential.actor_mismatch"),
+        "{report:?}"
+    );
+    assert_eq!(
+        adapter.client().writes().len(),
+        0,
+        "a foreign credential never writes"
+    );
+    assert!(
+        matches!(intent_status(&store, &push_id), HostActionStatus::Pending),
+        "a blocked intent stays pending for repair"
+    );
+
+    // Unresolvable: the env slot holds no value — `credential.unresolvable`.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let adapter_book = workloop_github::fixture::CredentialBook::new();
+    let mut adapter = Adapter::new(InMemoryGitHub::new()).with_credentials(Box::new(adapter_book));
+    let work_id = submit_with(&store, "cred-unres", &config);
+    let push_id = insert_intent(&store, &work_id, push("work/cred-unres"));
+    let report = adapter
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .credential_blocked
+            .iter()
+            .any(|b| b.action_id == push_id && b.code == "credential.unresolvable"),
+        "{report:?}"
+    );
+    assert_eq!(adapter.client().writes().len(), 0);
+    assert!(matches!(
+        intent_status(&store, &push_id),
+        HostActionStatus::Pending
+    ));
+}

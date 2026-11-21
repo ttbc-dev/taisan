@@ -5,12 +5,13 @@
 
 use std::collections::BTreeMap;
 
-use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::identity::{ChangeRequestId, HostActorRef, IssueRef, RepositoryRef};
 use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::api::{
     ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
     RemoteReviewFinding,
 };
+use workloop_github::credential::{CredentialError, ResolvedCredential};
 
 /// One pull request the in-memory remote stores.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,12 @@ pub struct InMemoryGitHub {
     /// The login `viewer` reports — the ambient credential's proven
     /// identity. `None` means the transport cannot prove one.
     viewer_login: Option<String>,
+    /// `credential value` → the actor the host reports for it — the
+    /// `authenticate` surface the adapter-boundary binding checks.
+    credential_seats: BTreeMap<String, HostActorRef>,
+    /// The credential the adapter bound for the current intent —
+    /// `viewer` answers its actor when set.
+    active_credential: Option<String>,
     next_comment: u64,
 }
 
@@ -98,6 +105,13 @@ impl InMemoryGitHub {
     /// Test control: the transport can no longer prove an identity.
     pub fn clear_viewer(&mut self) {
         self.viewer_login = None;
+    }
+
+    /// Test control: the host recognizes `value` and reports `actor`
+    /// for it — the `authenticate` outcome the adapter-boundary
+    /// credential binding verifies against the intent's actor.
+    pub fn seat_credential(&mut self, value: &str, actor: HostActorRef) {
+        self.credential_seats.insert(value.to_string(), actor);
     }
 
     /// The mutation history, in order — what the adapter's receipts
@@ -127,6 +141,27 @@ impl InMemoryGitHub {
             (repository.to_string(), branch.to_string()),
             head.to_string(),
         );
+    }
+
+    /// Test control: a comment the remote already stores — what a
+    /// reconciliation read returns for the marker without this
+    /// adapter having written it.
+    pub fn seed_comment(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &str,
+        marker: &str,
+        body: &str,
+    ) {
+        self.comments.push((
+            repository.to_string(),
+            change_id.to_string(),
+            RemoteComment {
+                comment_id: format!("c-seeded-{}", self.comments.len()),
+                body: body.to_string(),
+                marker: marker.to_string(),
+            },
+        ));
     }
 
     /// Test control: a racing actor moved a pull request's head —
@@ -322,7 +357,29 @@ impl InMemoryGitHub {
 
 impl GitHubApi for InMemoryGitHub {
     fn viewer(&mut self) -> Result<Option<String>, ApiError> {
+        if let Some(value) = &self.active_credential {
+            return Ok(self
+                .credential_seats
+                .get(value)
+                .map(|actor| actor.actor.as_str().to_string()));
+        }
         Ok(self.viewer_login.clone())
+    }
+
+    fn set_credential(&mut self, credential: Option<ResolvedCredential>) {
+        self.active_credential = credential.map(|c| c.expose().to_string());
+    }
+
+    fn authenticate(
+        &mut self,
+        credential: &ResolvedCredential,
+    ) -> Result<HostActorRef, CredentialError> {
+        self.credential_seats
+            .get(credential.expose())
+            .cloned()
+            .ok_or_else(|| {
+                CredentialError::unresolvable("the host does not recognize the credential")
+            })
     }
 
     fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError> {

@@ -33,13 +33,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use workloop_core::identity::{ChangeRequestId, IssueRef, RepositoryRef};
+use workloop_core::identity::{
+    ChangeRequestId, HostActorId, HostActorRef, HostInstanceId, IssueRef, RepositoryRef,
+};
 use workloop_core::observation::{CheckConclusion, IssueState};
 
 use crate::api::{
     ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
     RemoteReviewFinding,
 };
+use crate::credential::{CredentialError, ResolvedCredential};
 
 /// Default per-call ceiling for one `gh` subprocess. A hung transport
 /// must not stall the adapter loop forever.
@@ -109,6 +112,11 @@ pub struct GhCliApi {
     /// this repository's number namespace.
     pull_numbers: HashMap<String, (u64, String)>,
     hostname: Option<String>,
+    /// The bound credential the adapter resolved for the current
+    /// intent, injected as `GH_TOKEN` on each `gh` child so the call
+    /// authenticates under the declared credential rather than `gh`'s
+    /// ambient login. `None` keeps the ambient identity.
+    credential: Option<ResolvedCredential>,
     read_deadline: Option<Instant>,
 }
 
@@ -120,6 +128,7 @@ impl GhCliApi {
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
             hostname: None,
+            credential: None,
             read_deadline: None,
         }
     }
@@ -132,6 +141,7 @@ impl GhCliApi {
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
             hostname: None,
+            credential: None,
             read_deadline: None,
         }
     }
@@ -174,6 +184,18 @@ impl GhCliApi {
     /// timeout is [`ApiError::Unknown`] — the request may have been
     /// issued before the ceiling hit.
     fn run(&self, args: &[String], body: Option<&serde_json::Value>) -> Result<GhOutput, ApiError> {
+        self.run_as(args, body, None)
+    }
+
+    /// `run` under an explicit credential — the authentication probe
+    /// passes the candidate it is verifying rather than the bound
+    /// credential; `None` defers to the bound one.
+    fn run_as(
+        &self,
+        args: &[String],
+        body: Option<&serde_json::Value>,
+        token_override: Option<&ResolvedCredential>,
+    ) -> Result<GhOutput, ApiError> {
         let effective = match self.read_deadline {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -191,6 +213,33 @@ impl GhCliApi {
         if let Some(hostname) = &self.hostname {
             command.arg("--hostname").arg(hostname);
             command.env_remove("GH_HOST");
+        }
+        // The bound credential rides as `GH_TOKEN` on this one child —
+        // `gh` prefers it over its own stored login, so the call
+        // authenticates as the declared credential's actor. The value
+        // never enters argv (process lists) and the child's own
+        // environment only.
+        let credential = token_override.or(self.credential.as_ref());
+        if let Some(credential) = credential {
+            command.env("GH_TOKEN", credential.expose());
+        }
+        // The bound credential rides as `GH_TOKEN` on this one child —
+        // `gh` prefers it over its own stored login, so the call
+        // authenticates as the declared credential's actor. The value
+        // never enters argv (process lists) and the child's own
+        // environment only.
+        let credential = token_override.or(self.credential.as_ref());
+        if let Some(credential) = credential {
+            command.env("GH_TOKEN", credential.expose());
+        }
+        // The bound credential rides as `GH_TOKEN` on this one child —
+        // `gh` prefers it over its own stored login, so the call
+        // authenticates as the declared credential's actor. The value
+        // never enters argv (process lists) and the child's own
+        // environment only.
+        let credential = token_override.or(self.credential.as_ref());
+        if let Some(credential) = credential {
+            command.env("GH_TOKEN", credential.expose());
         }
         if body.is_some() {
             command.arg("--input").arg("-");
@@ -273,12 +322,24 @@ impl GhCliApi {
         endpoint: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ApiError> {
+        self.api_as(method, endpoint, body, None)
+    }
+
+    /// `api` under an explicit credential — the authentication probe
+    /// runs the candidate token rather than the bound one.
+    fn api_as(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: Option<&serde_json::Value>,
+        token_override: Option<&ResolvedCredential>,
+    ) -> Result<serde_json::Value, ApiError> {
         let args = vec![
             endpoint.to_string(),
             "--method".to_string(),
             method.to_string(),
         ];
-        let output = self.run(&args, body)?;
+        let output = self.run_as(&args, body, token_override)?;
         if output.success {
             return serde_json::from_str(&output.stdout).map_err(|e| ApiError::Unknown {
                 reason: format!("gh api {endpoint}: unparseable response: {e}"),
@@ -604,6 +665,34 @@ impl GitHubApi for GhCliApi {
                 reason: "gh api user: response missing login".into(),
             }),
         }
+    }
+
+    fn set_credential(&mut self, credential: Option<ResolvedCredential>) {
+        self.credential = credential;
+    }
+
+    fn authenticate(
+        &mut self,
+        credential: &ResolvedCredential,
+    ) -> Result<HostActorRef, CredentialError> {
+        // `gh api user` under the candidate token — never the bound
+        // credential and never `gh`'s ambient login — answers which
+        // actor the resolved value acts as.
+        let user = self
+            .api_as("GET", "user", None, Some(credential))
+            .map_err(|_| {
+                CredentialError::unresolvable("the host denies or cannot verify the credential")
+            })?;
+        let login = user
+            .get("login")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CredentialError::unresolvable("gh api user: response missing login"))?;
+        let actor = HostActorId::new(login)
+            .map_err(|_| CredentialError::unresolvable("gh api user: unparseable login"))?;
+        Ok(HostActorRef {
+            host: HostInstanceId::trusted(self.hostname.as_deref().unwrap_or("github.com")),
+            actor,
+        })
     }
 
     fn read_repository(&mut self, repository: &RepositoryRef) -> Result<Option<String>, ApiError> {
