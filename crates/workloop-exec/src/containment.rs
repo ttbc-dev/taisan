@@ -903,19 +903,43 @@ fn run_battery(
         "tmpfs-scratch-writable",
         &mut records,
     );
-    // /home is an empty tmpfs — the host home is not merely unmounted,
-    // it is shadowed. POSIX glob, no external tool required.
+    // No host home content survives inside: a canary written into the
+    // host HOME never resolves — the fresh tmpfs /home shadows it.
+    // Mount-point scaffolding an own-path bind creates (a worker binary
+    // under a home checkout leaves only its bound file reachable) is
+    // inert — only real host content failing to appear would pass, and
+    // that is exactly what the canary denies. POSIX, no external tool.
+    let home_canary = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| {
+            PathBuf::from(home).join(format!("workloop-home-canary-{}", std::process::id()))
+        });
+    if let Some(canary) = &home_canary {
+        let _ = std::fs::write(canary, b"canary");
+    }
     run_named_probe(
         port,
         primitive,
         &plan,
-        &sh("set -- /home/*; [ \"$1\" = \"/home/*\" ]"),
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "test -d /home && test ! -e \"$1\"".to_string(),
+            "sh".to_string(),
+            home_canary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ],
         "/tmp",
         &env,
         &scratch,
         "sandbox-home-is-fresh",
         &mut records,
     );
+    if let Some(canary) = &home_canary {
+        let _ = std::fs::remove_file(canary);
+    }
     // The PID namespace reaps escaped descendants: a `setsid` child —
     // outside the process group — must die with the namespace init
     // before its delayed marker write lands in the bound out dir.
