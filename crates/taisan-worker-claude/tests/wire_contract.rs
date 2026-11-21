@@ -59,16 +59,11 @@ for a in "$@"; do
     exit 0
   fi
 done
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-p" ] && [ -n "$FAKE_PROMPT_CAPTURE" ]; then
-    printf '%s' "$a" > "$FAKE_PROMPT_CAPTURE"
-  fi
-  prev="$a"
-done
+if [ -n "$FAKE_PROMPT_CAPTURE" ]; then cat > "$FAKE_PROMPT_CAPTURE"; fi
 if [ -n "$FAKE_PGID_FILE" ]; then echo $$ > "$FAKE_PGID_FILE"; fi
 if [ -n "$FAKE_PWD_FILE" ]; then pwd > "$FAKE_PWD_FILE"; fi
 if [ -n "$FAKE_GRANDCHILD" ]; then sleep "$FAKE_GRANDCHILD" & fi
+if [ -n "$FAKE_CLOSE_PIPES_HANG" ]; then exec 1>&- 2>&-; sleep "$FAKE_CLOSE_PIPES_HANG"; fi
 if [ -n "$FAKE_HANG" ]; then sleep "$FAKE_HANG"; fi
 if [ -n "$FAKE_FLOOD" ]; then yes 'flood line' | head -c "$FAKE_FLOOD"; fi
 if [ -n "$FAKE_WRITE" ]; then printf 'fake output\n' > "$FAKE_WRITE"; fi
@@ -1380,4 +1375,95 @@ fn a_member_flood_stays_inside_the_report_bound() {
         classified(&out_dir, &req),
         ReportClassification::Failure { .. }
     ));
+}
+
+#[test]
+fn a_bound_legal_result_block_larger_than_256kib_is_parsed() {
+    let dir = tmp("big-block");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let head = git(&ws, &["rev-parse", "HEAD"]);
+    // Bound-legal members: 128 findings at the 4 KiB summary bound —
+    // the block far exceeds the old 256 KiB stream cap yet must still
+    // parse into evidence.
+    let findings: Vec<Value> = (0..128)
+        .map(|i| json!({"key": format!("f-{i:03}"), "summary": "x".repeat(3_900)}))
+        .collect();
+    let block = format!("```taisan-result\n{}\n```", json!({"findings": findings}));
+    let events = events_file(&dir, &format!("reviewed\n\n{block}"), json!({}));
+    let req = request_json(
+        "review",
+        json!({
+            "kind": "code_review",
+            "target": {"change": "chg-1", "base": head, "head": head, "diff_digest": hex(0x0f)},
+            "review_source": {"source": "gh-review", "bytes": 64, "digest": hex(0x10), "source_revision": "1"},
+        }),
+        &ws,
+        true,
+    );
+    let review_source = canonical_json(&json!({
+        "format": "taisan.review-source/1",
+        "work_id": "w-1",
+        "target": req["task"]["target"],
+        "prior_round": null,
+    }));
+    let (request_path, _, out_dir) = dispatch(
+        "big-block",
+        &req,
+        &[(
+            "review-source.json",
+            std::str::from_utf8(&review_source).unwrap(),
+        )],
+    );
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_EVENTS", events.to_str().unwrap())],
+    );
+    assert!(out.status.success());
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "negative");
+    assert_eq!(r["reason"]["code"], "findings_reported");
+    assert_eq!(r["findings"].as_array().unwrap().len(), 128);
+    assert!(matches!(
+        classified(&out_dir, &req),
+        ReportClassification::Negative
+    ));
+}
+
+#[test]
+fn a_runtime_that_outlives_its_pipes_is_still_killed() {
+    let dir = tmp("quiet-runtime");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let mut req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    req["budget"]["max_runtime_seconds"] = json!(4);
+    redigest(&mut req);
+    let (request_path, _, out_dir) = dispatch("quiet-runtime", &req, &[("goal.md", "goal\n")]);
+    let start = std::time::Instant::now();
+    // The runtime closes both pipes immediately, then keeps running —
+    // the shim must not park in wait() past the deadline.
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_CLOSE_PIPES_HANG", "300")],
+    );
+    assert!(out.status.success());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "pipe EOF must not suspend the deadline"
+    );
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "limit_reached");
+    assert_eq!(r["reason"]["code"], "deadline_reached");
 }

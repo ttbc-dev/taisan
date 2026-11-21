@@ -51,9 +51,10 @@ use serde_json::{Value, json};
 use workloop_core::{
     domain::{canonical_json, sha256_hex},
     worker_v2::{
-        FailedEvidenceBody, InvariantSetBody, IssueSnapshotBody, MAX_REPORT_MEMBERS,
-        ReviewSourceBody, TaskBody, WORKER_DECLARATION_V1_FORMAT, WORKER_REPORT_V2_FORMAT,
-        WORKER_REQUEST_V2_FORMAT, WorkerRequestV2, report_canonical_body, report_v2_digest,
+        FailedEvidenceBody, InvariantSetBody, IssueSnapshotBody, MAX_MEMBER_KEY, MAX_MEMBER_REFS,
+        MAX_MEMBER_SUMMARY, MAX_MEMBER_TAG, MAX_REPORT_MEMBERS, ReviewSourceBody, TaskBody,
+        WORKER_DECLARATION_V1_FORMAT, WORKER_REPORT_V2_FORMAT, WORKER_REQUEST_V2_FORMAT,
+        WorkerRequestV2, report_canonical_body, report_v2_digest,
     },
 };
 
@@ -69,9 +70,16 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const VERSION_PROBE_SECONDS: u64 = 10;
 /// Cap on the captured `--version` output before it is read.
 const VERSION_OUTPUT_CAP: usize = 8 * 1024;
-/// A single stream-json line larger than this is logged verbatim but
-/// never parsed — a runaway line cannot exhaust parse effort.
-const MAX_STREAM_LINE: usize = 256 * 1024;
+/// A single stream-json line larger than this is logged (truncated)
+/// but never parsed — a runaway line cannot exhaust parse effort. The
+/// bound is derived from the largest *bound-legal* result block:
+/// `MAX_REPORT_MEMBERS` members at their per-string char bounds
+/// encoded as worst-case 4-byte UTF-8, doubled to leave room for the
+/// event envelope and surrounding prose.
+const MAX_STREAM_LINE: usize = 2
+    * MAX_REPORT_MEMBERS
+    * (MAX_MEMBER_SUMMARY + MAX_MEMBER_KEY + 3 * MAX_MEMBER_TAG + MAX_MEMBER_REFS * 128)
+    * 4;
 /// Per-verification-command output capture bound (each claimed check
 /// reports only the digest of this capture).
 const CHECK_OUTPUT_CAP: usize = 1024 * 1024;
@@ -351,7 +359,6 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     let mut argv = cfg.runtime_argv.clone();
     argv.extend([
         "-p".into(),
-        prompt,
         "--output-format".into(),
         "stream-json".into(),
         "--max-turns".into(),
@@ -373,7 +380,17 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     }
 
     let budget = request.budget.clone();
-    let outcome = run_runtime(&argv, &workspace, &runtime_env, &budget, out_dir)?;
+    // The prompt travels on stdin: bound-legal requests can exceed the
+    // OS per-argument limit, and a prompt on argv would also appear in
+    // process listings.
+    let outcome = run_runtime(
+        &argv,
+        &workspace,
+        &runtime_env,
+        prompt.as_bytes(),
+        &budget,
+        out_dir,
+    )?;
     write_report(&request, out_dir, &workspace, &outcome, &provider)?;
     Ok(0)
 }
@@ -654,10 +671,60 @@ struct RuntimeOutcome {
     spawn_error: Option<String>,
 }
 
+/// Read one newline-terminated line while never holding more than
+/// `cap + 1` bytes of it in memory. A line that exceeds the cap is
+/// returned truncated at `cap + 1` bytes (its tail is discarded
+/// byte-by-byte), so a newline-free flood cannot exhaust memory —
+/// the caller's own `<= cap` check then declines to parse it.
+fn read_line_bounded<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            return Ok(if out.is_empty() { None } else { Some(out) });
+        }
+        let room = (cap + 1).saturating_sub(out.len());
+        let take = room.min(avail.len());
+        match avail[..take].iter().position(|b| *b == b'\n') {
+            Some(pos) => {
+                out.extend_from_slice(&avail[..=pos]);
+                reader.consume(pos + 1);
+                return Ok(Some(out));
+            }
+            None if take < avail.len() => {
+                // Cap reached with no newline: consume what fit, then
+                // discard the rest of this line without buffering it.
+                reader.consume(take);
+                loop {
+                    let rest = reader.fill_buf()?;
+                    if rest.is_empty() {
+                        return Ok(Some(out));
+                    }
+                    match rest.iter().position(|b| *b == b'\n') {
+                        Some(pos) => {
+                            reader.consume(pos + 1);
+                            return Ok(Some(out));
+                        }
+                        None => {
+                            let n = rest.len();
+                            reader.consume(n);
+                        }
+                    }
+                }
+            }
+            None => {
+                out.extend_from_slice(&avail[..take]);
+                reader.consume(take);
+            }
+        }
+    }
+}
+
 fn run_runtime(
     argv: &[String],
     cwd: &Path,
     runtime_env: &[(String, String)],
+    prompt: &[u8],
     budget: &workloop_core::worker_v2::RequestBudget,
     out_dir: &Path,
 ) -> Result<RuntimeOutcome, String> {
@@ -667,7 +734,7 @@ fn run_runtime(
         .current_dir(cwd)
         .env_clear()
         .envs(runtime_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Own process group: the shim's deadline kill covers the whole
@@ -699,6 +766,18 @@ fn run_runtime(
     #[cfg(unix)]
     let pgid = child.id() as i32;
 
+    // The prompt goes over stdin, not argv: the OS per-argument limit
+    // (~128 KiB on Linux) is below what bound-legal requests can
+    // produce. The writer runs on its own thread so a runtime that
+    // never reads stdin cannot stall the deadline clock — a kill
+    // closes the pipe and the write fails cleanly.
+    if let Some(mut stdin) = child.stdin.take() {
+        let prompt = prompt.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&prompt);
+        });
+    }
+
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let mut streams: Vec<(bool, Box<dyn Read + Send>)> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -711,16 +790,14 @@ fn run_runtime(
         let tx = tx.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(stream);
-            let mut buf = Vec::new();
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {
-                        if tx.send((is_stdout, buf.clone())).is_err() {
+                match read_line_bounded(&mut reader, MAX_STREAM_LINE) {
+                    Ok(Some(bytes)) => {
+                        if tx.send((is_stdout, bytes)).is_err() {
                             return;
                         }
                     }
+                    Ok(None) | Err(_) => return,
                 }
             }
         });
@@ -753,39 +830,50 @@ fn run_runtime(
         }
     };
 
+    let mut pipes_done = false;
     loop {
-        match rx.recv_timeout(POLL) {
-            Ok((is_stdout, bytes)) => {
-                if !log_truncated {
-                    if log_bytes + bytes.len() as u64 > log_cap {
-                        let keep = log_cap.saturating_sub(log_bytes) as usize;
-                        let _ = log.write_all(&bytes[..keep]);
-                        log_bytes += keep as u64;
-                        log_truncated = true;
-                        let _ = log.write_all(b"\n[taisan] log truncated at bound\n");
-                    } else {
-                        let _ = log.write_all(&bytes);
-                        log_bytes += bytes.len() as u64;
-                    }
-                }
-                if is_stdout {
-                    line_buf.extend_from_slice(&bytes);
-                    while let Some(pos) = line_buf.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = line_buf.drain(..=pos).collect();
-                        if line.len() <= MAX_STREAM_LINE
-                            && let Ok(v) = serde_json::from_slice::<Value>(&line)
-                            && v.get("type").and_then(|t| t.as_str()) == Some("result")
-                        {
-                            last_result = Some(v);
+        if !pipes_done {
+            match rx.recv_timeout(POLL) {
+                Ok((is_stdout, bytes)) => {
+                    if !log_truncated {
+                        if log_bytes + bytes.len() as u64 > log_cap {
+                            let keep = log_cap.saturating_sub(log_bytes) as usize;
+                            let _ = log.write_all(&bytes[..keep]);
+                            log_bytes += keep as u64;
+                            log_truncated = true;
+                            let _ = log.write_all(b"\n[taisan] log truncated at bound\n");
+                        } else {
+                            let _ = log.write_all(&bytes);
+                            log_bytes += bytes.len() as u64;
                         }
                     }
-                    if line_buf.len() > MAX_STREAM_LINE {
-                        line_buf.clear();
+                    if is_stdout {
+                        line_buf.extend_from_slice(&bytes);
+                        while let Some(pos) = line_buf.iter().position(|b| *b == b'\n') {
+                            let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                            if line.len() <= MAX_STREAM_LINE
+                                && let Ok(v) = serde_json::from_slice::<Value>(&line)
+                                && v.get("type").and_then(|t| t.as_str()) == Some("result")
+                            {
+                                last_result = Some(v);
+                            }
+                        }
+                        if line_buf.len() > MAX_STREAM_LINE {
+                            line_buf.clear();
+                        }
                     }
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // Pipe EOF is not process exit: a runtime that closed
+                // its streams, or one whose descendant still holds
+                // them, must keep answering to the deadline.
+                Err(mpsc::RecvTimeoutError::Disconnected) => pipes_done = true,
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        } else {
+            thread::sleep(POLL);
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
         }
         if killed_at.is_none() && Instant::now() > deadline {
             #[cfg(unix)]
@@ -1179,8 +1267,7 @@ fn run_verification(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
         )
-        .filter(|rem| *rem > 0)
-        .map(|rem| Instant::now() + Duration::from_secs(rem as u64));
+        .map(|rem| Instant::now() + Duration::from_secs(rem.max(0) as u64));
     let mut checks = Vec::new();
     for argv in argv_list
         .iter()
@@ -1242,16 +1329,14 @@ fn run_one_check(
         let tx = tx.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(stream);
-            let mut buf = Vec::new();
             loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {
-                        if tx.send(buf.clone()).is_err() {
+                match read_line_bounded(&mut reader, CHECK_OUTPUT_CAP) {
+                    Ok(Some(bytes)) => {
+                        if tx.send(bytes).is_err() {
                             return;
                         }
                     }
+                    Ok(None) | Err(_) => return,
                 }
             }
         });

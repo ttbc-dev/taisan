@@ -201,12 +201,14 @@ session handle.
   and may edit and commit locally; `invariant_check`/`review` carry
   `read_only: true` and the runtime additionally runs in plan
   permission mode so edit tools are denied even outside containment.
-- **Runtime invocation.** `claude -p <prompt>
+- **Runtime invocation.** `claude -p
   --output-format stream-json --max-turns <budget.max_turns>
   --strict-mcp-config --mcp-config <empty> --permission-mode
-  <acceptEdits|plan>` — writers get `acceptEdits` plus
-  `--allowedTools "Bash(git *)"` (local commits only); a configured
-  `model` is forwarded as `--model`.
+  <acceptEdits|plan>` with the prompt written to the runtime's stdin
+  (bound-legal requests can exceed the OS per-argument limit, and a
+  prompt on argv is visible in process listings) — writers get
+  `acceptEdits` plus `--allowedTools "Bash(git *)"` (local commits
+  only); a configured `model` is forwarded as `--model`.
 - **Prompt construction.** The shim translates the request's retained
   inputs into one bounded prompt: the goal body, the ordered Issue
   snapshots, constraints, and declared `verification_argv` for
