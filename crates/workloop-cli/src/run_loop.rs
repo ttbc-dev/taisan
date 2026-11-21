@@ -3387,30 +3387,32 @@ mod tests {
             HostActionStatus::Pending,
         );
         // The branch read cannot be answered: the pre-write check is
-        // indeterminate, so the intent records `unknown` and the write
-        // is never attempted blind.
+        // indeterminate, so the intent stays `pending` and the write
+        // is never attempted blind — an unreadable read fabricates no
+        // `unknown` verdict the next absent reconcile could settle
+        // `failed` against a write that never ran.
         let mut adapter = production_adapter(FakeGitHub::new());
         let settings = settings();
         let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
         assert_eq!(report.phases[3].phase, "host_outbox");
         assert_eq!(
             report.phases[3].status, "completed",
-            "the bounded drain settles the item with a receipt: {:?}",
+            "the bounded drain completes with the item held: {:?}",
             report.phases[3]
         );
         assert!(
             matches!(
                 intent_status(&store, &push_id),
-                HostActionStatus::Unknown { .. }
+                HostActionStatus::Pending
             ),
-            "an indeterminate pre-write read is unknown, never a blind write"
+            "an indeterminate pre-write read stays pending, never a blind write"
         );
-        // A second pass keeps reconciling the same outstanding intent —
-        // it is never dropped and never re-attempted blind.
+        // A second pass keeps the intent pending — it is never dropped
+        // and never re-attempted blind while the read cannot answer.
         run_production(&store, &settings, &mut adapter, &mut || NOW);
         assert!(matches!(
             intent_status(&store, &push_id),
-            HostActionStatus::Unknown { .. }
+            HostActionStatus::Pending
         ));
         let store = SqliteStore::in_memory(2).unwrap();
         submit(&store, "k-prod-empty");
