@@ -97,7 +97,9 @@ fn entry(entries: &[CapabilityEntry], capability: HostCapability) -> &Capability
 fn refresh_reports_supported_authorized_capabilities_once() {
     let store = SqliteStore::in_memory(1).unwrap();
     let config = config();
-    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let mut remote = InMemoryGitHub::new();
+    remote.set_viewer("pub-agent");
+    let mut adapter = Adapter::new(remote);
     adapter
         .refresh_sources(&store, &config, &mut || NOW, None, None)
         .unwrap();
@@ -145,7 +147,9 @@ fn a_declared_but_unimplemented_capability_reports_denied_support() {
     config
         .declared_capabilities
         .insert(HostCapability::MarkReady);
-    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let mut remote = InMemoryGitHub::new();
+    remote.set_viewer("pub-agent");
+    let mut adapter = Adapter::new(remote);
     adapter
         .refresh_sources(&store, &config, &mut || NOW, None, None)
         .unwrap();
@@ -161,7 +165,9 @@ fn a_declared_but_unimplemented_capability_reports_denied_support() {
 fn permission_drift_replaces_the_latest_report() {
     let store = SqliteStore::in_memory(1).unwrap();
     let config = config();
-    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let mut remote = InMemoryGitHub::new();
+    remote.set_viewer("pub-agent");
+    let mut adapter = Adapter::new(remote);
     adapter
         .refresh_sources(&store, &config, &mut || NOW, None, None)
         .unwrap();
@@ -325,5 +331,35 @@ fn a_foreign_probe_credential_reports_unknown_authorization() {
             CapabilityState::Unknown,
             "a foreign credential's permissions are never granted: {e:?}"
         );
+    }
+}
+
+/// The `default` slot is the shared ambient login: its permission
+/// bits count toward the report only when the ambient identity
+/// proves to be the bound publication actor — the same attestation a
+/// default-slot write requires. A foreign or unprovable ambient
+/// login records `unknown`, never a guessed grant.
+#[test]
+fn an_ambient_probe_requires_the_bound_actor() {
+    for viewer in [Some("other-account"), None] {
+        let store = SqliteStore::in_memory(1).unwrap();
+        let config = config();
+        let mut remote = InMemoryGitHub::new();
+        if let Some(login) = viewer {
+            remote.set_viewer(login);
+        }
+        let mut adapter = Adapter::new(remote);
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW, None, None)
+            .unwrap();
+        let reports = capability_reports(&store);
+        assert_eq!(reports.len(), 1);
+        for e in &reports[0] {
+            assert_eq!(
+                e.authorization,
+                CapabilityState::Unknown,
+                "ambient viewer {viewer:?} proves no bound actor: {e:?}"
+            );
+        }
     }
 }

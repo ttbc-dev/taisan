@@ -129,9 +129,11 @@ integrations.
 - The `fixture` driver emits no `CapabilityReport` — it is the
   deterministic test double, so a fixture-driven run still parks at
   the host-effect boundary. The in-process `github` driver is a real
-  producer: every source pass re-reads the credential's repository
-  permission bits and records a report whose `authorization` axis
-  mirrors the read (issue #355, closed).
+  producer: every unscoped source pass re-reads the credential's
+  repository permission bits and records a report whose
+  `authorization` axis mirrors the read (issue #355, closed). A
+  scoped `run --work` pass emits none — it must not drive Work
+  outside its scope.
 - `check --probe` has no wired adapter probe backend; the stage fails
   closed `capability.unknown` by design.
 - A real, owner-supplied conforming Worker implementation — the wire

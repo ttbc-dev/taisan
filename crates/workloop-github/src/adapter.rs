@@ -1300,8 +1300,27 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 }
             }
             ProbeCredential::Ambient => {
+                // `default` is the shared ambient slot: the
+                // permission bits belong to the publication actor
+                // only when the ambient login proves to be that
+                // actor — the same attestation
+                // `bind_intent_credential` requires before a
+                // default-slot write. An unprovable or foreign
+                // ambient identity reports `unknown`, never a
+                // guessed grant.
                 self.client.set_credential(None);
-                self.client.read_permissions(&config.host.repository).ok()
+                let proven = self.client.viewer().ok().flatten().and_then(|login| {
+                    HostActorId::new(login).ok().map(|actor| HostActorRef {
+                        host: config.host.repository.host.clone(),
+                        actor,
+                    })
+                });
+                match (bound_actor, proven) {
+                    (Some(bound), Some(actor)) if actor == bound => {
+                        self.client.read_permissions(&config.host.repository).ok()
+                    }
+                    _ => None,
+                }
             }
             ProbeCredential::Unresolvable => None,
         };
