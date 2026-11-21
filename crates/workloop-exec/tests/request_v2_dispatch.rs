@@ -4494,6 +4494,38 @@ fn a_clean_code_review_seals_a_zero_finding_round() {
     );
 }
 
+/// A Negative review report that names no findings — `checks_failed`
+/// or `invariant_violated` — records partial evidence under its own
+/// reason code and never seals a clean round, so a report that
+/// explicitly failed can never authorize completion. A negative
+/// report carrying findings still seals them as occurrences: the
+/// lane then stands on the judgment path, never the report's claim.
+#[test]
+fn a_negative_review_report_is_partial_and_never_seals_a_round() {
+    // `checks_failed` is the writer-role negative vocabulary — a
+    // Review worker reporting it claims checks failed, not that a
+    // review ran. It must never seal a complete zero-occurrence
+    // round that satisfies the review gate.
+    let rig = assess_rig(
+        "review-negative",
+        v2_argv("clean-exit", &["--report-mode", "negative"]),
+        true,
+    );
+    run_assessment_role(&rig, 1, InvocationRole::Review);
+    let reviews = review_facts(&rig.store, &rig.work_id);
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert!(
+        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "checks_failed"),
+        "a non-review negative is partial, never complete: {:?}",
+        reviews[0].0
+    );
+    assert_eq!(reviews[0].1, 0);
+    assert!(
+        sealed_rounds(&rig.store, &rig.work_id).is_empty(),
+        "a negative report never seals a round"
+    );
+}
+
 #[test]
 fn a_review_with_malformed_findings_records_partial_and_never_seals() {
     let argv = v2_argv(
@@ -4536,31 +4568,6 @@ fn a_review_reported_unavailable_records_unavailable_never_seals() {
         "{:?}",
         reviews[0].0
     );
-    assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
-}
-
-/// A Negative review report that names no findings — `checks_failed`
-/// or `invariant_violated` — records partial evidence under its own
-/// reason code and never seals a clean round, so a report that
-/// explicitly failed can never authorize completion. A negative
-/// report carrying findings still seals them as occurrences: the
-/// lane then stands on the judgment path, never the report's claim.
-#[test]
-fn a_negative_review_report_is_partial_and_never_seals_a_round() {
-    let rig = assess_rig(
-        "review-negative",
-        v2_argv("clean-exit", &["--report-mode", "negative"]),
-        true,
-    );
-    run_assessment_role(&rig, 1, InvocationRole::Review);
-    let reviews = review_facts(&rig.store, &rig.work_id);
-    assert_eq!(reviews.len(), 1, "{reviews:?}");
-    assert!(
-        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "checks_failed"),
-        "{:?}",
-        reviews[0].0
-    );
-    assert_eq!(reviews[0].1, 0);
     assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
 }
 

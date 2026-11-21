@@ -126,10 +126,14 @@ integrations.
 - Owner-run live acceptance of the real Worker path and the production
   GitHub driver — the [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
   defines the scenarios; no live evidence exists yet.
-- A `CapabilityReport` producer for the in-process host driver: publish
-  intents require capability evidence no current `taisan run`
-  composition emits, so Works park at the host-effect boundary
-  (tracked by issue #355).
+- The `fixture` driver emits no `CapabilityReport` — it is the
+  deterministic test double, so a fixture-driven run still parks at
+  the host-effect boundary. The in-process `github` driver is a real
+  producer: every unscoped source pass re-reads the credential's
+  repository permission bits and records a report whose
+  `authorization` axis mirrors the read (issue #355, closed). A
+  scoped `run --work` pass emits none — it must not drive Work
+  outside its scope.
 - `check --probe` has no wired adapter probe backend; the stage fails
   closed `capability.unknown` by design.
 - A real, owner-supplied conforming Worker implementation — the wire

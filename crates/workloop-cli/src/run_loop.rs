@@ -1228,14 +1228,14 @@ mod tests {
     use workloop_core::domain::*;
     use workloop_core::identity::*;
     use workloop_core::observation::{
-        BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
+        ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
         NormalizedEffectFact, Observation, ObservationFact, ProcessStateFact,
     };
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
     use workloop_github::api::{
         ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-        RemoteReviewFinding,
+        RemoteReviewFinding, RepositoryPermissions,
     };
 
     const NOW: i64 = 1_700_000_000;
@@ -2523,6 +2523,8 @@ mod tests {
         comment_seq: u64,
         /// One-shot armed faults per operation name.
         armed: std::collections::HashMap<String, ArmedFault>,
+        /// The permission bits `read_permissions` reports.
+        permissions: RepositoryPermissions,
         /// The login `viewer()` attests — the ambient identity the
         /// double models; `bot-pub` (the suite's bound publisher)
         /// by default.
@@ -2533,6 +2535,10 @@ mod tests {
         fn new() -> Self {
             Self {
                 repo_ok: true,
+                permissions: RepositoryPermissions {
+                    push: true,
+                    pull: true,
+                },
                 ..Default::default()
             }
         }
@@ -2589,6 +2595,18 @@ mod tests {
                     reason: "outage".into(),
                 })
             }
+        }
+
+        fn read_permissions(
+            &mut self,
+            _repository: &RepositoryRef,
+        ) -> Result<RepositoryPermissions, ApiError> {
+            if let Some(fault) = self.take_fault("read_permissions") {
+                return Err(match fault {
+                    ArmedFault::Refuse(e) | ArmedFault::Lose(e) => e,
+                });
+            }
+            Ok(self.permissions)
         }
 
         fn read_branch(
@@ -3412,6 +3430,161 @@ mod tests {
             vec!["completed"; 8],
             "no outstanding intents means an empty outbox report"
         );
+    }
+
+    /// #355: the production driver itself produces the CapabilityReport
+    /// evidence the publish gate reads. A Work parked at `waiting` with
+    /// complete producing evidence — the state the non-live acceptance
+    /// capture stalled in — gets its stage intents recorded and applied
+    /// by the ordinary pass, with no test-injected report.
+    #[test]
+    fn the_production_driver_reports_capabilities_and_publishes() {
+        let store = SqliteStore::in_memory(2).unwrap();
+        // Lanes off: this test isolates the capability gate; lane
+        // evidence has its own coverage.
+        let mut submit_cfg = config();
+        submit_cfg.lanes = LanePolicy {
+            invariant_check: false,
+            code_review: false,
+        };
+        let (w, e) = {
+            let d = handle_command(
+                &store,
+                &submit_cfg,
+                &CommandRequest {
+                    actor: Actor {
+                        kind: ActorKind::Human,
+                        external_id: "op".into(),
+                    },
+                    origin: Origin("cli".into()),
+                    idempotency_key: "k-cap-publish".into(),
+                    body: CommandBody::Submit {
+                        intent: "intent-cap-publish".into(),
+                        sources: vec![],
+                        constraints: vec![],
+                        verification_argv: vec![],
+                    },
+                },
+                NOW,
+            )
+            .unwrap();
+            let CommandDecision::Accepted {
+                work_id,
+                effect: CommandEffect::WorkCreated { execution_id },
+                ..
+            } = d
+            else {
+                panic!("submit: {d:?}")
+            };
+            (work_id.unwrap(), execution_id)
+        };
+        // The producing Invocation resolved `Done` with its required
+        // artifact present — the durable shape a finished worker
+        // leaves — and the Execution waits for reconciliation.
+        let digest = "produced-commit-1".to_string();
+        let invocation_id = store
+            .transact(|tx| {
+                let invocation = Invocation {
+                    id: InvocationId(tx.alloc_id("inv")?),
+                    request_id: format!("{}:inv:1", e.0),
+                    execution_id: e.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    descendants: vec![],
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "artifact.json".into(),
+                        path: "artifact.json".into(),
+                        expected_digest: Some(digest.clone()),
+                    }],
+                    evidence_refs: vec![],
+                };
+                tx.apply(&Effect::InsertInvocation {
+                    invocation: invocation.clone(),
+                })?;
+                let mut execution = tx.execution(&e)?.unwrap();
+                let expected_state = execution.state.clone();
+                execution.state = ExecutionState::Waiting;
+                execution.waiting_reason = Some(WaitingReason::Reconciliation);
+                tx.apply(&Effect::UpdateExecution {
+                    execution,
+                    expected_state,
+                })?;
+                Ok(invocation.id)
+            })
+            .unwrap();
+        workloop_core::work::handle_observation(
+            &store,
+            &submit_cfg,
+            &Observation {
+                delivery: None,
+                subject_work_id: Some(w.clone()),
+                subject_execution_id: Some(e.clone()),
+                fact: ObservationFact::Artifact {
+                    invocation_id,
+                    required_artifact: "artifact.json".into(),
+                    state: ArtifactFact::Present {
+                        digest: digest.clone(),
+                    },
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+        // The #355 stall, reproduced: complete evidence, no capability
+        // report, zero intents.
+        assert!(
+            store.transact(|tx| tx.action_intents()).unwrap().is_empty(),
+            "no report means the publish gate records nothing"
+        );
+        let mut fake = FakeGitHub::new();
+        // The managed branch does not exist yet: the first push
+        // expects an absent prior ref.
+        fake.branches.insert(
+            format!("{}:work/{}", submit_cfg.host.repository, w.0),
+            Ok(None),
+        );
+        let mut adapter = production_adapter(fake);
+        let settings = settings();
+        let report = run_production(&store, &settings, &mut adapter, &mut || NOW);
+        assert!(
+            report.phases.iter().all(|p| p.status != "failed"),
+            "the pass completes: {:?}",
+            report.phases
+        );
+        let intents = store.transact(|tx| tx.action_intents()).unwrap();
+        let push = intents
+            .iter()
+            .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+            .expect("the capability report unblocked the push intent");
+        assert_eq!(
+            push.status,
+            HostActionStatus::Applied,
+            "the bounded drain applied the recorded push: {intents:?}"
+        );
+        // The applied push's read-back lands as durable evidence, and
+        // the open-change-request stage follows on the same pass.
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i.action, HostAction::OpenChangeRequest { .. })),
+            "the publish chain advanced past push_ref: {intents:?}"
+        );
+        let reports: Vec<_> = store
+            .transact(|tx| tx.all_observations())
+            .unwrap()
+            .into_iter()
+            .filter(|o| {
+                matches!(
+                    o.fact,
+                    ObservationFact::CapabilityReport { ref host, .. }
+                        if canonical_host_instance(host.as_str())
+                            == canonical_host_instance(config().host.repository.host.as_str())
+                )
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "one capability report per change");
     }
 
     #[test]

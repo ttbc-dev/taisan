@@ -43,19 +43,32 @@ use std::time::{Duration, Instant};
 
 use workloop_core::domain::{ExecutionId, WorkId, canonical_json, new_id, sha256_hex};
 use workloop_core::identity::{
-    ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId, HostActorRef,
-    HostInstanceId, RepositoryRef, canonical_host_instance,
+    ActorRole, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId,
+    HostActorRef, HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
 };
 use workloop_core::observation::{
-    BranchState, CheckConclusion, Completeness, DeliveryId, DeliveryScope, HostActionStatus,
-    IssueState, NormalizedEffectFact, Observation, ObservationFact, OccurrenceInput, ReadSubject,
-    RefRelation,
+    BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
+    DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact, Observation,
+    ObservationFact, OccurrenceInput, ReadSubject, RefRelation,
 };
 use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
-use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding};
-use crate::credential::{CredentialError, CredentialProviders, resolve_credential};
+use crate::api::{ApiError, GitHubApi, RemoteReview, RemoteReviewFinding, RepositoryPermissions};
+use crate::credential::{
+    CredentialError, CredentialProviders, ResolvedCredential, resolve_credential,
+};
+
+/// Which credential a capability probe binds before reading
+/// permissions.
+enum ProbeCredential {
+    /// The publication role's resolved credential.
+    Resolved(ResolvedCredential),
+    /// The ambient login — the shared `default` slot or no book.
+    Ambient,
+    /// The bound slot cannot resolve — the probe reads nothing.
+    Unresolvable,
+}
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
@@ -283,6 +296,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
 
     fn supports(action: &HostAction) -> bool {
         Self::declared_capabilities().contains(&Self::capability_for(action))
+    }
+
+    /// Whether the capability-report `support` axis can honestly claim
+    /// `capability`: backed by a concrete [`GitHubApi`] operation —
+    /// the same declared surface `attempt` gates on.
+    fn implements(capability: HostCapability) -> bool {
+        Self::declared_capabilities()
+            .iter()
+            .any(|name| HostCapability::from_name(name) == Some(capability))
     }
 
     pub fn client(&self) -> &C {
@@ -1209,6 +1231,139 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Ok(())
     }
 
+    /// The credential the capability probe runs under — the
+    /// publication role's bound slot when a credential book is
+    /// installed. The ambient slot and an absent book probe under the
+    /// transport's own login; a slot that cannot resolve probes
+    /// nothing, so the report records `unknown` rather than an
+    /// authorization the adapter cannot prove.
+    fn capability_probe_credential(&self, config: &WorkloopConfig) -> ProbeCredential {
+        let Some(providers) = &self.credentials else {
+            return ProbeCredential::Ambient;
+        };
+        let reference = config
+            .host
+            .actors
+            .iter()
+            .find(|binding| binding.role == ActorRole::Publication)
+            .map(|binding| binding.credential_ref.clone());
+        match reference.as_ref() {
+            None => ProbeCredential::Ambient,
+            Some(r) if r.as_str() == "default" => ProbeCredential::Ambient,
+            Some(_) => match resolve_credential(reference.as_ref(), &**providers) {
+                Ok(resolved) => ProbeCredential::Resolved(resolved),
+                Err(_) => ProbeCredential::Unresolvable,
+            },
+        }
+    }
+
+    /// The capability report this adapter can honestly emit, refreshed
+    /// once per source pass. `support` is the adapter's own declared
+    /// operation surface — the same names `attempt` gates on, mapped
+    /// into the capability vocabulary — never a wider promise;
+    /// `authorization` is the credential's real permission read, and a
+    /// read that fails records `unknown` for every entry: unconfirmed
+    /// is never granted. The report is re-emitted only when its content
+    /// changes, so an unchanged credential costs no durable rows.
+    fn report_capabilities(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        now_unix_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let host = config.host.repository.host.clone();
+        // Authorization is probed under the credential that owns the
+        // publish path — the publication role's bound slot — never the
+        // ambient login or a credential a previous intent left bound.
+        // `default` is the ambient slot; an unresolvable slot reports
+        // `unknown` for every entry: unconfirmed is never granted.
+        let bound_actor = config
+            .host
+            .actors
+            .iter()
+            .find(|binding| binding.role == ActorRole::Publication)
+            .map(|binding| binding.actor.clone());
+        let permissions = match self.capability_probe_credential(config) {
+            ProbeCredential::Resolved(credential) => {
+                // The authorization axis is the bound publication
+                // actor's rights: the resolved credential must
+                // authenticate as that actor or its permission bits
+                // are a foreign account's — reported `unknown`, never
+                // granted.
+                let proven = self.client.authenticate(&credential).ok();
+                match (bound_actor, proven) {
+                    (Some(bound), Some(actor)) if actor == bound => {
+                        self.client.set_credential(Some(credential));
+                        self.client.read_permissions(&config.host.repository).ok()
+                    }
+                    _ => None,
+                }
+            }
+            ProbeCredential::Ambient => {
+                // `default` is the shared ambient slot: the
+                // permission bits belong to the publication actor
+                // only when the ambient login proves to be that
+                // actor — the same attestation
+                // `bind_intent_credential` requires before a
+                // default-slot write. An unprovable or foreign
+                // ambient identity reports `unknown`, never a
+                // guessed grant.
+                self.client.set_credential(None);
+                let proven = self.client.viewer().ok().flatten().and_then(|login| {
+                    HostActorId::new(login).ok().map(|actor| HostActorRef {
+                        host: config.host.repository.host.clone(),
+                        actor,
+                    })
+                });
+                match (bound_actor, proven) {
+                    (Some(bound), Some(actor)) if actor == bound => {
+                        self.client.read_permissions(&config.host.repository).ok()
+                    }
+                    _ => None,
+                }
+            }
+            ProbeCredential::Unresolvable => None,
+        };
+        // The probe's credential must not leak into the rest of the
+        // pass: source and issue reads after the report run under the
+        // ambient identity, exactly as before the probe.
+        self.client.set_credential(None);
+        let mut capabilities: Vec<CapabilityEntry> = config
+            .declared_capabilities
+            .iter()
+            .map(|capability| CapabilityEntry {
+                capability: *capability,
+                support: if Self::implements(*capability) {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Denied
+                },
+                authorization: capability_authorization(*capability, permissions),
+            })
+            .collect();
+        capabilities.sort_by_key(|entry| entry.capability);
+        let latest = latest_capability_entries(store, &host)?;
+        if latest
+            .as_ref()
+            .is_some_and(|entries| same_capability_set(entries, &capabilities))
+        {
+            return Ok(());
+        }
+        self.ingest(
+            store,
+            config,
+            Observation {
+                delivery: None,
+                subject_work_id: None,
+                subject_execution_id: None,
+                fact: ObservationFact::CapabilityReport { host, capabilities },
+                observed_unix_seconds: now_unix_seconds,
+            },
+            now_unix_seconds,
+        )?;
+        Ok(())
+    }
+
     pub fn refresh_sources(
         &mut self,
         store: &impl Store,
@@ -1231,6 +1386,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             let remaining = d.saturating_sub(now).max(0) as u64;
             self.client
                 .set_read_deadline(Some(Instant::now() + Duration::from_secs(remaining)));
+        }
+        // A scoped (`run --work`) pass is diagnostic: the CapabilityReport
+        // ingest re-drives `maybe_publish` for every Waiting execution on
+        // this host, so emitting it here would record publish intents for
+        // Works outside the scope. The scoped work's own chain still
+        // advances through its own ingest events; the unscoped driver owns
+        // the host-wide capability redrive.
+        if scope.is_none() {
+            self.report_capabilities(store, config, now)?;
         }
         for (work_id, execution_id, source) in declared_sources(store, scope)? {
             if !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)? {
@@ -3032,6 +3196,95 @@ fn attribute_change(
         }
         Ok(None)
     })
+}
+
+/// The permission bit a capability's `authorization` reads: the
+/// write-class capabilities need `push`, the read-class need `pull` —
+/// the repository permission model's coarse split.
+fn capability_needs_write(capability: &HostCapability) -> bool {
+    matches!(
+        capability,
+        HostCapability::PushRef
+            | HostCapability::ChangeRequestCreate
+            | HostCapability::ChangeRequestUpdate
+            | HostCapability::CommentWrite
+            | HostCapability::ChecksWrite
+            | HostCapability::InlineComment
+            | HostCapability::ReviewFeedback
+            | HostCapability::Approve
+            | HostCapability::RequestChanges
+            | HostCapability::ThreadReply
+            | HostCapability::ThreadResolve
+            | HostCapability::MarkReady
+    )
+}
+
+/// One entry's authorization state: `unknown` when the permission
+/// read could not confirm the bits — unconfirmed is never granted.
+fn capability_authorization(
+    capability: HostCapability,
+    permissions: Option<RepositoryPermissions>,
+) -> CapabilityState {
+    let Some(permissions) = permissions else {
+        return CapabilityState::Unknown;
+    };
+    let granted = if capability_needs_write(&capability) {
+        permissions.push
+    } else {
+        permissions.pull
+    };
+    if granted {
+        CapabilityState::Authorized
+    } else {
+        CapabilityState::Denied
+    }
+}
+
+/// The latest capability report recorded for `host`, on canonical
+/// host-instance identity — the same recency rule Core's
+/// `capability_state` applies.
+fn latest_capability_entries(
+    store: &impl Store,
+    host: &HostInstanceId,
+) -> Result<Option<Vec<CapabilityEntry>>, StoreError> {
+    store.transact(|tx| {
+        let mut latest: Option<(i64, usize, Vec<CapabilityEntry>)> = None;
+        for (index, o) in tx.all_observations()?.iter().enumerate() {
+            if let ObservationFact::CapabilityReport {
+                host: report_host,
+                capabilities,
+            } = &o.fact
+                && canonical_host_instance(report_host.as_str())
+                    == canonical_host_instance(host.as_str())
+            {
+                let key = (o.observed_unix_seconds, index, capabilities.clone());
+                latest = Some(match latest {
+                    Some(old)
+                        if old.0 > o.observed_unix_seconds
+                            || (old.0 == o.observed_unix_seconds && old.1 > index) =>
+                    {
+                        old
+                    }
+                    _ => key,
+                });
+            }
+        }
+        Ok(latest.map(|(_, _, entries)| entries))
+    })
+}
+
+/// Order-insensitive report comparison: identical when every
+/// capability carries the same support and authorization, whatever
+/// order the producer listed them in.
+fn same_capability_set(a: &[CapabilityEntry], b: &[CapabilityEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|entry| {
+            b.iter().any(|other| {
+                other.capability == entry.capability
+                    && other.support == entry.support
+                    && other.authorization == entry.authorization
+            })
+        })
 }
 
 fn work_bound_to_config(

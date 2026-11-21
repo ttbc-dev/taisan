@@ -2532,8 +2532,12 @@ fn capability_state(
     host: &crate::identity::HostInstanceId,
     capability: &HostCapability,
 ) -> Result<Option<crate::observation::CapabilityEntry>, StoreError> {
-    let mut latest: Option<(i64, usize, crate::observation::CapabilityEntry)> = None;
-    for (index, o) in tx.all_observations()?.iter().enumerate() {
+    // The newest report is the host's complete declaration: a
+    // capability absent from it is revoked — falling back to an older
+    // report's entry would keep a withdrawn grant usable.
+    let observations = tx.all_observations()?;
+    let mut latest_report: Option<(i64, usize, &Vec<crate::observation::CapabilityEntry>)> = None;
+    for (index, o) in observations.iter().enumerate() {
         if let ObservationFact::CapabilityReport {
             host: report_host,
             capabilities,
@@ -2544,23 +2548,18 @@ fn capability_state(
             && canonical_host_instance(report_host.as_str())
                 == canonical_host_instance(host.as_str())
         {
-            for entry in capabilities {
-                if &entry.capability == capability {
-                    let key = (o.observed_unix_seconds, index, entry.clone());
-                    latest = Some(match latest {
-                        Some(old)
-                            if old.0 > o.observed_unix_seconds
-                                || (old.0 == o.observed_unix_seconds && old.1 > index) =>
-                        {
-                            old
-                        }
-                        _ => key,
-                    });
-                }
+            let key = (o.observed_unix_seconds, index);
+            if latest_report.is_none_or(|old| key > (old.0, old.1)) {
+                latest_report = Some((key.0, key.1, capabilities));
             }
         }
     }
-    Ok(latest.map(|(_, _, e)| e))
+    Ok(latest_report.and_then(|(_, _, capabilities)| {
+        capabilities
+            .iter()
+            .find(|entry| &entry.capability == capability)
+            .cloned()
+    }))
 }
 
 /// What happened to an ingested Observation.
@@ -2681,6 +2680,15 @@ fn assess(
         && let Some(work_id) = &obs.subject_work_id
     {
         seal_round(tx, obs, work_id, now_unix_seconds)?;
+    }
+    // A capability report is host-scoped evidence with no work or
+    // execution subject of its own, but it is the only event that can
+    // turn a capability-blocked publish chain loose: re-drive every
+    // Waiting execution on the reported host. `maybe_publish`
+    // re-checks each precondition itself, so the sweep is safe on
+    // every report — changed or not.
+    if let ObservationFact::CapabilityReport { host, .. } = &obs.fact {
+        redrive_capability_waiters(tx, config, host, now_unix_seconds)?;
     }
     // Material progress resets the equivalent-failure streak and stamps
     // the no-progress clock with its durable basis.
@@ -3866,6 +3874,34 @@ fn assess_artifact(
         }
         _ => Ok(()),
     }
+}
+
+/// Re-drive `maybe_publish` for every Waiting execution whose Work
+/// binds the reported host. A capability report carries no work or
+/// execution subject, so without this sweep a publish chain blocked
+/// on `capability_held` would wait for an unrelated observation to
+/// re-fire — the level-triggered gap that left authorized work
+/// parked at `waiting` with zero intents.
+fn redrive_capability_waiters(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    host: &HostInstanceId,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    for work in tx.works()? {
+        if canonical_host_instance(work.binding.repository.host.as_str())
+            != canonical_host_instance(host.as_str())
+        {
+            continue;
+        }
+        let Some(execution) = crate::projection::current_execution(tx, &work.id)? else {
+            continue;
+        };
+        if execution.state == ExecutionState::Waiting {
+            maybe_publish(tx, config, &execution, now_unix_seconds)?;
+        }
+    }
+    Ok(())
 }
 
 /// Once the producing Invocation's evidence is complete — and, when
