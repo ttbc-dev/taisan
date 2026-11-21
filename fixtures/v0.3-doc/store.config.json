@@ -21,7 +21,7 @@
   "required_checks": [],
   "capacity": 1,
   "worker_argv": [
-    "target/debug/workloop-fixture-worker",
+    "<repo>/target/debug/workloop-fixture-worker",
     "clean-exit",
     "--wire",
     "v2",

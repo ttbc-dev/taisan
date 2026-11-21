@@ -54,6 +54,6 @@ host = "h1"
 allowlist = ["crates.io", "static.crates.io"]
 
 [worker]
-argv = ["target/debug/workloop-fixture-worker", "clean-exit", "--wire", "v2", "--git-commit", "--claim-head", "HEAD"]
+argv = ["<repo>/target/debug/workloop-fixture-worker", "clean-exit", "--wire", "v2", "--git-commit", "--claim-head", "HEAD"]
 isolation_profile = "taisan-reference-v0.1"
 max_turns = 200
