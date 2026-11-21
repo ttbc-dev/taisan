@@ -1793,7 +1793,11 @@ fn revision_stamp() -> Option<(String, String)> {
         return None;
     }
     let tested = git_stdout(&["-C", root.to_str()?, "rev-parse", "HEAD"])?;
-    let base = git_stdout(&["-C", root.to_str()?, "rev-parse", "HEAD^"])?;
+    // The PR base is the fork point, never `HEAD^` — on a multi-commit
+    // branch that is the previous commit, and in a depth-1 checkout it
+    // does not resolve at all.
+    let base = git_stdout(&["-C", root.to_str()?, "merge-base", "HEAD", "origin/main"])
+        .or_else(|| git_stdout(&["-C", root.to_str()?, "rev-parse", "HEAD^"]))?;
     Some((tested, base))
 }
 

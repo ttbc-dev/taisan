@@ -184,6 +184,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         store: &impl Store,
         intent: &HostActionIntent,
     ) -> Result<Option<CredentialError>, StoreError> {
+        // Every intent's binding starts from ambient: a credential a
+        // previous intent installed must never leak into this one —
+        // not when the binding resolves, not when it is blocked, and
+        // not when the intent declares no binding at all.
+        self.client.set_credential(None);
         let Some(providers) = &self.credentials else {
             return Ok(None);
         };
@@ -1837,7 +1842,14 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     {
                         let title_matches = title.as_ref().is_none_or(|t| &pull.title == t);
                         let body_matches = body.as_ref().is_none_or(|b| &pull.body == b);
-                        if title_matches && body_matches {
+                        // The remote head must still be the revision
+                        // the intent bound — a moved head means the
+                        // update ran against a different change than
+                        // the receipt would attest, so the intent
+                        // stays `unknown` and outstanding instead of
+                        // settling `applied` on a fabricated match.
+                        let head_matches = pull.head_sha == expected_head.object;
+                        if title_matches && body_matches && head_matches {
                             let fields_digest = sha256_hex(
                                 "change-meta-v1",
                                 &canonical_json(&serde_json::json!({
@@ -2198,6 +2210,36 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         if !execution.allowed_effects.host_write {
             return Ok(AttemptOutcome::Skipped("host_write_denied"));
         }
+        let execution_id = Some(execution.id);
+        let obs = |fact: ObservationFact| Observation {
+            delivery: None,
+            subject_work_id: Some(work_id.clone()),
+            subject_execution_id: execution_id.clone(),
+            fact,
+            observed_unix_seconds: now,
+        };
+        // Support is validated distinctly from anything else: an
+        // operation outside the declared set is an explicit
+        // `unsupported` receipt, never a write and never a permission
+        // verdict — and never waits on a credential slot it will not
+        // use. The classification is a terminal settle, so the receipt
+        // attests no actor.
+        if !Self::supports(&intent.action) {
+            self.ingest(
+                store,
+                config,
+                obs(ObservationFact::HostActionResult {
+                    action_id: intent.action_id.clone(),
+                    authenticated_actor: None,
+                    status: HostActionStatus::Unsupported {
+                        reason: format!("unsupported operation: {}", intent.action.name()),
+                    },
+                    effects: vec![],
+                }),
+                now,
+            )?;
+            return Ok(AttemptOutcome::Attempted);
+        }
         // The adapter-boundary credential gate — the declared
         // `credential_ref` for the intent's role resolves at use time
         // and authenticates as the intent's authorized actor before
@@ -2207,14 +2249,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         if let Some(error) = self.bind_intent_credential(store, &intent)? {
             return Ok(AttemptOutcome::CredentialBlocked(error.code()));
         }
-        let execution_id = Some(execution.id);
-        let obs = |fact: ObservationFact| Observation {
-            delivery: None,
-            subject_work_id: Some(work_id.clone()),
-            subject_execution_id: execution_id.clone(),
-            fact,
-            observed_unix_seconds: now,
-        };
         // The write receipt is authenticated by the transport's proven
         // identity — `gh api user` — never the intent's configured
         // actor: a credential acting as another account records that
@@ -2242,26 +2276,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     effects,
                 }
             };
-
-        // Support is validated distinctly from anything else: an
-        // operation outside the declared set is an explicit
-        // `unsupported` receipt, never a write and never a permission
-        // verdict.
-        if !Self::supports(&intent.action) {
-            self.ingest(
-                store,
-                config,
-                obs(result(
-                    intent.action_id,
-                    HostActionStatus::Unsupported {
-                        reason: format!("unsupported operation: {}", intent.action.name()),
-                    },
-                    vec![],
-                )),
-                now,
-            )?;
-            return Ok(AttemptOutcome::Attempted);
-        }
 
         // Reconcile-before-write: an intent whose effect the remote
         // already shows settles from the read — the receipt a crash
