@@ -1518,3 +1518,23 @@ fn intake_refusals_redact_rejected_values() {
     .unwrap_err();
     assert!(err.contains("selector_version"), "{err}");
 }
+
+/// The shipped public example profile must load through the real
+/// validator — the README instructs operators to run `taisan check`
+/// against it, so a schema drift in the file is a broken doc promise.
+#[test]
+fn the_shipped_reference_adapters_profile_loads() {
+    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/reference-adapters");
+    let profile =
+        std::fs::read_to_string(docs.join("config.toml")).expect("example config.toml missing");
+    parse_profile(&profile).expect("example config.toml must parse as a profile");
+
+    let installation: workloop_config::Installation = serde_json::from_str(
+        &std::fs::read_to_string(docs.join("workloop.config.json"))
+            .expect("example workloop.config.json missing"),
+    )
+    .expect("example workloop.config.json must deserialize as an Installation");
+    installation
+        .workloop_config()
+        .expect("example workloop.config.json must validate into a WorkloopConfig");
+}

@@ -161,7 +161,11 @@ fn cmd_version(cfg: &Config) -> i32 {
     // forward the probe so a missing runtime fails here, not mid-run.
     match probe_runtime_version(cfg) {
         Ok(v) => {
-            println!("{ADAPTER} {} (runtime {v})", env!("CARGO_PKG_VERSION"));
+            // Pure passthrough: the preflight's `observed_version`
+            // reads the first X.Y.Z triple on stdout as the *runtime*
+            // version, so the adapter must not print its own version
+            // ahead of it.
+            println!("{v}");
             0
         }
         Err(e) => {
@@ -220,6 +224,13 @@ fn probe_runtime_version(cfg: &Config) -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Same group discipline as the run path: `kill_tree` signals the
+    // child's group, which only exists if the child leads it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(VERSION_PROBE_SECONDS);
     loop {

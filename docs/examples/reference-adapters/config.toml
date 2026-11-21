@@ -86,5 +86,5 @@ policy_revision = 1
 argv = ["public-issue-selector", "select", "--github-endpoint", "https://api.github.com", "--label", "taisan"]
 # Task defaults echoed verbatim into every proposal's task.
 task_constraints = ["keep the change small and reviewable"]
-verification_argv = [["cargo", "test", "--workspace"]]
+verification_argv = ["cargo", "test", "--workspace"]
 required_permissions = []

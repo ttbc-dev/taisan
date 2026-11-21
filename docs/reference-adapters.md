@@ -125,7 +125,7 @@ policy_revision = 1
 argv = ["public-issue-selector", "select", "--github-endpoint", "https://api.github.com"]
 # optional task defaults echoed into every proposal:
 task_constraints = ["keep the change small"]
-verification_argv = [["cargo", "test", "--workspace"]]
+verification_argv = ["cargo", "test", "--workspace"]
 required_permissions = []
 ```
 
