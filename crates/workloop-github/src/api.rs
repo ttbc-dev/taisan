@@ -40,7 +40,9 @@ pub enum ApiError {
 /// capability report's `authorization` axis. A transport that cannot
 /// answer reports the read as failed; the adapter records
 /// `unknown`, never a guessed grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Default` is no access: a transport that cannot answer must
+/// never default to a grant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RepositoryPermissions {
     /// Write-level access: ref updates, change-request writes,
     /// comments, and review/thread mutations.
@@ -48,17 +50,6 @@ pub struct RepositoryPermissions {
     /// Read-level access: repository, branch, change-request, review,
     /// check, and issue reads.
     pub pull: bool,
-}
-
-impl Default for RepositoryPermissions {
-    /// No access: a transport that cannot answer must never default
-    /// to a grant.
-    fn default() -> Self {
-        Self {
-            push: false,
-            pull: false,
-        }
-    }
 }
 
 /// A pull request as GitHub reports it.
