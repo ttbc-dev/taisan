@@ -24,6 +24,8 @@ pub fn distinct_findings(detail: &WorkDetailView) -> impl Iterator<Item = &Findi
 pub struct FindingSlot {
     pub occurrence_id: String,
     pub source_key: String,
+    /// The sealed claim's finding text — display only.
+    pub summary: Option<String>,
     pub choice: Option<FindingChoice>,
     /// The disposition rationale dismiss/accept decisions require.
     pub rationale: Option<String>,
@@ -61,6 +63,7 @@ impl JudgmentDraft {
                 .map(|f| FindingSlot {
                     occurrence_id: f.occurrence_id.clone(),
                     source_key: f.source_key.clone(),
+                    summary: f.summary.clone(),
                     choice: None,
                     rationale: None,
                 })

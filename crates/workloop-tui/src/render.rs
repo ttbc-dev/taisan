@@ -125,7 +125,10 @@ pub fn detail_frame(detail: &WorkDetailView) -> String {
         ));
     }
     for (i, f) in distinct_findings(detail).enumerate() {
-        out.push_str(&format!("  finding {}: {}\n", i + 1, f.source_key));
+        match &f.summary {
+            Some(s) => out.push_str(&format!("  finding {}: {} — {}\n", i + 1, f.source_key, s)),
+            None => out.push_str(&format!("  finding {}: {}\n", i + 1, f.source_key)),
+        }
     }
     for j in &detail.judged {
         out.push_str(&format!("  judged {j}\n"));
@@ -180,7 +183,16 @@ pub fn draft_frame(draft: &JudgmentDraft) -> String {
             .as_ref()
             .map(|c| format!("{c:?}"))
             .unwrap_or_else(|| "-".into());
-        out.push_str(&format!("  {} {} [{}]\n", i + 1, slot.source_key, choice));
+        match &slot.summary {
+            Some(s) => out.push_str(&format!(
+                "  {} {} — {} [{}]\n",
+                i + 1,
+                slot.source_key,
+                s,
+                choice
+            )),
+            None => out.push_str(&format!("  {} {} [{}]\n", i + 1, slot.source_key, choice)),
+        }
     }
     out
 }

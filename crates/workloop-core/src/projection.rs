@@ -92,12 +92,16 @@ pub struct ExecutionView {
 }
 
 /// One finding the detail pane displays: the occurrence id a
-/// `JudgeFindings` decision names, plus the source-supplied key for
-/// display. Identity is the occurrence id, never the display text.
+/// `JudgeFindings` decision names, plus the source-supplied key and
+/// the sealed claim's human-readable text for display. Identity is
+/// the occurrence id, never the display text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FindingView {
     pub occurrence_id: String,
     pub source_key: String,
+    /// The sealed claim's finding text — display only.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +466,7 @@ pub fn work_detail(
             findings.push(FindingView {
                 occurrence_id: o.id,
                 source_key: o.source_key,
+                summary: o.summary,
             });
         }
         if let Some(j) = tx.judgment_for_round(&round.id)? {

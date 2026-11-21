@@ -461,6 +461,7 @@ fn seal_review(root: &Path, work_id: &str, head: &str, source_keys: &[&str]) {
                     severity: None,
                     position: None,
                     thread_id: None,
+                    summary: None,
                 })
                 .collect(),
         },

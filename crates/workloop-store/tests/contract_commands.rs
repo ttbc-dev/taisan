@@ -318,6 +318,7 @@ fn seal_review(store: &SqliteStore, work_id: &WorkId, head: &str, source_keys: &
                         severity: None,
                         position: None,
                         thread_id: None,
+                        summary: None,
                     })
                     .collect(),
             },
@@ -4232,7 +4233,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11, "the upgrade lands on the current format");
+        assert_eq!(version, 12, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4297,7 +4298,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11, "the upgrade lands on the current format");
+        assert_eq!(version, 12, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5901,7 +5902,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11, "the upgrade lands on the current format");
+        assert_eq!(version, 12, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

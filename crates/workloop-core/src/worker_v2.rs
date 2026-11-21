@@ -106,6 +106,15 @@ pub struct DiffTarget {
     /// 40 lowercase hex.
     pub head: String,
     pub diff_digest: String,
+    /// The target-branch revision the dispatch bound (40 lowercase
+    /// hex when observed). A target-branch-only move invalidates the
+    /// review just as a head move does — two assessments compare only
+    /// on an identical target. Absent on bodies minted before the
+    /// binding existed, which can never prove a revision match. The
+    /// member is omitted when absent so a pre-binding body
+    /// re-serializes to the bytes its recorded digest was taken over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_revision: Option<String>,
 }
 
 /// One sealed review-finding occurrence selected for a review-origin
@@ -117,6 +126,12 @@ pub struct FindingOccurrenceRef {
     pub source: String,
     pub digest: String,
     pub order: u64,
+    /// The human-readable finding text the sealed claim carried —
+    /// never identity; `occurrence`/`digest` name it. The member is
+    /// omitted when absent so a pre-upgrade body re-serializes to the
+    /// bytes its recorded digest was taken over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// The failed mechanical evidence a pre-publication Fix repairs. It
@@ -539,6 +554,11 @@ pub struct ReviewSourceOccurrence {
     pub severity: Option<String>,
     pub position: Option<String>,
     pub thread_id: Option<String>,
+    /// The human-readable finding text from the sealed claim.
+    /// Omitted when absent so a review source minted before the
+    /// member existed keeps the digest it was recorded under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// The judgment context a re-review binds: the exact-set decision
@@ -1758,6 +1778,7 @@ mod tests {
                             base: "0123456789abcdef0123456789abcdef01234567".into(),
                             head: "89abcdef0123456789abcdef0123456789abcdef".into(),
                             diff_digest: "d".repeat(64),
+                            target_revision: None,
                         },
                         round: "round-3".into(),
                         judgment: "judgment-9".into(),
@@ -1766,6 +1787,7 @@ mod tests {
                             source: "review-source-3".into(),
                             digest: "e".repeat(64),
                             order: 0,
+                            summary: Some("unchecked error return".into()),
                         }],
                     }),
                     constraints: vec!["Address only the selected finding".into()],
@@ -1795,6 +1817,7 @@ mod tests {
                         base: "0123456789abcdef0123456789abcdef01234567".into(),
                         head: "89abcdef0123456789abcdef0123456789abcdef".into(),
                         diff_digest: "d".repeat(64),
+                        target_revision: None,
                     },
                     review_source: ReviewSourceRef {
                         source: "review-source-3".into(),
@@ -1895,6 +1918,132 @@ mod tests {
         assert!(
             !incomplete.verifies(),
             "a digest-consistent incomplete envelope reads as corrupt"
+        );
+    }
+
+    /// Bodies minted before `target_revision` existed carry no member
+    /// for it; `None` must serialize as absence, not `null`, or every
+    /// pre-binding durable body stops verifying on upgrade and its
+    /// in-flight request reads as corrupt.
+    #[test]
+    fn a_body_minted_before_the_target_binding_still_verifies() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.role = crate::domain::InvocationRole::Review;
+        request.required_capabilities.role = crate::domain::InvocationRole::Review;
+        request.workspace.read_only = true;
+        request.task = TaskBody::CodeReview {
+            target: DiffTarget {
+                change: "change-5".into(),
+                base: "0".repeat(40),
+                head: "1".repeat(40),
+                diff_digest: "d".repeat(64),
+                target_revision: Some("2".repeat(40)),
+            },
+            review_source: ReviewSourceRef {
+                source: "review-source-3".into(),
+                bytes: 4096,
+                digest: "a".repeat(64),
+                source_revision: "3".into(),
+            },
+        };
+        // Mint the body the pre-binding schema wrote: no
+        // `target_revision` member at all.
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        value["task"]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_revision");
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(digest);
+        let bytes = canonical_json(&value);
+        let parsed = WorkerRequestV2::parse(&bytes).expect("pre-binding body parses");
+        let TaskBody::CodeReview { target, .. } = &parsed.task else {
+            panic!("task kind changed on parse");
+        };
+        assert_eq!(target.target_revision, None);
+        let body = WorkerRequestBody {
+            request_id: parsed.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: parsed.digest(),
+        };
+        assert!(
+            body.verifies(),
+            "a body minted before the target binding must keep verifying"
+        );
+    }
+
+    /// Bodies minted before `FindingOccurrenceRef.summary` existed
+    /// carry no member for it; `None` must serialize as absence, not
+    /// `null`, or every pre-upgrade review-origin Fix body stops
+    /// verifying and its in-flight request reads as corrupt.
+    #[test]
+    fn a_body_minted_before_the_finding_summary_still_verifies() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.role = crate::domain::InvocationRole::Fix;
+        request.required_capabilities.role = crate::domain::InvocationRole::Fix;
+        request.workspace.read_only = false;
+        request.task = TaskBody::Fix {
+            goal: GoalRef {
+                body_ref: "goal-7-fix-1".into(),
+                media_type: "text/markdown".into(),
+                bytes: 640,
+                digest: "b".repeat(64),
+            },
+            issues: vec![],
+            predecessor: ArtifactRef {
+                artifact_id: "inv-39/artifact.json".into(),
+                manifest_digest: "c".repeat(64),
+                produced: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            origin: Box::new(FixOrigin::Review {
+                target: DiffTarget {
+                    change: "change-5".into(),
+                    base: "0".repeat(40),
+                    head: "1".repeat(40),
+                    diff_digest: "d".repeat(64),
+                    target_revision: None,
+                },
+                round: "round-3".into(),
+                judgment: "judgment-9".into(),
+                findings: vec![FindingOccurrenceRef {
+                    occurrence: "occ-2".into(),
+                    source: "review-source-3".into(),
+                    digest: "e".repeat(64),
+                    order: 0,
+                    summary: Some("unchecked error return".into()),
+                }],
+            }),
+            constraints: vec![],
+            verification_argv: vec![],
+        };
+        // Mint the body the pre-upgrade schema wrote: no `summary`
+        // member on the finding ref at all.
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        value["task"]["origin"]["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("summary");
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(digest);
+        let bytes = canonical_json(&value);
+        let parsed = WorkerRequestV2::parse(&bytes).expect("pre-upgrade body parses");
+        let TaskBody::Fix { origin, .. } = &parsed.task else {
+            panic!("task kind changed on parse");
+        };
+        let FixOrigin::Review { findings, .. } = origin.as_ref() else {
+            panic!("fix origin kind changed on parse");
+        };
+        assert_eq!(findings[0].summary, None);
+        let body = WorkerRequestBody {
+            request_id: parsed.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: parsed.digest(),
+        };
+        assert!(
+            body.verifies(),
+            "a body minted before the finding summary must keep verifying"
         );
     }
 
@@ -2053,6 +2202,7 @@ mod tests {
                 base: "0".repeat(40),
                 head: "1".repeat(40),
                 diff_digest: "d".repeat(64),
+                target_revision: None,
             },
             review_source: ReviewSourceRef {
                 source: "review-source-3".into(),
