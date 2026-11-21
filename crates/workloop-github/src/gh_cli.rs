@@ -223,24 +223,6 @@ impl GhCliApi {
         if let Some(credential) = credential {
             command.env("GH_TOKEN", credential.expose());
         }
-        // The bound credential rides as `GH_TOKEN` on this one child —
-        // `gh` prefers it over its own stored login, so the call
-        // authenticates as the declared credential's actor. The value
-        // never enters argv (process lists) and the child's own
-        // environment only.
-        let credential = token_override.or(self.credential.as_ref());
-        if let Some(credential) = credential {
-            command.env("GH_TOKEN", credential.expose());
-        }
-        // The bound credential rides as `GH_TOKEN` on this one child —
-        // `gh` prefers it over its own stored login, so the call
-        // authenticates as the declared credential's actor. The value
-        // never enters argv (process lists) and the child's own
-        // environment only.
-        let credential = token_override.or(self.credential.as_ref());
-        if let Some(credential) = credential {
-            command.env("GH_TOKEN", credential.expose());
-        }
         if body.is_some() {
             command.arg("--input").arg("-");
         }

@@ -157,6 +157,21 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     }
 
     /// The adapter-boundary credential gate — the same binding the
+    /// The logical comment body a stored comment carries: live
+    /// transports append the marker envelope (`{body}\n\n<!--
+    /// {marker} -->`) for idempotence, so reconciliation and the
+    /// recorded digest both key on the body before the decoration —
+    /// a fixture's raw body strips to itself. A trailing envelope is
+    /// stripped only in the exact `{body}\n\n<!-- {marker} -->` shape;
+    /// anything else is the stored body as-is, and a mismatch stays a
+    /// foreign comment, never an adoption.
+    fn logical_comment_body<'a>(stored: &'a str, marker: &str) -> &'a str {
+        stored
+            .strip_suffix(&format!("<!-- {marker} -->"))
+            .map(|head| head.strip_suffix("\n\n").unwrap_or(head))
+            .unwrap_or(stored)
+    }
+
     /// fixture's book performs: the intent's recorded role binding
     /// resolves its credential slot at use time and the resolved value
     /// authenticates as the intent's authorized actor before any read
@@ -491,6 +506,20 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 continue;
             }
             report.examined += 1;
+            // The same adapter-boundary credential gate `attempt` and
+            // `reconcile_outstanding` run: the intent's role binding
+            // resolves and authenticates as the intent's actor before
+            // any remote read under it. A `credential.*` failure leaves
+            // the intent outstanding — a reconcile read under the
+            // ambient or previously bound credential could settle
+            // somebody else's effect onto this intent.
+            if let Some(error) = self.bind_intent_credential(store, &intent)? {
+                report.credential_blocked.push(CredentialBlock {
+                    action_id,
+                    code: error.code(),
+                });
+                continue;
+            }
             let work_id = intent.work_id.clone();
             let execution_id = store.transact(|tx| {
                 Ok(tx
@@ -1718,11 +1747,17 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                             .find_comment(&intent.repository, &change.change_request, marker)
                     {
                         match found {
-                            Some(comment) if comment.body == *body => {
+                            Some(comment)
+                                if Self::logical_comment_body(&comment.body, marker)
+                                    == body.as_str() =>
+                            {
                                 let body_digest = sha256_hex(
                                     "comment-v1",
                                     &canonical_json(&serde_json::json!({
-                                        "body": comment.body,
+                                        "body": Self::logical_comment_body(
+                                            &comment.body,
+                                            marker,
+                                        ),
                                     })),
                                 );
                                 terminal = record(
@@ -2053,14 +2088,21 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     // fixture's `Indeterminate` verdict — our write's
                     // landing cannot be told from a foreign comment
                     // carrying the marker.
-                    Ok(Some(comment)) if comment.body != *body => Ok(RemoteEffect::Indeterminate {
-                        reason: "the recorded marker carries a different stored body".into(),
-                    }),
+                    Ok(Some(comment))
+                        if Self::logical_comment_body(&comment.body, marker) != body.as_str() =>
+                    {
+                        Ok(RemoteEffect::Indeterminate {
+                            reason: "the recorded marker carries a different stored body".into(),
+                        })
+                    }
                     Ok(Some(comment)) => {
                         let body_digest = sha256_hex(
                             "comment-v1",
                             &canonical_json(&serde_json::json!({
-                                "body": comment.body,
+                                "body": Self::logical_comment_body(
+                                    &comment.body,
+                                    marker,
+                                ),
                             })),
                         );
                         Ok(RemoteEffect::Present {
@@ -2685,7 +2727,10 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         let body_digest = sha256_hex(
                             "comment-v1",
                             &canonical_json(&serde_json::json!({
-                                "body": comment.body,
+                                "body": Self::logical_comment_body(
+                                    &comment.body,
+                                    marker,
+                                ),
                             })),
                         );
                         self.ingest(
