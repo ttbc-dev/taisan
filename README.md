@@ -74,6 +74,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [Agent interface requirements](docs/agent-interface.md) — CLI-backed skills, installation deliverables, and verification gaps.
 - [Architecture](docs/architecture.md) — ownership, interfaces, adapters, and consistency.
 - [Adapter boundaries](docs/adapter-boundaries.md) — replaceable Work Selector and Worker contracts and reference adapters.
+- [Public reference adapters](docs/reference-adapters.md) — the packaged public Selector (`public-issue-selector`) and Worker (`taisan-worker-claude`), their configuration surfaces, limits, and the composed example.
 - [Repository host contract](docs/repository-host-contract.md) — common semantics, required capabilities, host identity, and GitHub/GitLab validation scope.
 - [Implementation plan](docs/implementation-plan.md) — named phases and v0.1 acceptance gates.
 - [Skill walkthrough](docs/skill-walkthrough.md) — clean setup, install, submit, inspect, Attention/decision, and recovery with captured CLI output.
