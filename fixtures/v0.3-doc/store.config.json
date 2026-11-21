@@ -29,7 +29,7 @@
     "--claim-head",
     "HEAD"
   ],
-  "worker_isolation_profile": "fixture-worker-v0.1",
+  "worker_isolation_profile": "taisan-reference-v0.1",
   "worker_dispatch": {
     "source_path": "/tmp/taisan-v03-doc/source-repo",
     "budget": {

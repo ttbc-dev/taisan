@@ -156,22 +156,21 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         self
     }
 
-    /// The adapter-boundary credential gate — the same binding the
     /// The logical comment body a stored comment carries: live
     /// transports append the marker envelope (`{body}\n\n<!--
     /// {marker} -->`) for idempotence, so reconciliation and the
     /// recorded digest both key on the body before the decoration —
-    /// a fixture's raw body strips to itself. A trailing envelope is
-    /// stripped only in the exact `{body}\n\n<!-- {marker} -->` shape;
-    /// anything else is the stored body as-is, and a mismatch stays a
-    /// foreign comment, never an adoption.
+    /// a fixture's raw body strips to itself. Only the exact
+    /// `\n\n<!-- {marker} -->` tail strips; a body that merely ends in
+    /// the envelope markup stays whole — a foreign comment carrying the
+    /// marker without our separator is never adopted as ours.
     fn logical_comment_body<'a>(stored: &'a str, marker: &str) -> &'a str {
         stored
-            .strip_suffix(&format!("<!-- {marker} -->"))
-            .map(|head| head.strip_suffix("\n\n").unwrap_or(head))
+            .strip_suffix(&format!("\n\n<!-- {marker} -->"))
             .unwrap_or(stored)
     }
 
+    /// The adapter-boundary credential gate — the same binding the
     /// fixture's book performs: the intent's recorded role binding
     /// resolves its credential slot at use time and the resolved value
     /// authenticates as the intent's authorized actor before any read
@@ -197,6 +196,33 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     .map(|binding| binding.credential_ref.clone())
             }))
         })?;
+        // `default` is the shared ambient slot: there is no credential
+        // to inject, but the ambient login still proves its actor —
+        // `gh api user` under the transport's own credential answers
+        // who the intent's calls act as, and an unprovable or foreign
+        // ambient identity blocks the intent the same way a resolved
+        // credential would.
+        if reference.as_ref().is_some_and(|r| r.as_str() == "default") {
+            // Ambient first — a credential a previous intent left bound
+            // must not impersonate the ambient login.
+            self.client.set_credential(None);
+            let proven = self.client.viewer().ok().flatten().and_then(|login| {
+                HostActorId::new(login).ok().map(|actor| HostActorRef {
+                    host: intent.host.clone(),
+                    actor,
+                })
+            });
+            return Ok(match proven {
+                Some(actor) if actor == intent.actor => None,
+                Some(actor) => Some(CredentialError::ActorMismatch {
+                    bound: intent.actor.clone(),
+                    authenticated: actor,
+                }),
+                None => Some(CredentialError::unresolvable(
+                    "the ambient credential cannot prove its actor",
+                )),
+            });
+        }
         let bind = resolve_credential(reference.as_ref(), &**providers).and_then(|resolved| {
             let authenticated = self.client.authenticate(&resolved)?;
             if authenticated != intent.actor {

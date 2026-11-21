@@ -16,7 +16,7 @@ Every file was produced by a real `taisan` invocation against:
 
 | File | Command that produced it |
 | --- | --- |
-| `profile/config.toml` | `taisan init` output, then hand-edited `worker.argv`/`isolation_profile`; placeholder identities only |
+| `profile/config.toml` | `taisan init` output, then hand-edited `worker.argv`/`isolation_profile`; placeholder identities only. The isolation profile names `taisan-reference-v0.1`, the only profile `taisan run` accepts — `run` rejects the contract-harness profile by design |
 | `store.config.json` | The installation record the store-backed commands loaded (published beside `store.db`) |
 | `out-check-pass.json` | `taisan --config profile/config.toml check` — all stages pass, `probe_capabilities: not_run` |
 | `out-check-probe.json` / `.err` | `taisan --config profile/config.toml check --probe` — stages 1–7 pass, `probe_capabilities` fails closed `capability.unknown`, exit 3 |
