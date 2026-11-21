@@ -240,6 +240,80 @@ fn push_and_open(
     }
 }
 
+/// The ambient credential's verified login binds the write: a token
+/// acting as another identity never authors the bound actor's intent —
+/// the receipt records the real login and the ingest settles
+/// `unknown{actor_mismatch}`, leaving the intent outstanding.
+#[test]
+fn a_foreign_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "viewer-mismatch");
+    let mut gh = InMemoryGitHub::new();
+    gh.set_viewer("other-login");
+    let mut adapter = Adapter::new(gh);
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown {
+            reason: "actor_mismatch".into()
+        },
+        "a foreign credential never records an applied write"
+    );
+    let intent = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| i.action_id == action_id)
+                .map(|i| i.authenticated_actor))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        intent,
+        Some(HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("other-login"),
+        }),
+        "the receipt attests the verified login, not the claim"
+    );
+}
+
+/// A credential whose identity cannot be attested never authors a
+/// write either — an indeterminate actor is fail-closed, retried on
+/// the next pass once `gh api user` answers again.
+#[test]
+fn an_unverifiable_ambient_credential_blocks_the_guarded_write() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "viewer-unverifiable");
+    let mut gh = InMemoryGitHub::new();
+    gh.lose_response("viewer");
+    let mut adapter = Adapter::new(gh);
+    let action_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: "work/w".into(),
+            produced: rev("head-1"),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config(), NOW).unwrap();
+    assert!(matches!(
+        intent_status(&store, &action_id),
+        HostActionStatus::Unknown { .. }
+    ));
+}
+
 fn intent_status_effects(store: &SqliteStore, action_id: &str) -> Vec<NormalizedEffectFact> {
     store
         .transact(|tx| {

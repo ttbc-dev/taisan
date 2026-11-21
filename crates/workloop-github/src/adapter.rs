@@ -2221,10 +2221,16 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // account so the durable actor-mismatch and drift-rearm checks
         // see the truth. A transport that cannot prove an identity
         // records an unauthenticated receipt, never a fabricated one.
-        let authenticated_actor = self.client.viewer().ok().flatten().and_then(|login| {
-            HostActorId::new(login).ok().map(|actor| HostActorRef {
-                host: intent.host.clone(),
-                actor,
+        // `Err` — the transport cannot answer who it acts as — is
+        // distinct from `Ok(None)`, a transport without an identity
+        // surface: only the outage fails the write closed below.
+        let viewer = self.client.viewer();
+        let authenticated_actor = viewer.as_ref().ok().and_then(|login| {
+            login.as_ref().and_then(|login| {
+                HostActorId::new(login).ok().map(|actor| HostActorRef {
+                    host: intent.host.clone(),
+                    actor,
+                })
             })
         });
         let result =
@@ -2298,19 +2304,24 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // acting as another account never pushes, opens, or comments —
         // the write is refused and the receipt records the proven
         // actor, so the durable `actor_mismatch` verdict is evidence of
-        // a prevented effect, never a landed one. An unprovable
-        // identity proceeds unauthenticated: the write's own outcome
-        // settles the intent.
-        if let Some(actor) = &authenticated_actor
-            && *actor != intent.actor
-        {
+        // a prevented effect, never a landed one. An outage answering
+        // `viewer` is fail-closed too — `unknown{actor_unverifiable}`
+        // leaves the intent outstanding until the transport answers
+        // again; a transport without an identity surface proceeds
+        // unauthenticated exactly as before.
+        let gate = match (&viewer, &authenticated_actor) {
+            (Err(_), _) => Some("actor_unverifiable"),
+            (Ok(_), Some(actor)) if *actor != intent.actor => Some("actor_mismatch"),
+            _ => None,
+        };
+        if let Some(reason) = gate {
             self.ingest(
                 store,
                 config,
                 obs(result(
                     intent.action_id,
                     HostActionStatus::Unknown {
-                        reason: "actor_mismatch".into(),
+                        reason: reason.to_string(),
                     },
                     vec![],
                 )),
