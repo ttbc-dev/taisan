@@ -769,12 +769,13 @@ fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
     );
 }
 
-/// The write receipt is authenticated by the transport's proven
-/// identity, never the intent's configured actor: a credential that
-/// acts as another account records that account, so the durable
-/// `actor_mismatch` verdict fires instead of settling `applied` under
-/// the wrong name. When the transport cannot prove an identity the
-/// receipt is unauthenticated — never a fabricated `intent.actor`.
+/// The credential gate before any write compares the transport's
+/// proven identity with the intent's bound actor: a credential acting
+/// as another account never executes the effect — the branch stays
+/// unpushed and `actor_mismatch` is recorded, never an `applied`
+/// receipt under the wrong name. When the transport cannot prove an
+/// identity the write still runs and the receipt is unauthenticated —
+/// never a fabricated `intent.actor`.
 #[test]
 fn a_write_receipt_carries_the_proven_actor_not_the_configured_one() {
     let store = SqliteStore::in_memory(1).unwrap();
@@ -792,10 +793,16 @@ fn a_write_receipt_carries_the_proven_actor_not_the_configured_one() {
     );
 
     // The ambient credential acts as an account that is not the bound
-    // publisher: the write lands, but the receipt authenticates the
-    // foreign login and reconciliation records `actor_mismatch`.
+    // publisher: the write never executes, and the receipt
+    // authenticates the foreign login — `actor_mismatch` records a
+    // prevented effect, not a landed one.
     adapter.client_mut().set_viewer("foreign-account");
     adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert!(
+        adapter.client().writes().is_empty(),
+        "no write executed under the foreign credential: {:?}",
+        adapter.client().writes()
+    );
     assert_eq!(
         intent_status(&store, &push_id),
         HostActionStatus::Unknown {
