@@ -2022,11 +2022,23 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             fact,
             observed_unix_seconds: now,
         };
+        // The write receipt is authenticated by the transport's proven
+        // identity — `gh api user` — never the intent's configured
+        // actor: a credential acting as another account records that
+        // account so the durable actor-mismatch and drift-rearm checks
+        // see the truth. A transport that cannot prove an identity
+        // records an unauthenticated receipt, never a fabricated one.
+        let authenticated_actor = self.client.viewer().ok().flatten().and_then(|login| {
+            HostActorId::new(login).ok().map(|actor| HostActorRef {
+                host: intent.host.clone(),
+                actor,
+            })
+        });
         let result =
             |action_id: String, status: HostActionStatus, effects: Vec<NormalizedEffectFact>| {
                 ObservationFact::HostActionResult {
                     action_id,
-                    authenticated_actor: Some(intent.actor.clone()),
+                    authenticated_actor: authenticated_actor.clone(),
                     status,
                     effects,
                 }
