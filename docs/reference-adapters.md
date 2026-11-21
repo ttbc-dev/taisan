@@ -193,9 +193,11 @@ session handle.
 
 ### How a `run` maps onto the runtime
 
-- **Workspace.** The runtime's working directory is the request's
-  granted workspace mount (`/workspace` inside containment; the bound
-  path otherwise). `coding`/`fix` requests carry `read_only: false`
+- **Workspace.** The runtime's working directory is the workspace the
+  supervisor bound as the worker's cwd (`workspace.mount` is the
+  contained spelling of that same path — the supervisor writes
+  `/workspace` unconditionally, so a host-side `/workspace` never wins
+  over the bound cwd). `coding`/`fix` requests carry `read_only: false`
   and may edit and commit locally; `invariant_check`/`review` carry
   `read_only: true` and the runtime additionally runs in plan
   permission mode so edit tools are denied even outside containment.
@@ -234,9 +236,11 @@ session handle.
 - **Report.** `report.json` echoes the exact request binding
   (`request_id`, `invocation_id`, `request_digest`, `role`), carries a
   verified `report_digest`, and stays inside
-  `budget.max_report_bytes`. An exit before the report is written is
-  the contract's `absent` class; a request that fails the closed
-  parse or digest check produces no process and no report.
+  `budget.max_report_bytes` — member evidence that cannot fit degrades
+  the report to a typed `failed`/`internal_error` that does, never to
+  a silently truncated member list. An exit before the report is
+  written is the contract's `absent` class; a request that fails the
+  closed parse or digest check produces no process and no report.
 
 ### Runtime-only authentication
 

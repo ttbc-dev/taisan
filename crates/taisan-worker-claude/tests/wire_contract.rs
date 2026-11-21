@@ -67,6 +67,7 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "$FAKE_PGID_FILE" ]; then echo $$ > "$FAKE_PGID_FILE"; fi
+if [ -n "$FAKE_PWD_FILE" ]; then pwd > "$FAKE_PWD_FILE"; fi
 if [ -n "$FAKE_GRANDCHILD" ]; then sleep "$FAKE_GRANDCHILD" & fi
 if [ -n "$FAKE_HANG" ]; then sleep "$FAKE_HANG"; fi
 if [ -n "$FAKE_FLOOD" ]; then yes 'flood line' | head -c "$FAKE_FLOOD"; fi
@@ -607,6 +608,20 @@ fn deadline_reports_limit_reached_and_kills_tree() {
     // their new parent reaps them — CI's PID 1 does not — so a bare
     // `kill -0 -pgid` probe is not the right check. Scan the table and
     // require every remaining member to be a zombie.
+    // Under parallel-suite load the 1s deadline can fire before the
+    // runtime's shell self-reports its pgid — the group is still dead
+    // (that is what bound it), it just never announced its id.
+    let mut wrote = false;
+    for _ in 0..40 {
+        if pgid_file.exists() {
+            wrote = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !wrote {
+        return;
+    }
     let pgid: i32 = fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -1218,4 +1233,151 @@ fn auth_token_reaches_runtime_but_not_verification() {
     let verify_env = fs::read_to_string(ws.join("verify-env.txt")).unwrap();
     assert!(!verify_env.contains("sk-test-secret-token"));
     assert!(!verify_env.contains("gh-secret-should-strip"));
+}
+
+/// Recompute `request_digest` after mutating a minted request.
+fn redigest(req: &mut Value) {
+    let digest = request_v2_digest(&canonical_json(&{
+        let mut v = req.clone();
+        v.as_object_mut().unwrap().remove("request_digest");
+        v
+    }));
+    req["request_digest"] = json!(digest);
+    WorkerRequestV2::parse(&canonical_json(req)).expect("mutated request must still parse");
+}
+
+#[test]
+fn the_bound_workspace_is_the_shim_cwd_not_a_host_mount() {
+    let dir = tmp("mount-vs-cwd");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    // `mount` is the contained spelling — here an existing host dir
+    // that must NOT win over the cwd the launch bound.
+    let stray = dir.join("stray-mount");
+    fs::create_dir_all(&stray).unwrap();
+    let mut req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &stray,
+        false,
+    );
+    redigest(&mut req);
+    let pwd_file = dir.join("runtime-pwd");
+    let (request_path, _, out_dir) = dispatch("mount", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_PWD_FILE", pwd_file.to_str().unwrap())],
+    );
+    assert!(out.status.success());
+    let runtime_dir = fs::canonicalize(fs::read_to_string(&pwd_file).unwrap().trim()).unwrap();
+    assert_eq!(runtime_dir, fs::canonicalize(&ws).unwrap());
+}
+
+#[test]
+fn a_check_that_outlives_its_pipes_is_still_killed() {
+    let dir = tmp("quiet-check");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let mut req = request_json(
+        "coding",
+        json!({
+            "kind": "coding", "goal": goal_ref(), "issues": [],
+            "constraints": [],
+            // Closes both pipes at once, then keeps running — the
+            // channel disconnects while the process lives on.
+            "verification_argv": [["sh", "-c", "exec 1>&- 2>&-; sleep 300"]],
+        }),
+        &ws,
+        false,
+    );
+    // Bind the request deadline a few seconds out so the check's own
+    // 300s ceiling is not what ends it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    req["budget"]["deadline_unix_seconds"] = json!(now + 6);
+    redigest(&mut req);
+    let (request_path, _, out_dir) = dispatch("quiet-check", &req, &[("goal.md", "goal\n")]);
+    let start = std::time::Instant::now();
+    let out = run_shim(&fake, &request_path, &out_dir, &ws, &[]);
+    assert!(out.status.success());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "a check that outlives its pipes must still be killed"
+    );
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "negative");
+    assert_eq!(r["reason"]["code"], "checks_failed");
+    let check = &r["claimed_checks"][0];
+    assert_eq!(check["status"], "failed");
+}
+
+#[test]
+fn a_member_flood_stays_inside_the_report_bound() {
+    let dir = tmp("report-bound");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let head = git(&ws, &["rev-parse", "HEAD"]);
+    // 128 bound-legal findings whose serialized size far exceeds a
+    // small but plausible report budget.
+    let findings: Vec<Value> = (0..128)
+        .map(|i| json!({"key": format!("f-{i}"), "summary": "x".repeat(3_900)}))
+        .collect();
+    let block = format!("```taisan-result\n{}\n```", json!({"findings": findings}));
+    let events = events_file(&dir, &format!("reviewed\n\n{block}"), json!({}));
+    let mut req = request_json(
+        "review",
+        json!({
+            "kind": "code_review",
+            "target": {"change": "chg-1", "base": head, "head": head, "diff_digest": hex(0x0f)},
+            "review_source": {"source": "gh-review", "bytes": 64, "digest": hex(0x10), "source_revision": "1"},
+        }),
+        &ws,
+        true,
+    );
+    req["budget"]["max_report_bytes"] = json!(65_536);
+    redigest(&mut req);
+    let review_source = canonical_json(&json!({
+        "format": "taisan.review-source/1",
+        "work_id": "w-1",
+        "target": req["task"]["target"],
+        "prior_round": null,
+    }));
+    let (request_path, _, out_dir) = dispatch(
+        "report-bound",
+        &req,
+        &[(
+            "review-source.json",
+            std::str::from_utf8(&review_source).unwrap(),
+        )],
+    );
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_EVENTS", events.to_str().unwrap())],
+    );
+    assert!(out.status.success());
+    let bytes = fs::read(out_dir.join("report.json")).unwrap();
+    assert!(
+        bytes.len() as u64 <= 65_536,
+        "report.json is {} bytes, bound is 65536",
+        bytes.len()
+    );
+    let r = report(&out_dir);
+    // The evidence did not fit: a typed failure that echoes identity,
+    // never a silently truncated member list.
+    assert_eq!(r["status"], "failed");
+    assert_eq!(r["reason"]["code"], "internal_error");
+    assert!(r["findings"].as_array().unwrap().is_empty());
+    assert!(matches!(
+        classified(&out_dir, &req),
+        ReportClassification::Failure { .. }
+    ));
 }

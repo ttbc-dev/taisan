@@ -329,7 +329,7 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
         WorkerRequestV2::parse(&request_bytes).map_err(|e| format!("request rejected: {e:?}"))?;
     fs::create_dir_all(out_dir).map_err(|e| format!("create out dir: {e}"))?;
 
-    let workspace = workspace_dir(&request);
+    let workspace = workspace_dir();
     let input_dir = request_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -378,17 +378,13 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     Ok(0)
 }
 
-/// The runtime works inside the granted workspace. Inside containment
-/// that is the sandbox mount `/workspace`; uncontained it is whatever
-/// the supervisor bound. When the mount cannot be resolved the shim
-/// still stays inside its own cwd — never somewhere unspecified.
-fn workspace_dir(request: &WorkerRequestV2) -> PathBuf {
-    let mount = PathBuf::from(&request.workspace.mount);
-    if mount.is_dir() {
-        mount
-    } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
+/// The runtime works inside the granted workspace: the supervisor
+/// always spawns the worker with its cwd set to the bound workspace.
+/// `workspace.mount` is the *contained* spelling of that same path —
+/// the supervisor writes `/workspace` unconditionally — so a host-side
+/// `/workspace` must never win over the bound cwd.
+fn workspace_dir() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn load_provider_config(cfg: &Config) -> ProviderConfig {
@@ -1038,7 +1034,20 @@ fn write_report(
     });
     let digest = report_v2_digest(&report_canonical_body(&report));
     report["report_digest"] = json!(digest);
-    let body = canonical_json(&report);
+    let mut body = canonical_json(&report);
+    if body.len() as u64 > request.budget.max_report_bytes {
+        // The runtime's member evidence does not fit the declared
+        // report bound. Silently dropping members would falsify the
+        // claim; an oversize body classifies Invalid and loses
+        // everything. Degrade to a typed failure that fits — it still
+        // echoes the exact request binding.
+        report["status"] = json!("failed");
+        report["reason"] = json!({"code": "internal_error"});
+        report["findings"] = json!([]);
+        report["invariant_items"] = json!([]);
+        report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
+        body = canonical_json(&report);
+    }
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
 }
@@ -1071,7 +1080,20 @@ fn write_simple_report(
     });
     let digest = report_v2_digest(&report_canonical_body(&report));
     report["report_digest"] = json!(digest);
-    let body = canonical_json(&report);
+    let mut body = canonical_json(&report);
+    if body.len() as u64 > request.budget.max_report_bytes {
+        // The runtime's member evidence does not fit the declared
+        // report bound. Silently dropping members would falsify the
+        // claim; an oversize body classifies Invalid and loses
+        // everything. Degrade to a typed failure that fits — it still
+        // echoes the exact request binding.
+        report["status"] = json!("failed");
+        report["reason"] = json!({"code": "internal_error"});
+        report["findings"] = json!([]);
+        report["invariant_items"] = json!([]);
+        report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
+        body = canonical_json(&report);
+    }
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
 }
@@ -1145,6 +1167,20 @@ fn run_verification(
     let env: Vec<(String, String)> = env::vars()
         .filter(|(k, _)| k != "GH_TOKEN" && k != "GITHUB_TOKEN" && k != "ANTHROPIC_API_KEY")
         .collect();
+    // The request deadline binds the whole invocation, checks
+    // included — a command may not outlive it even when
+    // CHECK_TIMEOUT is longer.
+    let request_deadline = request
+        .budget
+        .deadline_unix_seconds
+        .checked_sub(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        )
+        .filter(|rem| *rem > 0)
+        .map(|rem| Instant::now() + Duration::from_secs(rem as u64));
     let mut checks = Vec::new();
     for argv in argv_list
         .iter()
@@ -1153,12 +1189,17 @@ fn run_verification(
         if argv.is_empty() || runtime_over_budget {
             continue;
         }
-        checks.push(run_one_check(argv, workspace, &env));
+        checks.push(run_one_check(argv, workspace, &env, request_deadline));
     }
     checks
 }
 
-fn run_one_check(argv: &[String], workspace: &Path, env: &[(String, String)]) -> Value {
+fn run_one_check(
+    argv: &[String],
+    workspace: &Path,
+    env: &[(String, String)],
+    request_deadline: Option<Instant>,
+) -> Value {
     let fail = |note: &str| {
         json!({
             "argv": argv,
@@ -1218,8 +1259,8 @@ fn run_one_check(argv: &[String], workspace: &Path, env: &[(String, String)]) ->
     drop(tx);
 
     let mut captured: Vec<u8> = Vec::new();
-    let deadline = Instant::now() + CHECK_TIMEOUT;
-    let mut timed_out = false;
+    let check_end = Instant::now() + CHECK_TIMEOUT;
+    let deadline = request_deadline.map_or(check_end, |d| d.min(check_end));
     loop {
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
@@ -1228,21 +1269,32 @@ fn run_one_check(argv: &[String], workspace: &Path, env: &[(String, String)]) ->
                     captured.extend_from_slice(&bytes[..keep]);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() > deadline {
-                    timed_out = true;
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The pipes are done but the process may not be — a
+                // command that closes stdout/stderr and keeps running
+                // must still answer to the deadline, so keep polling
+                // liveness directly.
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) || Instant::now() > deadline {
+                        break;
                     }
-                    let _ = child.kill();
+                    thread::sleep(POLL);
                 }
+                break;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if timed_out {
+        if matches!(child.try_wait(), Ok(Some(_))) || Instant::now() > deadline {
             break;
         }
+    }
+    let timed_out = child.try_wait().ok().flatten().is_none();
+    if timed_out {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        let _ = child.kill();
     }
     let status = child.wait();
     match status {
