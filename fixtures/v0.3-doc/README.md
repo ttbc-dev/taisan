@@ -37,6 +37,13 @@ deterministically, so a relative `target/debug/...` spelling would
 refuse — the published records substitute `<repo>` for the local
 absolute prefix and are otherwise verbatim.
 
+`out-run.json` predates the read-only workspace grant for
+InvariantCheck/Review requests: its second `worker produced` line is
+the check Invocation's commit, which the current fixture worker
+suppresses on a read-only workspace. Re-running the documented
+configuration today yields one produced commit (the Coding
+Invocation); the transcript is retained as captured.
+
 ## What these captures prove — and do not prove
 
 They prove the command surface, the durable record shapes, the
