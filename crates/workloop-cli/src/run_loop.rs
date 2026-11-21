@@ -3383,10 +3383,7 @@ mod tests {
             report.phases[3]
         );
         assert!(
-            matches!(
-                intent_status(&store, &push_id),
-                HostActionStatus::Pending
-            ),
+            matches!(intent_status(&store, &push_id), HostActionStatus::Pending),
             "an indeterminate pre-write read stays pending, never a blind write"
         );
         // A second pass keeps the intent pending — it is never dropped
