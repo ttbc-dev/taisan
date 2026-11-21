@@ -259,3 +259,71 @@ fn reports_for_other_hosts_do_not_mask_this_hosts_latest() {
     assert_eq!(reports.len(), 1, "only this host's report is recorded");
     assert_eq!(reports[0].len(), config.declared_capabilities.len());
 }
+
+/// A resolved publication credential probes under its own proven
+/// actor: the seat authenticates as the bound publisher, the
+/// permission read runs under the bound credential, and the report's
+/// authorization axis is the real bit — pull-only denies the write
+/// capabilities while reads stay authorized.
+#[test]
+fn a_resolved_probe_reports_the_bound_actor_permissions() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut config = config();
+    config.host.actors[0].credential_ref = CredentialRef::trusted("env:PUB_TOKEN");
+    let mut book = workloop_github::fixture::CredentialBook::new();
+    book.seat_env("PUB_TOKEN", "pub-secret");
+    let mut gh = InMemoryGitHub::new();
+    gh.seat_credential("pub-secret", publisher());
+    gh.set_permissions(false, true);
+    let mut adapter = Adapter::new(gh).with_credentials(Box::new(book));
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    let reports = capability_reports(&store);
+    assert_eq!(reports.len(), 1);
+    let entries = &reports[0];
+    assert_eq!(
+        entry(entries, HostCapability::PushRef).authorization,
+        CapabilityState::Denied,
+        "the bound credential's pull-only grant denies writes"
+    );
+    assert_eq!(
+        entry(entries, HostCapability::IssueRead).authorization,
+        CapabilityState::Authorized
+    );
+}
+
+/// A publication credential that authenticates as a foreign account
+/// never lends its permissions to the report: the authorization axis
+/// is `unknown` for every entry, and the probe installs nothing on
+/// the transport afterwards.
+#[test]
+fn a_foreign_probe_credential_reports_unknown_authorization() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut config = config();
+    config.host.actors[0].credential_ref = CredentialRef::trusted("env:PUB_TOKEN");
+    let mut book = workloop_github::fixture::CredentialBook::new();
+    book.seat_env("PUB_TOKEN", "foreign-secret");
+    let mut gh = InMemoryGitHub::new();
+    gh.seat_credential(
+        "foreign-secret",
+        HostActorRef {
+            host: host(),
+            actor: HostActorId::trusted("other-account"),
+        },
+    );
+    gh.set_permissions(true, true);
+    let mut adapter = Adapter::new(gh).with_credentials(Box::new(book));
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    let reports = capability_reports(&store);
+    assert_eq!(reports.len(), 1);
+    for e in &reports[0] {
+        assert_eq!(
+            e.authorization,
+            CapabilityState::Unknown,
+            "a foreign credential's permissions are never granted: {e:?}"
+        );
+    }
+}
