@@ -602,19 +602,32 @@ fn deadline_reports_limit_reached_and_kills_tree() {
         ReportClassification::Failure { .. }
     ));
     // The runtime ran in its own process group (`$$` == pgid); after
-    // the kill, no member of that group may still exist.
+    // the kill, no member of that group may still exist. Members linger
+    // in the table briefly as unreaped zombies, so poll for the group
+    // to be fully gone instead of checking a single instant.
     let pgid: i32 = fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    let still = Command::new("kill")
-        .args(["-0", &format!("-{pgid}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(!still.success(), "runtime process group {pgid} survived");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", &format!("-{pgid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runtime process group {pgid} survived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]
