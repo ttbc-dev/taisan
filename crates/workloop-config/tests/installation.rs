@@ -194,10 +194,22 @@ fn worker_isolation_profile_is_fail_closed() {
     assert_eq!(profile.id, "taisan-reference-v0.1");
 
     let mut named = installation.clone();
-    named.worker_isolation_profile = Some("fixture-worker-v0.1".into());
+    named.worker_isolation_profile = Some("taisan-reference-v0.1".into());
     assert_eq!(
         named.worker_isolation_profile().unwrap().id,
-        "fixture-worker-v0.1"
+        "taisan-reference-v0.1"
+    );
+
+    // The contract-harness profile resolves nowhere but the harness:
+    // its launches are test evidence only and never prove namespace
+    // enforcement, so an installation naming it refuses rather than
+    // silently running every launch uncontained.
+    let mut harness = installation.clone();
+    harness.worker_isolation_profile = Some("fixture-worker-v0.1".into());
+    let err = harness.worker_isolation_profile().unwrap_err();
+    assert!(
+        err.contains("contract-harness"),
+        "expected the harness-profile refusal: {err}"
     );
 
     let mut invalid = installation;

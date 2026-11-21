@@ -104,13 +104,14 @@ pub enum ObservationFact {
         /// bytes the supervisor read, the retained byte count, and
         /// whether the on-disk file exceeded the read bound (an
         /// oversize report keeps a bounded truncated prefix, never
-        /// the tail it did not read). `None` only when no report
-        /// file existed — the `absent` class.
+        /// the tail it did not read). `None` whenever no bytes were
+        /// retained — the `absent` class, and `invalid`
+        /// classifications whose path was unsafe or unreadable.
         report: Option<WorkerReportEvidence>,
         /// The measured `runtime.log` retention under the same
         /// bounded-read rule; `None` when no regular log file existed
-        /// or the path was unsafe — the worker's own `log` descriptor
-        /// stays a claim inside the report body.
+        /// or the path was unsafe or unreadable — the worker's own
+        /// `log` descriptor stays a claim inside the report body.
         log: Option<WorkerReportEvidence>,
     },
     /// A different report-byte identity observed for an Invocation
@@ -121,10 +122,13 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         request_id: String,
         /// The accepted report evidence identity (`None` = the
-        /// accepted classification was `absent`).
+        /// accepted fact retained no report bytes — an `absent`
+        /// report, or an invalid one whose path was unsafe or
+        /// unreadable).
         accepted_report: Option<WorkerReportEvidence>,
-        /// The conflicting identity now observed (`None` = the report
-        /// file is gone where evidence was accepted).
+        /// The conflicting identity now observed (`None` = no bytes
+        /// were retained this collection — the report file is gone,
+        /// or its path is unsafe or unreadable).
         observed_report: Option<WorkerReportEvidence>,
     },
     /// The supervisor's verdict on one retained Worker `claimed_head`
@@ -385,6 +389,13 @@ pub struct OccurrenceInput {
     pub position: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The human-readable finding text the claim carried — what the
+    /// reviewer found, so operators and Fix workers read the sealed
+    /// evidence rather than only its key. Absent on facts recorded
+    /// before the field existed and on adapter-minted occurrences
+    /// that carry no prose.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

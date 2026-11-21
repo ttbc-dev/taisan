@@ -490,6 +490,7 @@ impl HostBinding {
 /// A typed evidence reference: the record id plus the digest that
 /// pins it to an exact payload.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     pub id: String,
     pub digest: String,

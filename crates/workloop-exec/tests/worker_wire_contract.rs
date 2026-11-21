@@ -35,7 +35,7 @@ use workloop_core::command::{CommandBody, CommandDecision, CommandEffect, Comman
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
-    HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
+    BranchState, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
 };
 use workloop_core::ports::{
     ProbeOutcome, ProcessControlPort, ProcessEvidence, SignalOutcome, SpawnError, WorkerEnv,
@@ -711,6 +711,28 @@ fn open_change_target(
         NOW,
     )
     .unwrap();
+    // The target-branch state a poller records before any review can
+    // dispatch: an absent revision is ignorance, never a bound target.
+    handle_observation(
+        store,
+        &cfg,
+        &obs(ObservationFact::BranchState {
+            repository: cfg.host.repository.clone(),
+            branch: target_branch.into(),
+            state: BranchState::At {
+                revision: fixture_target_revision(),
+            },
+        }),
+        NOW,
+    )
+    .unwrap();
+}
+
+/// The fixture's observed target-branch revision. Dispatch refuses
+/// while the branch state is unobserved — an opened change is only a
+/// dispatchable target once the poller has pinned where `main` sits.
+fn fixture_target_revision() -> CommitRevision {
+    CommitRevision::new(repo(), "0".repeat(40)).unwrap()
 }
 
 /// The managed workspace directory for one Work — where the worker's
