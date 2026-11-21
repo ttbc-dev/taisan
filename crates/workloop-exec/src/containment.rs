@@ -417,21 +417,6 @@ pub fn bwrap_args(
             ]);
         }
     }
-    // A host file beneath a bound system prefix — a `file:` credential
-    // source — stays visible through the wholesale bind unless it is
-    // shadowed: ro-bind /dev/null over it. The mask is emitted before
-    // every plan bind, so a path the plan legitimately names is still
-    // mounted by its own bind.
-    for file in &plan.masked_files {
-        if system_bind_covers(file) {
-            let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
-            args.extend([
-                "--ro-bind".to_string(),
-                "/dev/null".to_string(),
-                s(&resolved),
-            ]);
-        }
-    }
     args.extend(
         [
             "--proc", "/proc", "--dev", "/dev", // kernel-provided views
@@ -517,6 +502,23 @@ pub fn bwrap_args(
     }
     if let Some(worker) = &plan.worker {
         args.extend(["--ro-bind".to_string(), s(worker), s(worker)]);
+    }
+    // A host file beneath a bound system prefix — a `file:` credential
+    // source — stays visible through the wholesale bind unless it is
+    // shadowed: ro-bind /dev/null over it. The mask renders after every
+    // plan bind: an own-path bind whose source is the credential (or an
+    // ancestor of it) would otherwise re-mount the secret after the
+    // mask, and the staged `/taisan/runtime-auth` must be the only
+    // credential surface inside the sandbox.
+    for file in &plan.masked_files {
+        if system_bind_covers(file) {
+            let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
+            args.extend([
+                "--ro-bind".to_string(),
+                "/dev/null".to_string(),
+                s(&resolved),
+            ]);
+        }
     }
     args.extend([
         "--chdir".to_string(),
@@ -1339,6 +1341,37 @@ mod tests {
         let text = args.join(" ");
         assert!(!text.contains("uncovered-file"), "{text}");
         let _ = std::fs::remove_dir_all(&uncovered);
+    }
+
+    /// A masked path the plan also binds at its own spelling must stay
+    /// masked: the `/dev/null` shadow renders after every plan bind, so
+    /// a credential source named in argv-derived or worker binds cannot
+    /// be re-mounted over its mask.
+    #[test]
+    fn a_masked_file_bound_by_the_plan_stays_masked() {
+        let covered = Path::new("/bin/sh");
+        assert!(covered.is_file(), "test assumes /bin/sh exists");
+        let resolved = covered.canonicalize().unwrap();
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![covered.to_path_buf()];
+        plan.extra_binds = vec![resolved.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let own_bind = text
+            .find(&format!("--ro-bind {0} {0}", resolved.display()))
+            .expect("the plan binds the path at its own spelling");
+        let mask = text
+            .find(&format!("--ro-bind /dev/null {}", resolved.display()))
+            .expect("the mask renders");
+        assert!(
+            mask > own_bind,
+            "the mask must shadow the own-path bind: {text}"
+        );
     }
 
     #[test]
