@@ -208,6 +208,10 @@ fn an_unanswered_permission_read_records_unknown_authorization() {
     let store = SqliteStore::in_memory(1).unwrap();
     let config = config();
     let mut remote = InMemoryGitHub::new();
+    // The ambient login must attest the bound actor before the probe
+    // reaches the permission read — the lost response below is what
+    // this test exercises, not the attestation gate.
+    remote.set_viewer("pub-agent");
     // The permission endpoint's response is lost: authorization is
     // unconfirmed — recorded `unknown`, never `authorized`.
     remote.lose_response("read_permissions");
