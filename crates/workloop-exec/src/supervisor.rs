@@ -1676,9 +1676,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// actually promoted, and record the verdict as evidence
     /// (`docs/v0.3.md` §6.3). Runs after `handoff::drive` returns, so
     /// `produced` is durable. A report classified `invalid` or
-    /// `absent` — or carrying no claim — records nothing: claims are
-    /// evidence for later gates, never authority over the artifact,
-    /// and a `false` verdict never moves or replaces it.
+    /// `absent` — or carrying no claim — records no verdict but the
+    /// bare `HandoffAcknowledged` fact instead, so publication is
+    /// still re-driven: claims are evidence for later gates, never
+    /// authority over the artifact, and a `false` verdict never moves
+    /// or replaces it.
     fn record_claim_check(
         &self,
         store: &impl Store,
@@ -1729,7 +1731,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
             ..
         }) = report_fact
         else {
-            return Ok(());
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
         };
         // Only a validated envelope's claim is read — `invalid`
         // retains raw bytes but never a trusted claim, and `absent`
@@ -1738,7 +1746,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
             classification,
             ReportClassification::Invalid { .. } | ReportClassification::Absent
         ) {
-            return Ok(());
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
         }
         let Some(bodies) = self
             .body_store
@@ -1756,8 +1770,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // The verdict is advisory evidence for later gates, never
             // authority over the artifact: a body the retention sweep
             // already reclaimed — or that never catalogued — records
-            // no verdict, never a pass-aborting fault.
-            Ok(None) | Err(BodyError::Unavailable { .. }) => return Ok(()),
+            // no verdict and never a pass-aborting fault, but the
+            // acknowledgement still re-drives publication.
+            Ok(None) | Err(BodyError::Unavailable { .. }) => {
+                return self.report_handoff_acknowledged(
+                    store,
+                    invocation,
+                    artifact_id,
+                    &produced,
+                    now_unix_seconds,
+                );
+            }
             Err(e) => {
                 return Err(ExecError::Fault(format!("resolve worker report body: {e}")));
             }
@@ -1765,7 +1788,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let report: WorkerReportV2 = serde_json::from_slice(&resolved.bytes)
             .map_err(|e| ExecError::Fault(format!("retained worker report does not parse: {e}")))?;
         let Some(claimed) = report.claimed_head else {
-            return Ok(());
+            return self.report_handoff_acknowledged(
+                store,
+                invocation,
+                artifact_id,
+                &produced,
+                now_unix_seconds,
+            );
         };
         let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
             return Ok(());
@@ -1780,6 +1809,35 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 claimed,
                 produced,
                 agrees,
+            },
+            now_unix_seconds,
+        )
+    }
+
+    /// The acknowledgement itself, without a claim verdict: emitted
+    /// when `record_claim_check` reaches a durable `produced` commit
+    /// but cannot form a `ClaimedHeadCheck` — no retained report, an
+    /// `absent`/`invalid` classification, unavailable report bytes, or
+    /// no `claimed_head`. The fact re-drives `maybe_publish` for the
+    /// waiting Execution the same way the verdict does; without it
+    /// the publish chain would sit until the stage budget expires.
+    fn report_handoff_acknowledged(
+        &self,
+        store: &impl Store,
+        invocation: &Invocation,
+        artifact_id: &str,
+        produced: &str,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
+            return Ok(());
+        };
+        self.report(
+            store,
+            &request,
+            ObservationFact::HandoffAcknowledged {
+                artifact_id: artifact_id.to_string(),
+                produced: produced.to_string(),
             },
             now_unix_seconds,
         )
