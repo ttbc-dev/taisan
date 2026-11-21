@@ -2806,10 +2806,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // silent abandon would park the Execution `Ready` with no
             // pending request and no observation to drive it on. A
             // writer workspace must go together with its `.prepare`
-            // receipt — bound to this request's digest, it would
-            // refuse a Coding retry on 'receipt belongs to another
-            // request' — while a read role's workspace is never
-            // released.
+            // receipt — the tree is pinned to this consumed request's
+            // head, and a re-bindable receipt that outlives the launch
+            // would let a retry adopt a stale tree sight-unseen — while
+            // a read role's workspace is never released.
             let reason = if deadline_ok {
                 "execution left Ready during launch preparation"
             } else {

@@ -303,11 +303,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// intent never starves the ready intents behind it. The
     /// untouched remainder is reported `deferred`, never dropped.
     ///
-    /// Authentication is the transport's ambient credential (`gh`'s
-    /// own login or `GH_TOKEN`): this adapter performs no
-    /// per-credential binding, so `credential_blocked` is never
-    /// populated — the scenario-book credential gate belongs to the
-    /// fixture, not to this driver.
+    /// Credential binding is per intent: [`Self::attempt`] resolves
+    /// the intent's role-bound `credential_ref` and authenticates it
+    /// as the intent's authorized actor before any read or write — a
+    /// `credential.*` failure reports the intent `credential_blocked`
+    /// and leaves it pending for repair.
     pub fn apply_outbox_bounded(
         &mut self,
         store: &impl Store,
@@ -321,11 +321,26 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // is skipped for the rest of this pass — it neither loops the
         // pass forever nor blocks later independent intents.
         let mut report = OutboxReport::default();
+        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
+        // The installation-level `host_write` grant denies the whole
+        // drain — the pass still classifies every pending in-scope
+        // intent `host_write_denied` instead of returning an empty
+        // report that hides the held work.
         if !config.allowed_effects.host_write {
+            report.skipped = store.transact(|tx| {
+                Ok(tx
+                    .action_intents()?
+                    .into_iter()
+                    .filter(|i| i.status == HostActionStatus::Pending && in_scope(i))
+                    .map(|i| SkippedIntent {
+                        action_id: i.action_id,
+                        reason: "host_write_denied",
+                    })
+                    .collect())
+            })?;
             return Ok(report);
         }
         let now = clock();
-        let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
         let mut attempted = HashSet::new();
         loop {
             // Both bounds stop the drain before the next item starts:

@@ -831,9 +831,9 @@ fn a_v2_worker_runs_the_complete_wire_through_the_driver() {
     let execution = &executions[0];
     // The wire boundary completed: the Coding writer and the
     // pre-publication InvariantCheck both resolved Done. The
-    // Execution itself waits in `reconciliation` — the publish
-    // intents are outstanding and this installation denies
-    // `host_write`, so the host-outbox drain holds them by design.
+    // Execution itself waits in `reconciliation` — no
+    // CapabilityReport reaches this driver, so the capability gate
+    // records no publish intent and publication holds by design.
     assert_eq!(
         execution.state,
         ExecutionState::Waiting,

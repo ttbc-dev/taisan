@@ -20,6 +20,7 @@
 //! and is never fabricated.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -199,8 +200,17 @@ fn resolve_command_bounded(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Its own process group: a provider that forks a descendant
+        // holding the stdout pipe is reaped as a unit on timeout — the
+        // reader thread and the fd never leak on a dead child's pipe.
+        .process_group(0)
         .spawn()
         .map_err(|_| unresolvable("command provider: failed to start"))?;
+    let kill_group = |child: &std::process::Child| {
+        // SAFETY: the child spawned in its own process group, so the
+        // negative pid targets exactly that group.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    };
     // The reader reports through a channel rather than a join: a
     // provider that exits but leaves a forked descendant holding the
     // stdout pipe open would otherwise wedge `join` forever — the
@@ -224,7 +234,7 @@ fn resolve_command_bounded(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_group(&child);
                 let _ = child.wait();
                 return Err(unresolvable(
                     "command provider: did not answer within the bound",
@@ -251,6 +261,7 @@ fn resolve_command_bounded(
         Some(_) => match output_rx.recv_timeout(bound) {
             Ok(bytes) => bytes,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                kill_group(&child);
                 return Err(unresolvable(
                     "command provider: output did not close within the bound",
                 ));

@@ -455,7 +455,7 @@ impl GitlabFixture {
                 change,
                 expected_head,
                 marker,
-                ..
+                body,
             } => {
                 let actual = self.mr_head(&intent.repository, change.change_request.as_str());
                 if actual.as_deref() == Some(expected_head.object.as_str()) {
@@ -490,7 +490,12 @@ impl GitlabFixture {
                                 comment_id: note_id,
                                 actor: intent.actor.clone(),
                                 marker: marker.clone(),
-                                body_digest: "gitlab-fixture".into(),
+                                body_digest: workloop_core::domain::sha256_hex(
+                                    "comment-v1",
+                                    &workloop_core::domain::canonical_json(
+                                        &serde_json::json!({ "body": body }),
+                                    ),
+                                ),
                                 target: None,
                             }],
                         )),
