@@ -1701,6 +1701,42 @@ fn review_admission_never_exceeds_max_review_rounds() {
     assert_eq!(requests.len(), 1, "no second review request");
 }
 
+/// A Review admission is read-only like the invariant check: its
+/// request payload carries an explicitly empty required-artifact set
+/// so the recorded Invocation never waits on a workspace artifact the
+/// role does not produce.
+#[test]
+fn review_admission_records_an_empty_required_artifact_set() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(3, 1);
+    let (_, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("rart"), NOW).unwrap());
+
+    store
+        .transact(|tx| {
+            let admitted = workloop_core::work::admit_queued_role(
+                tx,
+                &config,
+                &e1,
+                InvocationRole::Review,
+                NOW,
+            )?;
+            assert!(admitted.is_some(), "first review round is within budget");
+            Ok(())
+        })
+        .unwrap();
+
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].role, InvocationRole::Review);
+    assert_eq!(
+        requests[0].payload.get("required_artifacts"),
+        Some(&serde_json::json!([])),
+        "the review request declares no required artifacts: {:?}",
+        requests[0].payload
+    );
+}
+
 /// The installation binds a dedicated reviewer App identity for the
 /// review role.
 fn config_with_reviewer() -> WorkloopConfig {

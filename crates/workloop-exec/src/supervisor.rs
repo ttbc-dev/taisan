@@ -1259,16 +1259,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // entry and refuse anything else (a staged workspace is a
         // real `git init` repository, never a gitfile). Git runs
         // through `workspace::git`'s scrubbed environment — the same
-        // hardened settings workspace preparation uses. A commit the
-        // cloned object store does not carry refuses through the
-        // same path as a snapshot that could not be taken. A v2 check
-        // pins its evidence to a produced commit and must never run
-        // against the uncommitted live tree: when the workspace
-        // repository itself is gone the durable handoff repository —
-        // the artifact's own object store, not a worker-writable
-        // surface — supplies the commit instead; only when no
-        // repository carries it does the launch refuse. The raw copy
-        // is the fallback only for a v1 check, which pins no commit.
+        // hardened settings workspace preparation uses. A commit no
+        // repository carries refuses through the same path as a
+        // snapshot that could not be taken. A v2 check pins its
+        // evidence to a produced commit and must never run against
+        // the uncommitted live tree: when the workspace repository
+        // is gone — or a successor request re-prepared it at a new
+        // base so its object store no longer carries the produced
+        // commit — the durable handoff repository (the artifact's own
+        // object store, not a worker-writable surface) supplies the
+        // commit instead; only when no repository carries it does the
+        // launch refuse. The raw copy is the fallback only for a v1
+        // check, which pins no commit.
         let real_git_dir = match std::fs::symlink_metadata(source.join(".git")) {
             Ok(meta) if meta.file_type().is_dir() => true,
             Ok(_) => {
@@ -1279,7 +1281,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Err(_) => false,
         };
         if let Some(produced) = produced {
-            let clone_source = if real_git_dir {
+            let clone_source = if real_git_dir
+                && crate::workspace::git(&source, &["cat-file", "-e", produced]).is_ok()
+            {
                 Some(source.clone())
             } else {
                 self.handoff.as_ref().and_then(|layout| {
