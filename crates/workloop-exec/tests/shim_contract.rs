@@ -864,15 +864,21 @@ fn a_sandbox_scoped_escapee_blocks_absence_without_leaking_the_port_contract() {
             .any(|m| m.identity.pid == escapee),
         "a sandbox cwd is never an occupant of an unrelated dir"
     );
-    // No host inode backs `/workspace`, so a cwd spelled inside it
-    // cannot be proven outside: the genuine scan fails closed on the
-    // same table the real port returns — the namespace query is the
-    // one that surfaces the escapee as occupant data.
-    assert!(
-        port.processes_in_directory(std::path::Path::new("/workspace"))
-            .is_err(),
-        "the genuine sandbox-root scan fails closed on the unresolvable spelling"
-    );
+    // A cwd spelled inside `/workspace` is never proven outside it.
+    // Where no host inode backs the mount the genuine scan fails
+    // closed on the same table the real port returns; where the
+    // host mounts a real `/workspace` — the remote worker
+    // containers do — the spelling resolves and the escapee is an
+    // occupant of the scan root. Either verdict keeps absence
+    // unproven; the namespace query surfaces the pid as data on
+    // both host shapes.
+    match port.processes_in_directory(std::path::Path::new("/workspace")) {
+        Err(_) => {}
+        Ok(occupants) => assert!(
+            occupants.iter().any(|m| m.identity.pid == escapee),
+            "a resolvable /workspace scan reports the contained escapee"
+        ),
+    }
     assert!(
         port.processes_in_namespace_dir(std::path::Path::new("/workspace"))
             .expect("scan")
