@@ -160,11 +160,20 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
-/// The working directory `pid` runs in, read through `lsof`. `None` on
-/// any failure — a missing `lsof`, a denied read, or a process with no
-/// reported cwd — never a guessed path. Only ever used to *attribute* a
-/// candidate; `None` makes a child less attributable, never absent-proof.
+/// The working directory `pid` runs in: `lsof` first, then the
+/// `/proc/<pid>/cwd` symlink where that filesystem exists. `None` on
+/// any failure — a denied read, a dead process, or no mechanism at
+/// all — never a guessed path. Only ever used to *attribute* a
+/// candidate; `None` makes a child less attributable, never
+/// absent-proof.
 fn cwd_of(pid: i32) -> Option<PathBuf> {
+    if let Some(cwd) = lsof_cwd_of(pid) {
+        return Some(cwd);
+    }
+    proc_cwd_of(pid)
+}
+
+fn lsof_cwd_of(pid: i32) -> Option<PathBuf> {
     let out = Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
@@ -180,6 +189,18 @@ fn cwd_of(pid: i32) -> Option<PathBuf> {
     None
 }
 
+/// `/proc/<pid>/cwd` is the same answer `lsof -d cwd` gives, without
+/// the tool — the fallback for minimal images that do not ship lsof.
+#[cfg(target_os = "linux")]
+fn proc_cwd_of(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd_of(_: i32) -> Option<PathBuf> {
+    None
+}
+
 /// Whether a child's reported cwd is the launch directory or inside it.
 /// Both sides are canonicalized so symlinked temp roots and `.`/`..`
 /// spellings compare equal; an unresolvable cwd is never a match.
@@ -188,6 +209,114 @@ pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
         return false;
     };
     std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
+}
+
+/// Every process one scan mechanism could map to a working directory:
+/// `mapped` is the pid set the completeness gate checks, `cwds` the
+/// pid → cwd pairs the occupant filter reads.
+struct CwdScan {
+    mapped: HashSet<i32>,
+    cwds: Vec<(i32, PathBuf)>,
+}
+
+/// One `lsof -d cwd` pass maps every inspectable pid to its working
+/// directory — per-pid lookups would not scale to a system-wide
+/// absence proof. Field output (`p`/`n` pairs) is parsed positionally:
+/// a process lsof cannot inspect simply has no `n` line and cannot be
+/// placed inside the scanned directory.
+fn lsof_cwds() -> Result<CwdScan, String> {
+    let out = Command::new("lsof")
+        .args(["-d", "cwd", "-F", "pn"])
+        .output()
+        .map_err(|e| format!("lsof spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "lsof failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut mapped = HashSet::new();
+    let mut cwds = Vec::new();
+    let mut pid: Option<i32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pid = rest.trim().parse().ok();
+        } else if let Some(path) = line.strip_prefix('n')
+            && let Some(pid) = pid
+        {
+            mapped.insert(pid);
+            cwds.push((pid, PathBuf::from(path)));
+        }
+    }
+    Ok(CwdScan { mapped, cwds })
+}
+
+/// The same table read straight out of `/proc`: each numeric entry's
+/// `cwd` symlink. A process whose link cannot be read — it exited, is
+/// a zombie, or belongs to a user this one cannot inspect — is simply
+/// unmapped, exactly as under lsof; the completeness gate decides
+/// whether that is a gap.
+#[cfg(target_os = "linux")]
+fn proc_cwds() -> Result<CwdScan, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc scan failed: {e}"))?;
+    let mut mapped = HashSet::new();
+    let mut cwds = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if let Ok(cwd) = std::fs::read_link(entry.path().join("cwd")) {
+            mapped.insert(pid);
+            cwds.push((pid, cwd));
+        }
+    }
+    Ok(CwdScan { mapped, cwds })
+}
+
+/// Non-Linux platforms have no `/proc`; without lsof the scan cannot
+/// enumerate at all and must fail closed.
+#[cfg(not(target_os = "linux"))]
+fn proc_cwds() -> Result<CwdScan, String> {
+    Err("no /proc filesystem on this platform".into())
+}
+
+/// The working-directory table the absence proof enumerates over.
+/// `lsof` is the primary mechanism; when it cannot produce a table —
+/// absent from the image, or a failed run — the fallback enumerates
+/// `/proc/<pid>/cwd` directly, the same table lsof reports on Linux.
+/// `Err` means neither mechanism could enumerate — never a silent
+/// empty table the absence proof could read as "no occupants".
+fn directory_cwds() -> Result<CwdScan, String> {
+    with_proc_fallback(lsof_cwds())
+}
+
+/// Mechanism selection, split from `directory_cwds` so a test can
+/// drive the lsof-failure arm without shadowing PATH.
+fn with_proc_fallback(lsof: Result<CwdScan, String>) -> Result<CwdScan, String> {
+    match lsof {
+        Err(lsof_err) => proc_cwds()
+            .map_err(|proc_err| format!("directory process scan failed: {lsof_err}; {proc_err}")),
+        ok => ok,
+    }
+}
+
+/// Whether `pid` is a kernel thread — the only kind of live process
+/// that can never hold a working directory, so its unmappable cwd is
+/// no enumeration gap. Without the exclusion a scan running as root
+/// could never complete: kernel threads share the euid and never map
+/// a cwd under any mechanism. On Linux every kernel thread descends
+/// from `kthreadd` (pid 2) and user space is never born under it, so
+/// `ppid == 2` — or pid 2 itself — is exactly that set; on macOS the
+/// kernel enters the process table as `kernel_task`, pid 0.
+#[cfg(target_os = "linux")]
+fn is_kernel_thread(pid: i32, ppid: i32) -> bool {
+    pid == 2 || ppid == 2
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_kernel_thread(pid: i32, _: i32) -> bool {
+    pid == 0
 }
 
 /// Every process identity the store already accounts for — leaders,
@@ -500,7 +629,7 @@ impl ProcessControlPort for PosixProcessControl {
     }
 
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
-        // Enumerate this user's processes before the `lsof` pass: the
+        // Enumerate this user's processes before the cwd pass: the
         // absence proof is only as strong as the table's completeness
         // — a live process whose cwd cannot be mapped could be inside
         // `dir`, so the scan is `Err` whenever a same-user live
@@ -511,18 +640,21 @@ impl ProcessControlPort for PosixProcessControl {
         // cannot be this supervisor's spawn and stays the documented
         // residual.
         let euid = unsafe { libc::geteuid() };
-        let table =
-            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
+        let table = ps_output(&["-ewwo", "pid=,ppid=,uid="])
+            .map_err(|e| format!("process scan failed: {e}"))?;
         let mut same_user_pids = Vec::new();
         for line in table.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let mut it = line.split_whitespace();
-            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
+            let (Some(pid), Some(ppid), Some(uid)) = (it.next(), it.next(), it.next()) else {
                 return Err(format!("incomplete process-table row: {line}"));
             };
             let pid: i32 = pid
+                .parse()
+                .map_err(|_| format!("invalid process-table row: {line}"))?;
+            let ppid: i32 = ppid
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
             // `ps` prints some kernel/nobody uids as negatives on macOS
@@ -533,49 +665,27 @@ impl ProcessControlPort for PosixProcessControl {
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
             if uid == euid as i64 {
-                same_user_pids.push(pid);
+                same_user_pids.push((pid, ppid));
             }
         }
-        // One `lsof -d cwd` pass maps every inspectable pid to its
-        // working directory — per-pid lookups would not scale to a
-        // system-wide absence proof. Field output (`p`/`n` pairs) is
-        // parsed positionally: a process lsof cannot inspect simply
-        // has no `n` line and cannot be placed inside `dir`.
+        // One pass maps every inspectable pid to its working directory
+        // — per-pid lookups would not scale to a system-wide absence
+        // proof. `lsof` is the primary mechanism and `/proc` the Linux
+        // fallback (`directory_cwds`); a process neither could map
+        // simply has no cwd row and the completeness gate decides
+        // whether that is a gap.
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let out = Command::new("lsof")
-            .args(["-d", "cwd", "-F", "pn"])
-            .output()
-            .map_err(|e| format!("directory process scan failed: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "lsof failed ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let mut mapped = HashSet::new();
-        let mut occupants = Vec::new();
-        let mut pid: Option<i32> = None;
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some(rest) = line.strip_prefix('p') {
-                pid = rest.trim().parse().ok();
-            } else if let Some(path) = line.strip_prefix('n')
-                && let Some(pid) = pid
-            {
-                mapped.insert(pid);
-                occupants.push((pid, PathBuf::from(path)));
-            }
-        }
+        let scan = directory_cwds()?;
         // Completeness gate before any occupant answer: a live
-        // same-user process lsof could not map to a cwd makes the
+        // same-user process the scan could not map to a cwd makes the
         // whole enumeration partial — its cwd might be inside `dir`,
         // so the table can never authorize absence.
-        for pid in same_user_pids {
-            if mapped.contains(&pid) {
+        for (pid, ppid) in same_user_pids {
+            if scan.mapped.contains(&pid) {
                 continue;
             }
             match lstart_of(pid) {
-                // Exited between the pid-list and lsof reads — not a
+                // Exited between the pid-list and cwd reads — not a
                 // gap, just a process that was already gone.
                 LstartLookup::Absent => continue,
                 LstartLookup::Failed(reason) => return Err(reason),
@@ -589,17 +699,22 @@ impl ProcessControlPort for PosixProcessControl {
             if stat.contains('Z') {
                 continue;
             }
+            // A kernel thread can never hold a working directory — it
+            // cannot occupy `dir`, so its unmappable cwd is no gap.
+            if is_kernel_thread(pid, ppid) {
+                continue;
+            }
             return Err(format!(
                 "directory scan incomplete: live process {pid} has no readable cwd"
             ));
         }
         let mut out = Vec::new();
-        for (pid, cwd) in occupants {
+        for (pid, cwd) in scan.cwds {
             // `cwd_within` canonicalizes the reported path and treats
             // an unresolvable cwd as "not inside" — but a reported
             // path spelled inside `dir` cannot be proven outside it
-            // either (a live writer whose cwd was deleted). `mapped`
-            // already holds the pid, so skipping it here would slip
+            // either (a live writer whose cwd was deleted). The pid is
+            // already mapped, so skipping it here would slip
             // it past the completeness gate: fail the scan instead,
             // matching the same fail-closed contract.
             if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
@@ -612,7 +727,7 @@ impl ProcessControlPort for PosixProcessControl {
                 continue;
             }
             // Same re-verification as the signature scan: a pid that
-            // exited between the lsof pass and now drops out, and a
+            // exited between the cwd pass and now drops out, and a
             // start-time lookup failure fails the whole scan — a
             // partial table can never authorize absence.
             let started_at = match lstart_of(pid) {
@@ -4689,6 +4804,36 @@ mod tests {
         assert!(checked_ps_output(output(1, b"process table unavailable"), true).is_err());
         assert!(checked_ps_output(output(2, b""), true).is_err());
         assert!(checked_ps_output(output(1, b""), false).is_err());
+    }
+
+    /// A Linux scan without lsof still enumerates — `/proc/<pid>/cwd`
+    /// carries the same table. The calling test process is the
+    /// fixture: its own cwd must appear in both the whole-table scan
+    /// and the single-pid read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_fallback_maps_cwds_without_lsof() {
+        let pid = std::process::id() as i32;
+        let scan = with_proc_fallback(Err("injected lsof failure".into()))
+            .expect("/proc fallback enumerates");
+        assert!(scan.mapped.contains(&pid));
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(
+            scan.cwds
+                .iter()
+                .any(|(p, c)| *p == pid && std::fs::canonicalize(c).ok().as_ref() == Some(&cwd)),
+            "the /proc scan maps this process's cwd"
+        );
+        let single = proc_cwd_of(pid).expect("own cwd through /proc");
+        assert_eq!(std::fs::canonicalize(single).unwrap(), cwd);
+    }
+
+    /// With no working mechanism the scan is `Err` — an empty table
+    /// would read back as a false absence proof.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn directory_scan_fails_closed_when_no_mechanism_enumerates() {
+        assert!(with_proc_fallback(Err("injected lsof failure".into())).is_err());
     }
 
     struct SnapshotFailure;
