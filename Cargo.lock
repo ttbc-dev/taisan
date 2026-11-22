@@ -576,6 +576,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "taisan-worker-claude"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "workloop-core",
+]
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

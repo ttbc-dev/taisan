@@ -1,0 +1,90 @@
+schema_version = 1
+
+# Composed public reference configuration: the packaged public Selector
+# (public-issue-selector) plus the packaged public Worker
+# (taisan-worker-claude driving the Claude Code CLI). Every value here
+# is an example placeholder — substitute your own repository id,
+# actors, credential references, and paths before a real install.
+
+[installation]
+capacity_slots = 1
+
+[hosts.h1]
+adapter = "github"
+endpoint = "https://api.github.com"
+contract_version = 1
+
+[[hosts.h1.repositories]]
+id = "123456789"
+display = "owner/reference-repository"
+use = "publication"
+
+[roles.publication]
+host = "h1"
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[roles.review]
+host = "h1"
+actor = "example-reviewer"
+credential_ref = "file:/home/operator/.config/taisan/reviewer.token"
+
+[roles.discussion]
+host = "h1"
+actor = "example-publisher"
+credential_ref = "env:TAISAN_GH_TOKEN"
+
+[identity_evidence.publication]
+login = "example-publisher"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+[identity_evidence.review]
+login = "example-reviewer"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+[identity_evidence.discussion]
+login = "example-publisher"
+host_instance = "https://api.github.com"
+repository = "123456789"
+observed_unix_seconds = 1700000000
+
+# The public reference Worker. `claude` must resolve on PATH for the
+# supervisor's describe/--version probes; the runtime credential is
+# resolved by reference and staged at /taisan/runtime-auth — never in
+# this file or on argv.
+[worker]
+argv = ["taisan-worker-claude", "--runtime", "claude"]
+isolation_profile = "taisan-reference-v0.1"
+runtime_version = ">=1.0.0"
+max_turns = 200
+
+[verification.egress]
+allowlist = ["api.github.com", "crates.io", "static.crates.io"]
+
+[capabilities.required]
+publication = ["repository_read", "branch_read", "push_ref", "change_request_read", "change_request_create", "change_request_update", "comment_write", "ready"]
+review = ["repository_read", "branch_read", "review_feedback", "inline_comment", "thread_reply", "thread_resolve"]
+discussion = ["comment_read", "comment_write"]
+
+[intake]
+enabled = true
+interval_minutes = 30
+timeout_seconds = 120
+pending_queue_limit = 10
+
+# The public reference Selector. The --github-endpoint declaration is
+# required: the adapter's scope is fail-closed and reads go through
+# ambient `gh` authentication. --label values are an all-of filter.
+[intake.selector]
+adapter = "public-issue-selector"
+selector_version = 1
+policy_revision = 1
+argv = ["public-issue-selector", "select", "--github-endpoint", "https://api.github.com", "--label", "taisan"]
+# Task defaults echoed verbatim into every proposal's task.
+task_constraints = ["keep the change small and reviewable"]
+verification_argv = ["cargo", "test", "--workspace"]
+required_permissions = []
