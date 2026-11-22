@@ -864,12 +864,21 @@ fn a_sandbox_scoped_escapee_blocks_absence_without_leaking_the_port_contract() {
             .any(|m| m.identity.pid == escapee),
         "a sandbox cwd is never an occupant of an unrelated dir"
     );
+    // No host inode backs `/workspace`, so a cwd spelled inside it
+    // cannot be proven outside: the genuine scan fails closed on the
+    // same table the real port returns — the namespace query is the
+    // one that surfaces the escapee as occupant data.
     assert!(
         port.processes_in_directory(std::path::Path::new("/workspace"))
+            .is_err(),
+        "the genuine sandbox-root scan fails closed on the unresolvable spelling"
+    );
+    assert!(
+        port.processes_in_namespace_dir(std::path::Path::new("/workspace"))
             .expect("scan")
             .iter()
             .any(|m| m.identity.pid == escapee),
-        "the sandbox root scan sees the contained escapee"
+        "the namespace query sees the contained escapee"
     );
     // Past the window the launch scope still holds an unexplained
     // process: the sandbox-root scan counts the escapee, so no absence.
@@ -891,6 +900,92 @@ fn a_sandbox_scoped_escapee_blocks_absence_without_leaking_the_port_contract() {
     let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
     assert_eq!(slots, 0, "proven absence releases the capacity slot");
     assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// The sandbox-root scan must still reach the recorded-occupant
+/// judgment when a contained worker's cwd cannot resolve on the
+/// host: `/workspace` has no host inode, so the genuine scan fails
+/// closed on the spelling — but the namespace query reports the
+/// occupant as data, and a worker the store already records is not
+/// unexplained. The remote lane runs several contained workers at
+/// once: without the recorded judgment a live sibling worker would
+/// hold an unidentified launch `Prepared` — and its slot — forever.
+#[test]
+fn a_recorded_sandbox_occupant_does_not_block_the_absence_proof() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-sandbox-recorded");
+    let port = ScriptedProcessControl::new();
+    // Same contained-launch gate as the sandbox-escapee test: the
+    // version probe plus the nine-probe battery; later probes fall
+    // through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = Supervisor::new(port.clone(), root, vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-sandbox-recorded",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (_w, eid) = submit_and_admit(&store, "k-shim-sandbox-recorded");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone. A sibling contained invocation's
+    // writer is still live at `/workspace` — the remote lane's
+    // normal shape — and the store records its identity, so the
+    // namespace scan's occupant is accounted for, not unexplained.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let sibling = port
+        .spawn(
+            &["other-contained-worker".into()],
+            std::path::Path::new("/workspace"),
+            &WorkerEnv::default(),
+        )
+        .expect("sibling spawn");
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId("inv-sibling".into()),
+                    request_id: "req-sibling".into(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: Some(sibling.clone()),
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })
+        })
+        .unwrap();
+    assert!(
+        port.processes_in_namespace_dir(std::path::Path::new("/workspace"))
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == sibling.pid),
+        "the namespace query reports the recorded sibling worker"
+    );
+    // Past the window the launch scope holds only recorded
+    // occupants: absence is proven and the launch abandons instead
+    // of wedging on a worker it was never meant to wait for.
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned,
+        "a recorded contained occupant must not hold absence open"
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    // The only second spawn is the test's recorded sibling — the
+    // supervisor never started a replacement writer.
+    assert_eq!(port.spawn_calls(), 2);
 }
 
 /// A v1 Review launch mounts the managed workspace read-only: the

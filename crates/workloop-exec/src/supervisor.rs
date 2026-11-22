@@ -505,6 +505,156 @@ fn apply_worker_env(cmd: &mut Command, env: &WorkerEnv) {
     cmd.envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 }
 
+/// How the directory-occupant scan treats a reported cwd that reads
+/// inside `dir` but the host cannot resolve — a deleted directory a
+/// live writer still holds, or a mount-namespace spelling (the
+/// sandbox workspace root) with no host inode behind it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnresolvedOccupant {
+    /// `processes_in_directory`: the path cannot be proven outside
+    /// `dir`, so the enumeration is incomplete and the whole read
+    /// fails — never a truncated proof set.
+    FailClosed,
+    /// `processes_in_namespace_dir`: under a namespace spelling of
+    /// `dir` the reported path IS the occupancy evidence, so the
+    /// process is returned with its literal cwd — data the caller's
+    /// recorded-occupant filter judges per pid.
+    Report,
+}
+
+/// The working-directory occupant scan behind both directory
+/// queries. `processes_in_directory` and
+/// `processes_in_namespace_dir` share the process table, the
+/// completeness gate, and the canonical containment judgment; they
+/// differ only at the unresolvable-spelling edge
+/// (`UnresolvedOccupant`).
+fn directory_occupants(
+    dir: &Path,
+    unresolved: UnresolvedOccupant,
+) -> Result<Vec<ProcessMatch>, String> {
+    // Enumerate this user's processes before the cwd pass: the
+    // absence proof is only as strong as the table's completeness
+    // — a live process whose cwd cannot be mapped could be inside
+    // `dir`, so the scan is `Err` whenever a same-user live
+    // process has no readable cwd. Reading the pid list first
+    // means a process born between the two reads is never misread
+    // as a gap; one that exits between them drops out on the
+    // liveness re-verify below. Another user's unreadable process
+    // cannot be this supervisor's spawn and stays the documented
+    // residual.
+    let euid = unsafe { libc::geteuid() };
+    let table =
+        ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
+    let mut same_user_pids = Vec::new();
+    for line in table.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
+            return Err(format!("incomplete process-table row: {line}"));
+        };
+        let pid: i32 = pid
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+        // `ps` prints some kernel/nobody uids as negatives on macOS
+        // (nobody is -2); a signed parse keeps those legitimate
+        // rows and they can never equal the non-negative euid, so
+        // the comparison stays fail-closed.
+        let uid: i64 = uid
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+        if uid == euid as i64 {
+            same_user_pids.push(pid);
+        }
+    }
+    // One pass maps every inspectable pid to its working directory
+    // — per-pid lookups would not scale to a system-wide absence
+    // proof. `lsof` is the primary mechanism and `/proc` the Linux
+    // fallback (`directory_cwds`); a process neither could map
+    // simply has no cwd row and the completeness gate decides
+    // whether that is a gap.
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let scan = directory_cwds()?;
+    // Completeness gate before any occupant answer: a live
+    // same-user process the scan could not map to a cwd makes the
+    // whole enumeration partial — its cwd might be inside `dir`,
+    // so the table can never authorize absence.
+    for pid in same_user_pids {
+        if scan.mapped.contains(&pid) {
+            continue;
+        }
+        match lstart_of(pid) {
+            // Exited between the pid-list and cwd reads — not a
+            // gap, just a process that was already gone.
+            LstartLookup::Absent => continue,
+            LstartLookup::Failed(reason) => return Err(reason),
+            LstartLookup::Present(_) => {}
+        }
+        // Gone between the liveness check and the stat read, or a
+        // zombie — either way it cannot write inside `dir`.
+        let Some(stat) = stat_of(pid) else {
+            continue;
+        };
+        if stat.contains('Z') {
+            continue;
+        }
+        // A kernel thread can never hold a working directory — it
+        // cannot occupy `dir`, so its unmappable cwd is no gap.
+        if is_kernel_thread(pid) {
+            continue;
+        }
+        return Err(format!(
+            "directory scan incomplete: live process {pid} has no readable cwd"
+        ));
+    }
+    let mut out = Vec::new();
+    for (pid, cwd) in scan.cwds {
+        // `cwd_within` canonicalizes the reported path and treats
+        // an unresolvable cwd as "not inside" — but a reported
+        // path spelled inside `dir` cannot be proven outside it
+        // either (a live writer whose cwd was deleted, or a
+        // mount-namespace spelling no host inode backs). The pid
+        // is already mapped, so skipping it here would slip it
+        // past the completeness gate: the genuine scan fails
+        // closed, the namespace query reports the literal
+        // spelling as an occupant the caller judges per pid.
+        let unresolvable_inside = std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir);
+        if unresolvable_inside && unresolved == UnresolvedOccupant::FailClosed {
+            return Err(format!(
+                "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                cwd.display()
+            ));
+        }
+        if !unresolvable_inside && !cwd_within(Some(&cwd), &dir) {
+            continue;
+        }
+        // Same re-verification as the signature scan: a pid that
+        // exited between the cwd pass and now drops out, and a
+        // start-time lookup failure fails the whole scan — a
+        // partial table can never authorize absence.
+        let started_at = match lstart_of(pid) {
+            LstartLookup::Present(s) => s,
+            LstartLookup::Absent => continue,
+            LstartLookup::Failed(reason) => return Err(reason),
+        };
+        if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
+            continue;
+        }
+        let pgid = unsafe { libc::getpgid(pid) };
+        out.push(ProcessMatch {
+            identity: ProcessIdentity {
+                pid,
+                started_at,
+                pgid: if pgid > 0 { Some(pgid) } else { None },
+            },
+            cwd: Some(cwd),
+            command: None,
+        });
+    }
+    Ok(out)
+}
+
 impl ProcessControlPort for PosixProcessControl {
     fn spawn(
         &self,
@@ -661,124 +811,11 @@ impl ProcessControlPort for PosixProcessControl {
     }
 
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
-        // Enumerate this user's processes before the cwd pass: the
-        // absence proof is only as strong as the table's completeness
-        // — a live process whose cwd cannot be mapped could be inside
-        // `dir`, so the scan is `Err` whenever a same-user live
-        // process has no readable cwd. Reading the pid list first
-        // means a process born between the two reads is never misread
-        // as a gap; one that exits between them drops out on the
-        // liveness re-verify below. Another user's unreadable process
-        // cannot be this supervisor's spawn and stays the documented
-        // residual.
-        let euid = unsafe { libc::geteuid() };
-        let table =
-            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
-        let mut same_user_pids = Vec::new();
-        for line in table.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
-                return Err(format!("incomplete process-table row: {line}"));
-            };
-            let pid: i32 = pid
-                .parse()
-                .map_err(|_| format!("invalid process-table row: {line}"))?;
-            // `ps` prints some kernel/nobody uids as negatives on macOS
-            // (nobody is -2); a signed parse keeps those legitimate
-            // rows and they can never equal the non-negative euid, so
-            // the comparison stays fail-closed.
-            let uid: i64 = uid
-                .parse()
-                .map_err(|_| format!("invalid process-table row: {line}"))?;
-            if uid == euid as i64 {
-                same_user_pids.push(pid);
-            }
-        }
-        // One pass maps every inspectable pid to its working directory
-        // — per-pid lookups would not scale to a system-wide absence
-        // proof. `lsof` is the primary mechanism and `/proc` the Linux
-        // fallback (`directory_cwds`); a process neither could map
-        // simply has no cwd row and the completeness gate decides
-        // whether that is a gap.
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let scan = directory_cwds()?;
-        // Completeness gate before any occupant answer: a live
-        // same-user process the scan could not map to a cwd makes the
-        // whole enumeration partial — its cwd might be inside `dir`,
-        // so the table can never authorize absence.
-        for pid in same_user_pids {
-            if scan.mapped.contains(&pid) {
-                continue;
-            }
-            match lstart_of(pid) {
-                // Exited between the pid-list and cwd reads — not a
-                // gap, just a process that was already gone.
-                LstartLookup::Absent => continue,
-                LstartLookup::Failed(reason) => return Err(reason),
-                LstartLookup::Present(_) => {}
-            }
-            // Gone between the liveness check and the stat read, or a
-            // zombie — either way it cannot write inside `dir`.
-            let Some(stat) = stat_of(pid) else {
-                continue;
-            };
-            if stat.contains('Z') {
-                continue;
-            }
-            // A kernel thread can never hold a working directory — it
-            // cannot occupy `dir`, so its unmappable cwd is no gap.
-            if is_kernel_thread(pid) {
-                continue;
-            }
-            return Err(format!(
-                "directory scan incomplete: live process {pid} has no readable cwd"
-            ));
-        }
-        let mut out = Vec::new();
-        for (pid, cwd) in scan.cwds {
-            // `cwd_within` canonicalizes the reported path and treats
-            // an unresolvable cwd as "not inside" — but a reported
-            // path spelled inside `dir` cannot be proven outside it
-            // either (a live writer whose cwd was deleted). The pid is
-            // already mapped, so skipping it here would slip
-            // it past the completeness gate: fail the scan instead,
-            // matching the same fail-closed contract.
-            if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
-                return Err(format!(
-                    "directory scan incomplete: process {pid} cwd {} is not resolvable",
-                    cwd.display()
-                ));
-            }
-            if !cwd_within(Some(&cwd), &dir) {
-                continue;
-            }
-            // Same re-verification as the signature scan: a pid that
-            // exited between the cwd pass and now drops out, and a
-            // start-time lookup failure fails the whole scan — a
-            // partial table can never authorize absence.
-            let started_at = match lstart_of(pid) {
-                LstartLookup::Present(s) => s,
-                LstartLookup::Absent => continue,
-                LstartLookup::Failed(reason) => return Err(reason),
-            };
-            if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
-                continue;
-            }
-            let pgid = unsafe { libc::getpgid(pid) };
-            out.push(ProcessMatch {
-                identity: ProcessIdentity {
-                    pid,
-                    started_at,
-                    pgid: if pgid > 0 { Some(pgid) } else { None },
-                },
-                cwd: Some(cwd),
-                command: None,
-            });
-        }
-        Ok(out)
+        directory_occupants(dir, UnresolvedOccupant::FailClosed)
+    }
+
+    fn processes_in_namespace_dir(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        directory_occupants(dir, UnresolvedOccupant::Report)
     }
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
@@ -3854,13 +3891,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
         contained: bool,
         recorded: &HashSet<(i32, String)>,
     ) -> bool {
-        let clear = |scope: &Path| match self.port.processes_in_directory(scope) {
+        let clear = |occupants: Result<Vec<ProcessMatch>, String>| match occupants {
             Ok(occupants) => occupants
                 .iter()
                 .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
             Err(_) => false,
         };
-        clear(dir) && (!contained || clear(Path::new(containment::SANDBOX_WORKSPACE)))
+        // The sandbox root is a mount-namespace spelling, not a host
+        // dir: on a host with no real `/workspace` every live
+        // contained worker's `/proc` cwd reads `/workspace` and
+        // cannot canonicalize, which fails the genuine scan before
+        // the recorded filter ever runs — another execution's
+        // recorded contained worker would hold absence unprovable
+        // forever. The namespace query reports that spelling as an
+        // occupant instead, so the same recorded judgment applies
+        // per pid: a recorded contained worker no longer blocks,
+        // an unexplained one still does.
+        clear(self.port.processes_in_directory(dir))
+            && (!contained
+                || clear(
+                    self.port
+                        .processes_in_namespace_dir(Path::new(containment::SANDBOX_WORKSPACE)),
+                ))
     }
 
     /// Report an unidentified launch as still unknown — the same
