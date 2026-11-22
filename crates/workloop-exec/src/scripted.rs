@@ -535,7 +535,7 @@ impl ProcessControlPort for ScriptedProcessControl {
         }
         Ok(s.procs
             .iter()
-            .filter(|(_, p)| p.alive && crate::supervisor::cwd_within(Some(&p.cwd), dir))
+            .filter(|(_, p)| p.alive && crate::supervisor::cwd_in_launch_scope(Some(&p.cwd), dir))
             .map(|(pid, p)| ProcessMatch {
                 identity: ProcessIdentity {
                     pid: *pid,

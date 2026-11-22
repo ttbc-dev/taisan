@@ -211,6 +211,17 @@ pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
     std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
 }
 
+/// Whether a reported cwd places its process inside the launch scope
+/// the occupancy proof enumerates: within `dir`, or under
+/// `SANDBOX_WORKSPACE` — a contained worker's launch workspace is
+/// bind-mounted at that root, so its `/proc/<pid>/cwd` resolves to the
+/// sandbox spelling rather than the host launch directory. Without the
+/// special case a live contained descendant is invisible to the
+/// occupant filter — the false absence this scan exists to prevent.
+pub(crate) fn cwd_in_launch_scope(cwd: Option<&Path>, dir: &Path) -> bool {
+    cwd_within(cwd, dir) || cwd.is_some_and(|cwd| cwd.starts_with(containment::SANDBOX_WORKSPACE))
+}
+
 /// Every process one scan mechanism could map to a working directory:
 /// `mapped` is the pid set the completeness gate checks, `cwds` the
 /// pid → cwd pairs the occupant filter reads.
@@ -301,21 +312,40 @@ fn with_proc_fallback(lsof: Result<CwdScan, String>) -> Result<CwdScan, String> 
     }
 }
 
+/// `PF_KTHREAD` — field 9 of `/proc/<pid>/stat` — marks a kernel
+/// thread in every PID namespace. The field is counted after `comm`,
+/// whose parenthesized text may itself contain spaces and `)`, so
+/// parsing resumes after the LAST `)`.
+#[cfg(target_os = "linux")]
+const PF_KTHREAD: u64 = 0x0020_0000;
+
+#[cfg(target_os = "linux")]
+fn proc_stat_flags(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(6)?.parse().ok()
+}
+
 /// Whether `pid` is a kernel thread — the only kind of live process
 /// that can never hold a working directory, so its unmappable cwd is
 /// no enumeration gap. Without the exclusion a scan running as root
 /// could never complete: kernel threads share the euid and never map
-/// a cwd under any mechanism. On Linux every kernel thread descends
-/// from `kthreadd` (pid 2) and user space is never born under it, so
-/// `ppid == 2` — or pid 2 itself — is exactly that set; on macOS the
-/// kernel enters the process table as `kernel_task`, pid 0.
+/// a cwd under any mechanism. On Linux the marker is `PF_KTHREAD`,
+/// which holds in every PID namespace — the pid-2 descent test does
+/// not: inside a container namespace pid 2 is ordinary userspace, and
+/// exempting it would let a live writer slip the completeness gate.
+/// An unreadable stat is not proof of kernel-ness — the process stays
+/// a gap and the scan fails closed. On macOS the kernel enters the
+/// process table as `kernel_task`, pid 0.
 #[cfg(target_os = "linux")]
-fn is_kernel_thread(pid: i32, ppid: i32) -> bool {
-    pid == 2 || ppid == 2
+fn is_kernel_thread(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| proc_stat_flags(&stat))
+        .is_some_and(|flags| flags & PF_KTHREAD != 0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn is_kernel_thread(pid: i32, _: i32) -> bool {
+fn is_kernel_thread(pid: i32) -> bool {
     pid == 0
 }
 
@@ -680,7 +710,7 @@ impl ProcessControlPort for PosixProcessControl {
         // same-user process the scan could not map to a cwd makes the
         // whole enumeration partial — its cwd might be inside `dir`,
         // so the table can never authorize absence.
-        for (pid, ppid) in same_user_pids {
+        for (pid, _) in same_user_pids {
             if scan.mapped.contains(&pid) {
                 continue;
             }
@@ -701,7 +731,7 @@ impl ProcessControlPort for PosixProcessControl {
             }
             // A kernel thread can never hold a working directory — it
             // cannot occupy `dir`, so its unmappable cwd is no gap.
-            if is_kernel_thread(pid, ppid) {
+            if is_kernel_thread(pid) {
                 continue;
             }
             return Err(format!(
@@ -723,7 +753,7 @@ impl ProcessControlPort for PosixProcessControl {
                     cwd.display()
                 ));
             }
-            if !cwd_within(Some(&cwd), &dir) {
+            if !cwd_in_launch_scope(Some(&cwd), &dir) {
                 continue;
             }
             // Same re-verification as the signature scan: a pid that
@@ -3682,11 +3712,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // is exactly the launch's workspace bind, so it satisfies the
         // same "inside the launch directory" rule.
         match unrecorded.as_slice() {
-            [child]
-                if cwd_within(child.cwd.as_deref(), &canonical_dir)
-                    || child.cwd.as_deref()
-                        == Some(std::path::Path::new(containment::SANDBOX_WORKSPACE)) =>
-            {
+            [child] if cwd_in_launch_scope(child.cwd.as_deref(), &canonical_dir) => {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -4826,6 +4852,64 @@ mod tests {
         );
         let single = proc_cwd_of(pid).expect("own cwd through /proc");
         assert_eq!(std::fs::canonicalize(single).unwrap(), cwd);
+    }
+
+    /// `PF_KTHREAD` (field 9) marks a kernel thread in every PID
+    /// namespace; the parser must count past a `comm` that itself
+    /// contains spaces and `)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_flags_reads_flags_past_comm() {
+        // `kthreadd` carries PF_KTHREAD in field 9.
+        assert_eq!(
+            proc_stat_flags("2 (kthreadd) S 0 0 0 0 2097152 0 0"),
+            Some(0x0020_0000)
+        );
+        // A userspace row never does.
+        assert_eq!(
+            proc_stat_flags("42 (worker) S 1 42 42 0 -1 4194304 0"),
+            Some(4194304)
+        );
+        // Splitting on the FIRST `)` would misfield a `comm` like this.
+        assert_eq!(
+            proc_stat_flags("7 (odd ) name) S 1 7 7 0 -1 2097152 0"),
+            Some(0x0020_0000)
+        );
+        // Malformed input yields no answer rather than a wrong one.
+        assert_eq!(proc_stat_flags("garbage"), None);
+        assert_eq!(proc_stat_flags("5 (x) S 1"), None);
+    }
+
+    /// The live check agrees: pid 1 is userspace in every PID
+    /// namespace — including a container's, where pid 2 is userspace
+    /// too — and an unreadable stat is never kernel-thread proof, so
+    /// the completeness gate stays fail-closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_thread_check_uses_stat_flags_not_pid2() {
+        assert!(!is_kernel_thread(1));
+        assert!(!is_kernel_thread(std::process::id() as i32));
+        assert!(!is_kernel_thread(i32::MAX));
+    }
+
+    /// A contained worker's cwd reads as the sandbox mount, not the
+    /// host launch directory — launch scope counts `/workspace` (and
+    /// paths under it) as inside, so the occupant filter cannot miss
+    /// a live contained descendant.
+    #[test]
+    fn launch_scope_covers_the_sandbox_workspace_mount() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let sandbox = Path::new(containment::SANDBOX_WORKSPACE);
+        assert!(cwd_in_launch_scope(Some(sandbox), &dir));
+        assert!(cwd_in_launch_scope(Some(&sandbox.join("nested")), &dir));
+        assert!(cwd_in_launch_scope(Some(dir.as_path()), &dir));
+        assert!(!cwd_in_launch_scope(Some(Path::new("/")), &dir));
+        assert!(!cwd_in_launch_scope(None, &dir));
+        // Component-wise matching: a sibling spelling does not count.
+        assert!(!cwd_in_launch_scope(
+            Some(Path::new("/workspace-sibling")),
+            &dir
+        ));
     }
 
     /// With no working mechanism the scan is `Err` — an empty table
