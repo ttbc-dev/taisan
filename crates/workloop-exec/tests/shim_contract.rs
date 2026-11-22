@@ -802,6 +802,97 @@ fn a_contained_orphan_rebinds_on_its_sandbox_workspace_cwd() {
     assert_eq!(invocation.state, InvocationState::Running);
 }
 
+/// A contained launch's escaped descendant reports the sandbox mount
+/// as its cwd — never the host launch directory. The port contract is
+/// unscoped: `processes_in_directory` answers "cwd inside this dir"
+/// alone, so the escapee is an occupant of `/workspace` and of no
+/// host dir. The absence proof's launch scope scans the sandbox root
+/// for a contained launch, so the same escapee still blocks absence —
+/// the special case lives in the launch-scope judgment, not the port.
+#[test]
+fn a_sandbox_scoped_escapee_blocks_absence_without_leaking_the_port_contract() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-sandbox-escapee");
+    let port = ScriptedProcessControl::new();
+    // Exactly the launch gate: the version probe plus the nine-probe
+    // battery. Every later probe — `describe` and the recovery pass's
+    // re-proof — falls through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = Supervisor::new(port.clone(), root, vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-sandbox-escapee",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+        });
+    let (w, eid) = submit_and_admit(&store, "k-shim-sandbox-escapee");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The lost leader is gone; its escaped descendant keeps running
+    // inside the sandbox — a different argv the signature scan cannot
+    // see, and a cwd that reads the sandbox mount.
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let escapee =
+        port.adopt_child_with(leader, "fixture-worker escaped-writer --file heartbeat.log");
+    port.set_cwd(escapee, std::path::Path::new("/workspace"));
+    // Port contract: `/workspace` is inside no host dir — the escapee
+    // is not an occupant of the launch workspace nor of any unrelated
+    // directory; it IS an occupant of the sandbox root the contained
+    // launch scope adds.
+    let ws = sup.workspace_of(&w);
+    assert!(
+        !port
+            .processes_in_directory(&ws)
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == escapee),
+        "a sandbox cwd is never an occupant of the host launch dir"
+    );
+    let elsewhere = tmp_root("unidentified-sandbox-elsewhere");
+    assert!(
+        !port
+            .processes_in_directory(&elsewhere)
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == escapee),
+        "a sandbox cwd is never an occupant of an unrelated dir"
+    );
+    assert!(
+        port.processes_in_directory(std::path::Path::new("/workspace"))
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == escapee),
+        "the sandbox root scan sees the contained escapee"
+    );
+    // Past the window the launch scope still holds an unexplained
+    // process: the sandbox-root scan counts the escapee, so no absence.
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared,
+        "a sandbox-scoped escapee keeps the absence unproven"
+    );
+    assert!(only_invocation(&store, &eid).process_identity.is_none());
+    // The escapee exits: the whole launch scope is provably clear and
+    // the launch abandons, releasing the slot.
+    port.exit(escapee, 0);
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0, "proven absence releases the capacity slot");
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
 /// A v1 Review launch mounts the managed workspace read-only: the
 /// assessment reads produced state and a review process must never
 /// mutate the artifact workspace — writers are the only roles that

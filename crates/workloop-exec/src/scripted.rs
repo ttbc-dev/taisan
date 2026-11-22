@@ -535,7 +535,16 @@ impl ProcessControlPort for ScriptedProcessControl {
         }
         Ok(s.procs
             .iter()
-            .filter(|(_, p)| p.alive && crate::supervisor::cwd_in_launch_scope(Some(&p.cwd), dir))
+            // The contract is "cwd inside `dir`" — never widened to the
+            // launch scope; the supervisor layers `SANDBOX_WORKSPACE`
+            // on at its own call sites. The model's cwd is ground
+            // truth: `cwd_within` canonicalizes host-backed spellings,
+            // and a path no host inode backs (a contained worker's
+            // `/workspace`) compares literally.
+            .filter(|(_, p)| {
+                p.alive
+                    && (crate::supervisor::cwd_within(Some(&p.cwd), dir) || p.cwd.starts_with(dir))
+            })
             .map(|(pid, p)| ProcessMatch {
                 identity: ProcessIdentity {
                     pid: *pid,

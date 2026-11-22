@@ -211,13 +211,15 @@ pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
     std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
 }
 
-/// Whether a reported cwd places its process inside the launch scope
-/// the occupancy proof enumerates: within `dir`, or under
-/// `SANDBOX_WORKSPACE` — a contained worker's launch workspace is
-/// bind-mounted at that root, so its `/proc/<pid>/cwd` resolves to the
-/// sandbox spelling rather than the host launch directory. Without the
-/// special case a live contained descendant is invisible to the
-/// occupant filter — the false absence this scan exists to prevent.
+/// Whether a reported cwd places its process inside the launch scope:
+/// within `dir`, or under `SANDBOX_WORKSPACE` — a contained worker's
+/// launch workspace is bind-mounted at that root, so its
+/// `/proc/<pid>/cwd` resolves to the sandbox spelling rather than the
+/// host launch directory. Launch-scope call sites only — the bind
+/// judgment and the absence proof's scope union: the
+/// `processes_in_directory` contract answers "cwd inside `dir`" alone,
+/// and widening that answer would report the sandbox's occupants to
+/// every scanned directory.
 pub(crate) fn cwd_in_launch_scope(cwd: Option<&Path>, dir: &Path) -> bool {
     cwd_within(cwd, dir) || cwd.is_some_and(|cwd| cwd.starts_with(containment::SANDBOX_WORKSPACE))
 }
@@ -670,21 +672,18 @@ impl ProcessControlPort for PosixProcessControl {
         // cannot be this supervisor's spawn and stays the documented
         // residual.
         let euid = unsafe { libc::geteuid() };
-        let table = ps_output(&["-ewwo", "pid=,ppid=,uid="])
-            .map_err(|e| format!("process scan failed: {e}"))?;
+        let table =
+            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
         let mut same_user_pids = Vec::new();
         for line in table.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let mut it = line.split_whitespace();
-            let (Some(pid), Some(ppid), Some(uid)) = (it.next(), it.next(), it.next()) else {
+            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
                 return Err(format!("incomplete process-table row: {line}"));
             };
             let pid: i32 = pid
-                .parse()
-                .map_err(|_| format!("invalid process-table row: {line}"))?;
-            let ppid: i32 = ppid
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
             // `ps` prints some kernel/nobody uids as negatives on macOS
@@ -695,7 +694,7 @@ impl ProcessControlPort for PosixProcessControl {
                 .parse()
                 .map_err(|_| format!("invalid process-table row: {line}"))?;
             if uid == euid as i64 {
-                same_user_pids.push((pid, ppid));
+                same_user_pids.push(pid);
             }
         }
         // One pass maps every inspectable pid to its working directory
@@ -710,7 +709,7 @@ impl ProcessControlPort for PosixProcessControl {
         // same-user process the scan could not map to a cwd makes the
         // whole enumeration partial — its cwd might be inside `dir`,
         // so the table can never authorize absence.
-        for (pid, _) in same_user_pids {
+        for pid in same_user_pids {
             if scan.mapped.contains(&pid) {
                 continue;
             }
@@ -753,7 +752,7 @@ impl ProcessControlPort for PosixProcessControl {
                     cwd.display()
                 ));
             }
-            if !cwd_in_launch_scope(Some(&cwd), &dir) {
+            if !cwd_within(Some(&cwd), &dir) {
                 continue;
             }
             // Same re-verification as the signature scan: a pid that
@@ -3585,8 +3584,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // wrapped argv cannot be reconstructed — the orphan's
         // signature is then unprovable, so stay uncertain rather than
         // declare absence on an incomplete search.
-        match self.containment_gate(&binding.argv, now_unix_seconds)? {
-            Ok(Gate::Uncontained) => {}
+        let contained = match self.containment_gate(&binding.argv, now_unix_seconds)? {
+            Ok(Gate::Uncontained) => false,
             Err(_) => {
                 return self.report_unidentified_unknown(
                     store,
@@ -3655,8 +3654,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         );
                     }
                 }
+                true
             }
-        }
+        };
         let mut matches = Vec::new();
         for signature in &signatures {
             match self.port.matching_processes(signature) {
@@ -3802,7 +3802,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     && execution.uncertain_since_unix_seconds.is_some_and(|since| {
                         now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
                     })
-                    && self.launch_dir_clear(&canonical_dir, &recorded);
+                    && self.launch_dir_clear(&canonical_dir, contained, &recorded);
                 if absence_proven {
                     self.report(
                         store,
@@ -3839,13 +3839,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// enumeration — a live process whose cwd the port cannot map is
     /// a possible occupant — proves nothing: fail closed, stay
     /// uncertain.
-    fn launch_dir_clear(&self, dir: &Path, recorded: &HashSet<(i32, String)>) -> bool {
-        match self.port.processes_in_directory(dir) {
+    ///
+    /// The launch scope is `dir` plus, for a contained launch, the
+    /// sandbox workspace root: the worker's mount namespace binds the
+    /// launch workspace at `SANDBOX_WORKSPACE` and chdirs into it, so a
+    /// contained escapee's `/proc` cwd reads `/workspace` and never
+    /// lands inside the host dir. `processes_in_directory` stays
+    /// unscoped — each scan answers "cwd inside this dir" alone — so
+    /// the launch scope is one scan per root and an unexplained
+    /// occupant in either keeps absence unproven.
+    fn launch_dir_clear(
+        &self,
+        dir: &Path,
+        contained: bool,
+        recorded: &HashSet<(i32, String)>,
+    ) -> bool {
+        let clear = |scope: &Path| match self.port.processes_in_directory(scope) {
             Ok(occupants) => occupants
                 .iter()
                 .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
             Err(_) => false,
-        }
+        };
+        clear(dir) && (!contained || clear(Path::new(containment::SANDBOX_WORKSPACE)))
     }
 
     /// Report an unidentified launch as still unknown — the same
@@ -4910,6 +4925,13 @@ mod tests {
             Some(Path::new("/workspace-sibling")),
             &dir
         ));
+        // The port contract predicate never widens to the sandbox —
+        // `processes_in_directory` answers "cwd inside `dir`" alone,
+        // so the launch scope is layered on by its call sites, not by
+        // the shared filter.
+        assert!(!cwd_within(Some(sandbox), &dir));
+        assert!(!cwd_within(Some(&sandbox.join("nested")), &dir));
+        assert!(cwd_within(Some(dir.as_path()), &dir));
     }
 
     /// With no working mechanism the scan is `Err` — an empty table
