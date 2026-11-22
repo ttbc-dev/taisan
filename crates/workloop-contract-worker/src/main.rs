@@ -36,6 +36,35 @@ fn usage_exit() -> ! {
     std::process::exit(2);
 }
 
+/// The contract worker only ever runs under an in-process supervisor:
+/// once its launching process is gone — the test binary was killed,
+/// timed out, or crashed — nothing remains to stop it, and a leaked
+/// worker keeps the caller's inherited output pipes open, which is
+/// what wedged a remote verify run for ~24h. The unbounded modes
+/// therefore exit as soon as their parent changes — an orphan has no
+/// supervisor left to stop it.
+fn exit_when_orphaned() {
+    let parent = parent_pid();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let now = parent_pid();
+            // `now == 1` covers the spawn/death race: reparented to init
+            // before the original parent could be recorded.
+            if now != parent || now == 1 {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+fn parent_pid() -> i32 {
+    unsafe extern "C" {
+        fn getppid() -> i32;
+    }
+    unsafe { getppid() }
+}
+
 fn workspace() -> PathBuf {
     std::env::current_dir().expect("contract worker has a cwd")
 }
@@ -122,6 +151,7 @@ fn heartbeat_forever(ws: &Path, interval: Duration) -> ! {
         report(serde_json::json!({"evidence": "denied-host-write"}));
         std::process::exit(3);
     };
+    exit_when_orphaned();
     loop {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -554,6 +584,7 @@ fn run_request(args: &Args, ws: &Path) {
     // `hang` is the only behavior left: the report is already on disk
     // — the stop paths collect it after the proven stop.
     if args.mode == "hang" {
+        exit_when_orphaned();
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -607,9 +638,12 @@ fn main() {
             }));
         }
         // Never exits on its own — the suite's stop-proof target.
-        "hang" => loop {
-            std::thread::park();
-        },
+        "hang" => {
+            exit_when_orphaned();
+            loop {
+                std::thread::park();
+            }
+        }
         // Reopen the workspace path on an interval — a live writer the
         // stop proof must cover. The shared suite expects the fixed
         // heartbeat file.
@@ -627,6 +661,7 @@ fn main() {
                 report(serde_json::json!({"evidence": "denied-host-write"}));
                 std::process::exit(3);
             };
+            exit_when_orphaned();
             loop {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)

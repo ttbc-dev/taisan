@@ -503,6 +503,7 @@ fn run_request(args: &Args, ws: &Path) {
     // `hang` is the only behavior left: the report is already on disk
     // — the stop paths collect it after the proven stop.
     if behavior == "hang" {
+        exit_when_orphaned();
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -544,9 +545,12 @@ fn main() {
         }
         // Never exits on its own; the stop target. Default signal
         // disposition — SIGTERM/SIGKILL end it.
-        "hang" => loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        },
+        "hang" => {
+            exit_when_orphaned();
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
         // A `setsid` child keeps writing after the leader exits: it
         // survives a process-group signal, so only the descendant snapshot
         // recorded at stop-intent time covers it.
@@ -582,6 +586,7 @@ fn main() {
                 .expect("spawn short-lived child");
             // Deliberately never wait: the child stays a zombie of this
             // process while it hangs.
+            exit_when_orphaned();
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -590,6 +595,7 @@ fn main() {
         // also recreates it — documenting why rename is not a fence.
         "path-reopen" | "makedirs-writer" => {
             let recreate = args.mode == "makedirs-writer";
+            exit_when_orphaned();
             loop {
                 let path = ws.join("heartbeat.log");
                 if recreate {
@@ -643,6 +649,36 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// The fixture only ever runs under an in-process supervisor: once its
+/// launching process is gone — the test binary was killed, timed out,
+/// or crashed — nothing remains to stop it, and a leaked worker keeps
+/// the caller's inherited output pipes open, which is what wedged a
+/// remote verify run for ~24h. The unbounded modes therefore exit as
+/// soon as their parent changes — an orphan has no supervisor left to
+/// stop it. `escaped-writer` is the deliberate exception: surviving
+/// its leader's exit is the scenario it exists to prove.
+fn exit_when_orphaned() {
+    let parent = parent_pid();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let now = parent_pid();
+            // `now == 1` covers the spawn/death race: reparented to init
+            // before the original parent could be recorded.
+            if now != parent || now == 1 {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+fn parent_pid() -> i32 {
+    unsafe extern "C" {
+        fn getppid() -> i32;
+    }
+    unsafe { getppid() }
 }
 
 fn libc_setsid() {
