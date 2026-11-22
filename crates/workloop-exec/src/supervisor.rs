@@ -4862,7 +4862,7 @@ mod tests {
     fn proc_stat_flags_reads_flags_past_comm() {
         // `kthreadd` carries PF_KTHREAD in field 9.
         assert_eq!(
-            proc_stat_flags("2 (kthreadd) S 0 0 0 0 2097152 0 0"),
+            proc_stat_flags("2 (kthreadd) S 0 0 0 0 0 2097152 0 0"),
             Some(0x0020_0000)
         );
         // A userspace row never does.
