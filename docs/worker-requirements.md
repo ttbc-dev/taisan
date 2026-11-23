@@ -200,11 +200,11 @@ Planned proof for AC5: A spawned environment lacks host credential variables; af
 
 ## R269
 
-Enforced read-only assessment with honest verdicts. The sandbox read-only bind enforces scope for InvariantCheck and CodeReview; a killed or timed-out runner is `Incomplete`, never `Failed` or `Passed`; findings and invariant items are claims classified by #51, not verdicts the Worker can settle.
+Enforced read-only assessment with honest verdicts. The sandbox read-only bind enforces scope for InvariantCheck and CodeReview; a killed or timed-out runner is `Inconclusive`, never `Failed` or `Passed`; findings and invariant items are claims classified by #51, not verdicts the Worker can settle.
 
 Clause: [role translation for the reference adapter](worker-protocol.md#role-translation-for-the-reference-adapter); [verification runner](worker-protocol.md#verification-runner). Suite: WS-16, WS-22.
 
-Planned proof for AC5: A killed check run records `Incomplete`; a write attempt under the read-only bind is denied and recorded.
+Planned proof for AC5: A killed check run records `Inconclusive`; a write attempt under the read-only bind is denied and recorded.
 
 ## R286
 

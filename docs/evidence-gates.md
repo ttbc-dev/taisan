@@ -76,7 +76,7 @@ struct VerificationResult {
     result: CommandResult,
     output: RetainedContentRef,
 }
-enum CommandResult { Passed, Failed { exit_code: i32 }, Incomplete { reason: Reason } }
+enum CommandResult { Passed, Failed { exit_code: i32 }, Inconclusive { reason: Reason } }
 struct InvariantSet {
     specification: SpecRevision,
     requirements: NonEmptyVec<InvariantRequirement>,
