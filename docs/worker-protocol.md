@@ -204,6 +204,11 @@ The shim performs no retry of its own: one `run` launches the runtime once. Retr
 
 ## Artifact handoff
 
+This section describes the existing local handoff. The remote v0.4
+manifest is separate transfer metadata in a per-Invocation out
+directory. See [handoff manifest custody](handoff-manifest-custody.md)
+for its identity, collection, and acknowledgement rules.
+
 ### Ownership
 
 | Step | Producer | Consumer | Durable record |
