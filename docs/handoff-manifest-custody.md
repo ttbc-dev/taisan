@@ -23,11 +23,11 @@ The handoff manifest may identify the expected object closure, but the coordinat
 
 ## Artifact evidence
 
-`required_artifacts` continues to declare expected workspace outputs. The supervisor computes `artifact_digest(workspace, path)` for each declared output using the existing local evidence path. The remote handoff manifest carries bounded descriptors for those outputs through a separate collection channel. The manifest itself is not a required artifact and is not measured with `artifact_digest`.
+`required_artifacts` continues to declare expected outputs. The local handoff computes `artifact_digest(workspace, path)` from the workspace. Remote handoff uses a stricter rule: every remotely declared output must be committed in the exact produced commit. An output that exists only in a dirty workspace, `.checkpoints`, or a runtime artifact store does not satisfy a remote declaration. Materialize and commit that output before handoff if the remote verifier must check it.
 
-Each descriptor names a path relative to the workspace and binds the path to the expected content digest. Absolute paths, parent traversal, symlinks, duplicate paths, and paths outside the declared artifact set are rejected. The versioned contract defines the exact encoding, canonicalization, and size limits.
+The remote handoff manifest carries bounded descriptors for declared outputs through a separate collection channel. The manifest itself is not a required artifact and is not measured with `artifact_digest`. Each descriptor names a path relative to the workspace. A Worker-reported digest is an untrusted claim, not the expected digest. The coordinator derives the expected digest from the file in the verified produced commit. It rejects absolute paths, parent traversal, symlinks, duplicate paths, and paths outside the declared artifact set. The versioned contract defines the exact encoding, canonicalization, and size limits.
 
-The coordinator verifies every descriptor against the transferred Git object closure and the corresponding file in the produced commit. A matching digest proves that the declared output is present in that commit. A missing output or a mismatch fails artifact verification.
+The coordinator verifies every descriptor against the transferred Git object closure and the corresponding file in the produced commit. It computes the expected digest from that committed file, then compares any Worker-reported digest with the computed value. A missing output or a mismatch fails artifact verification. The Worker manifest cannot establish its own expected digest.
 
 ## Collection and acknowledgement
 
@@ -35,7 +35,7 @@ The coordinator verifies every descriptor against the transferred Git object clo
 2. The Worker writes `report.json` and the handoff manifest into that out directory. It does not write the remote handoff manifest into the workspace.
 3. After the supervisor confirms process exit and stop proof, the executor transfers the bounded report, manifest, and Git object closure through the collection protocol.
 4. The coordinator rejects a foreign or stale identity, malformed or oversized data, an unsafe path, a missing object, or a digest mismatch. Rejection never becomes `Present` evidence.
-5. The coordinator imports valid objects into quarantine, verifies the base ancestry and exact produced commit, derives the canonical Git object manifest, and records its digest.
+5. The coordinator imports valid objects into quarantine, verifies the base ancestry and exact produced commit, checks that every remote declared output is present in that commit, derives each expected output digest from the committed file, and derives the canonical Git object manifest and its digest.
 6. The coordinator acknowledges collection only after the durable artifact record and verified handoff ref agree. A repeated collection with the same Invocation and content is idempotent. Different content for the same identity is a conflict.
 7. The executor may delete the retained out-directory contents only after acknowledgement and when the retention policy permits cleanup.
 
