@@ -5328,6 +5328,78 @@ fn a_retry_launches_a_successor_execution_without_refunding_cumulative_usage() {
     assert_eq!(report_facts(&store, &e).len(), 1);
 }
 
+/// A manifest a previous round left at the workspace root is stale
+/// output, never this Invocation's evidence: bound to a different
+/// request and invocation it reads exactly like a file that was never
+/// written — recovery may find and promote it, but it is never
+/// reported `Present`.
+#[test]
+fn a_stale_manifest_is_never_present_for_the_new_invocation() {
+    let root = tmp_root("stale-manifest");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-stale-manifest", vec![]);
+    // The writer exits with no artifact: the Execution waits on the
+    // bounded recovery pass.
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..40 {
+        let exec = execution(&store, &e);
+        if exec.state == ExecutionState::Waiting
+            && exec.waiting_reason == Some(WaitingReason::ArtifactRecovery)
+        {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "bounded recovery entered: {exec:?}"
+    );
+
+    // A manifest bound to another request and invocation — the shape a
+    // reused workspace carries over from the previous round — is found
+    // at the root and promoted, but its binding is not this
+    // Invocation's: it must never surface as `Present` evidence.
+    let ws = sup.workspace_of(&w);
+    std::fs::write(
+        ws.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": "other-execution:inv:0",
+            "invocation_id": "inv-foreign",
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    sup.run_recovery(&store, NOW).unwrap();
+    let present = store
+        .transact(|tx| tx.observations_for_execution(&e))
+        .unwrap()
+        .iter()
+        .any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    state: workloop_core::observation::ArtifactFact::Present { .. },
+                    ..
+                }
+            )
+        });
+    assert!(
+        !present,
+        "a manifest bound to another invocation is stale, never Present"
+    );
+}
+
 /// A cancel committed while declared verification work is pending
 /// does not skip the owned child: the bounded verification run still
 /// executes and records its result while the Execution is stopping,

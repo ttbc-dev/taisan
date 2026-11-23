@@ -1095,6 +1095,58 @@ fn a_fix_reuses_the_workspace_its_predecessor_left() {
     assert_eq!(git(&ws, &["rev-parse", "HEAD"]), produced);
 }
 
+/// A runtime's `git add -A` can still capture a manifest a previous
+/// round left behind — the produced commit then tracks it. The tree
+/// is clean and the next round must reuse it: refusing would deadlock
+/// a state the writer's own round created. (The shim separately
+/// guarantees the file is never a tracked *modification*: tracked
+/// repository content is left exactly as it is.)
+#[test]
+fn a_manifest_captured_by_the_produced_commit_still_verifies_clean() {
+    let root = tmp_root("tracked-mf");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-trkmf", &base, coding_task(vec![]));
+    let (sup, layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    // Round N's produced commit captured the manifest alongside the
+    // output: the file is tracked and unmodified.
+    git(&ws, &["config", "user.email", "t@t"]);
+    git(&ws, &["config", "user.name", "t"]);
+    std::fs::write(ws.join("out.txt"), "produced").unwrap();
+    std::fs::write(ws.join("artifact.json"), "{}").unwrap();
+    git(&ws, &["add", "."]);
+    git(&ws, &["commit", "-m", "produced"]);
+    let produced = git(&ws, &["rev-parse", "HEAD"]);
+    acknowledge_predecessor(
+        &store, &layout, &ws, &w, &e, "art-1", &produced, &base, "m-1",
+    );
+
+    let rid2 = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Fix);
+    let request2 = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Fix,
+        &base,
+        fix_task("art-1", "m-1", &produced),
+    );
+    insert_body(&store, &request2);
+    declared_invocation(&store, &e, &rid2, &["artifact.json"]);
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    assert_eq!(prepared.head, produced);
+    assert_eq!(prepared.request_digest, request2.request_digest);
+}
+
 #[test]
 fn unknown_partial_and_symlinked_workspaces_are_refused_untouched() {
     let root = tmp_root("partial");

@@ -4139,24 +4139,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 detail: "invocation without request".into(),
             }))?;
         let workspace = self.workspace_of(&request.work_id);
+        // A recorded v2 request body marks the dispatch whose
+        // workspace-root `artifact.json` is the shim's bound manifest:
+        // the slot requires the manifest contract. A v1 artifact at
+        // the same path stays an opaque payload.
+        let v2_manifest = store
+            .transact(|tx| tx.worker_request_body(&invocation.request_id))?
+            .is_some();
         for required in &invocation.required_artifacts {
-            let digest = artifact_digest(&workspace, &required.path);
-            // A present artifact must carry its exact payload digest; an
-            // unexpected payload is corrupt evidence, never present.
-            let state = match digest {
-                Some(digest)
-                    if required
-                        .expected_digest
-                        .as_ref()
-                        .is_none_or(|expected| expected == &digest) =>
-                {
-                    ArtifactFact::Present { digest }
-                }
-                Some(_) => ArtifactFact::Corrupt {
-                    reason: Some("payload digest does not match the declared expectation".into()),
-                },
-                None => ArtifactFact::Missing,
-            };
+            let state = artifact_fact(&workspace, required, invocation, v2_manifest);
             self.report(
                 store,
                 &request,
@@ -4604,6 +4595,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     Some(r) => r,
                     None => continue,
                 };
+                let v2_manifest = store
+                    .transact(|tx| tx.worker_request_body(&invocation.request_id))?
+                    .is_some();
                 for (required, dir) in &recovered {
                     if invocation.required_artifacts.contains(required) {
                         // Promote into the workspace root so downstream
@@ -4620,17 +4614,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         {
                             continue;
                         }
-                        let digest = match artifact_digest(&workspace, &required.path) {
-                            Some(digest)
-                                if required
-                                    .expected_digest
-                                    .as_ref()
-                                    .is_none_or(|expected| expected == &digest) =>
-                            {
-                                digest
-                            }
-                            _ => continue,
-                        };
+                        let digest =
+                            match artifact_fact(&workspace, required, &invocation, v2_manifest) {
+                                ArtifactFact::Present { digest } => digest,
+                                _ => continue,
+                            };
                         self.report(
                             store,
                             &request,
@@ -4881,19 +4869,86 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// The payload digest of an artifact in the workspace root; `None` when
-/// it is absent or unreadable. Presence is never reported without a
-/// digest — the fact's `Present` state carries it.
-fn artifact_digest(workspace: &Path, name: &str) -> Option<String> {
-    let candidate = workspace.join(name);
+/// Whether the bytes at a required-artifact path are the v2 handoff
+/// manifest, and whose. The manifest names its producing invocation:
+/// a file in that format is only ever evidence for the producer it
+/// binds — a previous round's manifest a reused workspace kept is
+/// `Foreign` to every other invocation that finds it.
+enum ManifestBinding {
+    /// `taisan.worker.artifact/1` naming this invocation and request.
+    Bound,
+    /// The manifest format naming another producer.
+    Foreign,
+    /// Not the manifest format — an opaque artifact payload.
+    Opaque,
+}
+
+fn manifest_binding(bytes: &[u8], invocation: &Invocation) -> ManifestBinding {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return ManifestBinding::Opaque;
+    };
+    if value.get("format_version").and_then(|v| v.as_str()) != Some("taisan.worker.artifact/1") {
+        return ManifestBinding::Opaque;
+    }
+    if value.get("invocation_id").and_then(|v| v.as_str()) == Some(invocation.id.0.as_str())
+        && value.get("request_id").and_then(|v| v.as_str()) == Some(invocation.request_id.as_str())
+    {
+        ManifestBinding::Bound
+    } else {
+        ManifestBinding::Foreign
+    }
+}
+
+/// The evidence state one required artifact earns in the workspace
+/// root. Presence is never reported without a digest — `Present`
+/// carries the exact payload digest and an unexpected payload is
+/// corrupt evidence, never present. On top of the digest rule the
+/// manifest binds its producer: a manifest naming another invocation
+/// is stale, never `Present`, and a v2 dispatch's `artifact.json`
+/// slot holding anything but the bound manifest is malformed — both
+/// degrade to the same `missing` a failed write already records.
+/// `v2_manifest` marks an invocation whose dispatch recorded a
+/// durable v2 request body; only then does the `artifact.json` path
+/// require the manifest contract — a v1 artifact stays opaque.
+fn artifact_fact(
+    workspace: &Path,
+    required: &RequiredArtifact,
+    invocation: &Invocation,
+    v2_manifest: bool,
+) -> ArtifactFact {
+    let candidate = workspace.join(&required.path);
     if !candidate.is_file() {
-        return None;
+        return ArtifactFact::Missing;
     }
-    let bytes = std::fs::read(&candidate).ok()?;
+    let Ok(bytes) = std::fs::read(&candidate) else {
+        return ArtifactFact::Missing;
+    };
     if bytes.is_empty() {
-        return None;
+        return ArtifactFact::Missing;
     }
-    Some(sha256_hex("artifact-v1", &bytes))
+    match manifest_binding(&bytes, invocation) {
+        ManifestBinding::Foreign => return ArtifactFact::Missing,
+        ManifestBinding::Opaque
+            if v2_manifest && Path::new(&required.path) == Path::new("artifact.json") =>
+        {
+            return ArtifactFact::Missing;
+        }
+        _ => {}
+    }
+    let digest = sha256_hex("artifact-v1", &bytes);
+    // A present artifact must carry its exact payload digest; an
+    // unexpected payload is corrupt evidence, never present.
+    if required
+        .expected_digest
+        .as_ref()
+        .is_none_or(|expected| expected == &digest)
+    {
+        ArtifactFact::Present { digest }
+    } else {
+        ArtifactFact::Corrupt {
+            reason: Some("payload digest does not match the declared expectation".into()),
+        }
+    }
 }
 
 /// Recursively copy `source` into `dest` for the invariant check's
@@ -5076,6 +5131,118 @@ mod tests {
     #[test]
     fn directory_scan_fails_closed_when_no_mechanism_enumerates() {
         assert!(with_proc_fallback(Err("injected lsof failure".into())).is_err());
+    }
+
+    /// `Present` evidence requires the manifest to bind the invocation
+    /// it is recorded against: a previous round's manifest naming
+    /// another producer is stale — the same `missing` a failed write
+    /// records — and under a v2 dispatch the `artifact.json` slot only
+    /// ever holds the bound manifest. A v1 artifact at the same path
+    /// stays an opaque payload under the plain digest rule.
+    #[test]
+    fn artifact_evidence_binds_the_manifest_to_its_invocation() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-fact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let invocation = Invocation {
+            id: InvocationId("inv-1".into()),
+            request_id: "req-1".into(),
+            execution_id: ExecutionId("e-1".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let required = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        let write = |body: &str| std::fs::write(dir.join("artifact.json"), body).unwrap();
+
+        // The manifest this invocation produced binds it — Present.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-1",
+                "invocation_id": "inv-1",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+
+        // A previous round's manifest names another producer: stale,
+        // missing — under v2 and under the v1 digest rule alike,
+        // because a manifest-format file only ever evidences its
+        // namesake.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-9",
+                "invocation_id": "inv-9",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, false),
+            ArtifactFact::Missing
+        ));
+
+        // An opaque payload is not the manifest contract: under v2 the
+        // slot holds nothing bound — missing, like a failed write;
+        // under v1 the plain digest rule still stands.
+        write("opaque payload");
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, false),
+            ArtifactFact::Present { .. }
+        ));
+        // ...and an opaque payload at a non-manifest path is an
+        // artifact under either rule.
+        let other = RequiredArtifact {
+            kind: "result.bin".into(),
+            path: "result.bin".into(),
+            expected_digest: None,
+        };
+        std::fs::write(dir.join("result.bin"), "opaque payload").unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &other, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+
+        // Absent and digest-mismatched files keep their states.
+        std::fs::remove_file(dir.join("artifact.json")).unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        write("opaque payload");
+        let wrong = RequiredArtifact {
+            expected_digest: Some("0".repeat(64)),
+            ..required.clone()
+        };
+        assert!(matches!(
+            artifact_fact(&dir, &wrong, &invocation, false),
+            ArtifactFact::Corrupt { .. }
+        ));
     }
 
     struct SnapshotFailure;

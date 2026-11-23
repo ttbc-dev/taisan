@@ -47,6 +47,7 @@ fn tmp(name: &str) -> PathBuf {
 ///   FAKE_FLOOD      bytes of stdout noise to emit before events
 ///   FAKE_WRITE      relative file path to create inside the workspace
 ///   FAKE_COMMIT     when set, `git add -A && git commit` inside cwd
+///   FAKE_SYMLINK    target a planted `artifact.json` symlink points to
 ///   FAKE_PROMPT_CAPTURE  file that receives the `-p` prompt text
 ///   FAKE_ARGV_CAPTURE  file that receives the runtime argv, one per line
 ///   FAKE_VERSION_ORPHAN  seconds a backgrounded --version descendant
@@ -76,6 +77,7 @@ if [ -n "$FAKE_COMMIT" ]; then
   git add -A >/dev/null 2>&1
   git -c user.email=fake@test -c user.name=fake commit -qm fake >/dev/null 2>&1
 fi
+if [ -n "$FAKE_SYMLINK" ]; then ln -sf "$FAKE_SYMLINK" artifact.json; fi
 if [ -n "$FAKE_STDERR" ]; then printf '%s\n' "$FAKE_STDERR" >&2; fi
 if [ -n "$FAKE_EVENTS" ]; then cat "$FAKE_EVENTS"; fi
 exit "${FAKE_EXIT:-0}"
@@ -559,6 +561,165 @@ fn read_only_role_writes_no_workspace_artifact() {
         !ws.join("artifact.json").exists(),
         "read-only role must not write a workspace artifact"
     );
+}
+
+#[test]
+fn a_stale_manifest_is_removed_before_the_runtime_can_commit_it() {
+    // Round N's leftover manifest is stale debris to round N+1: left
+    // in place, the runtime's own `git add -A` would commit it, and
+    // the reuse gate then refuses every later round on a tracked
+    // modification it can never tolerate.
+    let dir = tmp("stale-art");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    fs::write(
+        ws.join("artifact.json"),
+        "{\"format_version\":\"taisan.worker.artifact/1\",\"request_id\":\"e-9:inv:9\",\"invocation_id\":\"inv-9\"}\n",
+    )
+    .unwrap();
+    let events = events_file(&dir, "done\n\n```taisan-result\n{}\n```", json!({}));
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("stale-art", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+            ("FAKE_WRITE", "produced.txt"),
+            ("FAKE_COMMIT", "1"),
+        ],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out.stderr);
+
+    // The runtime's `git add -A` ran while no manifest existed:
+    // `artifact.json` never enters the produced commit — it stays
+    // untracked, exactly the state the reuse gate tolerates.
+    assert!(
+        !git(&ws, &["ls-files"])
+            .lines()
+            .any(|l| l == "artifact.json"),
+        "a stale manifest must never reach the produced commit"
+    );
+    // ...and the post-run write replaced it with this invocation's
+    // manifest, bound to this request and invocation.
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(ws.join("artifact.json")).expect("artifact.json must exist"),
+    )
+    .expect("artifact.json must parse");
+    assert_eq!(manifest["format_version"], "taisan.worker.artifact/1");
+    assert_eq!(manifest["request_id"], "e-1:inv:1");
+    assert_eq!(manifest["invocation_id"], "inv-1");
+    assert_eq!(manifest["status"], "success");
+}
+
+#[test]
+fn a_symlink_at_the_manifest_path_never_redirects_the_write() {
+    // A planted symlink must never carry the write outside the
+    // workspace — whether it already sits there at launch (the
+    // pre-run sweep removes it) or appears while the runtime runs
+    // (the exclusive-create write replaces it).
+    let dir = tmp("symlink-art");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let outside = dir.join("outside.txt");
+    std::os::unix::fs::symlink(&outside, ws.join("artifact.json")).unwrap();
+    let events = events_file(&dir, "done\n\n```taisan-result\n{}\n```", json!({}));
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("symlink-art", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+            // The runtime re-plants the link mid-run: the post-run
+            // write meets it without ever following it.
+            ("FAKE_SYMLINK", outside.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out.stderr);
+    assert!(
+        !outside.exists(),
+        "the manifest write must never escape the workspace"
+    );
+    let meta = fs::symlink_metadata(ws.join("artifact.json")).unwrap();
+    assert!(
+        meta.is_file() && !meta.file_type().is_symlink(),
+        "the manifest lands as a regular file, the link replaced"
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(ws.join("artifact.json")).unwrap())
+        .expect("artifact.json must parse");
+    assert_eq!(manifest["invocation_id"], "inv-1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("artifact.json") && stderr.contains("symlink"),
+        "the replaced link is diagnosed honestly: {stderr}"
+    );
+}
+
+#[test]
+fn a_tracked_manifest_is_repository_content_never_rewritten() {
+    // A tracked `artifact.json` — one the repository or the runtime's
+    // own commit carries — is repository content: the shim must not
+    // rewrite it, the collision is diagnosed, and the evidence the
+    // supervisor records reads the file for what it is rather than a
+    // manifest for this invocation.
+    let dir = tmp("tracked-art");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    fs::write(ws.join("artifact.json"), "tracked manifest\n").unwrap();
+    git(&ws, &["add", "artifact.json"]);
+    git(&ws, &["commit", "-qm", "track the manifest"]);
+    let events = events_file(&dir, "done\n\n```taisan-result\n{}\n```", json!({}));
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("tracked-art", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_EVENTS", events.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out.stderr);
+    assert_eq!(
+        fs::read_to_string(ws.join("artifact.json")).unwrap(),
+        "tracked manifest\n",
+        "repository content is never clobbered"
+    );
+    // No tracked modification — the state the reuse gate refuses.
+    assert!(
+        git(&ws, &["status", "--porcelain"]).is_empty(),
+        "the tracked file stays untouched"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("artifact.json: tracked"),
+        "the collision is diagnosed: {stderr}"
+    );
+    // report.json still carries the run.
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "success");
 }
 
 #[test]
