@@ -45,6 +45,30 @@ use crate::request_v2::V2Dispatch;
 /// one outcome that could admit a second writer.
 const UNIDENTIFIED_LAUNCH_ABSENT_SECONDS: i64 = 30;
 
+/// Consecutive incomplete absence scans an unidentified launch
+/// tolerates before the unprovable absence is surfaced to the
+/// operator. The bound decides only WHEN the operator is told, never
+/// what is concluded — the launch stays an unresolved writer either
+/// way — and a completed scan (clear or occupied) restarts the
+/// count: one transient unmappable process should not converge the
+/// outcome, but a scan that can never complete must not hold
+/// `uncertain` forever either.
+const UNIDENTIFIED_LAUNCH_SCAN_LIMIT: u32 = 3;
+
+/// The verdict one absence check returns for an unidentified launch.
+/// `Clear` — the enumeration completed and nothing unexplained
+/// remains. `Occupied` — the enumeration completed and a live
+/// unrecorded process was found; absence is disproven for this pass.
+/// `Incomplete` — the enumeration itself could not be completed or a
+/// member could not be verified; absence is unprovable for this pass
+/// and the carried reason feeds the bounded escalation's record.
+#[derive(Debug)]
+enum Clearance {
+    Clear,
+    Occupied,
+    Incomplete(String),
+}
+
 /// The POSIX `ProcessControlPort`. Identities are `pid + lstart` strings
 /// captured from `ps`; the recorded string is compared verbatim before any
 /// signal so a reused pid is never signaled.
@@ -387,6 +411,52 @@ fn is_kernel_thread(pid: i32) -> bool {
     pid == 0
 }
 
+/// The completeness gate over one scan's `mapped` set. Every live
+/// same-user pid the mechanism left unmapped is a gap in the proof —
+/// its cwd might be inside the scanned directory — UNLESS the pid
+/// belongs to a class that provably cannot possess a cwd at all. The
+/// exclusion predicate `cannot_hold_cwd` is an independent structural
+/// property of the process — the kernel-thread flag — never "the
+/// scan could not map it", which would be circular: any other
+/// ambiguous process remains the gap it must be. A pid absent from
+/// the table, one whose stat cannot be re-read, or a zombie is
+/// skipped — none can hold a live cwd to write with.
+fn unmappable_cwd_gap(
+    same_user_pids: &[i32],
+    mapped: &HashSet<i32>,
+    present: impl Fn(i32) -> LstartLookup,
+    stat: impl Fn(i32) -> Option<String>,
+    cannot_hold_cwd: impl Fn(i32) -> bool,
+) -> Result<(), String> {
+    for pid in same_user_pids {
+        if mapped.contains(pid) {
+            continue;
+        }
+        match present(*pid) {
+            // Exited between the pid-list and cwd reads — not a
+            // gap, just a process that was already gone.
+            LstartLookup::Absent => continue,
+            LstartLookup::Failed(reason) => return Err(reason),
+            LstartLookup::Present(_) => {}
+        }
+        // Gone between the liveness check and the stat read, or a
+        // zombie — either way it cannot write inside the dir.
+        let Some(stat) = stat(*pid) else {
+            continue;
+        };
+        if stat.contains('Z') {
+            continue;
+        }
+        if cannot_hold_cwd(*pid) {
+            continue;
+        }
+        return Err(format!(
+            "directory scan incomplete: live process {pid} has no readable cwd"
+        ));
+    }
+    Ok(())
+}
+
 /// Every process identity the store already accounts for — leaders,
 /// descendant snapshots, and stop-intent proofs across all nonterminal
 /// executions — so a recorded writer is never re-bound as an
@@ -618,35 +688,16 @@ fn directory_occupants(
     // Completeness gate before any occupant answer: a live
     // same-user process the scan could not map to a cwd makes the
     // whole enumeration partial — its cwd might be inside `dir`,
-    // so the table can never authorize absence.
-    for pid in same_user_pids {
-        if scan.mapped.contains(&pid) {
-            continue;
-        }
-        match lstart_of(pid) {
-            // Exited between the pid-list and cwd reads — not a
-            // gap, just a process that was already gone.
-            LstartLookup::Absent => continue,
-            LstartLookup::Failed(reason) => return Err(reason),
-            LstartLookup::Present(_) => {}
-        }
-        // Gone between the liveness check and the stat read, or a
-        // zombie — either way it cannot write inside `dir`.
-        let Some(stat) = stat_of(pid) else {
-            continue;
-        };
-        if stat.contains('Z') {
-            continue;
-        }
-        // A kernel thread can never hold a working directory — it
-        // cannot occupy `dir`, so its unmappable cwd is no gap.
-        if is_kernel_thread(pid) {
-            continue;
-        }
-        return Err(format!(
-            "directory scan incomplete: live process {pid} has no readable cwd"
-        ));
-    }
+    // so the table can never authorize absence. The only exclusion
+    // is `is_kernel_thread` — a class that provably cannot hold a
+    // cwd (`unmappable_cwd_gap`).
+    unmappable_cwd_gap(
+        &same_user_pids,
+        &scan.mapped,
+        lstart_of,
+        stat_of,
+        is_kernel_thread,
+    )?;
     let mut out = Vec::new();
     for (pid, cwd) in scan.cwds {
         // `cwd_within` canonicalizes the reported path and treats
@@ -731,9 +782,18 @@ impl ProcessControlPort for PosixProcessControl {
             LstartLookup::Absent => {
                 return Err(SpawnError::Unknown {
                     reason: format!("spawned pid {pid} vanished before identity capture"),
+                    // The fork produced a process and `process_group(0)`
+                    // put it in its own group: the group id survives the
+                    // lost identity and may still hold live descendants.
+                    pgid: Some(pid),
                 });
             }
-            LstartLookup::Failed(reason) => return Err(SpawnError::Unknown { reason }),
+            LstartLookup::Failed(reason) => {
+                return Err(SpawnError::Unknown {
+                    reason,
+                    pgid: Some(pid),
+                });
+            }
         };
         let pgid = unsafe { libc::getpgid(pid) };
         Ok(ProcessIdentity {
@@ -1007,7 +1067,10 @@ impl ProcessControlPort for PosixProcessControl {
             Err(reason) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(SpawnError::Unknown { reason });
+                return Err(SpawnError::Unknown {
+                    reason,
+                    pgid: Some(pid),
+                });
             }
         };
         let (sender, receiver) = mpsc::channel();
@@ -1029,6 +1092,7 @@ impl ProcessControlPort for PosixProcessControl {
                 let _ = self.reap(pid);
                 Err(SpawnError::Unknown {
                     reason: format!("wait {program}: {e}"),
+                    pgid: Some(pid),
                 })
             }
             Err(_) => {
@@ -1051,6 +1115,7 @@ impl ProcessControlPort for PosixProcessControl {
                             "probe bound elapsed and the leader identity could not \
                              be re-verified at {pid}; nothing was signalled"
                         ),
+                        pgid: Some(pid),
                     }),
                     _ => Ok(ProbeOutcome::Bounded),
                 }
@@ -1179,6 +1244,12 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// root; the composition root adds the state root.
     pub sandbox_mask_roots: Vec<PathBuf>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Consecutive incomplete absence scans per unidentified
+    /// Invocation — the bounded-escalation streak. In-memory on
+    /// purpose: "consecutive" is scoped to one supervisor's lifetime,
+    /// and an entry is dropped the moment a scan completes or the
+    /// Invocation resolves.
+    incomplete_scans: Mutex<HashMap<String, u32>>,
 }
 
 impl<P: ProcessControlPort> Supervisor<P> {
@@ -1201,6 +1272,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             body_store: None,
             sandbox_mask_roots,
             locks: Mutex::new(HashMap::new()),
+            incomplete_scans: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2593,6 +2665,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
         };
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
+                // Commit the launch's process group the moment the
+                // spawn call returns, before the running commit: when
+                // the leader's identity record is the one that is
+                // lost, the group stays the durable handle the absence
+                // proof enumerates for group-keeping escapes.
+                if let Some(pgid) = identity.pgid {
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::LaunchGroup {
+                            invocation_id: invocation.id.clone(),
+                            pgid,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
                 // Descendant coverage starts at launch: a writer that
                 // escapes its tree before the first poll is still a
                 // recorded identity the exit proof must account for. A
@@ -2639,7 +2727,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
             Err(SpawnError::Refused { reason }) => {
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
-            Err(SpawnError::Unknown { .. }) => {
+            Err(SpawnError::Unknown { pgid, .. }) => {
+                // Same durability order as the `Ok` arm: the group the
+                // spawn produced is committed before the unknown-state
+                // fact, so the unidentified launch's absence proof can
+                // still enumerate it.
+                if let Some(pgid) = pgid {
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::LaunchGroup {
+                            invocation_id: invocation.id.clone(),
+                            pgid,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
                 self.report(
                     store,
                     request,
@@ -3160,6 +3263,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // the same receipt-conflict reason.
         match self.port.spawn(&argv, &workspace, &launch_env) {
             Ok(identity) => {
+                // The group is committed before the running commit —
+                // the durable handle the absence proof keeps when the
+                // leader's identity record is the one that is lost.
+                if let Some(pgid) = identity.pgid {
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::LaunchGroup {
+                            invocation_id: invocation.id.clone(),
+                            pgid,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
                 let descendants = self
                     .port
                     .snapshot_descendants(identity.pid)
@@ -3198,7 +3315,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 self.release_launch_workspace(request, &workspace);
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
-            Err(SpawnError::Unknown { .. }) => {
+            Err(SpawnError::Unknown { pgid, .. }) => {
+                if let Some(pgid) = pgid {
+                    self.report(
+                        store,
+                        request,
+                        ObservationFact::LaunchGroup {
+                            invocation_id: invocation.id.clone(),
+                            pgid,
+                        },
+                        now_unix_seconds,
+                    )?;
+                }
                 self.report(
                     store,
                     request,
@@ -3579,11 +3707,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// that could be the real writer instead — through the same
     /// durable commit a normal launch uses, or report the proven
     /// absence that lets `work` abandon the launch. Absence requires
-    /// BOTH no unrecorded signature match (a chdir'd writer still
-    /// matches the argv) AND the bounded uncertain window (a process
-    /// inside its fork-exec visibility gap is never declared absent).
-    /// Anything else keeps reporting `Unknown`: an ambiguous or
-    /// unreadable answer is never a guess.
+    /// ALL of: no unrecorded signature match (a chdir'd writer still
+    /// matches the argv), no unexplained process in the launch
+    /// directory (an argv-escaped descendant keeps the cwd), no live
+    /// unrecorded member of the recorded launch group (a
+    /// chdir+argv-escaped descendant keeps the group), and the
+    /// bounded uncertain window (a process inside its fork-exec
+    /// visibility gap is never declared absent). Anything else keeps
+    /// reporting `Unknown`: an ambiguous or unreadable answer is
+    /// never a guess — and a bounded count of consecutive incomplete
+    /// scans escalates to the `absence_unprovable` outcome rather
+    /// than hold `uncertain` forever.
     fn resolve_unidentified_launch(
         &self,
         store: &impl Store,
@@ -3848,17 +3982,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                     Ok(Some(()))
                 }) {
-                    Ok(Some(())) => self.report(
-                        store,
-                        request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: bound_identity,
-                            state: ProcessStateFact::Running,
-                            exit_code: None,
-                        },
-                        now_unix_seconds,
-                    ),
+                    Ok(Some(())) => {
+                        self.incomplete_scans
+                            .lock()
+                            .unwrap()
+                            .remove(&invocation.id.0);
+                        self.report(
+                            store,
+                            request,
+                            ObservationFact::ProcessState {
+                                invocation_id: invocation.id.clone(),
+                                process_identity: bound_identity,
+                                state: ProcessStateFact::Running,
+                                exit_code: None,
+                            },
+                            now_unix_seconds,
+                        )
+                    }
                     // The orphan was bound by a concurrent resolution
                     // since the scan, or the world moved under the
                     // read (e.g. a stop settled first): the next pass
@@ -3876,9 +4016,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // unexplained process: an escaped descendant keeps the
                 // leader's cwd after leaving the argv signature, so the
                 // signature scan alone cannot prove the writer's whole
-                // tree is gone. The directory scan runs only once the
-                // bounded window has elapsed — before that the answer
-                // is Unknown regardless. The anchor is the Execution's
+                // tree is gone — AND no live unrecorded process remains
+                // in the recorded launch group: a descendant that
+                // changed BOTH argv and working directory is invisible
+                // to the first two checks but stays in the leader's
+                // group unless it called `setsid`. The named residual
+                // is exactly that escape — `setsid` + chdir + argv
+                // change leaves every handle the launch committed —
+                // and so does a spawn whose group record was lost
+                // before it could be committed; neither can be told
+                // from a truly absent writer by enumeration alone.
+                //
+                // The scans run only once the bounded window has
+                // elapsed — before that the answer is Unknown
+                // regardless. The anchor is the Execution's
                 // `uncertain_since`, set on the transition into
                 // `uncertain` and never refreshed by repeat `Unknown`
                 // reports; an unidentified Prepared is the only
@@ -3886,30 +4037,99 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // `ready`, so the anchor always postdates this launch's
                 // commit — the measured window covers the whole
                 // spawn-to-visible gap plus poll lag.
-                let absence_proven = unrecorded.is_empty()
-                    && execution.uncertain_since_unix_seconds.is_some_and(|since| {
-                        now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
-                    })
-                    && self.launch_dir_clear(&canonical_dir, contained, &recorded);
-                if absence_proven {
-                    self.report(
-                        store,
-                        request,
-                        ObservationFact::ProcessState {
-                            invocation_id: invocation.id.clone(),
-                            process_identity: String::new(),
-                            state: ProcessStateFact::Exited,
-                            exit_code: None,
-                        },
-                        now_unix_seconds,
-                    )
-                } else {
-                    self.report_unidentified_unknown(
+                let window_elapsed = execution.uncertain_since_unix_seconds.is_some_and(|since| {
+                    now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
+                });
+                if !window_elapsed {
+                    return self.report_unidentified_unknown(
                         store,
                         request,
                         &invocation.id,
                         now_unix_seconds,
-                    )
+                    );
+                }
+                // The launch group was committed the moment the spawn
+                // call returned — read it back so a live group member
+                // that escaped both other scans still defeats the
+                // clear verdict.
+                let launch_pgid = store.transact(|tx| {
+                    tx.observations_for_execution(&execution.id).map(|obs| {
+                        obs.iter().rev().find_map(|o| match &o.fact {
+                            ObservationFact::LaunchGroup {
+                                invocation_id,
+                                pgid,
+                            } if *invocation_id == invocation.id => Some(*pgid),
+                            _ => None,
+                        })
+                    })
+                })?;
+                let clearance =
+                    match self.launch_dir_clearance(&canonical_dir, contained, &recorded) {
+                        Clearance::Clear => self.launch_group_clearance(launch_pgid, &recorded),
+                        other => other,
+                    };
+                match clearance {
+                    Clearance::Clear => {
+                        self.incomplete_scans
+                            .lock()
+                            .unwrap()
+                            .remove(&invocation.id.0);
+                        self.report(
+                            store,
+                            request,
+                            ObservationFact::ProcessState {
+                                invocation_id: invocation.id.clone(),
+                                process_identity: String::new(),
+                                state: ProcessStateFact::Exited,
+                                exit_code: None,
+                            },
+                            now_unix_seconds,
+                        )
+                    }
+                    Clearance::Occupied => {
+                        // A completed scan that found unexplained life
+                        // restarts the streak: this pass is uncertain
+                        // on positive evidence, not on a gap.
+                        self.incomplete_scans
+                            .lock()
+                            .unwrap()
+                            .remove(&invocation.id.0);
+                        self.report_unidentified_unknown(
+                            store,
+                            request,
+                            &invocation.id,
+                            now_unix_seconds,
+                        )
+                    }
+                    Clearance::Incomplete(reason) => {
+                        let streak = {
+                            let mut streaks = self.incomplete_scans.lock().unwrap();
+                            let n = streaks.entry(invocation.id.0.clone()).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        if streak >= UNIDENTIFIED_LAUNCH_SCAN_LIMIT {
+                            // The bounded escalation: a distinct
+                            // operator-visible outcome, not another
+                            // silent Unknown.
+                            self.report(
+                                store,
+                                request,
+                                ObservationFact::LaunchAbsenceUnprovable {
+                                    invocation_id: invocation.id.clone(),
+                                    reason,
+                                },
+                                now_unix_seconds,
+                            )
+                        } else {
+                            self.report_unidentified_unknown(
+                                store,
+                                request,
+                                &invocation.id,
+                                now_unix_seconds,
+                            )
+                        }
+                    }
                 }
             }
             // Anything else is ambiguous — more than one candidate,
@@ -3925,8 +4145,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// occupancy is the only remaining evidence that the vanished
     /// writer's tree is really gone. A failed OR INCOMPLETE
     /// enumeration — a live process whose cwd the port cannot map is
-    /// a possible occupant — proves nothing: fail closed, stay
-    /// uncertain.
+    /// a possible occupant — proves nothing: `Incomplete` keeps the
+    /// launch uncertain and feeds the bounded escalation.
     ///
     /// The launch scope is `dir` plus, for a contained launch, the
     /// sandbox workspace root: the worker's mount namespace binds the
@@ -3936,17 +4156,24 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// unscoped — each scan answers "cwd inside this dir" alone — so
     /// the launch scope is one scan per root and an unexplained
     /// occupant in either keeps absence unproven.
-    fn launch_dir_clear(
+    fn launch_dir_clearance(
         &self,
         dir: &Path,
         contained: bool,
         recorded: &HashSet<(i32, String)>,
-    ) -> bool {
+    ) -> Clearance {
         let clear = |occupants: Result<Vec<ProcessMatch>, String>| match occupants {
-            Ok(occupants) => occupants
-                .iter()
-                .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
-            Err(_) => false,
+            Err(reason) => Clearance::Incomplete(reason),
+            Ok(occupants) => {
+                if occupants
+                    .iter()
+                    .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone())))
+                {
+                    Clearance::Clear
+                } else {
+                    Clearance::Occupied
+                }
+            }
         };
         // The sandbox root is a mount-namespace spelling, not a host
         // dir: on a host with no real `/workspace` every live
@@ -3958,12 +4185,61 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // occupant instead, so the same recorded judgment applies
         // per pid: a recorded contained worker no longer blocks,
         // an unexplained one still does.
-        clear(self.port.processes_in_directory(dir))
-            && (!contained
-                || clear(
-                    self.port
-                        .processes_in_namespace_dir(Path::new(containment::SANDBOX_WORKSPACE)),
-                ))
+        match clear(self.port.processes_in_directory(dir)) {
+            Clearance::Clear if contained => clear(
+                self.port
+                    .processes_in_namespace_dir(Path::new(containment::SANDBOX_WORKSPACE)),
+            ),
+            other => other,
+        }
+    }
+
+    /// The third absence check: whether the launch's recorded process
+    /// group still holds a live process the store cannot account for.
+    /// A descendant that changed both argv and working directory is
+    /// invisible to the signature and directory scans but stays in
+    /// the leader's group unless it called `setsid` — the recorded
+    /// group is the last handle on that escape. `None` means the
+    /// launch never committed a group record — a spawn fault before
+    /// the record could land — so nothing can be enumerated and the
+    /// check is vacuous: a strictly smaller residual than the
+    /// `setsid` escape, because the leader's spawn had already been
+    /// lost before the group existed on record.
+    ///
+    /// A recorded member is accounted for elsewhere; a dead member is
+    /// gone; anything else live defeats the verdict — including a
+    /// foreign member the group collected after the pgid recycled,
+    /// which can only ever block, never clear.
+    fn launch_group_clearance(
+        &self,
+        launch_pgid: Option<i32>,
+        recorded: &HashSet<(i32, String)>,
+    ) -> Clearance {
+        let Some(pgid) = launch_pgid else {
+            return Clearance::Clear;
+        };
+        let members = match self.port.group_members(pgid) {
+            Ok(members) => members,
+            Err(reason) => return Clearance::Incomplete(reason),
+        };
+        for member in members {
+            if recorded.contains(&(member.pid, member.started_at.clone())) {
+                continue;
+            }
+            match self.port.inspect(&member) {
+                ProcessEvidence::Alive { .. } => return Clearance::Occupied,
+                ProcessEvidence::Stopped { .. } => {}
+                // A member whose liveness cannot be verified keeps the
+                // group unprovable — it might be the escaped writer.
+                ProcessEvidence::Unknown { reason } => {
+                    return Clearance::Incomplete(format!(
+                        "launch group {pgid} member {} could not be verified: {reason}",
+                        member.pid
+                    ));
+                }
+            }
+        }
+        Clearance::Clear
     }
 
     /// Report an unidentified launch as still unknown — the same
@@ -5063,6 +5339,61 @@ mod tests {
         assert!(!is_kernel_thread(1));
         assert!(!is_kernel_thread(std::process::id() as i32));
         assert!(!is_kernel_thread(i32::MAX));
+    }
+
+    /// The completeness gate excludes only the class that provably
+    /// cannot possess a cwd — an independent structural predicate,
+    /// never "the scan did not map it". The mappable population
+    /// completes with cwd-less processes of the excluded class
+    /// present (the uid-0/kernel-thread case); every other live
+    /// unmappable process stays a gap.
+    #[test]
+    fn completeness_gate_excludes_only_the_structural_no_cwd_class() {
+        let live = |_: i32| LstartLookup::Present("lstart".into());
+        let running = |_: i32| Some("S".to_string());
+        // The excluded class is skipped — the scan completes for the
+        // mappable population with cwd-less processes present.
+        assert!(
+            unmappable_cwd_gap(&[7, 8], &HashSet::from([8]), live, running, |p| p == 7).is_ok()
+        );
+        // A same-user live process with an unmappable cwd outside the
+        // excluded class is still a gap — the contract is unchanged.
+        assert!(unmappable_cwd_gap(&[7], &HashSet::new(), live, running, |_| false).is_err());
+        // A zombie and a process gone between the table reads can hold
+        // no live cwd — neither is a gap.
+        assert!(
+            unmappable_cwd_gap(
+                &[7],
+                &HashSet::new(),
+                live,
+                |_| Some("Z".to_string()),
+                |_| false
+            )
+            .is_ok()
+        );
+        assert!(
+            unmappable_cwd_gap(
+                &[7],
+                &HashSet::new(),
+                |_| LstartLookup::Absent,
+                running,
+                |_| false
+            )
+            .is_ok()
+        );
+        // A failed liveness lookup fails closed — it can never read as
+        // "the process is gone", so the whole enumeration stays
+        // incomplete rather than silently skip an ambiguous row.
+        assert!(
+            unmappable_cwd_gap(
+                &[7],
+                &HashSet::new(),
+                |_| LstartLookup::Failed("ps failed".into()),
+                running,
+                |_| false
+            )
+            .is_err()
+        );
     }
 
     /// A contained worker's cwd reads as the sandbox mount, not the

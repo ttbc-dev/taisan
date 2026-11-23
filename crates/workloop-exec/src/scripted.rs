@@ -289,6 +289,18 @@ impl ScriptedProcessControl {
         pid
     }
 
+    /// Register a live descendant that kept `leader`'s process group —
+    /// the chdir/argv escape the launch-group check exists to catch:
+    /// `group_members(leader's pgid)` still reports it even though
+    /// neither the signature nor the directory scan can see it.
+    pub fn adopt_child_in_group(&self, leader: i32, command: &str) -> i32 {
+        let pid = self.adopt_child_with(leader, command);
+        if let Some(p) = self.state.lock().unwrap().procs.get_mut(&pid) {
+            p.pgid = Some(leader);
+        }
+        pid
+    }
+
     /// The next `snapshot_descendants` fails with this reason — an
     /// incomplete process-table read that must not authorize signals.
     pub fn fail_next_snapshot(&self, reason: &str) {
@@ -474,7 +486,10 @@ impl ProcessControlPort for ScriptedProcessControl {
                     },
                 );
                 s.spawned.push(identity);
-                Err(SpawnError::Unknown { reason })
+                Err(SpawnError::Unknown {
+                    reason,
+                    pgid: Some(pid),
+                })
             }
             SpawnPlan::Resident | SpawnPlan::ExitAfterWrite { .. } => {
                 let pid = s.next_pid;

@@ -188,7 +188,7 @@ fn run_probe_argv(
         .run_probe(argv, cwd, env, timeout)
         .map_err(|e| match e {
             SpawnError::Refused { reason } => format!("describe spawn refused: {reason}"),
-            SpawnError::Unknown { reason } => format!("describe spawn unknown: {reason}"),
+            SpawnError::Unknown { reason, .. } => format!("describe spawn unknown: {reason}"),
         })?;
     match outcome {
         ProbeOutcome::Exited {

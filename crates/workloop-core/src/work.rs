@@ -2764,6 +2764,35 @@ fn assess(
             }
             Ok(())
         }
+        ObservationFact::LaunchAbsenceUnprovable {
+            invocation_id,
+            reason,
+        } => {
+            // The bounded escalation for an unidentified launch: the
+            // absence scans could not be completed a bounded number of
+            // consecutive times. The Invocation stays an unresolved
+            // writer — a live process may still exist, so no slot is
+            // released — but is marked `unknown` so the resolution
+            // loop stops silently re-scanning; the Execution is held
+            // for an operator decision. An intent already recorded on
+            // the Execution (cancel/fail/pause) is never overwritten,
+            // and a terminal Execution is never resurrected — the
+            // state guard lives inside `pause_for_repair`.
+            mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
+            if execution.desired_action.is_none()
+                || execution.desired_action == Some(DesiredAction::Continue)
+            {
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "absence_unprovable",
+                    &format!("repair: launch absence unprovable: {reason}"),
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+            }
+            Ok(())
+        }
         ObservationFact::DispatchRefused { code, detail, .. } => {
             // No Invocation ever existed for the request: the refusal
             // is proven before spawn, so — like `LaunchRefused` — it
