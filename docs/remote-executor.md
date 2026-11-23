@@ -378,7 +378,7 @@ the milestone splits contract, mechanism, and environment:
 | Interchange suite rows and packaging/quickstart | #384/#385 | Compose the proven slices |
 | Automatic event-driven review arming (#309–#311, #322) | parallel milestone items | Remote review must not depend on webhook ingress; polling and the bounded reconciler supply arming facts. The milestone's automatic-review acceptance rides on those issues, not on this boundary |
 
-#416 is not an open item in this table because it is already decided: the remote handoff manifest is a fresh per-Invocation out-directory record (`handoff.json`) beside `report.json`, recorded in #416's `docs/handoff-manifest-custody.md` and consumed by §4 and #374 rather than left open here.
+#416 is not an open item in this table because it is already decided: the remote handoff manifest is a fresh per-Invocation out-directory record (`handoff.json`) beside `report.json`. The decision record lands on `main` as `docs/handoff-manifest-custody.md` with #416's own PR; this spec consumes the decision through §4 and #374 rather than leaving it open here.
 
 ### 7.2 Intentionally open design points
 
