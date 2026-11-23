@@ -101,6 +101,11 @@ fn valid_marker(marker: &str) -> bool {
 /// DNS, reset, TLS) where no HTTP answer exists.
 struct GhOutput {
     success: bool,
+    /// The child's exit code — `None` when the process died to a
+    /// signal. `merge-base --is-ancestor` distinguishes a verdict
+    /// (`1`) from an undeterminable answer (`128`), which `success`
+    /// alone cannot.
+    code: Option<i32>,
     http_status: Option<u16>,
     stdout: String,
     stderr: String,
@@ -381,6 +386,7 @@ impl GhCliApi {
         let stderr = buffer_string(&stderr_buf);
         Ok(GhOutput {
             success: status.success(),
+            code: status.code(),
             http_status: http_status(stderr.trim()),
             stdout: stdout.trim().to_string(),
             stderr: stderr.trim().to_string(),
@@ -534,64 +540,16 @@ impl GhCliApi {
         (output.success && !token.is_empty()).then_some(token)
     }
 
-    /// Move `branch` to `new_head` by real git transport: `git push`
-    /// from `object_source` uploads the produced object closure and
-    /// updates the remote ref in one server-side operation —
-    /// `--force-with-lease` makes the prior-position guard atomic on
-    /// the host, closing the refs-API read-then-write window the
-    /// module header records. The child runs under a scrubbed
-    /// environment: no ambient config, no credential helper, prompts
-    /// dead, HTTPS only — the bound credential (or the ambient gh
-    /// token for the `default` slot) reaches it only as an
-    /// Authorization header value carried in env-scoped config,
-    /// never argv. A git-reported rejection is a definite refusal;
-    /// a transport-level or unclassifiable failure is `Unknown` —
-    /// the ref may or may not have moved.
-    fn git_push_ref(
-        &self,
-        slug: &str,
-        branch: &str,
-        new_head: &str,
-        expected_prior: Option<&str>,
-    ) -> Result<String, ApiError> {
-        let Some(object_source) = self.object_source.clone() else {
-            return Err(ApiError::Refused {
-                reason: "git transport has no object source".into(),
-            });
-        };
-        let host = self.hostname.as_deref().unwrap_or("github.com");
-        let url = format!("https://{host}/{slug}.git");
-        let Some(token) = self.push_token() else {
-            return Err(ApiError::Refused {
-                reason: "git transport found no usable credential".into(),
-            });
-        };
-        // The prior-position guard rides in the push itself: the
-        // server refuses the update unless the remote ref still
-        // holds `expected_prior` — and an empty expectation means
-        // "the ref must not exist".
-        let lease = format!(
-            "--force-with-lease=refs/heads/{branch}:{}",
-            expected_prior.unwrap_or("")
-        );
-        let args = vec![
-            "-C".to_string(),
-            object_source.to_string_lossy().into_owned(),
-            "push".to_string(),
-            "--porcelain".to_string(),
-            lease,
-            url.clone(),
-            format!("{new_head}:refs/heads/{branch}"),
-        ];
-        // env-scoped config entries: the credential helper list is
-        // emptied so no ambient helper can answer, and the token
-        // rides as an Authorization header scoped to this push URL —
-        // the value never enters argv or process listings.
-        let mut config = vec![("credential.helper".to_string(), String::new())];
-        config.push((
-            format!("http.{url}.extraHeader"),
-            format!("Authorization: Bearer {token}"),
-        ));
+    /// The scrubbed environment every `git` child runs under — the
+    /// object transport's push and the local `merge-base` ancestry
+    /// check alike: no ambient config, prompts dead, replacement
+    /// objects denied (a `replace` ref could fake ancestry), HTTPS
+    /// only. `config` appends env-scoped `GIT_CONFIG_KEY_N`/
+    /// `GIT_CONFIG_VALUE_N` pairs — the emptied credential helper
+    /// and, for the push, the Authorization extraHeader whose value
+    /// never enters argv. Proxy and TLS roots pass through; nothing
+    /// else does.
+    fn scrubbed_git_env(&self, config: &[(String, String)]) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = vec![
             (
                 "PATH".into(),
@@ -626,6 +584,115 @@ impl GhCliApi {
                 env.push((key.to_string(), value));
             }
         }
+        env
+    }
+
+    /// Move `branch` to `new_head` by real git transport: `git push`
+    /// from `object_source` uploads the produced object closure and
+    /// updates the remote ref in one server-side operation —
+    /// `--force-with-lease` makes the prior-position guard atomic on
+    /// the host, closing the refs-API read-then-write window the
+    /// module header records. Two guards, not one: the lease covers
+    /// only the ref's *position*, so a `merge-base --is-ancestor`
+    /// check first re-states the descendant requirement the refs
+    /// API's `force: false` enforced server-side — the push alone
+    /// would happily rewrite the branch to a non-descendant history.
+    /// An absent `expected_prior` is a new ref: there is no ancestry
+    /// to check, only the empty lease's must-not-exist guard. The
+    /// child runs under a scrubbed environment: no ambient config,
+    /// no credential helper, prompts dead, HTTPS only — the bound
+    /// credential (or the ambient gh token for the `default` slot)
+    /// reaches it only as an Authorization header value carried in
+    /// env-scoped config, never argv. A git-reported rejection is a
+    /// definite refusal; a transport-level or unclassifiable failure
+    /// is `Unknown` — the ref may or may not have moved.
+    fn git_push_ref(
+        &self,
+        slug: &str,
+        branch: &str,
+        new_head: &str,
+        expected_prior: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let Some(object_source) = self.object_source.clone() else {
+            return Err(ApiError::Refused {
+                reason: "git transport has no object source".into(),
+            });
+        };
+        let host = self.hostname.as_deref().unwrap_or("github.com");
+        let url = format!("https://{host}/{slug}.git");
+        let Some(token) = self.push_token() else {
+            return Err(ApiError::Refused {
+                reason: "git transport found no usable credential".into(),
+            });
+        };
+        // The descendant guard the refs API's `force: false` enforced
+        // server-side, re-stated locally before any write is issued:
+        // `--force-with-lease` guards only the ref's position and
+        // would happily rewrite history to a non-descendant head.
+        // `merge-base --is-ancestor` distinguishes its verdict (exit
+        // 1) from an answer it cannot give (128 — a missing object),
+        // which refuses rather than pushing blind. The check runs
+        // after credential resolution: a transport that cannot
+        // authenticate never spawns git at all.
+        if let Some(prior) = expected_prior {
+            let output = self.run_plain(
+                &self.git.clone(),
+                &[
+                    "-C".to_string(),
+                    object_source.to_string_lossy().into_owned(),
+                    "merge-base".to_string(),
+                    "--is-ancestor".to_string(),
+                    prior.to_string(),
+                    new_head.to_string(),
+                ],
+                Some(&self.scrubbed_git_env(&[])),
+            )?;
+            match output.code {
+                Some(0) => {}
+                Some(1) => {
+                    return Err(ApiError::Refused {
+                        reason: "non_fast_forward".into(),
+                    });
+                }
+                _ => {
+                    let detail = if output.stderr.is_empty() {
+                        output.stdout
+                    } else {
+                        output.stderr
+                    };
+                    return Err(ApiError::Refused {
+                        reason: format!("git merge-base --is-ancestor: {detail}"),
+                    });
+                }
+            }
+        }
+        // The prior-position guard rides in the push itself: the
+        // server refuses the update unless the remote ref still
+        // holds `expected_prior` — and an empty expectation means
+        // "the ref must not exist".
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            expected_prior.unwrap_or("")
+        );
+        let args = vec![
+            "-C".to_string(),
+            object_source.to_string_lossy().into_owned(),
+            "push".to_string(),
+            "--porcelain".to_string(),
+            lease,
+            url.clone(),
+            format!("{new_head}:refs/heads/{branch}"),
+        ];
+        // env-scoped config entries: the credential helper list is
+        // emptied so no ambient helper can answer, and the token
+        // rides as an Authorization header scoped to this push URL —
+        // the value never enters argv or process listings.
+        let mut config = vec![("credential.helper".to_string(), String::new())];
+        config.push((
+            format!("http.{url}.extraHeader"),
+            format!("Authorization: Bearer {token}"),
+        ));
+        let env = self.scrubbed_git_env(&config);
         let output = self.run_plain(&self.git.clone(), &args, Some(&env))?;
         if output.success {
             return Ok(new_head.to_string());

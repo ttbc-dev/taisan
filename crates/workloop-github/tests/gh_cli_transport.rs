@@ -946,6 +946,10 @@ fn write_ref_pushes_objects_through_git_transport() {
         "the push runs from the object source: {argv}"
     );
     assert!(
+        argv.contains("merge-base --is-ancestor expected111 new000"),
+        "a guarded write proves the produced head descends from the prior: {argv}"
+    );
+    assert!(
         argv.contains("--force-with-lease=refs/heads/b:expected111"),
         "the lease carries the guarded prior head: {argv}"
     );
@@ -995,6 +999,75 @@ fn write_ref_creates_via_git_transport_with_an_empty_lease() {
         "an absent expectation is an empty lease — the ref must not exist: {argv}"
     );
     assert!(argv.contains("seed000:refs/heads/new-branch"), "{argv}");
+    assert!(
+        !argv.contains("merge-base"),
+        "a new ref has no prior — no ancestry check is possible or needed: {argv}"
+    );
+}
+
+#[test]
+fn git_transport_refuses_a_non_descendant_head() {
+    // `--force-with-lease` guards only the ref's position: without
+    // the local ancestry check the push would happily rewrite the
+    // branch to a non-descendant history, where the refs-API
+    // `force: false` refused it server-side.
+    let dir = tempdir("git-push-nonff");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then exit 1; fi\nexit 0\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Refused {
+            reason: "non_fast_forward".into()
+        },
+        "a non-descendant produced head is a definite refusal"
+    );
+    assert!(
+        !git_calls(&dir).lines().any(|l| l.contains(" push ")),
+        "the push is never issued: {}",
+        git_calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_refuses_when_ancestry_cannot_be_determined() {
+    // A `merge-base` that cannot answer (missing object, corrupt
+    // store) is not a verdict — the write refuses rather than
+    // pushing blind. Definite refusal, not Unknown: nothing reached
+    // the remote.
+    let dir = tempdir("git-push-nobase");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then echo 'fatal: Not a valid object name expected111' >&2; exit 128; fi\nexit 0\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "an undeterminable ancestry refuses, never pushes blind: {err:?}"
+    );
+    assert!(
+        !git_calls(&dir).lines().any(|l| l.contains(" push ")),
+        "the push is never issued: {}",
+        git_calls(&dir)
+    );
 }
 
 #[test]
@@ -1046,7 +1119,7 @@ fn git_transport_lease_failure_reports_stale_head() {
     let gh = stub_gh_for_push(&dir);
     let git = stub_git(
         &dir,
-        "echo '! refs/heads/b:refs/heads/b [rejected] (stale info)'\nexit 1\n",
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho '! refs/heads/b:refs/heads/b [rejected] (stale info)'\nexit 1\n",
     );
     let store = dir.join("handoff-repo.git");
     fs::create_dir_all(&store).unwrap();
@@ -1071,7 +1144,7 @@ fn git_transport_rejection_is_a_definite_refusal() {
     let gh = stub_gh_for_push(&dir);
     let git = stub_git(
         &dir,
-        "echo '! refs/heads/b:refs/heads/b [rejected] (non-fast-forward)'\nexit 1\n",
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho '! refs/heads/b:refs/heads/b [rejected] (non-fast-forward)'\nexit 1\n",
     );
     let store = dir.join("handoff-repo.git");
     fs::create_dir_all(&store).unwrap();
@@ -1100,7 +1173,7 @@ fn git_transport_lost_connection_is_unknown() {
     let gh = stub_gh_for_push(&dir);
     let git = stub_git(
         &dir,
-        "echo 'fatal: unable to access https://github.com/owner/repo.git/: Could not resolve host' >&2\nexit 128\n",
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho 'fatal: unable to access https://github.com/owner/repo.git/: Could not resolve host' >&2\nexit 128\n",
     );
     let store = dir.join("handoff-repo.git");
     fs::create_dir_all(&store).unwrap();
