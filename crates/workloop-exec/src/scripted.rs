@@ -301,6 +301,30 @@ impl ScriptedProcessControl {
         pid
     }
 
+    /// Recycle `pid` as a foreign process: the row is replaced by a
+    /// live one at the same pid with a fresh start time — the pid-reuse
+    /// shape the real table produces when an unrelated process lands on
+    /// a freed number. The replacement is its own group leader, so a
+    /// recorded pgid equal to the pid enumerates a foreign family whose
+    /// owner start differs from the launch's recorded leader.
+    pub fn recycle_as(&self, pid: i32, command: &str, cwd: &std::path::Path) {
+        let mut s = self.state.lock().unwrap();
+        s.procs.insert(
+            pid,
+            Proc {
+                started_at: format!("scripted-lstart-recycled-{pid}"),
+                pgid: Some(pid),
+                cwd: cwd.to_path_buf(),
+                command: command.to_string(),
+                alive: true,
+                exit_code: None,
+                inspect_unknown: None,
+                survives_signal: false,
+                cwd_unreadable: false,
+            },
+        );
+    }
+
     /// The next `snapshot_descendants` fails with this reason — an
     /// incomplete process-table read that must not authorize signals.
     pub fn fail_next_snapshot(&self, reason: &str) {

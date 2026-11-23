@@ -2772,12 +2772,18 @@ fn assess(
             // absence scans could not be completed a bounded number of
             // consecutive times. The Invocation stays an unresolved
             // writer — a live process may still exist, so no slot is
-            // released — but is marked `unknown` so the resolution
-            // loop stops silently re-scanning; the Execution is held
-            // for an operator decision. An intent already recorded on
-            // the Execution (cancel/fail/pause) is never overwritten,
-            // and a terminal Execution is never resurrected — the
-            // state guard lives inside `pause_for_repair`.
+            // released — and is marked `unknown`: the distinct outcome
+            // surfaces the unprovable absence to the operator while
+            // the Execution is held for an operator decision. The
+            // mark does not end the resolution — the poll loop keeps
+            // scanning the `unknown` launch, so a later provable
+            // answer (a re-bound writer or a completed clear) still
+            // settles it under the recorded desired action; the
+            // transient burst is never a permanent wedge. An intent
+            // already recorded on the Execution (cancel/fail/pause)
+            // is never overwritten, and a terminal Execution is never
+            // resurrected — the state guard lives inside
+            // `pause_for_repair`.
             mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
             if execution.desired_action.is_none()
                 || execution.desired_action == Some(DesiredAction::Continue)

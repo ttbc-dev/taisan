@@ -2669,7 +2669,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // spawn call returns, before the running commit: when
                 // the leader's identity record is the one that is
                 // lost, the group stays the durable handle the absence
-                // proof enumerates for group-keeping escapes.
+                // proof enumerates for group-keeping escapes. The
+                // leader's start is the owner identity the group's
+                // recycled-pgid check verifies against.
                 if let Some(pgid) = identity.pgid {
                     self.report(
                         store,
@@ -2677,6 +2679,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         ObservationFact::LaunchGroup {
                             invocation_id: invocation.id.clone(),
                             pgid,
+                            leader_started_at: Some(identity.started_at.clone()),
                         },
                         now_unix_seconds,
                     )?;
@@ -2731,7 +2734,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // Same durability order as the `Ok` arm: the group the
                 // spawn produced is committed before the unknown-state
                 // fact, so the unidentified launch's absence proof can
-                // still enumerate it.
+                // still enumerate it. The leader's start is the owner
+                // identity the recycled-pgid check verifies against —
+                // captured here from the group itself, the one read of
+                // the owner slot the failed identity capture still
+                // allows.
                 if let Some(pgid) = pgid {
                     self.report(
                         store,
@@ -2739,6 +2746,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         ObservationFact::LaunchGroup {
                             invocation_id: invocation.id.clone(),
                             pgid,
+                            leader_started_at: self.launch_owner_start(pgid),
                         },
                         now_unix_seconds,
                     )?;
@@ -3273,6 +3281,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         ObservationFact::LaunchGroup {
                             invocation_id: invocation.id.clone(),
                             pgid,
+                            leader_started_at: Some(identity.started_at.clone()),
                         },
                         now_unix_seconds,
                     )?;
@@ -3316,6 +3325,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 self.refuse_launch(store, request, &invocation, reason, now_unix_seconds)?;
             }
             Err(SpawnError::Unknown { pgid, .. }) => {
+                // The leader's start is the owner identity the
+                // recycled-pgid check verifies against — captured
+                // here from the group itself, the one read of the
+                // owner slot the failed identity capture still allows.
                 if let Some(pgid) = pgid {
                     self.report(
                         store,
@@ -3323,6 +3336,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         ObservationFact::LaunchGroup {
                             invocation_id: invocation.id.clone(),
                             pgid,
+                            leader_started_at: self.launch_owner_start(pgid),
                         },
                         now_unix_seconds,
                     )?;
@@ -3534,10 +3548,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // outcome is unrecorded. Resolve it — re-bind a found
                 // orphaned writer, prove absence after the bounded
                 // window, or keep the Execution uncertain rather than
-                // starting a second writer.
-                if invocation.state == InvocationState::Prepared
-                    && let Some(request) =
-                        store.transact(|tx| tx.request(&invocation.request_id))?
+                // starting a second writer. An `unknown` launch — the
+                // escalation's recorded outcome — keeps resolving too:
+                // the escalation only bounds how soon the operator is
+                // told, and a later provable answer still settles the
+                // writer under the recorded desired action.
+                if matches!(
+                    invocation.state,
+                    InvocationState::Prepared | InvocationState::Unknown
+                ) && let Some(request) =
+                    store.transact(|tx| tx.request(&invocation.request_id))?
                 {
                     self.resolve_unidentified_launch(
                         store,
@@ -3717,7 +3737,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// reporting `Unknown`: an ambiguous or unreadable answer is
     /// never a guess — and a bounded count of consecutive incomplete
     /// scans escalates to the `absence_unprovable` outcome rather
-    /// than hold `uncertain` forever.
+    /// than hold `uncertain` forever. The escalation marks the launch
+    /// `unknown` but does not end the resolution: the loop keeps
+    /// scanning so a later provable answer — a re-bound writer or a
+    /// completed clear — still settles it under the Execution's
+    /// recorded desired action.
     fn resolve_unidentified_launch(
         &self,
         store: &impl Store,
@@ -4051,21 +4075,26 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // The launch group was committed the moment the spawn
                 // call returned — read it back so a live group member
                 // that escaped both other scans still defeats the
-                // clear verdict.
-                let launch_pgid = store.transact(|tx| {
+                // clear verdict. The recorded leader start is the
+                // owner identity the group check verifies before any
+                // member counts.
+                let launch_group = store.transact(|tx| {
                     tx.observations_for_execution(&execution.id).map(|obs| {
                         obs.iter().rev().find_map(|o| match &o.fact {
                             ObservationFact::LaunchGroup {
                                 invocation_id,
                                 pgid,
-                            } if *invocation_id == invocation.id => Some(*pgid),
+                                leader_started_at,
+                            } if *invocation_id == invocation.id => {
+                                Some((*pgid, leader_started_at.clone()))
+                            }
                             _ => None,
                         })
                     })
                 })?;
                 let clearance =
                     match self.launch_dir_clearance(&canonical_dir, contained, &recorded) {
-                        Clearance::Clear => self.launch_group_clearance(launch_pgid, &recorded),
+                        Clearance::Clear => self.launch_group_clearance(launch_group, &recorded),
                         other => other,
                     };
                 match clearance {
@@ -4108,10 +4137,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             *n += 1;
                             *n
                         };
-                        if streak >= UNIDENTIFIED_LAUNCH_SCAN_LIMIT {
+                        if streak >= UNIDENTIFIED_LAUNCH_SCAN_LIMIT
+                            && invocation.state == InvocationState::Prepared
+                        {
                             // The bounded escalation: a distinct
                             // operator-visible outcome, not another
-                            // silent Unknown.
+                            // silent Unknown. It is reported once —
+                            // the launch then scans on as `unknown`,
+                            // so a later provable answer still
+                            // resolves it; further incomplete scans
+                            // stay `uncertain` without re-escalating.
                             self.report(
                                 store,
                                 request,
@@ -4194,6 +4229,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
         }
     }
 
+    /// The group owner's start as the enumeration reports it — the
+    /// owner-slot identity `launch_group_clearance` verifies against.
+    /// `pgid` is the spawned leader's pid (`process_group(0)`), so the
+    /// member at that slot is the leader itself while it lives; a read
+    /// taken at launch-report time runs under the same post-spawn
+    /// trust the `Started` arm's identity capture does. `None` when
+    /// the enumeration fails or the slot is already empty.
+    fn launch_owner_start(&self, pgid: i32) -> Option<String> {
+        self.port.group_members(pgid).ok().and_then(|members| {
+            members
+                .into_iter()
+                .find(|m| m.pid == pgid)
+                .map(|m| m.started_at)
+        })
+    }
+
     /// The third absence check: whether the launch's recorded process
     /// group still holds a live process the store cannot account for.
     /// A descendant that changed both argv and working directory is
@@ -4206,22 +4257,42 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// `setsid` escape, because the leader's spawn had already been
     /// lost before the group existed on record.
     ///
+    /// The owner slot is verified before any member counts — the same
+    /// attribution `proof_identities` applies on the stop path. `pgid`
+    /// is the leader's pid, so the member at `pid == pgid` is the
+    /// owner; when the launch recorded the leader's start, a live
+    /// process there with a different start means the number was
+    /// recycled after the leader died — a group can never be recycled
+    /// while a member lives, so a foreign owner also proves no member
+    /// of the launch's group remains: the whole enumeration is a
+    /// foreign family the verdict must not count in either direction.
+    /// With no recorded owner start the slot cannot be verified and
+    /// the member check below keeps its conservative reading.
+    ///
     /// A recorded member is accounted for elsewhere; a dead member is
     /// gone; anything else live defeats the verdict — including a
-    /// foreign member the group collected after the pgid recycled,
-    /// which can only ever block, never clear.
+    /// foreign member in a group whose owner is still this launch's
+    /// (or cannot be verified), which can only ever block, never
+    /// clear.
     fn launch_group_clearance(
         &self,
-        launch_pgid: Option<i32>,
+        launch_group: Option<(i32, Option<String>)>,
         recorded: &HashSet<(i32, String)>,
     ) -> Clearance {
-        let Some(pgid) = launch_pgid else {
+        let Some((pgid, owner_started_at)) = launch_group else {
             return Clearance::Clear;
         };
         let members = match self.port.group_members(pgid) {
             Ok(members) => members,
             Err(reason) => return Clearance::Incomplete(reason),
         };
+        if owner_started_at.as_ref().is_some_and(|start| {
+            members
+                .iter()
+                .any(|m| m.pid == pgid && &m.started_at != start)
+        }) {
+            return Clearance::Clear;
+        }
         for member in members {
             if recorded.contains(&(member.pid, member.started_at.clone())) {
                 continue;

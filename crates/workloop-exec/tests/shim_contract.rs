@@ -751,16 +751,183 @@ fn consecutive_incomplete_scans_converge_to_absence_unprovable() {
         vec![RepairPrerequisite::OperatorDecision]
     );
     // The slot stays held — a live writer may still exist; nothing
-    // was proven absent, and a later pass does not resurrect the
-    // resolution loop.
+    // was proven absent. The hold is stable while scans stay
+    // incomplete: the escalation is surfaced once and further
+    // incomplete scans keep the launch `unknown` without
+    // re-escalating, but a later completed scan still resolves it.
     let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
     assert_eq!(slots, 1);
-    sup.poll_invocations(&store, NOW + 40).unwrap();
+    for poll in 40..43 {
+        sup.poll_invocations(&store, NOW + poll).unwrap();
+    }
     assert_eq!(
         only_invocation(&store, &eid).state,
         InvocationState::Unknown,
-        "the converged outcome is stable"
+        "the converged outcome is stable while scans stay incomplete"
     );
+    let escalations = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .filter(|o| matches!(o.fact, ObservationFact::LaunchAbsenceUnprovable { .. }))
+        .count();
+    assert_eq!(escalations, 1, "the distinct outcome is reported once");
+}
+
+/// The escalated `unknown` outcome is surfaced, not concluded: the
+/// resolution loop keeps scanning the unidentified launch, so once
+/// the obstruction clears a completed scan proves the absence and the
+/// Execution settles under the recorded desired action — `paused` for
+/// the operator decision the escalation asked for — and releases the
+/// slot it held against the possible writer.
+#[test]
+fn an_escalated_unprovable_launch_recovers_when_absence_becomes_provable() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unprovable-recovers");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
+    let (_w, eid) = submit_and_admit(&store, "k-shim-recover");
+    sup.consume_requests(&store, NOW).unwrap();
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    // An unmappable foreign cwd makes every absence scan incomplete —
+    // three consecutive failures converge to the recorded outcome.
+    let foreign = port.adopt_child_with(leader, "foreign-daemon");
+    port.set_cwd(foreign, &tmp_root("unprovable-foreign"));
+    port.set_cwd_unreadable(foreign, true);
+    for poll in 1..=3 {
+        sup.poll_invocations(&store, NOW + 30 + poll).unwrap();
+    }
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Unknown,
+        "the bounded count surfaced the unprovable absence"
+    );
+    // The obstruction clears: the next scan completes, proves the
+    // absence, and the escalated launch settles like any other
+    // unidentified launch — `abandoned`, Execution `paused` under the
+    // recorded desired action, slot released.
+    port.set_cwd_unreadable(foreign, false);
+    sup.poll_invocations(&store, NOW + 40).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(e.desired_action, None);
+    assert_eq!(
+        e.repair_prerequisites,
+        vec![RepairPrerequisite::OperatorDecision]
+    );
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("absence unprovable")),
+        "the escalation record survives the recovery"
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0);
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// A writer that surfaces after the escalation is still resolved by
+/// the ordinary rules: the completed scan re-binds it under the same
+/// single-match-in-directory evidence a never-escalated launch uses,
+/// and the recorded pause desire then drives the normal
+/// signal-and-prove path — the found writer is stopped and the
+/// Execution settles `paused`.
+#[test]
+fn an_escalated_launch_rebinds_a_late_appearing_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unprovable-rebinds");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
+    let (_w, eid) = submit_and_admit(&store, "k-shim-rebind");
+    sup.consume_requests(&store, NOW).unwrap();
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    let foreign = port.adopt_child_with(leader, "foreign-daemon");
+    port.set_cwd(foreign, &tmp_root("unprovable-rebind-foreign"));
+    port.set_cwd_unreadable(foreign, true);
+    for poll in 1..=3 {
+        sup.poll_invocations(&store, NOW + 30 + poll).unwrap();
+    }
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Unknown
+    );
+    // The obstruction clears and the orphaned writer finally shows in
+    // the signature scan: the single in-directory match is re-bound.
+    port.set_cwd_unreadable(foreign, false);
+    let orphan = port.adopt_child(leader);
+    sup.poll_invocations(&store, NOW + 40).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Running);
+    assert_eq!(
+        invocation.process_identity.as_ref().map(|i| i.pid),
+        Some(orphan),
+        "the found writer is bound to the escalated launch"
+    );
+    // The recorded desired action still applies: the operator's pause
+    // drives the normal signal-and-prove loop over the bound writer.
+    sup.drive_stops(&store, NOW + 41).unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0);
+    assert!(
+        port.signals()
+            .iter()
+            .any(|s| s.pid == Some(orphan) || s.pgid == Some(orphan)),
+        "the re-bound writer was signaled under the recorded pause"
+    );
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// A recorded launch group whose owner slot was recycled is a foreign
+/// family, not the lost writer's: `pgid` is the leader's pid, so a
+/// live process there with a different start than the recorded
+/// leader's proves the group re-formed after the leader died — its
+/// members can never defeat the absence verdict.
+#[test]
+fn a_recycled_launch_group_owner_is_foreign_not_the_lost_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-recycled-group");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
+    let (_w, eid) = submit_and_admit(&store, "k-shim-recycled");
+    sup.consume_requests(&store, NOW).unwrap();
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    // The freed pid/pgid lands on an unrelated process — its own
+    // group leader with a different start — and the recycled group
+    // collects foreign members. None of them is the lost writer.
+    let elsewhere = tmp_root("unidentified-recycled-elsewhere");
+    port.recycle_as(leader, "foreign-daemon", &elsewhere);
+    port.adopt_child_in_group(leader, "foreign-child");
+    // Past the window the signature and directory scans complete and
+    // find nothing of this launch's; the recycled group is verified
+    // foreign at the owner slot, so its live members cannot hold
+    // absence open — the launch abandons and the slot releases.
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned,
+        "a recycled group is foreign evidence, never the lost writer"
+    );
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0);
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
 }
 
 /// Only CONSECUTIVE incomplete scans count toward the bound: a

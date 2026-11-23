@@ -89,6 +89,16 @@ pub enum ObservationFact {
     LaunchGroup {
         invocation_id: InvocationId,
         pgid: i32,
+        /// The leader's start as captured at report time: `pgid` is
+        /// the leader's pid, so the group member at that slot is the
+        /// owner identity the absence proof verifies the group
+        /// against — a live process there with a different start means
+        /// the number was recycled after the leader died and the whole
+        /// group is a foreign family. `None` when the spawn could not
+        /// capture it; the owner slot is then unverifiable and the
+        /// member check stays conservative.
+        #[serde(default)]
+        leader_started_at: Option<String>,
     },
     /// The bounded escalation for an unidentified launch whose
     /// absence scans could not be completed a bounded number of
@@ -96,6 +106,9 @@ pub enum ObservationFact {
     /// live process may still exist, so the slot is never released —
     /// but the unprovable absence is surfaced to the operator as a
     /// distinct outcome instead of an indefinite `uncertain` hold.
+    /// The escalation surfaces the outcome; it does not conclude it:
+    /// the absence scans keep running underneath, so a later provable
+    /// answer still resolves the writer.
     LaunchAbsenceUnprovable {
         invocation_id: InvocationId,
         reason: String,

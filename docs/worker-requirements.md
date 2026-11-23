@@ -12,7 +12,7 @@ The proof paragraphs are planned contract scenarios. Run them through the future
 
 ## R11
 
-Lost start acknowledgement is uncertainty, not failure. A replayed request with an existing launch intent never spawns again; a lost start response reconciles the recorded process identity, proves the writer absent after the bounded window — the Invocation is `abandoned` and the Execution pauses for an operator decision — or leaves the Invocation `uncertain` until either answer is provable. The Worker-owned slice covers start idempotency and launch facts; Work-wide successor and budget limits follow #51.
+Lost start acknowledgement is uncertainty, not failure. A replayed request with an existing launch intent never spawns again; a lost start response reconciles the recorded process identity, proves the writer absent after the bounded window — no unrecorded signature match, no unexplained process in the launch directory, and no live unrecorded member of the recorded launch group — the Invocation is `abandoned` and the Execution pauses for an operator decision — or leaves the Invocation `uncertain` until either answer is provable, with a bounded count of consecutive incomplete absence scans escalating to the distinct `absence_unprovable` outcome rather than an indefinite silent hold. The Worker-owned slice covers start idempotency and launch facts; Work-wide successor and budget limits follow #51.
 
 Clause: [start, observe, stop](worker-protocol.md#start-observe-stop); [failure mapping](worker-protocol.md#failure-mapping). Suite: WS-02, WS-03, WS-05.
 
