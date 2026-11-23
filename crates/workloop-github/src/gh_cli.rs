@@ -18,20 +18,24 @@
 //!   mismatch — the reason string the adapter's guarded-write path
 //!   matches on.
 //!
-//! Known transport limitation, recorded for the runbook: GitHub's git
-//! refs API has no compare-and-swap on the prior value. The guard is
+//! `write_ref` has two shapes. With an `object_source` (the
+//! installation-owned handoff repository — see
+//! [`GhCliApi::with_git_transport`]) the write is a real `git push`:
+//! the produced objects upload in the same server-side ref update and
+//! `--force-with-lease` makes the prior-position guard atomic. Without
+//! one it falls back to the refs API — which cannot stage objects, so
+//! a head the host has never seen fails the write honestly, and which
+//! retains a known limitation recorded for the runbook: the API has
+//! no compare-and-swap on the prior value, so the guard is
 //! read-then-write plus the server-side fast-forward check
 //! (`force: false`); a ref moved by a third party in the narrow window
 //! between the read and the PATCH can still be overwritten when the
-//! new head remains a descendant. The `git push
-//! --force-with-lease` form would close that window but requires a
-//! local object store this transport does not have; the v0.2 HTTPS
-//! transport inherits the same constraint unless it adds one.
+//! new head remains a descendant.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -108,6 +112,18 @@ struct GhOutput {
 #[derive(Debug)]
 pub struct GhCliApi {
     gh: PathBuf,
+    /// The `git` executable the object transport spawns — only reached
+    /// when `object_source` is set. Pinned separately so tests can
+    /// drive a stub binary.
+    git: PathBuf,
+    /// The local object store `write_ref` pushes from — the
+    /// installation-owned handoff repository that already holds every
+    /// produced commit's objects. When set, the ref write is a real
+    /// `git push`: the objects travel in the same server-side ref
+    /// update, under `--force-with-lease`, which also makes the
+    /// prior-position guard atomic. `None` keeps the refs-API write,
+    /// which can only move a ref to an object the host already has.
+    object_source: Option<PathBuf>,
     timeout: Duration,
     /// `change_request_id` (node id) → `(pull number, owner/name)`.
     /// Numbers never change for a pull request; the slug is retained
@@ -128,6 +144,8 @@ impl GhCliApi {
     pub fn new() -> Self {
         Self {
             gh: PathBuf::from("gh"),
+            git: PathBuf::from("git"),
+            object_source: None,
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
             hostname: None,
@@ -141,6 +159,8 @@ impl GhCliApi {
     pub fn with_gh(gh: impl Into<PathBuf>) -> Self {
         Self {
             gh: gh.into(),
+            git: PathBuf::from("git"),
+            object_source: None,
             timeout: DEFAULT_TIMEOUT,
             pull_numbers: HashMap::new(),
             hostname: None,
@@ -157,6 +177,24 @@ impl GhCliApi {
 
     pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Route `write_ref` through real git transport: `object_source`
+    /// is the local repository holding the produced objects (the
+    /// installation-owned handoff repository). The push uploads the
+    /// object closure and moves the remote ref in one server-side
+    /// operation — a ref write can never again point at an object the
+    /// host does not have.
+    pub fn with_git_transport(mut self, object_source: impl Into<PathBuf>) -> Self {
+        self.object_source = Some(object_source.into());
+        self
+    }
+
+    /// The `git` executable the object transport spawns — the test
+    /// seam that lets a stub binary stand in for it.
+    pub fn with_git(mut self, git: impl Into<PathBuf>) -> Self {
+        self.git = git.into();
         self
     }
 
@@ -199,18 +237,7 @@ impl GhCliApi {
         body: Option<&serde_json::Value>,
         token_override: Option<&ResolvedCredential>,
     ) -> Result<GhOutput, ApiError> {
-        let effective = match self.read_deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(ApiError::Unknown {
-                        reason: format!("gh api {}: read deadline elapsed", args.join(" ")),
-                    });
-                }
-                remaining.min(self.timeout)
-            }
-            None => self.timeout,
-        };
+        let effective = self.effective_timeout(&format!("gh api {}", args.join(" ")))?;
         let mut command = Command::new(&self.gh);
         command.arg("api").args(args);
         if let Some(hostname) = &self.hostname {
@@ -255,11 +282,71 @@ impl GhCliApi {
                 }
             })
         });
-        // Drain both pipes on reader threads into shared buffers
-        // while the child runs: a response larger than the OS pipe
-        // buffer would otherwise block `gh` mid-write. The caller
-        // never blocks on join — a descendant surviving the kill can
-        // hold a pipe open, so readers get only a short flush grace.
+        self.wait_bounded(&mut child, effective, &format!("gh api {}", args.join(" ")))
+    }
+
+    /// Spawn `program` directly — no `api` prefix — for the calls the
+    /// transport makes outside the REST surface (`gh auth token`, the
+    /// `git` object transport). `env` `Some` replaces the child's
+    /// environment wholesale; `None` inherits this process's.
+    fn run_plain(
+        &self,
+        program: &Path,
+        args: &[String],
+        env: Option<&[(String, String)]>,
+    ) -> Result<GhOutput, ApiError> {
+        let label = format!("{} {}", program.display(), args.join(" "));
+        let effective = self.effective_timeout(&label)?;
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(vars) = env {
+            command.env_clear();
+            for (key, value) in vars {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Refused {
+                reason: format!("{label} spawn failed: {e}"),
+            })?;
+        self.wait_bounded(&mut child, effective, &label)
+    }
+
+    /// The per-call ceiling: the read window's deadline when one is
+    /// set, else the configured timeout.
+    fn effective_timeout(&self, label: &str) -> Result<Duration, ApiError> {
+        match self.read_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ApiError::Unknown {
+                        reason: format!("{label}: read deadline elapsed"),
+                    });
+                }
+                Ok(remaining.min(self.timeout))
+            }
+            None => Ok(self.timeout),
+        }
+    }
+
+    /// Wait for `child` under `effective`, draining both pipes on
+    /// reader threads into shared buffers while it runs: output larger
+    /// than the OS pipe buffer would otherwise block the child
+    /// mid-write. The call never blocks on join — a descendant
+    /// surviving the kill can hold a pipe open, so readers get only a
+    /// short flush grace. `label` names the invocation in failure
+    /// reasons; a timeout is [`ApiError::Unknown`] — the effect may
+    /// have landed.
+    fn wait_bounded(
+        &self,
+        child: &mut Child,
+        effective: Duration,
+        label: &str,
+    ) -> Result<GhOutput, ApiError> {
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stdout_reader = spawn_drain(child.stdout.take(), MAX_OUTPUT, &stdout_buf);
@@ -276,7 +363,7 @@ impl GhCliApi {
                     let _ = child.wait();
                     flush_readers(&[&stdout_reader, &stderr_reader]);
                     return Err(ApiError::Unknown {
-                        reason: format!("gh api {} timed out", args.join(" ")),
+                        reason: format!("{label} timed out"),
                     });
                 }
                 Err(e) => {
@@ -284,7 +371,7 @@ impl GhCliApi {
                     let _ = child.wait();
                     flush_readers(&[&stdout_reader, &stderr_reader]);
                     return Err(ApiError::Unknown {
-                        reason: format!("gh wait failed: {e}"),
+                        reason: format!("{label} wait failed: {e}"),
                     });
                 }
             }
@@ -425,6 +512,125 @@ impl GhCliApi {
                 reason: format!("gh api {endpoint}: {detail}"),
             },
         }
+    }
+
+    /// The credential the git transport authenticates the push as.
+    /// A bound credential is used verbatim; the ambient (`default`)
+    /// slot resolves through the adapter's own credential surface —
+    /// `gh auth token` answers the ambient gh/GitHub token — never an
+    /// ambient git credential helper or git config, which this
+    /// transport does not trust the operator's HOME to contain.
+    fn push_token(&self) -> Option<String> {
+        if let Some(credential) = &self.credential {
+            return Some(credential.expose().to_string());
+        }
+        let mut args = vec!["auth".to_string(), "token".to_string()];
+        if let Some(hostname) = &self.hostname {
+            args.push("--hostname".to_string());
+            args.push(hostname.clone());
+        }
+        let output = self.run_plain(&self.gh.clone(), &args, None).ok()?;
+        let token = output.stdout.trim().to_string();
+        (output.success && !token.is_empty()).then_some(token)
+    }
+
+    /// Move `branch` to `new_head` by real git transport: `git push`
+    /// from `object_source` uploads the produced object closure and
+    /// updates the remote ref in one server-side operation —
+    /// `--force-with-lease` makes the prior-position guard atomic on
+    /// the host, closing the refs-API read-then-write window the
+    /// module header records. The child runs under a scrubbed
+    /// environment: no ambient config, no credential helper, prompts
+    /// dead, HTTPS only — the bound credential (or the ambient gh
+    /// token for the `default` slot) reaches it only as an
+    /// Authorization header value carried in env-scoped config,
+    /// never argv. A git-reported rejection is a definite refusal;
+    /// a transport-level or unclassifiable failure is `Unknown` —
+    /// the ref may or may not have moved.
+    fn git_push_ref(
+        &self,
+        slug: &str,
+        branch: &str,
+        new_head: &str,
+        expected_prior: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let Some(object_source) = self.object_source.clone() else {
+            return Err(ApiError::Refused {
+                reason: "git transport has no object source".into(),
+            });
+        };
+        let host = self.hostname.as_deref().unwrap_or("github.com");
+        let url = format!("https://{host}/{slug}.git");
+        let Some(token) = self.push_token() else {
+            return Err(ApiError::Refused {
+                reason: "git transport found no usable credential".into(),
+            });
+        };
+        // The prior-position guard rides in the push itself: the
+        // server refuses the update unless the remote ref still
+        // holds `expected_prior` — and an empty expectation means
+        // "the ref must not exist".
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            expected_prior.unwrap_or("")
+        );
+        let args = vec![
+            "-C".to_string(),
+            object_source.to_string_lossy().into_owned(),
+            "push".to_string(),
+            "--porcelain".to_string(),
+            lease,
+            url.clone(),
+            format!("{new_head}:refs/heads/{branch}"),
+        ];
+        // env-scoped config entries: the credential helper list is
+        // emptied so no ambient helper can answer, and the token
+        // rides as an Authorization header scoped to this push URL —
+        // the value never enters argv or process listings.
+        let mut config = vec![("credential.helper".to_string(), String::new())];
+        config.push((
+            format!("http.{url}.extraHeader"),
+            format!("Authorization: Bearer {token}"),
+        ));
+        let mut env: Vec<(String, String)> = vec![
+            (
+                "PATH".into(),
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            ),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+            ("GIT_ALLOW_PROTOCOL".into(), "https".into()),
+            ("GIT_CONFIG_COUNT".into(), config.len().to_string()),
+        ];
+        for (i, (key, value)) in config.iter().enumerate() {
+            env.push((format!("GIT_CONFIG_KEY_{i}"), key.clone()));
+            env.push((format!("GIT_CONFIG_VALUE_{i}"), value.clone()));
+        }
+        // Proxy and TLS roots the push may legitimately need pass
+        // through — nothing else does.
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "GIT_SSL_CAINFO",
+            "GIT_SSL_CAPATH",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                env.push((key.to_string(), value));
+            }
+        }
+        let output = self.run_plain(&self.git.clone(), &args, Some(&env))?;
+        if output.success {
+            return Ok(new_head.to_string());
+        }
+        Err(classify_push(&output))
     }
 
     /// `gh api graphql` — the one GraphQL call the REST surface cannot
@@ -630,6 +836,49 @@ fn http_status(detail: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
+/// Classify a failed `git push`. A ref update is atomic server-side,
+/// so a git-reported rejection — the lease verdict, a non-fast-forward,
+/// an auth refusal, or a client-side error that means no request ever
+/// left — is a definite no-effect [`ApiError::Refused`]. Anything else
+/// (DNS, TLS, a lost connection) is [`ApiError::Unknown`]: the update
+/// may have landed before the answer died.
+fn classify_push(output: &GhOutput) -> ApiError {
+    let detail = if output.stderr.is_empty() {
+        output.stdout.clone()
+    } else {
+        output.stderr.clone()
+    };
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    if combined.contains("stale info") {
+        return ApiError::Refused {
+            reason: "stale_head".into(),
+        };
+    }
+    for marker in [
+        "[rejected]",
+        "remote rejected",
+        "non-fast-forward",
+        "fetch first",
+        "does not match any",
+        "src refspec",
+        "not a git repository",
+        "could not read Username",
+        "terminal prompts disabled",
+        "Authentication failed",
+        "Permission denied",
+        "returned error: 40",
+    ] {
+        if combined.contains(marker) {
+            return ApiError::Refused {
+                reason: format!("git push: {detail}"),
+            };
+        }
+    }
+    ApiError::Unknown {
+        reason: format!("git push: {detail}"),
+    }
+}
+
 /// The comment body actually posted: the logical body plus the
 /// reconciliation marker as an HTML comment — invisible when rendered,
 /// exact-matchable as text.
@@ -769,6 +1018,13 @@ impl GitHubApi for GhCliApi {
             return Err(ApiError::Refused {
                 reason: "stale_head".into(),
             });
+        }
+        // Real git transport when an object source is configured: the
+        // produced objects upload in the same server-side ref update,
+        // so the write can never point the remote at an object it
+        // lacks — the refs API's "Object does not exist" failure mode.
+        if self.object_source.is_some() {
+            return self.git_push_ref(&slug, branch, new_head, expected_prior);
         }
         let result = if actual.is_some() {
             self.api(
