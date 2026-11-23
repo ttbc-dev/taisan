@@ -168,9 +168,9 @@ fn stat_of(pid: i32) -> Option<String> {
 /// absent-proof.
 fn cwd_of(pid: i32) -> Option<PathBuf> {
     if let Some(cwd) = lsof_cwd_of(pid) {
-        return Some(cwd);
+        return Some(strip_deleted_marker(&cwd).0);
     }
-    proc_cwd_of(pid)
+    proc_cwd_of(pid).map(|cwd| strip_deleted_marker(&cwd).0)
 }
 
 fn lsof_cwd_of(pid: i32) -> Option<PathBuf> {
@@ -191,6 +191,8 @@ fn lsof_cwd_of(pid: i32) -> Option<PathBuf> {
 
 /// `/proc/<pid>/cwd` is the same answer `lsof -d cwd` gives, without
 /// the tool — the fallback for minimal images that do not ship lsof.
+/// The raw link target is returned; a deleted working directory's
+/// ` (deleted)` marker is stripped by `cwd_of`.
 #[cfg(target_os = "linux")]
 fn proc_cwd_of(pid: i32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
@@ -201,14 +203,40 @@ fn proc_cwd_of(_: i32) -> Option<PathBuf> {
     None
 }
 
+/// `/proc/<pid>/cwd` — and lsof's `n` field for the same table —
+/// annotates a deleted working directory's path with a trailing
+/// ` (deleted)`; the marker is not part of the path. Judged raw it
+/// never matches component-wise: `dir/gone (deleted)` is not inside
+/// `dir`, so a live writer in a deleted directory would slip every
+/// membership check — and because its cwd read succeeded it is
+/// already `mapped`, sliding past the completeness gate into a
+/// clear table while an occupant still runs. The marker is also
+/// positive evidence: the mechanism reported the exact directory
+/// the process WAS in. Returns the pre-deletion spelling and
+/// whether the marker was present, so callers can count a marked
+/// path inside `dir` as an occupant outright — never a silent
+/// skip. The marker compares as bytes so a non-UTF-8 spelling is
+/// handled the same way.
+pub(crate) fn strip_deleted_marker(cwd: &Path) -> (PathBuf, bool) {
+    use std::os::unix::ffi::OsStrExt;
+    const MARKER: &[u8] = b" (deleted)";
+    match cwd.as_os_str().as_bytes().strip_suffix(MARKER) {
+        Some(spelling) => (PathBuf::from(std::ffi::OsStr::from_bytes(spelling)), true),
+        None => (cwd.to_path_buf(), false),
+    }
+}
+
 /// Whether a child's reported cwd is the launch directory or inside it.
 /// Both sides are canonicalized so symlinked temp roots and `.`/`..`
-/// spellings compare equal; an unresolvable cwd is never a match.
+/// spellings compare equal; an unresolvable cwd is never a match. A
+/// ` (deleted)` marker is stripped first — membership judges the
+/// pre-deletion spelling.
 pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
+    let (cwd, _) = strip_deleted_marker(cwd);
+    std::fs::canonicalize(&cwd).is_ok_and(|canon| canon.starts_with(dir))
 }
 
 /// Whether a reported cwd places its process inside the launch scope:
@@ -219,9 +247,13 @@ pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
 /// judgment and the absence proof's scope union: the
 /// `processes_in_directory` contract answers "cwd inside `dir`" alone,
 /// and widening that answer would report the sandbox's occupants to
-/// every scanned directory.
+/// every scanned directory. A ` (deleted)` marker is stripped so a
+/// deleted mount spelling still reads as the sandbox workspace.
 pub(crate) fn cwd_in_launch_scope(cwd: Option<&Path>, dir: &Path) -> bool {
-    cwd_within(cwd, dir) || cwd.is_some_and(|cwd| cwd.starts_with(containment::SANDBOX_WORKSPACE))
+    cwd_within(cwd, dir)
+        || cwd
+            .map(|cwd| strip_deleted_marker(cwd).0)
+            .is_some_and(|cwd| cwd.starts_with(containment::SANDBOX_WORKSPACE))
 }
 
 /// Every process one scan mechanism could map to a working directory:
@@ -236,7 +268,9 @@ struct CwdScan {
 /// directory — per-pid lookups would not scale to a system-wide
 /// absence proof. Field output (`p`/`n` pairs) is parsed positionally:
 /// a process lsof cannot inspect simply has no `n` line and cannot be
-/// placed inside the scanned directory.
+/// placed inside the scanned directory. The `n` text is kept verbatim:
+/// lsof appends ` (deleted)` to a deleted directory's name just as
+/// `/proc` does, and the occupant filter reads that marker.
 fn lsof_cwds() -> Result<CwdScan, String> {
     let out = Command::new("lsof")
         .args(["-d", "cwd", "-F", "pn"])
@@ -269,7 +303,9 @@ fn lsof_cwds() -> Result<CwdScan, String> {
 /// `cwd` symlink. A process whose link cannot be read — it exited, is
 /// a zombie, or belongs to a user this one cannot inspect — is simply
 /// unmapped, exactly as under lsof; the completeness gate decides
-/// whether that is a gap.
+/// whether that is a gap. Rows keep the raw link target: a deleted
+/// working directory's ` (deleted)` marker is evidence the occupant
+/// filter reads, not noise to discard here.
 #[cfg(target_os = "linux")]
 fn proc_cwds() -> Result<CwdScan, String> {
     let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc scan failed: {e}"))?;
@@ -506,9 +542,12 @@ fn apply_worker_env(cmd: &mut Command, env: &WorkerEnv) {
 }
 
 /// How the directory-occupant scan treats a reported cwd that reads
-/// inside `dir` but the host cannot resolve — a deleted directory a
-/// live writer still holds, or a mount-namespace spelling (the
-/// sandbox workspace root) with no host inode behind it.
+/// inside `dir` but the host cannot resolve — a mount-namespace
+/// spelling (the sandbox workspace root) with no host inode behind
+/// it. A ` (deleted)`-marked cwd is judged before this split: the
+/// marker reports the exact directory the process was in, so a
+/// marked spelling inside `dir` is a known occupant under either
+/// contract, never an ambiguous spelling.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UnresolvedOccupant {
     /// `processes_in_directory`: the path cannot be proven outside
@@ -613,20 +652,28 @@ fn directory_occupants(
         // `cwd_within` canonicalizes the reported path and treats
         // an unresolvable cwd as "not inside" — but a reported
         // path spelled inside `dir` cannot be proven outside it
-        // either (a live writer whose cwd was deleted, or a
-        // mount-namespace spelling no host inode backs). The pid
-        // is already mapped, so skipping it here would slip it
-        // past the completeness gate: the genuine scan fails
+        // either (a mount-namespace spelling no host inode backs).
+        // The pid is already mapped, so skipping it here would slip
+        // it past the completeness gate: the genuine scan fails
         // closed, the namespace query reports the literal
-        // spelling as an occupant the caller judges per pid.
-        let unresolvable_inside = std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir);
+        // spelling as an occupant the caller judges per pid. A
+        // ` (deleted)` marker is not ambiguous that way — it is
+        // the mechanism reporting the exact directory the process
+        // WAS in, so a marked spelling inside `dir` is a known
+        // occupant under either contract; judged raw it would
+        // never match and the pid would silently skip into a
+        // clear table, the forbidden outcome.
+        let (cwd, deleted) = strip_deleted_marker(&cwd);
+        let marked_inside = deleted && cwd.starts_with(&dir);
+        let unresolvable_inside =
+            !deleted && std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir);
         if unresolvable_inside && unresolved == UnresolvedOccupant::FailClosed {
             return Err(format!(
                 "directory scan incomplete: process {pid} cwd {} is not resolvable",
                 cwd.display()
             ));
         }
-        if !unresolvable_inside && !cwd_within(Some(&cwd), &dir) {
+        if !marked_inside && !unresolvable_inside && !cwd_within(Some(&cwd), &dir) {
             continue;
         }
         // Same re-verification as the signature scan: a pid that
@@ -4984,6 +5031,39 @@ mod tests {
         assert!(!cwd_within(Some(sandbox), &dir));
         assert!(!cwd_within(Some(&sandbox.join("nested")), &dir));
         assert!(cwd_within(Some(dir.as_path()), &dir));
+    }
+
+    /// `/proc/<pid>/cwd` (and lsof) annotate a deleted working
+    /// directory's reported path with ` (deleted)` — a marker, not
+    /// part of the path. Membership judges the pre-deletion
+    /// spelling, and the flag carries the "the process WAS there"
+    /// evidence the scan counts as occupancy.
+    #[test]
+    fn deleted_marker_judges_the_pre_deletion_spelling() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let marked = PathBuf::from(format!("{} (deleted)", dir.display()));
+        assert_eq!(strip_deleted_marker(&marked), (dir.clone(), true));
+        assert_eq!(strip_deleted_marker(&dir), (dir.clone(), false));
+        // Only a trailing marker goes — mid-path spellings and other
+        // suffixes are untouched.
+        let other = dir.join("a (deleted) dir");
+        assert_eq!(strip_deleted_marker(&other), (other, false));
+        // `cwd_within` strips too: a marked spelling of a live dir
+        // compares by the pre-deletion path.
+        assert!(cwd_within(Some(&marked), &dir));
+        // A marked sandbox mount still reads in launch scope — a
+        // contained worker's `/workspace` stays attributable even
+        // after the mount dir is gone — while a marked sibling
+        // spelling stays outside: membership is component-wise on
+        // the pre-deletion path.
+        assert!(cwd_in_launch_scope(
+            Some(Path::new("/workspace (deleted)")),
+            &dir
+        ));
+        assert!(!cwd_in_launch_scope(
+            Some(Path::new("/workspace-sibling (deleted)")),
+            &dir
+        ));
     }
 
     /// With no working mechanism the scan is `Err` — an empty table

@@ -375,16 +375,24 @@ impl ScriptedProcessControl {
         // under the sandbox-root scan — is the real port's
         // fail-closed edge: the genuine scan errs on the same table
         // rather than silently drop the pid; only the namespace
-        // query surfaces it as data.
-        if !report_unresolvable
-            && let Some((pid, p)) = s.procs.iter().find(|(_, p)| {
-                p.alive && std::fs::canonicalize(&p.cwd).is_err() && p.cwd.starts_with(&dir)
-            })
-        {
-            return Err(format!(
-                "directory scan incomplete: process {pid} cwd {} is not resolvable",
-                p.cwd.display()
-            ));
+        // query surfaces it as data. A ` (deleted)`-marked cwd is
+        // not ambiguous that way: the marker reports the exact
+        // directory the process was in, so the model counts a
+        // marked spelling inside `dir` as an occupant — the same
+        // table the real port produces — under either contract.
+        if !report_unresolvable {
+            for (pid, p) in &s.procs {
+                if !p.alive {
+                    continue;
+                }
+                let (cwd, deleted) = crate::supervisor::strip_deleted_marker(&p.cwd);
+                if !deleted && std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
+                    return Err(format!(
+                        "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                        cwd.display()
+                    ));
+                }
+            }
         }
         Ok(s.procs
             .iter()
@@ -392,22 +400,29 @@ impl ScriptedProcessControl {
             // the launch scope; the supervisor layers
             // `SANDBOX_WORKSPACE` on at its own call sites. The
             // namespace query additionally counts an unresolvable
-            // spelling inside `dir`, matching the real port.
-            .filter(|(_, p)| {
-                p.alive
-                    && (crate::supervisor::cwd_within(Some(&p.cwd), &dir)
-                        || (report_unresolvable
-                            && std::fs::canonicalize(&p.cwd).is_err()
-                            && p.cwd.starts_with(&dir)))
-            })
-            .map(|(pid, p)| ProcessMatch {
-                identity: ProcessIdentity {
-                    pid: *pid,
-                    started_at: p.started_at.clone(),
-                    pgid: p.pgid,
-                },
-                cwd: Some(p.cwd.clone()),
-                command: Some(p.command.clone()),
+            // spelling inside `dir`, matching the real port; both
+            // queries count a ` (deleted)`-marked spelling inside
+            // `dir` as an occupant.
+            .filter_map(|(pid, p)| {
+                if !p.alive {
+                    return None;
+                }
+                let (cwd, deleted) = crate::supervisor::strip_deleted_marker(&p.cwd);
+                let inside = (deleted && cwd.starts_with(&dir))
+                    || crate::supervisor::cwd_within(Some(&cwd), &dir)
+                    || (report_unresolvable
+                        && !deleted
+                        && std::fs::canonicalize(&cwd).is_err()
+                        && cwd.starts_with(&dir));
+                inside.then(|| ProcessMatch {
+                    identity: ProcessIdentity {
+                        pid: *pid,
+                        started_at: p.started_at.clone(),
+                        pgid: p.pgid,
+                    },
+                    cwd: Some(cwd),
+                    command: Some(p.command.clone()),
+                })
             })
             .collect())
     }

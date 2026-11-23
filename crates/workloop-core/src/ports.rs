@@ -271,7 +271,12 @@ pub trait ProcessControlPort {
     /// never a truncated proof set, the same rule
     /// `matching_processes` applies. A process the port cannot even
     /// observe (e.g. one that changed uid) is the documented
-    /// residual.
+    /// residual. A cwd the mechanism reports with its deleted marker
+    /// (` (deleted)` on `/proc` and lsof) is judged on its
+    /// pre-deletion spelling — the marker names the exact directory
+    /// the process was in, so a marked spelling inside `dir` is an
+    /// occupant, never a skipped row that reads back as a clear
+    /// table.
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
         let _ = dir;
         Err("directory process enumeration unsupported".into())

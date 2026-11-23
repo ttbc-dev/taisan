@@ -458,6 +458,64 @@ fn directory_scan_finds_an_occupant_by_cwd_alone() {
     );
 }
 
+/// A live writer whose working directory is deleted still reports a
+/// cwd inside the scanned tree — `/proc/<pid>/cwd` (and Linux lsof)
+/// mark the spelling ` (deleted)`; other mechanisms report the plain
+/// unresolvable path. Either way the pid is already mapped, so the
+/// scan must never read back clear: the genuine query errs or counts
+/// the pid, the namespace query reports it.
+#[test]
+fn directory_scan_never_clears_a_deleted_cwd_occupant() {
+    let port = PosixProcessControl;
+    let root = std::fs::canonicalize(tmp_root("dir-scan-deleted")).unwrap();
+    let gone = root.join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    // `path-reopen` rewrites its heartbeat on an interval and ignores
+    // the failure once the directory is gone — a live process holding
+    // a deleted cwd. The first beat proves the eager startup cwd read
+    // ran, so the deletion never kills the writer.
+    let identity = port
+        .spawn(
+            &[
+                fixture_bin(),
+                "path-reopen".into(),
+                "--interval-ms".into(),
+                "50".into(),
+            ],
+            &gone,
+            &WorkerEnv::default(),
+        )
+        .expect("spawn");
+    wait_for(
+        || gone.join("heartbeat.log").exists(),
+        "writer heartbeat before cwd deletion",
+    );
+    std::fs::remove_dir_all(&gone).unwrap();
+    // The genuine query never returns a table missing the pid —
+    // `Err` fails the read closed; `Ok` must carry the occupant.
+    for dir in [&root, &gone] {
+        match port.processes_in_directory(dir) {
+            Err(_) => {}
+            Ok(occupants) => assert!(
+                occupants.iter().any(|m| m.identity.pid == identity.pid),
+                "a deleted-cwd occupant is never a silent skip into a clear table"
+            ),
+        }
+        assert!(
+            port.processes_in_namespace_dir(dir)
+                .expect("scan")
+                .iter()
+                .any(|m| m.identity.pid == identity.pid),
+            "the namespace query reports the deleted-cwd occupant"
+        );
+    }
+    port.signal_verified(&identity, libc::SIGKILL);
+    wait_for(
+        || matches!(port.inspect(&identity), ProcessEvidence::Stopped { .. }),
+        "stopped after signal",
+    );
+}
+
 #[test]
 fn setsid_escapee_is_in_the_snapshot_and_signaled() {
     let root = tmp_root("setsid");

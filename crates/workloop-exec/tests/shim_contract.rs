@@ -994,6 +994,73 @@ fn a_recorded_sandbox_occupant_does_not_block_the_absence_proof() {
     assert_eq!(port.spawn_calls(), 2);
 }
 
+/// A live process whose cwd the mechanism reports with the kernel's
+/// ` (deleted)` marker — `<root>/gone (deleted)` — WAS inside the
+/// scanned directory: judged raw the marked spelling never matches
+/// `dir` component-wise where the marker lands on the boundary
+/// component, so an unhandled marker is the forbidden outcome — a
+/// silent skip that reads back as a clear table and authorizes a
+/// replacement writer while the orphan still runs. Both directory
+/// queries count the marked row as an occupant.
+#[test]
+fn a_deleted_marked_cwd_inside_the_scanned_dir_counts_as_an_occupant() {
+    let port = ScriptedProcessControl::new();
+    // The scans compare the canonical spelling — the mechanism's raw
+    // report resolves symlinks (`/var` → `/private/var` on macOS).
+    let root = std::fs::canonicalize(tmp_root("deleted-cwd-scan")).unwrap();
+    let pid = port
+        .spawn(&["writer".into()], &root, &WorkerEnv::default())
+        .expect("spawn")
+        .pid;
+    // The modeled cwd is the mechanism's raw report: the link target
+    // of a deleted `<root>/gone` still carries the marker.
+    let gone = root.join("gone");
+    port.set_cwd(pid, &PathBuf::from(format!("{} (deleted)", gone.display())));
+    for occupants in [
+        port.processes_in_directory(&root),
+        port.processes_in_namespace_dir(&root),
+    ] {
+        assert!(
+            occupants
+                .expect("scan")
+                .iter()
+                .any(|m| m.identity.pid == pid),
+            "a ` (deleted)` cwd inside the scanned dir is an occupant, never a silent skip"
+        );
+    }
+    // The deleted-dir-is-scanned-dir case — the marker on the
+    // boundary component, where the raw spelling could never match:
+    // the process was in `dir` itself, so it still lands.
+    port.set_cwd(pid, &PathBuf::from(format!("{} (deleted)", root.display())));
+    for occupants in [
+        port.processes_in_directory(&root),
+        port.processes_in_namespace_dir(&root),
+    ] {
+        assert!(
+            occupants
+                .expect("scan")
+                .iter()
+                .any(|m| m.identity.pid == pid),
+            "a deleted scanned dir is still an occupant spelling"
+        );
+    }
+    // Membership is the pre-deletion spelling: a marked path outside
+    // `dir` is no occupant.
+    let elsewhere = std::fs::canonicalize(tmp_root("deleted-cwd-elsewhere")).unwrap();
+    port.set_cwd(
+        pid,
+        &PathBuf::from(format!("{} (deleted)", elsewhere.display())),
+    );
+    assert!(
+        !port
+            .processes_in_directory(&root)
+            .expect("scan")
+            .iter()
+            .any(|m| m.identity.pid == pid),
+        "a marked cwd outside the scanned dir is not an occupant"
+    );
+}
+
 /// A v1 Review launch mounts the managed workspace read-only: the
 /// assessment reads produced state and a review process must never
 /// mutate the artifact workspace — writers are the only roles that
