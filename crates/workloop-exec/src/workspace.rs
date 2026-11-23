@@ -510,11 +510,43 @@ fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError> {
     Ok(())
 }
 
+/// A declared artifact path rendered in `status --porcelain` form —
+/// plain `/`-joined components. `.` segments normalize away (git
+/// reports the same canonical name), while an absolute or
+/// parent-traversing declaration produces `None`: a path porcelain can
+/// never report inside the repo is never tolerated.
+fn declared_porcelain_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str()?.to_owned()),
+            // A leading `./` survives component normalization; it still
+            // names the same in-tree path `workspace.join` resolves.
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// The reused-tree invariant: branch, HEAD pin, base anchor, and a
+/// porcelain-clean tree — with one exception. A writer's durable
+/// Invocation declares the artifacts it must produce (`artifact.json`
+/// at the workspace root by default); an untracked file at exactly a
+/// declared workspace-relative path is expected output the previous
+/// round left behind, not WIP, and is tolerated. Anything else — a
+/// modified, staged, or deleted tracked file, or an untracked path the
+/// Invocation never declared — refuses exactly as before.
 fn verify_existing(
     final_path: &Path,
     branch: &str,
     base: &str,
     head: &str,
+    declared: &[RequiredArtifact],
 ) -> Result<(), PreparationError> {
     let conflict = |detail: &str| PreparationError::WorkspaceConflict {
         detail: detail.to_string(),
@@ -548,8 +580,24 @@ fn verify_existing(
     {
         return Err(conflict("base anchor differs"));
     }
-    if !git(final_path, &["status", "--porcelain"])?.is_empty() {
-        return Err(conflict("workspace is not clean"));
+    // `-z` gives unquoted NUL-terminated v1 records and
+    // `--untracked-files=all` lists every untracked file rather than a
+    // collapsed `dir/` entry, so a declared artifact nested in a
+    // fresh directory is checked on its own name.
+    let status = git(
+        final_path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    for record in status.split_terminator('\0') {
+        let Some(path) = record.strip_prefix("?? ") else {
+            return Err(conflict("workspace is not clean"));
+        };
+        if !declared
+            .iter()
+            .any(|a| declared_porcelain_path(&a.path).as_deref() == Some(path))
+        {
+            return Err(conflict("workspace is not clean"));
+        }
     }
     Ok(())
 }
@@ -562,6 +610,12 @@ struct Gate {
     base: String,
     head: String,
     predecessor: Option<(String, PathBuf)>,
+    /// The required-artifact set the durable Invocation declared at
+    /// consume time — the same record the artifact-evidence path
+    /// digests, so the names `verify_existing` tolerates have exactly
+    /// one source of truth. A request with no Invocation row declares
+    /// nothing and the tree must be strictly clean.
+    declared_artifacts: Vec<RequiredArtifact>,
 }
 
 fn gates(
@@ -754,6 +808,14 @@ fn gates(
             ));
         }
     };
+    // The Invocation row carries the declared set verbatim — the
+    // durable body and the Invocation land in one consume commit, so a
+    // preparable request always has the row; the empty fallback keeps
+    // any other caller on the strict contract.
+    let declared_artifacts = tx
+        .invocation_for_request(request_id)?
+        .map(|inv| inv.required_artifacts)
+        .unwrap_or_default();
     Ok(Gate {
         base: request.base.object.clone(),
         request,
@@ -762,6 +824,7 @@ fn gates(
         workspace_id,
         head,
         predecessor,
+        declared_artifacts,
     })
 }
 
@@ -818,6 +881,7 @@ fn same_gate(a: &Gate, b: &Gate) -> bool {
         && a.base == b.base
         && a.head == b.head
         && a.predecessor == b.predecessor
+        && a.declared_artifacts == b.declared_artifacts
 }
 
 fn revalidate(
@@ -1033,7 +1097,13 @@ fn prepare_locked(
                         detail: "receipt head disagrees with the request pin".into(),
                     });
                 }
-                verify_existing(&final_path, &gate.branch, &gate.base, &gate.head)?;
+                verify_existing(
+                    &final_path,
+                    &gate.branch,
+                    &gate.base,
+                    &gate.head,
+                    &gate.declared_artifacts,
+                )?;
                 revalidate(
                     store,
                     request_id,
@@ -1050,8 +1120,17 @@ fn prepare_locked(
                 // acknowledged predecessor — only after the live tree
                 // proves it still matches this request's pins; the
                 // receipt is then re-bound to the new digest. A dirty
-                // or advanced tree still refuses and preserves WIP.
-                verify_existing(&final_path, &gate.branch, &gate.base, &gate.head)?;
+                // or advanced tree still refuses and preserves WIP —
+                // except untracked files at this request's declared
+                // artifact paths, which are the previous round's
+                // expected output, not dirt.
+                verify_existing(
+                    &final_path,
+                    &gate.branch,
+                    &gate.base,
+                    &gate.head,
+                    &gate.declared_artifacts,
+                )?;
                 let control = control.clone();
                 let work_id = gate.work.id.0.clone();
                 let request_digest = gate.request.request_digest.clone();
@@ -1233,5 +1312,29 @@ mod tests {
         let dir = std::env::temp_dir();
         let err = bounded_run(&argv("sleep 30"), &dir, Duration::from_millis(200)).unwrap_err();
         assert!(matches!(err, PreparationError::Git { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn declared_paths_render_in_porcelain_form_or_nothing() {
+        assert_eq!(
+            declared_porcelain_path("artifact.json").as_deref(),
+            Some("artifact.json")
+        );
+        assert_eq!(
+            declared_porcelain_path("./artifact.json").as_deref(),
+            Some("artifact.json")
+        );
+        assert_eq!(
+            declared_porcelain_path("store//out.json").as_deref(),
+            Some("store/out.json")
+        );
+        assert_eq!(
+            declared_porcelain_path("a/./b/c.json").as_deref(),
+            Some("a/b/c.json")
+        );
+        assert_eq!(declared_porcelain_path(""), None);
+        assert_eq!(declared_porcelain_path("/abs.json"), None);
+        assert_eq!(declared_porcelain_path("../escape.json"), None);
+        assert_eq!(declared_porcelain_path("a/../../escape"), None);
     }
 }

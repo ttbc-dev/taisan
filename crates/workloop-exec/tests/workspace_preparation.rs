@@ -284,6 +284,35 @@ fn insert_request_row(
         .unwrap();
 }
 
+/// The consume-time Invocation row a writer request carries; `paths`
+/// is the declared required-artifact set the reuse gate tolerates.
+fn declared_invocation(store: &SqliteStore, e: &ExecutionId, rid: &str, paths: &[&str]) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(format!("inv-{rid}")),
+                    request_id: rid.into(),
+                    execution_id: e.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Prepared,
+                    process_identity: None,
+                    required_artifacts: paths
+                        .iter()
+                        .map(|p| RequiredArtifact {
+                            kind: (*p).to_string(),
+                            path: (*p).to_string(),
+                            expected_digest: None,
+                        })
+                        .collect(),
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })
+        })
+        .unwrap();
+}
+
 fn layout(root: &Path) -> HandoffLayout {
     let bare = root.join("handoff.git");
     git(root, &["init", "--bare", bare.to_str().unwrap()]);
@@ -901,6 +930,169 @@ fn dirty_or_advanced_or_foreign_workspaces_are_preserved_not_reset() {
         "{err:?}"
     );
     assert_eq!(git(&ws, &["symbolic-ref", "--short", "HEAD"]), "foreign");
+}
+
+#[test]
+fn declared_untracked_artifacts_are_output_not_dirt() {
+    let root = tmp_root("declared-art");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-art", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    // With no Invocation row the declared set is empty: even the
+    // manifest name still counts as dirt.
+    std::fs::write(ws.join("artifact.json"), "{}").unwrap();
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+
+    // Once the Invocation declares it, the untracked manifest is the
+    // round's expected output and the same request reuses the tree.
+    declared_invocation(&store, &e, &rid, &["artifact.json"]);
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+
+    // An undeclared untracked file next to it still refuses.
+    std::fs::write(ws.join("stray.txt"), "wip").unwrap();
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("stray.txt")).unwrap(),
+        "wip"
+    );
+}
+
+#[test]
+fn a_retried_request_reuses_a_workspace_holding_declared_output() {
+    let root = tmp_root("retry-art");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-retry", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+    std::fs::write(ws.join("artifact.json"), "{}").unwrap();
+
+    // A retry records a fresh request under a new digest; it takes the
+    // workspace over once the tree verifies, manifest and all.
+    let rid2 = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Coding);
+    let request2 = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Coding,
+        &base,
+        coding_task(vec![]),
+    );
+    insert_body(&store, &request2);
+    declared_invocation(&store, &e, &rid2, &["artifact.json"]);
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.request_digest, request2.request_digest);
+    assert!(ws.join("artifact.json").exists());
+}
+
+#[test]
+fn a_declared_path_on_a_modified_tracked_file_still_refuses() {
+    let root = tmp_root("tracked-art");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base0, _n) = git_source(&root);
+    // `artifact.json` tracked in the base: a modification is a real
+    // change, never the untracked manifest slot the tolerance covers.
+    std::fs::write(src.join("artifact.json"), "tracked").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "track artifact"]);
+    let base = git(&src, &["rev-parse", "HEAD"]);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-track", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+    declared_invocation(&store, &e, &rid, &["artifact.json"]);
+
+    std::fs::write(ws.join("artifact.json"), "edited").unwrap();
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("artifact.json")).unwrap(),
+        "edited"
+    );
+}
+
+#[test]
+fn a_fix_reuses_the_workspace_its_predecessor_left() {
+    let root = tmp_root("fix-reuse");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, e, rid, _r) = coding_fixture(&store, "p-fxreuse", &base, coding_task(vec![]));
+    let (sup, layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    // The Coding writer commits its output on the managed branch and
+    // leaves the declared manifest untracked at the workspace root.
+    git(&ws, &["config", "user.email", "t@t"]);
+    git(&ws, &["config", "user.name", "t"]);
+    std::fs::write(ws.join("out.txt"), "produced").unwrap();
+    git(&ws, &["add", "."]);
+    git(&ws, &["commit", "-m", "produced"]);
+    let produced = git(&ws, &["rev-parse", "HEAD"]);
+    std::fs::write(ws.join("artifact.json"), "{}").unwrap();
+    acknowledge_predecessor(
+        &store, &layout, &ws, &w, &e, "art-1", &produced, &base, "m-1",
+    );
+
+    // The follow-up Fix binds the acknowledged predecessor; the
+    // workspace already sits on `produced` with the manifest left
+    // over — reuse must succeed, not deadlock on WorkspaceConflict.
+    let rid2 = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Fix);
+    let request2 = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Fix,
+        &base,
+        fix_task("art-1", "m-1", &produced),
+    );
+    insert_body(&store, &request2);
+    declared_invocation(&store, &e, &rid2, &["artifact.json"]);
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    assert_eq!(prepared.head, produced);
+    assert_eq!(prepared.request_digest, request2.request_digest);
+    assert!(ws.join("artifact.json").exists());
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), produced);
 }
 
 #[test]
