@@ -172,9 +172,11 @@ features, while environment hygiene and the CONNECT egress proxy are
 user-space components of the same approved profile — see
 `docs/worker-protocol.md` selected profile and `docs/v0.3.md` OP-1
 ("Linux POSIX host with unprivileged user namespaces, `bwrap`, and the
-taisan CONNECT proxy"). `docs/v0.3.md` still records the
-namespace/egress enforcement as an unclaimed, unenforced gap, so this
-is the specified profile, not measured enforcement. A VM or
+taisan CONNECT proxy"). `docs/v0.3.md` records the
+namespace/egress enforcement as landed and preflight-proven (#259/#260)
+with owner-run live acceptance still pending, so this is the specified
+profile with persisted-preflight evidence, not live-accepted
+enforcement. A VM or
 container daemon on such a host would
 add a resident daemon and memory for zero contract benefit. What the
 endpoint needs beyond the existing v0.3 primitives is a small
