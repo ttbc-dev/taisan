@@ -625,6 +625,10 @@ impl GhCliApi {
                 reason: "git transport found no usable credential".into(),
             });
         };
+        // The header the push authenticates with — built before any
+        // git spawn so a credential that cannot form it refuses fast
+        // with an explicit reason, never a retry-burning remote 401.
+        let authorization = push_authorization(&token)?;
         // The descendant guard the refs API's `force: false` enforced
         // server-side, re-stated locally before any write is issued:
         // `--force-with-lease` guards only the ref's position and
@@ -688,10 +692,7 @@ impl GhCliApi {
         // rides as an Authorization header scoped to this push URL —
         // the value never enters argv or process listings.
         let mut config = vec![("credential.helper".to_string(), String::new())];
-        config.push((
-            format!("http.{url}.extraHeader"),
-            format!("Authorization: Bearer {token}"),
-        ));
+        config.push((format!("http.{url}.extraHeader"), authorization));
         let env = self.scrubbed_git_env(&config);
         let output = self.run_plain(&self.git.clone(), &args, Some(&env))?;
         if output.success {
@@ -944,6 +945,71 @@ fn classify_push(output: &GhOutput) -> ApiError {
     ApiError::Unknown {
         reason: format!("git push: {detail}"),
     }
+}
+
+/// The `Authorization` header the git push authenticates with —
+/// HTTP Basic with `x-access-token` as the username, GitHub's
+/// documented credential shape for token auth on the git smart-HTTP
+/// endpoint. The scheme is uniform, not per-class: every token class
+/// the credential surface can yield — OAuth (`gho_`), App
+/// installation (`ghs_`), user-to-server (`ghu_`), PATs (`ghp_`,
+/// `github_pat_`), the ambient `gh auth token` answer — authenticates
+/// the same way (the scheme `gh auth setup-git` and actions/checkout
+/// configure), and a value that survives the credential boundary is a
+/// GitHub HTTP token by construction. `Bearer` is the REST API's
+/// convention and the smart-HTTP endpoint rejects it: the post-#413
+/// live re-verification (run record
+/// `RUN-RECORD-2026-11-23-REVERIFY.md`, issue #420) watched `gho_`
+/// pushes die on `www-authenticate: Basic` 401s. Mock transports
+/// cannot see that per-scheme requirement — the stub never contacts
+/// the real endpoint — so the mapping lives in this one tested
+/// function, and the u3.6e live harness carries the scenario that
+/// proves it against the host.
+///
+/// A value that cannot ride one HTTP header line — empty, non-ASCII,
+/// or carrying whitespace or control characters — is refused with an
+/// explicit reason: it could only produce a malformed request or a
+/// bare remote 401. Bound credentials already reject whitespace at
+/// resolution, but the ambient `gh auth token` answer does not pass
+/// that gate, so the check runs here where both paths converge.
+fn push_authorization(token: &str) -> Result<String, ApiError> {
+    if token.is_empty()
+        || !token.is_ascii()
+        || token
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(ApiError::Refused {
+            reason: "git transport: resolved credential cannot form an \
+                     HTTP auth header"
+                .into(),
+        });
+    }
+    Ok(format!(
+        "Authorization: Basic {}",
+        basic64(format!("x-access-token:{token}").as_bytes())
+    ))
+}
+
+/// RFC 4648 standard-alphabet base64 with `=` padding — the encoding
+/// HTTP Basic requires. The crate carries no base64 dependency; the
+/// encoder is a dozen lines, mirroring the evidence protocol's
+/// `base64url`.
+fn basic64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | ((*b as u32) << (16 - 8 * i)));
+        let take = chunk.len() + 1;
+        for s in 0..take {
+            out.push(ALPHABET[(n >> (18 - 6 * s)) as usize & 0x3f] as char);
+        }
+        out.extend(std::iter::repeat_n('=', 4 - take));
+    }
+    out
 }
 
 /// The comment body actually posted: the logical body plus the
@@ -1531,5 +1597,86 @@ impl GitHubApi for GhCliApi {
 
     fn set_read_deadline(&mut self, deadline: Option<Instant>) {
         self.read_deadline = deadline;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The header mapping is uniform and literal: every token class
+    /// the credential surface can yield produces
+    /// `Authorization: Basic <base64 of "x-access-token:<token>">` —
+    /// the shape github.com's smart-HTTP endpoint requires (#420).
+    /// The expected payloads are reproducible offline:
+    /// `printf 'x-access-token:<token>' | base64`.
+    #[test]
+    fn push_authorization_is_basic_x_access_token_for_every_token_class() {
+        for (token, expected) in [
+            (
+                "gho_test-token",
+                "Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hvX3Rlc3QtdG9rZW4=",
+            ),
+            (
+                "ghs_installation-token",
+                "Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hzX2luc3RhbGxhdGlvbi10b2tlbg==",
+            ),
+            (
+                "ghu_user-to-server",
+                "Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2h1X3VzZXItdG8tc2VydmVy",
+            ),
+            (
+                "ghp_classic-pat",
+                "Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX2NsYXNzaWMtcGF0",
+            ),
+            (
+                "github_pat_fine-grained",
+                "Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2l0aHViX3BhdF9maW5lLWdyYWluZWQ=",
+            ),
+        ] {
+            assert_eq!(
+                push_authorization(token).unwrap(),
+                expected,
+                "token {token}"
+            );
+        }
+    }
+
+    /// A credential that cannot ride one header line is a definite
+    /// refusal before any git spawn — the explicit reason replaces
+    /// what would otherwise be a bare remote 401.
+    #[test]
+    fn push_authorization_refuses_values_that_corrupt_the_header() {
+        for token in [
+            "",
+            "gho_has space",
+            "gho_has\ttab",
+            "gho_has\nnewline",
+            "gho_has\rcarriage",
+            "gho_null\0byte",
+            "gho_non-ascii-é",
+        ] {
+            assert!(
+                matches!(push_authorization(token), Err(ApiError::Refused { .. })),
+                "token {token:?} must refuse"
+            );
+        }
+    }
+
+    /// Standard-alphabet base64 with padding — the RFC 4648 test
+    /// vectors, including both remainders.
+    #[test]
+    fn basic64_matches_the_rfc4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(basic64(input.as_bytes()), expected);
+        }
     }
 }

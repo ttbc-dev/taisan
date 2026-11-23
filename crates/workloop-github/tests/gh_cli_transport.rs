@@ -958,9 +958,14 @@ fn write_ref_pushes_objects_through_git_transport() {
         "the refspec uploads produced objects and moves the remote ref: {argv}"
     );
     let env = git_env(&dir);
+    // `x-access-token` is GitHub's documented username for token auth
+    // on the smart-HTTP endpoint — the literal payload decodes as
+    // `x-access-token:ghp_ambient-token-1` (#420: Bearer is refused).
     assert!(
-        env.contains("GIT_CONFIG_VALUE_1=Authorization: Bearer ghp_ambient-token-1"),
-        "the ambient gh token authenticates the push via env config: {env}"
+        env.contains(
+            "GIT_CONFIG_VALUE_1=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX2FtYmllbnQtdG9rZW4tMQ=="
+        ),
+        "the ambient gh token authenticates the push as Basic x-access-token via env config: {env}"
     );
     for key in ["GH_TOKEN", "GITHUB_TOKEN", "HOME", "GIT_SSH_COMMAND"] {
         assert!(
@@ -1103,8 +1108,8 @@ fn git_transport_bound_credential_reaches_env_not_argv() {
     );
     let env = git_env(&dir);
     assert!(
-        env.contains("Authorization: Bearer bound-secret-value-9"),
-        "the bound credential authenticates the push: {env}"
+        env.contains("Authorization: Basic eC1hY2Nlc3MtdG9rZW46Ym91bmQtc2VjcmV0LXZhbHVlLTk="),
+        "the bound credential authenticates the push as Basic x-access-token: {env}"
     );
     assert!(
         !calls(&dir).contains("auth token"),
@@ -1220,6 +1225,46 @@ esac
     assert!(
         git_calls(&dir).is_empty(),
         "git is never spawned without a credential: {}",
+        git_calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_refuses_an_ambient_token_that_cannot_form_a_header() {
+    // The ambient slot does not pass the credential boundary's
+    // whitespace check — a `gh auth token` answer with interior
+    // whitespace could only corrupt the Authorization header into a
+    // bare remote 401, so the write refuses fast with an explicit
+    // reason and git is never spawned.
+    let dir = tempdir("git-push-badtok");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+  printf 'gho_fragment\nextra-line\n'; exit 0
+fi
+case "$2" in
+  repos/owner/repo/git/ref/heads/b) echo '{"object":{"sha":"expected111"}}' ;;
+esac
+"#,
+    );
+    let git = stub_git(&dir, "exit 0\n");
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "an unencodable credential is a definite refusal: {err:?}"
+    );
+    assert!(
+        git_calls(&dir).is_empty(),
+        "git is never spawned with an unencodable credential: {}",
         git_calls(&dir)
     );
 }
