@@ -23,6 +23,11 @@ struct PullRecord {
     target_branch: String,
     title: String,
     body: String,
+    base_sha: String,
+    merged: bool,
+    mergeable: Option<bool>,
+    mergeable_state: String,
+    conflicting_paths: Vec<String>,
 }
 
 impl PullRecord {
@@ -35,9 +40,13 @@ impl PullRecord {
             target_branch: self.target_branch.clone(),
             title: self.title.clone(),
             body: self.body.clone(),
-            // No code path in this remote can merge: merge lives
-            // outside the adapter's vocabulary.
-            merged: false,
+            // Merge is not an adapter write; tests may seed the
+            // remote's merged state to exercise read-side detection.
+            merged: self.merged,
+            mergeable: self.mergeable,
+            mergeable_state: self.mergeable_state.clone(),
+            base_sha: self.base_sha.clone(),
+            conflicting_paths: self.conflicting_paths.clone(),
         }
     }
 }
@@ -194,6 +203,37 @@ impl InMemoryGitHub {
         self.note_object(repository, head);
         if let Some(pull) = self.pulls.get_mut(&key) {
             pull.head_sha = head.to_string();
+        }
+    }
+
+    /// Test control: the remote reports the pull merged.
+    pub fn set_pull_merged(&mut self, repository: &RepositoryRef, change_id: &str) {
+        if let Some(pull) = self
+            .pulls
+            .get_mut(&(repository.to_string(), change_id.to_string()))
+        {
+            pull.merged = true;
+        }
+    }
+
+    /// Test control: the mergeability verdict for one pull.
+    pub fn set_pull_mergeability(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &str,
+        mergeable: Option<bool>,
+        state: &str,
+        base_sha: &str,
+        paths: &[&str],
+    ) {
+        if let Some(pull) = self
+            .pulls
+            .get_mut(&(repository.to_string(), change_id.to_string()))
+        {
+            pull.mergeable = mergeable;
+            pull.mergeable_state = state.to_string();
+            pull.base_sha = base_sha.to_string();
+            pull.conflicting_paths = paths.iter().map(|p| (*p).to_string()).collect();
         }
     }
 
@@ -528,6 +568,15 @@ impl GitHubApi for InMemoryGitHub {
             target_branch: target_branch.to_string(),
             title: title.to_string(),
             body: body.to_string(),
+            base_sha: self
+                .branches
+                .get(&(repository.to_string(), target_branch.to_string()))
+                .cloned()
+                .unwrap_or_default(),
+            merged: false,
+            mergeable: Some(true),
+            mergeable_state: "clean".into(),
+            conflicting_paths: vec![],
         };
         let remote = record.remote();
         self.pulls
@@ -623,6 +672,22 @@ impl GitHubApi for InMemoryGitHub {
                     && comment.marker == marker
             })
             .map(|(_, _, comment)| comment.clone()))
+    }
+
+    fn list_open_pulls_on_base(
+        &mut self,
+        repository: &RepositoryRef,
+        target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        Ok(self
+            .pulls
+            .iter()
+            .filter(|((repo, _), pull)| {
+                repo == &repository.to_string() && pull.target_branch == target_branch
+            })
+            .map(|(_, pull)| pull.remote())
+            .filter(|pull| !pull.merged)
+            .collect())
     }
 
     fn list_pulls_on_branch(

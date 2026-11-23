@@ -3,6 +3,7 @@ pub mod command;
 pub mod credential;
 pub mod domain;
 pub mod identity;
+pub mod mergeability;
 pub mod observation;
 pub mod ports;
 pub mod projection;

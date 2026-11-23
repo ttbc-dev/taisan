@@ -17,6 +17,10 @@ use crate::identity::{
     HostInstanceId, IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
     canonical_host_instance,
 };
+use crate::mergeability::{
+    ConflictDisposition, ConflictEpisode, ConflictEscalation, ConflictFixRequest,
+    MergeabilityState, conflict_payload, plan_conflict,
+};
 use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, Outcome, ProcessStateFact, RefRelation,
@@ -2273,7 +2277,15 @@ pub fn admit_queued_role(
     }
 
     let seq = tx.alloc_seq()?;
-    let mut payload = serde_json::to_value(&execution.input).unwrap_or_default();
+    // A conflict-repair trigger already carries the canonical binding
+    // object; promote it as the request payload so both revisions sit
+    // at the request's top level rather than under the generic
+    // InvocationInput wrapper.
+    let conflict_payload = (role == InvocationRole::Fix)
+        .then(|| execution.input.input.clone())
+        .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("conflict_repair"));
+    let mut payload = conflict_payload
+        .unwrap_or_else(|| serde_json::to_value(&execution.input).unwrap_or_default());
     if matches!(
         role,
         InvocationRole::InvariantCheck | InvocationRole::Review
@@ -2716,6 +2728,7 @@ fn assess(
                     | ObservationFact::HostActionResult { .. }
                     | ObservationFact::Issue { .. }
                     | ObservationFact::Assessment { .. }
+                    | ObservationFact::Mergeability { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -2950,6 +2963,9 @@ fn assess(
             Ok(())
         }
         ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
+        ObservationFact::Mergeability { .. } => {
+            assess_mergeability(tx, config, &execution, obs, now_unix_seconds)
+        }
         // The handoff acknowledgement these facts ride on is the
         // moment the produced commit became durable: publication may
         // now name it, so a waiting Execution re-evaluates its stage
@@ -2965,6 +2981,367 @@ fn assess(
         return Ok(());
     };
     assess_completion(tx, &current)
+}
+
+/// Decide one mergeability observation: a required-window conflict mints
+/// exactly one bounded Fix request bound to `(head, base)`, while a
+/// conflict that cannot be bound (or whose Work cannot accept a repair)
+/// escalates to a paused human decision carrying the conflicting paths.
+fn assess_mergeability(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    obs: &Observation,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let ObservationFact::Mergeability {
+        target,
+        state,
+        conflicting_paths,
+        reason,
+    } = &obs.fact
+    else {
+        return Ok(());
+    };
+    let disposition = plan_conflict(Some(target), *state, conflicting_paths, reason.as_deref());
+    let repair = match disposition {
+        ConflictDisposition::NotConflicting => return Ok(()),
+        ConflictDisposition::Repair(request) => request,
+        ConflictDisposition::Escalate(escalation) => {
+            if conflict_episode_already_recorded(tx, &execution.work_id, None, target)? {
+                return Ok(());
+            }
+            return escalate_conflict(tx, config, &execution.work_id, escalation, now_unix_seconds);
+        }
+    };
+    if conflict_episode_already_recorded(tx, &execution.work_id, Some(&repair), target)? {
+        return Ok(());
+    }
+    trigger_conflict_repair(tx, config, &execution.work_id, repair, now_unix_seconds)
+}
+
+/// Whether this exact conflict episode already produced a trigger. The
+/// observation that is being assessed is already in the transaction, so
+/// the first occurrence sees one matching fact and a repeat scan sees
+/// two. The successor's input payload carries the episode id as a second,
+/// scan-independent marker.
+fn conflict_episode_already_recorded(
+    tx: &mut dyn TxView,
+    work_id: &WorkId,
+    request: Option<&ConflictFixRequest>,
+    target: &DiffTarget,
+) -> Result<bool, StoreError> {
+    let current_episode = ConflictEpisode::from_target(target).ok();
+    let episode_id = request
+        .map(ConflictFixRequest::episode_id)
+        .or_else(|| current_episode.as_ref().map(ConflictEpisode::episode_id));
+    let target_key = mergeability_target_key(target);
+    let mut matching = 0usize;
+    for observation in tx.observations_for_work(work_id)? {
+        if let ObservationFact::Mergeability {
+            target: observed,
+            state,
+            ..
+        } = &observation.fact
+            && *state == MergeabilityState::Conflicting
+        {
+            let candidate = ConflictEpisode::from_target(observed).ok();
+            let same = match (&candidate, &current_episode) {
+                (Some(a), Some(b)) => a == b,
+                // An unbindable target has no episode id; its exact
+                // `(change, head, optional base)` is still a stable
+                // identity for suppressing repeated escalations.
+                (None, None) => mergeability_target_key(observed) == target_key,
+                (Some(a), None) => episode_id.as_ref().is_some_and(|id| a.episode_id() == *id),
+                (None, Some(_)) => false,
+            };
+            if same {
+                matching += 1;
+            }
+        }
+    }
+    if matching > 1 {
+        return Ok(true);
+    }
+    let Some(episode_id) = episode_id else {
+        return Ok(false);
+    };
+    Ok(tx.executions_for_work(work_id)?.iter().any(|execution| {
+        execution
+            .input
+            .input
+            .get("episode_id")
+            .and_then(|v| v.as_str())
+            == Some(episode_id.as_str())
+            && execution.input.input.get("kind").and_then(|v| v.as_str()) == Some("conflict_repair")
+    }))
+}
+
+fn mergeability_target_key(target: &DiffTarget) -> Vec<u8> {
+    canonical_json(&serde_json::json!({
+        "change": {
+            "repository": target.change.repository,
+            "change_request": target.change.change_request,
+        },
+        "head": target.head,
+        "base": target.base,
+        "target_revision": target.target_revision,
+    }))
+}
+
+/// Produce the bounded Fix-class request for a conflict. A terminal Work
+/// gets a successor Execution dedicated to the repair; a queued Work can
+/// re-enter under the Fix role. A Work with a writer already in flight is
+/// never disturbed — its conflict escalates instead.
+fn trigger_conflict_repair(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    work_id: &WorkId,
+    request: ConflictFixRequest,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let Some(work) = tx.work(work_id)? else {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "conflict belongs to an unknown Work".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    };
+    if let Some(active) = tx.active_execution(work_id)? {
+        return match active.state {
+            ExecutionState::Queued | ExecutionState::Waiting => {
+                let payload = conflict_payload(&request.episode, &request.paths);
+                let seq = tx.alloc_seq()?;
+                let mut next = active.clone();
+                next.state = ExecutionState::Queued;
+                next.enqueued_seq = seq;
+                next.waiting_reason = None;
+                next.next_role = Some(InvocationRole::Fix);
+                next.input.input = payload;
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: active.state.clone(),
+                })?;
+                // Admission is the single request-creation seam; it also
+                // enforces the Work-wide Fix budget before any emission.
+                admit_queued_role(
+                    tx,
+                    config,
+                    &active.id,
+                    InvocationRole::Fix,
+                    now_unix_seconds,
+                )?;
+                Ok(())
+            }
+            // A writer already in flight (ready/running) or a human-held
+            // pause is never overwritten by an automatic repair. Hold for
+            // human action with the exact pair and paths instead.
+            _ => escalate_conflict(
+                tx,
+                config,
+                work_id,
+                ConflictEscalation {
+                    episode: Some(request.episode.clone()),
+                    reason: format!(
+                        "conflict repair requires a queued or terminal Work; active Execution is {}",
+                        execution_state_name(&active.state)
+                    ),
+                    paths: request.paths.clone(),
+                },
+                now_unix_seconds,
+            ),
+        };
+    }
+    let executions = tx.executions_for_work(work_id)?;
+    let Some(last) = executions.last() else {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "conflict repair has no Execution lineage to extend".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    };
+    if last.state != ExecutionState::Succeeded {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: format!(
+                    "conflict repair requires a completed Work; latest Execution is {}",
+                    execution_state_name(&last.state)
+                ),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
+    let issue_refs = tx.issue_refs(work_id)?;
+    for issue in &issue_refs {
+        if let Some(owner) = tx.issue_claim(issue)?
+            && &owner != work_id
+        {
+            return escalate_conflict(
+                tx,
+                config,
+                work_id,
+                ConflictEscalation {
+                    episode: Some(request.episode.clone()),
+                    reason: format!("source {issue} is now owned by {}", owner.0),
+                    paths: request.paths.clone(),
+                },
+                now_unix_seconds,
+            );
+        }
+    }
+    let spec = tx
+        .spec(work_id, Some(work.spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "conflict repair Work has no spec".into(),
+        })?;
+    let seq = tx.alloc_seq()?;
+    let mut input = last.input.clone();
+    input.input = conflict_payload(&request.episode, &request.paths);
+    input.resume = false;
+    input.next_execution_input = last.input.next_execution_input.clone();
+    input.previous_execution_outcome = last.outcome.clone();
+    let mut successor = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        last.ordinal + 1,
+        seq,
+        input,
+    )?;
+    successor.next_role = Some(InvocationRole::Fix);
+    tx.apply(&Effect::InsertExecution {
+        execution: successor.clone(),
+    })?;
+    if !issue_refs.is_empty() {
+        tx.apply(&Effect::InsertIssueClaims {
+            work_id: work_id.clone(),
+            issues: issue_refs,
+        })?;
+    }
+    admit_queued_role(
+        tx,
+        config,
+        &successor.id,
+        InvocationRole::Fix,
+        now_unix_seconds,
+    )?;
+    Ok(())
+}
+
+/// Hold an unbindable/unrepairable conflict for a human with the paths
+/// the host reported. A Work with an active Execution pauses that
+/// Execution; a completed Work gets a paused successor so the Attention
+/// projection names the conflict instead of hiding it.
+fn escalate_conflict(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    work_id: &WorkId,
+    escalation: ConflictEscalation,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let reason = conflict_reason(&escalation.reason, &escalation.paths);
+    let Some(work) = tx.work(work_id)? else {
+        return Ok(());
+    };
+    if let Some(active) = tx.active_execution(work_id)? {
+        pause_for_repair(
+            tx,
+            &active,
+            "conflict_unresolvable",
+            &reason,
+            vec![RepairPrerequisite::OperatorDecision],
+            now_unix_seconds,
+        )?;
+        return Ok(());
+    }
+    let executions = tx.executions_for_work(work_id)?;
+    let Some(last) = executions.last() else {
+        return Ok(());
+    };
+    let spec = tx
+        .spec(work_id, Some(work.spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "conflict escalation Work has no spec".into(),
+        })?;
+    let issue_refs = tx.issue_refs(work_id)?;
+    let seq = tx.alloc_seq()?;
+    let mut input = last.input.clone();
+    input.previous_execution_outcome = last.outcome.clone();
+    let mut paused = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        last.ordinal + 1,
+        seq,
+        input,
+    )?;
+    paused.state = ExecutionState::Paused;
+    paused.pause_reason = Some(reason);
+    paused.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+    paused.paused_since_unix_seconds = Some(now_unix_seconds);
+    tx.apply(&Effect::InsertExecution { execution: paused })?;
+    if !issue_refs.is_empty() {
+        tx.apply(&Effect::InsertIssueClaims {
+            work_id: work_id.clone(),
+            issues: issue_refs,
+        })?;
+    }
+    Ok(())
+}
+
+/// A bounded human-facing diagnostic: the reason plus the reported
+/// conflicting paths, capped so an attacker-controlled path list cannot
+/// grow the pause record without bound.
+fn conflict_reason(reason: &str, paths: &[String]) -> String {
+    const MAX_PATHS: usize = 20;
+    const MAX_CHARS: usize = 1024;
+    let rendered = paths.iter().take(MAX_PATHS).cloned().collect::<Vec<_>>();
+    let mut out = if rendered.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}; conflicting paths: {}", rendered.join(", "))
+    };
+    if paths.len() > MAX_PATHS {
+        out.push_str(&format!(" (+{} more)", paths.len() - MAX_PATHS));
+    }
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect();
+    }
+    out
+}
+
+fn execution_state_name(state: &ExecutionState) -> &'static str {
+    match state {
+        ExecutionState::Queued => "queued",
+        ExecutionState::Ready => "ready",
+        ExecutionState::Running => "running",
+        ExecutionState::Waiting => "waiting",
+        ExecutionState::Stopping => "stopping",
+        ExecutionState::Paused => "paused",
+        ExecutionState::Uncertain => "uncertain",
+        ExecutionState::Succeeded => "succeeded",
+        ExecutionState::Failed => "failed",
+        ExecutionState::Cancelled => "cancelled",
+    }
 }
 
 /// Record the reconciled intent status. `applied` requires a normalized

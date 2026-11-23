@@ -15,6 +15,7 @@ use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef, DiffTarget, HostActorRef,
     IssueRef, RepositoryRef, SourceSnapshot,
 };
+use workloop_core::mergeability::{MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState};
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
@@ -204,6 +205,11 @@ pub struct FixtureGithub {
     /// `change_request_id` → the remote's stored title/body: what a
     /// metadata update wrote and a fresh read returns.
     change_meta: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// Change ids the remote reports merged.
+    merged_changes: std::collections::BTreeSet<String>,
+    /// `change_request_id` → the mergeability verdict the remote reports
+    /// for that change's current head against its base.
+    change_mergeability: BTreeMap<String, (MergeabilityState, Vec<String>)>,
     /// `action name` → failure reason: test-injected execution faults.
     /// A matching attempt consumes the entry — one-shot per arming.
     forced_failures: BTreeMap<String, String>,
@@ -385,6 +391,11 @@ pub struct SourceRefreshReport {
     pub unchanged: usize,
     pub ingested: usize,
     pub deferred: Vec<String>,
+    /// Sibling changes re-checked because a managed merge was recorded
+    /// in this pass.
+    pub merge_rechecks: usize,
+    /// Sibling changes observed conflicted against the new base.
+    pub sibling_conflicts: usize,
     /// Every issue source whose authoritative read completed this
     /// pass, whether or not the recorded observation changed — the
     /// retained body must exist even when the gate already matched.
@@ -812,6 +823,43 @@ impl FixtureGithub {
     /// metadata receipt reports.
     fn change_fields(&self, change_id: &str) -> (Option<String>, Option<String>) {
         self.change_meta.get(change_id).cloned().unwrap_or_default()
+    }
+
+    /// Test control: mark a change merged on the remote.
+    pub fn set_merged(&mut self, change: &ChangeRequestRef) {
+        self.merged_changes
+            .insert(change.change_request.as_str().to_string());
+        self.bump_change(change.change_request.as_str());
+    }
+
+    /// Alias for [`Self::set_merged`].
+    pub fn mark_merged(&mut self, change: &ChangeRequestRef) {
+        self.set_merged(change);
+    }
+
+    /// Alias for [`Self::set_change_mergeability`].
+    pub fn set_mergeability(
+        &mut self,
+        change: &ChangeRequestRef,
+        state: MergeabilityState,
+        paths: &[&str],
+    ) {
+        self.set_change_mergeability(change, state, paths);
+    }
+
+    /// Test control: the mergeability verdict the remote reports for a
+    /// change's current head against its base.
+    pub fn set_change_mergeability(
+        &mut self,
+        change: &ChangeRequestRef,
+        state: MergeabilityState,
+        paths: &[&str],
+    ) {
+        self.change_mergeability.insert(
+            change.change_request.as_str().to_string(),
+            (state, paths.iter().map(|p| (*p).to_string()).collect()),
+        );
+        self.bump_change(change.change_request.as_str());
     }
 
     /// Test control: the remote's record of a repository's
@@ -2178,6 +2226,15 @@ impl FixtureGithub {
                 }
             }
         }
+        // A Work whose change head was already observed is managed even
+        // if its opening intent has aged out of the retained outbox:
+        // record the pair so merge detection and sibling re-checks still
+        // see it.
+        for (work_id, change) in recorded_change_pairs(store, scope)? {
+            owners
+                .entry(change.change_request.as_str().to_string())
+                .or_insert((work_id, change));
+        }
         for (change_id, head) in &self.changes {
             let Some((work_id, change)) = owners.get(change_id) else {
                 continue;
@@ -2218,6 +2275,158 @@ impl FixtureGithub {
                 now,
             )?;
             report.ingested += 1;
+        }
+        // A recorded managed merge re-checks the remaining open managed
+        // changes on the same target. The scan is bounded per pass and
+        // each for-merge scan is scoped to the new target revision; the
+        // stable observation identity makes a steady conflicted pair one
+        // trigger, not one per pass.
+        for (owner_work, change) in owners.values() {
+            let change_id = change.change_request.as_str();
+            if !self.merged_changes.contains(change_id) {
+                continue;
+            }
+            if let Some(d) = deadline
+                && now >= d
+            {
+                report.deferred.push(format!("merge:{change_id}"));
+                continue;
+            }
+            let Some(head_object) = self.changes.get(change_id).cloned() else {
+                continue;
+            };
+            let target_branch = self
+                .change_sources
+                .get(change_id)
+                .map(|(_, target)| target.clone())
+                .unwrap_or_else(|| "main".to_string());
+            let Some(base_object) = self
+                .branches
+                .get(&(change.repository.to_string(), target_branch.clone()))
+                .cloned()
+            else {
+                continue;
+            };
+            let Ok(head) = CommitRevision::new(change.repository.clone(), head_object) else {
+                continue;
+            };
+            let Ok(base) = CommitRevision::new(change.repository.clone(), base_object) else {
+                continue;
+            };
+            let execution_id = store.transact(|tx| {
+                Ok(tx
+                    .executions_for_work(owner_work)?
+                    .into_iter()
+                    .max_by_key(|e| e.ordinal)
+                    .map(|e| e.id))
+            })?;
+            self.emit(
+                store,
+                config,
+                Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Host {
+                            host: change.repository.host.clone(),
+                        },
+                        source: "fixture.merge".into(),
+                        event_id: format!(
+                            "merge:{}:{}@{}:{}",
+                            owner_work.0, change_id, head.object, base.object
+                        ),
+                    }),
+                    subject_work_id: Some(owner_work.clone()),
+                    subject_execution_id: execution_id,
+                    fact: ObservationFact::ChangeMerged {
+                        change: change.clone(),
+                        head: head.clone(),
+                        base: base.clone(),
+                        target_branch: target_branch.clone(),
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
+            report.merge_rechecks += 1;
+            let mut rechecked = 0usize;
+            for (sibling_id, (sibling_work, sibling)) in &owners {
+                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
+                if sibling_id == change_id {
+                    continue;
+                }
+                let sibling_target = self
+                    .change_sources
+                    .get(sibling_id)
+                    .map(|(_, target)| target.clone())
+                    .unwrap_or_else(|| "main".to_string());
+                if sibling_target != target_branch {
+                    continue;
+                }
+                let Some((state, paths)) = self.change_mergeability.get(sibling_id) else {
+                    continue;
+                };
+                let Some(sibling_head_object) = self.changes.get(sibling_id).cloned() else {
+                    continue;
+                };
+                if self.merged_changes.contains(sibling_id) {
+                    continue;
+                }
+                let Ok(sibling_head) =
+                    CommitRevision::new(sibling.repository.clone(), sibling_head_object)
+                else {
+                    continue;
+                };
+                let execution_id = store.transact(|tx| {
+                    Ok(tx
+                        .executions_for_work(sibling_work)?
+                        .into_iter()
+                        .max_by_key(|e| e.ordinal)
+                        .map(|e| e.id))
+                })?;
+                let token = workloop_core::domain::sha256_hex(
+                    "fixture-mergeability-v1",
+                    format!("{state:?}:{paths:?}").as_bytes(),
+                );
+                self.emit(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: sibling.repository.host.clone(),
+                            },
+                            source: "fixture.mergeability".into(),
+                            event_id: format!(
+                                "mergeability:{}:{}@{}:{}#{token}",
+                                sibling_work.0, sibling_id, sibling_head.object, base.object
+                            ),
+                        }),
+                        subject_work_id: Some(sibling_work.clone()),
+                        subject_execution_id: execution_id,
+                        fact: ObservationFact::Mergeability {
+                            target: DiffTarget {
+                                change: sibling.clone(),
+                                head: sibling_head,
+                                base: Some(base.clone()),
+                                target_revision: Some(base.clone()),
+                            },
+                            state: *state,
+                            conflicting_paths: paths.clone(),
+                            reason: (*state == MergeabilityState::Unknown)
+                                .then(|| "fixture mergeability is unknown".to_string()),
+                        },
+                        observed_unix_seconds: now,
+                    },
+                    now,
+                )?;
+                rechecked += 1;
+                report.merge_rechecks += 1;
+                if *state == MergeabilityState::Conflicting {
+                    report.sibling_conflicts += 1;
+                }
+            }
         }
         Ok(report)
     }
@@ -3145,6 +3354,38 @@ pub(crate) fn declared_sources(
             };
             for source in &spec.payload.sources {
                 out.push((work.id.clone(), execution.id.clone(), source.clone()));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Every `(Work, change)` pair this store has observed, including Work
+/// whose Execution has already reached a terminal state. Merge
+/// detection and bounded sibling re-checks must still see a completed
+/// Work's open change; only its ordinary head polling is suppressed.
+pub(crate) fn recorded_change_pairs(
+    store: &impl Store,
+    scope: Option<&WorkId>,
+) -> Result<Vec<(WorkId, ChangeRequestRef)>, StoreError> {
+    store.transact(|tx| {
+        let mut out = Vec::new();
+        for work in tx.works()? {
+            if let Some(w) = scope
+                && work.id != *w
+            {
+                continue;
+            }
+            let latest = tx
+                .observations_for_work(&work.id)?
+                .into_iter()
+                .filter_map(|o| match o.fact {
+                    ObservationFact::ChangeHead { change, .. } => Some(change),
+                    _ => None,
+                })
+                .next_back();
+            if let Some(change) = latest {
+                out.push((work.id.clone(), change));
             }
         }
         Ok(out)

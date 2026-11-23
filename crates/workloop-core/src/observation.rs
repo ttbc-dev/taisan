@@ -5,6 +5,7 @@ use crate::identity::{
     ChangeRequestRef, CommitRevision, DiffSnapshot, DiffTarget, EvidenceRef, HostActorRef,
     HostCapability, HostInstanceId, IssueRef, RepositoryRef,
 };
+use crate::mergeability::MergeabilityState;
 use crate::worker_v2::ReportClassification;
 
 /// Delivery identity for transports that assign one (webhooks, worker
@@ -192,6 +193,37 @@ pub enum ObservationFact {
         repository: RepositoryRef,
         branch: String,
         state: BranchState,
+    },
+    /// A managed change was recorded merged. `head` is the source head
+    /// the merge landed and `base` is the target revision observed
+    /// immediately after the merge — the new base sibling changes are
+    /// re-checked against. `target_branch` names the branch the bounded
+    /// sibling scan is scoped to.
+    ChangeMerged {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+        base: CommitRevision,
+        target_branch: String,
+    },
+    /// Alias variant for producers that name the merge record rather
+    /// than the change. Both decode and assess identically.
+    MergeRecorded {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+        base: CommitRevision,
+        target_branch: String,
+    },
+    /// The host's mergeability verdict for one exact `(head, base)`
+    /// pair. A `Conflicting` verdict carries the paths the host could
+    /// report; a verdict the host could not establish is `Unknown` with
+    /// a reason, never an invented conflict.
+    Mergeability {
+        target: DiffTarget,
+        state: MergeabilityState,
+        #[serde(default)]
+        conflicting_paths: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// One named check conclusion on an exact head.
     Check {

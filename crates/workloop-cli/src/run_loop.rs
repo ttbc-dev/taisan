@@ -2565,6 +2565,10 @@ mod tests {
                 title: "t".into(),
                 body: String::new(),
                 merged: false,
+                mergeable: None,
+                mergeable_state: String::new(),
+                base_sha: String::new(),
+                conflicting_paths: vec![],
             }
         }
 
@@ -2722,6 +2726,10 @@ mod tests {
                 title: title.to_string(),
                 body: body.to_string(),
                 merged: false,
+                mergeable: None,
+                mergeable_state: String::new(),
+                base_sha: String::new(),
+                conflicting_paths: vec![],
             };
             self.pulls
                 .insert(format!("{repository}:{}", pull.id), Ok(pull.clone()));
