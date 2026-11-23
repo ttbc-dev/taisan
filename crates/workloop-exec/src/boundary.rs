@@ -161,10 +161,20 @@ impl RuntimeBoundary {
             BoundaryState::Unresolved => unreachable!("state resolved above"),
         };
         if stale {
-            if let BoundaryState::Ready(ready) = &mut *state
-                && let Some(proxy) = ready.proxy.take()
+            // Release the stale grant's resources — the proxy and,
+            // when it carried one, the staged credential — before
+            // re-resolving. A failed re-resolve leaves `Unresolved`
+            // behind: never a dismantled grant a later digest match
+            // could serve with its staged file already gone.
+            if let BoundaryState::Ready(ready) =
+                std::mem::replace(&mut *state, BoundaryState::Unresolved)
             {
-                proxy.shutdown();
+                if let Some(proxy) = ready.proxy {
+                    proxy.shutdown();
+                }
+                if ready.credential_file.is_some() {
+                    let _ = self.unstage_credential();
+                }
             }
             *state = BoundaryState::Ready(self.resolve()?);
         }
@@ -706,6 +716,40 @@ mod tests {
         boundary2.ensure().unwrap();
         assert!(!staged.exists(), "the stale staged file is unlinked");
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN5") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed stale re-resolve releases the stale grant and must
+    /// not leave it cached: once the provider config recovers, the
+    /// next `ensure` resolves from scratch and hands out a grant
+    /// whose staged file actually exists — never the dismantled one.
+    #[test]
+    fn a_failed_reresolve_does_not_serve_a_dismantled_grant() {
+        let dir = tmp("dismantle");
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN7", "sekrit7") };
+        let cfg_dir = dir.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let member = cfg_dir.join("provider.toml");
+        std::fs::write(&member, "token = \"aaaaaa\"\n").unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN7".into());
+        cfg.provider_config = Some(cfg_dir);
+        let boundary = RuntimeBoundary::new(cfg);
+        boundary.ensure().expect("a clean config resolves");
+        // A stale re-resolve that fails past staging leaves no file.
+        std::fs::write(&member, "token = \"sekrit7\"\n").unwrap();
+        let err = boundary.ensure().unwrap_err();
+        assert!(err.contains("provider_config.contains_credential"), "{err}");
+        assert!(!dir.join("runtime/runtime-auth").exists());
+        // Restoring the original content re-resolves from scratch:
+        // the grant carries a live staged file, not the dismantled
+        // grant's dead path.
+        std::fs::write(&member, "token = \"aaaaaa\"\n").unwrap();
+        let grant = boundary.ensure().unwrap();
+        let staged = grant.credential_file.expect("credential restaged");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"sekrit7");
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN7") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
