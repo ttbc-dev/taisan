@@ -379,7 +379,7 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     let prompt = match build_prompt(&request, &input_dir) {
         Ok(p) => p,
         Err(reason) => {
-            write_simple_report(&request, out_dir, "unavailable", &reason)?;
+            write_simple_report(&request, out_dir, &workspace, "unavailable", &reason)?;
             return Ok(0);
         }
     };
@@ -1261,6 +1261,7 @@ fn write_report(
         report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
         body = canonical_json(&report);
     }
+    write_artifact_manifest(request, workspace, &report, report["claimed_head"].as_str());
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
 }
@@ -1271,6 +1272,7 @@ fn write_report(
 fn write_simple_report(
     request: &WorkerRequestV2,
     out_dir: &Path,
+    workspace: &Path,
     status: &str,
     reason: &str,
 ) -> Result<(), String> {
@@ -1307,8 +1309,53 @@ fn write_simple_report(
         report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
         body = canonical_json(&report);
     }
+    // The report claims nothing, but the manifest still records the
+    // observed HEAD: the handoff file is mechanical evidence, not the
+    // runtime's word.
+    write_artifact_manifest(
+        request,
+        workspace,
+        &report,
+        git_rev_parse_head(workspace).as_deref(),
+    );
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
+}
+
+/// The workspace-root handoff manifest. The supervisor discovers a
+/// non-empty `artifact.json` at the workspace root as the default
+/// required artifact for writer roles, so the shim — never the
+/// runtime — writes it after the runtime exits: `claimed_head` then
+/// observes every commit the runtime made. Its fields are the same
+/// mechanical claims the report carries; the produced commit itself
+/// is the workspace's git state, which the supervisor's own handoff
+/// reads — the manifest is evidence, not authority. A read-only role
+/// declares no artifacts and must not touch the read-only workspace.
+/// A failed write is a stderr diagnostic, not a shim failure: the
+/// supervisor's artifact evidence then records `missing` honestly,
+/// while `report.json` still carries the run's claims.
+fn write_artifact_manifest(
+    request: &WorkerRequestV2,
+    workspace: &Path,
+    report: &Value,
+    claimed_head: Option<&str>,
+) {
+    if request.workspace.read_only {
+        return;
+    }
+    let manifest = json!({
+        "format_version": "taisan.worker.artifact/1",
+        "worker": ADAPTER,
+        "request_id": request.request_id,
+        "invocation_id": request.invocation_id,
+        "status": report["status"],
+        "reason": report["reason"],
+        "claimed_head": claimed_head,
+        "claimed_checks": report["claimed_checks"],
+    });
+    if let Err(e) = fs::write(workspace.join("artifact.json"), canonical_json(&manifest)) {
+        eprintln!("artifact.json: {e}");
+    }
 }
 
 /// Validate and bound the reader-role members the runtime claimed.

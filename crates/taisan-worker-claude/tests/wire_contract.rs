@@ -454,6 +454,143 @@ fn coding_success_reports_head_and_checks() {
 }
 
 #[test]
+fn writer_role_writes_the_workspace_artifact_manifest() {
+    let dir = tmp("artifact");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let events = events_file(
+        &dir,
+        "implemented\n\n```taisan-result\n{\"notes\":\"done\"}\n```",
+        json!({}),
+    );
+    let req = request_json(
+        "coding",
+        json!({
+            "kind": "coding",
+            "goal": goal_ref(),
+            "issues": [],
+            "constraints": [],
+            "verification_argv": [["sh", "-c", "exit 0"]],
+        }),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("artifact", &req, &[("goal.md", "goal\n")]);
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+            ("FAKE_WRITE", "produced.txt"),
+            ("FAKE_COMMIT", "1"),
+        ],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out.stderr);
+
+    // The supervisor's default required artifact: the shim
+    // materializes a truthful manifest at the workspace root —
+    // claimed_head is the real produced commit, not the runtime's
+    // word, and the file itself lands uncommitted (the runtime's
+    // `git add -A` ran before it existed).
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(ws.join("artifact.json")).expect("artifact.json must exist"),
+    )
+    .expect("artifact.json must parse");
+    let head = git(&ws, &["rev-parse", "HEAD"]);
+    assert_eq!(manifest["format_version"], "taisan.worker.artifact/1");
+    assert_eq!(manifest["worker"], "taisan-worker-claude");
+    assert_eq!(manifest["request_id"], "e-1:inv:1");
+    assert_eq!(manifest["invocation_id"], "inv-1");
+    assert_eq!(manifest["status"], "success");
+    assert_eq!(manifest["reason"]["code"], "completed");
+    assert_eq!(manifest["claimed_head"].as_str().unwrap(), head);
+    assert_eq!(manifest["claimed_checks"][0]["status"], "passed");
+    assert!(
+        git(&ws, &["status", "--porcelain"]).contains("artifact.json"),
+        "the manifest is workspace evidence, never committed"
+    );
+}
+
+#[test]
+fn read_only_role_writes_no_workspace_artifact() {
+    let dir = tmp("ro-artifact");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let head = git(&ws, &["rev-parse", "HEAD"]);
+    let block = "```taisan-result\n{\"findings\":[]}\n```";
+    let events = events_file(&dir, &format!("clean\n\n{block}"), json!({}));
+    let req = request_json(
+        "review",
+        json!({
+            "kind": "code_review",
+            "target": {"change": "chg-1", "base": head, "head": head, "diff_digest": hex(0x0f)},
+            "review_source": {"source": "gh-review", "bytes": 64, "digest": hex(0x10), "source_revision": "1"},
+        }),
+        &ws,
+        true,
+    );
+    let review_source = canonical_json(&json!({
+        "format": "taisan.review-source/1",
+        "work_id": "w-1",
+        "target": req["task"]["target"],
+        "prior_round": null,
+    }));
+    let (request_path, _, out_dir) = dispatch(
+        "ro-artifact",
+        &req,
+        &[(
+            "review-source.json",
+            std::str::from_utf8(&review_source).unwrap(),
+        )],
+    );
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[("FAKE_EVENTS", events.to_str().unwrap())],
+    );
+    assert!(out.status.success());
+    // Reader roles declare an empty artifact set: the shim must not
+    // write into a workspace the request marked read-only.
+    assert!(
+        !ws.join("artifact.json").exists(),
+        "read-only role must not write a workspace artifact"
+    );
+}
+
+#[test]
+fn missing_input_still_writes_the_observed_manifest() {
+    let dir = tmp("artifact-no-input");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let base = git(&ws, &["rev-parse", "HEAD"]);
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    // No input/goal.md materialized — a pre-runtime failure still
+    // hands off the manifest so the supervisor sees the workspace's
+    // observed HEAD, not an absent artifact.
+    let (request_path, _, out_dir) = dispatch("artifact-no-input", &req, &[]);
+    let out = run_shim(&fake, &request_path, &out_dir, &ws, &[]);
+    assert!(out.status.success());
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(ws.join("artifact.json")).expect("artifact.json must exist"),
+    )
+    .expect("artifact.json must parse");
+    assert_eq!(manifest["status"], "unavailable");
+    assert_eq!(manifest["reason"]["code"], "missing_required_input");
+    assert_eq!(manifest["claimed_head"].as_str().unwrap(), base);
+    assert_eq!(manifest["claimed_checks"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn coding_failed_check_reports_negative() {
     let dir = tmp("coding-fail");
     let fake = fake_runtime(&dir);
