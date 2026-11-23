@@ -725,6 +725,16 @@ pub trait ReadView {
     /// Invocations that may still write (prepared/running/unknown).
     fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError>;
 
+    /// Resolved v2 Invocations whose required process observations are
+    /// recorded but whose bounded Worker-report collection has not
+    /// recorded an accepted fact yet — the durable retry set for a pass
+    /// that committed the terminal observation and then crashed before
+    /// ingestion. Stores that cannot enumerate them return none and
+    /// rely on the supervisor's inline collection at finish.
+    fn pending_report_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn works(&self) -> Result<Vec<Work>, StoreError>;
     fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError>;
 

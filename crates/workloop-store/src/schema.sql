@@ -1,6 +1,6 @@
--- workloop v12 store: current-state tables enforcing structural
+-- workloop v13 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 12` marks the format; a stamped older file with
+-- `PRAGMA user_version = 13` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -8,7 +8,8 @@
 -- added the intake_settings admission record (#213); v10 added the
 -- recovery_intents.retirement_generation column (#139); v11 added the
 -- worker_request_bodies canonical v2 request-body record (docs/v0.3.md,
--- #256); v12 added the finding_occurrences.summary column (#264).
+-- #256); v12 added the finding_occurrences.summary column (#264); v13
+-- added the observations_execution evidence-lookup index.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -192,6 +193,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS observations_dedupe
     ON observations (delivery_scope, delivery_host, delivery_source,
                      delivery_event_id)
     WHERE delivery_event_id IS NOT NULL;
+
+-- Per-Execution evidence history (process, artifacts, reports) is read
+-- in durable order on every supervisor pass and by the deferred-report
+-- retry; keep that lookup from scanning the whole append-only log.
+CREATE INDEX IF NOT EXISTS observations_execution
+    ON observations (subject_execution_id);
 
 -- Recorded host write intents; `pending`/`unknown` are outstanding
 -- effects a terminal state must not silently drain.

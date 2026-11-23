@@ -4276,7 +4276,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12, "the upgrade lands on the current format");
+        assert_eq!(version, 13, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4341,11 +4341,64 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12, "the upgrade lands on the current format");
+        assert_eq!(version, 13, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
     let _ = SqliteStore::open(&db, 1).unwrap();
+}
+
+/// Regression: a store stamped at the pre-index v12 format gains the
+/// `observations_execution` lookup on open. The index is installed by
+/// the version bump rather than only by a fresh bootstrap, so an
+/// upgraded installation's per-pass deferred-report retry does not
+/// scan the append-only observation history.
+#[test]
+fn a_v12_store_gains_the_observation_execution_index() {
+    let root = temp_root("upgrade-v12-index");
+    let db = root.join("store.db");
+    {
+        let _store = SqliteStore::open(&db, 1).unwrap();
+    }
+    // Reshape into a faithful v12 file: no evidence index, stamp 12.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP INDEX observations_execution; PRAGMA user_version=12;")
+            .unwrap();
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='index' AND name='observations_execution')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!present, "the reshaped file is a real pre-index v12 store");
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v12 store upgrades in place");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='index' AND name='observations_execution')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            present,
+            "the v12->v13 migration installs the evidence index"
+        );
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 13, "the upgrade lands on the current format");
+    }
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Regression (acceptance): new-format records survive a reopen — the
@@ -6411,7 +6464,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12, "the upgrade lands on the current format");
+        assert_eq!(version, 13, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

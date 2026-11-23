@@ -1,7 +1,12 @@
 //! Bounded collection of `taisan.worker.report/2` evidence
-//! (`docs/v0.3.md` §6). Runs only after the Invocation's process tree
-//! is proven stopped — `finish_invocation` is the single caller — so a
+//! (`docs/v0.3.md` §6). Runs only after the Invocation's launch
+//! acceptance — a recorded `Running` observation, or the process
+//! identity durably persisted when that observation was lost — is
+//! followed by a terminal `Exited` fact for that same process, so a
 //! report is never read from a writer that could still change it.
+//! `finish_invocation` collects inline after committing the terminal
+//! fact; the supervisor's deferred-report sweep retries a collection a
+//! crash interrupted.
 //!
 //! The collector reads `report.json` and `runtime.log` from the
 //! Invocation-owned out directory under hard bounds taken from the
@@ -22,7 +27,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use workloop_core::domain::{Invocation, InvocationRequest};
-use workloop_core::observation::{ObservationFact, WorkerReportEvidence};
+use workloop_core::observation::{
+    ObservationFact, ReportCollectionGate, WorkerReportEvidence, report_collection_gate,
+};
 use workloop_core::store::{BodyCatalog, Store, StoreError};
 use workloop_core::worker_v2::{
     ReportBinding, ReportClassification, WorkerRequestV2, classify_report,
@@ -127,8 +134,9 @@ fn retain_evidence(
 /// return the observation fact to deliver — `WorkerReport` for the
 /// first accepted collection, `WorkerReportConflict` when the bytes
 /// under the Invocation's identity changed, `None` when the request
-/// carries no v2 body (a v1 invocation) or identical evidence was
-/// already accepted (idempotent replay).
+/// carries no v2 body (a v1 invocation), the required process
+/// observations are not recorded yet (deferred, never failed), or
+/// identical evidence was already accepted (idempotent replay).
 ///
 /// `request` is the durable `InvocationRequest`; the v2-ness of the
 /// dispatch is decided by its recorded `worker_request_body` row, so
@@ -171,6 +179,24 @@ pub fn collect(
         ));
     };
     let catalog = store.body_catalog();
+
+    // Collection begins only after the Invocation's launch acceptance
+    // is recorded — an observed `Running`, or the durable identity on
+    // the Invocation row when a crash lost the observation — followed
+    // by a terminal `Exited` fact for that same process. An earlier
+    // attempt is deferred — nothing is read from the worker-owned out
+    // surface and no evidence is recorded; the pass that commits the
+    // terminal fact collects again.
+    let observations = store.transact(|tx| tx.observations_for_execution(&request.execution_id))?;
+    let recorded_identity = invocation
+        .process_identity
+        .as_ref()
+        .map(|identity| format!("{}@{}", identity.pid, identity.started_at));
+    if report_collection_gate(&observations, &invocation.id, recorded_identity.as_deref())
+        != ReportCollectionGate::Ready
+    {
+        return Ok(None);
+    }
 
     let out_dir: PathBuf = invocation_io_root(workspace_root)
         .join(isolation::sanitize_key(&invocation.id.0))

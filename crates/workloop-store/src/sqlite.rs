@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `12` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `11`
+//! `PRAGMA user_version` is the format gate: `13` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `12`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -48,9 +48,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `10` adds the `recovery_intents.retirement_generation` column (#139);
 /// `11` adds the `worker_request_bodies` canonical-body record for the
 /// versioned executable Worker request (`docs/v0.3.md`, #256);
-/// `12` adds the `finding_occurrences.summary` column (#264).
+/// `12` adds the `finding_occurrences.summary` column (#264);
+/// `13` adds the `observations_execution` evidence-lookup index.
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 12;
+pub(crate) const FORMAT_VERSION: i64 = 13;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -1796,6 +1797,51 @@ impl ReadView for Tx<'_> {
             &format!(
                 "SELECT {INVOCATION_COLS} FROM invocations \
                       WHERE state IN ('prepared','running','unknown') ORDER BY rowid"
+            ),
+            [],
+            invocation_from_row,
+        )
+    }
+
+    fn pending_report_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
+        // Resolved v2 Invocations carrying a terminal process
+        // observation for the launched process but no accepted report
+        // fact: the durable retry set for a crash between the terminal
+        // commit and report ingestion. The launch acceptance is either
+        // a recorded `running` fact or the identity durably persisted
+        // on the Invocation row when that observation was lost. The
+        // order and identity checks are re-evaluated in Rust before
+        // collection; this query only bounds the candidate set so a
+        // pass never scans all history.
+        self.query_all(
+            &format!(
+                "SELECT {INVOCATION_COLS} FROM invocations i \
+                 WHERE i.state IN ('done','abandoned') \
+                   AND EXISTS (SELECT 1 FROM worker_request_bodies b \
+                               WHERE b.request_id=i.request_id) \
+                   AND EXISTS (SELECT 1 FROM observations t \
+                               WHERE t.subject_execution_id=i.execution_id \
+                                 AND json_extract(t.fact,'$.kind')='process_state' \
+                                 AND json_extract(t.fact,'$.state')='exited' \
+                                 AND json_extract(t.fact,'$.invocation_id')=i.id \
+                                 AND ((i.process_identity IS NOT NULL \
+                                       AND json_extract(t.fact,'$.process_identity')=\
+                                           CAST(json_extract(i.process_identity,'$.pid') AS TEXT) || '@' || \
+                                           json_extract(i.process_identity,'$.started_at')) \
+                                      OR EXISTS (SELECT 1 FROM observations o \
+                                                 WHERE o.subject_execution_id=i.execution_id \
+                                                   AND o.id < t.id \
+                                                   AND json_extract(o.fact,'$.kind')='process_state' \
+                                                   AND json_extract(o.fact,'$.state')='running' \
+                                                   AND json_extract(o.fact,'$.invocation_id')=i.id \
+                                                   AND json_extract(o.fact,'$.process_identity')<>'' \
+                                                   AND json_extract(o.fact,'$.process_identity')=\
+                                                       json_extract(t.fact,'$.process_identity')))) \
+                   AND NOT EXISTS (SELECT 1 FROM observations r \
+                                   WHERE r.subject_execution_id=i.execution_id \
+                                     AND json_extract(r.fact,'$.kind')='worker_report' \
+                                     AND json_extract(r.fact,'$.invocation_id')=i.id) \
+                 ORDER BY i.rowid"
             ),
             [],
             invocation_from_row,
