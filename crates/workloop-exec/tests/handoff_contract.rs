@@ -1237,6 +1237,141 @@ fn a_spent_deadline_runs_no_command_at_all() {
     );
 }
 
+/// The spent bound is checked before `prepare_enforcement` and before
+/// `git worktree prune` / `remove_dir_all`: a missing toolchain would
+/// refuse and a stale worktree registration would be pruned if either
+/// ran on that path.
+#[test]
+fn a_spent_deadline_short_circuits_before_enforcement_and_worktree_maintenance() {
+    let root = tmp_root("verifyzeroorder");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vzorder");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    // A missing toolchain is an enforcement refusal if anything
+    // resolves enforcement; the spent bound must never reach it.
+    if let Some(sandbox) = layout.verification.as_mut() {
+        sandbox.toolchain = Some(root.join("absent-toolchain"));
+    }
+    let produced = row(&store, &aid).unwrap().produced.unwrap();
+    // Crash residue a normal verification run would prune: the
+    // directory is gone but the registration remains.
+    let stale = scratch.join("stale-verify-worktree");
+    git(
+        &layout.repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            stale.to_str().unwrap(),
+            &produced,
+        ],
+    );
+    std::fs::remove_dir_all(&stale).unwrap();
+    let stale_path = stale.to_string_lossy().into_owned();
+    assert!(
+        git(&layout.repository, &["worktree", "list", "--porcelain"]).contains(&stale_path),
+        "the stale registration exists before the call"
+    );
+
+    let argv = vec!["/bin/sh".into(), "-c".into(), "true".into()];
+    let res = handoff::verify_with_timeout(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        Duration::ZERO,
+        64 * 1024,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert_eq!(
+        res.output,
+        "execution deadline elapsed before verification started"
+    );
+    assert!(
+        !res.output.contains("toolchain"),
+        "the spent bound ran enforcement resolution: {}",
+        res.output
+    );
+    assert!(!bwrap_log.exists(), "no sandbox launch on a spent bound");
+    assert_eq!(res.environment_digest, handoff::deadline_bound_marker());
+    assert!(
+        handoff::is_bound_marker(&res.environment_digest),
+        "the evidence carries the dedicated bound marker"
+    );
+    assert!(
+        !(res.environment_digest.len() == 64
+            && res
+                .environment_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())),
+        "the marker must not be presentable as a real environment_digest"
+    );
+    // The refused-enforcement identity for this exact subject is not
+    // the marker.
+    let refused = sha256_hex(
+        "verification-env-v1",
+        &canonical_json(&serde_json::json!({
+            "argv": argv,
+            "produced": res.produced,
+            "ref": artifact_ref(&aid),
+            "enforcement": {"kind": "refused"},
+        })),
+    );
+    assert_ne!(res.environment_digest, refused);
+    let after = git(&layout.repository, &["worktree", "list", "--porcelain"]);
+    assert!(
+        after.contains(&stale_path),
+        "the spent bound must not prune worktrees:\n{after}"
+    );
+    assert!(
+        std::fs::read_dir(&scratch).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("verify-")),
+        "no verification worktree or log is created for a spent bound"
+    );
+}
+
+/// The spent-deadline evidence marker has a defined shape and is
+/// structurally distinct from every real `environment_digest`.
+#[test]
+fn a_spent_deadline_marker_cannot_masquerade_as_an_environment_digest() {
+    let marker = handoff::deadline_bound_marker();
+    let expected = format!(
+        "{}deadline:{}",
+        handoff::BOUND_MARKER_PREFIX,
+        sha256_hex(
+            "verification-bound-marker-v1",
+            &canonical_json(&serde_json::json!({"kind": "deadline"})),
+        )
+    );
+    assert_eq!(marker, expected, "the documented marker shape");
+    assert_eq!(marker, handoff::deadline_bound_marker(), "deterministic");
+    assert!(handoff::is_bound_marker(&marker));
+    let (prefix, hex) = marker.rsplit_once(':').expect("marker has a digest");
+    assert_eq!(prefix, "bound-marker-v1:deadline");
+    assert_eq!(hex.len(), 64);
+    assert!(
+        hex.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the digest is lowercase hex: {hex}"
+    );
+    // A real environment digest is exactly 64 lowercase hex with no
+    // marker prefix, so the two shapes cannot be confused.
+    let real = sha256_hex("verification-env-v1", b"real-environment");
+    assert_eq!(real.len(), 64);
+    assert!(!handoff::is_bound_marker(&real));
+    assert_ne!(marker, real);
+    assert!(!(marker.len() == 64 && marker.chars().all(|c| c.is_ascii_hexdigit())));
+}
+
 /// `source_revision` is a host issue-version token, not a git commit:
 /// a source-bound Work derives the handoff base from the managed
 /// branch's fork point in the workspace, and a valid produced commit
