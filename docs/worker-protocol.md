@@ -251,7 +251,7 @@ Each recovery attempt counts against the existing artifact-recovery bound (3 att
 | Workspace commit | Branch unchanged: `nothing_produced` for Coding/Fix | Descends from `base`, on the managed branch | Not a descendant, different branch, or history rewrite below `base`: invalid artifact |
 | Export bundle | Absent: re-export within bounds | `bundle verify` passes and contains `produced` | Corrupt or contains unexpected refs: discard and re-export; repeated corruption becomes invalid |
 | Handoff ref / acknowledgement | Absent: no publication, no verification | Ref equals `produced`; manifest digest matches the row | Ref differs, digest differs, or connectivity fails: invalid, never published |
-| `VerificationResult` | Not yet run: requirement pending | Argv, environment profile, artifact, and commit exact; completed | Different artifact/argv/profile, or runner killed: incomplete or invalid, never passing |
+| `VerificationResult` | Not yet run: requirement pending | Argv, environment profile, artifact, and commit exact; completed | Different artifact/argv/profile, or runner killed: `Inconclusive` or invalid, never passing |
 | Capability declaration | `describe` fails: adapter not selectable (`adapter.declaration_unavailable`, fail-closed — no synthetic declaration is compared) | Fresh `describe` of the bound argv matches the request's stored binding field-for-field | Per-field mismatch with the stored request binding: configuration repair, no start, terminal for that binding (abandon and re-issue under a new request) |
 | Isolation preflight | Not run: dispatch refused | All probes pass for this profile | Any probe fails: dispatch refused with repair prerequisite |
 | Stop proof | Not established: `uncertain` | Every recorded identity stopped, namespace init gone | Contradictory inspection: `uncertain`, Attention after threshold |
@@ -267,7 +267,7 @@ The reference adapter declares `checkpoints: WorkspaceCommits`: WIP that the run
 1. For each declared argv, create an independent clean worktree from `refs/taisan/artifacts/<artifact_id>`. Verify the exact commit and tracked input bytes before running it; no command inherits source changes from another command.
 2. Run that argv in the recorded verification sandbox profile. Tracked source inputs are read-only. Build outputs and temporary files use separate per-command writable directories that cannot shadow tracked inputs. The out directory is per-command, there are no runtime credentials, and the same PID namespace stop rules apply. A command requiring source mutation is incompatible with this profile and needs an explicit validated profile decision; its result cannot silently certify the original commit.
 3. Egress: denied by default. The effective allowlist for a command is the installation-level verification allowlist plus the egress hosts the Work declared in `required_capabilities` at admission — enforced through the same CONNECT-proxy mechanism, CONNECT-only on port 443 with DNS resolved by the proxy, TLS uninspected. The allowlist never contains model-API hosts, and its digest is part of the recorded environment identity. A command needing an undeclared host fails; a Work that needs hosts it did not declare is an admission gap, never a reason to open the network silently.
-4. Record `VerificationResult{requirement, artifact, commit, argv, environment: profile digest, result, output}` with bounded output. A timeout or a killed runner is `Incomplete`, never `Failed` with an invented exit code and never `Passed`.
+4. Record `VerificationResult{requirement, artifact, commit, argv, environment: profile digest, result, output}` with bounded output. A timeout or a killed runner is `Inconclusive`, never `Failed` with an invented exit code and never `Passed`.
 
 The runner is a supervised effect of the CLI loop, not a Worker Invocation; it is bounded by its own per-command timeout and the Execution deadline.
 
@@ -380,7 +380,7 @@ Both implementations run the same suite through the supervisor and the public Co
 | WS-19 | Adapter attempts to change Work state or request retry | No path exists; any such output ignored and recorded |
 | WS-20 | Config-only swap between adapters for new Invocations | Identical Command, queue, budget and Outcome results; running Invocation unaffected |
 | WS-21 | Runtime version differs from declaration | Configuration repair; no start |
-| WS-22 | Verification runner timeout or source-mutation attempt | Timeout is `Incomplete`, not `Failed` or `Passed`. Source mutation is denied; every subsequent command starts from the exact original artifact with independent outputs |
+| WS-22 | Verification runner timeout or source-mutation attempt | Timeout is `Inconclusive`, not `Failed` or `Passed`. Source mutation is denied; every subsequent command starts from the exact original artifact with independent outputs |
 | WS-23 | Verification egress with Work-declared hosts | Declared and installation-default hosts reachable; undeclared destination denied; no runtime credential present; recorded environment digest reflects the effective allowlist |
 | WS-24 | Missing, stale, or undeliverable worker input snapshot (`review_source`, `invariant_set`, `goal`) | Dispatch refused as an invalid request; the Worker never fetches the input itself |
 
