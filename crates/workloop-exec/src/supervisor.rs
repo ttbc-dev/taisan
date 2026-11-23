@@ -1618,6 +1618,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
         if deadline_reached(clock, deadline) {
             return Ok(true);
         }
+        self.collect_deferred_reports_scoped(store, now_unix_seconds, scope, clock, deadline)?;
+        if deadline_reached(clock, deadline) {
+            return Ok(true);
+        }
         self.drive_stops_scoped(store, now_unix_seconds, scope, clock, deadline)?;
         if deadline_reached(clock, deadline) {
             return Ok(true);
@@ -3518,6 +3522,57 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
+    /// Retry report collection for resolved v2 Invocations whose
+    /// required process observations are durable but whose accepted
+    /// report fact is not. Normally `finish_invocation` collects inline
+    /// right after the terminal commit; this sweep only has work when a
+    /// pass crashed in that window. Collection re-checks the
+    /// launch-then-terminal gate and is idempotent, so an invocation
+    /// that never produced a readable report records `absent` once and
+    /// leaves the set.
+    fn collect_deferred_reports_scoped(
+        &self,
+        store: &impl Store,
+        now_unix_seconds: i64,
+        scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
+        deadline: Option<i64>,
+    ) -> Result<(), ExecError> {
+        let pending = store.transact(|tx| tx.pending_report_invocations())?;
+        for invocation in pending {
+            if deadline_reached(clock, deadline) {
+                break;
+            }
+            if let Some(work_id) = scope {
+                let belongs = store.transact(|tx| {
+                    Ok::<_, StoreError>(
+                        tx.execution(&invocation.execution_id)?
+                            .is_some_and(|e| &e.work_id == work_id),
+                    )
+                })?;
+                if !belongs {
+                    continue;
+                }
+            }
+            let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
+                continue;
+            };
+            if let Some(fact) = crate::report_v2::collect(
+                store,
+                self.body_store
+                    .as_ref()
+                    .or(self.v2.as_ref().map(|d| &d.bodies)),
+                &self.workspace_root,
+                &invocation,
+                &request,
+                now_unix_seconds,
+            )? {
+                self.report(store, &request, fact, now_unix_seconds)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Refresh the durable descendant snapshot while the leader is alive.
     /// Escapees are cheapest to record while they are still children; a
     /// failed or unchanged table read leaves the stored set alone.
@@ -4109,13 +4164,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
-    /// Save every artifact fact before the exit fact resolves the writer.
-    /// Interrupted reporting leaves the Invocation in the next scan.
-    /// `exit_code` is the status `inspect` proved for the writer's own
-    /// exit without consuming it — `None` when no normal exit status
-    /// could be proven, which the exit fact records honestly rather
-    /// than as a pass. Callers reap only after this commits, so a
-    /// failed report is retried against the same zombie's status.
+    /// Save every artifact fact, commit the terminal process
+    /// observation, then collect the v2 report. The report gate needs
+    /// both the earlier launch-acceptance `Running` fact and this
+    /// terminal fact in the Invocation's record, so the order is part
+    /// of the contract; a crash between the two commits leaves a
+    /// durable candidate for the deferred-report sweep. `exit_code` is
+    /// the status `inspect` proved for the writer's own exit without
+    /// consuming it — `None` when no normal exit status could be
+    /// proven, which the exit fact records honestly rather than as a
+    /// pass. Callers reap only after this commits, so a failed finish
+    /// is retried against the same zombie's status.
     fn finish_invocation(
         &self,
         store: &impl Store,
@@ -4164,23 +4223,13 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 now_unix_seconds,
             )?;
         }
-        // The process tree is proven stopped before this runs, so the
-        // Invocation-owned out directory is final: collect the v2
-        // report evidence now, before the exit fact resolves the
-        // writer — a crash after the exit commit could never retry the
-        // collection. v1 requests collect nothing.
-        if let Some(fact) = crate::report_v2::collect(
-            store,
-            self.body_store
-                .as_ref()
-                .or(self.v2.as_ref().map(|d| &d.bodies)),
-            &self.workspace_root,
-            invocation,
-            &request,
-            now_unix_seconds,
-        )? {
-            self.report(store, &request, fact, now_unix_seconds)?;
-        }
+        // The process tree is proven stopped before this runs. Commit
+        // the terminal process observation first: bounded report
+        // collection may begin only after the launch acceptance and
+        // this terminal fact for the same process are both recorded.
+        // The collection itself is idempotent and is retried by the
+        // pending-report sweep if this pass fails between the two
+        // commits. v1 requests collect nothing.
         self.report(
             store,
             &request,
@@ -4196,6 +4245,18 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             now_unix_seconds,
         )?;
+        if let Some(fact) = crate::report_v2::collect(
+            store,
+            self.body_store
+                .as_ref()
+                .or(self.v2.as_ref().map(|d| &d.bodies)),
+            &self.workspace_root,
+            invocation,
+            &request,
+            now_unix_seconds,
+        )? {
+            self.report(store, &request, fact, now_unix_seconds)?;
+        }
         Ok(())
     }
 

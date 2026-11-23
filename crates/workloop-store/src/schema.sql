@@ -193,6 +193,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS observations_dedupe
                      delivery_event_id)
     WHERE delivery_event_id IS NOT NULL;
 
+-- Per-Execution evidence history (process, artifacts, reports) is read
+-- in durable order on every supervisor pass and by the deferred-report
+-- retry; keep that lookup from scanning the whole append-only log.
+CREATE INDEX IF NOT EXISTS observations_execution
+    ON observations (subject_execution_id);
+
 -- Recorded host write intents; `pending`/`unknown` are outstanding
 -- effects a terminal state must not silently drain.
 CREATE TABLE IF NOT EXISTS host_action_intents (

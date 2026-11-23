@@ -1802,6 +1802,43 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn pending_report_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
+        // Resolved v2 Invocations carrying both a launch-acceptance and
+        // a terminal process observation but no accepted report fact:
+        // the durable retry set for a crash between the terminal commit
+        // and report ingestion. The order and identity checks are
+        // re-evaluated in Rust before collection; this query only
+        // bounds the candidate set so a pass never scans all history.
+        self.query_all(
+            &format!(
+                "SELECT {INVOCATION_COLS} FROM invocations i \
+                 WHERE i.state IN ('done','abandoned') \
+                   AND EXISTS (SELECT 1 FROM worker_request_bodies b \
+                               WHERE b.request_id=i.request_id) \
+                   AND EXISTS (SELECT 1 FROM observations o, observations t \
+                               WHERE o.subject_execution_id=i.execution_id \
+                                 AND t.subject_execution_id=i.execution_id \
+                                 AND o.id < t.id \
+                                 AND json_extract(o.fact,'$.kind')='process_state' \
+                                 AND json_extract(o.fact,'$.state')='running' \
+                                 AND json_extract(o.fact,'$.invocation_id')=i.id \
+                                 AND json_extract(o.fact,'$.process_identity')<>'' \
+                                 AND json_extract(t.fact,'$.kind')='process_state' \
+                                 AND json_extract(t.fact,'$.state')='exited' \
+                                 AND json_extract(t.fact,'$.invocation_id')=i.id \
+                                 AND json_extract(t.fact,'$.process_identity')=\
+                                     json_extract(o.fact,'$.process_identity')) \
+                   AND NOT EXISTS (SELECT 1 FROM observations r \
+                                   WHERE r.subject_execution_id=i.execution_id \
+                                     AND json_extract(r.fact,'$.kind')='worker_report' \
+                                     AND json_extract(r.fact,'$.invocation_id')=i.id) \
+                 ORDER BY i.rowid"
+            ),
+            [],
+            invocation_from_row,
+        )
+    }
+
     fn works(&self) -> Result<Vec<Work>, StoreError> {
         self.query_all(
             &format!("SELECT {WORK_COLS} FROM works ORDER BY created_seq"),
