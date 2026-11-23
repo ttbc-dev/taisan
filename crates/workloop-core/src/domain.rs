@@ -852,6 +852,9 @@ pub struct VerificationResult {
     /// The exact commit the run materialized — never a branch name.
     pub produced: String,
     /// Digest over the run environment descriptor (argv + produced).
+    /// A spent-bound short-circuit that never ran enforcement carries
+    /// the prefixed bound marker (`handoff::deadline_bound_marker`)
+    /// instead — never a fabricated 64-hex environment digest.
     pub environment_digest: String,
     pub result: VerificationOutcome,
     pub output: String,
