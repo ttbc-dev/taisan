@@ -32,7 +32,7 @@ that does is marked **provisional** inline.
 | --- | --- | --- |
 | `limactl` | absent → installed 2.3.0 via Homebrew for this spike | primary candidate |
 | `qemu-system-aarch64` | absent → installed 11.1.3 via Homebrew for this spike | comparison candidate |
-| OrbStack | installed and running; `docker` CLI answers (server 29.8.2) | inventory only — always-on resident daemons and a commercial licence for non-personal use make it ineligible as the reference environment (see Constraints); footprint recorded below as context |
+| OrbStack | installed and running; `docker` CLI answers (server 29.8.2) | inventory only — always-on resident daemons and a commercial licence for non-personal use make it ineligible as the reference environment (see Ranking, item 4); footprint recorded below as context |
 | Docker Desktop | absent | per issue, Docker must not become a requirement |
 | colima, nerdctl, vfkit, Tart, UTM, Parallels, VMware | absent | — |
 | hypervisor.framework frontends | none besides Lima (vz) and OrbStack | — |
@@ -201,10 +201,12 @@ criteria:
 3. **Firecracker — unavailable on macOS** (Linux/KVM-only); on a Linux
    endpoint it would compete with the native-bwrap path that needs no
    guest at all, so it ranks below "no guest" there too.
-4. **OrbStack — excluded by constraint** (always-on daemons ~384 MB
-   resident here; commercial licence for non-personal use violates the
-   no-paid-resources boundary; Docker daemon model conflicts with the
-   optional-only criterion). Recorded as inventory context only.
+4. **OrbStack — excluded by the issue's boundary** (#373 requires the
+   reference environment not to depend on Docker; OrbStack's model is a
+   resident Docker daemon plus an always-on shared VM — ~384 MB
+   resident measured above — and a commercial licence for non-personal
+   use makes it unsuitable as the project default). Recorded as
+   inventory context only.
 
 ## Pinned default recipe
 
