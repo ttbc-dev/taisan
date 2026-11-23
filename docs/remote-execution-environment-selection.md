@@ -95,10 +95,10 @@ are upper bounds, not clean attribution):
 | D — guest stopped again | 43% | 126,895 | 151,080 | all lima/qemu processes exited; compressor decays lazily |
 
 Even under the worst-case reading (process footprint plus the full
-observed compressor delta), the vz guest's marginal host cost stays an
-order of magnitude below the qemu guest's 1.84 GB resident. On this
-host the dominant cost of a vz guest is that it *pressures* the
-compressor, not that it *reserves* memory.
+observed compressor delta — ~98–100 MB + ~789 MB ≈ 0.89 GB), the vz
+guest's marginal host cost stays roughly 2x below the qemu guest's
+1.84 GB resident. On this host the dominant cost of a vz guest is that
+it *pressures* the compressor, not that it *reserves* memory.
 
 ### Component breakdown (host-visible, vz candidate)
 
@@ -111,12 +111,12 @@ compressor, not that it *reserves* memory.
 | Coordinator (taisan Core), executor, transport helper, egress proxy | not part of this spike — **provisional** on #372's topology; nothing in the recipe requires them to be guest-resident | not measured |
 | Runtime server / container daemon | none — `containerd` disabled in the recipe | 0 |
 
-### v0.3-boundary proof in the guest
+### v0.3 namespace-level containment in the guest
 
-The approved v0.3 profile (bubblewrap mount/PID/network/IPC namespaces
-— `docs/worker-protocol.md` selected profile, `docs/v0.3.md` OP-1) runs
-in the guest as an unprivileged user after the recipe's one-time
-provisioning:
+The namespace layer of the approved v0.3 profile (bubblewrap
+user/mount/PID/network/IPC namespaces — `docs/worker-protocol.md`
+selected profile, `docs/v0.3.md` OP-1) runs in the guest as an
+unprivileged user after the recipe's one-time provisioning:
 
 ```
 $ bwrap --unshare-user --unshare-pid --unshare-net --unshare-ipc \
@@ -127,6 +127,15 @@ $ bwrap --unshare-user --unshare-pid --unshare-net --unshare-ipc \
 RECIPE-OK
 NET-DOWN      # network namespace is present and empty
 ```
+
+This demonstrates the namespace-level containment primitive only. The
+remaining elements of the approved v0.3 profile were **not** exercised
+in the guest: credential/environment hygiene, the profile's fixed
+mount set (the `--ro-bind`/`--tmpfs` mounts above are illustrative,
+not the approved set), the mandatory N1 model-API CONNECT proxy (the
+network is fully unshared — `NET-DOWN` — so no egress path exists to
+proxy), and the preflight negative probes. Those stay unverified
+pending #372, matching the caveats in "Honest limits and non-claims".
 
 Two Ubuntu 24.04-specific provisioning facts, measured not assumed:
 
@@ -174,10 +183,12 @@ criteria:
 1. **Lima `vmType: vz` — selected.** ~100 MB idle host footprint for a
    1 GiB-capped guest; ~10 s warm start; no host sudo, no daemon, no
    Docker; starts on demand and fully releases; runs the v0.3 bwrap
-   boundary after a scripted one-time provision.
-2. **Lima `vmType: qemu` — fallback.** Same guest, same tooling, but
-   ~1.84 GB resident at idle — acceptable only where vz is unavailable
-   (e.g. macOS < 13). Keep as documented fallback, not default.
+   namespace-level boundary after a scripted one-time provision.
+2. **Lima `vmType: qemu` — fallback.** Same arm64 guest, same tooling,
+   but ~1.84 GB resident at idle — the fallback for arm64 hosts where
+   vz is unavailable (e.g. Apple Silicon on macOS < 13). Keep as
+   documented fallback, not default; no Intel recipe is pinned in this
+   round — qemu on Intel cannot boot an arm64 guest efficiently.
 3. **Firecracker — unavailable on macOS** (Linux/KVM-only); on a Linux
    endpoint it would compete with the native-bwrap path that needs no
    guest at all, so it ranks below "no guest" there too.
@@ -190,7 +201,9 @@ criteria:
 
 ```yaml
 # taisan remote-execution reference environment — Lima / vz
-# Host: macOS >= 13 (tested: arm64, macOS 26.7.1). Guest: Ubuntu 24.04 minimal.
+# Host: macOS >= 13 on Apple Silicon (arm64) — this recipe is arm64-only
+# (aarch64 guest image, vz; no Intel recipe is pinned). Guest: Ubuntu 24.04 minimal.
+# Tested: arm64, macOS 26.7.1.
 vmType: vz
 os: Linux
 arch: aarch64
@@ -269,10 +282,13 @@ Notes on the pinned values:
 - vz per-process accounting under-reports guest-touched memory;
   system-level deltas on a live workstation carry unrelated churn
   (measurements above state both honestly). The ranking does not depend
-  on the attribution — qemu's resident cost is an order of magnitude
-  higher under either reading.
-- Measured on a single arm64 Mac; Intel-Mac vz behaviour and a
-  Linux-host comparison are unmeasured (honest absence, not a claim).
+  on the attribution — qemu's resident cost is higher under either
+  reading (~18x the vz idle process footprint, ~2x under the worst-case
+  compressor-inclusive accounting).
+- Measured on a single arm64 Mac; the pinned recipe requires an Apple
+  Silicon host — Intel Macs are out of scope for this recipe, and
+  Intel-Mac vz behaviour and a Linux-host comparison are unmeasured
+  (honest absence, not a claim).
 - Minimum safe memory: 1 GiB guest is the measured floor for this
   spike's trivial workload. If the eventual executor's real working set
   exceeds a realistic laptop budget, that finding must be surfaced at
