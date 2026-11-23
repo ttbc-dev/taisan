@@ -250,6 +250,36 @@ pub enum Effect {
     InsertWorkerRequestBody {
         body: crate::worker_v2::WorkerRequestBody,
     },
+    /// The immutable executor endpoint binding for one remote request
+    /// (`docs/executor-transport-contract.md` §2). Written before the
+    /// first remote operation is sent. A duplicate insert with
+    /// identical content is a replay; different content is a
+    /// `ConstraintConflict` — a bound request is never silently
+    /// migrated to another endpoint, incarnation, payload, or launch
+    /// configuration.
+    InsertExecutorBinding {
+        binding: crate::executor::ExecutorBinding,
+    },
+    /// The durable executor operation record (`docs/executor-transport-
+    /// contract.md` §4): the command identity and canonical bytes are
+    /// committed before the operation is sent. A duplicate insert with
+    /// identical bytes is an idempotent replay; differing bytes under
+    /// the same `(request_id, operation_id)` are a `ConstraintConflict`
+    /// — the store's form of `conflicting_replay`. A second `start`
+    /// for one request conflicts structurally.
+    RecordExecutorCommand {
+        operation: crate::executor::ExecutorOperation,
+    },
+    /// Attach a validated receipt to its previously recorded command.
+    /// The receipt must parse and echo every identity field of the
+    /// stored command; an identical re-record is a replay, differing
+    /// bytes a `ConstraintConflict`, and a receipt for an unrecorded
+    /// operation is refused.
+    RecordExecutorReceipt {
+        request_id: String,
+        operation_id: String,
+        receipt_body: Vec<u8>,
+    },
     /// Replaces the singleton intake-settings record, guarded by the
     /// caller-observed revision: `expected_revision` must equal the
     /// currently recorded `settings_revision`, and `None` requires the
@@ -760,6 +790,29 @@ pub trait ReadView {
         &self,
         request_id: &str,
     ) -> Result<Option<crate::worker_v2::WorkerRequestBody>, StoreError>;
+    /// The immutable executor binding recorded for a remote request;
+    /// `None` = absent (the request is local-bound or predates remote
+    /// placement). A corrupt row is an error, never silently absent —
+    /// a missing binding refuses dispatch, a forged one must too.
+    fn executor_binding(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorBinding>, StoreError>;
+    /// The durable operation record for one command identity;
+    /// `None` = absent. Replay and reconciliation read this before any
+    /// endpoint contact.
+    fn executor_operation(
+        &self,
+        request_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorOperation>, StoreError>;
+    /// Every durable operation record for one request, ordered by
+    /// `operation_id` — the deterministic reconciliation set a
+    /// restart replays against.
+    fn executor_operations_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<crate::executor::ExecutorOperation>, StoreError>;
     /// The first recorded handoff row for an Invocation; an Invocation
     /// may carry one handoff per required artifact.
     fn handoff_for_invocation(
