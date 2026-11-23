@@ -272,6 +272,69 @@ fn sibling_rechecks_stop_at_the_per_pass_bound() {
     );
 }
 
+#[test]
+fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
+    // Enough capacity slots that every sibling's Fix request can be
+    // admitted; the per-pass bound under test is the conflict re-check
+    // budget, not the execution capacity gate.
+    let store = SqliteStore::in_memory(32).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "merged-work-progress");
+    let merged = change("cr-merged-progress");
+    record_change(&store, &merged_work, &merged);
+
+    let mut fixture = FixtureGithub::new();
+    fixture.set_change_head(&merged, "merged-head", &actor());
+    fixture.set_branch(&repo(), "main", "new-base", &actor());
+    fixture.set_merged(&merged);
+    let siblings = MAX_CONFLICT_RECHECKS_PER_PASS + 2;
+    let mut works = Vec::new();
+    for index in 0..siblings {
+        let work = submit(&store, &config, &format!("progress-sibling-{index}"));
+        let change = change(&format!("cr-progress-sibling-{index}"));
+        record_change(&store, &work, &change);
+        fixture.set_change_head(&change, &format!("progress-head-{index}"), &actor());
+        fixture.set_change_mergeability(
+            &change,
+            MergeabilityState::Conflicting,
+            &["src/shared.rs"],
+        );
+        works.push(work);
+    }
+
+    let first = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
+    for (index, work) in works
+        .iter()
+        .enumerate()
+        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
+    {
+        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
+        assert_eq!(fix_requests(&store, work), 0, "sibling {index} waits");
+    }
+
+    // The second pass re-examines the already-recorded siblings, but
+    // those duplicates must not consume the per-pass bound: the
+    // deferred siblings are reached and triggered.
+    fixture
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    for (index, work) in works.iter().enumerate() {
+        assert_eq!(
+            mergeability_facts(&store, work),
+            1,
+            "sibling {index} is observed"
+        );
+        assert_eq!(
+            fix_requests(&store, work),
+            1,
+            "sibling {index} triggers exactly once"
+        );
+    }
+}
+
 fn ingest_head(
     store: &SqliteStore,
     config: &WorkloopConfig,
@@ -357,4 +420,111 @@ fn the_production_adapter_rechecks_siblings_after_a_merged_read() {
         request.payload["target_revision"],
         serde_json::json!(rev("new-base"))
     );
+}
+
+#[test]
+fn the_production_adapter_makes_progress_on_deferred_siblings() {
+    use workloop_github::api::GitHubApi;
+
+    // Enough capacity slots for every sibling's Fix request; the bound
+    // under test is the conflict re-check budget.
+    let store = SqliteStore::in_memory(32).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "adapter-progress-merged");
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "work/merged-progress", "merged-progress-head");
+    api.seed_branch(&repo(), "main", "old-base");
+    let merged_pull = api
+        .open_pull(
+            &repo(),
+            "work/merged-progress",
+            "main",
+            "merged-progress",
+            "",
+        )
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    record_change(&store, &merged_work, &merged);
+    ingest_head(
+        &store,
+        &config,
+        &merged_work,
+        &merged,
+        "merged-progress-head",
+    );
+
+    let siblings = MAX_CONFLICT_RECHECKS_PER_PASS + 2;
+    let mut works = Vec::new();
+    for index in 0..siblings {
+        let work = submit(
+            &store,
+            &config,
+            &format!("adapter-progress-sibling-{index}"),
+        );
+        api.seed_branch(
+            &repo(),
+            &format!("work/progress-{index}"),
+            &format!("progress-head-{index}"),
+        );
+        let pull = api
+            .open_pull(
+                &repo(),
+                &format!("work/progress-{index}"),
+                "main",
+                &format!("progress-{index}"),
+                "",
+            )
+            .unwrap();
+        let sibling = change(&pull.id);
+        record_change(&store, &work, &sibling);
+        ingest_head(
+            &store,
+            &config,
+            &work,
+            &sibling,
+            &format!("progress-head-{index}"),
+        );
+        works.push((work, pull.id));
+    }
+    api.seed_branch(&repo(), "main", "new-base");
+    api.set_pull_merged(&repo(), &merged_pull.id);
+    for (_, pull_id) in &works {
+        api.set_pull_mergeability(
+            &repo(),
+            pull_id,
+            Some(false),
+            "dirty",
+            "new-base",
+            &["src/shared.rs"],
+        );
+    }
+
+    let mut adapter = GitHubAdapter::new(api);
+    let first = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
+    for (index, (work, _)) in works
+        .iter()
+        .enumerate()
+        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
+    {
+        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
+    }
+
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    for (index, (work, _)) in works.iter().enumerate() {
+        assert_eq!(
+            mergeability_facts(&store, work),
+            1,
+            "sibling {index} is observed"
+        );
+        assert_eq!(
+            fix_requests(&store, work),
+            1,
+            "sibling {index} triggers exactly once"
+        );
+    }
 }

@@ -1669,6 +1669,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 } else {
                     verdict.head_sha.clone()
                 };
+                let records_before = self.poll_records;
                 let Ok(sibling_head) =
                     CommitRevision::new(sibling_change.repository.clone(), head_object)
                 else {
@@ -1684,14 +1685,17 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         "conflict head is not a valid revision",
                         now,
                     )?;
-                    rechecked += 1;
                     report.merge_rechecks += 1;
+                    if self.poll_records != records_before {
+                        rechecked += 1;
+                    }
                     continue;
                 };
+                let state = verdict.state;
                 let paths = verdict.conflicting_paths.clone();
                 let token = workloop_core::domain::sha256_hex(
                     "mergeability-observation-v1",
-                    format!("{:?}:{paths:?}", verdict.state).as_bytes(),
+                    format!("{:?}:{paths:?}", state).as_bytes(),
                 );
                 self.poll_ingest(
                     store,
@@ -1716,7 +1720,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                                 base: Some(base.clone()),
                                 target_revision: Some(base.clone()),
                             },
-                            state: verdict.state,
+                            state,
                             conflicting_paths: paths,
                             reason: verdict.reason,
                         },
@@ -1724,10 +1728,17 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     },
                     now,
                 )?;
-                rechecked += 1;
                 report.merge_rechecks += 1;
-                if verdict.state == MergeabilityState::Conflicting {
+                if state == MergeabilityState::Conflicting {
                     report.sibling_conflicts += 1;
+                }
+                // Only a newly recorded observation consumes the per-pass
+                // bound. A duplicate is a re-read of a pair this scan has
+                // already minted a fact for; charging the bound for it
+                // would let the same leading siblings starve the deferred
+                // remainder on every pass.
+                if self.poll_records != records_before {
+                    rechecked += 1;
                 }
             }
         }

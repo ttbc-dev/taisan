@@ -2389,7 +2389,7 @@ impl FixtureGithub {
                     "fixture-mergeability-v1",
                     format!("{state:?}:{paths:?}").as_bytes(),
                 );
-                self.emit(
+                let receipt = self.emit(
                     store,
                     config,
                     Observation {
@@ -2421,10 +2421,17 @@ impl FixtureGithub {
                     },
                     now,
                 )?;
-                rechecked += 1;
                 report.merge_rechecks += 1;
                 if *state == MergeabilityState::Conflicting {
                     report.sibling_conflicts += 1;
+                }
+                // Only a newly recorded observation consumes the per-pass
+                // bound. A duplicate is a re-read of a pair this scan has
+                // already minted a fact for; charging the bound for it
+                // would let the same leading siblings starve the deferred
+                // remainder on every pass.
+                if matches!(receipt, IngestReceipt::Recorded) {
+                    rechecked += 1;
                 }
             }
         }
