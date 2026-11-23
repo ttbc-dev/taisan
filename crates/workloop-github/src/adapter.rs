@@ -38,7 +38,7 @@
 //!   [`crate::api::GitHubApi`] operation can merge; `succeeded` turns
 //!   on evidence, never on a merge.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use workloop_core::domain::{ExecutionId, WorkId, canonical_json, new_id, sha256_hex};
@@ -46,7 +46,9 @@ use workloop_core::identity::{
     ActorRole, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId,
     HostActorRef, HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
 };
-use workloop_core::mergeability::{MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState};
+use workloop_core::mergeability::{
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS, MergeabilityState,
+};
 use workloop_core::observation::{
     BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
     DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact, Observation,
@@ -76,7 +78,7 @@ enum ProbeCredential {
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
-    recorded_change_pairs,
+    latest_recorded_merge, recorded_change_pairs,
 };
 
 /// One delivered GitHub webhook: the transport GUID GitHub assigned,
@@ -1512,12 +1514,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     }
 
     /// A recorded managed merge triggers bounded mergeability re-checks
-    /// for the remaining open managed changes on the same target. The
-    /// scan is bounded both by the pass deadline and by
-    /// [`MAX_CONFLICT_RECHECKS_PER_PASS`]; the remainder waits for the
-    /// next pass. Every observation carries the exact `(head, new base)`
-    /// pair, and its stable delivery identity makes a steady conflicted
-    /// pair one trigger.
+    /// for the remaining open managed changes on the same target. Every
+    /// historical merge on one branch re-reads the same fresh base and
+    /// the same open siblings, so the scan is collapsed to one per
+    /// target per pass; it is bounded by the pass deadline, by
+    /// [`MAX_MERGE_RECHECKS_PER_PASS`] over the whole pass, and by
+    /// [`MAX_CONFLICT_RECHECKS_PER_PASS`] shared across every merge.
+    /// The remainder waits for the next pass. Every observation carries
+    /// the exact `(head, new base)` pair, and its stable delivery
+    /// identity makes a steady conflicted pair one trigger.
     fn recheck_after_recorded_merges(
         &mut self,
         store: &impl Store,
@@ -1528,43 +1533,105 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         report: &mut SourceRefreshReport,
     ) -> Result<(), StoreError> {
         let scan_deadline = deadline;
+        let mut scanned_targets: HashMap<String, CommitRevision> = HashMap::new();
+        let mut merge_scans = 0usize;
+        // The sibling budget is pass-wide, not per merge: accumulated
+        // merge history cannot multiply the remote verdict reads.
+        let mut rechecked = 0usize;
         for (work_id, change) in recorded_change_pairs(store, scope)? {
             if change.repository != config.host.repository
                 || !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)?
             {
                 continue;
             }
+            // A merge already recorded needs no pull re-read: its head,
+            // base and target branch are durable evidence. Only an
+            // unobserved merge is read to detect it.
+            let recorded = latest_recorded_merge(store, &work_id, &change)?;
+            let (head, target_branch, base_hint, newly_detected) = match recorded {
+                Some((head, base, target_branch)) => (head, target_branch, Some(base), false),
+                None => {
+                    let pull = match self
+                        .client
+                        .read_pull(&change.repository, &change.change_request)
+                    {
+                        Ok(pull) => pull,
+                        // A read outage invents no merge and no conflict;
+                        // the next pass catches up.
+                        Err(_) => continue,
+                    };
+                    if !pull.merged {
+                        continue;
+                    }
+                    let Ok(head) =
+                        CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
+                    else {
+                        continue;
+                    };
+                    let hint = (!pull.base_sha.is_empty())
+                        .then(|| {
+                            CommitRevision::new(change.repository.clone(), pull.base_sha.clone())
+                                .ok()
+                        })
+                        .flatten();
+                    (head, pull.target_branch.clone(), hint, true)
+                }
+            };
+            if let Some(scanned_base) = scanned_targets.get(&target_branch) {
+                // This pass already scanned the target; another merge on
+                // the same branch adds no new base or sibling set.
+                if newly_detected {
+                    // Record the newly seen merge against the target's
+                    // fresh base so a later pass does not read its pull
+                    // again. It needs no second sibling scan.
+                    self.poll_ingest(
+                        store,
+                        config,
+                        Observation {
+                            delivery: Some(DeliveryId {
+                                scope: DeliveryScope::Host {
+                                    host: change.repository.host.clone(),
+                                },
+                                source: "github.merge".into(),
+                                event_id: format!(
+                                    "merge:{}:{}@{}:{}",
+                                    work_id.0, change, head.object, scanned_base.object
+                                ),
+                            }),
+                            subject_work_id: Some(work_id.clone()),
+                            subject_execution_id: None,
+                            fact: ObservationFact::ChangeMerged {
+                                change: change.clone(),
+                                head: head.clone(),
+                                base: scanned_base.clone(),
+                                target_branch: target_branch.clone(),
+                            },
+                            observed_unix_seconds: now,
+                        },
+                        now,
+                    )?;
+                }
+                continue;
+            }
             if scan_deadline.is_some_and(|d| now >= d) {
                 report.deferred.push(format!("merge:{change}"));
                 continue;
             }
-            let pull = match self
-                .client
-                .read_pull(&change.repository, &change.change_request)
-            {
-                Ok(pull) => pull,
-                // A read outage invents no merge and no conflict; the
-                // next pass catches up.
-                Err(_) => continue,
-            };
-            if !pull.merged {
+            if merge_scans >= MAX_MERGE_RECHECKS_PER_PASS {
+                report.deferred.push(format!("merge:{change}"));
                 continue;
             }
-            let Ok(head) = CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
-            else {
-                continue;
-            };
-            // The fresh target-branch read is the new base. A pull's
-            // cached `base.sha` is only the fallback: after a merge it
+            // The fresh target-branch read is the new base. The recorded
+            // or pull-cached base is only the fallback: after a merge it
             // can lag the branch the sibling change must now rebase
             // onto, and the trigger must bind the revision actually
             // present.
             let base_object = self
                 .client
-                .read_branch(&change.repository, &pull.target_branch)
+                .read_branch(&change.repository, &target_branch)
                 .ok()
                 .flatten()
-                .or_else(|| (!pull.base_sha.is_empty()).then(|| pull.base_sha.clone()));
+                .or_else(|| base_hint.map(|base| base.object));
             let Some(base_object) = base_object else {
                 // A merge whose new base cannot be established cannot
                 // bind a repair; nothing is guessed.
@@ -1573,7 +1640,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             let Ok(base) = CommitRevision::new(change.repository.clone(), base_object) else {
                 continue;
             };
-            let target_branch = pull.target_branch.clone();
             self.poll_ingest(
                 store,
                 config,
@@ -1601,6 +1667,8 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 now,
             )?;
             report.merge_rechecks += 1;
+            merge_scans += 1;
+            scanned_targets.insert(target_branch.clone(), base.clone());
             let siblings = match self
                 .client
                 .list_open_pulls_on_base(&change.repository, &target_branch)
@@ -1616,7 +1684,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 // The sibling list was unavailable: no fact is invented.
                 Err(_) => continue,
             };
-            let mut rechecked = 0usize;
             for sibling in siblings {
                 if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
                     report.deferred.push(format!("merge-siblings:{change}"));

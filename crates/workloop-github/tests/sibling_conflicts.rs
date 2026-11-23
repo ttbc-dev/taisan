@@ -273,6 +273,135 @@ fn sibling_rechecks_stop_at_the_per_pass_bound() {
 }
 
 #[test]
+fn historical_merges_on_one_target_are_scanned_once() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut fixture = FixtureGithub::new();
+    // Three historical merges already landed on `main`; each would have
+    // triggered its own full scan if the recheck were per merge.
+    for index in 0..3 {
+        let work = submit(&store, &config, &format!("history-merged-{index}"));
+        let change = change(&format!("cr-history-merged-{index}"));
+        record_change(&store, &work, &change);
+        fixture.set_change_head(&change, &format!("history-head-{index}"), &actor());
+        fixture.set_merged(&change);
+    }
+    let sibling_work = submit(&store, &config, "history-sibling");
+    let sibling = change("cr-history-sibling");
+    record_change(&store, &sibling_work, &sibling);
+    fixture.set_change_head(&sibling, "history-sibling-head", &actor());
+    fixture.set_branch(&repo(), "main", "new-base", &actor());
+    fixture.set_change_mergeability(&sibling, MergeabilityState::Conflicting, &["src/shared.rs"]);
+
+    let report = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert!(
+        report.merge_rechecks <= 2,
+        "one merge scan plus its one sibling, not one per historical merge: {report:?}"
+    );
+    assert_eq!(
+        report.sibling_conflicts, 1,
+        "the conflicting sibling is observed once, not once per merge: {report:?}"
+    );
+    assert_eq!(mergeability_facts(&store, &sibling_work), 1);
+    assert_eq!(fix_requests(&store, &sibling_work), 1);
+
+    // A later pass still scans the target once and never mints a second
+    // trigger for the steady conflicted pair.
+    let report = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert!(report.merge_rechecks <= 2, "{report:?}");
+    assert_eq!(report.sibling_conflicts, 1);
+    assert_eq!(mergeability_facts(&store, &sibling_work), 1);
+    assert_eq!(fix_requests(&store, &sibling_work), 1);
+}
+
+#[test]
+fn the_production_adapter_does_not_rescan_each_historical_merge() {
+    use workloop_github::api::GitHubApi;
+
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    // Three historical merges on `main`, each with its own pull and
+    // recorded head — the accumulated history the recheck must not
+    // multiply.
+    let mut merged_pulls = Vec::new();
+    for index in 0..3 {
+        let work = submit(&store, &config, &format!("adapter-history-{index}"));
+        let branch = format!("work/history-{index}");
+        let head = format!("history-head-{index}");
+        api.seed_branch(&repo(), &branch, &head);
+        let pull = api
+            .open_pull(&repo(), &branch, "main", &format!("history-{index}"), "")
+            .unwrap();
+        let merged = change(&pull.id);
+        record_change(&store, &work, &merged);
+        ingest_head(&store, &config, &work, &merged, &head);
+        merged_pulls.push(pull.id);
+    }
+    let sibling_work = submit(&store, &config, "adapter-history-sibling");
+    api.seed_branch(&repo(), "work/history-sibling", "history-sibling-head");
+    let sibling_pull = api
+        .open_pull(
+            &repo(),
+            "work/history-sibling",
+            "main",
+            "history-sibling",
+            "",
+        )
+        .unwrap();
+    let sibling = change(&sibling_pull.id);
+    record_change(&store, &sibling_work, &sibling);
+    ingest_head(
+        &store,
+        &config,
+        &sibling_work,
+        &sibling,
+        "history-sibling-head",
+    );
+    api.seed_branch(&repo(), "main", "new-base");
+    for pull_id in &merged_pulls {
+        api.set_pull_merged(&repo(), pull_id);
+    }
+    api.set_pull_mergeability(
+        &repo(),
+        &sibling_pull.id,
+        Some(false),
+        "dirty",
+        "new-base",
+        &["src/shared.rs"],
+    );
+
+    let mut adapter = GitHubAdapter::new(api);
+    let first = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert!(
+        first.merge_rechecks <= 2,
+        "three historical merges on one target take one scan: {first:?}"
+    );
+    assert_eq!(
+        first.sibling_conflicts, 1,
+        "the conflicting sibling is observed once, not once per merge: {first:?}"
+    );
+
+    let second = adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert!(
+        second.merge_rechecks <= 2,
+        "a recorded merge is not re-read and the target is scanned once: {second:?}"
+    );
+    assert_eq!(second.sibling_conflicts, 1);
+    assert_eq!(mergeability_facts(&store, &sibling_work), 1);
+    assert_eq!(fix_requests(&store, &sibling_work), 1);
+}
+
+#[test]
 fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
     // Enough capacity slots that every sibling's Fix request can be
     // admitted; the per-pass bound under test is the conflict re-check

@@ -3113,6 +3113,29 @@ fn trigger_conflict_repair(
             now_unix_seconds,
         );
     };
+    // A conflict repair is a new automatic attempt charged against the
+    // Work-wide automatic-time budget. When that budget is already
+    // spent, admission would terminally fail the Execution with
+    // `automatic_time_exhausted` instead of dispatching the Fix.
+    // Escalate with the exact conflict paths so a human decides.
+    let usage = tx
+        .work_usage(work_id)?
+        .unwrap_or_else(|| WorkUsage::new(work_id));
+    if automatic_seconds_used(&usage, now_unix_seconds)
+        .is_some_and(|automatic| automatic > work.policy.automatic_time_limit_seconds)
+    {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "Work-wide automatic time limit reached; conflict repair requires an operator decision".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
     if let Some(active) = tx.active_execution(work_id)? {
         return match active.state {
             ExecutionState::Queued | ExecutionState::Waiting => {

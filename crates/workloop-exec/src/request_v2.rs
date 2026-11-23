@@ -257,6 +257,7 @@ fn artifact_ref(handoff: &ArtifactHandoff) -> Result<ArtifactRef, DispatchRefusa
 fn conflict_origin(
     request: &InvocationRequest,
     work: &Work,
+    handoff: &ArtifactHandoff,
 ) -> Result<Option<FixOrigin>, BuildError> {
     if request.payload.get("kind").and_then(|k| k.as_str()) != Some("conflict_repair") {
         return Ok(None);
@@ -287,6 +288,29 @@ fn conflict_origin(
     if head.repository != work.binding.repository || base.repository != work.binding.repository {
         return Err(refusal(DispatchRefusal::EvidenceMissing {
             detail: "conflict repair pair names a foreign repository".into(),
+        }));
+    }
+    // The same exact-revision protections the review path applies: a
+    // repaired pair must name two exact commits, and the source head
+    // must be the produced commit the mounted workspace is pinned at.
+    // A non-commit string or a source head the workspace does not
+    // contain can never be repaired against.
+    if !is_hex_sha1(&head.object) || !is_hex_sha1(&base.object) {
+        return Err(refusal(DispatchRefusal::HeadStale {
+            detail: "conflict repair pair does not carry exact commit ids".into(),
+        }));
+    }
+    let produced = handoff.produced.as_deref().ok_or_else(|| {
+        refusal(DispatchRefusal::ArtifactUnavailable {
+            detail: format!("handoff {} has no produced commit", handoff.artifact_id),
+        })
+    })?;
+    if head.object != produced {
+        return Err(refusal(DispatchRefusal::HeadStale {
+            detail: format!(
+                "the conflict source revision {} does not match the produced commit {produced} the workspace pins",
+                head.object
+            ),
         }));
     }
     let paths = request
@@ -768,7 +792,7 @@ pub fn build_request_body(
             // Fix dispositions; otherwise it binds failed mechanical
             // evidence. A fix with none is refused — it has no durable
             // basis to repair against.
-            let origin = match conflict_origin(request, &durable.work)? {
+            let origin = match conflict_origin(request, &durable.work, handoff)? {
                 Some(conflict) => conflict,
                 None => {
                     let origin = match &durable.judged_round {

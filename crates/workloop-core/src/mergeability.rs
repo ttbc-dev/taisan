@@ -17,10 +17,19 @@ use crate::domain::InvocationRole;
 use crate::domain::{canonical_json, sha256_hex};
 use crate::identity::{ChangeRequestRef, CommitRevision, DiffTarget};
 
-/// The most sibling changes one merge may re-check in one pass. The
-/// remainder is left for the next bounded pass rather than walking an
-/// unbounded open-change list.
+/// The most sibling changes one pass may re-check. The bound is over
+/// the whole pass, not per merge: every merge scanned in a pass shares
+/// it, so accumulated merge history cannot multiply the remote reads.
+/// The remainder is left for the next bounded pass rather than walking
+/// an unbounded open-change list.
 pub const MAX_CONFLICT_RECHECKS_PER_PASS: usize = 5;
+
+/// The most target branches one pass may scan for post-merge sibling
+/// conflicts. Every historical merge on the same branch re-reads the
+/// same fresh base and the same open siblings, so the scan is collapsed
+/// per target and additionally bounded here. The remainder waits for a
+/// later pass.
+pub const MAX_MERGE_RECHECKS_PER_PASS: usize = 5;
 
 const EPISODE_TAG: &str = "conflict-episode-v1";
 

@@ -15,7 +15,9 @@ use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef, DiffTarget, HostActorRef,
     IssueRef, RepositoryRef, SourceSnapshot,
 };
-use workloop_core::mergeability::{MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState};
+use workloop_core::mergeability::{
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS, MergeabilityState,
+};
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
@@ -2277,13 +2279,30 @@ impl FixtureGithub {
             report.ingested += 1;
         }
         // A recorded managed merge re-checks the remaining open managed
-        // changes on the same target. The scan is bounded per pass and
-        // each for-merge scan is scoped to the new target revision; the
-        // stable observation identity makes a steady conflicted pair one
-        // trigger, not one per pass.
+        // changes on the same target. Every historical merge on one
+        // branch re-reads the same fresh base and the same open
+        // siblings, so the scan is collapsed to one per target per pass
+        // and bounded over the whole pass. The stable observation
+        // identity makes a steady conflicted pair one trigger, not one
+        // per pass.
+        let mut scanned_targets: BTreeMap<String, CommitRevision> = BTreeMap::new();
+        let mut merge_scans = 0usize;
+        // The sibling budget is pass-wide, not per merge: accumulated
+        // merge history cannot multiply the remote verdict reads.
+        let mut rechecked = 0usize;
         for (owner_work, change) in owners.values() {
             let change_id = change.change_request.as_str();
             if !self.merged_changes.contains(change_id) {
+                continue;
+            }
+            let target_branch = self
+                .change_sources
+                .get(change_id)
+                .map(|(_, target)| target.clone())
+                .unwrap_or_else(|| "main".to_string());
+            if scanned_targets.contains_key(&target_branch) {
+                // This pass already scanned the target; another merge on
+                // the same branch adds no new base or sibling set.
                 continue;
             }
             if let Some(d) = deadline
@@ -2292,14 +2311,13 @@ impl FixtureGithub {
                 report.deferred.push(format!("merge:{change_id}"));
                 continue;
             }
+            if merge_scans >= MAX_MERGE_RECHECKS_PER_PASS {
+                report.deferred.push(format!("merge:{change_id}"));
+                continue;
+            }
             let Some(head_object) = self.changes.get(change_id).cloned() else {
                 continue;
             };
-            let target_branch = self
-                .change_sources
-                .get(change_id)
-                .map(|(_, target)| target.clone())
-                .unwrap_or_else(|| "main".to_string());
             let Some(base_object) = self
                 .branches
                 .get(&(change.repository.to_string(), target_branch.clone()))
@@ -2347,7 +2365,8 @@ impl FixtureGithub {
                 now,
             )?;
             report.merge_rechecks += 1;
-            let mut rechecked = 0usize;
+            merge_scans += 1;
+            scanned_targets.insert(target_branch.clone(), base.clone());
             for (sibling_id, (sibling_work, sibling)) in &owners {
                 if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
                     report.deferred.push(format!("merge-siblings:{change_id}"));
@@ -3403,6 +3422,31 @@ pub(crate) fn recorded_change_pairs(
         }
         Ok(out)
     })
+}
+
+/// The latest recorded `ChangeMerged` observation for one change: the
+/// durable proof the pull already merged, plus the target branch and
+/// base observed at that time. A later scan re-reads only the fresh
+/// target base, never the pull again — re-reading every recorded merge
+/// each pass would make remote reads grow with the merge history.
+pub(crate) fn latest_recorded_merge(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> Result<Option<(CommitRevision, CommitRevision, String)>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::ChangeMerged {
+                change: merged,
+                head,
+                base,
+                target_branch,
+            } if merged == *change => Some((head, base, target_branch)),
+            _ => None,
+        })
+        .next_back())
 }
 
 /// The latest recorded `issue` read for one declared source, ordered by

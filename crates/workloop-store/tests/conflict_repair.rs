@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
 use workloop_core::domain::{
     Actor, ActorKind, AllowedEffects, ExecutionBudget, ExecutionState, InvocationRole, LanePolicy,
-    Origin, WorkPolicy,
+    Origin, WorkPolicy, WorkUsage,
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef,
@@ -378,4 +378,67 @@ fn an_unbindable_conflict_escalates_to_attention_with_paths() {
     };
     assert_eq!(value.len(), 1, "one conflict escalation: {value:?}");
     assert_eq!(value[0].reason, "paused_judgment");
+}
+
+#[test]
+fn an_automatic_time_exhausted_work_escalates_a_conflict_instead_of_failing_terminal() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-timeout");
+    finish(&store, &work_id);
+    // First dispatch was more than the default four hours ago, so the
+    // Work-wide automatic-time budget is already spent when the merge
+    // is observed now.
+    store
+        .transact(|tx| {
+            let mut usage = tx
+                .work_usage(&work_id)?
+                .unwrap_or_else(|| WorkUsage::new(&work_id));
+            usage.first_dispatch_unix_seconds = Some(NOW - 5 * 3600);
+            tx.apply(&Effect::UpdateWorkUsage { usage })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-timeout-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/a.rs"],
+        ),
+        NOW,
+    )
+    .unwrap();
+
+    // The exhausted budget forbids a new automatic dispatch, but the
+    // conflict is never terminally failed with a bare budget code: it
+    // is held for an operator decision carrying the conflict paths.
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        0,
+        "no Fix request is admitted past the automatic-time ceiling"
+    );
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap();
+    assert!(
+        executions
+            .iter()
+            .all(|execution| execution.state != ExecutionState::Failed),
+        "the completed Work is not failed with automatic_time_exhausted: {executions:?}"
+    );
+    let current = executions.last().expect("escalation execution");
+    assert_eq!(current.state, ExecutionState::Paused);
+    let reason = current.pause_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("automatic time"), "{reason}");
+    assert!(reason.contains("src/a.rs"), "{reason}");
 }
