@@ -379,7 +379,7 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     let prompt = match build_prompt(&request, &input_dir) {
         Ok(p) => p,
         Err(reason) => {
-            write_simple_report(&request, out_dir, "unavailable", &reason)?;
+            write_simple_report(&request, out_dir, &workspace, "unavailable", &reason)?;
             return Ok(0);
         }
     };
@@ -390,6 +390,15 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
     fs::write(&mcp_path, b"{\"mcpServers\":{}}\n").map_err(|e| format!("mcp config: {e}"))?;
 
     let read_only = request.workspace.read_only;
+    if !read_only {
+        // A previous round's manifest at the workspace root is stale
+        // debris to this launch: the runtime's own `git add -A` would
+        // commit it, and the reuse gate then refuses the next round on
+        // a tracked modification it can never tolerate. A tracked
+        // `artifact.json` is repository content instead — left in
+        // place, and the write path records the collision honestly.
+        clear_stale_manifest(&workspace);
+    }
     let mut argv = cfg.runtime_argv.clone();
     argv.extend([
         "-p".into(),
@@ -1261,6 +1270,7 @@ fn write_report(
         report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
         body = canonical_json(&report);
     }
+    write_artifact_manifest(request, workspace, &report, report["claimed_head"].as_str());
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
 }
@@ -1271,6 +1281,7 @@ fn write_report(
 fn write_simple_report(
     request: &WorkerRequestV2,
     out_dir: &Path,
+    workspace: &Path,
     status: &str,
     reason: &str,
 ) -> Result<(), String> {
@@ -1307,8 +1318,132 @@ fn write_simple_report(
         report["report_digest"] = json!(report_v2_digest(&report_canonical_body(&report)));
         body = canonical_json(&report);
     }
+    // The report claims nothing, but the manifest still records the
+    // observed HEAD: the handoff file is mechanical evidence, not the
+    // runtime's word.
+    write_artifact_manifest(
+        request,
+        workspace,
+        &report,
+        git_rev_parse_head(workspace).as_deref(),
+    );
     fs::write(out_dir.join("report.json"), &body).map_err(|e| format!("report.json: {e}"))?;
     Ok(())
+}
+
+/// The workspace-root handoff manifest. The supervisor discovers a
+/// non-empty `artifact.json` at the workspace root as the default
+/// required artifact for writer roles, so the shim — never the
+/// runtime — writes it after the runtime exits: `claimed_head` then
+/// observes every commit the runtime made. Its fields are the same
+/// mechanical claims the report carries; the produced commit itself
+/// is the workspace's git state, which the supervisor's own handoff
+/// reads — the manifest is evidence, not authority. A read-only role
+/// declares no artifacts and must not touch the read-only workspace.
+/// A tracked `artifact.json` is repository content — possibly one the
+/// runtime itself committed — and is never rewritten: the collision
+/// is a stderr diagnostic and the supervisor's evidence records the
+/// file it finds, never `Present` for this invocation. Any other
+/// failed write is a stderr diagnostic too, not a shim failure: the
+/// supervisor's artifact evidence then records `missing` honestly,
+/// while `report.json` still carries the run's claims.
+fn write_artifact_manifest(
+    request: &WorkerRequestV2,
+    workspace: &Path,
+    report: &Value,
+    claimed_head: Option<&str>,
+) {
+    if request.workspace.read_only {
+        return;
+    }
+    let path = workspace.join("artifact.json");
+    if artifact_json_tracked(workspace) {
+        eprintln!("artifact.json: tracked in the workspace repository; manifest write skipped");
+        return;
+    }
+    let manifest = json!({
+        "format_version": "taisan.worker.artifact/1",
+        "worker": ADAPTER,
+        "request_id": request.request_id,
+        "invocation_id": request.invocation_id,
+        "status": report["status"],
+        "reason": report["reason"],
+        "claimed_head": claimed_head,
+        "claimed_checks": report["claimed_checks"],
+    });
+    if fs::symlink_metadata(&path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        eprintln!("artifact.json: replacing a symlink — its target is never written");
+    }
+    if let Err(e) = write_no_follow(&path, &canonical_json(&manifest)) {
+        eprintln!("artifact.json: {e}");
+    }
+}
+
+/// Whether the workspace repository tracks `artifact.json` — staged
+/// or committed. A tracked entry is repository content, never the
+/// stale manifest debris a previous round left behind. Outside a git
+/// repository nothing is tracked.
+fn artifact_json_tracked(workspace: &Path) -> bool {
+    Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", "artifact.json"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Pre-run removal of a stale `artifact.json`: an untracked file or a
+/// symlink at the manifest path is a previous round's leftover, and
+/// left in place the runtime's `git add -A` would commit it — the
+/// tracked modification the reuse gate then refuses forever. A
+/// tracked entry stays: removing repository content is not the shim's
+/// call, so the collision is diagnosed and the file is left for the
+/// supervisor's evidence to read as the stale artifact it is.
+fn clear_stale_manifest(workspace: &Path) {
+    let path = workspace.join("artifact.json");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return;
+    };
+    if meta.is_dir() {
+        // Removing a tree is beyond a manifest sweep — the write path
+        // diagnoses its own failure against the directory.
+        return;
+    }
+    if artifact_json_tracked(workspace) {
+        eprintln!("artifact.json: tracked in the workspace repository; leaving it in place");
+        return;
+    }
+    let symlink = meta.file_type().is_symlink();
+    match fs::remove_file(&path) {
+        Ok(()) if symlink => {
+            eprintln!("artifact.json: removed a symlink — its target is never written");
+        }
+        Ok(()) => {}
+        Err(e) => eprintln!("artifact.json: could not remove the stale entry: {e}"),
+    }
+}
+
+/// Replace `path` without ever following a link: unlink whatever sits
+/// there, then create exclusively — a symlink (or any entry) planted
+/// between the two calls fails the exclusive create instead of
+/// redirecting the write outside the workspace.
+fn write_no_follow(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(body))
 }
 
 /// Validate and bound the reader-role members the runtime claimed.

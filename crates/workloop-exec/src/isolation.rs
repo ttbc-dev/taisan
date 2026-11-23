@@ -102,6 +102,40 @@ fn build(profile: &IsolationProfile, scratch: &Path) -> Result<WorkerEnv, String
         "credential.helper".to_string(),
     ));
     vars.push(("GIT_CONFIG_VALUE_0".to_string(), String::new()));
+    // The profile's declared commit identity rides env, not git
+    // config: the sandbox has no `/etc/passwd` and the generated
+    // gitconfig carries none, so a runtime's local commits would
+    // fail `git commit` outright without it.
+    if let Some((name, email)) = profile.commit_identity {
+        for (key, value) in [
+            ("GIT_AUTHOR_NAME", name),
+            ("GIT_AUTHOR_EMAIL", email),
+            ("GIT_COMMITTER_NAME", name),
+            ("GIT_COMMITTER_EMAIL", email),
+        ] {
+            vars.push((key.to_string(), value.to_string()));
+        }
+    }
+    // TLS roots the runtimes need beyond the mounts themselves:
+    // point the standard variables at the profile's declared
+    // trust-store paths — a declared file feeds `SSL_CERT_FILE`, a
+    // declared directory `SSL_CERT_DIR`, and only paths that exist
+    // on the host ever reach the environment.
+    for path in profile.ca_trust_paths {
+        let path = Path::new(path);
+        if path.is_file() && !vars.iter().any(|(k, _)| k == "SSL_CERT_FILE") {
+            vars.push((
+                "SSL_CERT_FILE".to_string(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        if path.is_dir() && !vars.iter().any(|(k, _)| k == "SSL_CERT_DIR") {
+            vars.push((
+                "SSL_CERT_DIR".to_string(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+    }
     Ok(WorkerEnv { vars })
 }
 
@@ -242,6 +276,83 @@ mod tests {
         prepare(&default_isolation_profile(), &scratch).unwrap();
         assert!(!scratch.join("home").join("stale").exists());
         let _ = std::fs::remove_dir_all(scratch.parent().unwrap());
+    }
+
+    #[test]
+    fn prepare_injects_the_declared_commit_identity() {
+        // The reference profile declares one; the contained runtime's
+        // `git commit` must not depend on `/etc/passwd` or writable
+        // git config.
+        let scratch = tmp("identity").join("env");
+        let env = prepare(&default_isolation_profile(), &scratch).unwrap();
+        let map: std::collections::BTreeMap<_, _> = env.vars.iter().cloned().collect();
+
+        assert_eq!(map["GIT_AUTHOR_NAME"], "taisan-worker");
+        assert_eq!(map["GIT_AUTHOR_EMAIL"], "taisan-worker@localhost");
+        assert_eq!(map["GIT_COMMITTER_NAME"], "taisan-worker");
+        assert_eq!(map["GIT_COMMITTER_EMAIL"], "taisan-worker@localhost");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn prepare_points_tls_variables_only_at_declared_existing_paths() {
+        let root = tmp("ca-trust");
+        let file = root.join("bundle.pem");
+        let dir = root.join("certs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "ca").unwrap();
+        let absent = root.join("missing.pem");
+        let file_str = file.to_string_lossy().into_owned();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let absent_str = absent.to_string_lossy().into_owned();
+        // The profile type declares `'static` paths — test-local
+        // strings are leaked to satisfy it.
+        let declared: Vec<&'static str> = [&absent_str, &file_str, &dir_str]
+            .iter()
+            .map(|s| &**s)
+            .map(|s| Box::leak(s.to_string().into_boxed_str()) as &'static str)
+            .collect();
+        let profile = IsolationProfile {
+            id: "test-ca-profile",
+            env_passthrough: &[],
+            sandbox_primitive: None,
+            // A declared-but-absent path is skipped, never relocated;
+            // the file feeds SSL_CERT_FILE, the directory SSL_CERT_DIR.
+            ca_trust_paths: Box::leak(declared.into_boxed_slice()),
+            commit_identity: None,
+        };
+
+        let scratch = root.join("env");
+        let env = prepare(&profile, &scratch).unwrap();
+        let map: std::collections::BTreeMap<_, _> = env.vars.iter().cloned().collect();
+        assert_eq!(map["SSL_CERT_FILE"], file_str);
+        assert_eq!(map["SSL_CERT_DIR"], dir_str);
+        assert!(
+            !env.vars.iter().any(|(_, v)| v == &absent_str),
+            "an absent declared path never reaches the environment"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_leaves_tls_variables_absent_without_declared_paths() {
+        // The fixture profile declares no trust store: the environment
+        // must not invent one from ambient host state.
+        let scratch = tmp("no-ca").join("env");
+        let profile = IsolationProfile {
+            id: "test-no-ca",
+            env_passthrough: &[],
+            sandbox_primitive: None,
+            ca_trust_paths: &[],
+            commit_identity: None,
+        };
+        let env = prepare(&profile, &scratch).unwrap();
+        assert!(
+            !env.vars
+                .iter()
+                .any(|(k, _)| k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR")
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

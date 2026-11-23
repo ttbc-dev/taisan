@@ -334,7 +334,16 @@ pub enum RunHost {
 }
 
 impl RunHost {
-    pub fn from_config(config: &WorkloopConfig) -> Result<Self, String> {
+    /// The configured host adapter; `object_source` is the local
+    /// repository the GitHub transport pushes produced objects from —
+    /// the installation-owned handoff repository. `None` leaves
+    /// `write_ref` on the refs API (test composition and object-less
+    /// hosts), where a head the host has never seen fails the write
+    /// honestly.
+    pub fn from_config_with_transport(
+        config: &WorkloopConfig,
+        object_source: Option<PathBuf>,
+    ) -> Result<Self, String> {
         match config.host.adapter.as_str() {
             "fixture" => Ok(Self::Fixture(Box::new(FixtureGithub::new()))),
             "github" => {
@@ -345,7 +354,10 @@ impl RunHost {
                 {
                     return Err("driver.host_unsupported".into());
                 }
-                let api = GhCliApi::new().with_hostname("github.com");
+                let mut api = GhCliApi::new().with_hostname("github.com");
+                if let Some(source) = object_source {
+                    api = api.with_git_transport(source);
+                }
                 Ok(Self::Github(Box::new(
                     GitHubAdapter::for_host(
                         workloop_core::identity::HostInstanceId::trusted("github.com"),
@@ -3044,7 +3056,10 @@ mod tests {
     fn the_run_driver_selects_the_configured_adapter_visibly() {
         let mut cfg = config();
         assert!(
-            matches!(RunHost::from_config(&cfg), Ok(RunHost::Fixture(_))),
+            matches!(
+                RunHost::from_config_with_transport(&cfg, None),
+                Ok(RunHost::Fixture(_))
+            ),
             "fixture config must not pick production"
         );
         cfg.host.adapter = AdapterId::trusted("github");
@@ -3054,14 +3069,19 @@ mod tests {
             RepositoryId::trusted("owner/repo"),
         );
         assert!(
-            matches!(RunHost::from_config(&cfg), Ok(RunHost::Github(_))),
+            matches!(
+                RunHost::from_config_with_transport(&cfg, None),
+                Ok(RunHost::Github(_))
+            ),
             "github config must not pick the fixture"
         );
         cfg.host.repository = RepositoryRef::new(
             HostInstanceId::trusted("host-local"),
             RepositoryId::trusted("local-repo"),
         );
-        let err = RunHost::from_config(&cfg).err().unwrap();
+        let err = RunHost::from_config_with_transport(&cfg, None)
+            .err()
+            .unwrap();
         assert!(
             err.contains("driver.host_unsupported"),
             "a non-github.com host refuses before any run: {err}"
@@ -3070,7 +3090,9 @@ mod tests {
             HostInstanceId::trusted("ghe.corp.example"),
             RepositoryId::trusted("owner/repo"),
         );
-        let err = RunHost::from_config(&cfg).err().unwrap();
+        let err = RunHost::from_config_with_transport(&cfg, None)
+            .err()
+            .unwrap();
         assert!(
             err.contains("driver.host_unsupported"),
             "an enterprise host refuses before any run: {err}"
@@ -3080,7 +3102,9 @@ mod tests {
                 HostInstanceId::trusted(alias),
                 RepositoryId::trusted("owner/repo"),
             );
-            let err = RunHost::from_config(&cfg).err().unwrap();
+            let err = RunHost::from_config_with_transport(&cfg, None)
+                .err()
+                .unwrap();
             assert!(
                 err.contains("driver.host_unsupported"),
                 "raw host {alias} must refuse rather than be remapped: {err}"
@@ -3092,11 +3116,16 @@ mod tests {
         );
         cfg.allowed_effects.host_write = true;
         assert!(
-            matches!(RunHost::from_config(&cfg), Ok(RunHost::Github(_))),
+            matches!(
+                RunHost::from_config_with_transport(&cfg, None),
+                Ok(RunHost::Github(_))
+            ),
             "github + host_write composes the production driver: {cfg:?}"
         );
         cfg.host.adapter = AdapterId::trusted("s1_bridge");
-        let err = RunHost::from_config(&cfg).err().unwrap();
+        let err = RunHost::from_config_with_transport(&cfg, None)
+            .err()
+            .unwrap();
         assert!(
             err.contains("unsupported host adapter"),
             "an unknown adapter is a visible config error: {err}"

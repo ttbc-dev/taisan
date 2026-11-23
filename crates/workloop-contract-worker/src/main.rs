@@ -458,24 +458,7 @@ fn run_request(args: &Args, ws: &Path) {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     match args.mode.as_str() {
-        "clean-exit" => {
-            if !read_only {
-                let file = declared_file(args.file.clone()).unwrap_or_else(|_| {
-                    eprintln!("--file must stay inside the workspace");
-                    std::process::exit(2);
-                });
-                let body = artifact_body(&request_bytes, &file);
-                let Some(path) = resolve_inside(ws, &file) else {
-                    eprintln!("--file escapes the workspace");
-                    std::process::exit(2);
-                };
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).expect("artifact parent");
-                }
-                std::fs::write(&path, body).expect("write artifact");
-            }
-        }
-        "exit-no-artifact" | "hang" => {}
+        "clean-exit" | "exit-no-artifact" | "hang" => {}
         other => {
             eprintln!("unknown run behavior {other}\n{USAGE}");
             std::process::exit(2);
@@ -483,6 +466,30 @@ fn run_request(args: &Args, ws: &Path) {
     }
     if args.git_commit && !read_only {
         git_commit_produced(ws);
+    }
+    if args.mode == "clean-exit" && !read_only {
+        // The manifest is the Worker's own handoff file: it binds this
+        // exact request and invocation, and it lands after the
+        // produced commit so a `git add -A` can never capture it into
+        // the produced revision.
+        let file = declared_file(args.file.clone()).unwrap_or_else(|_| {
+            eprintln!("--file must stay inside the workspace");
+            std::process::exit(2);
+        });
+        let Some(path) = resolve_inside(ws, &file) else {
+            eprintln!("--file escapes the workspace");
+            std::process::exit(2);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("artifact parent");
+        }
+        let manifest = serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "workloop-contract-worker",
+            "request_id": request.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
+            "invocation_id": request.get("invocation_id").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        std::fs::write(&path, manifest.to_string()).expect("write artifact");
     }
     let log_path = out.join("runtime.log");
     std::fs::write(&log_path, format!("contract worker run {request_path}\n"))

@@ -11,11 +11,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use workloop_core::identity::{
-    ChangeRequestId, HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef,
+    ChangeRequestId, CredentialRef, HostInstanceId, IssueId, IssueRef, RepositoryId, RepositoryRef,
 };
 use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::adapter::GitHubAdapter;
 use workloop_github::api::{ApiError, GitHubApi};
+use workloop_github::credential::{OsProviders, resolve_credential};
 use workloop_github::gh_cli::GhCliApi;
 
 fn repository() -> RepositoryRef {
@@ -62,6 +63,32 @@ fn calls(dir: &Path) -> String {
 
 fn stdin_json(dir: &Path) -> String {
     fs::read_to_string(dir.join("stdin.json")).unwrap_or_default()
+}
+
+/// Write an executable stub `git` into `dir`: argv lines go to
+/// `git-calls.log` and the child's environment to `git-env.log`, so
+/// tests assert both the push shape and the credential hygiene.
+fn stub_git(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("git");
+    let dir_display = dir.display();
+    let script = format!(
+        "#!/bin/sh\nlog=\"{dir_display}/git-calls.log\"\nenv_file=\"{dir_display}/git-env.log\"\necho \"$@\" >> \"$log\"\nenv > \"$env_file\"\n{body}"
+    );
+    let tmp = dir.join("git.tmp");
+    fs::write(&tmp, script).unwrap();
+    let mut perms = fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&tmp, perms).unwrap();
+    fs::rename(&tmp, &path).unwrap();
+    path
+}
+
+fn git_calls(dir: &Path) -> String {
+    fs::read_to_string(dir.join("git-calls.log")).unwrap_or_default()
+}
+
+fn git_env(dir: &Path) -> String {
+    fs::read_to_string(dir.join("git-env.log")).unwrap_or_default()
 }
 
 #[test]
@@ -876,5 +903,341 @@ esac
         calls(&dir).lines().count(),
         1,
         "the expired call never reached the stub"
+    );
+}
+
+// ----------------------------------------------------------------------
+// git object transport (push_ref through real `git push`)
+// ----------------------------------------------------------------------
+
+/// A `gh` stub answering the ref read and `gh auth token` — the
+/// ambient-slot credential the git transport resolves through.
+fn stub_gh_for_push(dir: &Path) -> PathBuf {
+    stub_gh(
+        dir,
+        "gh",
+        r#"
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then echo 'ghp_ambient-token-1'; exit 0; fi
+case "$2" in
+  repos/owner/repo/git/ref/heads/b) echo '{"object":{"sha":"expected111"}}' ;;
+  repos/owner/repo/git/ref/heads/new-branch) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+esac
+"#,
+    )
+}
+
+#[test]
+fn write_ref_pushes_objects_through_git_transport() {
+    let dir = tempdir("git-push");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(&dir, "exit 0\n");
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let head = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap();
+    assert_eq!(head, "new000");
+    let argv = git_calls(&dir);
+    assert!(
+        argv.contains(&format!("-C {}", store.display())),
+        "the push runs from the object source: {argv}"
+    );
+    assert!(
+        argv.contains("merge-base --is-ancestor expected111 new000"),
+        "a guarded write proves the produced head descends from the prior: {argv}"
+    );
+    assert!(
+        argv.contains("--force-with-lease=refs/heads/b:expected111"),
+        "the lease carries the guarded prior head: {argv}"
+    );
+    assert!(
+        argv.contains("https://github.com/owner/repo.git new000:refs/heads/b"),
+        "the refspec uploads produced objects and moves the remote ref: {argv}"
+    );
+    let env = git_env(&dir);
+    assert!(
+        env.contains("GIT_CONFIG_VALUE_1=Authorization: Bearer ghp_ambient-token-1"),
+        "the ambient gh token authenticates the push via env config: {env}"
+    );
+    for key in ["GH_TOKEN", "GITHUB_TOKEN", "HOME", "GIT_SSH_COMMAND"] {
+        assert!(
+            !env.contains(&format!("{key}=")),
+            "the scrubbed env must not carry {key}: {env}"
+        );
+    }
+    assert!(
+        env.contains("GIT_CONFIG_VALUE_0="),
+        "the credential helper list is emptied: {env}"
+    );
+    assert!(
+        !calls(&dir).contains("PATCH") && !calls(&dir).contains("git/refs --method POST"),
+        "no refs-API write may be issued once git transport is active: {}",
+        calls(&dir)
+    );
+}
+
+#[test]
+fn write_ref_creates_via_git_transport_with_an_empty_lease() {
+    let dir = tempdir("git-push-create");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(&dir, "exit 0\n");
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let head = api
+        .write_ref(&repository(), "new-branch", "seed000", None)
+        .unwrap();
+    assert_eq!(head, "seed000");
+    let argv = git_calls(&dir);
+    assert!(
+        argv.contains("--force-with-lease=refs/heads/new-branch:"),
+        "an absent expectation is an empty lease — the ref must not exist: {argv}"
+    );
+    assert!(argv.contains("seed000:refs/heads/new-branch"), "{argv}");
+    assert!(
+        !argv.contains("merge-base"),
+        "a new ref has no prior — no ancestry check is possible or needed: {argv}"
+    );
+}
+
+#[test]
+fn git_transport_refuses_a_non_descendant_head() {
+    // `--force-with-lease` guards only the ref's position: without
+    // the local ancestry check the push would happily rewrite the
+    // branch to a non-descendant history, where the refs-API
+    // `force: false` refused it server-side.
+    let dir = tempdir("git-push-nonff");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then exit 1; fi\nexit 0\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Refused {
+            reason: "non_fast_forward".into()
+        },
+        "a non-descendant produced head is a definite refusal"
+    );
+    assert!(
+        !git_calls(&dir).lines().any(|l| l.contains(" push ")),
+        "the push is never issued: {}",
+        git_calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_refuses_when_ancestry_cannot_be_determined() {
+    // A `merge-base` that cannot answer (missing object, corrupt
+    // store) is not a verdict — the write refuses rather than
+    // pushing blind. Definite refusal, not Unknown: nothing reached
+    // the remote.
+    let dir = tempdir("git-push-nobase");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then echo 'fatal: Not a valid object name expected111' >&2; exit 128; fi\nexit 0\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "an undeterminable ancestry refuses, never pushes blind: {err:?}"
+    );
+    assert!(
+        !git_calls(&dir).lines().any(|l| l.contains(" push ")),
+        "the push is never issued: {}",
+        git_calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_bound_credential_reaches_env_not_argv() {
+    let dir = tempdir("git-push-cred");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(&dir, "exit 0\n");
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let secret_file = dir.join("push-token");
+    fs::write(&secret_file, "bound-secret-value-9").unwrap();
+    // The file: provider demands owner-only permissions.
+    let mut perms = fs::metadata(&secret_file).unwrap().permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&secret_file, perms).unwrap();
+    let credential = resolve_credential(
+        Some(&CredentialRef::trusted(
+            format!("file:{}", secret_file.display()).as_str(),
+        )),
+        &OsProviders,
+    )
+    .unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    api.set_credential(Some(credential));
+    api.write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap();
+    let argv = git_calls(&dir);
+    assert!(
+        !argv.contains("bound-secret-value-9"),
+        "the credential never enters argv: {argv}"
+    );
+    let env = git_env(&dir);
+    assert!(
+        env.contains("Authorization: Bearer bound-secret-value-9"),
+        "the bound credential authenticates the push: {env}"
+    );
+    assert!(
+        !calls(&dir).contains("auth token"),
+        "a bound credential never falls back to the ambient slot: {}",
+        calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_lease_failure_reports_stale_head() {
+    let dir = tempdir("git-push-stale");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho '! refs/heads/b:refs/heads/b [rejected] (stale info)'\nexit 1\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Refused {
+            reason: "stale_head".into()
+        },
+        "a lease rejection maps to the adapter's stale_head reason"
+    );
+}
+
+#[test]
+fn git_transport_rejection_is_a_definite_refusal() {
+    let dir = tempdir("git-push-rejected");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho '! refs/heads/b:refs/heads/b [rejected] (non-fast-forward)'\nexit 1\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "a server-side rejection is a definite no-effect refusal: {err:?}"
+    );
+    assert_ne!(
+        err,
+        ApiError::Refused {
+            reason: "stale_head".into()
+        },
+        "a non-guard rejection must not masquerade as stale_head"
+    );
+}
+
+#[test]
+fn git_transport_lost_connection_is_unknown() {
+    let dir = tempdir("git-push-lost");
+    let gh = stub_gh_for_push(&dir);
+    let git = stub_git(
+        &dir,
+        "if [ \"$3\" = \"merge-base\" ]; then exit 0; fi\necho 'fatal: unable to access https://github.com/owner/repo.git/: Could not resolve host' >&2\nexit 128\n",
+    );
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Unknown { .. }),
+        "a lost transport response is unknown, never a failed claim: {err:?}"
+    );
+}
+
+#[test]
+fn git_transport_refuses_when_no_credential_resolves() {
+    let dir = tempdir("git-push-nocred");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+  echo 'gh: not logged in' >&2; exit 1
+fi
+case "$2" in
+  repos/owner/repo/git/ref/heads/b) echo '{"object":{"sha":"expected111"}}' ;;
+esac
+"#,
+    );
+    let git = stub_git(&dir, "exit 0\n");
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(git)
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "no credential is a definite refusal, never an anonymous push: {err:?}"
+    );
+    assert!(
+        git_calls(&dir).is_empty(),
+        "git is never spawned without a credential: {}",
+        git_calls(&dir)
+    );
+}
+
+#[test]
+fn git_transport_spawn_failure_is_a_definite_refusal() {
+    let dir = tempdir("git-push-nospawn");
+    let gh = stub_gh_for_push(&dir);
+    let store = dir.join("handoff-repo.git");
+    fs::create_dir_all(&store).unwrap();
+    let mut api = GhCliApi::with_gh(gh)
+        .with_git(dir.join("no-such-git"))
+        .with_git_transport(&store);
+    let err = api
+        .write_ref(&repository(), "b", "new000", Some("expected111"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Refused { .. }),
+        "a spawn failure never reached the host: {err:?}"
     );
 }

@@ -58,11 +58,45 @@ pub struct IsolationProfile {
     /// its recorded preflight evidence is absent — never a hygiene-only
     /// substitute.
     pub sandbox_primitive: Option<&'static str>,
+    /// Declared host CA trust-store locations bound read-only at their
+    /// own path inside the sandbox, when they exist on the host —
+    /// bundle files *and* hashed directories the runtimes' TLS stacks
+    /// look up by compiled-in default. A declared path absent on the
+    /// host is skipped, never mounted from elsewhere: the sandbox sees
+    /// the trust store only at the path runtimes already expect.
+    pub ca_trust_paths: &'static [&'static str],
+    /// The declared commit identity `(name, email)` a launch's
+    /// environment carries as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` — the
+    /// sandbox has no `/etc/passwd` and git config is sealed, so the
+    /// runtime's local commits need an identity that arrives through
+    /// declared configuration, not ambient git config. `None` leaves
+    /// the role without a default identity.
+    pub commit_identity: Option<(&'static str, &'static str)>,
 }
 
 /// The names every approved profile lets through: enough for process
 /// and locale setup, none of them credential-bearing.
 const ENV_PASSTHROUGH: &[&str] = &["PATH", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
+
+/// The conventional CA trust-store locations across the
+/// distributions the reference profile supports: Debian/Ubuntu,
+/// Alpine/OpenBSD, RHEL/Fedora (both layouts), openSUSE. Each is
+/// bound at its own path read-only when it exists on the host —
+/// absent entries are skipped, never relocated.
+const REFERENCE_CA_TRUST_PATHS: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/certs",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/tls/certs",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+];
+
+/// The reference profile's declared commit identity: the shim's own
+/// commits inside the sandbox name the role that made them.
+const REFERENCE_COMMIT_IDENTITY: (&str, &str) = ("taisan-worker", "taisan-worker@localhost");
 
 /// The closed registry of approved profiles. `isolation_profile` is the
 /// single resolution point shared by config validation and the
@@ -72,11 +106,15 @@ const APPROVED_PROFILES: &[IsolationProfile] = &[
         id: DEFAULT_ISOLATION_PROFILE_ID,
         env_passthrough: ENV_PASSTHROUGH,
         sandbox_primitive: Some("bwrap"),
+        ca_trust_paths: REFERENCE_CA_TRUST_PATHS,
+        commit_identity: Some(REFERENCE_COMMIT_IDENTITY),
     },
     IsolationProfile {
         id: FIXTURE_ISOLATION_PROFILE_ID,
         env_passthrough: ENV_PASSTHROUGH,
         sandbox_primitive: None,
+        ca_trust_paths: &[],
+        commit_identity: None,
     },
 ];
 

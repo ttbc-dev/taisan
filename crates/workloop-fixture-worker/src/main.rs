@@ -351,7 +351,7 @@ fn run_request(args: &Args, ws: &Path) {
     let out = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&out).expect("create out dir");
     // The base mode's workspace behavior applies first: `clean-exit`
-    // produces the artifact, `exit-no-artifact` does not, `hang`
+    // produces the manifest, `exit-no-artifact` does not, `hang`
     // leaves the tree untouched and keeps the process alive — its
     // report is still written below before the loop, exactly as the
     // stop-path tests require. A read-only grant (review, invariant
@@ -367,15 +367,7 @@ fn run_request(args: &Args, ws: &Path) {
         args.mode.as_str()
     };
     match behavior {
-        "clean-exit" => {
-            if !read_only {
-                write_artifact(
-                    &ws.join(&args.file),
-                    "{\"status\":\"done\",\"worker\":\"fixture\"}\n",
-                );
-            }
-        }
-        "exit-no-artifact" | "hang" => {}
+        "clean-exit" | "exit-no-artifact" | "hang" => {}
         other => {
             eprintln!("unknown run behavior {other}\n{USAGE}");
             std::process::exit(2);
@@ -383,6 +375,22 @@ fn run_request(args: &Args, ws: &Path) {
     }
     if args.git_commit && !read_only {
         git_commit_produced(ws);
+    }
+    if behavior == "clean-exit" && !read_only {
+        // The manifest is the worker shim's own handoff file: it binds
+        // this exact request and invocation, and it lands after the
+        // produced commit so a `git add -A` can never capture it into
+        // the produced revision.
+        write_artifact(
+            &ws.join(&args.file),
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "worker": "workloop-fixture-worker",
+                "request_id": request.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
+                "invocation_id": request.get("invocation_id").cloned().unwrap_or(serde_json::Value::Null),
+            })
+            .to_string(),
+        );
     }
     let log_path = out.join("runtime.log");
     let mut log_content = format!("fixture worker run {request_path}\n");

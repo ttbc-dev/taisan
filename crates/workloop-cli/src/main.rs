@@ -778,7 +778,14 @@ fn run(cli: Cli) -> i32 {
                     ));
                 }
             };
-            let mut github = match run_loop::RunHost::from_config(&config) {
+            let mut github = match run_loop::RunHost::from_config_with_transport(
+                &config,
+                // The handoff repository is the object source the
+                // GitHub transport pushes produced objects from —
+                // without it `push_ref` can move a ref only to an
+                // object the host already has.
+                Some(handoff_repository(&state_root, &installation)),
+            ) {
                 Ok(host) => host,
                 Err(e) => {
                     return emit(envelope::error_envelope(
@@ -1982,6 +1989,17 @@ fn run_check(cli: &Cli, probe: bool) -> i32 {
     }
 }
 
+/// The installation-owned bare repository durable handoffs land in:
+/// bundles export to it, verification worktrees check out from it,
+/// and the GitHub adapter's git transport pushes produced objects
+/// from it. It lives under the workspace root's `.handoff` directory
+/// — never inside a `ws-*` workspace.
+fn handoff_repository(state_root: &std::path::Path, installation: &Installation) -> PathBuf {
+    installation_path(state_root, &installation.workspace_root)
+        .join(".handoff")
+        .join("repo.git")
+}
+
 /// `Ok(None)` only when no worker is configured. Handoff
 /// initialization failure is an error, not an absent worker — a `run`
 /// that keeps going without a supervisor admits work no worker ever
@@ -2000,12 +2018,11 @@ fn build_supervisor(
         return Ok(None);
     }
     let workspace_root = installation_path(state_root, &installation.workspace_root);
-    // The durable artifact handoff needs an installation-owned bare
-    // repository: bundles export to it, verification worktrees check
-    // out from it. It lives under the workspace root's `.handoff`
-    // directory — never inside a `ws-*` workspace.
-    let handoff_root = workspace_root.join(".handoff");
-    let repository = handoff_root.join("repo.git");
+    let repository = handoff_repository(state_root, installation);
+    let handoff_root = repository
+        .parent()
+        .expect("repo.git has a parent")
+        .to_path_buf();
     if !repository.exists() {
         std::fs::create_dir_all(&handoff_root)
             .map_err(|e| format!("handoff dir {}: {e}", handoff_root.display()))?;

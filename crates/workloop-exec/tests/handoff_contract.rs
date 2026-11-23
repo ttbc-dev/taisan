@@ -1499,6 +1499,8 @@ fn contained_profile(primitive: &Path) -> workloop_core::worker::IsolationProfil
         sandbox_primitive: Some(Box::leak(
             primitive.to_string_lossy().into_owned().into_boxed_str(),
         )),
+        ca_trust_paths: &[],
+        commit_identity: None,
     }
 }
 
