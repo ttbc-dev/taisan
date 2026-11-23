@@ -200,8 +200,9 @@ impl RuntimeBoundary {
         let credential_file = match &self.config.credential_ref {
             None => {
                 // A resolution carrying no credential still owns the
-                // staged path: a file an earlier grant left behind is
-                // stale secret material and is unlinked here.
+                // staged paths: a file or staging sibling an earlier
+                // grant left behind is stale secret material and is
+                // unlinked here.
                 self.unstage_credential()?;
                 None
             }
@@ -270,39 +271,39 @@ impl RuntimeBoundary {
         })?;
         let path = self.config.runtime_dir.join("runtime-auth");
         let tmp = self.config.runtime_dir.join("runtime-auth.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(|e| format!("credential.stage_failed: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|e| format!("credential.stage_failed: {e}"))?;
-            }
-            file.write_all(credential.bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|e| format!("credential.stage_failed: {e}"))?;
+        // The staging sibling carries the same secret bytes the moment
+        // it is created: a failure past that point must not leave the
+        // copy at its predictable path.
+        let staged = write_staged_credential(&tmp, &path, credential);
+        if staged.is_err() {
+            let _ = self.unstage_credential();
         }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("credential.stage_failed: {e}"))?;
-        Ok(path)
+        staged.map(|()| path)
     }
 
-    /// Remove the staged credential file. An already-absent file is
-    /// not an error — cleanup runs on refusals, re-resolves, and
-    /// drops and must be idempotent. A real removal failure refuses
-    /// the resolve that asks for it; the error-cleanup and Drop paths
-    /// ignore it because they cannot report it.
+    /// Remove the staged credential file and its staging sibling —
+    /// `runtime-auth.tmp` holds the same secret material from the
+    /// moment a stage creates it, so an orphaned tmp is stale secret
+    /// too. Both paths are tried even when the first removal fails.
+    /// An already-absent file is not an error — cleanup runs on
+    /// refusals, re-resolves, and drops and must be idempotent. A
+    /// real removal failure refuses the resolve that asks for it; the
+    /// error-cleanup and Drop paths ignore it because they cannot
+    /// report it.
     fn unstage_credential(&self) -> Result<(), String> {
-        match std::fs::remove_file(self.config.runtime_dir.join("runtime-auth")) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("credential.unstage_failed: {e}")),
+        let mut failed = None;
+        for name in ["runtime-auth", "runtime-auth.tmp"] {
+            match std::fs::remove_file(self.config.runtime_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if failed.is_none() {
+                        failed = Some(format!("credential.unstage_failed: {e}"));
+                    }
+                }
+            }
         }
+        failed.map_or(Ok(()), Err)
     }
 
     /// The provider config must exist, be a file or directory the
@@ -350,6 +351,35 @@ impl Drop for RuntimeBoundary {
             }
         }
     }
+}
+
+/// Write the credential to `tmp` owner-only, fsync it, and rename it
+/// over `path`. On `Err` the caller owns removing `tmp` — it may
+/// already hold a partial secret copy.
+fn write_staged_credential(
+    tmp: &Path,
+    path: &Path,
+    credential: &ResolvedCredential,
+) -> Result<(), String> {
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp)
+            .map_err(|e| format!("credential.stage_failed: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("credential.stage_failed: {e}"))?;
+        }
+        file.write_all(credential.bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("credential.stage_failed: {e}"))?;
+    }
+    std::fs::rename(tmp, path).map_err(|e| format!("credential.stage_failed: {e}"))
 }
 
 /// The provider-config content identity `ensure` compares against
@@ -695,9 +725,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resolve carrying no `credential_ref` owns the staged path:
-    /// a file an earlier grant left behind — e.g. a supervisor that
-    /// died before Drop — is stale secret material and is unlinked.
+    /// A resolve carrying no `credential_ref` owns the staged paths:
+    /// a file — or a staging sibling a killed stage left behind — is
+    /// stale secret material and is unlinked.
     #[test]
     fn a_no_credential_resolve_unlinks_an_earlier_grants_file() {
         let dir = tmp("unstage");
@@ -710,12 +740,39 @@ mod tests {
         let staged = dir.join("runtime/runtime-auth");
         assert!(staged.exists(), "the first grant staged the file");
         // Forget the boundary so its file survives like a crashed
-        // supervisor's — Drop would remove it.
+        // supervisor's — Drop would remove it. A tmp orphaned
+        // mid-stage is the same stale secret material.
         std::mem::forget(boundary);
+        let orphan = dir.join("runtime/runtime-auth.tmp");
+        std::fs::write(&orphan, "partial-secret").unwrap();
         let boundary2 = RuntimeBoundary::new(config(&dir));
         boundary2.ensure().unwrap();
         assert!(!staged.exists(), "the stale staged file is unlinked");
+        assert!(!orphan.exists(), "the orphaned staging file is unlinked");
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN5") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stage that fails after the tmp file carries secret bytes —
+    /// here the rename refuses because `runtime-auth` is a directory —
+    /// must remove the partial copy rather than leave it at the
+    /// predictable staging path.
+    #[test]
+    fn a_failed_stage_removes_the_tmp_credential() {
+        let dir = tmp("stagefail");
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
+        std::fs::create_dir_all(dir.join("runtime/runtime-auth")).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
+        let boundary = RuntimeBoundary::new(cfg);
+        let err = boundary.ensure().unwrap_err();
+        assert!(err.contains("credential.stage_failed"), "{err}");
+        assert!(
+            !dir.join("runtime/runtime-auth.tmp").exists(),
+            "a failed stage must not leave the tmp credential copy"
+        );
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
