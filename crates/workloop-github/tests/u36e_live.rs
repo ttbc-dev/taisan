@@ -15,7 +15,7 @@
 //! without `TAISAN_U36E_AUTH` refuses before any host call: no
 //! authorization reference, no live claim.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use workloop_core::command::*;
@@ -895,6 +895,137 @@ fn live_denied_permission_refused() {
         vec![ReadBackReceipt {
             target: format!("branch:{}/{}", env.slug, branch),
             observed: format!("head {head:?} after {status:?}"),
+        }],
+        result,
+    );
+}
+
+/// Mint one root commit in a fresh local object store — the
+/// produced-object shape the git transport pushes from (#411's
+/// installation-owned handoff repository). Returns the store path
+/// and the commit SHA.
+fn mint_object_source(dir: &Path) -> (PathBuf, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let store = dir.join("handoff.git");
+    let out = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&store)
+        .output()
+        .expect("git init spawn");
+    assert!(
+        out.status.success(),
+        "git init --bare: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let git = |args: &[&str], stdin: &str| -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&store)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "u36e-live")
+            .env("GIT_AUTHOR_EMAIL", "u36e@localhost")
+            .env("GIT_COMMITTER_NAME", "u36e-live")
+            .env("GIT_COMMITTER_EMAIL", "u36e@localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git spawn");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let blob = git(
+        &["hash-object", "-w", "--stdin"],
+        "u36e git transport probe\n",
+    );
+    let tree = git(&["mktree"], &format!("100644 blob {blob}\tprobe.txt\n"));
+    let commit = git(
+        &["commit-tree", &tree, "-m", "u36e git transport probe"],
+        "",
+    );
+    (store, commit)
+}
+
+/// Scenario: the git object transport pushes a produced commit to the
+/// isolated remote — the publish leg's real shape (#411) and the auth
+/// path contract tests cannot see. Issue #420: github.com's smart-HTTP
+/// endpoint requires HTTP Basic `x-access-token:` for token
+/// credentials and refuses `Bearer` (`www-authenticate: Basic` → 401
+/// on every `gho_` push in the post-#413 re-verification). A local
+/// object store holds a commit the remote lacks; the PushRef intent
+/// uploads it and moves the ref in one server-side update.
+#[test]
+#[ignore = "U3.6e live case — requires TAISAN_U36E_* env and owner authorization"]
+fn live_git_transport_push_ref() {
+    let Some(env) = live_env() else {
+        eprintln!("skip: TAISAN_U36E_REPO/INSTALL/AUTH not set");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("u36e-gitpush-{}", run_nonce()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (object_store, produced) = mint_object_source(&dir);
+    let api = match &env.gh {
+        Some(path) => GhCliApi::with_gh(path.clone()),
+        None => GhCliApi::new(),
+    }
+    .with_git_transport(&object_store);
+    let mut adapter = GitHubAdapter::for_host(env.install.clone(), api);
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = live_config(&env);
+    let (work_id, _eid) = submit(&store, &env, "u36e-gitpush");
+    let branch = format!("u36e/gitpush-{}", run_nonce());
+    let push_id = insert_intent(
+        &store,
+        &env,
+        &work_id,
+        HostAction::PushRef {
+            branch: branch.clone(),
+            produced: rev(&env, &produced),
+            expected_prior: None,
+        },
+    );
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    let (status, _) = intent_state(&store, &push_id);
+    assert_eq!(
+        status,
+        HostActionStatus::Applied,
+        "the git-transport push applies under the ambient credential"
+    );
+    // Read-back: the remote branch sits at the locally minted commit —
+    // the push uploaded objects the host had never seen.
+    let head = adapter
+        .client_mut()
+        .read_branch(&live_repo(&env), &branch)
+        .unwrap();
+    let result = if head.as_deref() == Some(produced.as_str()) {
+        ScenarioResult::Pass
+    } else {
+        ScenarioResult::Fail
+    };
+    // Remote cleanup runs before the record is retained: a panic in
+    // `retain` must never strand the scratch branch.
+    delete_branch(&env, &branch);
+    retain(
+        &env,
+        "git_transport_push",
+        &store,
+        &work_id,
+        &[push_id],
+        vec![ReadBackReceipt {
+            target: format!("branch:{}/{}", env.slug, branch),
+            observed: format!("head {head:?}"),
         }],
         result,
     );
