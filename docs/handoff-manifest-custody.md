@@ -10,6 +10,8 @@ The manifest is transfer metadata. It identifies the produced commit and describ
 
 The out directory belongs to exactly one coordinator-issued `request_id` and `invocation_id`. The supervisor creates it before dispatch and never reuses it. The remote endpoint retains the report, manifest, and collected output until the coordinator acknowledges durable collection.
 
+The existing out-directory contract enumerates `report.json`, `runtime.log`, and `checkpoint.json` and treats anything else there as non-evidence; the retention policy reclaims those files as the out-directory unit. This decision adds `handoff.json` as a named out-directory member for remote Invocations — transfer metadata, still not evidence — and the out-directory whitelist and retention enumeration updates are part of the #374 contract work, not this document's claim about local behavior.
+
 ## Two manifests with separate roles
 
 The remote handoff manifest and the canonical Git object manifest are different records.
@@ -17,7 +19,7 @@ The remote handoff manifest and the canonical Git object manifest are different 
 | Record | Producer | Contents | Authority |
 | --- | --- | --- | --- |
 | Remote handoff manifest | Worker adapter | Invocation identity, produced commit identity, and bounded descriptors for declared workspace artifacts | Untrusted input to collection; it cannot acknowledge an artifact |
-| Canonical Git object manifest | Coordinator supervisor | Repository, base, produced commit, tree, and the sorted object IDs in the transferred closure | Digest-bound input to the durable artifact handoff record |
+| Canonical Git object manifest | Coordinator supervisor | `{format_version, repository, base, produced commit, tree, sorted object IDs of base..produced}` — derived from the imported objects, which may transfer a wider closure than `base..produced` | Digest-bound input to the durable artifact handoff record |
 
 The handoff manifest may identify the expected object closure, but the coordinator derives and verifies the canonical Git object manifest from the imported objects. The coordinator does not trust a Worker claim, a manifest digest, or a Git object ID without checking the transferred content.
 
