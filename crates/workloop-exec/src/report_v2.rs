@@ -1,11 +1,12 @@
 //! Bounded collection of `taisan.worker.report/2` evidence
-//! (`docs/v0.3.md` §6). Runs only after the Invocation's required
-//! process observations are recorded — the launch-acceptance `Running`
-//! fact binding a live process to the Invocation, then a terminal
-//! `Exited` fact for that same process — so a report is never read from
-//! a writer that could still change it. `finish_invocation` collects
-//! inline after committing the terminal fact; the supervisor's
-//! deferred-report sweep retries a collection a crash interrupted.
+//! (`docs/v0.3.md` §6). Runs only after the Invocation's launch
+//! acceptance — a recorded `Running` observation, or the process
+//! identity durably persisted when that observation was lost — is
+//! followed by a terminal `Exited` fact for that same process, so a
+//! report is never read from a writer that could still change it.
+//! `finish_invocation` collects inline after committing the terminal
+//! fact; the supervisor's deferred-report sweep retries a collection a
+//! crash interrupted.
 //!
 //! The collector reads `report.json` and `runtime.log` from the
 //! Invocation-owned out directory under hard bounds taken from the
@@ -179,15 +180,21 @@ pub fn collect(
     };
     let catalog = store.body_catalog();
 
-    // Collection begins only after the Invocation's required process
-    // observations are recorded, in order: the launch-acceptance
-    // `Running` fact binding the live process to this Invocation,
-    // then a terminal `Exited` fact for that same process. An earlier
+    // Collection begins only after the Invocation's launch acceptance
+    // is recorded — an observed `Running`, or the durable identity on
+    // the Invocation row when a crash lost the observation — followed
+    // by a terminal `Exited` fact for that same process. An earlier
     // attempt is deferred — nothing is read from the worker-owned out
     // surface and no evidence is recorded; the pass that commits the
     // terminal fact collects again.
     let observations = store.transact(|tx| tx.observations_for_execution(&request.execution_id))?;
-    if report_collection_gate(&observations, &invocation.id) != ReportCollectionGate::Ready {
+    let recorded_identity = invocation
+        .process_identity
+        .as_ref()
+        .map(|identity| format!("{}@{}", identity.pid, identity.started_at));
+    if report_collection_gate(&observations, &invocation.id, recorded_identity.as_deref())
+        != ReportCollectionGate::Ready
+    {
         return Ok(None);
     }
 

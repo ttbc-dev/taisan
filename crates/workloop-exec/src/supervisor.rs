@@ -3283,13 +3283,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// dispatch or a crash between materialization and the consume
     /// commit leaves orphans no unresolved Invocation names. Once per
     /// pass, reclaim every tree no unresolved Invocation still owns.
+    /// A resolved Invocation whose Worker report is still pending keeps
+    /// its tree too: the deferred-report sweep may collect it on a
+    /// later (or out-of-scope) pass, and reclaiming `out/` here would
+    /// lose the report bytes before that collection.
     pub fn sweep_invocation_io(&self, store: &impl Store) -> Result<(), ExecError> {
         let root = crate::request_v2::invocation_io_root(&self.workspace_root);
-        let keep: HashSet<PathBuf> = store
+        let mut keep: HashSet<PathBuf> = store
             .transact(|tx| tx.unresolved_invocations())?
             .iter()
             .map(|invocation| root.join(isolation::sanitize_key(&invocation.id.0)))
             .collect();
+        for invocation in store.transact(|tx| tx.pending_report_invocations())? {
+            keep.insert(root.join(isolation::sanitize_key(&invocation.id.0)));
+        }
         isolation::sweep_orphans(&root, &keep);
         Ok(())
     }
@@ -4166,15 +4173,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
     /// Save every artifact fact, commit the terminal process
     /// observation, then collect the v2 report. The report gate needs
-    /// both the earlier launch-acceptance `Running` fact and this
-    /// terminal fact in the Invocation's record, so the order is part
-    /// of the contract; a crash between the two commits leaves a
-    /// durable candidate for the deferred-report sweep. `exit_code` is
-    /// the status `inspect` proved for the writer's own exit without
-    /// consuming it — `None` when no normal exit status could be
-    /// proven, which the exit fact records honestly rather than as a
-    /// pass. Callers reap only after this commits, so a failed finish
-    /// is retried against the same zombie's status.
+    /// the launch acceptance (the observed `Running` fact or the
+    /// Invocation row's durable identity) and this terminal fact in the
+    /// Invocation's record, so the order is part of the contract; a
+    /// crash between the two commits leaves a durable candidate for
+    /// the deferred-report sweep. `exit_code` is the status `inspect`
+    /// proved for the writer's own exit without consuming it — `None`
+    /// when no normal exit status could be proven, which the exit fact
+    /// records honestly rather than as a pass. Once the terminal fact
+    /// is durable the child's status is consumed, so this reaps even
+    /// when collection then fails: a `Done` Invocation is never
+    /// re-entered and its report retry belongs to the deferred sweep,
+    /// not to holding the zombie open. A failure before the terminal
+    /// commit leaves the child for the retry to inspect again.
     fn finish_invocation(
         &self,
         store: &impl Store,
@@ -4245,7 +4256,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             now_unix_seconds,
         )?;
-        if let Some(fact) = crate::report_v2::collect(
+        let collected = crate::report_v2::collect(
             store,
             self.body_store
                 .as_ref()
@@ -4254,7 +4265,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
             invocation,
             &request,
             now_unix_seconds,
-        )? {
+        );
+        // The terminal fact is durable, so the child's exit status has
+        // been consumed: reap now even if collection fails. The
+        // Invocation is already `Done`, so no later pass re-enters
+        // finish; a stranded collector error is retried by the
+        // deferred-report sweep, not by keeping the zombie.
+        if let Some(identity) = &invocation.process_identity {
+            let _ = self.port.reap(identity.pid);
+        }
+        if let Some(fact) = collected? {
             self.report(store, &request, fact, now_unix_seconds)?;
         }
         Ok(())
