@@ -46,9 +46,7 @@ use workloop_core::identity::{
     ActorRole, ChangeRequestId, ChangeRequestRef, CommitRevision, DiffTarget, HostActorId,
     HostActorRef, HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
 };
-use workloop_core::mergeability::{
-    CONFLICT_RECHECK_WINDOW_SECONDS, MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState,
-};
+use workloop_core::mergeability::{MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState};
 use workloop_core::observation::{
     BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
     DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact, Observation,
@@ -1515,11 +1513,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
 
     /// A recorded managed merge triggers bounded mergeability re-checks
     /// for the remaining open managed changes on the same target. The
-    /// scan window starts at the merge observation and is bounded both
-    /// by the pass deadline and by [`MAX_CONFLICT_RECHECKS_PER_PASS`];
-    /// the remainder waits for the next pass. Every observation carries
-    /// the exact `(head, new base)` pair, and its stable delivery
-    /// identity makes a steady conflicted pair one trigger.
+    /// scan is bounded both by the pass deadline and by
+    /// [`MAX_CONFLICT_RECHECKS_PER_PASS`]; the remainder waits for the
+    /// next pass. Every observation carries the exact `(head, new base)`
+    /// pair, and its stable delivery identity makes a steady conflicted
+    /// pair one trigger.
     fn recheck_after_recorded_merges(
         &mut self,
         store: &impl Store,
@@ -1529,11 +1527,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         now: i64,
         report: &mut SourceRefreshReport,
     ) -> Result<(), StoreError> {
-        let window = now.saturating_add(CONFLICT_RECHECK_WINDOW_SECONDS);
-        let scan_deadline = match deadline {
-            Some(d) => Some(d.min(window)),
-            None => Some(window),
-        };
+        let scan_deadline = deadline;
         for (work_id, change) in recorded_change_pairs(store, scope)? {
             if change.repository != config.host.repository
                 || !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)?
@@ -1649,6 +1643,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     // repair.
                     continue;
                 };
+                if let Some(scoped) = scope
+                    && &sibling_work != scoped
+                {
+                    // A scoped (`run --work`) pass records nothing for
+                    // another Work: its merge may seed the scan, but a
+                    // sibling owned outside the scope waits for the
+                    // unscoped driver.
+                    continue;
+                }
                 let verdict = match self
                     .client
                     .read_mergeability(&sibling_change.repository, &sibling_change.change_request)
@@ -1670,26 +1673,53 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     verdict.head_sha.clone()
                 };
                 let records_before = self.poll_records;
-                let Ok(sibling_head) =
-                    CommitRevision::new(sibling_change.repository.clone(), head_object)
-                else {
-                    // Without an exact head there is no episode to bind;
-                    // retain the reported paths for the human instead.
-                    self.ingest_unknown_mergeability(
-                        store,
-                        config,
-                        &sibling_work,
-                        &sibling_change,
-                        &base,
-                        verdict.conflicting_paths.clone(),
-                        "conflict head is not a valid revision",
-                        now,
-                    )?;
-                    report.merge_rechecks += 1;
-                    if self.poll_records != records_before {
-                        rechecked += 1;
+                let sibling_head =
+                    CommitRevision::new(sibling_change.repository.clone(), head_object.clone());
+                let sibling_head = match sibling_head {
+                    Ok(head) => head,
+                    Err(_) => {
+                        // The read carried no usable head. Binding the new
+                        // target base as the head would fabricate a
+                        // head==base episode and misreport the source
+                        // revision; use the last head this installation
+                        // actually recorded instead. With no recorded head
+                        // there is nothing truthful to bind, so no
+                        // mergeability fact is invented.
+                        let Some(recorded_head) =
+                            latest_recorded_head(store, &sibling_work, &sibling_change)?.and_then(
+                                |object| {
+                                    CommitRevision::new(sibling_change.repository.clone(), object)
+                                        .ok()
+                                },
+                            )
+                        else {
+                            report
+                                .deferred
+                                .push(format!("mergeability-head:{sibling_change}"));
+                            report.merge_rechecks += 1;
+                            continue;
+                        };
+                        let invalid: String = head_object.chars().take(80).collect();
+                        let reason = format!(
+                            "conflict head {invalid:?} is not a valid revision; bound to the last recorded head"
+                        );
+                        self.ingest_unknown_mergeability(
+                            store,
+                            config,
+                            &sibling_work,
+                            &sibling_change,
+                            &recorded_head,
+                            &base,
+                            verdict.conflicting_paths.clone(),
+                            &reason,
+                            now,
+                        )?;
+                        report.merge_rechecks += 1;
+                        if self.poll_records != records_before {
+                            rechecked += 1;
+                        }
+                        continue;
                     }
-                    continue;
                 };
                 let state = verdict.state;
                 let paths = verdict.conflicting_paths.clone();
@@ -1752,6 +1782,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         config: &WorkloopConfig,
         work_id: &WorkId,
         change: &ChangeRequestRef,
+        head: &CommitRevision,
         base: &CommitRevision,
         paths: Vec<String>,
         reason: &str,
@@ -1771,8 +1802,8 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     },
                     source: "github.mergeability".into(),
                     event_id: format!(
-                        "mergeability-unknown:{}:{}:{}#{token}",
-                        work_id.0, change, base.object
+                        "mergeability-unknown:{}:{}:{}:{}#{token}",
+                        work_id.0, change, head.object, base.object
                     ),
                 }),
                 subject_work_id: Some(work_id.clone()),
@@ -1780,7 +1811,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 fact: ObservationFact::Mergeability {
                     target: DiffTarget {
                         change: change.clone(),
-                        head: base.clone(),
+                        head: head.clone(),
                         base: Some(base.clone()),
                         target_revision: Some(base.clone()),
                     },

@@ -1171,6 +1171,67 @@ fn fix_dispatch_binds_the_acknowledged_predecessor_and_failed_evidence() {
 }
 
 #[test]
+fn conflict_repair_dispatch_binds_the_reported_pair() {
+    let root = tmp_root("conflict-origin");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-origin", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let lo = layout(&root);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&lo, &src, &artifact_id, &produced);
+    let target_revision = "1".repeat(40);
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Fix,
+        serde_json::json!({
+            "kind": "conflict_repair",
+            "schema_version": 1,
+            "episode_id": "ep-conflict",
+            "repository": repo(),
+            "change_request": "change-1",
+            "source_revision": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "target_revision": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "head": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "base": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "conflicting_paths": ["src/a.rs"],
+        }),
+    );
+
+    // A conflict origin needs neither a review judgment nor failed
+    // evidence: the exact pair is the durable repair basis.
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
+    let TaskBody::Fix { origin, .. } = &wire.task else {
+        panic!("expected fix task: {:?}", wire.task)
+    };
+    let FixOrigin::Conflict {
+        change,
+        source_revision,
+        target_revision: target,
+        paths,
+    } = origin.as_ref()
+    else {
+        panic!("expected conflict origin: {origin:?}")
+    };
+    assert_eq!(change, "change-1");
+    assert_eq!(source_revision, &produced);
+    assert_eq!(target, &"1".repeat(40));
+    assert_eq!(paths, &["src/a.rs"]);
+    assert!(
+        invocation_for(&store, &rid1).is_some(),
+        "the conflict repair dispatches instead of refusing evidence_missing"
+    );
+}
+
+#[test]
 fn a_fix_without_durable_evidence_refuses_dispatch() {
     let root = tmp_root("fix-noev");
     let state_root = root.join("state");

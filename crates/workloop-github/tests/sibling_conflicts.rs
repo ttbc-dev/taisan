@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
 use workloop_core::domain::{
-    Actor, ActorKind, AllowedEffects, ExecutionBudget, InvocationRole, LanePolicy, Origin, WorkId,
-    WorkPolicy,
+    Actor, ActorKind, AllowedEffects, ExecutionBudget, ExecutionState, InvocationRole, LanePolicy,
+    Origin, WorkId, WorkPolicy,
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef,
@@ -527,4 +527,157 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
             "sibling {index} triggers exactly once"
         );
     }
+}
+
+#[test]
+fn a_scoped_refresh_never_rechecks_a_sibling_outside_the_scope() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "scoped-merged");
+    let outside_work = submit(&store, &config, "scoped-outside");
+    let merged = change("cr-scoped-merged");
+    let outside = change("cr-scoped-outside");
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &outside_work, &outside);
+
+    let mut fixture = FixtureGithub::new();
+    fixture.set_change_head(&merged, "merged-head", &actor());
+    fixture.set_change_head(&outside, "outside-head", &actor());
+    fixture.set_branch(&repo(), "main", "new-base", &actor());
+    fixture.set_merged(&merged);
+    fixture.set_change_mergeability(&outside, MergeabilityState::Conflicting, &["src/shared.rs"]);
+
+    // The merge belongs to the scoped Work, but the only conflicted
+    // sibling belongs to another Work: a scoped (`run --work`) pass
+    // must record nothing for it.
+    let report = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, Some(&merged_work))
+        .unwrap();
+    assert_eq!(report.sibling_conflicts, 0);
+    assert_eq!(mergeability_facts(&store, &outside_work), 0);
+    assert_eq!(fix_requests(&store, &outside_work), 0);
+}
+
+#[test]
+fn the_production_adapter_does_not_recheck_an_out_of_scope_sibling() {
+    use workloop_github::api::GitHubApi;
+
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "adapter-scoped-merged");
+    let outside_work = submit(&store, &config, "adapter-scoped-outside");
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "work/scoped-merged", "merged-head");
+    api.seed_branch(&repo(), "work/scoped-outside", "outside-head");
+    api.seed_branch(&repo(), "main", "old-base");
+    let merged_pull = api
+        .open_pull(&repo(), "work/scoped-merged", "main", "merged", "")
+        .unwrap();
+    let outside_pull = api
+        .open_pull(&repo(), "work/scoped-outside", "main", "outside", "")
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    let outside = change(&outside_pull.id);
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &outside_work, &outside);
+    ingest_head(&store, &config, &merged_work, &merged, "merged-head");
+    ingest_head(&store, &config, &outside_work, &outside, "outside-head");
+    api.seed_branch(&repo(), "main", "new-base");
+    api.set_pull_merged(&repo(), &merged_pull.id);
+    api.set_pull_mergeability(
+        &repo(),
+        &outside_pull.id,
+        Some(false),
+        "dirty",
+        "new-base",
+        &["src/shared.rs"],
+    );
+
+    let mut adapter = GitHubAdapter::new(api);
+    let report = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, Some(&merged_work))
+        .unwrap();
+    assert_eq!(report.sibling_conflicts, 0);
+    assert_eq!(mergeability_facts(&store, &outside_work), 0);
+    assert_eq!(fix_requests(&store, &outside_work), 0);
+}
+
+#[test]
+fn an_unusable_sibling_head_is_bound_to_the_last_recorded_head() {
+    use workloop_github::api::GitHubApi;
+
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "unknown-head-merged");
+    let sibling_work = submit(&store, &config, "unknown-head-sibling");
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "work/unknown-merged", "merged-head");
+    api.seed_branch(&repo(), "work/unknown-sibling", "sibling-head");
+    api.seed_branch(&repo(), "main", "old-base");
+    let merged_pull = api
+        .open_pull(&repo(), "work/unknown-merged", "main", "merged", "")
+        .unwrap();
+    let sibling_pull = api
+        .open_pull(&repo(), "work/unknown-sibling", "main", "sibling", "")
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    let sibling = change(&sibling_pull.id);
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &sibling_work, &sibling);
+    ingest_head(&store, &config, &merged_work, &merged, "merged-head");
+    ingest_head(&store, &config, &sibling_work, &sibling, "sibling-head");
+    // The sibling's own head poll has nothing current to read; finish
+    // it so the re-check (not the ordinary head poll) exercises the
+    // unusable-head path.
+    store
+        .transact(|tx| {
+            let execution = tx
+                .active_execution(&sibling_work)?
+                .expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Succeeded;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            tx.apply(&Effect::ReleaseSlot {
+                execution_id: execution.id,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    // The mergeability read carries no usable head.
+    api.set_pull_head(&repo(), &sibling_pull.id, "");
+    api.seed_branch(&repo(), "main", "new-base");
+    api.set_pull_merged(&repo(), &merged_pull.id);
+    api.set_pull_mergeability(
+        &repo(),
+        &sibling_pull.id,
+        Some(false),
+        "dirty",
+        "new-base",
+        &["src/shared.rs"],
+    );
+
+    let mut adapter = GitHubAdapter::new(api);
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+
+    let observed = store
+        .transact(|tx| tx.observations_for_work(&sibling_work))
+        .unwrap();
+    let target = observed
+        .iter()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Mergeability { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .expect("the reported paths are retained as an unknown observation");
+    assert_eq!(target.head.object, "sibling-head");
+    assert_eq!(
+        target.base.as_ref().map(|b| b.object.as_str()),
+        Some("new-base"),
+        "the unknown observation must not fabricate a head==base pair"
+    );
 }

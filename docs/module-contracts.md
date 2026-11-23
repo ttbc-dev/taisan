@@ -303,7 +303,9 @@ type CodingTask = TaskBase & { kind: "coding"; issue_refs: IssueRef[] };
 type FixTask = TaskBase & { kind: "fix"; predecessor: EvidenceRef;
 	origin: { kind: "prepublication"; failed_evidence: EvidenceRef[] }
 	    | { kind: "review"; target: EvidenceRef; round: EvidenceRef;
-	        judgment: EvidenceRef; findings: FindingRef[] } };
+	        judgment: EvidenceRef; findings: FindingRef[] }
+	    | { kind: "conflict"; change: ChangeRequestId; source_revision: CommitRevision;
+	        target_revision: CommitRevision; paths: string[] } };
 type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: CommitRevision };
 type InvariantCheckTask = TaskBase & { kind: "invariant_check";
 	artifact: EvidenceRef; invariant_set: EvidenceRef;

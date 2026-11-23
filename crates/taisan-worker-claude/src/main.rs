@@ -588,6 +588,22 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                         ));
                     }
                 }
+                workloop_core::worker_v2::FixOrigin::Conflict {
+                    change,
+                    source_revision,
+                    target_revision,
+                    paths,
+                } => {
+                    p.push_str(&format!(
+                        "\n## Merge conflict to repair\nchange: {change}\nsource revision: {source_revision}\ntarget revision: {target_revision}\n\nMerge the target revision into the source branch and resolve the conflict, preserving the intent of both changes.\n"
+                    ));
+                    if !paths.is_empty() {
+                        p.push_str("conflicting paths:\n");
+                        for path in paths {
+                            p.push_str(&format!("- {path}\n"));
+                        }
+                    }
+                }
                 workloop_core::worker_v2::FixOrigin::Prepublication { failed_evidence } => {
                     p.push_str("\n## Failed evidence to repair\n");
                     for (i, e) in failed_evidence.iter().enumerate() {

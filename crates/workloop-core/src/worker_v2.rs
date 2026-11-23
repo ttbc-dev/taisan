@@ -144,8 +144,10 @@ pub struct FailedEvidence {
     pub digest: String,
 }
 
-/// What produced the Fix request: an exact sealed review judgment, or
-/// failed verification/invariant evidence for an unpublished artifact.
+/// What produced the Fix request: an exact sealed review judgment,
+/// failed verification/invariant evidence for an unpublished artifact,
+/// or a merge conflict bound to the exact `(source head, target
+/// revision)` pair.
 /// Member sets are checked against the closed lists below — internally
 /// tagged enums cannot carry `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +163,21 @@ pub enum FixOrigin {
     },
     Prepublication {
         failed_evidence: Vec<FailedEvidence>,
+    },
+    /// A merge conflict: the source head no longer merges into the
+    /// target revision. Both revisions are exact commit ids so the
+    /// Worker repairs the pair the host reported, never a moved branch.
+    Conflict {
+        /// The conflicted change request identity.
+        change: String,
+        /// The conflicted source head.
+        source_revision: String,
+        /// The new target revision the source must merge.
+        target_revision: String,
+        /// The paths the host reported as conflicting; may be empty when
+        /// the host gives only a verdict.
+        #[serde(default)]
+        paths: Vec<String>,
     },
 }
 
@@ -998,6 +1015,13 @@ fn check_tagged_members(request: &serde_json::Value) -> Result<(), RequestInvali
         let oallowed: &[&str] = match okind {
             "review" => &["kind", "target", "round", "judgment", "findings"],
             "prepublication" => &["kind", "failed_evidence"],
+            "conflict" => &[
+                "kind",
+                "change",
+                "source_revision",
+                "target_revision",
+                "paths",
+            ],
             _ => {
                 return Err(RequestInvalid::Malformed {
                     detail: format!("unknown origin.kind {okind:?}"),

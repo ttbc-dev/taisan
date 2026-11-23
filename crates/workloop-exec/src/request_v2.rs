@@ -248,6 +248,66 @@ fn artifact_ref(handoff: &ArtifactHandoff) -> Result<ArtifactRef, DispatchRefusa
     })
 }
 
+/// The merge-conflict origin a conflict-repair request carries: the
+/// exact `(source head, target revision)` pair observed by the host.
+/// The pair is the repair basis — a missing revision or one naming a
+/// foreign repository refuses dispatch rather than repairing a guessed
+/// pair. A non-conflict request returns `None` and follows the review /
+/// failed-evidence path.
+fn conflict_origin(
+    request: &InvocationRequest,
+    work: &Work,
+) -> Result<Option<FixOrigin>, BuildError> {
+    if request.payload.get("kind").and_then(|k| k.as_str()) != Some("conflict_repair") {
+        return Ok(None);
+    }
+    let revision = |field: &str| -> Result<CommitRevision, BuildError> {
+        let value = request.payload.get(field).cloned().ok_or_else(|| {
+            refusal(DispatchRefusal::EvidenceMissing {
+                detail: format!("conflict repair payload has no {field} revision"),
+            })
+        })?;
+        serde_json::from_value(value).map_err(|_| {
+            refusal(DispatchRefusal::EvidenceMissing {
+                detail: format!("conflict repair payload {field} is not an exact revision"),
+            })
+        })
+    };
+    let change = request
+        .payload
+        .get("change_request")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            refusal(DispatchRefusal::EvidenceMissing {
+                detail: "conflict repair payload names no change".into(),
+            })
+        })?;
+    let head = revision("head")?;
+    let base = revision("base")?;
+    if head.repository != work.binding.repository || base.repository != work.binding.repository {
+        return Err(refusal(DispatchRefusal::EvidenceMissing {
+            detail: "conflict repair pair names a foreign repository".into(),
+        }));
+    }
+    let paths = request
+        .payload
+        .get("conflicting_paths")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(FixOrigin::Conflict {
+        change: change.to_string(),
+        source_revision: head.object,
+        target_revision: base.object,
+        paths,
+    }))
+}
+
 /// The wire review target for the Work's current accepted head —
 /// `change`/`base`/`head` exact, `diff_digest` derived from the same
 /// `(change, base, head)` triple `DiffSnapshot` digests everywhere
@@ -701,123 +761,131 @@ pub fn build_request_body(
                 .as_ref()
                 .expect("fix requires a handoff — gathered above");
             let predecessor = artifact_ref(handoff)?;
-            // A review origin wins when the current target's latest
-            // sealed round carries a judgment selecting Fix
-            // dispositions; otherwise the fix binds failed mechanical
-            // evidence. A fix with neither is refused — it has no
-            // durable basis to repair against.
-            let origin = match &durable.judged_round {
-                Some((round, judgment, occurrences)) => {
-                    let mut findings = Vec::new();
-                    for (order, decision) in judgment
-                        .decisions
-                        .iter()
-                        .filter(|d| d.choice == FindingChoice::Fix)
-                        .enumerate()
-                    {
-                        let Some(occurrence) =
-                            occurrences.iter().find(|o| o.id == decision.occurrence_id)
-                        else {
-                            return Err(refusal(DispatchRefusal::FindingMissing {
-                                detail: format!(
-                                    "judgment {} selects occurrence {} which is not in round {}",
-                                    judgment.id, decision.occurrence_id, round.id
-                                ),
-                            }));
-                        };
-                        // The wire `digest` binds the finding's content
-                        // identity; an occurrence the review source
-                        // recorded without one has nothing immutable to
-                        // bind — refuse rather than substitute the
-                        // source key into a digest field.
-                        let Some(content_digest) = occurrence.content_digest.clone() else {
-                            return Err(refusal(DispatchRefusal::FindingMissing {
-                                detail: format!(
-                                    "judgment {} selects occurrence {} which carries no content digest",
-                                    judgment.id, decision.occurrence_id
-                                ),
-                            }));
-                        };
-                        findings.push(workloop_core::worker_v2::FindingOccurrenceRef {
-                            occurrence: occurrence.id.clone(),
-                            source: occurrence.source_key.clone(),
-                            digest: content_digest,
-                            order: order as u64,
-                            summary: occurrence.summary.clone(),
-                        });
-                    }
-                    if findings.is_empty() {
-                        None
-                    } else {
-                        let target = durable.target.as_ref().ok_or_else(|| {
-                            refusal(DispatchRefusal::HeadStale {
-                                detail: "the judged target is no longer current".into(),
-                            })
-                        })?;
-                        Some(FixOrigin::Review {
-                            target: wire_target(&durable.work, target, handoff)?,
-                            round: round.id.clone(),
-                            judgment: judgment.id.clone(),
-                            findings,
-                        })
-                    }
-                }
-                None => None,
-            };
-            let origin = match origin {
-                Some(o) => o,
+            // A conflict origin binds the exact re-checked pair and
+            // needs neither a review judgment nor failed evidence. Any
+            // other fix takes the review origin when the current
+            // target's latest sealed round carries a judgment selecting
+            // Fix dispositions; otherwise it binds failed mechanical
+            // evidence. A fix with none is refused — it has no durable
+            // basis to repair against.
+            let origin = match conflict_origin(request, &durable.work)? {
+                Some(conflict) => conflict,
                 None => {
-                    if durable.failed_verification.is_empty() {
-                        return Err(refusal(DispatchRefusal::EvidenceMissing {
-                            detail:
-                                "no failed verification evidence or current review judgment binds this fix"
-                                    .into(),
-                        }));
-                    }
-                    let mut failed_evidence = Vec::new();
-                    for result in &durable.failed_verification {
-                        let body = FailedEvidenceBody {
-                            format: FAILED_EVIDENCE_FORMAT.into(),
-                            work_id: durable.work.id.0.clone(),
-                            artifact_id: result.artifact_id.clone(),
-                            evidence_id: result.id.clone(),
-                            kind: "verification".into(),
-                            requirement: result.requirement.clone(),
-                            argv: result.argv.clone(),
-                            produced: result.produced.clone(),
-                            result: match result.result {
-                                VerificationOutcome::Fail => "fail".into(),
-                                VerificationOutcome::Pass => "pass".into(),
-                                VerificationOutcome::Inconclusive => "inconclusive".into(),
-                            },
-                            output: result.output.clone(),
-                        };
-                        let bytes = body.canonical_bytes();
-                        let digest = body.wire_digest();
-                        let resolved = retain_derived(
-                            &dispatch.bodies,
-                            catalog,
-                            "failed-evidence",
-                            &digest,
-                            &bytes,
-                            now_unix_seconds,
-                            horizon,
-                        )?;
-                        input_total = input_total.saturating_add(resolved.bytes.len() as u64);
-                        if input_total > MAX_INPUT_TOTAL_BYTES {
-                            return Err(refusal(DispatchRefusal::BodyOversize {
-                                detail: format!(
-                                    "request inputs exceed {MAX_INPUT_TOTAL_BYTES} bytes total"
-                                ),
-                            }));
+                    let origin = match &durable.judged_round {
+                        Some((round, judgment, occurrences)) => {
+                            let mut findings = Vec::new();
+                            for (order, decision) in judgment
+                                .decisions
+                                .iter()
+                                .filter(|d| d.choice == FindingChoice::Fix)
+                                .enumerate()
+                            {
+                                let Some(occurrence) =
+                                    occurrences.iter().find(|o| o.id == decision.occurrence_id)
+                                else {
+                                    return Err(refusal(DispatchRefusal::FindingMissing {
+                                        detail: format!(
+                                            "judgment {} selects occurrence {} which is not in round {}",
+                                            judgment.id, decision.occurrence_id, round.id
+                                        ),
+                                    }));
+                                };
+                                // The wire `digest` binds the finding's content
+                                // identity; an occurrence the review source
+                                // recorded without one has nothing immutable to
+                                // bind — refuse rather than substitute the
+                                // source key into a digest field.
+                                let Some(content_digest) = occurrence.content_digest.clone() else {
+                                    return Err(refusal(DispatchRefusal::FindingMissing {
+                                        detail: format!(
+                                            "judgment {} selects occurrence {} which carries no content digest",
+                                            judgment.id, decision.occurrence_id
+                                        ),
+                                    }));
+                                };
+                                findings.push(workloop_core::worker_v2::FindingOccurrenceRef {
+                                    occurrence: occurrence.id.clone(),
+                                    source: occurrence.source_key.clone(),
+                                    digest: content_digest,
+                                    order: order as u64,
+                                    summary: occurrence.summary.clone(),
+                                });
+                            }
+                            if findings.is_empty() {
+                                None
+                            } else {
+                                let target = durable.target.as_ref().ok_or_else(|| {
+                                    refusal(DispatchRefusal::HeadStale {
+                                        detail: "the judged target is no longer current".into(),
+                                    })
+                                })?;
+                                Some(FixOrigin::Review {
+                                    target: wire_target(&durable.work, target, handoff)?,
+                                    round: round.id.clone(),
+                                    judgment: judgment.id.clone(),
+                                    findings,
+                                })
+                            }
                         }
-                        failed_evidence.push(FailedEvidence {
-                            evidence_id: result.id.clone(),
-                            kind: "verification".into(),
-                            digest,
-                        });
+                        None => None,
+                    };
+                    match origin {
+                        Some(o) => o,
+                        None => {
+                            if durable.failed_verification.is_empty() {
+                                return Err(refusal(DispatchRefusal::EvidenceMissing {
+                                    detail:
+                                        "no failed verification evidence or current review judgment binds this fix"
+                                            .into(),
+                                }));
+                            }
+                            let mut failed_evidence = Vec::new();
+                            for result in &durable.failed_verification {
+                                let body = FailedEvidenceBody {
+                                    format: FAILED_EVIDENCE_FORMAT.into(),
+                                    work_id: durable.work.id.0.clone(),
+                                    artifact_id: result.artifact_id.clone(),
+                                    evidence_id: result.id.clone(),
+                                    kind: "verification".into(),
+                                    requirement: result.requirement.clone(),
+                                    argv: result.argv.clone(),
+                                    produced: result.produced.clone(),
+                                    result: match result.result {
+                                        VerificationOutcome::Fail => "fail".into(),
+                                        VerificationOutcome::Pass => "pass".into(),
+                                        VerificationOutcome::Inconclusive => "inconclusive".into(),
+                                    },
+                                    output: result.output.clone(),
+                                };
+                                let bytes = body.canonical_bytes();
+                                let digest = body.wire_digest();
+                                let resolved = retain_derived(
+                                    &dispatch.bodies,
+                                    catalog,
+                                    "failed-evidence",
+                                    &digest,
+                                    &bytes,
+                                    now_unix_seconds,
+                                    horizon,
+                                )?;
+                                input_total =
+                                    input_total.saturating_add(resolved.bytes.len() as u64);
+                                if input_total > MAX_INPUT_TOTAL_BYTES {
+                                    return Err(refusal(DispatchRefusal::BodyOversize {
+                                        detail: format!(
+                                            "request inputs exceed {MAX_INPUT_TOTAL_BYTES} bytes total"
+                                        ),
+                                    }));
+                                }
+                                failed_evidence.push(FailedEvidence {
+                                    evidence_id: result.id.clone(),
+                                    kind: "verification".into(),
+                                    digest,
+                                });
+                            }
+                            FixOrigin::Prepublication { failed_evidence }
+                        }
                     }
-                    FixOrigin::Prepublication { failed_evidence }
                 }
             };
             TaskBody::Fix {

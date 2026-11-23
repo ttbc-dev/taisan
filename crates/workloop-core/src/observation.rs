@@ -205,14 +205,6 @@ pub enum ObservationFact {
         base: CommitRevision,
         target_branch: String,
     },
-    /// Alias variant for producers that name the merge record rather
-    /// than the change. Both decode and assess identically.
-    MergeRecorded {
-        change: ChangeRequestRef,
-        head: CommitRevision,
-        base: CommitRevision,
-        target_branch: String,
-    },
     /// The host's mergeability verdict for one exact `(head, base)`
     /// pair. A `Conflicting` verdict carries the paths the host could
     /// report; a verdict the host could not establish is `Unknown` with

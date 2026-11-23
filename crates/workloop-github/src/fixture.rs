@@ -2353,6 +2353,12 @@ impl FixtureGithub {
                     report.deferred.push(format!("merge-siblings:{change_id}"));
                     break;
                 }
+                if let Some(d) = deadline
+                    && now >= d
+                {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
                 if sibling_id == change_id {
                     continue;
                 }

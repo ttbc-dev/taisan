@@ -22,10 +22,6 @@ use crate::identity::{ChangeRequestRef, CommitRevision, DiffTarget};
 /// unbounded open-change list.
 pub const MAX_CONFLICT_RECHECKS_PER_PASS: usize = 5;
 
-/// How long after a recorded merge sibling re-checks stay due. The
-/// window bounds the trigger latency; it is not a retry interval.
-pub const CONFLICT_RECHECK_WINDOW_SECONDS: i64 = 60;
-
 const EPISODE_TAG: &str = "conflict-episode-v1";
 
 /// The host's mergeability verdict for one change at one exact pair.
@@ -38,12 +34,6 @@ pub enum MergeabilityState {
     Conflicting,
     Unknown,
 }
-
-/// `Mergeability` is the short name the observation vocabulary uses.
-pub use MergeabilityState as Mergeability;
-
-/// Alias for callers naming the observed value rather than the state.
-pub type MergeabilityObservation = MergeabilityState;
 
 /// One conflict episode: repository, change, source head, and target
 /// revision. Both revisions participate in identity — a new target tip
@@ -111,12 +101,6 @@ impl ConflictEpisode {
             })),
         )
     }
-
-    /// Alias used by callers that name the identity rather than the
-    /// record.
-    pub fn identity(&self) -> String {
-        self.episode_id()
-    }
 }
 
 /// The bounded repair trigger: a Fix-class request bound to both the
@@ -134,15 +118,6 @@ pub struct ConflictFixRequest {
     /// payload directly.
     pub payload: serde_json::Value,
 }
-
-/// Short aliases for callers that name the trigger by its class or by
-/// the repair action.
-pub type FixRequest = ConflictFixRequest;
-pub type ConflictRepairRequest = ConflictFixRequest;
-/// Alias for the bounded repair trigger's class.
-pub type FixClassRequest = ConflictFixRequest;
-/// Alias for callers naming the trigger by its effect.
-pub type ConflictTrigger = ConflictFixRequest;
 
 impl ConflictFixRequest {
     pub fn new(episode: ConflictEpisode, paths: Vec<String>) -> Self {
@@ -195,21 +170,6 @@ pub enum ConflictDisposition {
     /// A conflict exists but no automatic trigger may be minted; the
     /// paths and reason go to human Attention.
     Escalate(ConflictEscalation),
-}
-
-/// Build a Fix-class request directly from an episode and its paths.
-pub fn fix_class_request(episode: ConflictEpisode, paths: Vec<String>) -> ConflictFixRequest {
-    ConflictFixRequest::new(episode, paths)
-}
-
-/// Alias for `fix_class_request`.
-pub fn conflict_fix_request(episode: ConflictEpisode, paths: Vec<String>) -> ConflictFixRequest {
-    fix_class_request(episode, paths)
-}
-
-/// Alias used by callers that name the repair action.
-pub fn repair_request(episode: ConflictEpisode, paths: Vec<String>) -> ConflictFixRequest {
-    fix_class_request(episode, paths)
 }
 
 /// Classify a mergeability observation with optional revision evidence.
