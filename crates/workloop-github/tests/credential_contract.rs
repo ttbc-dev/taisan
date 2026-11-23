@@ -316,6 +316,50 @@ fn providers_resolve_slots_and_fail_unresolvable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Providers conventionally terminate their output — an editor-written
+/// token file ends with a newline, `echo`-style command output does —
+/// so the boundary trims trailing whitespace off the resolved value.
+/// Whitespace that survives the trim is never repaired into shape: it
+/// would corrupt the `Authorization` header the value rides, so the
+/// ref resolves `credential.unresolvable` instead.
+#[cfg(unix)]
+#[test]
+fn resolved_values_trim_trailing_whitespace_and_reject_interior() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("credential-whitespace");
+    let secret_file = dir.join("token");
+    // The shape an editor- or `echo`-written token file has.
+    std::fs::write(&secret_file, "file-secret-value\n").unwrap();
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let book = CredentialBook::new();
+
+    let file_ref = CredentialRef::trusted(format!("file:{}", secret_file.display()).as_str());
+    assert_eq!(
+        resolve_credential(Some(&file_ref), &book).unwrap().expose(),
+        "file-secret-value",
+        "a trailing newline is provider framing, not part of the secret"
+    );
+
+    // Interior whitespace is never silently accepted: a value that
+    // still contains any after the trailing trim is unresolvable.
+    for bad in ["tok en", " secret", "sec\tret", "sec\nret"] {
+        std::fs::write(&secret_file, bad).unwrap();
+        let error = resolve_credential(Some(&file_ref), &book).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "credential.unresolvable",
+            "{bad:?} must not resolve"
+        );
+        assert!(
+            !format!("{error}").contains(bad),
+            "the detail never carries the value: {error}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// AC: a renewed credential resolving to a different actor is rejected
 /// `credential.actor_mismatch` and never re-binds outstanding actions;
 /// a same-actor renewal resolves the new secret under the original

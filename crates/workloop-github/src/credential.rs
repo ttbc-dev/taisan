@@ -261,7 +261,7 @@ pub fn resolve_credential(
     let provider = CredentialProvider::parse(reference)
         .map_err(|rule| CredentialError::unresolvable(format!("malformed reference: {rule}")))?;
     let kind = provider.kind();
-    let value = match provider {
+    let raw = match provider {
         CredentialProvider::Env { name } => providers.env(&name)?,
         CredentialProvider::File { path } => {
             let bytes = providers.file(&path)?;
@@ -271,12 +271,25 @@ pub fn resolve_credential(
         }
         CredentialProvider::Command { argv } => providers.command(&argv)?,
     };
+    // Whitespace is never part of a credential value: providers
+    // conventionally terminate their output — an editor-written token
+    // file, `echo`-style command output — so a trailing run is
+    // trimmed at the boundary. Whitespace surviving the trim is not
+    // repaired into shape: the value rides `Authorization` headers
+    // where an embedded space or newline corrupts the request, so the
+    // resolution fails honestly as unresolvable.
+    let value = raw.trim_end();
     if value.is_empty() {
         return Err(CredentialError::unresolvable(format!(
             "{kind}: resolved to an empty value"
         )));
     }
-    Ok(ResolvedCredential(value))
+    if value.chars().any(char::is_whitespace) {
+        return Err(CredentialError::unresolvable(format!(
+            "{kind}: resolved value contains whitespace"
+        )));
+    }
+    Ok(ResolvedCredential(value.to_string()))
 }
 
 /// Resolve a role's credential slot and bind it to the authorized
