@@ -53,7 +53,7 @@ not a weakened remote variant.
 | --- | --- | --- |
 | Worker wire contract `taisan.worker.request/2`, `taisan.worker.report/2`, `taisan.worker.declaration/1`; `argv-v2` transport (`describe`, `run --request <path> --out <dir>`) | [v0.3](v0.3.md#4-executable-request-taisanworkerrequest2) | The remote executor hosts the same argv surface and the same mount contract. The request/report envelopes and their digests are identical on either side of the transport; the executor transport (#374) carries them, it does not redefine them |
 | Request/invocation identity and first-binding rule | [v0.3](v0.3.md#32-identities), [worker protocol](worker-protocol.md#start-observe-stop) | `request_id` `<execution_id>:inv:<sequence>`, `invocation_id`, `request_digest`, and the immutable adapter declaration binding are allocated and recorded coordinator-side before any remote send; the executor never mints, rewrites, or reuses them |
-| Report classes `success`/`negative`/`unavailable`/`failure`/`invalid`/`absent` and closed reason codes | [v0.3](v0.3.md#6-report-taisanworkerreport2) | Ingested identically; a transport fault is its own class (`unavailable`), never folded into a report class and never a clean result |
+| Report classes `success`/`negative`/`unavailable`/`failure`/`invalid`/`absent` and closed reason codes | [v0.3](v0.3.md#6-report-taisanworkerreport2) | Ingested identically; a transport fault is not a report class — it surfaces through the executor-operation vocabulary (typed refusal, `unknown`, unreachable) and resolves to `unavailable`/`absent` evidence plus Attention (§4.2), never a clean result |
 | Artifact handoff: sandboxed export bundle → quarantine import → `refs/taisan/artifacts/<artifact_id>` → `acknowledged` row | [worker protocol](worker-protocol.md#artifact-handoff) | The remote analogue is `collect` + `acknowledge`: produced objects return through quarantined import with the same base-ancestry/exact-commit checks; the durable acknowledgement stays the coordinator store row plus the verified ref, never a remote claim |
 | Supervisor stop proof: durable stop intent, descendant snapshot, identity re-verification, state-not-presence inspection | [worker protocol](worker-protocol.md#process-descendants-and-stop-proof), [decisions](decisions.md) | Remote stop authority follows the same rule: persisted intent plus inspected remote process identities plus executor incarnation evidence. A closed transport session, a missed heartbeat, or an expired lease never proves stop |
 | Verification runner: independent clean worktree of the produced commit, exact argv/commit/environment binding, `Inconclusive` on timeout/signal | [worker protocol](worker-protocol.md#verification-runner), [v0.3 §14.5](v0.3.md#145-verification-toolchain-dependency-setup-and-host-allowlist) | Relocatable to the executor as a supervisor-authorized operation distinct from any Worker Invocation, keeping the same input/result/evidence shapes (#383) |
@@ -67,7 +67,7 @@ not a weakened remote variant.
 
 | Gap | Evidence | Consequence for the remote contract |
 | --- | --- | --- |
-| Reference Worker did not produce the workspace-root `artifact.json` handoff manifest | #410; operator scaffolding synthesized it during the first live run; addressed on open PR #413, unmerged at this baseline | The remote custody contract cannot rely on implicit workspace state: produced artifacts cross the transport only as validated descriptors (manifest + object closure), and the manifest shape is a contract input, not an afterthought — manifest placement/lifecycle is decided by #416 and bound through #374 |
+| Reference Worker did not produce the workspace-root `artifact.json` required-artifact evidence | #410; operator scaffolding synthesized it during the first live run; addressed on open PR #413, unmerged at this baseline | The remote custody contract cannot rely on implicit workspace state: produced artifacts cross the transport only as validated descriptors (manifest + object closure), and the manifest shape is a contract input, not an afterthought — manifest placement/lifecycle is decided by #416 and bound through #374 |
 | `push_ref` wrote only `git/refs` — no git-object transport, remote 422 | #411; worked around via Git Database API staging plus a bridge push; addressed on open PR #413 (pack upload from the handoff repository under `--force-with-lease`) | Object transfer is the hard primitive everywhere: coordinator→executor inputs and executor→coordinator produced objects both travel as real git transport (bundle/pack), never as ref updates against objects that do not exist |
 | Contained sandbox lacked a CA trust store and a git identity | #412; worked around via `--runtime-arg` bind and `GIT_*` env injection; addressed on open PR #413 (`ca_trust_paths`, `commit_identity` profile fields) | A remote executor host needs the same declared environment; it is a preflight requirement of the executor profile, not per-run surgery |
 | No executor transport or placement port | `ProcessControlPort` (`workloop-core/src/ports.rs`) is POSIX-local; `Supervisor` spawns, inspects, and signals on the coordinator host only | The coordinator↔executor operation set (§4) and its versioned wire types (#374/#375) are new contract surface; placement is bound per request like the adapter declaration, never inferred mid-Invocation |
@@ -350,7 +350,7 @@ scoped to #373 and listed in §7.3 — never solved here.
 | --- | --- | --- | --- | --- |
 | RA-01 | Remote review on an exact PR head | A | Materialized exact `target` + `review_source`; remote `review` Invocation bound per §3.1; complete findings ingest into the sealed round; a head move before ingestion invalidates the round and cannot settle the newer head | contract + live |
 | RA-02 | New Issue → PR (ship) | B | Selector/manual admission → remote Coding → collect → coordinator import → verification → coordinator `push_ref` + open → remote Review → judgment → remote Fix → republish → verified Outcome. Each stage's postcondition is the local one; the produced head reaching the PR is proven by coordinator receipts, not remote claims | contract + live |
-| RA-03 | Review / fix / republish (converge) | A+B | Judged findings → remote Fix bound to exact predecessor/round/judgment → collected commit → verification → guarded republish → `ConvergeRecord::Fixed` classification against the live head; a claimed-but-unpublished fix is `UnpublishedFailure` | contract + live |
+| RA-03 | Review / fix / republish (converge) | A+B | Judged findings → remote Fix bound to exact predecessor/round/judgment → collected commit → verification → guarded republish → `ConvergeClassification::Fixed` classification against the live head; a claimed-but-unpublished fix is `UnpublishedFailure` | contract + live |
 | RA-04 | Attention surfaces | A+B | Transport loss mid-Invocation, unreachable endpoint at collect, `unknown` start, executor incapacity — each produces typed evidence and a current Attention item; none silently retries, falls back local, or completes | contract |
 | RA-05 | Outage and partition | A+B | Partition at prepare/start/observe/request_stop/collect/acknowledge: reconnect recovers the same Invocation and binding; no duplicate writer, no lost report, no premature remote cleanup; outage is `unavailable`, never an empty result | contract + live (where repeatable) |
 | RA-06 | Coordinator and executor restart | A+B | Coordinator restart reconciles every in-flight remote Invocation by recorded identity; executor reboot surfaces a new incarnation, prior process evidence becomes uninspectable as a typed class, and no replacement writer starts until remote stop is proven or the request is abandoned under the normal path | contract + live |
@@ -386,12 +386,14 @@ on this document having guessed it:
 - **Executor incarnation identity format** — required by §4.3 fencing;
   the concrete identity (boot ID, key pair, generation counter) is a
   #374/#375 choice.
-- **Remote workspace identity** — the executor mirrors
-  `work/<work_id>` naming inside its own state root, but whether the
-  remote workspace persists across Invocations of one Execution (the
-  local model) or is reconstructed per Invocation is #376/#377's
-  trade-off; §4.2 requires WIP retention until acknowledgement
-  either way.
+- **Remote workspace retention** — §4.1 fixes construction: the
+  executor builds `work/<work_id>` from validated objects inside its
+  own state root. Whether the executor may then retain and reuse that
+  constructed workspace across Invocations of one Execution (the
+  local persistence model) or must discard and rebuild it is
+  #376/#377's trade-off — a retention/optimization question over the
+  fixed construction rule, not an alternative to it; §4.2 requires
+  WIP retention until acknowledgement either way.
 - **Bounded progress surface of `observe`** — minimum is liveness plus
   receipt identity; richer progress (bounded log tail) is a #374
   negotiation item, never a liveness substitute.
