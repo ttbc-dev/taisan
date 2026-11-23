@@ -133,8 +133,12 @@ remaining elements of the approved v0.3 profile were **not** exercised
 in the guest: credential/environment hygiene, the profile's fixed
 mount set (the `--ro-bind`/`--tmpfs` mounts above are illustrative,
 not the approved set), the mandatory N1 model-API CONNECT proxy (the
-network is fully unshared — `NET-DOWN` — so no egress path exists to
-proxy), and the preflight negative probes. Those stay unverified
+probe command neither bind-mounts the proxy socket nor runs the
+in-sandbox relay — under the approved N1 design an `--unshare-net`
+sandbox still reaches the out-of-sandbox proxy through a
+bind-mounted Unix socket, so the unshared network is not what
+excluded the proxy here; the probe simply never provided the path),
+and the preflight negative probes. Those stay unverified
 pending #372, matching the caveats in "Honest limits and non-claims".
 
 Two Ubuntu 24.04-specific provisioning facts, measured not assumed:
@@ -163,10 +167,15 @@ On a supported-Linux remote endpoint **no guest is needed**, and this
 spike claims that honestly rather than inventing one: the v0.3
 containment primitives (unprivileged user/mount/PID/network/IPC
 namespaces via `bwrap`, environment hygiene, the CONNECT egress proxy)
-are native kernel features that the executor already uses — see
+are the profile's mechanisms — the namespaces are native kernel
+features, while environment hygiene and the CONNECT egress proxy are
+user-space components of the same approved profile — see
 `docs/worker-protocol.md` selected profile and `docs/v0.3.md` OP-1
 ("Linux POSIX host with unprivileged user namespaces, `bwrap`, and the
-taisan CONNECT proxy"). A VM or container daemon on such a host would
+taisan CONNECT proxy"). `docs/v0.3.md` still records the
+namespace/egress enforcement as an unclaimed, unenforced gap, so this
+is the specified profile, not measured enforcement. A VM or
+container daemon on such a host would
 add a resident daemon and memory for zero contract benefit. What the
 endpoint needs beyond the existing v0.3 primitives is a small
 restricted transport helper (ssh or equivalent) and separate
