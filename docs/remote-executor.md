@@ -31,7 +31,7 @@ contract evidence never prove a live remote run.
 | Surface | Revision | Locator |
 | --- | --- | --- |
 | Repository `main` (all components below) | `63905c6bd08f646289876ebb1dfeedd4409ca7f6` | `git rev-parse origin/main`, merge of #408; also the revision the first live run exercised |
-| Overlapping open PR | `3feef81ecd6ce2fb89a129c8144e41a40f5c6127` | PR #413 (head `issue-410-agent`), addressing #410/#411/#412 — not yet merged at this baseline |
+| Manifest-handoff PR | `bfa0412` (merge of branch head `c1d3343`) | PR #413, addressing #410/#411/#412 — merged into `main` during this baseline review; the baseline main pin above predates it |
 | Public v0.3 reference implementations | same tree | `public-issue-selector` and `taisan-worker-claude` shipped under #366; clean-install documentation alignment tracked by #367 |
 | Design baselines cited by prior contracts | `51f0b34daf33a1975a39b7614f5ceeac7dabf431`, `7d9ea3d` | [v0.3](v0.3.md) planning/recheck baselines, kept as historical audit |
 
