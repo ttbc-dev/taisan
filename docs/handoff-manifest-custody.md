@@ -47,7 +47,7 @@ The report, handoff manifest, and object transfer can arrive in separate bounded
 
 The verifier checks declared workspace outputs against the handed-off produced commit. It does not wait for a workspace-root manifest. Missing declared outputs fail the artifact verification. Missing, stale, or invalid transfer metadata fails collection. These failures remain distinct and neither can make a later workspace cleanliness check depend on a manifest staged into the repository.
 
-The workspace-root `artifact.json` remains part of the existing local handoff path. The remote custody contract does not use that file as an alternate source of authority. The local contract continues to use its verified bundle, quarantine import, canonical Git object manifest, handoff ref, and acknowledged store record as described in the [Worker protocol](worker-protocol.md#artifact-handoff).
+The workspace-root `artifact.json` is the default `required_artifacts` entry checked by the local finish/verify path (`finish_invocation`/`find_artifact`), written by the Worker shim. It is not an input to the local handoff, which consumes only the produced-commit bundle, quarantine import, canonical Git object manifest, handoff ref, and acknowledged store record as described in the [Worker protocol](worker-protocol.md#artifact-handoff). The remote custody contract does not use that file as an alternate source of authority either.
 
 ## Contract ownership
 
