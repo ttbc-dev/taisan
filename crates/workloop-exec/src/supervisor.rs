@@ -160,11 +160,20 @@ fn stat_of(pid: i32) -> Option<String> {
     }
 }
 
-/// The working directory `pid` runs in, read through `lsof`. `None` on
-/// any failure — a missing `lsof`, a denied read, or a process with no
-/// reported cwd — never a guessed path. Only ever used to *attribute* a
-/// candidate; `None` makes a child less attributable, never absent-proof.
+/// The working directory `pid` runs in: `lsof` first, then the
+/// `/proc/<pid>/cwd` symlink where that filesystem exists. `None` on
+/// any failure — a denied read, a dead process, or no mechanism at
+/// all — never a guessed path. Only ever used to *attribute* a
+/// candidate; `None` makes a child less attributable, never
+/// absent-proof.
 fn cwd_of(pid: i32) -> Option<PathBuf> {
+    if let Some(cwd) = lsof_cwd_of(pid) {
+        return Some(strip_deleted_marker(&cwd).0);
+    }
+    proc_cwd_of(pid).map(|cwd| strip_deleted_marker(&cwd).0)
+}
+
+fn lsof_cwd_of(pid: i32) -> Option<PathBuf> {
     let out = Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
@@ -180,14 +189,202 @@ fn cwd_of(pid: i32) -> Option<PathBuf> {
     None
 }
 
+/// `/proc/<pid>/cwd` is the same answer `lsof -d cwd` gives, without
+/// the tool — the fallback for minimal images that do not ship lsof.
+/// The raw link target is returned; a deleted working directory's
+/// ` (deleted)` marker is stripped by `cwd_of`.
+#[cfg(target_os = "linux")]
+fn proc_cwd_of(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd_of(_: i32) -> Option<PathBuf> {
+    None
+}
+
+/// `/proc/<pid>/cwd` — and lsof's `n` field for the same table —
+/// annotates a deleted working directory's path with a trailing
+/// ` (deleted)`; the marker is not part of the path. Judged raw it
+/// never matches component-wise: `dir/gone (deleted)` is not inside
+/// `dir`, so a live writer in a deleted directory would slip every
+/// membership check — and because its cwd read succeeded it is
+/// already `mapped`, sliding past the completeness gate into a
+/// clear table while an occupant still runs. The marker is also
+/// positive evidence: the mechanism reported the exact directory
+/// the process WAS in. Returns the pre-deletion spelling and
+/// whether the marker was present, so callers can count a marked
+/// path inside `dir` as an occupant outright — never a silent
+/// skip. The marker compares as bytes so a non-UTF-8 spelling is
+/// handled the same way.
+pub(crate) fn strip_deleted_marker(cwd: &Path) -> (PathBuf, bool) {
+    use std::os::unix::ffi::OsStrExt;
+    const MARKER: &[u8] = b" (deleted)";
+    match cwd.as_os_str().as_bytes().strip_suffix(MARKER) {
+        Some(spelling) => (PathBuf::from(std::ffi::OsStr::from_bytes(spelling)), true),
+        None => (cwd.to_path_buf(), false),
+    }
+}
+
 /// Whether a child's reported cwd is the launch directory or inside it.
 /// Both sides are canonicalized so symlinked temp roots and `.`/`..`
-/// spellings compare equal; an unresolvable cwd is never a match.
+/// spellings compare equal; an unresolvable cwd is never a match. A
+/// ` (deleted)` marker is stripped first — membership judges the
+/// pre-deletion spelling.
 pub(crate) fn cwd_within(cwd: Option<&Path>, dir: &Path) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
-    std::fs::canonicalize(cwd).is_ok_and(|canon| canon.starts_with(dir))
+    let (cwd, _) = strip_deleted_marker(cwd);
+    std::fs::canonicalize(&cwd).is_ok_and(|canon| canon.starts_with(dir))
+}
+
+/// Whether a reported cwd places its process inside the launch scope:
+/// within `dir`, or under `SANDBOX_WORKSPACE` — a contained worker's
+/// launch workspace is bind-mounted at that root, so its
+/// `/proc/<pid>/cwd` resolves to the sandbox spelling rather than the
+/// host launch directory. Launch-scope call sites only — the bind
+/// judgment and the absence proof's scope union: the
+/// `processes_in_directory` contract answers "cwd inside `dir`" alone,
+/// and widening that answer would report the sandbox's occupants to
+/// every scanned directory. A ` (deleted)` marker is stripped so a
+/// deleted mount spelling still reads as the sandbox workspace.
+pub(crate) fn cwd_in_launch_scope(cwd: Option<&Path>, dir: &Path) -> bool {
+    cwd_within(cwd, dir)
+        || cwd
+            .map(|cwd| strip_deleted_marker(cwd).0)
+            .is_some_and(|cwd| cwd.starts_with(containment::SANDBOX_WORKSPACE))
+}
+
+/// Every process one scan mechanism could map to a working directory:
+/// `mapped` is the pid set the completeness gate checks, `cwds` the
+/// pid → cwd pairs the occupant filter reads.
+struct CwdScan {
+    mapped: HashSet<i32>,
+    cwds: Vec<(i32, PathBuf)>,
+}
+
+/// One `lsof -d cwd` pass maps every inspectable pid to its working
+/// directory — per-pid lookups would not scale to a system-wide
+/// absence proof. Field output (`p`/`n` pairs) is parsed positionally:
+/// a process lsof cannot inspect simply has no `n` line and cannot be
+/// placed inside the scanned directory. The `n` text is kept verbatim:
+/// lsof appends ` (deleted)` to a deleted directory's name just as
+/// `/proc` does, and the occupant filter reads that marker.
+fn lsof_cwds() -> Result<CwdScan, String> {
+    let out = Command::new("lsof")
+        .args(["-d", "cwd", "-F", "pn"])
+        .output()
+        .map_err(|e| format!("lsof spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "lsof failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut mapped = HashSet::new();
+    let mut cwds = Vec::new();
+    let mut pid: Option<i32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pid = rest.trim().parse().ok();
+        } else if let Some(path) = line.strip_prefix('n')
+            && let Some(pid) = pid
+        {
+            mapped.insert(pid);
+            cwds.push((pid, PathBuf::from(path)));
+        }
+    }
+    Ok(CwdScan { mapped, cwds })
+}
+
+/// The same table read straight out of `/proc`: each numeric entry's
+/// `cwd` symlink. A process whose link cannot be read — it exited, is
+/// a zombie, or belongs to a user this one cannot inspect — is simply
+/// unmapped, exactly as under lsof; the completeness gate decides
+/// whether that is a gap. Rows keep the raw link target: a deleted
+/// working directory's ` (deleted)` marker is evidence the occupant
+/// filter reads, not noise to discard here.
+#[cfg(target_os = "linux")]
+fn proc_cwds() -> Result<CwdScan, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc scan failed: {e}"))?;
+    let mut mapped = HashSet::new();
+    let mut cwds = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if let Ok(cwd) = std::fs::read_link(entry.path().join("cwd")) {
+            mapped.insert(pid);
+            cwds.push((pid, cwd));
+        }
+    }
+    Ok(CwdScan { mapped, cwds })
+}
+
+/// Non-Linux platforms have no `/proc`; without lsof the scan cannot
+/// enumerate at all and must fail closed.
+#[cfg(not(target_os = "linux"))]
+fn proc_cwds() -> Result<CwdScan, String> {
+    Err("no /proc filesystem on this platform".into())
+}
+
+/// The working-directory table the absence proof enumerates over.
+/// `lsof` is the primary mechanism; when it cannot produce a table —
+/// absent from the image, or a failed run — the fallback enumerates
+/// `/proc/<pid>/cwd` directly, the same table lsof reports on Linux.
+/// `Err` means neither mechanism could enumerate — never a silent
+/// empty table the absence proof could read as "no occupants".
+fn directory_cwds() -> Result<CwdScan, String> {
+    with_proc_fallback(lsof_cwds())
+}
+
+/// Mechanism selection, split from `directory_cwds` so a test can
+/// drive the lsof-failure arm without shadowing PATH.
+fn with_proc_fallback(lsof: Result<CwdScan, String>) -> Result<CwdScan, String> {
+    match lsof {
+        Err(lsof_err) => proc_cwds()
+            .map_err(|proc_err| format!("directory process scan failed: {lsof_err}; {proc_err}")),
+        ok => ok,
+    }
+}
+
+/// `PF_KTHREAD` — field 9 of `/proc/<pid>/stat` — marks a kernel
+/// thread in every PID namespace. The field is counted after `comm`,
+/// whose parenthesized text may itself contain spaces and `)`, so
+/// parsing resumes after the LAST `)`.
+#[cfg(target_os = "linux")]
+const PF_KTHREAD: u64 = 0x0020_0000;
+
+#[cfg(target_os = "linux")]
+fn proc_stat_flags(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(6)?.parse().ok()
+}
+
+/// Whether `pid` is a kernel thread — the only kind of live process
+/// that can never hold a working directory, so its unmappable cwd is
+/// no enumeration gap. Without the exclusion a scan running as root
+/// could never complete: kernel threads share the euid and never map
+/// a cwd under any mechanism. On Linux the marker is `PF_KTHREAD`,
+/// which holds in every PID namespace — the pid-2 descent test does
+/// not: inside a container namespace pid 2 is ordinary userspace, and
+/// exempting it would let a live writer slip the completeness gate.
+/// An unreadable stat is not proof of kernel-ness — the process stays
+/// a gap and the scan fails closed. On macOS the kernel enters the
+/// process table as `kernel_task`, pid 0.
+#[cfg(target_os = "linux")]
+fn is_kernel_thread(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| proc_stat_flags(&stat))
+        .is_some_and(|flags| flags & PF_KTHREAD != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_kernel_thread(pid: i32) -> bool {
+    pid == 0
 }
 
 /// Every process identity the store already accounts for — leaders,
@@ -342,6 +539,167 @@ impl PosixProcessControl {
 fn apply_worker_env(cmd: &mut Command, env: &WorkerEnv) {
     cmd.env_clear();
     cmd.envs(env.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+}
+
+/// How the directory-occupant scan treats a reported cwd that reads
+/// inside `dir` but the host cannot resolve — a mount-namespace
+/// spelling (the sandbox workspace root) with no host inode behind
+/// it. A ` (deleted)`-marked cwd is judged before this split: the
+/// marker reports the exact directory the process was in, so a
+/// marked spelling inside `dir` is a known occupant under either
+/// contract, never an ambiguous spelling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnresolvedOccupant {
+    /// `processes_in_directory`: the path cannot be proven outside
+    /// `dir`, so the enumeration is incomplete and the whole read
+    /// fails — never a truncated proof set.
+    FailClosed,
+    /// `processes_in_namespace_dir`: under a namespace spelling of
+    /// `dir` the reported path IS the occupancy evidence, so the
+    /// process is returned with its literal cwd — data the caller's
+    /// recorded-occupant filter judges per pid.
+    Report,
+}
+
+/// The working-directory occupant scan behind both directory
+/// queries. `processes_in_directory` and
+/// `processes_in_namespace_dir` share the process table, the
+/// completeness gate, and the canonical containment judgment; they
+/// differ only at the unresolvable-spelling edge
+/// (`UnresolvedOccupant`).
+fn directory_occupants(
+    dir: &Path,
+    unresolved: UnresolvedOccupant,
+) -> Result<Vec<ProcessMatch>, String> {
+    // Enumerate this user's processes before the cwd pass: the
+    // absence proof is only as strong as the table's completeness
+    // — a live process whose cwd cannot be mapped could be inside
+    // `dir`, so the scan is `Err` whenever a same-user live
+    // process has no readable cwd. Reading the pid list first
+    // means a process born between the two reads is never misread
+    // as a gap; one that exits between them drops out on the
+    // liveness re-verify below. Another user's unreadable process
+    // cannot be this supervisor's spawn and stays the documented
+    // residual.
+    let euid = unsafe { libc::geteuid() };
+    let table =
+        ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
+    let mut same_user_pids = Vec::new();
+    for line in table.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
+            return Err(format!("incomplete process-table row: {line}"));
+        };
+        let pid: i32 = pid
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+        // `ps` prints some kernel/nobody uids as negatives on macOS
+        // (nobody is -2); a signed parse keeps those legitimate
+        // rows and they can never equal the non-negative euid, so
+        // the comparison stays fail-closed.
+        let uid: i64 = uid
+            .parse()
+            .map_err(|_| format!("invalid process-table row: {line}"))?;
+        if uid == euid as i64 {
+            same_user_pids.push(pid);
+        }
+    }
+    // One pass maps every inspectable pid to its working directory
+    // — per-pid lookups would not scale to a system-wide absence
+    // proof. `lsof` is the primary mechanism and `/proc` the Linux
+    // fallback (`directory_cwds`); a process neither could map
+    // simply has no cwd row and the completeness gate decides
+    // whether that is a gap.
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let scan = directory_cwds()?;
+    // Completeness gate before any occupant answer: a live
+    // same-user process the scan could not map to a cwd makes the
+    // whole enumeration partial — its cwd might be inside `dir`,
+    // so the table can never authorize absence.
+    for pid in same_user_pids {
+        if scan.mapped.contains(&pid) {
+            continue;
+        }
+        match lstart_of(pid) {
+            // Exited between the pid-list and cwd reads — not a
+            // gap, just a process that was already gone.
+            LstartLookup::Absent => continue,
+            LstartLookup::Failed(reason) => return Err(reason),
+            LstartLookup::Present(_) => {}
+        }
+        // Gone between the liveness check and the stat read, or a
+        // zombie — either way it cannot write inside `dir`.
+        let Some(stat) = stat_of(pid) else {
+            continue;
+        };
+        if stat.contains('Z') {
+            continue;
+        }
+        // A kernel thread can never hold a working directory — it
+        // cannot occupy `dir`, so its unmappable cwd is no gap.
+        if is_kernel_thread(pid) {
+            continue;
+        }
+        return Err(format!(
+            "directory scan incomplete: live process {pid} has no readable cwd"
+        ));
+    }
+    let mut out = Vec::new();
+    for (pid, cwd) in scan.cwds {
+        // `cwd_within` canonicalizes the reported path and treats
+        // an unresolvable cwd as "not inside" — but a reported
+        // path spelled inside `dir` cannot be proven outside it
+        // either (a mount-namespace spelling no host inode backs).
+        // The pid is already mapped, so skipping it here would slip
+        // it past the completeness gate: the genuine scan fails
+        // closed, the namespace query reports the literal
+        // spelling as an occupant the caller judges per pid. A
+        // ` (deleted)` marker is not ambiguous that way — it is
+        // the mechanism reporting the exact directory the process
+        // WAS in, so a marked spelling inside `dir` is a known
+        // occupant under either contract; judged raw it would
+        // never match and the pid would silently skip into a
+        // clear table, the forbidden outcome.
+        let (cwd, deleted) = strip_deleted_marker(&cwd);
+        let marked_inside = deleted && cwd.starts_with(&dir);
+        let unresolvable_inside =
+            !deleted && std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir);
+        if unresolvable_inside && unresolved == UnresolvedOccupant::FailClosed {
+            return Err(format!(
+                "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                cwd.display()
+            ));
+        }
+        if !marked_inside && !unresolvable_inside && !cwd_within(Some(&cwd), &dir) {
+            continue;
+        }
+        // Same re-verification as the signature scan: a pid that
+        // exited between the cwd pass and now drops out, and a
+        // start-time lookup failure fails the whole scan — a
+        // partial table can never authorize absence.
+        let started_at = match lstart_of(pid) {
+            LstartLookup::Present(s) => s,
+            LstartLookup::Absent => continue,
+            LstartLookup::Failed(reason) => return Err(reason),
+        };
+        if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
+            continue;
+        }
+        let pgid = unsafe { libc::getpgid(pid) };
+        out.push(ProcessMatch {
+            identity: ProcessIdentity {
+                pid,
+                started_at,
+                pgid: if pgid > 0 { Some(pgid) } else { None },
+            },
+            cwd: Some(cwd),
+            command: None,
+        });
+    }
+    Ok(out)
 }
 
 impl ProcessControlPort for PosixProcessControl {
@@ -500,141 +858,11 @@ impl ProcessControlPort for PosixProcessControl {
     }
 
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
-        // Enumerate this user's processes before the `lsof` pass: the
-        // absence proof is only as strong as the table's completeness
-        // — a live process whose cwd cannot be mapped could be inside
-        // `dir`, so the scan is `Err` whenever a same-user live
-        // process has no readable cwd. Reading the pid list first
-        // means a process born between the two reads is never misread
-        // as a gap; one that exits between them drops out on the
-        // liveness re-verify below. Another user's unreadable process
-        // cannot be this supervisor's spawn and stays the documented
-        // residual.
-        let euid = unsafe { libc::geteuid() };
-        let table =
-            ps_output(&["-ewwo", "pid=,uid="]).map_err(|e| format!("process scan failed: {e}"))?;
-        let mut same_user_pids = Vec::new();
-        for line in table.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            let (Some(pid), Some(uid)) = (it.next(), it.next()) else {
-                return Err(format!("incomplete process-table row: {line}"));
-            };
-            let pid: i32 = pid
-                .parse()
-                .map_err(|_| format!("invalid process-table row: {line}"))?;
-            // `ps` prints some kernel/nobody uids as negatives on macOS
-            // (nobody is -2); a signed parse keeps those legitimate
-            // rows and they can never equal the non-negative euid, so
-            // the comparison stays fail-closed.
-            let uid: i64 = uid
-                .parse()
-                .map_err(|_| format!("invalid process-table row: {line}"))?;
-            if uid == euid as i64 {
-                same_user_pids.push(pid);
-            }
-        }
-        // One `lsof -d cwd` pass maps every inspectable pid to its
-        // working directory — per-pid lookups would not scale to a
-        // system-wide absence proof. Field output (`p`/`n` pairs) is
-        // parsed positionally: a process lsof cannot inspect simply
-        // has no `n` line and cannot be placed inside `dir`.
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let out = Command::new("lsof")
-            .args(["-d", "cwd", "-F", "pn"])
-            .output()
-            .map_err(|e| format!("directory process scan failed: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "lsof failed ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let mut mapped = HashSet::new();
-        let mut occupants = Vec::new();
-        let mut pid: Option<i32> = None;
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some(rest) = line.strip_prefix('p') {
-                pid = rest.trim().parse().ok();
-            } else if let Some(path) = line.strip_prefix('n')
-                && let Some(pid) = pid
-            {
-                mapped.insert(pid);
-                occupants.push((pid, PathBuf::from(path)));
-            }
-        }
-        // Completeness gate before any occupant answer: a live
-        // same-user process lsof could not map to a cwd makes the
-        // whole enumeration partial — its cwd might be inside `dir`,
-        // so the table can never authorize absence.
-        for pid in same_user_pids {
-            if mapped.contains(&pid) {
-                continue;
-            }
-            match lstart_of(pid) {
-                // Exited between the pid-list and lsof reads — not a
-                // gap, just a process that was already gone.
-                LstartLookup::Absent => continue,
-                LstartLookup::Failed(reason) => return Err(reason),
-                LstartLookup::Present(_) => {}
-            }
-            // Gone between the liveness check and the stat read, or a
-            // zombie — either way it cannot write inside `dir`.
-            let Some(stat) = stat_of(pid) else {
-                continue;
-            };
-            if stat.contains('Z') {
-                continue;
-            }
-            return Err(format!(
-                "directory scan incomplete: live process {pid} has no readable cwd"
-            ));
-        }
-        let mut out = Vec::new();
-        for (pid, cwd) in occupants {
-            // `cwd_within` canonicalizes the reported path and treats
-            // an unresolvable cwd as "not inside" — but a reported
-            // path spelled inside `dir` cannot be proven outside it
-            // either (a live writer whose cwd was deleted). `mapped`
-            // already holds the pid, so skipping it here would slip
-            // it past the completeness gate: fail the scan instead,
-            // matching the same fail-closed contract.
-            if std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
-                return Err(format!(
-                    "directory scan incomplete: process {pid} cwd {} is not resolvable",
-                    cwd.display()
-                ));
-            }
-            if !cwd_within(Some(&cwd), &dir) {
-                continue;
-            }
-            // Same re-verification as the signature scan: a pid that
-            // exited between the lsof pass and now drops out, and a
-            // start-time lookup failure fails the whole scan — a
-            // partial table can never authorize absence.
-            let started_at = match lstart_of(pid) {
-                LstartLookup::Present(s) => s,
-                LstartLookup::Absent => continue,
-                LstartLookup::Failed(reason) => return Err(reason),
-            };
-            if stat_of(pid).is_some_and(|stat| stat.contains('Z')) {
-                continue;
-            }
-            let pgid = unsafe { libc::getpgid(pid) };
-            out.push(ProcessMatch {
-                identity: ProcessIdentity {
-                    pid,
-                    started_at,
-                    pgid: if pgid > 0 { Some(pgid) } else { None },
-                },
-                cwd: Some(cwd),
-                command: None,
-            });
-        }
-        Ok(out)
+        directory_occupants(dir, UnresolvedOccupant::FailClosed)
+    }
+
+    fn processes_in_namespace_dir(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        directory_occupants(dir, UnresolvedOccupant::Report)
     }
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
@@ -3440,8 +3668,8 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // wrapped argv cannot be reconstructed — the orphan's
         // signature is then unprovable, so stay uncertain rather than
         // declare absence on an incomplete search.
-        match self.containment_gate(&binding.argv, now_unix_seconds)? {
-            Ok(Gate::Uncontained) => {}
+        let contained = match self.containment_gate(&binding.argv, now_unix_seconds)? {
+            Ok(Gate::Uncontained) => false,
             Err(_) => {
                 return self.report_unidentified_unknown(
                     store,
@@ -3510,8 +3738,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                         );
                     }
                 }
+                true
             }
-        }
+        };
         let mut matches = Vec::new();
         for signature in &signatures {
             match self.port.matching_processes(signature) {
@@ -3567,11 +3796,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // is exactly the launch's workspace bind, so it satisfies the
         // same "inside the launch directory" rule.
         match unrecorded.as_slice() {
-            [child]
-                if cwd_within(child.cwd.as_deref(), &canonical_dir)
-                    || child.cwd.as_deref()
-                        == Some(std::path::Path::new(containment::SANDBOX_WORKSPACE)) =>
-            {
+            [child] if cwd_in_launch_scope(child.cwd.as_deref(), &canonical_dir) => {
                 let child = *child;
                 // Descendant coverage starts at re-bind, same as at a
                 // normal launch; a failed table read is not a bind
@@ -3661,7 +3886,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     && execution.uncertain_since_unix_seconds.is_some_and(|since| {
                         now_unix_seconds - since >= UNIDENTIFIED_LAUNCH_ABSENT_SECONDS
                     })
-                    && self.launch_dir_clear(&canonical_dir, &recorded);
+                    && self.launch_dir_clear(&canonical_dir, contained, &recorded);
                 if absence_proven {
                     self.report(
                         store,
@@ -3698,13 +3923,43 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// enumeration — a live process whose cwd the port cannot map is
     /// a possible occupant — proves nothing: fail closed, stay
     /// uncertain.
-    fn launch_dir_clear(&self, dir: &Path, recorded: &HashSet<(i32, String)>) -> bool {
-        match self.port.processes_in_directory(dir) {
+    ///
+    /// The launch scope is `dir` plus, for a contained launch, the
+    /// sandbox workspace root: the worker's mount namespace binds the
+    /// launch workspace at `SANDBOX_WORKSPACE` and chdirs into it, so a
+    /// contained escapee's `/proc` cwd reads `/workspace` and never
+    /// lands inside the host dir. `processes_in_directory` stays
+    /// unscoped — each scan answers "cwd inside this dir" alone — so
+    /// the launch scope is one scan per root and an unexplained
+    /// occupant in either keeps absence unproven.
+    fn launch_dir_clear(
+        &self,
+        dir: &Path,
+        contained: bool,
+        recorded: &HashSet<(i32, String)>,
+    ) -> bool {
+        let clear = |occupants: Result<Vec<ProcessMatch>, String>| match occupants {
             Ok(occupants) => occupants
                 .iter()
                 .all(|m| recorded.contains(&(m.identity.pid, m.identity.started_at.clone()))),
             Err(_) => false,
-        }
+        };
+        // The sandbox root is a mount-namespace spelling, not a host
+        // dir: on a host with no real `/workspace` every live
+        // contained worker's `/proc` cwd reads `/workspace` and
+        // cannot canonicalize, which fails the genuine scan before
+        // the recorded filter ever runs — another execution's
+        // recorded contained worker would hold absence unprovable
+        // forever. The namespace query reports that spelling as an
+        // occupant instead, so the same recorded judgment applies
+        // per pid: a recorded contained worker no longer blocks,
+        // an unexplained one still does.
+        clear(self.port.processes_in_directory(dir))
+            && (!contained
+                || clear(
+                    self.port
+                        .processes_in_namespace_dir(Path::new(containment::SANDBOX_WORKSPACE)),
+                ))
     }
 
     /// Report an unidentified launch as still unknown — the same
@@ -4689,6 +4944,134 @@ mod tests {
         assert!(checked_ps_output(output(1, b"process table unavailable"), true).is_err());
         assert!(checked_ps_output(output(2, b""), true).is_err());
         assert!(checked_ps_output(output(1, b""), false).is_err());
+    }
+
+    /// A Linux scan without lsof still enumerates — `/proc/<pid>/cwd`
+    /// carries the same table. The calling test process is the
+    /// fixture: its own cwd must appear in both the whole-table scan
+    /// and the single-pid read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_fallback_maps_cwds_without_lsof() {
+        let pid = std::process::id() as i32;
+        let scan = with_proc_fallback(Err("injected lsof failure".into()))
+            .expect("/proc fallback enumerates");
+        assert!(scan.mapped.contains(&pid));
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(
+            scan.cwds
+                .iter()
+                .any(|(p, c)| *p == pid && std::fs::canonicalize(c).ok().as_ref() == Some(&cwd)),
+            "the /proc scan maps this process's cwd"
+        );
+        let single = proc_cwd_of(pid).expect("own cwd through /proc");
+        assert_eq!(std::fs::canonicalize(single).unwrap(), cwd);
+    }
+
+    /// `PF_KTHREAD` (field 9) marks a kernel thread in every PID
+    /// namespace; the parser must count past a `comm` that itself
+    /// contains spaces and `)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_flags_reads_flags_past_comm() {
+        // `kthreadd` carries PF_KTHREAD in field 9.
+        assert_eq!(
+            proc_stat_flags("2 (kthreadd) S 0 0 0 0 0 2097152 0 0"),
+            Some(0x0020_0000)
+        );
+        // A userspace row never does.
+        assert_eq!(
+            proc_stat_flags("42 (worker) S 1 42 42 0 -1 4194304 0"),
+            Some(4194304)
+        );
+        // Splitting on the FIRST `)` would misfield a `comm` like this.
+        assert_eq!(
+            proc_stat_flags("7 (odd ) name) S 1 7 7 0 -1 2097152 0"),
+            Some(0x0020_0000)
+        );
+        // Malformed input yields no answer rather than a wrong one.
+        assert_eq!(proc_stat_flags("garbage"), None);
+        assert_eq!(proc_stat_flags("5 (x) S 1"), None);
+    }
+
+    /// The live check agrees: pid 1 is userspace in every PID
+    /// namespace — including a container's, where pid 2 is userspace
+    /// too — and an unreadable stat is never kernel-thread proof, so
+    /// the completeness gate stays fail-closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_thread_check_uses_stat_flags_not_pid2() {
+        assert!(!is_kernel_thread(1));
+        assert!(!is_kernel_thread(std::process::id() as i32));
+        assert!(!is_kernel_thread(i32::MAX));
+    }
+
+    /// A contained worker's cwd reads as the sandbox mount, not the
+    /// host launch directory — launch scope counts `/workspace` (and
+    /// paths under it) as inside, so the occupant filter cannot miss
+    /// a live contained descendant.
+    #[test]
+    fn launch_scope_covers_the_sandbox_workspace_mount() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let sandbox = Path::new(containment::SANDBOX_WORKSPACE);
+        assert!(cwd_in_launch_scope(Some(sandbox), &dir));
+        assert!(cwd_in_launch_scope(Some(&sandbox.join("nested")), &dir));
+        assert!(cwd_in_launch_scope(Some(dir.as_path()), &dir));
+        assert!(!cwd_in_launch_scope(Some(Path::new("/")), &dir));
+        assert!(!cwd_in_launch_scope(None, &dir));
+        // Component-wise matching: a sibling spelling does not count.
+        assert!(!cwd_in_launch_scope(
+            Some(Path::new("/workspace-sibling")),
+            &dir
+        ));
+        // The port contract predicate never widens to the sandbox —
+        // `processes_in_directory` answers "cwd inside `dir`" alone,
+        // so the launch scope is layered on by its call sites, not by
+        // the shared filter.
+        assert!(!cwd_within(Some(sandbox), &dir));
+        assert!(!cwd_within(Some(&sandbox.join("nested")), &dir));
+        assert!(cwd_within(Some(dir.as_path()), &dir));
+    }
+
+    /// `/proc/<pid>/cwd` (and lsof) annotate a deleted working
+    /// directory's reported path with ` (deleted)` — a marker, not
+    /// part of the path. Membership judges the pre-deletion
+    /// spelling, and the flag carries the "the process WAS there"
+    /// evidence the scan counts as occupancy.
+    #[test]
+    fn deleted_marker_judges_the_pre_deletion_spelling() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let marked = PathBuf::from(format!("{} (deleted)", dir.display()));
+        assert_eq!(strip_deleted_marker(&marked), (dir.clone(), true));
+        assert_eq!(strip_deleted_marker(&dir), (dir.clone(), false));
+        // Only a trailing marker goes — mid-path spellings and other
+        // suffixes are untouched.
+        let other = dir.join("a (deleted) dir");
+        assert_eq!(strip_deleted_marker(&other), (other, false));
+        // `cwd_within` strips too: a marked spelling of a live dir
+        // compares by the pre-deletion path.
+        assert!(cwd_within(Some(&marked), &dir));
+        // A marked sandbox mount still reads in launch scope — a
+        // contained worker's `/workspace` stays attributable even
+        // after the mount dir is gone — while a marked sibling
+        // spelling stays outside: membership is component-wise on
+        // the pre-deletion path.
+        assert!(cwd_in_launch_scope(
+            Some(Path::new("/workspace (deleted)")),
+            &dir
+        ));
+        assert!(!cwd_in_launch_scope(
+            Some(Path::new("/workspace-sibling (deleted)")),
+            &dir
+        ));
+    }
+
+    /// With no working mechanism the scan is `Err` — an empty table
+    /// would read back as a false absence proof.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn directory_scan_fails_closed_when_no_mechanism_enumerates() {
+        assert!(with_proc_fallback(Err("injected lsof failure".into())).is_err());
     }
 
     struct SnapshotFailure;

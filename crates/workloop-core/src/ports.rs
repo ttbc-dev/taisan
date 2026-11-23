@@ -271,8 +271,30 @@ pub trait ProcessControlPort {
     /// never a truncated proof set, the same rule
     /// `matching_processes` applies. A process the port cannot even
     /// observe (e.g. one that changed uid) is the documented
-    /// residual.
+    /// residual. A cwd the mechanism reports with its deleted marker
+    /// (` (deleted)` on `/proc` and lsof) is judged on its
+    /// pre-deletion spelling — the marker names the exact directory
+    /// the process was in, so a marked spelling inside `dir` is an
+    /// occupant, never a skipped row that reads back as a clear
+    /// table.
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        let _ = dir;
+        Err("directory process enumeration unsupported".into())
+    }
+
+    /// Every live process whose working directory reads inside `dir`,
+    /// for a `dir` that is a mount-namespace spelling the host may not
+    /// resolve — the sandbox workspace root a contained worker's cwd
+    /// reports as its own. The contract is `processes_in_directory`'s
+    /// except at the unresolvable-spelling edge: where the genuine
+    /// scan fails the whole read because a cwd spelled inside `dir`
+    /// cannot be proven outside it, this query reports that process
+    /// as an occupant carrying its literal spelling — under a
+    /// namespace `dir` the spelling IS the occupancy evidence, and
+    /// the caller judges each returned pid (the absence proof's
+    /// recorded-occupant filter). The completeness gate is unchanged:
+    /// a live process with no cwd mapping at all still fails the read.
+    fn processes_in_namespace_dir(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
         let _ = dir;
         Err("directory process enumeration unsupported".into())
     }

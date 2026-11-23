@@ -388,6 +388,9 @@ impl ProcessControlPort for CountingPosix {
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
         PosixProcessControl.processes_in_directory(dir)
     }
+    fn processes_in_namespace_dir(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        PosixProcessControl.processes_in_namespace_dir(dir)
+    }
     fn snapshot_descendants(&self, leader_pid: i32) -> Result<Vec<ProcessIdentity>, String> {
         PosixProcessControl.snapshot_descendants(leader_pid)
     }

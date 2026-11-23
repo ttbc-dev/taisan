@@ -72,7 +72,7 @@ struct Proc {
     /// When set, `matching_processes` reports `cwd: None` — a process
     /// whose working directory the platform cannot prove (denied
     /// lsof, minimal image). It can be neither bound nor ruled out,
-    /// and `processes_in_directory` errs on the incomplete table.
+    /// and the directory scans err on the incomplete table.
     cwd_unreadable: bool,
 }
 
@@ -100,9 +100,9 @@ struct State {
     /// enumeration that cannot complete must never authorize an
     /// absence claim.
     scan_errors: VecDeque<String>,
-    /// Queued `processes_in_directory` failures consumed FIFO — a
-    /// separate tool from the signature scan (`lsof` vs `ps`), so its
-    /// failures are queued separately.
+    /// Queued directory-scan failures consumed FIFO by either
+    /// directory query — a separate tool from the signature scan
+    /// (`lsof` vs `ps`), so its failures are queued separately.
     dir_scan_errors: VecDeque<String>,
     /// Every accepted signal, in order — the write history a scenario
     /// audits without pattern-matching internals.
@@ -225,7 +225,7 @@ impl ScriptedProcessControl {
     /// Make `matching_processes` report `cwd: None` for the pid until
     /// cleared — an lsof-denied or minimal-image process whose launch
     /// attribution cannot be proven either way. While it is live it
-    /// also makes `processes_in_directory` fail: an unmappable cwd is
+    /// also makes the directory scans fail: an unmappable cwd is
     /// an enumeration gap, never a silent absence.
     pub fn set_cwd_unreadable(&self, pid: i32, on: bool) {
         let mut s = self.state.lock().unwrap();
@@ -342,6 +342,89 @@ impl ScriptedProcessControl {
     /// The environment every `run_probe` was given, in call order.
     pub fn probe_envs(&self) -> Vec<WorkerEnv> {
         self.state.lock().unwrap().probe_envs.clone()
+    }
+
+    /// The shared scan behind both directory queries — the model's
+    /// cwd is ground truth: `cwd_within` canonicalizes host-backed
+    /// spellings, and a path no host inode backs (a contained
+    /// worker's `/workspace`) compares literally.
+    /// `report_unresolvable` selects the contract: the genuine scan
+    /// fails on such a spelling inside `dir` exactly like
+    /// `PosixProcessControl`; the namespace query reports it as
+    /// occupant data for the launch-scope filter instead.
+    fn directory_scan(
+        &self,
+        dir: &Path,
+        report_unresolvable: bool,
+    ) -> Result<Vec<ProcessMatch>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(reason) = s.dir_scan_errors.pop_front() {
+            return Err(reason);
+        }
+        // The model's cwd is provable unless flagged; a live process
+        // the scan cannot map makes the whole enumeration incomplete —
+        // like a real table read that cannot prove every row, the
+        // scan errs rather than return a truncated set an absence
+        // proof would read as clear.
+        if s.procs.values().any(|p| p.alive && p.cwd_unreadable) {
+            return Err("directory scan incomplete: process cwd unreadable".into());
+        }
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // A live process whose modeled cwd has no host inode yet is
+        // spelled inside `dir` — a contained worker's `/workspace`
+        // under the sandbox-root scan — is the real port's
+        // fail-closed edge: the genuine scan errs on the same table
+        // rather than silently drop the pid; only the namespace
+        // query surfaces it as data. A ` (deleted)`-marked cwd is
+        // not ambiguous that way: the marker reports the exact
+        // directory the process was in, so the model counts a
+        // marked spelling inside `dir` as an occupant — the same
+        // table the real port produces — under either contract.
+        if !report_unresolvable {
+            for (pid, p) in &s.procs {
+                if !p.alive {
+                    continue;
+                }
+                let (cwd, deleted) = crate::supervisor::strip_deleted_marker(&p.cwd);
+                if !deleted && std::fs::canonicalize(&cwd).is_err() && cwd.starts_with(&dir) {
+                    return Err(format!(
+                        "directory scan incomplete: process {pid} cwd {} is not resolvable",
+                        cwd.display()
+                    ));
+                }
+            }
+        }
+        Ok(s.procs
+            .iter()
+            // The contract is "cwd inside `dir`" — never widened to
+            // the launch scope; the supervisor layers
+            // `SANDBOX_WORKSPACE` on at its own call sites. The
+            // namespace query additionally counts an unresolvable
+            // spelling inside `dir`, matching the real port; both
+            // queries count a ` (deleted)`-marked spelling inside
+            // `dir` as an occupant.
+            .filter_map(|(pid, p)| {
+                if !p.alive {
+                    return None;
+                }
+                let (cwd, deleted) = crate::supervisor::strip_deleted_marker(&p.cwd);
+                let inside = (deleted && cwd.starts_with(&dir))
+                    || crate::supervisor::cwd_within(Some(&cwd), &dir)
+                    || (report_unresolvable
+                        && !deleted
+                        && std::fs::canonicalize(&cwd).is_err()
+                        && cwd.starts_with(&dir));
+                inside.then(|| ProcessMatch {
+                    identity: ProcessIdentity {
+                        pid: *pid,
+                        started_at: p.started_at.clone(),
+                        pgid: p.pgid,
+                    },
+                    cwd: Some(cwd),
+                    command: Some(p.command.clone()),
+                })
+            })
+            .collect())
     }
 }
 
@@ -521,31 +604,11 @@ impl ProcessControlPort for ScriptedProcessControl {
     }
 
     fn processes_in_directory(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
-        let mut s = self.state.lock().unwrap();
-        if let Some(reason) = s.dir_scan_errors.pop_front() {
-            return Err(reason);
-        }
-        // The model's cwd is provable unless flagged; a live process
-        // the scan cannot map makes the whole enumeration incomplete —
-        // like a real table read that cannot prove every row, the
-        // scan errs rather than return a truncated set an absence
-        // proof would read as clear.
-        if s.procs.values().any(|p| p.alive && p.cwd_unreadable) {
-            return Err("directory scan incomplete: process cwd unreadable".into());
-        }
-        Ok(s.procs
-            .iter()
-            .filter(|(_, p)| p.alive && crate::supervisor::cwd_within(Some(&p.cwd), dir))
-            .map(|(pid, p)| ProcessMatch {
-                identity: ProcessIdentity {
-                    pid: *pid,
-                    started_at: p.started_at.clone(),
-                    pgid: p.pgid,
-                },
-                cwd: Some(p.cwd.clone()),
-                command: Some(p.command.clone()),
-            })
-            .collect())
+        self.directory_scan(dir, false)
+    }
+
+    fn processes_in_namespace_dir(&self, dir: &Path) -> Result<Vec<ProcessMatch>, String> {
+        self.directory_scan(dir, true)
     }
 
     fn inspect(&self, identity: &ProcessIdentity) -> ProcessEvidence {
