@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `12` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `11`
+//! `PRAGMA user_version` is the format gate: `13` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `12`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -48,9 +48,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `10` adds the `recovery_intents.retirement_generation` column (#139);
 /// `11` adds the `worker_request_bodies` canonical-body record for the
 /// versioned executable Worker request (`docs/v0.3.md`, #256);
-/// `12` adds the `finding_occurrences.summary` column (#264).
+/// `12` adds the `finding_occurrences.summary` column (#264);
+/// `13` adds the `observations_execution` evidence-lookup index.
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 12;
+pub(crate) const FORMAT_VERSION: i64 = 13;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
