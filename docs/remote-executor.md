@@ -4,8 +4,8 @@ Status: design specification for issue #372 under milestone v0.4
 ("Pluggable remote execution, review first"). This document defines the
 executor-ownership boundary, the two supported execution modes, the
 custody contract between one coordinator and one static remote
-endpoint, and the acceptance rows the dependent issues (#373–#386)
-implement and verify against. It is a specification design, not
+endpoint, and the acceptance rows the dependent issues (#373–#386
+plus the #416 manifest-custody decision) implement and verify against. It is a specification design, not
 implementation: it authorizes no runtime change, credential change,
 transport, store migration, live execution, publication, or Work
 completion, and it changes no v0.3 guard. Dependent implementation
@@ -248,8 +248,8 @@ any conforming transport must provide.
   is never a transferable artifact identity, and no `source_path`
   value crosses the wire.
 - The executor reconstructs the managed workspace from validated
-  objects — `work/<work_id>` at the pinned base — into its own state
-  root. There is no shared working tree, shared object store, network
+  objects — the `ws-<work_id>` checkout on branch `work/<work_id>` at
+  the pinned base — into its own state root. There is no shared working tree, shared object store, network
   filesystem, or ambient home mount between coordinator and executor.
 - Produced output returns the same way it leaves locally: for
   writers, the sandboxed export (`base..produced` object closure plus
@@ -378,6 +378,8 @@ the milestone splits contract, mechanism, and environment:
 | Interchange suite rows and packaging/quickstart | #384/#385 | Compose the proven slices |
 | Automatic event-driven review arming (#309–#311, #322) | parallel milestone items | Remote review must not depend on webhook ingress; polling and the bounded reconciler supply arming facts. The milestone's automatic-review acceptance rides on those issues, not on this boundary |
 
+#416 is not an open item in this table because it is already decided: the remote handoff manifest is a fresh per-Invocation out-directory record (`handoff.json`) beside `report.json`, recorded in #416's `docs/handoff-manifest-custody.md` and consumed by §4 and #374 rather than left open here.
+
 ### 7.2 Intentionally open design points
 
 Recorded so downstream issues can depend on the answer existing, not
@@ -387,8 +389,8 @@ on this document having guessed it:
   the concrete identity (boot ID, key pair, generation counter) is a
   #374/#375 choice.
 - **Remote workspace retention** — §4.1 fixes construction: the
-  executor builds `work/<work_id>` from validated objects inside its
-  own state root. Whether the executor may then retain and reuse that
+  executor builds the `ws-<work_id>` workspace on branch
+  `work/<work_id>` from validated objects inside its own state root. Whether the executor may then retain and reuse that
   constructed workspace across Invocations of one Execution (the
   local persistence model) or must discard and rebuild it is
   #376/#377's trade-off — a retention/optimization question over the
