@@ -109,10 +109,19 @@ manual `submit` and driven by `taisan run`/`run --work`. Therefore:
   reconciliation of a due/in-flight run, disable semantics — are
   unexercised on the candidate. #271 remains open and this criterion
   must not be claimed.
-- Duplicate-writer/effect evidence available only for the manual path:
-  each run's `host_action_intents` holds exactly one `push_ref` and
-  one `open_change_request` per publication, all `applied` once; no
-  Work was dispatched twice.
+- Duplicate-writer/effect evidence (manual path only): **run 3**
+  (post-#421) is the clean publication — `state-reverify2/store.db`
+  holds exactly one `push_ref` intent and one `open_change_request`
+  intent, each `applied` once
+  (`act-abf9cb71-…`/`act-20c0d696-…`). **Run 2**'s publish leg
+  recorded three `push_ref` intents that all `failed` identically
+  (`act-a53d7e32-…`, `act-6bcbbde5-…`, `act-a27c9d6b-…`, HTTP 401
+  → #420) — the bounded re-issue path after a definite failure, never
+  an applied or duplicated effect; no remote ref was created. **Run
+  1**'s H1 publication used recorded operator workarounds (Git
+  Database API staging plus a bridge push) rather than the adapter
+  intent path, so it is not clean-path duplicate-effect evidence. No
+  Work was dispatched twice in any run.
 - Intervention counts (manual runs): run 1 lists six operator
   workarounds plus four Attention-gate navigations; run 2 lists two
   required operator inputs (ambient `GH_TOKEN` by design, declared
@@ -145,6 +154,7 @@ not treated as a confirmed defect.
 | #364 — staged runtime-auth never cleaned up | **Release-blocking** | Confirmed present: `resolve()` stages `<runtime_dir>/runtime-auth` before `validate_provider_config`/proxy start and returns `Err` with the file left behind (`boundary.rs:190-223`); `Drop` shuts down only the proxy (`boundary.rs:291-300`); no `remove_file`/`unstage` exists for the staged path. Credential material persists at a predictable path past refused resolutions, re-resolves, and process lifetime — contradicting the boundary's own contract that the secret exists in the staged file only while the grant needs it. Residual risk is bounded (0600, owner-only, mounted only for grants carrying `credential_file`) but this is a credential-hygiene defect in the boundary the release advertises; the owner may re-disposition to deferred. |
 | #422 — preflight does not probe `gh` version/features | **Explicitly deferred** | Environment-provisioning gap surfaced by run 3, not a code defect in the candidate: the guest's apt-default `gh` 2.45.0 lacks `gh api --slurp`, collapsing adapter list calls into opaque `read_indeterminate` skips; upgrading to `gh` 2.105.0 unblocked the run. Documented environment requirement and a design-TBD follow-up (preflight version probe and/or fail-loud transport errors); not release-blocking. |
 | #420 — git push `Bearer` auth 401 for `gho_` tokens | **Fixed and verified live** | Closed via PR #421 (merged `4464c4f`): push authenticates as `Basic x-access-token:<token>` and unencodable credentials refuse before spawn. Run 3 verified live: `push_ref` applied, `ref_published` recorded, PR #64 opened, where the same credential under `Bearer` had deterministically 401'd in run 2. |
+| Run-1 review finding — `greet(name)` with `name=None` raised `AttributeError` | **Fixed** (verified via the loop's own fix path) | The operator-posted inline finding on the isolated repository's PR #62 entered as a real review occurrence, was judged `fix`, and the bounded Fix Invocation produced `5c5cc6e`; republished head `35ce3cb` passed verification/review and `assess_completion` recorded `succeeded`. A defect in the produced change — not a taisan defect — dispositioned by the workflow itself; it is also the §3 real-review-finding → Fix → H2 → reassessment evidence, so it needs no separate repair issue. |
 
 ## 7. Live-run findings tracked to repair
 
