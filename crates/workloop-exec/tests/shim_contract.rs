@@ -329,6 +329,8 @@ fn a_lost_contained_launch_rebinds_by_the_wrapped_signature() {
             id: "test-lost-contained",
             env_passthrough: &[],
             sandbox_primitive: Some("sh"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         });
     let (_w, eid) = submit_and_admit(&store, "k-lost-contained");
     sup.consume_requests(&store, NOW).unwrap();
@@ -399,6 +401,8 @@ fn an_unresolvable_containment_primitive_refuses_the_launch() {
             id: "test-unresolvable-primitive",
             env_passthrough: &[],
             sandbox_primitive: Some("definitely-not-a-real-primitive-xyz"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         });
     let (_w, eid) = submit_and_admit(&store, "k-shim-ns");
     sup.consume_requests(&store, NOW).unwrap();
@@ -831,6 +835,8 @@ fn a_sandbox_scoped_escapee_blocks_absence_without_leaking_the_port_contract() {
             id: "test-sandbox-escapee",
             env_passthrough: &[],
             sandbox_primitive: Some("sh"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         });
     let (w, eid) = submit_and_admit(&store, "k-shim-sandbox-escapee");
     sup.consume_requests(&store, NOW).unwrap();
@@ -938,6 +944,8 @@ fn a_recorded_sandbox_occupant_does_not_block_the_absence_proof() {
             id: "test-sandbox-recorded",
             env_passthrough: &[],
             sandbox_primitive: Some("sh"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         });
     let (_w, eid) = submit_and_admit(&store, "k-shim-sandbox-recorded");
     sup.consume_requests(&store, NOW).unwrap();
@@ -1143,6 +1151,8 @@ fn a_v1_review_launch_mounts_the_workspace_read_only() {
         sandbox_primitive: Some(Box::leak(
             bwrap.to_string_lossy().into_owned().into_boxed_str(),
         )),
+        ca_trust_paths: &[],
+        commit_identity: None,
     });
     sup.consume_requests(&store, NOW).unwrap();
     let commands = port.spawned_commands();
@@ -1264,6 +1274,8 @@ fn a_contained_assessment_binds_the_workspace_read_only() {
             id: "test-contained-ro-mount",
             env_passthrough: &[],
             sandbox_primitive: Some("sh"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         });
     let (work, _eid) = submit_and_admit(&store, "k-ro-mount-writer");
     let (check_work, check_eid) = submit_and_admit(&store, "k-ro-mount-check");

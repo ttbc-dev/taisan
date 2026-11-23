@@ -145,6 +145,13 @@ pub struct MountPlan {
     /// host path so tool configuration that names them keeps working
     /// (verification sandboxes only).
     pub caches: Vec<PathBuf>,
+    /// The host CA trust-store paths the isolation profile declares —
+    /// bundle files and hashed directories bound read-only at their
+    /// own path (`ca_trust_binds` filters the declared list to paths
+    /// the host actually has). `/etc` stays unbound wholesale; these
+    /// are the narrow declared exception the contained runtimes' TLS
+    /// stacks need.
+    pub ca_bundles: Vec<PathBuf>,
     /// Absolute-path argv elements that exist on the host, bound
     /// read-only at their own path — a `python3 /opt/worker.py`
     /// launch keeps its script reachable. This can only ever expose
@@ -327,6 +334,21 @@ pub fn extra_binds(inner_argv: &[String], worker: Option<&Path>) -> Vec<PathBuf>
     binds
 }
 
+/// The host CA trust-store paths the profile declares, filtered to
+/// paths that exist on this host — each becomes a read-only own-path
+/// bind inside the sandbox. A declared path absent on the host is
+/// skipped, never relocated: the sandbox sees the trust store only
+/// where runtimes' compiled-in defaults already look.
+pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
+    profile
+        .ca_trust_paths
+        .iter()
+        .map(Path::new)
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 /// Refuse a mount plan whose binds would cover or enter the
 /// supervisor-owned sandbox surface. Every bind the plan mounts at
 /// its own spelling is checked — caches, argv-derived binds, the
@@ -358,6 +380,7 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
         .toolchain
         .iter()
         .chain(plan.caches.iter())
+        .chain(plan.ca_bundles.iter())
         .chain(plan.extra_binds.iter())
         .chain(plan.extra_rw_binds.iter())
         .chain(plan.worker.iter());
@@ -516,6 +539,9 @@ pub fn bwrap_args(
     }
     for cache in &plan.caches {
         args.extend(["--ro-bind".to_string(), s(cache), s(cache)]);
+    }
+    for bundle in &plan.ca_bundles {
+        args.extend(["--ro-bind".to_string(), s(bundle), s(bundle)]);
     }
     for extra in &plan.extra_binds {
         args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
@@ -799,6 +825,7 @@ fn invisible_canary(workspace_root: &Path, plan: &MountPlan) -> PathBuf {
     .into_iter()
     .flatten()
     .chain(plan.caches.iter().cloned())
+    .chain(plan.ca_bundles.iter().cloned())
     .chain(plan.extra_binds.iter().cloned())
     .chain(plan.extra_rw_binds.iter().cloned())
     .collect();
@@ -877,6 +904,7 @@ fn run_battery(
         proxy_sock: None,
         toolchain: None,
         caches: vec![],
+        ca_bundles: ca_trust_binds(profile),
         extra_binds: vec![],
         extra_rw_binds: vec![],
         worker: worker.map(Path::to_path_buf),
@@ -1307,6 +1335,7 @@ mod tests {
             proxy_sock: None,
             toolchain: None,
             caches: vec![],
+            ca_bundles: vec![],
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
             extra_rw_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
@@ -1544,6 +1573,12 @@ mod tests {
                 ("TMPDIR".into(), "/host/tmp".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/host/gitconfig".into()),
                 ("GIT_ALLOW_PROTOCOL".into(), "file".into()),
+                ("GIT_AUTHOR_NAME".into(), "taisan-worker".into()),
+                (
+                    "GIT_COMMITTER_EMAIL".into(),
+                    "taisan-worker@localhost".into(),
+                ),
+                ("SSL_CERT_FILE".into(), "/etc/ssl/cert.pem".into()),
             ],
         };
         let env = contained_env(&base, None);
@@ -1553,6 +1588,11 @@ mod tests {
         assert_eq!(map["GIT_CONFIG_GLOBAL"], "/taisan/gitconfig");
         assert_eq!(map["PATH"], "/usr/bin");
         assert_eq!(map["GIT_ALLOW_PROTOCOL"], "file");
+        // The declared commit identity and TLS pointers are bound at
+        // their own path inside the sandbox, so they pass verbatim.
+        assert_eq!(map["GIT_AUTHOR_NAME"], "taisan-worker");
+        assert_eq!(map["GIT_COMMITTER_EMAIL"], "taisan-worker@localhost");
+        assert_eq!(map["SSL_CERT_FILE"], "/etc/ssl/cert.pem");
         // No egress proxy was granted — no proxy variables exist.
         assert!(!map.contains_key("HTTPS_PROXY"));
         assert!(!map.contains_key("https_proxy"));
@@ -1690,6 +1730,76 @@ mod tests {
         );
     }
 
+    /// The declared CA trust paths are bound read-only at their own
+    /// absolute path — the sandbox sees the store only where the
+    /// runtimes' compiled-in TLS defaults already look.
+    #[test]
+    fn bwrap_args_bind_the_declared_ca_trust_paths_at_their_own_path() {
+        let mut plan = plan_fixture();
+        plan.ca_bundles = vec![
+            PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            PathBuf::from("/etc/pki/tls/certs"),
+        ];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        for path in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs"] {
+            assert!(
+                text.contains(&format!("--ro-bind {path} {path}")),
+                "declared CA path {path} binds read-only at its own path: {text}"
+            );
+            assert!(
+                !text.contains(&format!("--bind {path} {path}")),
+                "a CA bind is never writable: {text}"
+            );
+        }
+    }
+
+    /// A declared CA path covering or entering the supervisor-owned
+    /// sandbox surface is refused before it ever renders — the trust
+    /// binds go through the same own-path guard as caches and
+    /// argv-derived binds.
+    #[test]
+    fn plan_denial_refuses_a_ca_bundle_over_the_sandbox_surface() {
+        let mut plan = plan_fixture();
+        plan.ca_bundles = vec![PathBuf::from("/")];
+        assert!(plan_denial(&plan).is_some());
+        plan.ca_bundles = vec![PathBuf::from("/taisan")];
+        assert!(plan_denial(&plan).is_some());
+        plan.ca_bundles = vec![PathBuf::from("/workspace")];
+        assert!(plan_denial(&plan).is_some());
+        plan.ca_bundles = vec![];
+        assert!(plan_denial(&plan).is_none());
+    }
+
+    /// `ca_trust_binds` keeps only the declared paths that exist on
+    /// this host — an absent entry is skipped, never relocated.
+    #[test]
+    fn ca_trust_binds_keeps_only_existing_declared_paths() {
+        let dir = tmp("ca-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("bundle.pem");
+        std::fs::write(&present, "ca").unwrap();
+        let absent = dir.join("missing.pem");
+        let present_s: &'static str =
+            Box::leak(present.to_string_lossy().into_owned().into_boxed_str());
+        let absent_s: &'static str =
+            Box::leak(absent.to_string_lossy().into_owned().into_boxed_str());
+        let profile = IsolationProfile {
+            id: "test-ca-binds",
+            env_passthrough: &[],
+            sandbox_primitive: None,
+            ca_trust_paths: Box::leak(vec![absent_s, present_s].into_boxed_slice()),
+            commit_identity: None,
+        };
+        assert_eq!(ca_trust_binds(&profile), vec![present]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The canary cleanup reclaims only the probe's own temp-dir
     /// fallback — the workspace `.containment` dir is the evidence
     /// store and must survive the battery.
@@ -1737,6 +1847,8 @@ mod tests {
             id: "test-contained-v0.1",
             env_passthrough: &[],
             sandbox_primitive: Some("definitely-not-a-real-primitive-xyz"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         }
     }
 
@@ -1771,6 +1883,8 @@ mod tests {
                 id: FIXTURE_ISOLATION_PROFILE_ID,
                 env_passthrough: &[],
                 sandbox_primitive: None,
+                ca_trust_paths: &[],
+                commit_identity: None,
             },
             &["worker".into()],
             None,
@@ -1805,6 +1919,8 @@ mod tests {
             id: "test-contained-v0.1",
             env_passthrough: &[],
             sandbox_primitive: Some("bwrap"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         };
         let argv = vec!["/bin/sh".to_string()];
         let first = gate_with_resolvers(
@@ -1884,6 +2000,8 @@ mod tests {
             id: "test-contained-v0.1",
             env_passthrough: &[],
             sandbox_primitive: Some("bwrap"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         };
         let argv = vec!["/bin/sh".to_string()];
         let err = gate_with_resolvers(
@@ -1951,6 +2069,8 @@ mod tests {
             id: "test-contained-v0.1",
             env_passthrough: &[],
             sandbox_primitive: Some("bwrap"),
+            ca_trust_paths: &[],
+            commit_identity: None,
         };
         let argv = vec!["./gradlew".to_string(), "test".to_string()];
         // Worker resolution fails for a relative path with a
