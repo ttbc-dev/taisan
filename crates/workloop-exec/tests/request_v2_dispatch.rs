@@ -3435,6 +3435,44 @@ fn an_oversize_report_is_invalid_before_parsing() {
     assert_eq!(resolved.bytes.len() as u64, 1 << 20);
 }
 
+/// The declared fan-out ceiling is enforced at ingestion, not only
+/// later by the gate binder: a valid envelope carrying more member
+/// claims than the contract bound is `invalid(report.oversize)` and
+/// retains no parsed claim.
+#[test]
+fn an_oversize_verdict_member_set_is_invalid_at_ingestion() {
+    let flood = serde_json::Value::Array(
+        (0..=MAX_REPORT_MEMBERS)
+            .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "s"}))
+            .collect(),
+    )
+    .to_string();
+    let (_store, _state_root, _w, _e, _rid, facts) = run_report_mode(
+        "member-overflow",
+        "clean-exit",
+        &["--report-mode", "findings", "--findings", &flood],
+    );
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Invalid {
+            reasons: vec!["report.oversize".into()]
+        }
+    );
+    assert!(
+        report.as_ref().is_some_and(|r| !r.truncated),
+        "the whole under-byte-bound report is retained as invalid evidence"
+    );
+}
+
 #[test]
 fn a_symlinked_report_is_unsafe_never_followed() {
     let (_store, _state_root, _w, _e, _rid, facts) =
@@ -5079,32 +5117,39 @@ fn a_negative_review_report_with_findings_seals_them_as_occurrences() {
     assert_eq!(occurrences[0].source_key, "f-1");
 }
 
-/// Over the member cap the whole `findings[]` set is malformed
-/// evidence: the fact records `partial` and parses no member into an
-/// occurrence — the cap bounds the retained fan-out, matching the
-/// invariant-items treatment.
+/// A review whose report carries more members than the ceiling never
+/// reaches the gate binder: ingestion classifies the envelope
+/// `invalid(report.oversize)`, so no `Review` fact and no occurrence is
+/// recorded for a verdict that exceeded the declared fan-out bound.
 #[test]
-fn a_review_over_the_member_cap_records_partial_and_no_occurrences() {
+fn a_review_over_the_member_cap_is_invalid_and_binds_no_review() {
     let flood = serde_json::Value::Array(
         (0..=MAX_REPORT_MEMBERS)
             .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "s"}))
             .collect(),
     )
     .to_string();
-    // A success report carrying more members than the cap: the
-    // completeness check reads the flood as malformed evidence.
+    // A success report carrying more members than the cap is invalid
+    // evidence at ingestion; the gate binder emits nothing from it.
     let argv = v2_argv("clean-exit", &["--findings", &flood]);
     let rig = assess_rig("review-flood", argv, true);
     run_assessment_role(&rig, 1, InvocationRole::Review);
-    let reviews = review_facts(&rig.store, &rig.work_id);
-    assert_eq!(reviews.len(), 1, "{reviews:?}");
     assert!(
-        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "too_many_findings"),
-        "{:?}",
-        reviews[0].0
+        review_facts(&rig.store, &rig.work_id).is_empty(),
+        "an over-cap verdict binds no Review fact"
     );
-    assert_eq!(reviews[0].1, 0, "no member parses past the cap");
     assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+    let facts = report_facts(&rig.store, &rig.execution_id);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Invalid {
+            reasons: vec!["report.oversize".into()]
+        }
+    );
 }
 
 /// Record a target-branch revision observation — the axis
