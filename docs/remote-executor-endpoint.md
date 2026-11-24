@@ -111,6 +111,8 @@ requests/<request_id>/
   prepared/                          staged inputs (request.json, inputs/, bundle)
   workspace/                         worker workspace
   out/                               worker output (until acknowledge)
+  scratch/                           worker HOME, TMPDIR, generated
+                                     gitconfig (until acknowledge)
   runtime-auth                       staged runtime credential (mode 0600)
   stop_intent.json                   durable stop intent (fences late starts)
   stop_proof.json                    durable stop proof

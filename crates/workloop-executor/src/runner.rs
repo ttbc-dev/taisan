@@ -11,6 +11,7 @@
 //! observed `describe` declaration must match the digest the
 //! coordinator's launch configuration bound.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -992,10 +993,19 @@ impl Runner {
                         let proof = self.prove_stopped(record, &updated, "exit", "");
                         ObserveOutcome::Stopped { proof }
                     }
-                    Ok(_) => ObserveOutcome::Exited {
-                        evidence_ref: updated.evidence_ref,
-                        identity_digest: updated.identity_digest,
-                    },
+                    Ok(_) => {
+                        // Surviving members still run on the
+                        // authorized interval — a dead leader does
+                        // not exempt the request's recorded identity
+                        // set from the bound deadline.
+                        if let Some(outcome) = self.enforce_deadline(record, &updated) {
+                            return outcome;
+                        }
+                        ObserveOutcome::Exited {
+                            evidence_ref: updated.evidence_ref,
+                            identity_digest: updated.identity_digest,
+                        }
+                    }
                     Err(detail) => ObserveOutcome::Unknown {
                         code: "unknown",
                         detail,
@@ -1034,7 +1044,10 @@ impl Runner {
 
     /// Sweep every live request for an expired deadline — called on
     /// each incoming operation and by the serve loop's ticker so
-    /// enforcement does not depend on coordinator liveness.
+    /// enforcement does not depend on coordinator liveness. The
+    /// deadline binds the whole recorded identity set: a leader that
+    /// already exited leaves surviving descendants on authorized
+    /// time, and a fully-gone request earns its stop proof here.
     pub fn enforce_deadlines(&self, current_incarnation: &str) {
         let Ok(requests) = self.state.requests() else {
             return;
@@ -1046,9 +1059,7 @@ impl Runner {
             let Ok(Some(process)) = self.state.process(&record.request_id) else {
                 continue;
             };
-            if let ProcessEvidence::Alive { .. } = self.port.inspect(&process.leader) {
-                let _ = self.enforce_deadline(&record, &process);
-            }
+            let _ = self.enforce_deadline(&record, &process);
         }
     }
 
@@ -1334,12 +1345,22 @@ impl Runner {
         }
         let dir = self.request_dir(record);
         let out_dir = dir.join("out");
+        // Produced output shares `max_state_bytes` with the staged
+        // inputs still on disk — the endpoint storage bound covers
+        // both halves of a request's retained state (bounded_storage).
+        let staged = staged_bytes(&dir.join("prepared"));
+        let output_bound = record
+            .limits
+            .max_output_bytes
+            .min(self.max_state_bytes.saturating_sub(staged));
+        let mut collected = 0u64;
         let mut items: Vec<(CollectionItemRecord, Vec<u8>)> = Vec::new();
 
         let mut item = |name: &str, required: bool, source: &str| -> Result<bool, CollectOutcome> {
             let path = out_dir.join(name);
-            match read_regular_file(&path) {
+            match read_bounded_file(&path, output_bound.saturating_sub(collected)) {
                 Ok(bytes) => {
+                    collected += bytes.len() as u64;
                     items.push((
                         CollectionItemRecord {
                             item_id: name.to_string(),
@@ -1351,7 +1372,7 @@ impl Runner {
                     ));
                     Ok(true)
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ReadFailure::Missing) => {
                     if required {
                         Err(CollectOutcome::Incomplete {
                             code: "collection_incomplete",
@@ -1361,17 +1382,28 @@ impl Runner {
                         Ok(false)
                     }
                 }
+                // An over-bound member is refused before its body is
+                // buffered — and the over-limit bodies are reclaimed
+                // so the storage bound holds on disk, not only on the
+                // wire.
+                Err(ReadFailure::OverBound { bytes, bound }) => {
+                    let _ = std::fs::remove_dir_all(&out_dir);
+                    Err(CollectOutcome::Incomplete {
+                        code: "limit_exceeded",
+                        detail: format!(
+                            "{name} is {bytes} bytes; {bound} remain inside the output bound"
+                        ),
+                    })
+                }
                 // out/ is Worker-writable: a member that exists but is
                 // not a plain file — a symlink at a host path, a FIFO,
                 // a device — invalidates the collection rather than
                 // being followed or blocking the service lock.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                    Err(CollectOutcome::Invalid {
-                        code: "collection_invalid",
-                        detail: format!("{name}: {e}"),
-                    })
-                }
-                Err(e) => Err(CollectOutcome::Unknown {
+                Err(ReadFailure::NotRegular(detail)) => Err(CollectOutcome::Invalid {
+                    code: "collection_invalid",
+                    detail: format!("{name}: {detail}"),
+                }),
+                Err(ReadFailure::Io(e)) => Err(CollectOutcome::Unknown {
                     code: "unavailable",
                     detail: format!("{name}: {e}"),
                 }),
@@ -1419,8 +1451,9 @@ impl Runner {
                 };
             }
             // The produced object closure travels as one git bundle —
-            // real object transport, never a ref claim.
-            match self.bundle_objects(record, &manifest) {
+            // real object transport, never a ref claim. Its read is
+            // bounded by what remains of the output budget too.
+            match self.bundle_objects(record, &manifest, output_bound.saturating_sub(collected)) {
                 Ok(bundle) => {
                     items.push((
                         CollectionItemRecord {
@@ -1435,7 +1468,16 @@ impl Runner {
                         bundle,
                     ));
                 }
-                Err(detail) => {
+                Err(BundleFailure::OverBound { bytes, bound }) => {
+                    let _ = std::fs::remove_dir_all(&out_dir);
+                    return CollectOutcome::Incomplete {
+                        code: "limit_exceeded",
+                        detail: format!(
+                            "produced object bundle is {bytes} bytes; {bound} remain inside the output bound"
+                        ),
+                    };
+                }
+                Err(BundleFailure::Failed(detail)) => {
                     return CollectOutcome::Invalid {
                         code: "collection_invalid",
                         detail,
@@ -1444,13 +1486,6 @@ impl Runner {
             }
         }
 
-        let total: u64 = items.iter().map(|(i, _)| i.bytes).sum();
-        if total > record.limits.max_output_bytes {
-            return CollectOutcome::Incomplete {
-                code: "limit_exceeded",
-                detail: format!("output {total} bytes exceed max_output_bytes"),
-            };
-        }
         let mut entries: Vec<CollectionEntry> = items
             .iter()
             .map(|(i, _)| CollectionEntry {
@@ -1518,27 +1553,33 @@ impl Runner {
             } else {
                 dir.join(&item.source)
             };
-            match read_regular_file(&path) {
+            // Retained bodies are read under the same inline bound —
+            // an over-budget body is refused before it is buffered.
+            match read_bounded_file(&path, INLINE_COLLECT_BUDGET.saturating_sub(total)) {
                 Ok(body) => {
                     total += body.len() as u64;
                     with_bodies.push((item.clone(), body));
                 }
+                Err(ReadFailure::OverBound { .. }) => {
+                    return CollectOutcome::Incomplete {
+                        code: "limit_exceeded",
+                        detail: format!(
+                            "collection bodies exceed the {INLINE_COLLECT_BUDGET}-byte \
+                             inline delivery bound; chunked collection is outside this slice"
+                        ),
+                    };
+                }
                 Err(e) => {
                     return CollectOutcome::Unknown {
                         code: "unavailable",
-                        detail: format!("retained body {} unreadable: {e}", item.item_id),
+                        detail: format!(
+                            "retained body {} unreadable: {}",
+                            item.item_id,
+                            read_failure_detail(e)
+                        ),
                     };
                 }
             }
-        }
-        if total > INLINE_COLLECT_BUDGET {
-            return CollectOutcome::Incomplete {
-                code: "limit_exceeded",
-                detail: format!(
-                    "collection {total} bytes exceed the inline delivery bound; \
-                     chunked collection is outside this slice"
-                ),
-            };
         }
         CollectOutcome::Collected {
             collection_id: collection.collection_id.clone(),
@@ -1548,12 +1589,15 @@ impl Runner {
     }
 
     /// `git bundle create` of `base..produced` — the produced object
-    /// closure as real git transport.
+    /// closure as real git transport. The bundle body is Worker-
+    /// influenced, so its read honors `bound` like every other output
+    /// member.
     fn bundle_objects(
         &self,
         record: &RequestRecord,
         manifest: &RemoteHandoffV1,
-    ) -> Result<Vec<u8>, String> {
+        bound: u64,
+    ) -> Result<Vec<u8>, BundleFailure> {
         let dir = self.request_dir(record);
         let workspace = dir.join("workspace");
         let bundle = dir.join("objects.bundle.tmp");
@@ -1573,16 +1617,26 @@ impl Runner {
             max_stderr: 8192,
         };
         match bounded::exchange(&argv, &dir, &git_env(), &[], &bounds, GIT_TIMEOUT) {
-            Ok(out) if out.exit_code == Some(0) => std::fs::read(&bundle)
-                .map_err(|e| format!("object bundle read: {e}"))
-                .inspect(|_| {
-                    let _ = std::fs::remove_file(&bundle);
-                }),
-            Ok(out) => Err(format!(
+            Ok(out) if out.exit_code == Some(0) => {
+                let body = read_bounded_file(&bundle, bound).map_err(|e| match e {
+                    ReadFailure::OverBound { bytes, bound } => {
+                        BundleFailure::OverBound { bytes, bound }
+                    }
+                    other => BundleFailure::Failed(format!(
+                        "object bundle read: {}",
+                        read_failure_detail(other)
+                    )),
+                });
+                let _ = std::fs::remove_file(&bundle);
+                body
+            }
+            Ok(out) => Err(BundleFailure::Failed(format!(
                 "object closure bundle failed (exit {:?}); the produced range is not provable",
                 out.exit_code
-            )),
-            Err(e) => Err(format!("object closure bundle: {e:?}")),
+            ))),
+            Err(e) => Err(BundleFailure::Failed(format!(
+                "object closure bundle: {e:?}"
+            ))),
         }
     }
 }
@@ -1618,21 +1672,96 @@ fn run_git(args: &[&str], cwd: &Path) -> Result<(), String> {
     }
 }
 
-/// Read a file body only when it is a plain regular file —
-/// `symlink_metadata` refuses symlinks, FIFOs, and devices before any
-/// open can follow or block. Applied to every Worker-controlled
-/// `out/` read: a symlink at a host path would exfiltrate it into the
-/// collection, and a FIFO open would hang under the service lock.
-/// `NotFound` means absent; `InvalidInput` means non-regular.
-fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
+/// Why a bounded Worker-output read refused — each arm maps to a
+/// different collection outcome.
+enum ReadFailure {
+    /// No member at the path.
+    Missing,
+    /// Exists but is not a plain file — symlink, FIFO, device.
+    NotRegular(String),
+    /// A regular file over the remaining bound — refused before its
+    /// body was buffered.
+    OverBound { bytes: u64, bound: u64 },
+    /// A read fault unrelated to membership or size.
+    Io(std::io::Error),
+}
+
+/// Why producing the object bundle failed — an over-bound bundle is
+/// a limit refusal, everything else invalidates the collection.
+enum BundleFailure {
+    Failed(String),
+    OverBound { bytes: u64, bound: u64 },
+}
+
+/// Render a `ReadFailure` for diagnostics.
+fn read_failure_detail(e: ReadFailure) -> String {
+    match e {
+        ReadFailure::Missing => "absent".to_string(),
+        ReadFailure::NotRegular(detail) => detail,
+        ReadFailure::OverBound { bytes, bound } => {
+            format!("{bytes} bytes exceed the {bound}-byte bound")
+        }
+        ReadFailure::Io(e) => e.to_string(),
     }
-    std::fs::read(path)
+}
+
+/// Read at most `bound` bytes of a file that must be a plain regular
+/// file — `symlink_metadata` refuses symlinks, FIFOs, and devices
+/// before any open can follow or block, and a body over `bound` is
+/// refused before it is buffered. Applied to every Worker-controlled
+/// `out/` read: a symlink at a host path would exfiltrate it into
+/// the collection, a FIFO open would hang under the service lock,
+/// and an unbounded body would make the declared `bounded_output`
+/// capability unenforceable at read time.
+fn read_bounded_file(path: &Path, bound: u64) -> Result<Vec<u8>, ReadFailure> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ReadFailure::Missing,
+        _ => ReadFailure::Io(e),
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(ReadFailure::NotRegular(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() > bound {
+        return Err(ReadFailure::OverBound {
+            bytes: meta.len(),
+            bound,
+        });
+    }
+    // The file may grow between metadata and open — the read itself
+    // is capped, so a growing body can never force the bound.
+    let file = std::fs::File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ReadFailure::Missing,
+        _ => ReadFailure::Io(e),
+    })?;
+    let mut body = Vec::new();
+    std::io::Read::take(file, bound.saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(ReadFailure::Io)?;
+    if body.len() as u64 > bound {
+        return Err(ReadFailure::OverBound {
+            bytes: body.len() as u64,
+            bound,
+        });
+    }
+    Ok(body)
+}
+
+/// Total bytes this request's staged inputs still occupy under
+/// `prepared/` — the input half of the per-Invocation
+/// `max_state_bytes` budget that produced output must share.
+fn staged_bytes(prepared: &Path) -> u64 {
+    walk(prepared)
+        .iter()
+        .filter_map(|p| {
+            p.symlink_metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+        })
+        .sum()
 }
 
 /// Copy a prepared tree into the workspace, verifying every path

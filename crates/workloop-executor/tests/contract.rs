@@ -831,6 +831,35 @@ fn start_with_drifting_worker_binding_is_refused() {
 }
 
 #[test]
+fn a_dead_leader_still_enforces_the_deadline_on_surviving_descendants() {
+    let fx = fixture("deadline-descendants");
+    // Far enough out to start, close enough to expire in-test.
+    let deadline = now_seconds() + 2;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "started");
+    let leader = fx.port.spawned()[0].pid;
+
+    // The leader exits but an in-group descendant survives — the case
+    // the deadline sweep and the Exited observation used to skip.
+    fx.port.adopt_child_in_group(leader, "descendant-writer");
+    fx.port.exit(leader, 0);
+    while now_ms() <= deadline * 1000 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let receipt =
+        issue(&fx.service, "op-observe", OperationKind::Observe, json!({})).expect("observe");
+    // The endpoint enforces the bound itself: the surviving member is
+    // stopped and the durable record frees the execution slot.
+    assert_eq!(receipt.result["status"], "stopped");
+    let record = fx.state.request(REQUEST_ID).expect("read").expect("record");
+    assert_eq!(record.state, "stopped");
+    assert!(fx.port.signals().iter().any(|s| s.pgid == Some(leader)));
+}
+
+#[test]
 fn expired_deadline_refuses_the_start() {
     let fx = fixture("deadline-past");
     let config = launch_config(now_seconds() - 60);
@@ -930,6 +959,126 @@ fn acknowledge_of_a_different_collection_conflicts() {
     .expect("ack");
     assert_eq!(receipt.result["status"], "conflict");
     assert_eq!(receipt.result["reason"], "acknowledgement_conflict");
+}
+
+#[test]
+fn an_overbound_output_member_is_refused_and_reclaimed() {
+    let fx = fixture("output-bound");
+    let request_dir = fx.state.request_path(REQUEST_ID);
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let _ = start(&fx.service, "op-start", deadline);
+    std::fs::create_dir_all(request_dir.join("out")).expect("out");
+    // Over the launch's max_output_bytes (1 MiB) — refused before the
+    // body is buffered, and the retained bodies are reclaimed so the
+    // storage bound holds on disk.
+    std::fs::write(
+        request_dir.join("out/report.json"),
+        vec![b'x'; 2 * 1024 * 1024],
+    )
+    .expect("report");
+    let receipt = issue(
+        &fx.service,
+        "op-stop",
+        OperationKind::RequestStop,
+        json!({}),
+    )
+    .expect("stop");
+    assert_eq!(receipt.result["status"], "stopped");
+
+    let receipt = issue(
+        &fx.service,
+        "op-collect",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": receipt.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "incomplete");
+    assert_eq!(receipt.result["reason"], "limit_exceeded");
+    assert!(!request_dir.join("out").exists());
+}
+
+#[test]
+fn produced_output_shares_the_endpoint_storage_bound() {
+    let dir = test_dir("state-bound");
+    write_credentials(&dir);
+    let mut config = endpoint_config(&dir);
+    // Small enough that a modest produced body overruns it while
+    // staying under the launch's max_output_bytes.
+    config.max_state_bytes = 4096;
+    let port = ScriptedProcessControl::new();
+    port.set_default_probe(Ok(ProbeOutcome::Exited {
+        stdout: DECLARATION.as_bytes().to_vec(),
+        success: true,
+    }));
+    let service =
+        ExecutorService::boot_with_port(config, Arc::new(port.clone())).expect("service boots");
+    let state = EndpointState::open(dir.join("state")).expect("state");
+    let request_dir = state.request_path(REQUEST_ID);
+
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&service, "op-prepare", deadline);
+    port.push_plan(SpawnPlan::Resident);
+    let _ = start(&service, "op-start", deadline);
+    std::fs::create_dir_all(request_dir.join("out")).expect("out");
+    std::fs::write(request_dir.join("out/report.json"), vec![b'x'; 4096]).expect("report");
+    let receipt = issue(&service, "op-stop", OperationKind::RequestStop, json!({})).expect("stop");
+    assert_eq!(receipt.result["status"], "stopped");
+
+    let receipt = issue(
+        &service,
+        "op-collect",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": receipt.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "incomplete");
+    assert_eq!(receipt.result["reason"], "limit_exceeded");
+}
+
+#[test]
+fn acknowledge_reclaims_the_worker_scratch_tree() {
+    let fx = fixture("scratch-reclaim");
+    let request_dir = fx.state.request_path(REQUEST_ID);
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let _ = start(&fx.service, "op-start", deadline);
+    // isolation::prepare built the worker HOME/TMPDIR/gitconfig here.
+    assert!(request_dir.join("scratch").is_dir());
+    std::fs::create_dir_all(request_dir.join("out")).expect("out");
+    std::fs::write(request_dir.join("out/report.json"), b"{}").expect("report");
+    fx.port.exit_all(0);
+
+    let receipt =
+        issue(&fx.service, "op-observe", OperationKind::Observe, json!({})).expect("observe");
+    assert_eq!(receipt.result["status"], "stopped");
+    let receipt = issue(
+        &fx.service,
+        "op-collect",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": receipt.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "collected");
+    let collection_id = receipt.result["collection_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let collection_digest = receipt.result["collection_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let receipt = issue(
+        &fx.service,
+        "op-ack",
+        OperationKind::Acknowledge,
+        json!({"collection_id": collection_id, "collection_digest": collection_digest}),
+    )
+    .expect("ack");
+    assert_eq!(receipt.result["status"], "acknowledged");
+    assert!(!request_dir.join("scratch").exists());
 }
 
 // ---------------------------------------------------------------------

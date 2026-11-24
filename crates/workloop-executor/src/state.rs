@@ -582,6 +582,7 @@ impl EndpointState {
             "prepared",
             "workspace",
             "out",
+            "scratch",
             "objects.bundle",
             "runtime-auth",
         ] {
