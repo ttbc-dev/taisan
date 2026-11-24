@@ -9,12 +9,18 @@
   infra repo" — see `docs/source-workflow-audit.md` for the role legend).
   Issue numbers and abbreviated revision SHAs may be cited as
   owner-verifiable evidence locators.
-- `docs/source-workflow-audit.md` is the owner-controlled audit record
-  and the single exception to the naming rule: it retains source-internal
+- `docs/source-workflow-audit.md` is an owner-controlled audit record
+  and an exception to the naming rule: it retains source-internal
   names, issue/PR numbers, and revision SHAs so each design mapping can
   be re-verified against the sources. It is not publication-facing;
   publication of the repository requires a disclosure review covering
   this document and the git history that retains the removed identifiers.
+- `docs/release-audit.md` is a second owner-controlled exception under
+  the same terms: it maps every remaining leak location verbatim, so it
+  is itself a disclosure surface — publication requires the same
+  disclosure review covering this document and the history that retains
+  it. If it is ever to be published, the leak map must first be scrubbed
+  or the file removed from the published tree and its history.
 
 ## Pull requests
 

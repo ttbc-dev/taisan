@@ -12,7 +12,8 @@ reproduced here — names are described by role using the legend in
 > adversary the leak index itself. It needs the same disposition as
 > `docs/source-workflow-audit.md` — a disclosure review, or exclusion
 > from the published tree — before the repository goes public (see §6).
-> If it stays, `AGENTS.md`'s exception list needs amending to name it.
+> `AGENTS.md` names it a second owner-controlled exception under the
+> same terms; keeping it tracked still requires that review.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -57,7 +58,7 @@ Under the current publication route, everything below becomes public:
 ### 2.1 Current tree — the sanctioned file exists, but leaks occur outside it
 
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
-the single permitted exception per `AGENTS.md`. It correctly self-declares
+the first permitted exception per `AGENTS.md`. It correctly self-declares
 that publication requires a disclosure review covering it and the git
 history (`docs/source-workflow-audit.md:23-33`).
 
