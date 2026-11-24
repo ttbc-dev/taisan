@@ -11,7 +11,6 @@
 //! observed `describe` declaration must match the digest the
 //! coordinator's launch configuration bound.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1271,6 +1270,14 @@ impl Runner {
         );
         let _ = self.state.put_stop_proof(&record.request_id, &proof);
         self.release_credential(record);
+        // Advance the durable record with the proof: a request left
+        // `started`/`live_unknown` would hold the single execution
+        // slot until collect/ack freed it.
+        if record.is_live() {
+            let mut advanced = record.clone();
+            advanced.state = "stopped".into();
+            let _ = self.state.put_request(&advanced);
+        }
         proof
     }
 
@@ -1331,7 +1338,7 @@ impl Runner {
 
         let mut item = |name: &str, required: bool, source: &str| -> Result<bool, CollectOutcome> {
             let path = out_dir.join(name);
-            match std::fs::read(&path) {
+            match read_regular_file(&path) {
                 Ok(bytes) => {
                     items.push((
                         CollectionItemRecord {
@@ -1353,6 +1360,16 @@ impl Runner {
                     } else {
                         Ok(false)
                     }
+                }
+                // out/ is Worker-writable: a member that exists but is
+                // not a plain file — a symlink at a host path, a FIFO,
+                // a device — invalidates the collection rather than
+                // being followed or blocking the service lock.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    Err(CollectOutcome::Invalid {
+                        code: "collection_invalid",
+                        detail: format!("{name}: {e}"),
+                    })
                 }
                 Err(e) => Err(CollectOutcome::Unknown {
                     code: "unavailable",
@@ -1377,7 +1394,12 @@ impl Runner {
         // A producing Invocation's manifest: strict parse plus the
         // request/Invocation identity check — a foreign or stale
         // manifest invalidates the collection.
-        let handoff_bytes = std::fs::read(out_dir.join("handoff.json")).ok();
+        // The gated whitelist pass already read any `handoff.json` —
+        // reusing those bytes never re-opens a Worker-controlled path.
+        let handoff_bytes = items
+            .iter()
+            .find(|(i, _)| i.item_id == "handoff.json")
+            .map(|(_, bytes)| bytes.clone());
         if let Some(bytes) = &handoff_bytes {
             let manifest = match RemoteHandoffV1::parse(bytes, record.limits.max_item_count) {
                 Ok(m) => m,
@@ -1496,10 +1518,7 @@ impl Runner {
             } else {
                 dir.join(&item.source)
             };
-            match std::fs::File::open(&path).and_then(|mut f| {
-                let mut buf = Vec::new();
-                f.read_to_end(&mut buf).map(|_| buf)
-            }) {
+            match read_regular_file(&path) {
                 Ok(body) => {
                     total += body.len() as u64;
                     with_bodies.push((item.clone(), body));
@@ -1597,6 +1616,23 @@ fn run_git(args: &[&str], cwd: &Path) -> Result<(), String> {
         Ok(out) => Err(format!("git {:?} exited {:?}", args, out.exit_code)),
         Err(e) => Err(format!("git {:?}: {e:?}", args)),
     }
+}
+
+/// Read a file body only when it is a plain regular file —
+/// `symlink_metadata` refuses symlinks, FIFOs, and devices before any
+/// open can follow or block. Applied to every Worker-controlled
+/// `out/` read: a symlink at a host path would exfiltrate it into the
+/// collection, and a FIFO open would hang under the service lock.
+/// `NotFound` means absent; `InvalidInput` means non-regular.
+fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    std::fs::read(path)
 }
 
 /// Copy a prepared tree into the workspace, verifying every path

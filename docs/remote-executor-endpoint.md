@@ -17,7 +17,7 @@ one executable, `taisan-executor`. Every other surface is reused from
 | --- | --- | --- |
 | `taisan-executor serve` | foreground/durable helper executable (new) | Holds the incarnation identity, the durable state root, the one execution slot, and the supervisor calls. These must outlive any one transport session; a library cannot own them. |
 | `taisan-executor connect` | stdio↔socket bridge in the same executable | The restricted-SSH forced-command shape: the remote command reads a bounded frame from stdin, hands it to the durable service over the unix socket, and writes the framed receipt to stdout. It holds no state, so one executable covers both roles. |
-| `EndpointService` (`service.rs`) | library server | hello plus the six fixed operations, replay fences, one-start slot, incarnation fencing. |
+| `ExecutorService` (`service.rs`) | library server | hello plus the six fixed operations, replay fences, one-start slot, incarnation fencing. |
 | `RemoteExecutor` (`adapter.rs`) | coordinator-side transport adapter | Session mutual authentication, hello binding check, framed command send, sealed receipt verification. It never emits a shell string. |
 | `endpoint-state` (`state.rs`) | durable state root on the local filesystem | Digest-sealed JSON records — one file per record, atomic rename. Local durable receipt files satisfy the contract; no database server is introduced. |
 | `Runner` (`runner.rs`) | invocation engine | Staging, launch, observation, stop escalation, and collection through `ProcessControlPort`, `containment`, `isolation`, and the v2 `describe` probe — the existing supervisor surface unchanged. |
@@ -88,7 +88,7 @@ with owner-only permissions.
 
 ## 4. Operations and durable state
 
-`taisan-executor serve <config.toml>` binds a unix socket at
+`taisan-executor serve --config <endpoint.toml>` binds a unix socket at
 `config.socket_path`, mints a fresh unpredictable
 `inc-<uuid>` incarnation into `service.json`, and answers connections.
 A background sweep enforces bound deadlines executor-side: a request

@@ -1072,3 +1072,213 @@ fn the_executor_enforces_the_authorized_runtime_itself() {
     assert_eq!(receipt.result["status"], "stopped");
     assert_eq!(receipt.result["proof"]["manner"], "signaled");
 }
+
+// ---------------------------------------------------------------------
+// Start fencing after stop intent and unproven outcomes
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_delayed_start_after_stop_intent_is_refused_not_replayed() {
+    let fx = fixture("stop-then-start");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "started");
+
+    let receipt = issue(
+        &fx.service,
+        "op-stop",
+        OperationKind::RequestStop,
+        json!({}),
+    )
+    .expect("stop");
+    assert_eq!(receipt.result["status"], "stopped");
+
+    // A delayed start on a fresh operation id must be refused by the
+    // durable stop intent — the recorded process evidence may not
+    // answer `started` for an Invocation already proven stopped.
+    let receipt = start(&fx.service, "op-start-late", deadline);
+    assert_eq!(receipt.result["status"], "refused");
+    assert_eq!(
+        receipt.result["reason"], "request_identity_mismatch",
+        "the durable stop intent refuses the delayed start"
+    );
+    assert_eq!(fx.port.spawn_calls(), 1);
+}
+
+#[test]
+fn a_second_start_after_an_unknown_outcome_stays_unknown() {
+    let fx = fixture("unknown-then-start");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    // Identity capture failed after a possible spawn — the record
+    // advances to `live_unknown` and the workspace now exists.
+    fx.port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "unknown");
+
+    // A second start with a new operation id must replay the recorded
+    // `unknown` — never re-dispatch (a second writer) and never
+    // answer `known_not_started` (durable state cannot prove no
+    // process exists).
+    let receipt = start(&fx.service, "op-start-2", deadline);
+    assert_eq!(receipt.result["status"], "unknown");
+    assert_eq!(receipt.result["reason"], "process_identity_unavailable");
+    assert_eq!(fx.port.spawn_calls(), 1);
+}
+
+#[test]
+fn a_proven_stop_advances_the_record_and_frees_the_slot() {
+    let fx = fixture("slot-freed");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "started");
+
+    // A second request prepares while the first is live.
+    let config = launch_config(deadline);
+    let other_identity = ExecutorIdentity {
+        request_id: "e-9:inv:9".into(),
+        invocation_id: "inv-42".into(),
+        request_digest: sha256_hex("taisan.test.request", b"other"),
+        ..identity(&fx.service)
+    };
+    let prepare2 = ExecutorCommandV1::new(
+        other_identity.clone(),
+        "op-prepare-2",
+        OperationKind::Prepare,
+        prepare_payload(&config),
+    )
+    .expect("command");
+    let receipt = issue_command(&fx.service, &prepare2).expect("receipt");
+    assert_eq!(receipt.result["status"], "prepared");
+
+    // The first Invocation exits; observe proves the stop. The proof
+    // must advance the durable record — a stale `started` state would
+    // pin the single execution slot until collect/ack.
+    fx.port.exit_all(0);
+    let receipt =
+        issue(&fx.service, "op-observe", OperationKind::Observe, json!({})).expect("observe");
+    assert_eq!(receipt.result["status"], "stopped");
+    assert_eq!(
+        fx.state
+            .request(REQUEST_ID)
+            .expect("request")
+            .expect("record")
+            .state,
+        "stopped"
+    );
+
+    // The freed slot admits the second request's start.
+    fx.port.push_plan(SpawnPlan::Resident);
+    let start2 = ExecutorCommandV1::new(
+        other_identity,
+        "op-start-2",
+        OperationKind::Start,
+        json!({
+            "prepared_id": format!("prep-{}", &sha256_hex("taisan.test.request", b"other")[..16]),
+            "launch_config_digest": launch_config_digest_of(&config),
+        }),
+    )
+    .expect("command");
+    let receipt = issue_command(&fx.service, &start2).expect("receipt");
+    assert_eq!(receipt.result["status"], "started");
+    assert_eq!(fx.port.spawn_calls(), 2);
+}
+
+// ---------------------------------------------------------------------
+// Worker-controlled out/ entries
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_out_member_is_refused_not_followed() {
+    use std::os::unix::fs::symlink;
+    let fx = fixture("out-symlink");
+    let request_dir = fx.state.request_path(REQUEST_ID);
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let _ = start(&fx.service, "op-start", deadline);
+
+    // The Worker controls out/: a symlinked report.json at a host
+    // path would exfiltrate it into the collection.
+    let out = request_dir.join("out");
+    std::fs::create_dir_all(&out).expect("out");
+    let sentinel = fx._dir.join("host-secret");
+    std::fs::write(&sentinel, b"host-secret-bytes").expect("sentinel");
+    symlink(&sentinel, out.join("report.json")).expect("symlink");
+
+    let receipt = issue(
+        &fx.service,
+        "op-stop",
+        OperationKind::RequestStop,
+        json!({}),
+    )
+    .expect("stop");
+    assert_eq!(receipt.result["status"], "stopped");
+
+    let receipt = issue(
+        &fx.service,
+        "op-collect",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": receipt.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "invalid");
+    assert_eq!(receipt.result["reason"], "collection_invalid");
+    assert!(
+        !receipt
+            .result
+            .get("items")
+            .and_then(|i| i.as_array())
+            .is_some_and(|items| items.iter().any(|i| i["data_b64"]
+                .as_str()
+                .is_some_and(|b| b.contains("aG9zdC1zZWNyZXQ=")))),
+        "the symlink target's bytes never enter the collection"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_out_member_is_refused_before_it_can_block() {
+    use std::os::unix::ffi::OsStrExt;
+    let fx = fixture("out-fifo");
+    let request_dir = fx.state.request_path(REQUEST_ID);
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let _ = start(&fx.service, "op-start", deadline);
+
+    // A valid report plus a FIFO under an optional whitelist name —
+    // an unguarded open would block the service lock forever.
+    let out = request_dir.join("out");
+    std::fs::create_dir_all(&out).expect("out");
+    std::fs::write(out.join("report.json"), b"{}").expect("report");
+    let fifo = out.join("runtime.log");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let receipt = issue(
+        &fx.service,
+        "op-stop",
+        OperationKind::RequestStop,
+        json!({}),
+    )
+    .expect("stop");
+    assert_eq!(receipt.result["status"], "stopped");
+
+    let receipt = issue(
+        &fx.service,
+        "op-collect",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": receipt.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "invalid");
+    assert_eq!(receipt.result["reason"], "collection_invalid");
+}

@@ -754,14 +754,11 @@ impl ExecutorService {
                 "diagnostic": "start names a different prepared set or launch configuration",
             });
         }
-        // One start slot: a second start returns the recorded state,
-        // never another process tree.
-        if let Ok(Some(process)) = self.state.process(&record.request_id) {
-            return json!({
-                "status": "started",
-                "process": {"evidence_ref": process.evidence_ref, "identity_digest": process.identity_digest},
-            });
-        }
+        // Durable stop intent fences any delayed start — checked
+        // before the recorded process answer so an Invocation whose
+        // stop already committed never reports live again (contract
+        // §4: once stop intent is durable, a delayed start is
+        // refused).
         if self
             .state
             .stop_intent(&record.request_id)
@@ -773,6 +770,27 @@ impl ExecutorService {
                 "status": "refused",
                 "reason": "request_identity_mismatch",
                 "diagnostic": "durable stop intent fences this Invocation from starting",
+            });
+        }
+        // One start slot: a second start returns the recorded state,
+        // never another process tree.
+        if let Ok(Some(process)) = self.state.process(&record.request_id) {
+            return json!({
+                "status": "started",
+                "process": {"evidence_ref": process.evidence_ref, "identity_digest": process.identity_digest},
+            });
+        }
+        // A request past `prepared` without a process record holds an
+        // unproven start outcome (`live_unknown`) or a torn record —
+        // durable state cannot prove no process exists, so a second
+        // start never re-dispatches and never answers
+        // `known_not_started` (contract §4, §5). It replays the
+        // recorded `unknown` state.
+        if record.state != "prepared" {
+            return json!({
+                "status": "unknown",
+                "reason": "process_identity_unavailable",
+                "diagnostic": "a prior start's outcome is unproven; the executor cannot prove no process exists",
             });
         }
         // Only the bound incarnation may launch it.
@@ -899,6 +917,14 @@ impl ExecutorService {
                 let proof = self
                     .runner
                     .finalize_proof(&record, proof, &command.operation_id);
+                // A durable proof frees the execution slot — advance
+                // the record even when this proof replays a write an
+                // earlier observation lost.
+                if record.is_live() {
+                    let mut record = record;
+                    record.state = "stopped".into();
+                    let _ = self.state.put_request(&record);
+                }
                 self.stopped_result_with_seq(&proof, sequence)
             }
             ObserveOutcome::Unknown { code, detail } => json!({
