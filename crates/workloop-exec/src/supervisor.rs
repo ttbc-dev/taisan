@@ -3737,11 +3737,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// reporting `Unknown`: an ambiguous or unreadable answer is
     /// never a guess — and a bounded count of consecutive incomplete
     /// scans escalates to the `absence_unprovable` outcome rather
-    /// than hold `uncertain` forever. The escalation marks the launch
-    /// `unknown` but does not end the resolution: the loop keeps
-    /// scanning so a later provable answer — a re-bound writer or a
-    /// completed clear — still settles it under the Execution's
-    /// recorded desired action.
+    /// than hold `uncertain` forever. The streak counts every
+    /// unprovable pass, not just a failed absence verdict: a scan
+    /// that could not run at all (unreadable table, unmappable
+    /// candidate, unformable signature) is the same gap to the
+    /// operator. The escalation marks the launch `unknown` but does
+    /// not end the resolution: the loop keeps scanning so a later
+    /// provable answer — a re-bound writer or a completed clear —
+    /// still settles it under the Execution's recorded desired
+    /// action.
     fn resolve_unidentified_launch(
         &self,
         store: &impl Store,
@@ -3827,15 +3831,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // launch used: `Uncontained` means no wrapped argv could
         // exist; a refused gate or an unresolvable boundary means the
         // wrapped argv cannot be reconstructed — the orphan's
-        // signature is then unprovable, so stay uncertain rather than
-        // declare absence on an incomplete search.
+        // signature is then unprovable, an incomplete scan: uncertain
+        // below the bound, escalated at it, never a declared absence
+        // on an incomplete search.
         let contained = match self.containment_gate(&binding.argv, now_unix_seconds)? {
             Ok(Gate::Uncontained) => false,
-            Err(_) => {
-                return self.report_unidentified_unknown(
+            Err(reason) => {
+                return self.report_unidentified_incomplete(
                     store,
                     request,
-                    &invocation.id,
+                    invocation,
+                    format!("containment gate refused: {reason}"),
                     now_unix_seconds,
                 );
             }
@@ -3843,13 +3849,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let (inner_argv, workspace_read_only, mounts_io) = if let Some(body) = &body {
                     // A durable body that no longer parses is corrupt
                     // evidence, not a v1 request — the contained shape
-                    // cannot be reconstructed either, so stay
-                    // uncertain.
+                    // cannot be reconstructed either, an incomplete
+                    // scan like any other unprovable pass.
                     let Ok(wire) = WorkerRequestV2::parse(&body.canonical_body) else {
-                        return self.report_unidentified_unknown(
+                        return self.report_unidentified_incomplete(
                             store,
                             request,
-                            &invocation.id,
+                            invocation,
+                            "the recorded request body no longer parses".to_string(),
                             now_unix_seconds,
                         );
                     };
@@ -3891,11 +3898,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     &WorkerEnv::default(),
                 ) {
                     Ok((argv, _)) => signatures.push(argv.join(" ")),
-                    Err(_) => {
-                        return self.report_unidentified_unknown(
+                    Err(reason) => {
+                        return self.report_unidentified_incomplete(
                             store,
                             request,
-                            &invocation.id,
+                            invocation,
+                            format!(
+                                "the contained launch argv could not be reconstructed: {reason}"
+                            ),
                             now_unix_seconds,
                         );
                     }
@@ -3908,12 +3918,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
             match self.port.matching_processes(signature) {
                 Ok(found) => matches.extend(found),
                 // An unreadable process table proves nothing in either
-                // direction — stay uncertain.
-                Err(_) => {
-                    return self.report_unidentified_unknown(
+                // direction — an incomplete scan: uncertain below the
+                // bound, escalated at it.
+                Err(reason) => {
+                    return self.report_unidentified_incomplete(
                         store,
                         request,
-                        &invocation.id,
+                        invocation,
+                        format!("the process table could not be enumerated: {reason}"),
                         now_unix_seconds,
                     );
                 }
@@ -3934,14 +3946,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
         // A candidate whose cwd cannot be read can be neither bound
         // nor ruled out: while one exists, no bind is provable — the
         // in-directory match might be a foreign process and the
-        // unreadable one the real orphan. Stay uncertain rather than
-        // adopt the wrong writer. (Absence is already blocked: the
+        // unreadable one the real orphan. An incomplete scan rather
+        // than a guess at the wrong writer — uncertain below the
+        // bound, escalated at it. (Absence is already blocked: the
         // candidate counts in `unrecorded` either way.)
         if unrecorded.iter().any(|m| m.cwd.is_none()) {
-            return self.report_unidentified_unknown(
+            return self.report_unidentified_incomplete(
                 store,
                 request,
-                &invocation.id,
+                invocation,
+                "an unrecorded signature match's working directory could not be read".to_string(),
                 now_unix_seconds,
             );
         }
@@ -4044,12 +4058,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 // in the recorded launch group: a descendant that
                 // changed BOTH argv and working directory is invisible
                 // to the first two checks but stays in the leader's
-                // group unless it called `setsid`. The named residual
-                // is exactly that escape — `setsid` + chdir + argv
-                // change leaves every handle the launch committed —
-                // and so does a spawn whose group record was lost
-                // before it could be committed; neither can be told
-                // from a truly absent writer by enumeration alone.
+                // group unless it left the group entirely — `setsid`,
+                // `setpgid`, or joining another group in the same
+                // session. The named residual is exactly that escape —
+                // leaving the recorded group plus chdir + argv change
+                // leaves every handle the launch committed — and so
+                // does a spawn whose group record was lost before it
+                // could be committed; neither can be told from a truly
+                // absent writer by enumeration alone.
                 //
                 // The scans run only once the bounded window has
                 // elapsed — before that the answer is Unknown
@@ -4130,47 +4146,28 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             now_unix_seconds,
                         )
                     }
-                    Clearance::Incomplete(reason) => {
-                        let streak = {
-                            let mut streaks = self.incomplete_scans.lock().unwrap();
-                            let n = streaks.entry(invocation.id.0.clone()).or_insert(0);
-                            *n += 1;
-                            *n
-                        };
-                        if streak >= UNIDENTIFIED_LAUNCH_SCAN_LIMIT
-                            && invocation.state == InvocationState::Prepared
-                        {
-                            // The bounded escalation: a distinct
-                            // operator-visible outcome, not another
-                            // silent Unknown. It is reported once —
-                            // the launch then scans on as `unknown`,
-                            // so a later provable answer still
-                            // resolves it; further incomplete scans
-                            // stay `uncertain` without re-escalating.
-                            self.report(
-                                store,
-                                request,
-                                ObservationFact::LaunchAbsenceUnprovable {
-                                    invocation_id: invocation.id.clone(),
-                                    reason,
-                                },
-                                now_unix_seconds,
-                            )
-                        } else {
-                            self.report_unidentified_unknown(
-                                store,
-                                request,
-                                &invocation.id,
-                                now_unix_seconds,
-                            )
-                        }
-                    }
+                    Clearance::Incomplete(reason) => self.report_unidentified_incomplete(
+                        store,
+                        request,
+                        invocation,
+                        reason,
+                        now_unix_seconds,
+                    ),
                 }
             }
             // Anything else is ambiguous — more than one candidate,
             // or a single candidate outside the launch directory.
-            // Never guess which process is this launch's writer.
-            _ => self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds),
+            // Never guess which process is this launch's writer. The
+            // match itself is positive evidence of unexplained life —
+            // a completed scan, not a gap — so it restarts the
+            // incomplete streak the same way `Occupied` does.
+            _ => {
+                self.incomplete_scans
+                    .lock()
+                    .unwrap()
+                    .remove(&invocation.id.0);
+                self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds)
+            }
         }
     }
 
@@ -4249,13 +4246,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// group still holds a live process the store cannot account for.
     /// A descendant that changed both argv and working directory is
     /// invisible to the signature and directory scans but stays in
-    /// the leader's group unless it called `setsid` — the recorded
-    /// group is the last handle on that escape. `None` means the
-    /// launch never committed a group record — a spawn fault before
-    /// the record could land — so nothing can be enumerated and the
-    /// check is vacuous: a strictly smaller residual than the
-    /// `setsid` escape, because the leader's spawn had already been
-    /// lost before the group existed on record.
+    /// the leader's group unless it left the group entirely —
+    /// `setsid`, `setpgid`, or joining another group in the same
+    /// session — so the recorded group is the last handle on that
+    /// escape. `None` means the launch never committed a group
+    /// record — a spawn fault before the record could land — so
+    /// nothing can be enumerated and the check is vacuous: a strictly
+    /// smaller residual than the group-leaving escape, because the
+    /// leader's spawn had already been lost before the group existed
+    /// on record.
     ///
     /// The owner slot is verified before any member counts — the same
     /// attribution `proof_identities` applies on the stop path. `pgid`
@@ -4333,6 +4332,48 @@ impl<P: ProcessControlPort> Supervisor<P> {
             },
             now_unix_seconds,
         )
+    }
+
+    /// One unprovable resolution pass — a scan gap that proves
+    /// nothing in either direction, wherever in the search it struck:
+    /// an unreadable table, an unmappable candidate, a signature that
+    /// could not be formed, an incomplete directory or group
+    /// enumeration. Counts the consecutive-incomplete streak and
+    /// takes the bounded escalation at the limit while the launch is
+    /// still `prepared`: a distinct operator-visible
+    /// `absence_unprovable`, reported once — the launch then scans on
+    /// as `unknown`, so a later provable answer still resolves it and
+    /// further gaps stay `uncertain` without re-escalating. Below the
+    /// bound (or already escalated) the pass reports the ordinary
+    /// Unknown.
+    fn report_unidentified_incomplete(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        invocation: &Invocation,
+        reason: String,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        let streak = {
+            let mut streaks = self.incomplete_scans.lock().unwrap();
+            let n = streaks.entry(invocation.id.0.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if streak >= UNIDENTIFIED_LAUNCH_SCAN_LIMIT && invocation.state == InvocationState::Prepared
+        {
+            self.report(
+                store,
+                request,
+                ObservationFact::LaunchAbsenceUnprovable {
+                    invocation_id: invocation.id.clone(),
+                    reason,
+                },
+                now_unix_seconds,
+            )
+        } else {
+            self.report_unidentified_unknown(store, request, &invocation.id, now_unix_seconds)
+        }
     }
 
     /// The identities whose stop must be proven before the exit fact:

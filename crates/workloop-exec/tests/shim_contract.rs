@@ -988,6 +988,138 @@ fn a_completed_scan_restarts_the_incomplete_scan_streak() {
     assert_eq!(slots, 1, "an unproven absence never releases the slot");
 }
 
+/// A scan that cannot run at all is the same unprovable pass as a
+/// failed absence verdict: a signature scan that cannot enumerate the
+/// process table counts toward the bounded escalation — the launch
+/// never reaches the absence checks on such a pass, yet still
+/// converges to `absence_unprovable` instead of holding `uncertain`
+/// forever. A pass that finds unexplained life restarts the streak,
+/// and once the table reads again the escalated launch resolves like
+/// any other.
+#[test]
+fn failed_signature_scans_converge_and_evidence_restarts_the_streak() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-table-fail");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
+    let (_w, eid) = submit_and_admit(&store, "k-shim-tablefail");
+    sup.consume_requests(&store, NOW).unwrap();
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    // Two unreadable process tables — one short of the bound.
+    port.fail_next_process_scan("ps failed");
+    sup.poll_invocations(&store, NOW + 31).unwrap();
+    port.fail_next_process_scan("ps failed");
+    sup.poll_invocations(&store, NOW + 32).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
+    // A completed scan that finds unexplained life — an unrecorded
+    // signature match outside the launch directory — restarts the
+    // count: this pass is uncertain on evidence, not on a gap.
+    let lookalike = port.adopt_child(leader);
+    port.set_cwd(lookalike, &tmp_root("unidentified-lookalike"));
+    sup.poll_invocations(&store, NOW + 33).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared
+    );
+    // Three consecutive table failures now converge — had the
+    // evidence pass not restarted the streak, the second failure
+    // after it would already have been the third.
+    port.fail_next_process_scan("ps failed");
+    sup.poll_invocations(&store, NOW + 34).unwrap();
+    port.fail_next_process_scan("ps failed");
+    sup.poll_invocations(&store, NOW + 35).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Prepared,
+        "the evidence pass restarted the streak"
+    );
+    port.fail_next_process_scan("ps failed");
+    sup.poll_invocations(&store, NOW + 36).unwrap();
+    let escalations = store
+        .transact(|tx| tx.observations_for_execution(&eid))
+        .unwrap()
+        .iter()
+        .filter(|o| matches!(o.fact, ObservationFact::LaunchAbsenceUnprovable { .. }))
+        .count();
+    assert_eq!(escalations, 1, "the table failures converged the outcome");
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Unknown,
+        "the launch converges to the distinct outcome, still unresolved"
+    );
+    // The table reads again: with the lookalike gone the completed
+    // scan proves the absence and the recoverable outcome settles —
+    // `abandoned`, `paused`, slot released.
+    port.exit(lookalike, 0);
+    sup.poll_invocations(&store, NOW + 40).unwrap();
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Abandoned
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0);
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
+/// A signature match whose cwd cannot be mapped is a scan gap, not
+/// just a bind blocker: consecutive unmappable-candidate passes
+/// converge to `absence_unprovable` like any other unprovable scan —
+/// and the recovery is the ordinary one, since clearing the flag
+/// lets the same candidate re-bind as the writer.
+#[test]
+fn unmappable_candidate_scans_converge_then_rebind_the_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("unidentified-unmappable");
+    let port = ScriptedProcessControl::new();
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "crashed between spawn and identity capture".into(),
+    });
+    let sup = supervisor(port.clone(), root, Some(FIXTURE_ISOLATION_PROFILE_ID));
+    let (_w, eid) = submit_and_admit(&store, "k-shim-unmappable");
+    sup.consume_requests(&store, NOW).unwrap();
+    let leader = port.spawned()[0].pid;
+    port.exit(leader, 0);
+    // A live signature match in the launch directory whose cwd the
+    // table cannot report: every scan it joins is unprovable.
+    let candidate = port.adopt_child(leader);
+    port.set_cwd_unreadable(candidate, true);
+    for poll in 1..=3 {
+        sup.poll_invocations(&store, NOW + 30 + poll).unwrap();
+    }
+    assert_eq!(
+        only_invocation(&store, &eid).state,
+        InvocationState::Unknown,
+        "unmappable candidates converge to the bounded outcome"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.desired_action, Some(DesiredAction::Pause));
+    // The mapping reads again: the only in-directory match is bound
+    // to the launch and the recorded pause drives it to a stop.
+    port.set_cwd_unreadable(candidate, false);
+    sup.poll_invocations(&store, NOW + 40).unwrap();
+    let invocation = only_invocation(&store, &eid);
+    assert_eq!(invocation.state, InvocationState::Running);
+    assert_eq!(
+        invocation.process_identity.as_ref().map(|i| i.pid),
+        Some(candidate)
+    );
+    sup.drive_stops(&store, NOW + 41).unwrap();
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(e.state, ExecutionState::Paused);
+    let slots = store.transact(|tx| Ok(tx.slot_holders()?.len())).unwrap();
+    assert_eq!(slots, 0);
+    assert_eq!(port.spawn_calls(), 1, "no second writer was ever started");
+}
+
 /// Two live processes carrying the same launch signature inside the
 /// launch directory can never be told apart — the launch stays
 /// uncertain rather than guessing which spawn produced which process.
