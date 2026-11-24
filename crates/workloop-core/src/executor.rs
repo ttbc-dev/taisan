@@ -916,6 +916,17 @@ impl ExecutorCommandV1 {
             serde_json::from_value(value).map_err(|e| EnvelopeError::Malformed {
                 detail: format!("command malformed: {e}"),
             })?;
+        // Identity members that downstream code slices or compares
+        // verbatim carry the fixed digest width — a short or non-hex
+        // value is malformed, refused here before dispatch can act on
+        // it (a `request_digest` under 16 bytes would panic the
+        // prepared-id derivation while the service lock is held).
+        if !is_hex64(&command.endpoint_identity_digest) || !is_hex64(&command.request_digest) {
+            return Err(EnvelopeError::Invalid {
+                reason: "envelope.invalid",
+                detail: "identity digest member is not 64 lowercase hex".into(),
+            });
+        }
         if command.payload_digest != expected_payload_digest {
             return Err(EnvelopeError::DigestMismatch {
                 member: "payload_digest",
@@ -1725,6 +1736,41 @@ mod tests {
         assert!(matches!(
             ExecutorCommandV1::parse(&executor_canonical_json(&v).unwrap()),
             Err(EnvelopeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_digests_under_the_fixed_width_are_refused_at_parse() {
+        // A sealed command whose `request_digest` is short or non-hex
+        // is malformed — dispatch must never slice identity members it
+        // has not validated (a `[..16]` slice under the service lock
+        // would panic and poison every later command).
+        let bytes = command().to_canonical_bytes().unwrap();
+        let base: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reseal = |v: &serde_json::Value| -> Vec<u8> {
+            let mut v = v.clone();
+            v["command_digest"] = serde_json::json!(tagged_sha256(
+                COMMAND_DIGEST_TAG,
+                &canonical_minus(&v, "command_digest").unwrap()
+            ));
+            executor_canonical_json(&v).unwrap()
+        };
+        for bad in ["abc".to_string(), "é".repeat(8), "g".repeat(64)] {
+            let mut v = base.clone();
+            v["request_digest"] = serde_json::json!(bad);
+            assert!(
+                matches!(
+                    ExecutorCommandV1::parse(&reseal(&v)),
+                    Err(EnvelopeError::Invalid { .. })
+                ),
+                "request_digest {bad:?} must refuse at parse"
+            );
+        }
+        let mut v = base.clone();
+        v["endpoint_identity_digest"] = serde_json::json!("short");
+        assert!(matches!(
+            ExecutorCommandV1::parse(&reseal(&v)),
+            Err(EnvelopeError::Invalid { .. })
         ));
     }
 

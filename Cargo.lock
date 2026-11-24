@@ -808,6 +808,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "workloop-executor"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+ "uuid",
+ "workloop-core",
+ "workloop-exec",
+]
+
+[[package]]
 name = "workloop-fixture-selector"
 version = "0.0.0"
 dependencies = [
