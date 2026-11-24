@@ -78,6 +78,41 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         reason: String,
     },
+    /// The launch's leader was spawned into this process group. The
+    /// supervisor commits it the moment the spawn call returns —
+    /// before the running commit — so an unidentified launch keeps a
+    /// durable handle on its group even when the leader's identity
+    /// commit never landed. The unidentified-launch absence proof
+    /// reads it back and enumerates the group for descendants that
+    /// escaped the signature and directory scans without calling
+    /// `setsid`.
+    LaunchGroup {
+        invocation_id: InvocationId,
+        pgid: i32,
+        /// The leader's start as captured at report time: `pgid` is
+        /// the leader's pid, so the group member at that slot is the
+        /// owner identity the absence proof verifies the group
+        /// against — a live process there with a different start means
+        /// the number was recycled after the leader died and the whole
+        /// group is a foreign family. `None` when the spawn could not
+        /// capture it; the owner slot is then unverifiable and the
+        /// member check stays conservative.
+        #[serde(default)]
+        leader_started_at: Option<String>,
+    },
+    /// The bounded escalation for an unidentified launch whose
+    /// absence scans could not be completed a bounded number of
+    /// consecutive times. The launch stays an unresolved writer — a
+    /// live process may still exist, so the slot is never released —
+    /// but the unprovable absence is surfaced to the operator as a
+    /// distinct outcome instead of an indefinite `uncertain` hold.
+    /// The escalation surfaces the outcome; it does not conclude it:
+    /// the absence scans keep running underneath, so a later provable
+    /// answer still resolves the writer.
+    LaunchAbsenceUnprovable {
+        invocation_id: InvocationId,
+        reason: String,
+    },
     /// The supervisor refused dispatch before any Invocation existed:
     /// a required input body was missing, stale, corrupt, oversized,
     /// or otherwise undeliverable. `code` is one of the closed

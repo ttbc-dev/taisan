@@ -374,6 +374,7 @@ impl ProcessControlPort for CountingPosix {
             }
             return Err(SpawnError::Unknown {
                 reason: "identity capture lost after spawn".into(),
+                pgid: out.as_ref().ok().and_then(|i| i.pgid),
             });
         }
         let out = PosixProcessControl.spawn(argv, cwd, env);

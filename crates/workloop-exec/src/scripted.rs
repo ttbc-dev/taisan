@@ -289,6 +289,42 @@ impl ScriptedProcessControl {
         pid
     }
 
+    /// Register a live descendant that kept `leader`'s process group —
+    /// the chdir/argv escape the launch-group check exists to catch:
+    /// `group_members(leader's pgid)` still reports it even though
+    /// neither the signature nor the directory scan can see it.
+    pub fn adopt_child_in_group(&self, leader: i32, command: &str) -> i32 {
+        let pid = self.adopt_child_with(leader, command);
+        if let Some(p) = self.state.lock().unwrap().procs.get_mut(&pid) {
+            p.pgid = Some(leader);
+        }
+        pid
+    }
+
+    /// Recycle `pid` as a foreign process: the row is replaced by a
+    /// live one at the same pid with a fresh start time — the pid-reuse
+    /// shape the real table produces when an unrelated process lands on
+    /// a freed number. The replacement is its own group leader, so a
+    /// recorded pgid equal to the pid enumerates a foreign family whose
+    /// owner start differs from the launch's recorded leader.
+    pub fn recycle_as(&self, pid: i32, command: &str, cwd: &std::path::Path) {
+        let mut s = self.state.lock().unwrap();
+        s.procs.insert(
+            pid,
+            Proc {
+                started_at: format!("scripted-lstart-recycled-{pid}"),
+                pgid: Some(pid),
+                cwd: cwd.to_path_buf(),
+                command: command.to_string(),
+                alive: true,
+                exit_code: None,
+                inspect_unknown: None,
+                survives_signal: false,
+                cwd_unreadable: false,
+            },
+        );
+    }
+
     /// The next `snapshot_descendants` fails with this reason — an
     /// incomplete process-table read that must not authorize signals.
     pub fn fail_next_snapshot(&self, reason: &str) {
@@ -474,7 +510,10 @@ impl ProcessControlPort for ScriptedProcessControl {
                     },
                 );
                 s.spawned.push(identity);
-                Err(SpawnError::Unknown { reason })
+                Err(SpawnError::Unknown {
+                    reason,
+                    pgid: Some(pid),
+                })
             }
             SpawnPlan::Resident | SpawnPlan::ExitAfterWrite { .. } => {
                 let pid = s.next_pid;

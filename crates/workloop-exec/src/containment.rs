@@ -725,7 +725,7 @@ fn primitive_version(
         Err(SpawnError::Refused { reason }) => Err(refused(format!(
             "isolation.primitive_unusable: the sandbox primitive refused to start: {reason}"
         ))),
-        Err(SpawnError::Unknown { reason }) => Err(fault(format!(
+        Err(SpawnError::Unknown { reason, .. }) => Err(fault(format!(
             "isolation primitive probe spawn unknown: {reason}"
         ))),
     }
@@ -774,7 +774,7 @@ fn run_named_probe(
         ),
         Ok(ProbeOutcome::Bounded) => (false, "did not answer within the bound".to_string()),
         Err(SpawnError::Refused { reason }) => (false, format!("spawn refused: {reason}")),
-        Err(SpawnError::Unknown { reason }) => (false, format!("spawn unknown: {reason}")),
+        Err(SpawnError::Unknown { reason, .. }) => (false, format!("spawn unknown: {reason}")),
     };
     records.push(ProbeRecord {
         name: name.to_string(),

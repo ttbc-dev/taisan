@@ -55,8 +55,13 @@ pub struct ProcessMatch {
 pub enum SpawnError {
     /// Definitely no process exists — safe to record `paused`/`failed`.
     Refused { reason: String },
-    /// The process may exist — must not start a second writer.
-    Unknown { reason: String },
+    /// The process may exist — must not start a second writer. `pgid`
+    /// carries the spawned leader's process group when the fork itself
+    /// produced a process: even when the launch's identity is lost,
+    /// its process group is the handle the absence proof enumerates
+    /// for descendants that escaped both the signature and the
+    /// directory scans.
+    Unknown { reason: String, pgid: Option<i32> },
 }
 
 /// Result of one signal attempt against a recorded identity.

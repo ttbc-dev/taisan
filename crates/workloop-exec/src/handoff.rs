@@ -1139,7 +1139,7 @@ fn prove_verification_mounts(
         Err(workloop_core::ports::SpawnError::Refused { reason }) => Err(format!(
             "verification.toolchain_preflight_failed: spawn refused: {reason}"
         )),
-        Err(workloop_core::ports::SpawnError::Unknown { reason }) => Err(format!(
+        Err(workloop_core::ports::SpawnError::Unknown { reason, .. }) => Err(format!(
             "verification.toolchain_preflight_failed: spawn unknown: {reason}"
         )),
     }
