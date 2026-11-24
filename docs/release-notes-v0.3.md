@@ -71,7 +71,11 @@ plus the owner-run live records summarized in
    timers.
 9. **Stop/restart recovery** — `taisan run` is a foreground loop;
    durable identities survive restart, retries stay bounded by
-   durable counters, and unproven writers keep their reservations.
+   durable counters, and writers not proven absent keep their
+   reservations. The reservation guarantee has an open edge case: a
+   chdir+argv-change escapee can be mis-proved absent, enabling a
+   second writer on resume — recorded as the release-blocking #344
+   absence-proof defect (see known limitations).
 
 Also shipped and contract-tested: the internal intake scheduler
 (v0.2) and its Selector port (**live-exercised claim: none — see

@@ -53,16 +53,24 @@ recorded here so the decision is explicit either way.
 - **Tag target is the recorded candidate commit**, not "current main"
   at tag time. The candidate is recorded before tagging (§3); the tag
   is applied with `git tag -a v0.3.0 <recorded-sha>` and verified with
-  `git rev-list -n 1 v0.3.0` against the record.
+  `git rev-list -n 1 v0.3.0` against the record. Where the route
+  rewrites history, `<recorded-sha>` is the candidate's commit in the
+  published history — see the placement rule below and §3.4.
 - **Patch releases** on the line reuse the procedure: `v0.3.1` tags the
   recorded fix commit after the same check record.
 - **Tag placement depends on the owner's publication route** and this
-  proposal does not choose one. Under route A (publish in place) the
-  tag lands on the existing `main` history. Under route B (fresh
-  publication) or C (truncated history) the tag names a commit in the
-  *published* history, so tagging waits for the sanitized/squashed
-  tree to exist; the candidate record then carries both the private
-  pre-sanitize SHA and the published SHA.
+  proposal does not choose one, but under every route the published
+  history can differ from this repository's private `main`: route A
+  (publish in place) still rewrites all 1,017 commits to strip names
+  and identities
+  ([release audit](release-audit.md#6-options-for-owner-decision) §6),
+  and routes B (fresh publication) and C (truncated history) publish a
+  sanitized/squashed tree. So under every route the tag names the
+  recorded candidate's commit *in the published history* — never a
+  private pre-rewrite commit — and tagging waits for the published
+  tree to exist. The candidate record carries both the private
+  pre-rewrite SHA and the published SHA so either side of the rewrite
+  can be re-verified (§3.4).
 
 ## 3. Candidate-commit recording procedure
 
@@ -118,8 +126,20 @@ not before the owner signs off):
   release line; crates.io publication is out of scope for this
   release, so the version is an identity marker, not a registry
   contract.
+- The same commit updates `crates/workloop-cli/Cargo.toml`'s
+  `workloop-evidence-protocol = { version = "0.1.0", path = ... }`
+  requirement to the new version and regenerates `Cargo.lock` — a
+  `^0.1.0` requirement left against a `0.3.0` path crate fails Cargo
+  resolution and the build gate. (`workloop-store`'s path-only
+  dependency declares no version requirement and needs no edit.)
 - The metadata bump lands in the freeze commit (or a commit the freeze
-  records), so the tagged tree self-reports `0.3.0` end to end.
+  records), so the tagged tree self-reports `0.3.0` end to end. Note
+  that the bump also changes the `adapter_version` the released
+  `taisan-worker-claude` self-reports into declarations
+  (`env!("CARGO_PKG_VERSION")`); the describe captures retained from
+  the pre-freeze live runs still report the pre-bump value — the
+  freeze records both so the notes' tested-identity values stay
+  honest.
 
 This draft intentionally changes no `Cargo.toml`: the version bump is
 part of the freeze, and landing it early would make builds claim a
