@@ -48,8 +48,10 @@ first):
 | Runtime-auth cleanup | `4df7087` (PR #425, #364) | staged credential removed on refusal, re-resolve, stage failure, and drop |
 | Bounded absence proofs | `d81f064` (PR #428, #344) | launch-group clearance, bounded `absence_unprovable` escalation, recoverable outcome |
 | Remote bindings; verdict bounds | `5ba0b4b` (PR #429, #375), `8465cb9` (PR #430, #338) | versioned executor wire types and durable remote bindings; bounded verdict-report member sets |
-| License prep; exposure audit | `aff8721` (PR #433, #369), `b0b81f6` (PR #432, #368) | dependency license inventory and selection prep; public-release exposure audit report |
-| Remote executor surface | `2c271f0` (PR #436, #377), `119dcb7` (PR #435, #376) | public remote executor reference endpoint; bounded remote input transfer and quarantined artifact collection |
+| License prep | `aff8721` (PR #433, #369) | dependency license inventory and selection prep |
+| Remote executor endpoint | `2c271f0` (PR #436, #377) | public remote executor reference endpoint |
+| Exposure audit | `b0b81f6` (PR #432, #368) | public-release exposure audit report |
+| Bounded remote transfer | `119dcb7` (PR #435, #376) | bounded remote input transfer and quarantined artifact collection |
 
 ## 2. Evidence classes and record locations
 
@@ -201,12 +203,12 @@ candidate (locator drift only, no behavior change found).
 Other open defects re-checked on the candidate (beyond the list #365
 names):
 
-| Issue | Disposition | Reason (verified on `119dcb7`) |
+| Issue | Disposition | Reason (verified on `119dcb7` unless the row says otherwise) |
 | --- | --- | --- |
 | #313 — unidentified launch cannot converge with ≥2 unrecorded same-signature processes | **Open defect — disposition pending owner call (deferred vs blocking)** | Confirmed present and adjacent to the fixed #344 class: an ambiguous match restarts the unprovable streak and reports `Unknown` (`supervisor.rs:4220-4232`) — correct never-guess behavior, but the convergence gap persists: two same-signature lost-identity launches can hold capacity indefinitely. Honest-uncertain wedge, not a false-absence or duplicate-writer violation. |
 | #398 — contained verification leaves `masked_files` empty | **Open defect — flag for owner release-blocking review** | Confirmed present: the contained-verification `MountPlan`s carry `masked_files: vec![]` (`handoff.rs:1119`, `handoff.rs:1277`) while `contained_exec` pushes `grant.credential_source` into the mask (`supervisor.rs:1474-1475`); a `file:` credential source under a system-bind prefix stays readable inside contained verification. Same credential-hygiene class for which #364 was release-blocking before #425. |
 | #399 — credential mask only under system-bind prefixes | **Open defect — flag with #398** | Confirmed present: the `/dev/null` shadow renders only when `system_bind_covers(file)` (`containment.rs:562-567`); a credential source outside `/usr`/`/bin`/`/sbin`/`/lib`/`/lib64` (e.g. `/etc`, `/run`) gets no mask and can still be bound read-only by the argv-derived own-path `extra_binds`. |
-| #400 — v2 `report.json` retention dropped by #360 merge resolution | **Open defect — retention regression** | Confirmed present: `retain_report` does not exist in `handoff.rs` on the candidate — the body-store retention implemented in `706b8e1` was dropped by the merge-conflict resolution `630e53b`; the per-Invocation io tree reclaim can lose the report body the assessment layer expects. |
+| #400 — v2 `report.json` retention dropped by #360 merge resolution | **Open defect — retention regression; flag for owner review** | Confirmed present: `retain_report` does not exist in `handoff.rs` on the candidate — the retention implemented in `706b8e1` was dropped by the merge-conflict resolution `630e53b`. Impact is bounded but real: `report_v2::collect` already retains a bounded prefix of the report content-addressed in the CAS body store (`report_v2.rs:113-125,253-268`), so completion facts and bounded evidence survive — but the full `report.json` dies with the per-Invocation io-tree reclaim, an evidence-completeness gap on the v2 path the release advertises. |
 | #437 — `remote_collect` reports zero-byte required artifact `Present` where local reports `Missing` | **Open defect (new since the previous record)** | Shadow finding on #435, merged with the finding open: `remote_collect.rs` treats `blob_at` → `Some(empty)` as `Present` (size and claimed-digest checks pass at `bytes=0`) while the local supervisor returns `Missing`. v0.4 remote path — outside this release's exercised surface but on the candidate's shipped code; no repair PR yet. |
 | #419 — tracked `artifact.json` collision burns ArtifactRecovery | **Open defect — repair in flight** | PR #431 is open against it at record time; the candidate is provisional until it resolves. |
 | #409 — #405 follow-ups (watchdog gap, ppid edges, docs, regression test) | **Open — deferred, not release-blocking** | Residual test-harness/observability coverage items; the merged core fix stands. |
@@ -321,10 +323,11 @@ this document.
 - **One recovered-store attempt was internally inconsistent** (§4):
   restart/recovery evidence is partial.
 - **Defect dispositions refreshed** (§6): the defects previously
-  assessed release-blocking (#344, #364) and deferred (#363) are fixed
-  on this candidate by #428/#425/#426; no issue named by #365 carries
-  a release-blocking disposition now. New flags for owner review:
-  #398/#399 (credential masking — the same class #364 gated on) and
-  #313 (ambiguous-match convergence wedge). The `release-audit.md` §5
+  assessed release-blocking and deferred — #344 via #428, #364 via
+  #425, #363 via #426 — are fixed on this candidate; no issue named
+  by #365 carries a release-blocking disposition now. New flags for
+  owner review: #398/#399 (credential masking — the same class #364
+  gated on), #313 (ambiguous-match convergence wedge), and #400
+  (v2 report-retention regression). The `release-audit.md` §5
   exposure blockers remain gated on the publication-route decision,
   which stays an open owner choice.
