@@ -243,7 +243,7 @@ Equivalent-failure suppression: the failure classifier `(stage, stable_check_id,
 
 ## Skill workflow
 
-Deliverable: `skills/taisan/SKILL.md` — one agent-agnostic skill file following the cross-agent skill convention (YAML frontmatter `name`/`description`, then instructions), installable via `npx skills add shimpeiws/taisan`. It names no agent-specific paths; placement follows each agent's own convention. Direct CLI use is always available.
+Deliverable: `skills/taisan/SKILL.md` — one agent-agnostic skill file following the cross-agent skill convention (YAML frontmatter `name`/`description`, then instructions), installable via `npx skills add ttbc-dev/taisan`. It names no agent-specific paths; placement follows each agent's own convention. Direct CLI use is always available.
 
 The skill collects intent/issues/constraints/verification, invokes `taisan`, and explains the recorded result. It never maintains a queue, launches workers, invents recovery policy, or rewrites preconditions to make a rejection pass. Conversation closure is not cancellation: recorded Work and execution ownership remain inspectable after the agent session ends.
 

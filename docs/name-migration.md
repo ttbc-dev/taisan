@@ -12,7 +12,7 @@ taisan is the public project name. The orchestration model, adapter contracts, a
 | `workloop.db` | Unchanged default SQLite store path, relative to the working directory. |
 | `workloop.config.json` | Unchanged default installation config path, derived from the database path. `--config` still overrides it. |
 | Config keys, command origins, and idempotency keys | Unchanged. Both command names share the same storage and command semantics. |
-| `shimpeiws/taisan` | Current GitHub repository and clone URL. The previous `shimpeiws/agent-workloop` URL redirects here. |
+| `ttbc-dev/taisan` | Current GitHub repository and clone URL. The previous `shimpeiws/agent-workloop` URL redirects here. |
 
 ## Update existing installations
 
@@ -26,13 +26,13 @@ Generic terms such as work loop remain technical descriptions. Historical audit 
 
 ## Update Git remotes
 
-The GitHub repository is renamed from `shimpeiws/agent-workloop` to `shimpeiws/taisan`. Update each existing clone:
+The GitHub repository is renamed from `shimpeiws/agent-workloop` to `ttbc-dev/taisan`. Update each existing clone:
 
 ```sh
-git remote set-url origin git@github.com:shimpeiws/taisan.git
+git remote set-url origin git@github.com:ttbc-dev/taisan.git
 ```
 
-For HTTPS clones, use `https://github.com/shimpeiws/taisan.git`. Issue and pull request numbers remain unchanged, including existing open pull requests.
+For HTTPS clones, use `https://github.com/ttbc-dev/taisan.git`. Issue and pull request numbers remain unchanged, including existing open pull requests.
 
 GitHub redirects old repository links and Git clone, fetch, and push operations. Do not reuse the old repository name, because that removes the redirects. See [GitHub repository rename behavior](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository).
 

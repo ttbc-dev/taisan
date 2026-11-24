@@ -1,7 +1,7 @@
 # Follow-up: reuse diagnostic capabilities for Retro; keep Wayfinder upstream
 
 Status: **Proposal amendment — documentation only**  
-Related: [Wayfinder / Retro / Ratchet proposal](proposal-wayfinder-retro-ratchet.md), [PR #193](https://github.com/shimpeiws/taisan/pull/193).
+Related: [Wayfinder / Retro / Ratchet proposal](proposal-wayfinder-retro-ratchet.md), [PR #193](https://github.com/ttbc-dev/taisan/pull/193).
 
 ## Motivation
 
