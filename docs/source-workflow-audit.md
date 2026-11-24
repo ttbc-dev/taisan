@@ -9,9 +9,11 @@ and implementation planning.
 
 The four source repositories are private. Publication-facing documents
 reference them by role, not by name (see `AGENTS.md`). This audit record
-is the owner-controlled exception: it retains issue numbers, revision
-SHAs, and source-internal module names as owner-verifiable evidence
-locators so each mapping can be re-checked against the sources:
+is an owner-controlled exception — the first of two;
+`docs/release-audit.md` is the second. This record retains issue
+numbers, revision SHAs, and source-internal module names as
+owner-verifiable evidence locators so each mapping can be re-checked
+against the sources:
 
 | Role name used here | What it is |
 | --- | --- |
