@@ -9,26 +9,14 @@ legend in `AGENTS.md` / `docs/source-workflow-audit.md`. The one name
 spelled out is `shimpeiws/agent-workloop`, this repository's own former
 name, which the name-migration analysis necessarily cites.
 
-> **Owner-controlled record — not publication-facing.** This document is
-> a map of every remaining leak location; publishing it would hand an
-> adversary the leak index itself. It needs the same disposition as
-> `docs/source-workflow-audit.md` — a disclosure review, or exclusion
-> from the published tree and its reachable history — before the
-> repository goes public (see §6). `AGENTS.md` names it a second
-> owner-controlled exception under the same terms — but that clause is
-> added by the same pull request that adds this file, so it is a
-> proposed disposition pending owner ratification, not a prior owner
-> decision. Committing the file already places the leak index in
-> reachable history, and merging this pull request puts it on `main`'s
-> history. Per route (§6): under A the published tree must be scrubbed
-> or the file removed and its blob history rewritten; under B a
-> sanitized snapshot can exclude it; under C the squashed root commit
-> publishes the current tree as-is, so the file must be removed or
-> scrubbed before the squash — it does not stay out by itself.
-> Accepting the merge is the owner's ratification of keeping this
-> record tracked under the second exception — it does not replace the
-> disclosure review required before publication (§5 item 6, §6), and
-> this record does not make that decision.
+> **Audit record — retained in the published tree.** This document maps
+> every leak location found on 2026-11-24. The owner reviewed §5 and
+> ruled that the private source-repository names and the owner identity
+> recorded here are acceptable to disclose (issue #438), choosing
+> in-place publication with the existing history kept — no squash, no
+> history rewrite, no tracker-metadata scrub. The file therefore stays
+> as the provenance/leak record; §5's items are dispositioned in §7 and
+> §6's route analysis is retained for the record.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -324,10 +312,38 @@ No action was taken. Three routes:
   item 6). Keeps issue/PR numbers meaningful for the audit record
   while removing blob history. Still requires the metadata pass.
 
-Whichever route is chosen, `docs/source-workflow-audit.md` needs its own
-disclosure review first — it is designed to retain the names this audit
-flags — and the same holds for this document, which maps where they
-survive.
+Whichever route is chosen, `docs/source-workflow-audit.md` retains the
+names this audit flags — and the same holds for this document, which
+maps where they survive. The owner's ruling in §7 accepts that
+exposure for both files.
+
+## 7. Owner disposition (2026-11-25, issue #438)
+
+The owner ruled that the private repository names — all four source
+repos, the smoke repo, and ops-adjacent repos — and the owner identity
+are acceptable to disclose, and chose in-place publication with the
+history kept. §5's items resolve under that decision as follows:
+
+1. Smoke-repo links/citations — retained verbatim; the citing documents
+   mark them as private/owner-only references (dead-link honesty, not
+   removal).
+2. `scripts/s1/` scenario tooling — retained; framed as owner-ops
+   tooling that cannot run publicly.
+3. `scripts/s1/mint-app-token.py` — retained; its owner-local
+   credential dependency is documented in the tool header.
+4. `docs/extraction-coverage.json` — redaction retained as written;
+   names are acceptable, no fixes required for disclosure.
+5. `docs/name-migration.md` — kept; the self-rename is disclosed by
+   GitHub's redirect regardless.
+6. This document — kept in the published tree as the leak/provenance
+   record; no disclosure review gates publication under the ruling.
+7. Tracker metadata — no scrub required under the decision.
+8. Owner-operations docs — retained, framed as owner-run records.
+
+§6's route analysis is superseded: none of routes A/B/C was taken as
+written. The chosen route is in-place publication with history kept —
+route A's mechanics with the name/identity exposure explicitly
+accepted rather than remediated.
 
 ## Appendix — verification commands
 

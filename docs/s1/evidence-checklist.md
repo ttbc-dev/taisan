@@ -6,6 +6,11 @@ count as exercised. Fixture or contract-test results never satisfy
 these rows — they require live evidence, and live execution is #113's
 separate authorization.
 
+> **Private references.** `shimpeiws/coding-worker-smoke` is a private
+> repository — every link and `#N` citation to it in this document
+> resolves only for the owner (they 404 publicly). The name is retained
+> verbatim under the owner publication decision (#438).
+
 For every run the evidence record carries: taisan revision, the
 sanitized installation config identity, the seeded-issue reference, all
 produced `command_id`/`work_id`/`execution_id`/`invocation_id`/

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Validate prepared S1 scenario materials without executing the scenario.
 
+Owner-operations tooling: the scenario targets the private repository
+``shimpeiws/coding-worker-smoke``, so a live run is owner-only — this
+preflight itself is read-only and runs anywhere.
+
 This is a read-only preflight for the fixtures in ``fixtures/s1``. It
 checks that the isolated installation specification, the deterministic
 seeded issue, and the criterion-to-evidence checklist are present and

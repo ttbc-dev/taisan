@@ -17,7 +17,9 @@ and results.
 from source reads and tracker queries at the recorded revisions, plus
 the public locators produced by the first live run (Work `w-2` /
 Execution `e-6` → `succeeded` at head `35ce3cb`, PR
-`shimpeiws/coding-worker-smoke#62`, 2026-11-23). That run approximated
+`shimpeiws/coding-worker-smoke#62`, 2026-11-23 — a private repository;
+the citation resolves only for the owner, retained verbatim under the
+owner publication decision #438). That run approximated
 a remote boundary by operator-driven manual transport, a
 bridge-assisted push, and containment workarounds; its facts are
 cited through the issues it produced (#410, #411, #412) and are

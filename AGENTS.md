@@ -2,27 +2,27 @@
 
 ## Source references
 
-- Do not name or directly reference the private source repositories this
-  project was distilled from: no repository names, file paths, or symbol
-  names in publication-facing docs or code. Describe them by role instead
-  (e.g. "the ops repo", "the worker repo", "the selector repo", "the
-  infra repo" — see `docs/source-workflow-audit.md` for the role legend).
-  Issue numbers and abbreviated revision SHAs may be cited as
-  owner-verifiable evidence locators.
-- `docs/source-workflow-audit.md` is an owner-controlled audit record
-  and an exception to the naming rule: it retains source-internal
-  names, issue/PR numbers, and revision SHAs so each design mapping can
-  be re-verified against the sources. It is not publication-facing;
-  publication of the repository requires a disclosure review covering
-  this document and the git history that retains the removed identifiers.
-- `docs/release-audit.md` is a second owner-controlled exception under
-  the same terms: it maps every remaining leak location by file:line
-  or commit reference, classified by leak class, while withholding
-  private source names behind role placeholders, so it is itself a
-  disclosure surface — publication requires the same disclosure review
-  covering this document and the history that retains it. If it is
-  ever to be published, the leak map must first be scrubbed or the
-  file removed from the published tree and its history.
+- Publication-facing docs and code describe the private source
+  repositories this project was distilled from by role ("the ops repo",
+  "the worker repo", "the selector repo", "the infra repo" — see
+  `docs/source-workflow-audit.md` for the role legend). Issue numbers
+  and abbreviated revision SHAs may be cited as owner-verifiable
+  evidence locators.
+- By owner decision (#438) the private repository names and the owner's
+  identity are acceptable to disclose: where a source or scenario name
+  does appear — including the private acceptance repository
+  `shimpeiws/coding-worker-smoke` — it is retained verbatim, and links
+  or `#N` citations to private repositories resolve only for the
+  owner. Documents carrying such references mark them as
+  private/owner-only rather than presenting them as working links.
+- `docs/source-workflow-audit.md` is the owner-controlled audit record:
+  it retains source-internal names, issue/PR numbers, and revision SHAs
+  so each design mapping can be re-verified against the sources. It
+  stays in the published tree as the provenance record.
+- `docs/release-audit.md` is the disclosure audit for issue #368: it
+  maps every leak location by file:line or commit reference, classified
+  by leak class, and records in §7 the owner disposition under which
+  this tree is published.
 
 ## Pull requests
 

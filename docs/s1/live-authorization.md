@@ -1,11 +1,15 @@
 # S1 live authorization — draft for owner record
 
-**Status: DRAFT.** This text is a proposal for the owner to review,
+**Status: DRAFT — owner-operations material.** This text is a proposal
+for the owner to review,
 edit, and record on issue #113 (or wherever the owner designates)
 **before** any live step in [live-runbook.md](live-runbook.md) begins.
 The agent preparing #113 does not record, sign, or imply this
 authorization. Recording it is the owner's deliberate act; bracketed
-fields must be filled or explicitly approved by the owner.
+fields must be filled or explicitly approved by the owner. It targets
+the private repository `shimpeiws/coding-worker-smoke` — citations to
+it resolve only for the owner (retained verbatim under the owner
+publication decision, #438).
 
 Authorization precedes every live write: no `submit`, no Worker launch,
 no `git push`, no `gh pr create`, and no store mutation on the isolated
