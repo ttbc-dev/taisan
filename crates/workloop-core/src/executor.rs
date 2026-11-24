@@ -528,8 +528,13 @@ fn validate_result(kind: OperationKind, result: &serde_json::Value) -> Result<()
     match status {
         "started" | "running" | "exited" => {
             let process = map.get("process").unwrap_or(&serde_json::Value::Null);
-            let _: ProcessEvidenceRef = serde_json::from_value(process.clone())
+            let evidence: ProcessEvidenceRef = serde_json::from_value(process.clone())
                 .map_err(|e| invalid(format!("process evidence ref malformed: {e}")))?;
+            if !is_hex64(&evidence.identity_digest) {
+                return Err(invalid(
+                    "process identity_digest is not 64 lowercase hex".into(),
+                ));
+            }
         }
         _ => {}
     }
@@ -1325,12 +1330,20 @@ pub fn collection_digest(entries: &[CollectionEntry]) -> Result<String, Envelope
 // against the class bound before allocating or parsing the body.
 // ---------------------------------------------------------------------
 
-/// Frame a bounded body for the transport.
-pub fn frame_body(body: &[u8]) -> Vec<u8> {
+/// Frame a bounded body for the transport. The send side applies the
+/// same bound the receiver enforces: a body over the class bound — or
+/// wider than the 32-bit length prefix can declare — is refused rather
+/// than emitted as a frame whose header disagrees with its body.
+pub fn frame_body(body: &[u8], limit: u64) -> Result<Vec<u8>, EnvelopeError> {
+    let limit = limit.min(u64::from(u32::MAX));
+    let bytes = body.len() as u64;
+    if bytes > limit {
+        return Err(EnvelopeError::Oversize { limit, bytes });
+    }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(body);
-    out
+    Ok(out)
 }
 
 /// Read a frame header's declared length and gate it against the
@@ -1893,6 +1906,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_identity_digest_must_be_64_lowercase_hex() {
+        // Every result variant carrying process evidence rejects a
+        // malformed identity_digest — the same hex rule the other
+        // contract digests are held to.
+        for (kind, result) in [
+            (
+                OperationKind::Start,
+                serde_json::json!({
+                    "status": "started",
+                    "process": {"evidence_ref": "p", "identity_digest": "not-hex"},
+                }),
+            ),
+            (
+                OperationKind::Observe,
+                serde_json::json!({
+                    "status": "running",
+                    "process": {"evidence_ref": "p", "identity_digest": "D".repeat(64)},
+                    "sequence": 3,
+                }),
+            ),
+            (
+                OperationKind::Observe,
+                serde_json::json!({
+                    "status": "exited",
+                    "process": {"evidence_ref": "p", "identity_digest": "d".repeat(63)},
+                    "sequence": 4,
+                }),
+            ),
+        ] {
+            assert!(
+                validate_result(kind, &result).is_err(),
+                "{kind:?} accepted a malformed identity_digest"
+            );
+        }
+    }
+
     // -- handshake --------------------------------------------------
 
     #[test]
@@ -2174,7 +2224,7 @@ mod tests {
     #[test]
     fn framing_bounds_length_before_body() {
         let body = b"{}";
-        let frame = frame_body(body);
+        let frame = frame_body(body, 1024).unwrap();
         assert_eq!(&frame[..4], &[0, 0, 0, 2]);
         assert_eq!(frame_len(frame[..4].try_into().unwrap(), 1024).unwrap(), 2);
         // A declared length over the class bound refuses before any
@@ -2183,6 +2233,13 @@ mod tests {
         assert!(matches!(
             frame_len(&header, MAX_DATA_FRAME_BYTES),
             Err(EnvelopeError::Oversize { .. })
+        ));
+        // The send side refuses the same way: a body over the class
+        // bound is never emitted as a frame — a small bound exercises
+        // the check without a real 4 GiB buffer.
+        assert!(matches!(
+            frame_body(body, 1),
+            Err(EnvelopeError::Oversize { limit: 1, bytes: 2 })
         ));
     }
 }
