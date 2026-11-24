@@ -21,26 +21,32 @@ The workspace has **9 direct external dependencies** and **87 external
 crates total** in the resolved dependency graph (all targets, normal +
 build edges; dev-dependencies add no additional crates). Of those 87:
 
-- **50 crates link into unix release binaries** — the table's
-  unmarked rows. (`cargo tree --target aarch64-apple-darwin --edges
-  normal,build` resolves 68 of the 87 — the linked set plus the
-  build-time set, which compiles on the host during build but never
-  links into the shipped binary; `x86_64-pc-windows-msvc` resolves 72.)
-- **20 crates compile only at build time and never ship inside a
-  binary** (21 table rows — `syn` is present at two versions): 7
-  proc-macro crates (`clap_derive`, `ref-cast-impl`, `rustversion`,
-  `schemars_derive`, `serde_derive`, `wasm-bindgen-macro`,
-  `zerocopy-derive`), 6 build-script helpers (`cc`, `find-msvc-tools`,
-  `pkg-config`, `shlex`, `vcpkg`, `version_check`), and the proc-macro
-  support crates reachable only through them (`proc-macro2`, `quote`,
-  `syn`, `heck`, `serde_derive_internals`, `unicode-ident`). The table
-  marks these "(build only)".
-- **16 crates are target-gated and never compile for unix release
-  binaries**: `r-efi` (UEFI only), the `wasm-bindgen*`/`js-sys`/
-  `bumpalo`/`futures-*`/`slab`/`pin-project-lite`/`rustversion` cluster
-  (11 crates, wasm32 only, reached via `uuid`), and the `windows-sys`/
-  `windows-link`/`anstyle-wincon`/`once_cell_polyfill` cluster (4
-  crates, Windows only).
+- **52 crates link into unix release binaries** — the table's
+  unmarked rows.
+- **18 crates compile only at build time and never link into a
+  binary** (19 table rows — `syn` is present at two versions). The
+  unix build-time set is: proc-macro crates `clap_derive`,
+  `ref-cast-impl`, `schemars_derive`, `serde_derive`; build-script
+  helpers `cc`, `find-msvc-tools`, `pkg-config`, `shlex`, `vcpkg`,
+  `version_check`; and the proc-macro support crates reachable only
+  through them (`proc-macro2`, `quote`, `syn`, `heck`,
+  `serde_derive_internals`, `unicode-ident`). The table marks these
+  "(build only)". Two further marked rows — `rustversion` and
+  `zerocopy-derive` — are also build-time-only, but they resolve only
+  through the wasm-bound subtree (`rustversion` via `wasm-bindgen`;
+  `zerocopy-derive` via `zerocopy`'s derive feature, off on unix), so
+  they never compile for unix either and are counted below.
+  (`cargo tree --target aarch64-apple-darwin --edges normal,build`
+  resolves 68 of the 87: the 52 linked crates plus the 16 unix
+  build-time names; `x86_64-pc-windows-msvc` resolves 72.)
+- **16 crates are target-gated** (`(wasm only)`/`(windows only)`/
+  `(UEFI only)` rows): `r-efi` (UEFI only),
+  the `wasm-bindgen*`/`js-sys`/`bumpalo`/`futures-*`/`slab`/
+  `pin-project-lite` cluster (11 crates, wasm32 only, reached via
+  `uuid`) and the `windows-sys`/`windows-link`/`anstyle-wincon`/
+  `once_cell_polyfill` cluster (4 crates, Windows only). Together with
+  `rustversion` and `zerocopy-derive` above, **18 crates never resolve
+  for unix targets** (69 unix-resolved rows = 68 unique crates).
 
 `D` = declared directly in a workspace `Cargo.toml`.
 
