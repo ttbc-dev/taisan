@@ -17,8 +17,9 @@ use workloop_core::command::{
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
-    AssessmentVerdict, BranchState, Completeness, HostActionStatus, IssueState,
-    NormalizedEffectFact, Observation, ObservationFact, ProcessStateFact,
+    ArtifactFact, AssessmentVerdict, BranchState, CapabilityEntry, CapabilityState, Completeness,
+    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact,
+    ProcessStateFact,
 };
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::store::{
@@ -5870,6 +5871,256 @@ fn a_tracked_artifact_json_fails_unfulfillable_on_the_first_finish() {
             .as_deref()
             .is_some_and(|detail| detail.contains("tracked repository content")),
         "the failure keeps the collision reason for diagnosis: {outcome:?}"
+    );
+}
+
+/// Insert a resolved writer bound to `request_id` requiring the
+/// workspace-root `artifact.json` — the durable shape the artifact
+/// gates read when they pick the producing Invocation.
+fn insert_writer(
+    store: &SqliteStore,
+    execution_id: &ExecutionId,
+    invocation_id: &str,
+    request_id: &str,
+    state: InvocationState,
+) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(invocation_id.into()),
+                    request_id: request_id.into(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Coding,
+                    state,
+                    process_identity: None,
+                    descendants: vec![],
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "artifact.json".into(),
+                        path: "artifact.json".into(),
+                        expected_digest: None,
+                    }],
+                    evidence_refs: vec![],
+                },
+            })
+        })
+        .unwrap();
+}
+
+/// Move the admitted Execution into the `waiting` settle position a
+/// finished writer leaves — the only state `assess_completion` acts on.
+fn park_waiting(store: &SqliteStore, execution_id: &ExecutionId) {
+    store
+        .transact(|tx| {
+            let mut next = tx.execution(execution_id)?.expect("execution exists");
+            let expected = next.state.clone();
+            next.state = ExecutionState::Waiting;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: expected,
+            })
+        })
+        .unwrap();
+}
+
+/// Authorize `push_ref` on the fixture host: the capability report the
+/// publish chain's guard reads before recording a stage-effect intent.
+fn authorize_push(store: &SqliteStore) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: None,
+            fact: ObservationFact::CapabilityReport {
+                host: host(),
+                capabilities: vec![CapabilityEntry {
+                    capability: HostCapability::PushRef,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// Record one `Artifact` fact the finish or recovery path reports for
+/// an Invocation's required `artifact.json` kind — the append-only
+/// evidence the artifact gates order by `(observed_unix_seconds,
+/// index)`.
+fn record_artifact_fact(
+    store: &SqliteStore,
+    execution_id: &ExecutionId,
+    invocation_id: &InvocationId,
+    state: ArtifactFact,
+    at: i64,
+) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(execution_id.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: invocation_id.clone(),
+                required_artifact: "artifact.json".into(),
+                state,
+            },
+            observed_unix_seconds: at,
+        },
+        at,
+    )
+    .unwrap();
+}
+
+/// The collision refusal binds to its producing Invocation: an
+/// `Unfulfillable` recorded under a superseded writer is stale
+/// evidence, never the current writer's outcome. Artifact
+/// observations survive the pause/resume and requeue that replace a
+/// writer, so the settle pass reads the CURRENT producing
+/// Invocation's latest fact per required kind — the same binding
+/// `artifact_digests` applies to satisfying evidence (WC-REV-01).
+#[test]
+fn a_superseded_writers_collision_never_fails_the_current_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-stale", vec![], vec![], &cfg);
+    // The superseded writer whose finish recorded the tracked-artifact
+    // collision, and the current writer admitted after the path was
+    // untracked — both resolved `Done`.
+    insert_writer(
+        &store,
+        &e,
+        "inv-stale",
+        &format!("{rid}:prev"),
+        InvocationState::Done,
+    );
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+    authorize_push(&store);
+    // The stale collision's durable fact lands ahead of the current
+    // writer's evidence, exactly as a pause/resume replay delivers it.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-stale".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW,
+    );
+    let exec = execution(&store, &e);
+    assert_ne!(
+        exec.state,
+        ExecutionState::Failed,
+        "a superseded writer's collision is stale evidence: {exec:?}"
+    );
+    // The current writer's own `Present` — not the stale refusal —
+    // drives the publish chain.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "cd".repeat(32),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "the current writer's evidence advanced publication: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.action_intents())
+            .unwrap()
+            .iter()
+            .any(|i| matches!(i.action, HostAction::PushRef { .. })),
+        "the publish intent is authorized by the current writer's artifact"
+    );
+}
+
+/// Within one producing Invocation the latest fact per required kind
+/// is the current evidence: a later `Present` for the same kind
+/// supersedes an earlier `Unfulfillable`. The observation log is
+/// append-only — the finish path can report a collision while the
+/// writer is still unresolved, and a later recovery pass over the
+/// same workspace then promotes a now-valid manifest under the same
+/// Invocation identity. The gate reads the newest fact, never the
+/// first.
+#[test]
+fn a_writers_later_present_supersedes_its_earlier_collision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-supersede", vec![], vec![], &cfg);
+    // The writer is still unresolved while its finish path reports
+    // the collision — the settle pass defers to a live writer's later
+    // evidence, never settling on a mid-flight fact.
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Running);
+    authorize_push(&store);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW,
+    );
+    // The path is untracked and the recovery pass promotes a valid
+    // manifest under the same Invocation: the writer resolves `Done`
+    // and the Execution waits for the settle pass.
+    store
+        .transact(|tx| {
+            let mut writer = tx
+                .invocations_for_execution(&e)?
+                .into_iter()
+                .next()
+                .expect("writer recorded");
+            let expected_writer = writer.state.clone();
+            writer.state = InvocationState::Done;
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: writer,
+                expected_state: expected_writer,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    park_waiting(&store, &e);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ef".repeat(32),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_ne!(
+        exec.state,
+        ExecutionState::Failed,
+        "a superseded collision is not the Invocation's evidence: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "the latest fact — `Present` — drove publication: {exec:?}"
     );
 }
 

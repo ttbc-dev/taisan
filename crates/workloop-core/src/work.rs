@@ -4312,6 +4312,35 @@ fn produced_revision(
     })
 }
 
+/// The latest `Artifact` fact `invocation` recorded for `kind`, if
+/// any — the single latest-fact-per-kind selection every artifact
+/// gate shares, ordered by `(observed_unix_seconds, index)` so the
+/// required-set check and the collision check can never drift apart
+/// on what the Invocation's current evidence is.
+fn latest_artifact_fact<'o>(
+    observations: &'o [Observation],
+    invocation: &Invocation,
+    kind: &str,
+) -> Option<&'o ArtifactFact> {
+    let mut latest: Option<(i64, usize, &'o ArtifactFact)> = None;
+    for (index, o) in observations.iter().enumerate() {
+        if let ObservationFact::Artifact {
+            invocation_id,
+            required_artifact,
+            state,
+        } = &o.fact
+            && invocation_id == &invocation.id
+            && required_artifact == kind
+        {
+            let replace = latest.is_none_or(|(t, i, _)| (t, i) < (o.observed_unix_seconds, index));
+            if replace {
+                latest = Some((o.observed_unix_seconds, index, state));
+            }
+        }
+    }
+    latest.map(|(_, _, fact)| fact)
+}
+
 /// The digests of `Present` artifacts covering every required artifact
 /// of the invocation; empty when the set is not yet complete and valid.
 /// A `Present` fact with a missing or mismatched digest is invalid and
@@ -4324,25 +4353,8 @@ fn artifact_digests(
     let observations = tx.observations_for_execution(execution_id)?;
     let mut digests = Vec::new();
     for required in &invocation.required_artifacts {
-        let mut latest: Option<(i64, usize, &ArtifactFact)> = None;
-        for (index, o) in observations.iter().enumerate() {
-            if let ObservationFact::Artifact {
-                invocation_id,
-                required_artifact,
-                state,
-            } = &o.fact
-                && invocation_id == &invocation.id
-                && required_artifact == &required.kind
-            {
-                let replace =
-                    latest.is_none_or(|(t, i, _)| (t, i) < (o.observed_unix_seconds, index));
-                if replace {
-                    latest = Some((o.observed_unix_seconds, index, state));
-                }
-            }
-        }
-        match latest {
-            Some((_, _, ArtifactFact::Present { digest }))
+        match latest_artifact_fact(&observations, invocation, &required.kind) {
+            Some(ArtifactFact::Present { digest })
                 if !digest.is_empty()
                     && required
                         .expected_digest
@@ -4402,24 +4414,29 @@ fn satisfied_invariant_check(
     Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
 }
 
-/// The first recorded artifact collision for an Execution, if any.
-/// `Unfulfillable` is a structural refusal — no later recovery can
-/// turn the declared artifact into `Present` — so it must fail the
-/// request instead of entering bounded artifact recovery.
+/// The producing Invocation's artifact collision, if any: a required
+/// artifact kind whose latest recorded fact under that Invocation is
+/// `Unfulfillable`. The refusal binds to the Invocation that recorded
+/// it — a collision under a superseded Invocation is stale evidence,
+/// and within the producing Invocation a later `Present`/`Missing`
+/// fact for the same kind supersedes an earlier refusal. A kind whose
+/// current evidence is `Unfulfillable` can never become `Present`
+/// under this Invocation, so it must fail the request instead of
+/// entering bounded artifact recovery.
 fn unfulfillable_artifact(
     tx: &dyn ReadView,
     execution_id: &ExecutionId,
+    invocation: &Invocation,
 ) -> Result<Option<String>, StoreError> {
-    Ok(tx
-        .observations_for_execution(execution_id)?
-        .into_iter()
-        .find_map(|observation| match observation.fact {
-            ObservationFact::Artifact {
-                state: ArtifactFact::Unfulfillable { reason },
-                ..
-            } => Some(reason),
-            _ => None,
-        }))
+    let observations = tx.observations_for_execution(execution_id)?;
+    for required in &invocation.required_artifacts {
+        if let Some(ArtifactFact::Unfulfillable { reason }) =
+            latest_artifact_fact(&observations, invocation, &required.kind)
+        {
+            return Ok(Some(reason.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// `succeeded` requires the required stage effects applied, the declared
@@ -4436,12 +4453,20 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
     }
-    // A recorded artifact collision is structural: the declared
-    // artifact can never become `Present`, so bounded recovery would
-    // only burn its budget. The writer is resolved above, so settle
-    // the request now with the collision spelled out instead of
-    // retrying it.
-    if let Some(reason) = unfulfillable_artifact(tx, &execution.id)? {
+    // A recorded artifact collision is structural for the Invocation
+    // that produced it: the declared artifact can never become
+    // `Present` under that Invocation, so bounded recovery would only
+    // burn its budget. The refusal reads the latest producing writer's
+    // own current evidence — a collision recorded under a superseded
+    // Invocation is stale fact, never this writer's outcome. The
+    // writer is resolved above, so settle the request now with the
+    // collision spelled out instead of retrying it.
+    if let Some(writer) = invocations
+        .iter()
+        .rposition(|i| matches!(i.role, InvocationRole::Coding | InvocationRole::Fix))
+        .map(|i| &invocations[i])
+        && let Some(reason) = unfulfillable_artifact(tx, &execution.id, writer)?
+    {
         return fail_terminal(tx, execution, "artifact_unfulfillable", &reason);
     }
     if !invocations.iter().any(|i| {
