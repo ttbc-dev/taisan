@@ -3901,6 +3901,15 @@ fn assess_artifact(
                 expected_state: execution.state.clone(),
             })
         }
+        // A structurally impossible artifact never improves on retry:
+        // a tracked workspace-root `artifact.json` is repository
+        // content the worker shim never rewrites, so it can never
+        // become this Invocation's bound manifest. The finish path
+        // reports artifact facts before the terminal process fact, so
+        // the failure is settled by `assess_completion` once the
+        // writer is proven done — never by charging the bounded
+        // recovery budget for the collision.
+        ArtifactFact::Unfulfillable { .. } => Ok(()),
         ArtifactFact::Present { .. }
             if execution.state == ExecutionState::Waiting
                 || execution.state == ExecutionState::Running =>
@@ -4393,6 +4402,26 @@ fn satisfied_invariant_check(
     Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
 }
 
+/// The first recorded artifact collision for an Execution, if any.
+/// `Unfulfillable` is a structural refusal — no later recovery can
+/// turn the declared artifact into `Present` — so it must fail the
+/// request instead of entering bounded artifact recovery.
+fn unfulfillable_artifact(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+) -> Result<Option<String>, StoreError> {
+    Ok(tx
+        .observations_for_execution(execution_id)?
+        .into_iter()
+        .find_map(|observation| match observation.fact {
+            ObservationFact::Artifact {
+                state: ArtifactFact::Unfulfillable { reason },
+                ..
+            } => Some(reason),
+            _ => None,
+        }))
+}
+
 /// `succeeded` requires the required stage effects applied, the declared
 /// checks passing on the current target, the enabled lanes satisfied by
 /// their exact evidence, and no unresolved writer, gate, or outgoing
@@ -4406,6 +4435,14 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     let invocations = tx.invocations_for_execution(&execution.id)?;
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
+    }
+    // A recorded artifact collision is structural: the declared
+    // artifact can never become `Present`, so bounded recovery would
+    // only burn its budget. The writer is resolved above, so settle
+    // the request now with the collision spelled out instead of
+    // retrying it.
+    if let Some(reason) = unfulfillable_artifact(tx, &execution.id)? {
+        return fail_terminal(tx, execution, "artifact_unfulfillable", &reason);
     }
     if !invocations.iter().any(|i| {
         matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)

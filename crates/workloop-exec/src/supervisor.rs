@@ -5379,6 +5379,15 @@ fn manifest_binding(bytes: &[u8], invocation: &Invocation) -> ManifestBinding {
 /// `v2_manifest` marks an invocation whose dispatch recorded a
 /// durable v2 request body; only then does the `artifact.json` path
 /// require the manifest contract — a v1 artifact stays opaque.
+///
+/// A tracked `artifact.json` is one exception to that degradation.
+/// The shim never rewrites repository content, so under a v2 dispatch
+/// a tracked file that is not the bound manifest can never become
+/// `Present`; it is reported `Unfulfillable` so Core fails the
+/// request at once instead of spending the artifact-recovery budget.
+/// Whether the repository tracked the file or the runtime's own
+/// commit captured it makes no difference — the collision is the
+/// same.
 fn artifact_fact(
     workspace: &Path,
     required: &RequiredArtifact,
@@ -5386,23 +5395,55 @@ fn artifact_fact(
     v2_manifest: bool,
 ) -> ArtifactFact {
     let candidate = workspace.join(&required.path);
+    let artifact_slot = v2_manifest && Path::new(&required.path) == Path::new("artifact.json");
+    // A tracked slot is repository content the shim refuses to write,
+    // whether the worktree still holds it or not. Unless the bytes are
+    // the bound manifest, the declared artifact is structurally
+    // unfulfillable — no recovery attempt can change a tracked path
+    // into one the shim may overwrite.
+    let tracked = artifact_slot && artifact_path_tracked(workspace, &required.path);
+    let unfulfillable = || ArtifactFact::Unfulfillable {
+        reason: format!(
+            "workspace-root {} is tracked repository content; the worker shim \
+             never rewrites it, so it cannot be this invocation's bound \
+             handoff manifest",
+            required.path
+        ),
+    };
     if !candidate.is_file() {
-        return ArtifactFact::Missing;
+        return if tracked {
+            unfulfillable()
+        } else {
+            ArtifactFact::Missing
+        };
     }
     let Ok(bytes) = std::fs::read(&candidate) else {
-        return ArtifactFact::Missing;
+        return if tracked {
+            unfulfillable()
+        } else {
+            ArtifactFact::Missing
+        };
     };
     if bytes.is_empty() {
-        return ArtifactFact::Missing;
+        return if tracked {
+            unfulfillable()
+        } else {
+            ArtifactFact::Missing
+        };
     }
-    match manifest_binding(&bytes, invocation) {
-        ManifestBinding::Foreign => return ArtifactFact::Missing,
-        ManifestBinding::Opaque
-            if v2_manifest && Path::new(&required.path) == Path::new("artifact.json") =>
-        {
-            return ArtifactFact::Missing;
+    let binding = manifest_binding(&bytes, invocation);
+    if artifact_slot {
+        if !matches!(binding, ManifestBinding::Bound) {
+            // An untracked stale or malformed file is output recovery
+            // may still replace; only the tracked collision is final.
+            return if tracked {
+                unfulfillable()
+            } else {
+                ArtifactFact::Missing
+            };
         }
-        _ => {}
+    } else if matches!(binding, ManifestBinding::Foreign) {
+        return ArtifactFact::Missing;
     }
     let digest = sha256_hex("artifact-v1", &bytes);
     // A present artifact must carry its exact payload digest; an
@@ -5418,6 +5459,23 @@ fn artifact_fact(
             reason: Some("payload digest does not match the declared expectation".into()),
         }
     }
+}
+
+/// Whether the workspace repository tracks `path` — staged or
+/// committed. Outside a git repository nothing is tracked. A tracked
+/// path is repository content the shim's manifest write path refuses
+/// to rewrite; it is not stale manifest debris.
+fn artifact_path_tracked(workspace: &Path, path: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Recursively copy `source` into `dest` for the invariant check's
@@ -5766,6 +5824,121 @@ mod tests {
         assert!(matches!(
             artifact_fact(&dir, &wrong, &invocation, false),
             ArtifactFact::Corrupt { .. }
+        ));
+    }
+
+    /// A tracked `artifact.json` is repository content the shim never
+    /// rewrites: under a v2 dispatch an untracked stale or opaque file
+    /// stays `missing` for recovery, but the tracked collision is a
+    /// structural `Unfulfillable`. A bound manifest is still `Present`
+    /// whatever the index says, and the untracked rule returns once
+    /// the path leaves the index.
+    #[test]
+    fn a_tracked_artifact_json_is_unfulfillable_under_a_v2_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-tracked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let invocation = Invocation {
+            id: InvocationId("inv-tracked".into()),
+            request_id: "req-tracked".into(),
+            execution_id: ExecutionId("e-tracked".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let required = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        let write = |body: &str| {
+            std::fs::write(dir.join("artifact.json"), body).unwrap();
+        };
+
+        // Tracked opaque content is repository content that can never
+        // be the bound manifest: a decisive, non-recoverable refusal.
+        write("tracked repository content");
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        // The shim refuses to write a tracked path even when the
+        // worktree entry is gone, so the missing file is the same
+        // collision, not recoverable absence.
+        std::fs::remove_file(dir.join("artifact.json")).unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+
+        // A tracked manifest naming another producer is the same
+        // collision, not the ordinary stale-manifest `missing`.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-other",
+                "invocation_id": "inv-other",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+
+        // A manifest bound to this invocation is evidence regardless of
+        // the index.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-tracked",
+                "invocation_id": "inv-tracked",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+
+        // Untracked stale manifests keep the #413 recovery rule: the
+        // shim may sweep them, so they stay `missing`, never
+        // `Unfulfillable`.
+        git(&["rm", "--cached", "-q", "artifact.json"]);
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-other",
+                "invocation_id": "inv-other",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
         ));
     }
 

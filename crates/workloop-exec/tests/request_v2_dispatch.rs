@@ -5820,6 +5820,59 @@ fn a_stale_manifest_is_never_present_for_the_new_invocation() {
     );
 }
 
+/// A tracked workspace-root `artifact.json` is repository content the
+/// shim never rewrites. Under a v2 dispatch that slot must hold the
+/// bound handoff manifest, so the declared required artifact is
+/// unfulfillable by construction: the first finish fails the Execution
+/// with a distinct collision code instead of entering — and eventually
+/// exhausting — bounded artifact recovery.
+#[test]
+fn a_tracked_artifact_json_fails_unfulfillable_on_the_first_finish() {
+    let root = tmp_root("tracked-artifact");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    // The source repository tracks the workspace-root manifest path, so
+    // the prepared workspace inherits it as repository content.
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (_w, e, rid) = admit(&store, "v2-tracked-artifact", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the first finish fails the request: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the tracked collision is a distinct, diagnosable failure: {exec:?}"
+    );
+    assert_ne!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "no ArtifactRecovery budget is burned: {exec:?}"
+    );
+    assert_eq!(
+        exec.recovery_attempts_used, 0,
+        "the collision never charges a recovery attempt"
+    );
+    let outcome = exec.outcome.as_ref().expect("failed terminal outcome");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("tracked repository content")),
+        "the failure keeps the collision reason for diagnosis: {outcome:?}"
+    );
+}
+
 /// A cancel committed while declared verification work is pending
 /// does not skip the owned child: the bounded verification run still
 /// executes and records its result while the Execution is stopping,

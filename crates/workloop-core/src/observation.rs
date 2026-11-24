@@ -550,13 +550,16 @@ pub fn report_collection_gate(
 
 /// `Present` must carry a digest: the artifact's exact payload identity.
 /// A `Corrupt` artifact is never `missing` — it is retained with its
-/// reason and invalid.
+/// reason and invalid. `Unfulfillable` is a structural refusal: the
+/// declared artifact can never become present in this workspace, so
+/// retrying would only burn the recovery budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactFact {
     Present { digest: String },
     Missing,
     Corrupt { reason: Option<String> },
+    Unfulfillable { reason: String },
 }
 
 /// One retained worker-output body referenced by a `WorkerReport`
