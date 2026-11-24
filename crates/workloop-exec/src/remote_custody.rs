@@ -396,6 +396,12 @@ fn write_journal(root: &Path, journal: &CleanupJournal) -> Result<(), CustodyErr
         serde_json::to_vec(journal).expect("journal serializes"),
     )
     .map_err(|e| fault(format!("write journal: {e}")))?;
+    // Same durability order as `commit_tombstone`: the file's bytes
+    // are durable before the rename publishes them, so a crash can
+    // never leave a torn journal a retry cannot parse.
+    std::fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| fault(format!("sync journal: {e}")))?;
     std::fs::rename(&tmp, &path).map_err(|e| fault(format!("rename journal: {e}")))?;
     fsync_dir(path.parent().expect("cleanup dir"))?;
     Ok(())

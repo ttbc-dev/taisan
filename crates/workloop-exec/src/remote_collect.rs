@@ -713,10 +713,13 @@ fn validate_produced(
         verdicts.push((required.clone(), fact));
     }
 
-    // Commit the durable artifact records: the acknowledged ref
-    // under the expected-absent guard, then the handoff row — the
-    // same authority the local path establishes, so remote evidence
-    // is indistinguishable downstream.
+    // Every deterministic conflict is decided before the first
+    // durable write: a ref occupied by another commit or a handoff
+    // row recorded under a different produced is `ref_conflict` —
+    // terminal `invalid`, never partial evidence. An `Invalid`
+    // collection that already committed an earlier artifact's ref
+    // and row would make rejected output Present evidence, which the
+    // contract forbids ("rejection never becomes Present evidence").
     let repository_name = request.repository.repository.clone();
     for (required, fact) in &verdicts {
         let ArtifactFact::Present { .. } = fact else {
@@ -727,18 +730,56 @@ fn validate_produced(
         match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
             Ok(current) if current == produced => {}
             Ok(_) => return Err(invalid("ref_conflict")),
+            Err(_) => {}
+        }
+        let existing = store
+            .transact(|tx| tx.artifact_handoff(&artifact_id))
+            .map_err(|e| ProducedRefusal::Fault(e.into()))?;
+        if let Some(existing) = existing
+            && (existing.produced.as_deref() != Some(produced.as_str())
+                || existing.base != handoff.base_commit)
+        {
+            return Err(invalid("ref_conflict"));
+        }
+    }
+
+    // Commit the durable artifact records: the acknowledged ref
+    // under the expected-absent guard, then the handoff row — the
+    // same authority the local path establishes, so remote evidence
+    // is indistinguishable downstream.
+    for (required, fact) in &verdicts {
+        let ArtifactFact::Present { .. } = fact else {
+            continue;
+        };
+        let artifact_id = format!("{}/{}", invocation.id.0, required.kind);
+        let reference = handoff::artifact_ref(&artifact_id);
+        match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
+            Ok(current) if current == produced => {}
+            Ok(_) => {
+                // The precheck just cleared this ref — a different
+                // commit here means a claim landed mid-commit. That
+                // is a live race, retried: the next pass's precheck
+                // decides the outcome before writing anything.
+                return Err(ProducedRefusal::Fault(fault(
+                    "artifact ref moved between precheck and claim",
+                )));
+            }
             Err(_) => {
                 // Absent — claim it. A concurrent claim that landed
                 // this same produced commit is fine; a different one
-                // is a deterministic conflict; an unresolved ref is
-                // the failed update's fault, retried.
+                // is the same mid-commit race, retried; an unresolved
+                // ref is the failed update's fault, retried.
                 if let Err(e) = git(
                     &layout.repository,
                     &["update-ref", &reference, &produced, ""],
                 ) {
                     match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
                         Ok(current) if current == produced => {}
-                        Ok(_) => return Err(invalid("ref_conflict")),
+                        Ok(_) => {
+                            return Err(ProducedRefusal::Fault(fault(
+                                "artifact ref moved between precheck and claim",
+                            )));
+                        }
                         Err(_) => return Err(ProducedRefusal::Fault(e)),
                     }
                 }

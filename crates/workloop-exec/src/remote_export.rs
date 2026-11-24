@@ -290,24 +290,36 @@ fn closure_commits(request: &WorkerRequestV2) -> Result<(Vec<ClosureCommit>, Str
             target.head.clone()
         }
     };
-    // Dedup by sha — one commit is one ref, never bundled twice.
+    // Dedup by name — one ref name is pinned once. Two names may
+    // legitimately resolve to the same commit (a review target whose
+    // head equals its base): the receiver verifies refs by name, so
+    // collapsing by sha would silently drop a required pin.
     let mut seen = std::collections::HashSet::new();
-    commits.retain(|c| seen.insert(c.sha.clone()));
+    commits.retain(|c| seen.insert(c.name.clone()));
     Ok((commits, head))
 }
 
+/// Client-side `-c` config every export git invocation carries.
+/// `uploadpack.allowAnySHA1InWant` propagates to a locally-spawned
+/// upload-pack through `GIT_CONFIG_PARAMETERS`, granting the same
+/// fetch-by-raw-sha capability the workspace path's git environment
+/// grants — a commit no advertised ref names still imports under
+/// transports that negotiate through upload-pack.
+const GIT_CONFIG: &[&str] = &[
+    "core.hooksPath=/dev/null",
+    "credential.helper=",
+    "protocol.allow=never",
+    "protocol.file.allow=always",
+    "uploadpack.allowAnySHA1InWant=true",
+];
+
 fn git(repo: &Path, args: &[&str]) -> Result<String, ExportError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("-c")
-        .arg("credential.helper=")
-        .arg("-c")
-        .arg("protocol.allow=never")
-        .arg("-c")
-        .arg("protocol.file.allow=always")
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo);
+    for config in GIT_CONFIG {
+        command.arg("-c").arg(config);
+    }
+    let output = command
         .args(args)
         .output()
         .map_err(|e| fault(format!("spawn git: {e}")))?;
@@ -533,6 +545,19 @@ pub fn export_request_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_git_carries_fetch_by_unadvertised_sha_capability() {
+        // The fetch-by-sha flag is a contract, not an optimization:
+        // dropping it silently breaks pinned-commit import under
+        // negotiated transports. Pinning the literal is the only
+        // local guard — permissive local transports satisfy the want
+        // either way, so a contract test cannot observe the flag.
+        assert!(
+            GIT_CONFIG.contains(&"uploadpack.allowAnySHA1InWant=true"),
+            "export git config lost uploadpack.allowAnySHA1InWant"
+        );
+    }
 
     #[test]
     fn item_paths_are_flat_or_single_level() {

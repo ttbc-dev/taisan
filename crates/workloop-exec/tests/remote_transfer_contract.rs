@@ -24,7 +24,7 @@ use workloop_core::observation::ArtifactFact;
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_core::worker_v2::*;
-use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
+use workloop_exec::bodies::{BodyStore, CAS_CATEGORY, content_id};
 use workloop_exec::handoff;
 use workloop_exec::remote_collect::{self, RemoteCollectLayout};
 use workloop_exec::remote_custody::{self, AckTombstone, CustodyLayout};
@@ -435,14 +435,35 @@ fn ship_collection(
 /// The worker's contribution: a produced commit carrying the required
 /// artifact, plus the out-directory whitelist files.
 fn worker_produce(
-    _rig: &Rig,
+    rig: &Rig,
     prepared: &remote_prepare::PreparedRemote,
     artifact_path: &str,
     artifact_bytes: &[u8],
 ) -> String {
+    worker_produce_many(rig, prepared, &[(artifact_path, artifact_bytes)])
+}
+
+/// The multi-artifact form: one produced commit carrying every named
+/// output, and a `handoff.json` describing the whole set — the
+/// manifest's descriptor list is sorted by UTF-8 path bytes as the
+/// contract requires.
+fn worker_produce_many(
+    _rig: &Rig,
+    prepared: &remote_prepare::PreparedRemote,
+    outputs: &[(&str, &[u8])],
+) -> String {
     let ws = &prepared.workspace;
-    std::fs::create_dir_all(ws.join(artifact_path).parent().unwrap()).unwrap();
-    std::fs::write(ws.join(artifact_path), artifact_bytes).unwrap();
+    let mut descriptors = Vec::with_capacity(outputs.len());
+    for (artifact_path, artifact_bytes) in outputs {
+        std::fs::create_dir_all(ws.join(artifact_path).parent().unwrap()).unwrap();
+        std::fs::write(ws.join(artifact_path), artifact_bytes).unwrap();
+        descriptors.push(workloop_core::executor::HandoffArtifact {
+            path: (*artifact_path).into(),
+            bytes: artifact_bytes.len() as u64,
+            claimed_sha256: sha256_hex("artifact-v1", artifact_bytes),
+        });
+    }
+    descriptors.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     git(ws, &["config", "user.email", "worker@example"]);
     git(ws, &["config", "user.name", "worker"]);
     git(ws, &["add", "."]);
@@ -459,11 +480,7 @@ fn worker_produce(
         },
         base_commit: request.base.object.clone(),
         produced_commit: produced.clone(),
-        artifacts: vec![workloop_core::executor::HandoffArtifact {
-            path: artifact_path.into(),
-            bytes: artifact_bytes.len() as u64,
-            claimed_sha256: sha256_hex("artifact-v1", artifact_bytes),
-        }],
+        artifacts: descriptors,
     };
     std::fs::write(
         prepared.out_dir.join("handoff.json"),
@@ -473,6 +490,190 @@ fn worker_produce(
     std::fs::write(prepared.out_dir.join("report.json"), b"{\"status\":\"ok\"}").unwrap();
     std::fs::write(prepared.out_dir.join("runtime.log"), b"log line\n").unwrap();
     produced
+}
+
+/// Seed a CodeReview request: same durable plumbing as a Coding
+/// request but the read-only review role, a `review-source` body
+/// retained under the path the export resolves, and the exact diff
+/// target the request binds.
+fn seed_review_request(
+    store: &SqliteStore,
+    bodies: &BodyStore,
+    repository: &RepositoryRef,
+    base: &str,
+    target: workloop_core::worker_v2::DiffTarget,
+    max_report_bytes: u64,
+    max_log_bytes: u64,
+) -> Seeded {
+    let (work_id, execution_id) = match handle_command(
+        store,
+        &config(repository),
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: format!("remote-review-{}", &base[..8]),
+            body: CommandBody::Submit {
+                intent: "review the thing".into(),
+                sources: vec![],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap()
+    {
+        CommandDecision::Accepted {
+            work_id: Some(work_id),
+            effect:
+                CommandEffect::WorkCreated { execution_id }
+                | CommandEffect::ExecutionCreated { execution_id },
+            ..
+        } => (work_id, execution_id),
+        other => panic!("expected accepted submit, got {other:?}"),
+    };
+    let request_id = format!("{}:inv:0", execution_id.0);
+    let invocation_id = store.transact(|tx| tx.alloc_id("inv")).unwrap();
+
+    let review_body = ReviewSourceBody::new(
+        work_id.0.clone(),
+        serde_json::to_value(&target).unwrap(),
+        None,
+    );
+    let review_bytes = review_body.canonical_bytes();
+    let review_digest = review_body.wire_digest();
+    let review_path = format!("bodies/review-source/{review_digest}");
+    let catalog = store.body_catalog();
+    bodies
+        .retain_at(
+            catalog,
+            CAS_CATEGORY,
+            &review_path,
+            &review_bytes,
+            NOW,
+            None,
+        )
+        .unwrap();
+
+    let wire_repo = WireRepository {
+        host: repository.host.as_str().to_string(),
+        repository: repository.repository.as_str().to_string(),
+    };
+    let mut request = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: request_id.clone(),
+        invocation_id: invocation_id.clone(),
+        request_digest: String::new(),
+        store_id: store.transact(|tx| tx.store_id()).unwrap().0,
+        work_id: work_id.0.clone(),
+        execution_id: execution_id.0.clone(),
+        role: InvocationRole::Review,
+        repository: wire_repo.clone(),
+        base: RequestBase {
+            repository: wire_repo,
+            object: base.into(),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: "a".repeat(64),
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", work_id.0),
+            mount: "/workspace".into(),
+            read_only: true,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes,
+            max_log_bytes,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::Review,
+            protocol_versions: vec![],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::CodeReview {
+            target,
+            review_source: ReviewSourceRef {
+                source: "review-1".into(),
+                bytes: review_bytes.len() as u64,
+                digest: review_digest,
+                source_revision: content_id(&review_bytes),
+            },
+        },
+    };
+    request.request_digest = request.digest();
+
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: request_id.clone(),
+                    work_id: work_id.clone(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Review,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            })?;
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: WorkerRequestBody {
+                    request_id: request_id.clone(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: request.to_canonical_bytes(),
+                    body_digest: request.digest(),
+                },
+            })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(invocation_id.clone()),
+                    request_id: request_id.clone(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Review,
+                    state: InvocationState::Running,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertExecutorBinding {
+                binding: ExecutorBinding::new(ExecutorBindingFields {
+                    installation_id: "install-a".into(),
+                    endpoint_id: "executor-a".into(),
+                    endpoint_identity_digest: "e".repeat(64),
+                    bound_incarnation_id: "boot-1".into(),
+                    protocol_version: EXECUTOR_PROTOCOL_V1.into(),
+                    capabilities_digest: "c".repeat(64),
+                    launch_config_digest: "d".repeat(64),
+                    request_id: request_id.clone(),
+                    invocation_id: invocation_id.clone(),
+                    request_digest: request.digest(),
+                    limits: limits(),
+                })
+                .unwrap(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    Seeded {
+        request_id,
+        invocation_id,
+        work_id,
+        request,
+        goal_bytes: Vec::new(),
+    }
 }
 
 /// The full happy path: export → transfer → prepare → produce →
@@ -2053,5 +2254,399 @@ fn an_empty_output_file_finalizes_and_collects() {
         collected.log.as_ref().map(|l| l.bytes.as_slice()),
         Some(b"".as_slice()),
         "the empty log body is retained whole"
+    );
+}
+
+/// An `Invalid` collection never becomes `Present` evidence: when a
+/// later required artifact's ref is already held by a different
+/// commit (`ref_conflict`), the deterministic conflict is decided
+/// before any durable write — the earlier artifact's ref and handoff
+/// row stay absent (contract §6: "rejection never becomes Present
+/// evidence").
+#[test]
+fn an_invalid_collection_leaves_no_artifact_evidence() {
+    let (rig, base) = rig("invalid-no-evidence");
+    let required = vec![
+        RequiredArtifact {
+            kind: "aa".into(),
+            path: "dist/aa.json".into(),
+            expected_digest: None,
+        },
+        RequiredArtifact {
+            kind: "bb".into(),
+            path: "dist/bb.json".into(),
+            expected_digest: None,
+        },
+    ];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required.clone(),
+        1 << 20,
+        1 << 20,
+    );
+    let exported = remote_export::export_request_transfer(
+        &rig.store,
+        &rig.bodies,
+        &rig.source,
+        Some(&rig.handoff_repo),
+        &rig.root.join("coord/export-scratch"),
+        &seeded.request_id,
+        "tr-in-1",
+        CHUNK,
+    )
+    .unwrap();
+    let transfer_dir = ship(&exported, &rig.exec_transfers);
+    let prepared = remote_prepare::prepare_remote(
+        &rig.exec_prepare,
+        &transfer_dir,
+        &exported.manifest,
+        &limits(),
+        &identity(&seeded),
+    )
+    .unwrap();
+    worker_produce_many(
+        &rig,
+        &prepared,
+        &[
+            ("dist/aa.json", b"AA".as_slice()),
+            ("dist/bb.json", b"BB".as_slice()),
+        ],
+    );
+
+    // The second artifact's ref is already held by a different commit
+    // — a `ref_conflict` the collection must record as invalid.
+    let src = rig.source.path.to_string_lossy().into_owned();
+    git(&rig.handoff_repo, &["fetch", "--no-tags", &src, &base]);
+    let conflicting = format!("{}/bb", seeded.invocation_id);
+    git(
+        &rig.handoff_repo,
+        &["update-ref", &handoff::artifact_ref(&conflicting), &base],
+    );
+
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let collect_dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &collect_dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("ref_conflict")
+    );
+    assert!(
+        collected
+            .collection
+            .record()
+            .unwrap()
+            .artifact_ids
+            .is_empty(),
+        "an invalid collection names no present artifacts"
+    );
+
+    // The first artifact verified Present but its ref and handoff row
+    // must not be durable: the verdict was decided before any write.
+    let clean = format!("{}/aa", seeded.invocation_id);
+    let ref_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args(["rev-parse", "--verify", &handoff::artifact_ref(&clean)])
+        .output()
+        .unwrap()
+        .status;
+    assert!(
+        !ref_status.success(),
+        "no artifact ref survives an invalid collection"
+    );
+    for artifact_id in [&clean, &conflicting] {
+        assert!(
+            rig.store
+                .transact(|tx| tx.artifact_handoff(artifact_id))
+                .unwrap()
+                .is_none(),
+            "no handoff row survives an invalid collection"
+        );
+    }
+}
+
+/// A durable handoff row already recorded under a different produced
+/// commit is a deterministic `ref_conflict` — terminal `Invalid`
+/// decided before any write, not a retryable mid-commit race. The
+/// foreign row and the absent ref are left exactly as found.
+#[test]
+fn an_existing_handoff_row_for_another_produced_is_invalid() {
+    let (rig, base) = rig("invalid-row-conflict");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![RequiredArtifact {
+            kind: "aa".into(),
+            path: "dist/aa.json".into(),
+            expected_digest: None,
+        }],
+        1 << 20,
+        1 << 20,
+    );
+    let exported = remote_export::export_request_transfer(
+        &rig.store,
+        &rig.bodies,
+        &rig.source,
+        Some(&rig.handoff_repo),
+        &rig.root.join("coord/export-scratch"),
+        &seeded.request_id,
+        "tr-in-1",
+        CHUNK,
+    )
+    .unwrap();
+    let transfer_dir = ship(&exported, &rig.exec_transfers);
+    let prepared = remote_prepare::prepare_remote(
+        &rig.exec_prepare,
+        &transfer_dir,
+        &exported.manifest,
+        &limits(),
+        &identity(&seeded),
+    )
+    .unwrap();
+    worker_produce_many(&rig, &prepared, &[("dist/aa.json", b"AA".as_slice())]);
+
+    // A row for the same artifact_id already recorded under a
+    // different produced commit — foreign evidence the collect must
+    // refuse before writing anything.
+    let artifact_id = format!("{}/aa", seeded.invocation_id);
+    rig.store
+        .transact(|tx| {
+            let row = ArtifactHandoff {
+                artifact_id: artifact_id.clone(),
+                invocation_id: InvocationId(seeded.invocation_id.clone()),
+                request_id: seeded.request_id.clone(),
+                work_id: seeded.work_id.clone(),
+                execution_id: ExecutionId("exec-foreign".into()),
+                base: base.clone(),
+                produced: Some(base.clone()),
+                manifest_digest: None,
+                state: HandoffState::Acknowledged,
+                invalid_reason: None,
+                attempt: 0,
+                recorded_seq: tx.alloc_seq()?,
+            };
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: row,
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let collect_dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &collect_dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("ref_conflict")
+    );
+
+    // The foreign row stands untouched and no artifact ref was
+    // claimed beside it.
+    let row = rig
+        .store
+        .transact(|tx| tx.artifact_handoff(&artifact_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.produced.as_deref(), Some(base.as_str()));
+    let ref_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            &handoff::artifact_ref(&artifact_id),
+        ])
+        .output()
+        .unwrap()
+        .status;
+    assert!(
+        !ref_status.success(),
+        "no artifact ref survives an invalid collection"
+    );
+}
+
+/// A CodeReview whose `target.head == target.base` (both differing
+/// from the request base) still exports a bundle pinning
+/// `refs/taisan/export/review-head` — ref names are pinned
+/// independently, never deduplicated by commit SHA.
+#[test]
+fn a_review_whose_head_shares_base_sha_still_pins_review_head() {
+    let (rig, base) = rig("review-shared-sha");
+    let target_sha = git(&rig.source.path, &["rev-parse", "HEAD^"]);
+    assert_ne!(target_sha, base, "the fixture needs a two-commit source");
+    let target = workloop_core::worker_v2::DiffTarget {
+        change: "cr-1".into(),
+        base: target_sha.clone(),
+        head: target_sha.clone(),
+        diff_digest: "d".repeat(64),
+        target_revision: None,
+    };
+    let seeded = seed_review_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        target,
+        1 << 20,
+        1 << 20,
+    );
+    let exported = remote_export::export_request_transfer(
+        &rig.store,
+        &rig.bodies,
+        &rig.source,
+        Some(&rig.handoff_repo),
+        &rig.root.join("coord/export-scratch"),
+        &seeded.request_id,
+        "tr-in-1",
+        CHUNK,
+    )
+    .unwrap();
+    let bundle = exported
+        .items
+        .iter()
+        .find(|i| i.item_id == "source-bundle")
+        .unwrap();
+    let probe = rig.root.join("probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    git(&probe, &["init"]);
+    let bundle_path = probe.join("source.bundle");
+    std::fs::write(&bundle_path, &bundle.body).unwrap();
+    let heads = git(
+        &probe,
+        &["bundle", "list-heads", bundle_path.to_str().unwrap()],
+    );
+    for name in ["base", "review-base", "review-head"] {
+        let expect = format!("{target_sha} refs/taisan/export/{name}");
+        let expect = if name == "base" {
+            format!("{base} refs/taisan/export/{name}")
+        } else {
+            expect
+        };
+        assert!(
+            heads.lines().any(|l| l.trim() == expect),
+            "bundle pins {expect}\n{heads}"
+        );
+    }
+
+    // The receiving side re-verifies the pin by name and prepares.
+    let transfer_dir = ship(&exported, &rig.exec_transfers);
+    let prepared = remote_prepare::prepare_remote(
+        &rig.exec_prepare,
+        &transfer_dir,
+        &exported.manifest,
+        &limits(),
+        &identity(&seeded),
+    )
+    .unwrap();
+    assert_eq!(prepared.head, target_sha);
+}
+
+/// The export fetches pinned commits by raw SHA through transports
+/// that negotiate with upload-pack (`file://`), so the fetch carries
+/// the same `uploadpack.allowAnySHA1InWant` capability the workspace
+/// path grants — a commit no advertised ref names still imports.
+/// The pinned base here is `HEAD^`, never advertised as a ref tip,
+/// so the want is non-trivial; whether a strict upload-pack would
+/// refuse it without the flag is transport-dependent, and the
+/// flag's presence itself is pinned by a unit test in
+/// `remote_export`.
+#[test]
+fn export_fetches_pinned_commits_through_upload_pack() {
+    let (rig, base) = rig("export-upload-pack");
+    // Pin an ancestor that no ref advertises — the fetch must want
+    // the commit by raw SHA, not by name.
+    let unadvertised = git(&rig.source.path, &["rev-parse", "HEAD^"]);
+    assert_ne!(unadvertised, base, "the fixture needs a two-commit source");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &unadvertised,
+        vec![],
+        1 << 20,
+        1 << 20,
+    );
+    // Address the same mirror by URL so the fetch negotiates through
+    // upload-pack rather than direct object access.
+    let url_source = RepositorySource {
+        repository: rig.source.repository.clone(),
+        path: PathBuf::from(format!("file://{}", rig.source.path.display())),
+    };
+    let exported = remote_export::export_request_transfer(
+        &rig.store,
+        &rig.bodies,
+        &url_source,
+        Some(&rig.handoff_repo),
+        &rig.root.join("coord/export-scratch"),
+        &seeded.request_id,
+        "tr-in-1",
+        CHUNK,
+    )
+    .unwrap();
+    let bundle = exported
+        .items
+        .iter()
+        .find(|i| i.item_id == "source-bundle")
+        .unwrap();
+    let probe = rig.root.join("probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    git(&probe, &["init"]);
+    let bundle_path = probe.join("source.bundle");
+    std::fs::write(&bundle_path, &bundle.body).unwrap();
+    let heads = git(
+        &probe,
+        &["bundle", "list-heads", bundle_path.to_str().unwrap()],
+    );
+    let expect = format!("{unadvertised} refs/taisan/export/base");
+    assert!(
+        heads.lines().any(|l| l.trim() == expect),
+        "bundle pins {expect}\n{heads}"
     );
 }
