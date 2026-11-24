@@ -23,7 +23,8 @@ use workloop_core::domain::{
 };
 use workloop_core::executor::{
     CollectionEntry, ExecutorCollection, ExecutorCollectionRecord, ExecutorCollectionState,
-    ExecutorTransferV1, RemoteHandoffV1, TransferItemV1, collection_digest, item_content_digest,
+    ExecutorLimits, ExecutorTransferV1, RemoteHandoffV1, TransferItemV1, collection_digest,
+    item_content_digest,
 };
 use workloop_core::observation::ArtifactFact;
 use workloop_core::store::{Effect, Store, StoreError};
@@ -298,15 +299,18 @@ fn blob_at(repo: &Path, produced: &str, path: &str) -> Result<Option<Vec<u8>>, C
 /// Validate and commit one remote collection.
 ///
 /// `transfer_dir` is the receiver's finalized `complete/<id>`;
-/// `manifest` the declared collection manifest; `collection_id` the
-/// durable identity the `acknowledge` will match; `stop_proof` the
-/// receipt digest authorizing output collection.
+/// `manifest` the declared collection manifest; `limits` the run's
+/// immutable transfer bounds (the same set `prepare` enforced on
+/// input); `collection_id` the durable identity the `acknowledge`
+/// will match; `stop_proof` the receipt digest authorizing output
+/// collection.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_remote(
     store: &impl Store,
     layout: &RemoteCollectLayout,
     transfer_dir: &Path,
     manifest: &ExecutorTransferV1,
+    limits: &ExecutorLimits,
     request_id: &str,
     collection_id: &str,
     stop_proof: &str,
@@ -399,17 +403,40 @@ pub fn collect_remote(
             None => Ok(None),
         }
     };
-    let report_bytes =
-        item_body("report")?.ok_or_else(|| fault("collection carries no report item"))?;
-    let log_bytes = item_body("log")?;
-    let handoff_bytes = item_body("handoff")?;
-    let bundle_bytes = item_body("export-bundle")?;
-    let checkpoint_bytes = item_body("checkpoint")?;
+
+    // The run's immutable limits gate the declared output set before
+    // any item body is read (contract §6/§8 — the same bound
+    // `prepare_remote` enforces on input). An over-limit collection is
+    // a closed `limit_exceeded` outcome, persisted like
+    // `collection_incomplete`, never retried indefinitely.
+    let mut invalid_reason: Option<String> = (manifest.total_bytes > limits.max_output_bytes
+        || manifest.item_count > limits.max_item_count)
+        .then(|| "limit_exceeded".to_string());
+
+    // A finalized collection that omits the required report member is
+    // the same deterministic `collection_incomplete` a missing
+    // handoff or bundle records — not a retryable fault.
+    let mut report_bytes = None;
+    let mut log_bytes = None;
+    let mut handoff_bytes = None;
+    let mut bundle_bytes = None;
+    let mut checkpoint_bytes = None;
+    if invalid_reason.is_none() {
+        report_bytes = item_body("report")?;
+        log_bytes = item_body("log")?;
+        handoff_bytes = item_body("handoff")?;
+        bundle_bytes = item_body("export-bundle")?;
+        checkpoint_bytes = item_body("checkpoint")?;
+        if report_bytes.is_none() {
+            invalid_reason = Some("collection_incomplete".into());
+        }
+    }
 
     // Producing roles must carry the handoff manifest and the object
     // closure — a workspace writer that produces neither is an
-    // incomplete collection, not an empty artifact set.
-    let mut invalid_reason: Option<String> = None;
+    // incomplete collection, not an empty artifact set. Validation
+    // never runs for an already-invalid collection: invalid or
+    // incomplete never becomes Present evidence.
     let mut artifacts: Vec<(RequiredArtifact, ArtifactFact)> = Vec::new();
     let mut artifact_ids: Vec<String> = Vec::new();
     // The quarantine ref names the collection — wire identifiers admit
@@ -419,7 +446,7 @@ pub fn collect_remote(
         "refs/taisan/quarantine/{}",
         crate::isolation::sanitize_key(collection_id)
     );
-    if producing {
+    if producing && invalid_reason.is_none() {
         match (handoff_bytes, bundle_bytes) {
             (Some(handoff_raw), Some(bundle_raw)) => {
                 match validate_produced(
@@ -427,6 +454,7 @@ pub fn collect_remote(
                     layout,
                     &request,
                     &invocation,
+                    limits,
                     request_id,
                     &quarantine,
                     &handoff_raw,
@@ -467,11 +495,9 @@ pub fn collect_remote(
             bytes.to_vec()
         }
     };
-    let report_kept = bound(
-        &report_bytes,
-        request.budget.max_report_bytes,
-        &mut report_truncated,
-    );
+    let report_kept = report_bytes
+        .as_ref()
+        .map(|b| bound(b, request.budget.max_report_bytes, &mut report_truncated));
     let log_kept = log_bytes.map(|b| bound(&b, request.budget.max_log_bytes, &mut log_truncated));
 
     // Retain the bounded outputs in the CAS — the durable bodies the
@@ -500,10 +526,13 @@ pub fn collect_remote(
             truncated: false,
         })
     };
-    let report = {
-        let mut kept = retain(&report_kept)?;
-        kept.truncated = report_truncated;
-        Some(kept)
+    let report = match report_kept {
+        Some(kept_bytes) => {
+            let mut kept = retain(&kept_bytes)?;
+            kept.truncated = report_truncated;
+            Some(kept)
+        }
+        None => None,
     };
     let log = match log_kept {
         Some(kept_bytes) => {
@@ -571,6 +600,7 @@ fn validate_produced(
     layout: &RemoteCollectLayout,
     request: &WorkerRequestV2,
     invocation: &workloop_core::domain::Invocation,
+    limits: &ExecutorLimits,
     request_id: &str,
     quarantine: &str,
     handoff_raw: &[u8],
@@ -579,7 +609,9 @@ fn validate_produced(
     branch: &str,
 ) -> Result<Vec<(RequiredArtifact, ArtifactFact)>, ProducedRefusal> {
     let invalid = |reason: &str| ProducedRefusal::Invalid(reason.to_string());
-    let handoff = RemoteHandoffV1::parse(handoff_raw, u64::MAX).map_err(|e| {
+    // The handoff's descriptor count is bounded by the same immutable
+    // `max_item_count` the declared set answered to — never u64::MAX.
+    let handoff = RemoteHandoffV1::parse(handoff_raw, limits.max_item_count).map_err(|e| {
         ProducedRefusal::Invalid(format!("collection_invalid: handoff manifest refused: {e}"))
     })?;
     if !handoff

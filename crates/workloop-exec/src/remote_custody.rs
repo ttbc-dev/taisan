@@ -23,6 +23,7 @@ use std::process::Command;
 
 use workloop_core::executor::{
     CollectionEntry, ExecutorTransferV1, TransferItemV1, collection_digest, item_content_digest,
+    transfer_id_is_valid,
 };
 use workloop_core::worker_v2::WorkerRequestV2;
 
@@ -187,6 +188,19 @@ pub fn assemble_collection(
     collection_id: &str,
     chunk_size: u64,
 ) -> Result<AssembledCollection, CustodyError> {
+    // Wire-supplied identifiers join managed paths below
+    // (`scratch/<collection_id>`, `ws-<work_id>`) and the manifest
+    // declaration — validate them before any filesystem effect so a
+    // `/`/`..` id can never reach a remove or create outside the
+    // managed roots. Fail closed: an unsafe id is refused, never
+    // sanitized into a different one.
+    for id in [transfer_id, collection_id, request.work_id.as_str()] {
+        if !transfer_id_is_valid(id) {
+            return Err(CustodyError::Invalid {
+                detail: format!("identifier {id:?} is not a safe identifier"),
+            });
+        }
+    }
     let workspace = layout
         .workspace_root
         .join(format!("ws-{}", request.work_id));
@@ -295,6 +309,14 @@ pub fn commit_tombstone(
     layout: &CustodyLayout,
     tombstone: &AckTombstone,
 ) -> Result<(), CustodyError> {
+    if !transfer_id_is_valid(&tombstone.collection_id) {
+        return Err(CustodyError::Invalid {
+            detail: format!(
+                "collection_id {:?} is not a safe identifier",
+                tombstone.collection_id
+            ),
+        });
+    }
     let path = tombstone_path(&layout.custody_root, &tombstone.collection_id);
     if let Some(existing) = read_tombstone(layout, &tombstone.collection_id)? {
         if existing == *tombstone {
@@ -329,6 +351,11 @@ pub fn read_tombstone(
     layout: &CustodyLayout,
     collection_id: &str,
 ) -> Result<Option<AckTombstone>, CustodyError> {
+    if !transfer_id_is_valid(collection_id) {
+        return Err(CustodyError::Invalid {
+            detail: format!("collection_id {collection_id:?} is not a safe identifier"),
+        });
+    }
     let path = tombstone_path(&layout.custody_root, collection_id);
     match std::fs::read(&path) {
         Ok(raw) => serde_json::from_slice(&raw)
@@ -400,6 +427,13 @@ pub fn cleanup_after_ack(
     collection_id: &str,
     paths: &[PathBuf],
 ) -> Result<CleanupOutcome, CustodyError> {
+    // The collection id names the journal file — validate before it
+    // reaches the filesystem, same fail-closed rule as the tombstone.
+    if !transfer_id_is_valid(collection_id) {
+        return Err(CustodyError::Invalid {
+            detail: format!("collection_id {collection_id:?} is not a safe identifier"),
+        });
+    }
     let journal_file = journal_path(&layout.custody_root, collection_id);
     let mut journal = match std::fs::read(&journal_file) {
         Ok(raw) => serde_json::from_slice::<CleanupJournal>(&raw)

@@ -260,6 +260,31 @@ fn verify_input(request: &WorkerRequestV2, name: &str, bytes: &[u8]) -> Result<(
     }
 }
 
+/// The materialized input names the request's refs require — the
+/// same set `remote_export::required_inputs` ships: the goal, each
+/// grouped issue's snapshot, the prepublication failed-evidence set,
+/// the invariant set, or the review source. `verify_input` refuses
+/// *undeclared* names; this set is what makes the required side
+/// checked too — a finalized transfer missing a required body never
+/// prepares (contract §6).
+fn required_input_names(request: &WorkerRequestV2) -> Vec<String> {
+    let mut names = Vec::new();
+    match &request.task {
+        TaskBody::Coding { issues, .. } | TaskBody::Fix { issues, .. } => {
+            names.push("goal.md".to_string());
+            names.extend((0..issues.len()).map(|i| format!("issue-{i}.json")));
+            if let TaskBody::Fix { origin, .. } = &request.task
+                && let FixOrigin::Prepublication { failed_evidence } = origin.as_ref()
+            {
+                names.extend((0..failed_evidence.len()).map(|i| format!("evidence-{i}.json")));
+            }
+        }
+        TaskBody::InvariantCheck { .. } => names.push("invariant-set.json".into()),
+        TaskBody::CodeReview { .. } => names.push("review-source.json".into()),
+    }
+    names
+}
+
 /// One finalized item's whole body, re-verified against the manifest
 /// before it is ever materialized — the transport's digest check at
 /// finalize is replayed here so a swapped file can never reach the
@@ -464,6 +489,22 @@ pub fn prepare_remote(
     }
     let head = expected_head(&request);
     let head_ref = expected_head_ref(&request);
+
+    // Every body the request's refs require must be declared in the
+    // transfer — the per-item loop refuses undeclared names, and this
+    // set equality refuses a finalized transfer that simply omits a
+    // required input.
+    for name in required_input_names(&request) {
+        let declared = manifest
+            .items
+            .iter()
+            .any(|item| item.path == format!("input/{name}"));
+        if !declared {
+            return Err(invalid(format!(
+                "required input {name:?} is not declared by the transfer"
+            )));
+        }
+    }
 
     // The object closure: the bundle verifies, names the export refs
     // the export pinned, and its recorded tips equal the request's —

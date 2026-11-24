@@ -509,8 +509,25 @@ impl TransferStore {
                     ),
                 });
             }
-            let bytes = std::fs::read(item_path(&dir, &item.item_id))
-                .map_err(|e| fault(format!("read finalized item: {e}")))?;
+            let path = item_path(&dir, &item.item_id);
+            // A zero-byte item emits no chunk frame and `accept_chunk`
+            // refuses a 0-byte body, so no staged file ever exists for
+            // it: the whole body is the empty file, materialized here
+            // at finalize so the completed set holds every declared
+            // item.
+            if item.bytes == 0
+                && matches!(
+                    std::fs::symlink_metadata(&path),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                std::fs::write(&path, b"").map_err(|e| fault(format!("create empty item: {e}")))?;
+                std::fs::File::open(&path)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| fault(format!("sync empty item: {e}")))?;
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|e| fault(format!("read finalized item: {e}")))?;
             if bytes.len() as u64 != item.bytes || item_content_digest(&bytes) != item.digest {
                 return Err(TransferError::DigestMismatch {
                     detail: format!("item {:?} fails its declared digest", item.item_id),
@@ -776,6 +793,38 @@ mod tests {
         std::fs::write(journal_path(&staging, "b"), 5u64.to_be_bytes()).unwrap();
         let err = store.finalize(&m).unwrap_err();
         assert!(matches!(err, TransferError::DigestMismatch { .. }));
+    }
+
+    /// A declared zero-byte item emits no chunk frame — `item_chunks`
+    /// yields nothing and `accept_chunk` would refuse a 0-byte body —
+    /// so finalize materializes the empty file directly: the declared
+    /// set is whole without a single frame.
+    #[test]
+    fn a_zero_byte_item_finalizes_without_a_chunk() {
+        let store = TransferStore::new(root("empty-item"));
+        let m = manifest(
+            "t-1",
+            64,
+            vec![
+                item("empty", "empty.bin", b""),
+                item("full", "full.bin", b"body"),
+            ],
+        );
+        store.declare(&m).unwrap();
+        assert!(
+            item_chunks(&m, "empty", b"").is_empty(),
+            "an empty item produces no frames"
+        );
+        for (chunk, bytes) in item_chunks(&m, "full", b"body") {
+            store.accept_chunk(&m, &chunk, bytes).unwrap();
+        }
+        let done = store.finalize(&m).unwrap();
+        assert_eq!(
+            std::fs::read(item_path(&done, "empty")).unwrap(),
+            b"",
+            "the empty item materializes as an empty file"
+        );
+        assert_eq!(std::fs::read(item_path(&done, "full")).unwrap(), b"body");
     }
 
     #[test]

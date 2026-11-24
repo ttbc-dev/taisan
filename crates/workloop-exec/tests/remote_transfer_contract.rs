@@ -28,7 +28,7 @@ use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
 use workloop_exec::handoff;
 use workloop_exec::remote_collect::{self, RemoteCollectLayout};
 use workloop_exec::remote_custody::{self, AckTombstone, CustodyLayout};
-use workloop_exec::remote_export::{self, ExportedTransfer};
+use workloop_exec::remote_export::{self, ExportedItem, ExportedTransfer};
 use workloop_exec::remote_prepare::{self, PrepareError, RemotePrepareLayout};
 use workloop_exec::remote_transfer::{self, TransferError, TransferStore, item_chunks};
 use workloop_exec::workspace::RepositorySource;
@@ -564,6 +564,7 @@ fn a_coding_request_roundtrips_coordinator_to_executor_and_back() {
         &rig.collect_layout,
         &collect_dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof-digest",
@@ -946,6 +947,7 @@ fn repeated_collection_replays_without_duplicating() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -961,6 +963,7 @@ fn repeated_collection_replays_without_duplicating() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1087,6 +1090,7 @@ fn lost_acknowledgement_replays_the_tombstone() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1158,6 +1162,7 @@ fn lost_acknowledgement_replays_the_tombstone() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1207,6 +1212,7 @@ fn oversized_report_and_log_truncate_honestly() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1294,6 +1300,7 @@ fn a_foreign_handoff_manifest_is_invalid() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1368,6 +1375,7 @@ fn a_conflicting_collection_does_not_replay_the_durable_row() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1399,6 +1407,7 @@ fn a_conflicting_collection_does_not_replay_the_durable_row() {
         &rig.collect_layout,
         &dir2,
         &changed.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1431,6 +1440,7 @@ fn a_conflicting_collection_does_not_replay_the_durable_row() {
         &rig.collect_layout,
         &dir3,
         &renamed.manifest,
+        &limits(),
         &seeded.request_id,
         "col-other",
         "stop-proof",
@@ -1498,6 +1508,7 @@ fn a_transient_fault_does_not_poison_the_collection() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1524,6 +1535,7 @@ fn a_transient_fault_does_not_poison_the_collection() {
         &rig.collect_layout,
         &dir,
         &assembled.manifest,
+        &limits(),
         &seeded.request_id,
         &collection_id,
         "stop-proof",
@@ -1533,5 +1545,513 @@ fn a_transient_fault_does_not_poison_the_collection() {
     assert_eq!(
         collected.collection.state,
         ExecutorCollectionState::Collected
+    );
+}
+
+/// Wire-supplied identifiers that join managed paths are validated
+/// before any filesystem effect: a `collection_id` carrying `..` is
+/// refused at assembly, tombstone commit/read, and cleanup — a
+/// sentinel outside the scoped dir proves no remove or create escaped
+/// — and a `work_id` carrying a traversal is refused when the wire
+/// request parses, before prepare can join it into a workspace or
+/// receipt path.
+#[test]
+fn traversal_identifiers_are_refused_before_any_filesystem_effect() {
+    let (rig, base) = rig("traversal-ids");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }],
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+
+    // `scratch/../escaped` resolves to `custody_root/escaped` — the
+    // sentinel that remove_dir_all would have deleted before the fix.
+    let escaped = rig.custody.custody_root.join("escaped");
+    std::fs::create_dir_all(&escaped).unwrap();
+    std::fs::write(escaped.join("sentinel"), b"keep").unwrap();
+
+    let err = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-bad",
+        "../escaped",
+        CHUNK,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, remote_custody::CustodyError::Invalid { .. }),
+        "a traversal collection_id refuses at assembly, got {err:?}"
+    );
+    assert!(
+        escaped.join("sentinel").exists(),
+        "no remove or create escaped the custody root"
+    );
+
+    // The tombstone and journal constructors carry the same guard —
+    // `ack/../escaped.json` is the write that must never happen.
+    let tombstone = AckTombstone {
+        request_id: seeded.request_id.clone(),
+        invocation_id: seeded.invocation_id.clone(),
+        collection_id: "../escaped".into(),
+        collection_digest: "d".repeat(64),
+        bound_incarnation_id: "boot-1".into(),
+        responder_incarnation_id: "boot-1".into(),
+        stop_proof: "s".into(),
+        receipt_body: b"{}".to_vec(),
+    };
+    assert!(
+        matches!(
+            remote_custody::commit_tombstone(&rig.custody, &tombstone),
+            Err(remote_custody::CustodyError::Invalid { .. })
+        ),
+        "a traversal collection_id refuses at tombstone commit"
+    );
+    assert!(
+        matches!(
+            remote_custody::read_tombstone(&rig.custody, "../escaped"),
+            Err(remote_custody::CustodyError::Invalid { .. })
+        ),
+        "a traversal collection_id refuses at tombstone read"
+    );
+    assert!(
+        matches!(
+            remote_custody::cleanup_after_ack(
+                &rig.custody,
+                &seeded.request_id,
+                "../escaped",
+                std::slice::from_ref(&escaped),
+            ),
+            Err(remote_custody::CustodyError::Invalid { .. })
+        ),
+        "a traversal collection_id refuses at cleanup"
+    );
+    assert!(
+        !rig.custody.custody_root.join("escaped.json").exists(),
+        "no tombstone or journal write escaped the managed dirs"
+    );
+    assert!(escaped.join("sentinel").exists());
+
+    // A traversal `work_id` is refused when the wire request parses:
+    // the digest is recomputed so `validate` — not the digest check —
+    // is what refuses it, and prepare never sees the id.
+    let mut forged = seeded.request.clone();
+    forged.work_id = "w/../../escaped".into();
+    forged.workspace.workspace_id = format!("ws-{}", forged.work_id);
+    forged.request_digest = forged.digest();
+    assert!(
+        WorkerRequestV2::parse(&forged.to_canonical_bytes()).is_err(),
+        "a traversal work_id fails request validation"
+    );
+
+    // The same forged body inside a finalized transfer is refused at
+    // the same boundary — the request item's parse is the gate.
+    let forged_items = vec![ExportedItem {
+        item_id: "request".into(),
+        path: "request.json".into(),
+        body: forged.to_canonical_bytes(),
+    }];
+    let forged_transfer = ExportedTransfer {
+        manifest: ExecutorTransferV1::declared(
+            "tr-in-bad",
+            &seeded.request_id,
+            CHUNK,
+            forged_items
+                .iter()
+                .map(|i| TransferItemV1 {
+                    item_id: i.item_id.clone(),
+                    path: i.path.clone(),
+                    bytes: i.body.len() as u64,
+                    digest: item_content_digest(&i.body),
+                })
+                .collect(),
+        )
+        .unwrap(),
+        items: forged_items,
+        head: base.clone(),
+    };
+    let dir = ship(&forged_transfer, &rig.exec_transfers);
+    let err = remote_prepare::prepare_remote(
+        &rig.exec_prepare,
+        &dir,
+        &forged_transfer.manifest,
+        &limits(),
+        &identity(&seeded),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PrepareError::Invalid { .. }),
+        "a traversal work_id refuses at prepare, got {err:?}"
+    );
+    assert!(
+        escaped.join("sentinel").exists(),
+        "no workspace or receipt path escaped the managed roots"
+    );
+}
+
+/// A finalized collection that omits the required report member
+/// records the deterministic `collection_incomplete` invalid outcome
+/// — the row persists, a replay returns it, and no artifact ref is
+/// ever established for the invalid collection.
+#[test]
+fn a_collection_without_a_report_records_incomplete() {
+    let (rig, base) = rig("no-report");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required,
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    // The worker produces the artifact and the handoff manifest but
+    // never writes report.json — the collection assembles without a
+    // report member.
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    std::fs::remove_file(prepared.out_dir.join("report.json")).unwrap();
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    assert!(
+        assembled.manifest.item("report").is_none(),
+        "the collection carries no report item"
+    );
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("collection_incomplete"),
+        "a missing report is the closed incomplete outcome, not a retry"
+    );
+    assert!(
+        collected.report.is_none(),
+        "no report body is retained for the invalid collection"
+    );
+    // Invalid never becomes Present evidence — no artifact ref, and
+    // the artifact verdicts are empty.
+    assert!(collected.artifacts.is_empty());
+    let artifact_id = format!("{}/result", seeded.invocation_id);
+    let ref_missing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            &handoff::artifact_ref(&artifact_id),
+        ])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false);
+    assert!(ref_missing, "an incomplete collection pins no artifact ref");
+
+    // The outcome is durable: the replay returns the recorded row
+    // instead of retrying the validation forever.
+    let replayed = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.collection.state, ExecutorCollectionState::Invalid);
+}
+
+/// The receiver enforces the run's immutable output limits on the
+/// declared collection (contract §6/§8): an over-`max_output_bytes`
+/// total records the closed `limit_exceeded` invalid outcome and no
+/// item body is ever read into the record.
+#[test]
+fn an_over_limit_collection_is_refused() {
+    let (rig, base) = rig("over-limit");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required,
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+
+    let tight = ExecutorLimits {
+        max_output_bytes: assembled.manifest.total_bytes - 1,
+        ..limits()
+    };
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &tight,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("limit_exceeded"),
+        "an over-limit collection is refused, never retried"
+    );
+    assert!(collected.artifacts.is_empty() && collected.report.is_none());
+    let artifact_id = format!("{}/result", seeded.invocation_id);
+    let ref_missing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            &handoff::artifact_ref(&artifact_id),
+        ])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false);
+    assert!(ref_missing, "an over-limit collection pins no artifact ref");
+}
+
+/// The item-count bound is enforced the same way — a declared set
+/// past `max_item_count` records `limit_exceeded` and persists.
+#[test]
+fn an_over_item_count_collection_is_refused() {
+    let (rig, base) = rig("over-count");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![],
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    std::fs::write(prepared.out_dir.join("report.json"), b"{}").unwrap();
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+
+    let tight = ExecutorLimits {
+        max_item_count: assembled.manifest.item_count - 1,
+        ..limits()
+    };
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &tight,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("limit_exceeded")
+    );
+}
+
+/// A finalized transfer that simply omits a body the request's refs
+/// require is refused at prepare — the required set is checked, not
+/// only the declared set the manifest happens to carry.
+#[test]
+fn a_transfer_missing_a_required_input_is_refused() {
+    let (rig, base) = rig("missing-input");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![],
+        1 << 20,
+        1 << 20,
+    );
+    let exported = remote_export::export_request_transfer(
+        &rig.store,
+        &rig.bodies,
+        &rig.source,
+        Some(&rig.handoff_repo),
+        &rig.root.join("coord/export-scratch"),
+        &seeded.request_id,
+        "tr-in-1",
+        CHUNK,
+    )
+    .unwrap();
+    // Rebuild the transfer without the goal item — the request body
+    // still declares the goal ref, so prepare must refuse, not
+    // materialize a partial input set.
+    let items: Vec<ExportedItem> = exported
+        .items
+        .into_iter()
+        .filter(|i| i.item_id != "input-goal.md")
+        .collect();
+    let short = ExportedTransfer {
+        manifest: ExecutorTransferV1::declared(
+            "tr-in-2",
+            &seeded.request_id,
+            CHUNK,
+            items
+                .iter()
+                .map(|i| TransferItemV1 {
+                    item_id: i.item_id.clone(),
+                    path: i.path.clone(),
+                    bytes: i.body.len() as u64,
+                    digest: item_content_digest(&i.body),
+                })
+                .collect(),
+        )
+        .unwrap(),
+        items,
+        head: exported.head,
+    };
+    let dir = ship(&short, &rig.exec_transfers);
+    let err = remote_prepare::prepare_remote(
+        &rig.exec_prepare,
+        &dir,
+        &short.manifest,
+        &limits(),
+        &identity(&seeded),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PrepareError::Invalid { .. }),
+        "a missing required input refuses prepare, got {err:?}"
+    );
+}
+
+/// A zero-byte output file — an empty `runtime.log` — declares an
+/// item that emits no chunk frame; the transfer still finalizes and
+/// the collection imports it whole.
+#[test]
+fn an_empty_output_file_finalizes_and_collects() {
+    let (rig, base) = rig("empty-output");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required,
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    // The worker leaves an empty runtime.log — the item exists with
+    // zero bytes and crosses the wire as no frames at all.
+    std::fs::write(prepared.out_dir.join("runtime.log"), b"").unwrap();
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    assert_eq!(assembled.manifest.item("log").unwrap().bytes, 0);
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    assert!(
+        remote_transfer::item_path(&dir, "log").exists(),
+        "the zero-byte item materialized in the finalized set"
+    );
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        collected.collection.state,
+        ExecutorCollectionState::Collected,
+        "invalid_reason: {:?}",
+        collected.collection.invalid_reason
+    );
+    assert_eq!(
+        collected.log.as_ref().map(|l| l.bytes.as_slice()),
+        Some(b"".as_slice()),
+        "the empty log body is retained whole"
     );
 }

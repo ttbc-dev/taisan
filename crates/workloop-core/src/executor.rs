@@ -2004,8 +2004,12 @@ impl ExecutorCollection {
     ) -> bool {
         use ExecutorCollectionState as S;
         match (from, to) {
-            (S::Invalid | S::Acknowledged, _) => false,
+            // Same-state is an idempotent replay even out of a
+            // terminal state — the lost-ack replay requirement; only a
+            // *different* target from `Invalid`/`Acknowledged` is a
+            // conflict.
             _ if from == to => true,
+            (S::Invalid | S::Acknowledged, _) => false,
             (_, S::Invalid) => true,
             (S::Collecting, S::Collected) => true,
             (S::Collected, S::Acknowledged) => true,
@@ -2707,6 +2711,50 @@ mod tests {
         assert!(matches!(
             frame_body(body, 1),
             Err(EnvelopeError::Oversize { limit: 1, bytes: 2 })
+        ));
+    }
+
+    #[test]
+    fn collection_transitions_treat_same_state_as_idempotent_replay() {
+        use ExecutorCollectionState as S;
+        // A replayed terminal row — the acknowledge retry writing the
+        // state already recorded — is the same no-op a live-state
+        // replay is, never a conflict.
+        for state in [S::Collecting, S::Collected, S::Acknowledged, S::Invalid] {
+            assert!(
+                ExecutorCollection::transition_permitted(state, state),
+                "{state:?} -> {state:?} must be the idempotent replay"
+            );
+        }
+        // A *different* target out of a terminal state is the
+        // conflict; the monotonic steps stay permitted.
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collecting,
+            S::Collected
+        ));
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Acknowledged
+        ));
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Invalid
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Acknowledged,
+            S::Collected
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Invalid,
+            S::Collected
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Acknowledged,
+            S::Invalid
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Collecting
         ));
     }
 }

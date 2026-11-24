@@ -442,6 +442,59 @@ fn a_repeated_same_state_upsert_is_idempotent() {
     assert_eq!(read, collected);
 }
 
+/// The same idempotent rule holds out of a terminal state: a replayed
+/// `acknowledge` rewriting the already-`acknowledged` row — the
+/// lost-ack retry — is a no-op, and a replayed `invalid` verdict the
+/// same. Only a *different* target state out of a terminal row is a
+/// conflict.
+#[test]
+fn a_replayed_terminal_state_is_the_same_idempotent_no_op() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = bound_request(&store, "coll-term-idem");
+    let collected = collection(
+        &request_id,
+        "col-1",
+        1,
+        ExecutorCollectionState::Collected,
+        None,
+    );
+    apply_effects(&store, &[upsert(&collected, 0)]);
+    let acknowledged = collection(
+        &request_id,
+        "col-1",
+        2,
+        ExecutorCollectionState::Acknowledged,
+        None,
+    );
+    apply_effects(&store, &[upsert(&acknowledged, 1)]);
+    // The acknowledge's own replay applies under the same cursor and
+    // changes nothing — it must not read as a forbidden move out of
+    // the terminal state.
+    apply_effects(&store, &[upsert(&acknowledged, 2)]);
+    let read = store
+        .transact(|tx| tx.executor_collection(&request_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, acknowledged);
+
+    let store = SqliteStore::in_memory(1).unwrap();
+    let request_id = bound_request(&store, "coll-inv-idem");
+    let invalid = collection(
+        &request_id,
+        "col-1",
+        1,
+        ExecutorCollectionState::Invalid,
+        Some("collection_incomplete"),
+    );
+    apply_effects(&store, &[upsert(&invalid, 0)]);
+    apply_effects(&store, &[upsert(&invalid, 1)]);
+    let read = store
+        .transact(|tx| tx.executor_collection(&request_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, invalid);
+}
+
 /// The cursor is compare-and-set: an upsert whose `expected_seq`
 /// disagrees with the recorded row conflicts instead of regressing a
 /// concurrent collector's commit.

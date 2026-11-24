@@ -1165,6 +1165,17 @@ impl WorkerRequestV2 {
                 "base.repository names a foreign repository".into(),
             ));
         }
+        // `work_id` derives the managed `ws-<work_id>` workspace, the
+        // `work/<work_id>` branch, and per-request receipt paths on a
+        // remote executor — bound it to the wire identifier grammar
+        // at parse so no filesystem consumer ever joins a traversal
+        // id (contract §6).
+        if !crate::executor::transfer_id_is_valid(&self.work_id) {
+            return Err(invalid(
+                "request.invalid",
+                format!("work_id {:?} is not a safe identifier", self.work_id),
+            ));
+        }
         // Bounds (§4.2, OD-9).
         if self.continuation.len() as u64 > self.budget.max_continuation_refs {
             return Err(invalid(
