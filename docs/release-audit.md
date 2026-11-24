@@ -96,9 +96,10 @@ exception does not hold in practice:
   not a source-name leak. Recorded for completeness, not counted as a
   release blocker.
 - **The smoke repo is pervasive**: its `<owner>/<smoke-repo>` name
-  appears 161 times across 29 files — `docs/s1/*` (9 files),
-  `docs/evidence/u3.6d.md`, `u3.6e.md`, `u8.1*.md`, `u8.2`–`u8.5`,
-  `docs/remote-executor.md:20`, `fixtures/s1/*`,
+  appears 161 times across 29 files — the sanctioned
+  `docs/source-workflow-audit.md` plus, outside it, `docs/s1/*`
+  (8 files), `docs/evidence/u3.6d.md`, `u3.6e.md`, `u8.1*.md`,
+  `u8.2`–`u8.5`, `docs/remote-executor.md:20`, `fixtures/s1/*`,
   `scripts/s1/{check-prerequisites.py,worker-shim.sh,worker-shim-nc.sh}`,
   `scripts/tests/test_s1_materials.py`,
   `crates/workloop-cli/src/bin/s1_bridge.rs:1970`,
@@ -235,32 +236,34 @@ A clean HEAD certifies nothing here. Divergence table:
 | Author identities | n/a | **all 1,017 commits** | n/a |
 | Real secrets | none | none | none found |
 
-## 5. Residual exposure — release blockers until dispositioned
+## 5. Residual exposure — release blockers and owner decisions until dispositioned
 
-1. Every `github.com/<owner>/<smoke-repo>` link and every
-   `<smoke-repo>#N` issue/PR citation in `docs/s1/`, `docs/evidence/`,
-   and `fixtures/s1/` resolves only for the owner; publicly they 404 and
-   disclose the worker repo's name.
-2. `scripts/s1/` scenario tooling and `scripts/s1/worker-shim*.sh`
-   clone the private smoke repo — the S1/U8 materials cannot run
-   publicly as written.
-3. `scripts/s1/mint-app-token.py` depends on an owner-local config path
-   (`~/.config/<worker-repo>/…`).
-4. `docs/extraction-coverage.json` retains partially-redacted and
-   unredacted private names (§2.1).
-5. `docs/name-migration.md` names the former repository (§2.1) —
-   owner judgment call, not a source-name leak: the rename redirect
-   discloses it on publication regardless.
-6. **This document itself** is a publication blocker: it is a map of
-   every remaining leak location and must be excluded from the
-   published tree or dispositioned with `source-workflow-audit.md`
-   (§6).
-7. Milestone #2's description and tracker bodies/comments preserve the
-   private names even if the tree and history were fully cleaned —
-   metadata cleanup is required under any publication route.
-8. `docs/s1/live-authorization.md`, `docs/u3.6e-authorization.md`, and
-   the u8 live-evidence records are owner-operations documents; useful
-   as requirements/invariants but drafted as personal ops records.
+1. **Release blocker** — every `github.com/<owner>/<smoke-repo>` link
+   and every `<smoke-repo>#N` issue/PR citation in `docs/s1/`,
+   `docs/evidence/`, and `fixtures/s1/` resolves only for the owner;
+   publicly they 404 and disclose the worker repo's name.
+2. **Release blocker** — `scripts/s1/` scenario tooling and
+   `scripts/s1/worker-shim*.sh` clone the private smoke repo — the
+   S1/U8 materials cannot run publicly as written.
+3. **Release blocker** — `scripts/s1/mint-app-token.py` depends on an
+   owner-local config path (`~/.config/<worker-repo>/…`).
+4. **Release blocker** — `docs/extraction-coverage.json` retains
+   partially-redacted and unredacted private names (§2.1).
+5. **Owner judgment call, not a release blocker** —
+   `docs/name-migration.md` names the former repository (§2.1): the
+   repository's own self-rename rather than a source-name leak, and
+   the rename redirect discloses it on publication regardless.
+6. **Release blocker** — this document itself is a map of every
+   remaining leak location and must be excluded from the published
+   tree or dispositioned with `source-workflow-audit.md` (§6).
+7. **Release blocker** — milestone #2's description and tracker
+   bodies/comments preserve the private names even if the tree and
+   history were fully cleaned; metadata cleanup is required under any
+   publication route.
+8. **Release blocker** — `docs/s1/live-authorization.md`,
+   `docs/u3.6e-authorization.md`, and the u8 live-evidence records are
+   owner-operations documents; useful as requirements/invariants but
+   drafted as personal ops records.
 
 ## 6. Options for owner decision
 
