@@ -4467,6 +4467,20 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
         .map(|i| &invocations[i])
         && let Some(reason) = unfulfillable_artifact(tx, &execution.id, writer)?
     {
+        // The terminal-settle rule every other failure path applies:
+        // a pending or unknown delivery-bound intent may still be
+        // drained, and it must not land under an already-recorded
+        // failure. The reconciling `host_action_result` — or the
+        // sweep's level-triggered re-assessment — re-runs this check
+        // once the outbox settles.
+        if defer_terminal_while_outstanding(
+            tx,
+            &execution.work_id,
+            &execution.id,
+            "artifact_unfulfillable",
+        )? {
+            return Ok(());
+        }
         return fail_terminal(tx, execution, "artifact_unfulfillable", &reason);
     }
     if !invocations.iter().any(|i| {
@@ -4932,11 +4946,11 @@ fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Resu
     Ok(())
 }
 
-/// A terminal decision (spent budget or a passed deadline) must wait
-/// for outstanding host writes to reconcile (lifecycle.md): intents are
-/// delivery-bound and would still apply under a recorded failure, so the
-/// stall is recorded as `outbox_reconciliation` instead of the terminal
-/// outcome. An intent that can never be attempted — `pending` under a
+/// A terminal decision (spent budget, a passed deadline, or a
+/// structural refusal) must wait for outstanding host writes to
+/// reconcile (lifecycle.md): intents are delivery-bound and would still
+/// apply under a recorded failure, so the stall is recorded as
+/// `outbox_reconciliation` instead of the terminal outcome. An intent that can never be attempted — `pending` under a
 /// denied `host_write` grant — does not defer: there is no in-flight
 /// effect to wait for. Returns true while the deferral stands.
 fn defer_terminal_while_outstanding(

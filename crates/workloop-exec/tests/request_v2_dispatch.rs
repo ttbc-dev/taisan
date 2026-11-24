@@ -5874,6 +5874,96 @@ fn a_tracked_artifact_json_fails_unfulfillable_on_the_first_finish() {
     );
 }
 
+/// A tracked `artifact.json` whose worktree entry is *absent* is not
+/// the collision — nothing at the slot proves different bytes, and
+/// the worker-runtime artifact store may still hold this
+/// invocation's bound manifest. The finish reports `missing`, the
+/// Execution enters bounded recovery, and the recovery pass promotes
+/// the store copy into the root and reports `Present`: an outcome
+/// the fast-fail on absence would have made unreachable.
+#[test]
+fn an_absent_tracked_artifact_json_stays_on_the_recovery_path() {
+    let root = tmp_root("tracked-artifact-absent");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (w, e, rid) = admit(&store, "v2-tracked-absent", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The workspace is prepared and the writer launched. The tracked
+    // worktree entry disappears while the index still tracks it — a
+    // deletion, not a foreign file — and the runtime's artifact store
+    // holds this invocation's bound manifest.
+    let ws = sup.workspace_of(&w);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "absent tracked slot enters bounded recovery, not fast-fail: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the finish reported `missing`, never `unfulfillable`: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: workloop_core::observation::ArtifactFact::Present { .. },
+                        ..
+                    } if invocation_id == &invocation.id
+                )
+            }),
+        "recovery promoted the bound store copy and reported Present"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: workloop_core::observation::ArtifactFact::Unfulfillable { .. },
+                        ..
+                    }
+                )
+            }),
+        "no unfulfillable refusal was ever recorded"
+    );
+}
+
 /// Insert a resolved writer bound to `request_id` requiring the
 /// workspace-root `artifact.json` — the durable shape the artifact
 /// gates read when they pick the producing Invocation.
@@ -6121,6 +6211,114 @@ fn a_writers_later_present_supersedes_its_earlier_collision() {
         exec.waiting_reason,
         Some(WaitingReason::HostWrite),
         "the latest fact — `Present` — drove publication: {exec:?}"
+    );
+}
+
+/// An `artifact_unfulfillable` settle honors the terminal-settle rule
+/// every other failure path applies: a delivery-bound intent that may
+/// still be drained must not land under an already-recorded failure.
+/// While the publish chain's `push_ref` intent stays `pending`, the
+/// collision defers as `outbox_reconciliation` instead of failing;
+/// the reconciling receipt then re-drives the settle and the failure
+/// lands — never ahead of it.
+#[test]
+fn an_unfulfillable_settle_defers_until_the_outstanding_write_reconciles() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.allowed_effects.host_write = true;
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-defer", vec![], vec![], &cfg);
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+    authorize_push(&store);
+    // The producing writer's evidence lands: the publish chain records
+    // a `push_ref` intent that stays `pending` — an effect whose
+    // receipt may still arrive.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ab".repeat(32),
+        },
+        NOW,
+    );
+    let pending = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+        .expect("the publish chain recorded a push_ref intent");
+    assert_eq!(pending.status, HostActionStatus::Pending);
+
+    // The collision fact lands while the write is still outstanding:
+    // the settle defers, it does not fail.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "the outstanding host write defers the terminal failure: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e && d.reason == "outbox_reconciliation"),
+        "the deferred settle explains itself as outbox reconciliation"
+    );
+
+    // The reconciling receipt re-drives the settle: with the outbox
+    // resolved, the same collision now fails the request.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: pending.action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "transport lost".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW + 2,
+        },
+        NOW + 2,
+    )
+    .unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the deferred failure lands once the outbox reconciles: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable")
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e),
+        "a terminal Execution carries no stale deferral"
     );
 }
 

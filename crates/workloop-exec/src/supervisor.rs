@@ -5380,14 +5380,16 @@ fn manifest_binding(bytes: &[u8], invocation: &Invocation) -> ManifestBinding {
 /// durable v2 request body; only then does the `artifact.json` path
 /// require the manifest contract — a v1 artifact stays opaque.
 ///
-/// A tracked `artifact.json` is one exception to that degradation.
-/// The shim never rewrites repository content, so under a v2 dispatch
-/// a tracked file that is not the bound manifest can never become
-/// `Present`; it is reported `Unfulfillable` so Core fails the
+/// A tracked `artifact.json` is one exception to that degradation,
+/// but only while the slot holds provable bytes: a present tracked
+/// file that is not the bound manifest is repository content the
+/// shim never rewrites, so under a v2 dispatch it can never become
+/// `Present` and is reported `Unfulfillable` — Core fails the
 /// request at once instead of spending the artifact-recovery budget.
-/// Whether the repository tracked the file or the runtime's own
-/// commit captured it makes no difference — the collision is the
-/// same.
+/// An absent or empty worktree entry is different: nothing at the
+/// slot proves different bytes, and `.checkpoints/`/`.artifact-store`
+/// may still hold the bound manifest recovery promotes into the
+/// root, so it stays `missing` on the recovery path.
 fn artifact_fact(
     workspace: &Path,
     required: &RequiredArtifact,
@@ -5396,11 +5398,11 @@ fn artifact_fact(
 ) -> ArtifactFact {
     let candidate = workspace.join(&required.path);
     let artifact_slot = v2_manifest && Path::new(&required.path) == Path::new("artifact.json");
-    // A tracked slot is repository content the shim refuses to write,
-    // whether the worktree still holds it or not. Unless the bytes are
-    // the bound manifest, the declared artifact is structurally
-    // unfulfillable — no recovery attempt can change a tracked path
-    // into one the shim may overwrite.
+    // Absence is never a collision — an empty slot holds no provable
+    // bytes, and an unreadable entry proves nothing either. Only a
+    // present tracked file whose bytes are not the bound manifest is
+    // `Unfulfillable`; every thinner state stays `missing` so bounded
+    // recovery can promote a store copy into the root.
     let tracked = artifact_slot && artifact_path_tracked(workspace, &required.path);
     let unfulfillable = || ArtifactFact::Unfulfillable {
         reason: format!(
@@ -5411,25 +5413,13 @@ fn artifact_fact(
         ),
     };
     if !candidate.is_file() {
-        return if tracked {
-            unfulfillable()
-        } else {
-            ArtifactFact::Missing
-        };
+        return ArtifactFact::Missing;
     }
     let Ok(bytes) = std::fs::read(&candidate) else {
-        return if tracked {
-            unfulfillable()
-        } else {
-            ArtifactFact::Missing
-        };
+        return ArtifactFact::Missing;
     };
     if bytes.is_empty() {
-        return if tracked {
-            unfulfillable()
-        } else {
-            ArtifactFact::Missing
-        };
+        return ArtifactFact::Missing;
     }
     let binding = manifest_binding(&bytes, invocation);
     if artifact_slot {
@@ -5829,10 +5819,13 @@ mod tests {
 
     /// A tracked `artifact.json` is repository content the shim never
     /// rewrites: under a v2 dispatch an untracked stale or opaque file
-    /// stays `missing` for recovery, but the tracked collision is a
-    /// structural `Unfulfillable`. A bound manifest is still `Present`
-    /// whatever the index says, and the untracked rule returns once
-    /// the path leaves the index.
+    /// stays `missing` for recovery, and a *present* tracked file that
+    /// is not the bound manifest is a structural `Unfulfillable`. An
+    /// absent or empty worktree entry is only recoverable absence —
+    /// `.artifact-store` may still hold the bound copy — so it stays
+    /// `missing` too. A bound manifest is `Present` whatever the
+    /// index says, and the untracked rule returns once the path
+    /// leaves the index.
     #[test]
     fn a_tracked_artifact_json_is_unfulfillable_under_a_v2_dispatch() {
         let dir = std::env::temp_dir().join(format!(
@@ -5885,13 +5878,43 @@ mod tests {
             artifact_fact(&dir, &required, &invocation, true),
             ArtifactFact::Unfulfillable { .. }
         ));
-        // The shim refuses to write a tracked path even when the
-        // worktree entry is gone, so the missing file is the same
-        // collision, not recoverable absence.
+        // An absent worktree entry is not a collision: nothing at the
+        // slot proves different bytes, and the artifact store may
+        // still hold this invocation's bound manifest for recovery to
+        // promote — the case stays `missing` on the recovery path.
         std::fs::remove_file(dir.join("artifact.json")).unwrap();
         assert!(matches!(
             artifact_fact(&dir, &required, &invocation, true),
-            ArtifactFact::Unfulfillable { .. }
+            ArtifactFact::Missing
+        ));
+        // The promotion `run_recovery` performs: a bound copy in
+        // `.artifact-store` restores the root entry and reads
+        // `Present` — the tracked index never blocked it.
+        let store_dir = dir.join(".artifact-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(
+            store_dir.join("artifact.json"),
+            serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-tracked",
+                "invocation_id": "inv-tracked",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let found = find_artifact(&dir, "artifact.json").expect("store copy found");
+        assert_eq!(found, store_dir);
+        std::fs::copy(store_dir.join("artifact.json"), dir.join("artifact.json")).unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+        // An empty tracked entry holds no provable bytes either —
+        // the same recoverable absence, never `Unfulfillable`.
+        std::fs::write(dir.join("artifact.json"), "").unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
         ));
 
         // A tracked manifest naming another producer is the same
