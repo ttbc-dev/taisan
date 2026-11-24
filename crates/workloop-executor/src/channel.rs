@@ -142,7 +142,7 @@ pub fn coordinator_handshake(
     if auth.endpoint_identity_digest != expected_identity_digest {
         return Err(SessionError::Refused("endpoint_mismatch".into()));
     }
-    if auth.expected_mac(endpoint_credential)? != auth.endpoint_mac {
+    if !crate::auth::mac_eq(&auth.expected_mac(endpoint_credential)?, &auth.endpoint_mac) {
         return Err(SessionError::Refused("endpoint_auth_failed".into()));
     }
     let open = SessionOpen::new(&challenge, &auth, coordinator_credential)?;
@@ -179,7 +179,7 @@ pub fn endpoint_handshake(
     let expected = SessionOpen::expected_mac(&challenge, &auth, coordinator_credential)?;
     if open.coordinator_nonce != challenge.coordinator_nonce
         || open.endpoint_nonce != auth.endpoint_nonce
-        || open.coordinator_mac != expected
+        || !crate::auth::mac_eq(&expected, &open.coordinator_mac)
     {
         let _ = write_frame(
             channel,

@@ -514,6 +514,36 @@ fn concurrent_invocation_refuses_the_single_slot() {
     assert_eq!(fx.port.spawn_calls(), 1);
 }
 
+#[test]
+fn a_corrupt_binding_record_fails_the_slot_check_closed() {
+    let fx = fixture("corrupt-slot");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+
+    // One unreadable binding record aborts the slot-check scan; the
+    // start must refuse rather than let a second Invocation slip the
+    // single execution slot.
+    let corrupt = fx.state.request_path("corrupt-request");
+    std::fs::create_dir_all(&corrupt).expect("corrupt dir");
+    std::fs::write(corrupt.join("binding.json"), b"{ not json").expect("corrupt");
+
+    let config = launch_config(deadline);
+    let receipt = issue(
+        &fx.service,
+        "op-start",
+        OperationKind::Start,
+        json!({
+            "prepared_id": format!("prep-{}", &request_digest()[..16]),
+            "launch_config_digest": launch_config_digest_of(&config),
+        }),
+    )
+    .expect("receipt");
+    assert_eq!(receipt.result["status"], "refused");
+    assert_eq!(receipt.result["reason"], "unavailable");
+    assert_eq!(fx.port.spawn_calls(), 0);
+}
+
 // ---------------------------------------------------------------------
 // Reconnect and restart
 // ---------------------------------------------------------------------
@@ -980,6 +1010,19 @@ fn credential_delivery_stages_and_binds() {
         std::fs::read(&staged).expect("credential"),
         b"runtime-secret"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&staged)
+                .expect("credential metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the staged credential is owner-only from creation"
+        );
+    }
 
     drop(adapter);
     served.join().expect("session ended").expect("stream");

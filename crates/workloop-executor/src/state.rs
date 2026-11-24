@@ -85,6 +85,35 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     Ok(())
 }
 
+/// `write_atomic` for secret bodies: the tmp file is created owner-
+/// only (mode 0600) and a pre-existing tmp is clamped before any
+/// secret byte lands, so the content is never world-readable — and a
+/// permission failure is an error, never silently ignored (contract
+/// §7 requires mode 0600 for the staged runtime credential).
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp-partial");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(io(&tmp))?;
+    // `mode` applies only at creation — clamp a pre-existing tmp
+    // before any byte lands in it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io(&tmp))?;
+    }
+    file.write_all(bytes).map_err(io(&tmp))?;
+    file.sync_all().map_err(io(&tmp))?;
+    std::fs::rename(&tmp, path).map_err(io(path))?;
+    Ok(())
+}
+
 fn write_record(path: &Path, value: &serde_json::Value) -> Result<(), StateError> {
     let bytes = workloop_core::domain::canonical_json(value);
     write_atomic(path, &bytes)
@@ -411,10 +440,15 @@ impl EndpointState {
 
     // --- operation ledger ------------------------------------------------
 
+    /// The per-operation ledger filename: `sanitize_key` alone is
+    /// lossy (`a:b` and `a-b` both become `a-b`), so the file name
+    /// carries the same content tag the request directory does — a
+    /// distinct operation id can never overwrite another's record.
     fn op_path(&self, request_id: &str, operation_id: &str) -> PathBuf {
+        let tag = &sha256_hex("taisan.executor.operation-file.v1", operation_id.as_bytes())[..12];
         self.request_dir(request_id)
             .join("ops")
-            .join(format!("{}.json", sanitize_key(operation_id)))
+            .join(format!("{}-{tag}.json", sanitize_key(operation_id)))
     }
 
     pub fn operation(
@@ -559,5 +593,61 @@ impl EndpointState {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_ids_that_sanitize_alike_never_share_a_ledger_file() {
+        // `a:b` and `a-b` both sanitize to `a-b`; the digest tag keeps
+        // their ledger records distinct so replay reads its own
+        // receipt, never the colliding operation's.
+        let dir = std::env::temp_dir().join(format!("state-test-{}", std::process::id()));
+        let state = EndpointState::open(dir.clone()).expect("state");
+        let record = |id: &str| OpRecord {
+            operation_id: id.into(),
+            operation_kind: "observe".into(),
+            command_body_b64: String::new(),
+            command_digest: format!("digest-{id}"),
+            receipt_body_b64: None,
+            receipt_digest: None,
+        };
+        state.put_operation("req-1", &record("a:b")).expect("put");
+        state.put_operation("req-1", &record("a-b")).expect("put");
+        assert_eq!(
+            state
+                .operation("req-1", "a:b")
+                .expect("read")
+                .expect("exists")
+                .command_digest,
+            "digest-a:b"
+        );
+        assert_eq!(
+            state
+                .operation("req-1", "a-b")
+                .expect("read")
+                .expect("exists")
+                .command_digest,
+            "digest-a-b"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writes_are_owner_only_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("state-priv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("runtime-auth");
+        write_atomic_private(&path, b"secret").expect("write");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

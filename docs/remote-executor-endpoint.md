@@ -57,16 +57,20 @@ service's unix socket — but any reliable bidirectional stream works.
 Each session performs a mutual-authentication handshake before any
 command:
 
-1. The endpoint sends `taisan.executor.session-challenge/1` — a fresh
-   nonce, the installation/endpoint identities, and the incarnation.
-2. The coordinator answers `taisan.executor.session-auth/1` carrying an
-   HMAC-SHA256 (RFC 2104) of the challenge under the shared bootstrap
-   credential, proving the coordinator-side principal.
-3. The coordinator sends `taisan.executor.credential/1`, authenticated
-   the same way under the directional coordinator credential; the
-   endpoint verifies both MACs, binds the session, and replies
-   `taisan.executor.credential-ack/1`. A wrong credential yields
-   `taisan.executor.session-refusal/1` and a closed channel.
+1. The coordinator sends `taisan.executor.session-challenge/1` — a
+   fresh nonce, the installation/endpoint identities, and its
+   wall-clock send time so the endpoint can record the clock
+   measurement the deadline accounting needs.
+2. The endpoint answers `taisan.executor.session-auth/1` carrying a
+   fresh endpoint nonce, the `endpoint_identity_digest`, and an
+   HMAC-SHA256 (RFC 2104) over the two nonces and the identity under
+   the endpoint bootstrap credential, proving the endpoint-side
+   principal.
+3. The coordinator sends `taisan.executor.session-open/1` — the
+   counter-proof MAC over both nonces under the directional
+   coordinator credential. The endpoint verifies it; a wrong
+   credential yields `taisan.executor.session-refusal/1` and a closed
+   channel.
 
 The endpoint's authenticated-principal identity is
 `endpoint_identity_digest` — SHA-256 of the canonical principal bytes
@@ -76,7 +80,9 @@ closes the session. After authentication the adapter sends `hello` and
 records the responder's incarnation.
 
 Runtime credentials for a launch declaring `runtime_auth_mount` travel
-in-session via `deliver_credential`, bound to the
+over the authenticated session as
+`taisan.executor.credential/1` / `taisan.executor.credential-ack/1`
+(session messages, not executor operations), bound to the
 `launch_config_digest`, and are staged at `requests/<id>/runtime-auth`
 with owner-only permissions.
 
@@ -97,7 +103,7 @@ service.json                         service record: incarnation, boot sequence
 requests/<request_id>/
   binding.json                       request record: identities, launch config,
                                      digests, durable state word
-  ops/<operation_id>.json            operation ledger: command bytes, stored
+  ops/<operation_id>-<tag>.json      operation ledger: command bytes, stored
                                      receipt body + digest (replay surface)
   process.json                       process record: leader/descendant identities,
                                      incarnation, evidence ref + digest,
@@ -108,7 +114,9 @@ requests/<request_id>/
   runtime-auth                       staged runtime credential (mode 0600)
   stop_intent.json                   durable stop intent (fences late starts)
   stop_proof.json                    durable stop proof
-  collect.json                       collection manifest + digest
+  observations.json                  durable observation sequence
+  collection.json                    collection manifest + digest
+  objects.bundle                     retained produced-object bundle (until ack)
   ack.json                           acknowledge tombstone
 ```
 

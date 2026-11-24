@@ -784,16 +784,29 @@ impl ExecutorService {
             });
         }
         // One execution slot: another live Invocation refuses a start.
-        if let Ok(requests) = self.state.requests()
-            && requests
-                .iter()
-                .any(|r| r.request_id != record.request_id && r.is_live())
-        {
-            return json!({
-                "status": "refused",
-                "reason": "limit_exceeded",
-                "diagnostic": "the endpoint's single execution slot is occupied",
-            });
+        // The check fails closed — an enumeration error (one corrupt
+        // binding record aborts the scan) cannot skip the guard and
+        // admit a second live Invocation.
+        match self.state.requests() {
+            Ok(requests)
+                if requests
+                    .iter()
+                    .any(|r| r.request_id != record.request_id && r.is_live()) =>
+            {
+                return json!({
+                    "status": "refused",
+                    "reason": "limit_exceeded",
+                    "diagnostic": "the endpoint's single execution slot is occupied",
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return json!({
+                    "status": "refused",
+                    "reason": "unavailable",
+                    "diagnostic": format!("request enumeration failed: {e}"),
+                });
+            }
         }
         let mut record = record;
         match self.runner.launch(&record) {
@@ -1228,13 +1241,20 @@ impl ExecutorService {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
         // Deadline sweep: the executor enforces authorized runtime on
-        // its own clock, independent of session traffic.
+        // its own clock, independent of session traffic. The sweep
+        // serializes with command handling on the same service lock —
+        // an unsynchronized sweep could run stop escalation
+        // concurrently with a session's `request_stop` and
+        // double-signal the group or tear a shared record write.
         let ticker = {
             let service = Arc::clone(self);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    service.runner.enforce_deadlines(&service.incarnation);
+                    {
+                        let _serial = service.lock.lock().expect("service lock");
+                        service.runner.enforce_deadlines(&service.incarnation);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             })

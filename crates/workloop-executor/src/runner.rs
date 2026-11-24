@@ -17,14 +17,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use workloop_core::domain::{ProcessIdentity, sha256_hex};
-use workloop_core::executor::{CollectionEntry, RemoteHandoffV1, collection_digest};
+use workloop_core::executor::{
+    CollectionEntry, MAX_RECEIPT_BYTES, RemoteHandoffV1, collection_digest,
+};
 use workloop_core::ports::{ProcessControlPort, ProcessEvidence, SpawnError};
 use workloop_core::worker::IsolationProfile;
 use workloop_exec::{adapter, bounded, containment, isolation};
 
 use crate::state::{
     CollectionItemRecord, CollectionRecord, EndpointState, ProcessRecord, RequestRecord,
-    StateError, StopProof, write_atomic,
+    StateError, StopProof, write_atomic, write_atomic_private,
 };
 
 /// Signals used by the bounded escalation (SIGTERM → grace → SIGKILL).
@@ -44,11 +46,20 @@ const OUT_WHITELIST: &[&str] = &[
 /// `base..produced` for producing roles.
 const OBJECTS_ITEM: &str = "objects.bundle";
 
-/// The inline delivery ceiling for one collect result: keeps the
-/// receipt under the 1 MiB class bound with framing headroom. A
+/// Headroom the inline budget reserves inside the receipt envelope:
+/// the receipt's own members plus every item descriptor around the
+/// `data_b64` bodies — far above what a collect result can carry.
+const INLINE_RECEIPT_RESERVE: u64 = 64 * 1024;
+
+/// The inline delivery ceiling for one collect result, in raw item
+/// bytes. The receipt bound is on encoded wire bytes and bodies
+/// travel base64 (~4/3), so a raw-byte budget must buy back the
+/// expansion plus the envelope reserve — a successful collection
+/// always fits `MAX_RECEIPT_BYTES` and never degrades to
+/// unknown/unavailable after the ledger already committed it. A
 /// collection whose bounded items exceed it is `incomplete` —
 /// chunked resumable transfer is #376's, not this slice's.
-const INLINE_COLLECT_BUDGET: u64 = 768 * 1024;
+const INLINE_COLLECT_BUDGET: u64 = (MAX_RECEIPT_BYTES - INLINE_RECEIPT_RESERVE) * 3 / 4;
 
 /// Poll cadence while a stop escalation waits out the grace period
 /// and the post-KILL settle window.
@@ -273,10 +284,15 @@ impl Runner {
     /// Record the measured coordinator↔endpoint offset (coordinator
     /// minus endpoint wall clock) from the authenticated session's
     /// challenge timestamp. Applied at the conservative edge when a
-    /// deadline is converted to local time (contract §8).
+    /// deadline is converted to local time (contract §8): skew may
+    /// consume the authorized interval but never extend it, so an
+    /// offset that would inflate the remaining runtime clamps to
+    /// zero.
     pub fn record_clock_offset(&self, coordinator_time_unix_ms: i64, received_at_unix_ms: i64) {
         self.clock_offset_ms.store(
-            coordinator_time_unix_ms.saturating_sub(received_at_unix_ms),
+            coordinator_time_unix_ms
+                .saturating_sub(received_at_unix_ms)
+                .max(0),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -473,12 +489,10 @@ impl Runner {
             });
         }
         let path = self.request_dir(record).join("runtime-auth");
-        write_atomic(&path, secret).map_err(|_| "secret_invalid")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        // Owner-only from creation: the contract requires mode 0600,
+        // and a permission failure refuses the staging rather than
+        // leaving a world-readable credential.
+        write_atomic_private(&path, secret).map_err(|_| "unavailable")?;
         Ok(())
     }
 
@@ -1624,4 +1638,46 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     rec(root, &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runner(dir: &Path) -> Runner {
+        Runner::new(
+            Arc::new(workloop_exec::scripted::ScriptedProcessControl::new()),
+            EndpointState::open(dir.join("state")).expect("state"),
+            workloop_core::worker::default_isolation_profile(),
+            vec!["fixture-worker".into()],
+            u64::MAX,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn a_past_coordinator_timestamp_cannot_extend_the_deadline() {
+        // Contract §8: skew consumes budget, never extends it. A
+        // challenge timestamp behind the endpoint clock measures a
+        // negative offset; recorded verbatim it would inflate every
+        // remaining interval — the record clamps to zero instead.
+        let dir = std::env::temp_dir().join(format!("runner-test-{}", std::process::id()));
+        let runner = runner(&dir);
+        let now = Runner::now_ms();
+        runner.record_clock_offset(now - 60_000, now);
+        assert_eq!(runner.measured_clock_offset_ms(), 0);
+        runner.record_clock_offset(now + 250, now);
+        assert_eq!(runner.measured_clock_offset_ms(), 250);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_inline_budget_always_fits_the_receipt_bound() {
+        // A full-budget collection base64-encodes to ~4/3 raw plus
+        // the envelope reserve — the receipt must fit its class bound
+        // or the ledger stores a degraded receipt that poisons replay.
+        let encoded = INLINE_COLLECT_BUDGET.div_ceil(3) * 4;
+        assert!(encoded + INLINE_RECEIPT_RESERVE <= MAX_RECEIPT_BYTES);
+    }
 }

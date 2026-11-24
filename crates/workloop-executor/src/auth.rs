@@ -69,6 +69,21 @@ fn mac_hex(key: &[u8], tag: &[u8], msg: &[u8]) -> String {
         .collect()
 }
 
+/// Constant-time equality over two MAC hex strings. A `!=` byte
+/// compare returns at the first difference, leaking how much of a
+/// forged MAC was right; MACs are fixed-width so the length check is
+/// a shape check, not a timing oracle.
+pub fn mac_eq(expected: &str, presented: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), presented.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// A fresh unpredictable 128-bit nonce rendered as 32 lowercase hex —
 /// the same shape the contract's handshake nonce carries.
 pub fn fresh_nonce() -> String {
@@ -373,7 +388,7 @@ pub struct CredentialAck {
     /// `staged` | `refused`.
     pub status: String,
     /// Closed reason when refused: `request_unknown`, `not_prepared`,
-    /// `secret_invalid`, `secret_oversize`.
+    /// `secret_invalid`, `secret_oversize`, `unavailable`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -591,6 +606,18 @@ mod tests {
         let expected = SessionOpen::expected_mac(&challenge, &auth, b"coord-secret").unwrap();
         assert_eq!(open.coordinator_mac, expected);
         SessionOpen::parse(&open.to_canonical_bytes().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mac_eq_matches_only_identical_macs() {
+        let mac = mac_hex(b"key", b"tag", b"message");
+        assert!(mac_eq(&mac, &mac));
+        // Differs in the last byte only.
+        let mut other = mac.clone();
+        other.replace_range(63.., if mac.ends_with('0') { "1" } else { "0" });
+        assert!(!mac_eq(&mac, &other));
+        // Different width never matches.
+        assert!(!mac_eq(&mac, &mac[..32]));
     }
 
     #[test]
