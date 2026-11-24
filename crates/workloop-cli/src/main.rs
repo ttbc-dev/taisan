@@ -311,6 +311,22 @@ enum EvidenceCommands {
         /// Maximum records on this page (1..=500).
         #[arg(long, default_value_t = 100)]
         limit: u16,
+        /// Named export profile: `full` (default), `sanitized`, or
+        /// `shared`. Sanitized/shared exclude planner-authored classes
+        /// by default.
+        #[arg(long, alias = "export-profile", default_value = "full")]
+        profile: String,
+        /// Explicitly include an artifact class the profile excludes
+        /// by default. Recorded as a widening in the export manifest.
+        #[arg(long = "include-class", alias = "widen", alias = "include")]
+        include_class: Vec<String>,
+        /// Write a sanitized export bundle (page, manifest, included
+        /// artifacts, and previews) into this directory.
+        #[arg(long, alias = "out-dir")]
+        output: Option<PathBuf>,
+        /// Write the export manifest to this file.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Write one retained artifact's exact bytes to a new file after
     /// digest verification. Refuses an existing destination.
@@ -324,6 +340,9 @@ enum EvidenceCommands {
         /// New file to receive the exact retained bytes.
         #[arg(long)]
         output: PathBuf,
+        /// Named export profile; an excluded class is refused.
+        #[arg(long, alias = "export-profile", default_value = "full")]
+        profile: String,
     },
 }
 
@@ -1510,10 +1529,29 @@ fn run(cli: Cli) -> i32 {
                     after,
                     cursor,
                     limit,
-                } => evidence::export(&store, &actor_label, after, cursor, limit),
-                EvidenceCommands::Artifact { id, sha256, output } => {
-                    evidence::artifact(&store, &actor_label, id, sha256, output)
-                }
+                    profile,
+                    include_class,
+                    output,
+                    manifest,
+                } => evidence::export(
+                    &store,
+                    &actor_label,
+                    evidence::ExportOptions {
+                        after,
+                        cursor,
+                        limit,
+                        profile,
+                        include_classes: include_class,
+                        output,
+                        manifest,
+                    },
+                ),
+                EvidenceCommands::Artifact {
+                    id,
+                    sha256,
+                    output,
+                    profile,
+                } => evidence::artifact(&store, &actor_label, id, sha256, output, &profile),
             }
         }
         Commands::Retention { command } => {

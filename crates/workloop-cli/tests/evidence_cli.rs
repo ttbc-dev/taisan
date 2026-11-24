@@ -15,6 +15,8 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::store::Effect;
 use workloop_evidence_protocol::*;
+use workloop_store::artifact_class::ArtifactClass;
+use workloop_store::export_profile::ExportManifest;
 use workloop_store::sqlite::SqliteStore;
 
 fn bin() -> PathBuf {
@@ -567,4 +569,276 @@ fn help_documents_the_supported_protocol() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("rui-evidence/1"), "{text}");
+}
+
+// --- sanitized/shared export profiles and leak regression ---------------
+
+const PLAN_MARKER: &str = "PLAN-ONLY-MARKER-2f8c4d1a-SECRET";
+
+/// Append a spec revision whose retained artifact payload carries the
+/// private marker in a source snapshot (which no exported record body
+/// copies), then register the event artifact as plan-class. The
+/// projected invariant keeps the event cited, so the artifact really is
+/// part of the export page before the profile excludes it.
+fn append_plan_artifact(db: &Path) -> (String, String) {
+    let store = SqliteStore::open(db, 2).unwrap();
+    let spec = SpecSnapshot {
+        work_id: WorkId("w-1".into()),
+        revision: 2,
+        payload: SpecPayload {
+            intent: "synthetic follow-up".into(),
+            sources: vec![SourceSnapshot {
+                issue: IssueRef {
+                    repository: repo(),
+                    issue: IssueId::trusted("issue-plan"),
+                    display_number: None,
+                },
+                source_revision: PLAN_MARKER.into(),
+                content_digest: "p".repeat(64),
+            }],
+            constraints: vec!["exported constraint".into()],
+            verification_argv: vec![],
+            required_checks: vec![],
+            lanes: LanePolicy::default(),
+        },
+        digest: "d".repeat(64),
+        approved_by: Actor {
+            kind: ActorKind::Human,
+            external_id: "tester".into(),
+        },
+        recorded_seq: 0,
+    };
+    let seq = store
+        .append_event(
+            "effect",
+            &serde_json::to_string(&Effect::InsertSpec { spec }).unwrap(),
+        )
+        .unwrap();
+    let id = format!("event:{seq}");
+    store.set_artifact_class(&id, ArtifactClass::Plan).unwrap();
+    let snapshot = store.evidence_history().unwrap();
+    let descriptor = snapshot
+        .events
+        .iter()
+        .find(|event| event.seq == seq as u64)
+        .map(|event| sha256(event.payload.as_bytes()))
+        .unwrap();
+    (id, descriptor)
+}
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn sanitized_export_excludes_plan_content_but_retains_integrity_metadata() {
+    let root = root("sanitized");
+    let db = root.join("workloop.db");
+    populate(&db);
+    let (plan_id, plan_digest) = append_plan_artifact(&db);
+    let out_dir = root.join("shared-export");
+    let out = out_dir.to_string_lossy().into_owned();
+
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "sanitized",
+            "--output",
+            &out,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let page = export_envelope(&output).result.unwrap();
+    assert!(
+        page.artifacts
+            .iter()
+            .all(|artifact| artifact.artifact_id != plan_id),
+        "the excluded artifact descriptor is not exported as content-bearing"
+    );
+
+    let manifest: ExportManifest =
+        serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
+    let entry = manifest
+        .excluded_artifact(&plan_id)
+        .expect("the exclusion keeps an integrity entry");
+    assert_eq!(entry.sha256, plan_digest);
+    assert_eq!(entry.class, ArtifactClass::Plan);
+    assert!(entry.excluded);
+    assert!(!entry.content_included);
+    assert!(!entry.preview_included);
+    assert!(manifest.excludes_planner_content);
+    assert!(manifest.excluded_classes.contains(&ArtifactClass::Plan));
+    assert!(manifest.default_exclusion_on);
+
+    // Unique-marker regression: no file in the export bundle may carry
+    // the plan content, including the manifest and preview renders.
+    for file in files_under(&out_dir) {
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(PLAN_MARKER),
+            "{} leaked excluded plan content",
+            file.display()
+        );
+    }
+
+    // Re-running into the same directory replaces the bundle without
+    // resurrecting the excluded content.
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "sanitized",
+            "--output",
+            &out,
+        ],
+    );
+    assert!(output.status.success());
+    for file in files_under(&out_dir) {
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(PLAN_MARKER),
+            "{} leaked excluded plan content on re-run",
+            file.display()
+        );
+    }
+
+    // The artifact command refuses the excluded class under the same
+    // profile, so content cannot be recovered around the export.
+    let refused = root.join("refused.json");
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "artifact",
+            "--profile",
+            "sanitized",
+            "--id",
+            &plan_id,
+            "--sha256",
+            &plan_digest,
+            "--output",
+            &refused.to_string_lossy(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(env["reason"]["code"], "artifact_unavailable");
+    assert!(!refused.exists());
+}
+
+#[test]
+fn invalid_profile_class_and_output_fail_closed() {
+    let root = root("profile-errors");
+    let db = root.join("workloop.db");
+    populate(&db);
+    for args in [
+        vec!["evidence", "export", "--profile", "not-a-profile"],
+        vec![
+            "evidence",
+            "export",
+            "--profile",
+            "sanitized",
+            "--include-class",
+            "not-a-class",
+        ],
+    ] {
+        let output = output_at(&root, &args);
+        assert_eq!(output.status.code(), Some(2));
+        let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(env["reason"]["code"], "usage");
+        assert!(env["result"].is_null());
+    }
+    // An output path that cannot be a directory fails before claiming a
+    // bundle exists.
+    let blocked = root.join("blocked");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--profile",
+            "sanitized",
+            "--output",
+            &blocked.to_string_lossy(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(env["reason"]["code"], "usage");
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory");
+    assert!(!blocked.join("manifest.json").exists());
+}
+
+#[test]
+fn widening_a_sanitized_profile_is_explicit_and_recorded() {
+    let root = root("widened");
+    let db = root.join("workloop.db");
+    populate(&db);
+    let (plan_id, _) = append_plan_artifact(&db);
+    let out_dir = root.join("widened-export");
+    let out = out_dir.to_string_lossy().into_owned();
+
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "shared",
+            "--include-class",
+            "plan",
+            "--output",
+            &out,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: ExportManifest =
+        serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.profile, "shared");
+    assert_eq!(manifest.widened_classes, vec![ArtifactClass::Plan]);
+    assert!(!manifest.excluded_classes.contains(&ArtifactClass::Plan));
+    let entry = manifest
+        .artifacts
+        .iter()
+        .find(|entry| entry.artifact_id == plan_id)
+        .unwrap();
+    assert!(!entry.excluded);
+    assert!(entry.content_included);
+    let leaked = files_under(&out_dir)
+        .into_iter()
+        .any(|file| String::from_utf8_lossy(&std::fs::read(file).unwrap()).contains(PLAN_MARKER));
+    assert!(leaked, "an explicit widening exports the plan content");
 }

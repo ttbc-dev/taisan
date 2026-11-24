@@ -42,6 +42,29 @@ against its definition. Parse `body_json` separately against `RecordBody`
 after checking its digest. The [semantic validator](../crates/workloop-evidence-protocol/src/validate.rs)
 checks rules that span fields, messages, and artifact bytes.
 
+## Sanitized and shared exports
+
+`evidence export --profile NAME` selects a named artifact-class profile.
+`full` (also `local`, the default) exports every class. `sanitized` and
+`shared` exclude planner-authored material by default: `plan`,
+`decision`, and the `preview`/`manifest` renders derived from them.
+Exclusion is default-on for both profiles; ordinary evidence remains
+exportable.
+
+An excluded artifact's content is absent from the page, every bundle
+file, and every preview render. Its integrity metadata is retained in
+the export manifest (`--manifest PATH`, or `manifest.json` in an
+`--output DIR` bundle): artifact id, class, identity, SHA-256, byte
+length, media type, availability, and whether content or a preview was
+included. A referenced excluded artifact also carries an artifact-class
+gap so the page remains a valid, honest export.
+
+`--output DIR` writes `manifest.json`, `page.json`, the included
+artifacts, and their previews. `--include-class CLASS` is the only way
+to widen a sanitized/shared profile; the manifest records the widened
+class and the profile change, so an audit can see exactly what left.
+`evidence artifact --profile sanitized` refuses an excluded class.
+
 ## Encoding and limits
 
 Use UTF-8 JSON. Except where documented, fields are required. A nullable field

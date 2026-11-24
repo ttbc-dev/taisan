@@ -17,7 +17,9 @@ use workloop_evidence_protocol::{
     MAX_RECORDS, ProtocolError, ProtocolVersion, QueryCommand, QueryEnvelope, QuerySource,
     QueryStatus, SchemaVersion, SourceAvailability,
 };
+use workloop_store::artifact_class::ArtifactClass;
 use workloop_store::evidence;
+use workloop_store::export_profile::{ExportProfile, ExportedFile, bundle_files, export_profiled};
 use workloop_store::sqlite::SqliteStore;
 
 const EXIT_OK: i32 = 0;
@@ -150,14 +152,30 @@ fn export_error(e: &ExportError, cmd: QueryCommand) -> i32 {
     error(Some(cmd), e.code, e.message.clone())
 }
 
-/// `taisan evidence export [--after C | --cursor C] --limit N`.
-pub fn export(
-    store: &SqliteStore,
-    actor_label: &str,
-    after: Option<String>,
-    cursor: Option<String>,
-    limit: u16,
-) -> i32 {
+/// The `evidence export` request surface.
+pub struct ExportOptions {
+    pub after: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: u16,
+    pub profile: String,
+    pub include_classes: Vec<String>,
+    pub output: Option<PathBuf>,
+    pub manifest: Option<PathBuf>,
+}
+
+/// `taisan evidence export [--after C | --cursor C] --limit N
+/// [--profile NAME] [--include-class CLASS]... [--output DIR]
+/// [--manifest PATH]`.
+pub fn export(store: &SqliteStore, actor_label: &str, options: ExportOptions) -> i32 {
+    let ExportOptions {
+        after,
+        cursor,
+        limit,
+        profile: profile_name,
+        include_classes: includes,
+        output,
+        manifest: manifest_path,
+    } = options;
     let cmd = || command(CommandKind::EvidenceExport, actor_label);
     if after.is_some() && cursor.is_some() {
         return usage(
@@ -173,6 +191,23 @@ pub fn export(
             &format!("--limit must be within 1..={MAX_RECORDS}"),
         );
     }
+    let Some(mut profile) = ExportProfile::named(&profile_name) else {
+        return usage(
+            CommandKind::EvidenceExport,
+            actor_label,
+            &format!("unknown export profile '{profile_name}'"),
+        );
+    };
+    for include in &includes {
+        let Some(class) = ArtifactClass::parse(include) else {
+            return usage(
+                CommandKind::EvidenceExport,
+                actor_label,
+                &format!("unknown artifact class '{include}'"),
+            );
+        };
+        profile.widen(class);
+    }
     let request = ExportRequest {
         protocol_version: ProtocolVersion::V1,
         after,
@@ -185,15 +220,95 @@ pub fn export(
             return error(Some(cmd()), ErrorCode::Store, e.to_string());
         }
     };
-    match evidence::export_page(&request, &snapshot, now()) {
-        Ok(page) => emit(&envelope_for(
-            Some(cmd()),
-            Some(page.clone()),
-            Some(page.snapshot_seq),
-            None,
-        )),
-        Err(e) => export_error(&e, cmd()),
+    let profiled = match export_profiled(&request, &snapshot, now(), &profile) {
+        Ok(export) => export,
+        Err(e) => return export_error(&e, cmd()),
+    };
+    let page = profiled.page.clone();
+    if let Some(dir) = output {
+        let files = match bundle_files(&profiled) {
+            Ok(files) => files,
+            Err(e) => {
+                return error(
+                    Some(cmd()),
+                    ErrorCode::Store,
+                    format!("cannot render the export bundle: {e}"),
+                );
+            }
+        };
+        if let Err(e) = write_bundle(&dir, &files) {
+            return error(Some(cmd()), ErrorCode::Usage, e);
+        }
     }
+    if let Some(path) = manifest_path {
+        let bytes = match serde_json::to_vec_pretty(&profiled.manifest) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return error(
+                    Some(cmd()),
+                    ErrorCode::Store,
+                    format!("cannot render the export manifest: {e}"),
+                );
+            }
+        };
+        if let Err(e) = write_file(&path, &bytes) {
+            return error(Some(cmd()), ErrorCode::Usage, e);
+        }
+    }
+    emit(&envelope_for(
+        Some(cmd()),
+        Some(page.clone()),
+        Some(page.snapshot_seq),
+        None,
+    ))
+}
+
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create the export directory: {e}"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "the export path has no file name".to_string())?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    use std::io::Write;
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create_new(&tmp)
+            .map_err(|e| format!("cannot create a temporary export file: {e}"))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("cannot write the export file: {e}"))?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot publish the export file: {e}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_bundle(dir: &Path, files: &[ExportedFile]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create the export directory: {e}"))?;
+    // A manifest left by an earlier run must not survive a failed
+    // rewrite and claim the new bundle is complete. `bundle_files`
+    // emits the manifest last, so clearing it first makes the manifest
+    // the single completion marker.
+    let manifest = dir.join("manifest.json");
+    if manifest.is_file() {
+        std::fs::remove_file(&manifest)
+            .map_err(|e| format!("cannot clear the previous export manifest: {e}"))?;
+    }
+    for file in files {
+        write_file(&dir.join(&file.path), &file.bytes)?;
+    }
+    Ok(())
 }
 
 /// `taisan evidence artifact --id ID --sha256 DIGEST --output PATH`.
@@ -206,8 +321,16 @@ pub fn artifact(
     id: String,
     sha256_digest: String,
     output: PathBuf,
+    profile_name: &str,
 ) -> i32 {
     let cmd = || command(CommandKind::EvidenceArtifact, actor_label);
+    let Some(profile) = ExportProfile::named(profile_name) else {
+        return usage(
+            CommandKind::EvidenceArtifact,
+            actor_label,
+            &format!("unknown export profile '{profile_name}'"),
+        );
+    };
     if id.is_empty() {
         return usage(
             CommandKind::EvidenceArtifact,
@@ -255,6 +378,25 @@ pub fn artifact(
         }
         Err(e) => return error(Some(cmd()), ErrorCode::Store, e.to_string()),
     };
+    let registered = match store.artifact_class(&id) {
+        Ok(class) => class,
+        Err(e) => return error(Some(cmd()), ErrorCode::Store, e.to_string()),
+    };
+    let class = workloop_store::artifact_class::classify_artifact(
+        &id,
+        Some(payload.as_bytes()),
+        registered,
+    );
+    if profile.excludes(class) {
+        return error(
+            Some(cmd()),
+            ErrorCode::ArtifactUnavailable,
+            format!(
+                "artifact class {class} is excluded by the {} export profile",
+                profile.name()
+            ),
+        );
+    }
     let request = ArtifactRequest {
         protocol_version: ProtocolVersion::V1,
         artifact_id: id,

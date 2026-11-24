@@ -24,6 +24,7 @@ use workloop_core::domain::*;
 use workloop_core::store::{Effect, StoreError};
 use workloop_evidence_protocol::*;
 
+use crate::artifact_class::ArtifactClass;
 use crate::sqlite::{SqliteStore, internal, map_err};
 
 /// One `event_log` row: the recorded sequence, the row kind and the
@@ -50,6 +51,10 @@ pub struct HistorySnapshot {
     /// `effect` rows in sequence order (the only rows that project to
     /// evidence records).
     pub events: Vec<HistoryEvent>,
+    /// Explicit artifact classifications recorded beside the history.
+    /// An entry is authoritative for its artifact id; unclassified
+    /// artifacts fall back to id/payload classification.
+    pub artifact_classes: BTreeMap<String, ArtifactClass>,
 }
 
 fn artifact_id(seq: u64) -> String {
@@ -158,6 +163,22 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_err)?;
         drop(stmt);
+        let mut classes = tx
+            .prepare("SELECT key, value FROM store_meta WHERE key LIKE 'artifact_class:%'")
+            .map_err(internal)?;
+        let artifact_classes = classes
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let id = key.strip_prefix("artifact_class:")?.to_string();
+                let class = ArtifactClass::parse(&value)?;
+                Some((id, class))
+            })
+            .collect();
+        drop(classes);
         let store_epoch: String = tx
             .query_row(
                 "SELECT value FROM store_meta WHERE key='history_epoch'",
@@ -172,7 +193,50 @@ impl SqliteStore {
             watermark: watermark as u64,
             retained_from_seq: retained_from as u64,
             events,
+            artifact_classes,
         })
+    }
+
+    /// Record an explicit class for one artifact id. Classification is
+    /// metadata only: it never changes the retained bytes or their
+    /// digest. Re-registering the same id overwrites the earlier class.
+    pub fn set_artifact_class(
+        &self,
+        artifact_id: &str,
+        class: ArtifactClass,
+    ) -> Result<(), StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        guard
+            .execute(
+                "INSERT INTO store_meta (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("artifact_class:{artifact_id}"), class.as_str()],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Read one explicit artifact class, if registered.
+    pub fn artifact_class(&self, artifact_id: &str) -> Result<Option<ArtifactClass>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let value: Option<String> = guard
+            .query_row(
+                "SELECT value FROM store_meta WHERE key=?1",
+                params![format!("artifact_class:{artifact_id}")],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(value.as_deref().and_then(ArtifactClass::parse))
+    }
+
+    /// Every explicitly registered artifact class.
+    pub fn artifact_classes(&self) -> Result<BTreeMap<String, ArtifactClass>, StoreError> {
+        Ok(self.evidence_history()?.artifact_classes)
     }
 
     /// One retained `effect` row by sequence — the byte source behind
@@ -294,6 +358,22 @@ pub fn artifact_from_payload(
 pub fn artifact_seq(id: &str) -> Option<u64> {
     let seq = id.strip_prefix("event:")?.parse::<u64>().ok()?;
     (artifact_id(seq) == id).then_some(seq)
+}
+
+/// The class of one page descriptor under the snapshot's explicit
+/// classification, id convention, and payload class field.
+pub fn classify_descriptor(
+    snap: &HistorySnapshot,
+    descriptor: &ArtifactDescriptor,
+) -> ArtifactClass {
+    let payload = artifact_seq(&descriptor.artifact_id)
+        .and_then(|seq| snap.events.iter().find(|event| event.seq == seq))
+        .map(|event| event.payload.as_bytes());
+    crate::artifact_class::classify_artifact(
+        &descriptor.artifact_id,
+        payload,
+        snap.artifact_classes.get(&descriptor.artifact_id).copied(),
+    )
 }
 
 // ------------------------------------------------------------------
