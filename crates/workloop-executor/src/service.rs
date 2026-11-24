@@ -827,12 +827,29 @@ impl ExecutorService {
             }
         }
         let mut record = record;
+        // Start intent before spawn — durable, so a lost receipt or a
+        // failed post-spawn write can never leave the record `prepared`
+        // while a process may exist: `live_unknown` already holds the
+        // execution slot and fences every later start for this request
+        // (contract §4: persist start intent before returning started).
+        record.state = "live_unknown".into();
+        if let Err(e) = self.state.put_request(&record) {
+            return json!({
+                "status": "unknown",
+                "reason": "unavailable",
+                "diagnostic": format!("start intent could not be committed: {e}"),
+            });
+        }
         match self.runner.launch(&record) {
             LaunchOutcome::Started {
                 evidence_ref,
                 identity_digest,
             } => {
                 record.state = "started".into();
+                // Best effort — a lost write leaves `live_unknown`,
+                // which still holds the slot and fences a second
+                // start, while the durable process record replays
+                // this spawn's identity.
                 let _ = self.state.put_request(&record);
                 json!({
                     "status": "started",
@@ -842,7 +859,16 @@ impl ExecutorService {
             LaunchOutcome::KnownNotStarted { code, detail } => {
                 // Durable proof no process exists — the request stays
                 // prepared-but-fenced; the coordinator decides the next
-                // step with typed evidence.
+                // step with typed evidence. The start intent releases
+                // with the same durability the answer claims.
+                record.state = "prepared".into();
+                if let Err(e) = self.state.put_request(&record) {
+                    return json!({
+                        "status": "unknown",
+                        "reason": "unavailable",
+                        "diagnostic": format!("start intent could not be released: {e}"),
+                    });
+                }
                 json!({
                     "status": "known_not_started",
                     "reason": code,
@@ -850,8 +876,9 @@ impl ExecutorService {
                 })
             }
             LaunchOutcome::Unknown { code, detail } => {
-                record.state = "live_unknown".into();
-                let _ = self.state.put_request(&record);
+                // The committed `live_unknown` already records the
+                // unproven outcome — a second start can never spawn a
+                // replacement writer.
                 json!({
                     "status": "unknown",
                     "reason": code,

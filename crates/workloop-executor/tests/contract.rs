@@ -1339,6 +1339,177 @@ fn a_proven_stop_advances_the_record_and_frees_the_slot() {
     assert_eq!(fx.port.spawn_calls(), 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_start_intent_that_cannot_commit_spawns_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture("unwritable-binding");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+
+    // The durable start intent must commit before any spawn: with the
+    // request's binding directory unwritable the start answers
+    // `unknown`, spawns nothing, and leaves the record `prepared` so a
+    // repaired store retries cleanly.
+    let request_dir = fx.state.request_path(REQUEST_ID);
+    let saved = std::fs::metadata(&request_dir)
+        .expect("metadata")
+        .permissions();
+    let mut readonly = saved.clone();
+    readonly.set_mode(0o555);
+    std::fs::set_permissions(&request_dir, readonly).expect("readonly");
+    // A privileged runner ignores the mode bits — probe for that and
+    // skip rather than assert a guarantee this environment lacks.
+    if std::fs::write(request_dir.join(".perm-probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(request_dir.join(".perm-probe"));
+        std::fs::set_permissions(&request_dir, saved).expect("restore");
+        return;
+    }
+
+    let receipt = start(&fx.service, "op-start", deadline);
+
+    std::fs::set_permissions(&request_dir, saved).expect("restore");
+    assert_eq!(receipt.result["status"], "unknown");
+    assert_eq!(receipt.result["reason"], "unavailable");
+    assert_eq!(fx.port.spawn_calls(), 0);
+    assert_eq!(
+        fx.state
+            .request(REQUEST_ID)
+            .expect("request")
+            .expect("record")
+            .state,
+        "prepared"
+    );
+
+    let receipt = start(&fx.service, "op-start-retry", deadline);
+    assert_eq!(receipt.result["status"], "started");
+    assert_eq!(fx.port.spawn_calls(), 1);
+}
+
+#[test]
+fn an_unproven_start_keeps_the_execution_slot() {
+    let fx = fixture("unproven-slot");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    // Identity capture failed after a possible spawn — the outcome is
+    // unproven, so the writer reservation must hold for everyone.
+    fx.port.push_plan(SpawnPlan::Unknown {
+        reason: "identity capture failed".into(),
+    });
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "unknown");
+
+    // A different request's start is refused by the held slot — a
+    // second writer is never admitted while the first is unproven.
+    let config = launch_config(deadline);
+    let other_identity = ExecutorIdentity {
+        request_id: "e-9:inv:9".into(),
+        invocation_id: "inv-42".into(),
+        request_digest: sha256_hex("taisan.test.request", b"other"),
+        ..identity(&fx.service)
+    };
+    let prepare2 = ExecutorCommandV1::new(
+        other_identity.clone(),
+        "op-prepare-2",
+        OperationKind::Prepare,
+        prepare_payload(&config),
+    )
+    .expect("command");
+    let receipt = issue_command(&fx.service, &prepare2).expect("receipt");
+    assert_eq!(receipt.result["status"], "prepared");
+
+    fx.port.push_plan(SpawnPlan::Resident);
+    let start2 = ExecutorCommandV1::new(
+        other_identity,
+        "op-start-2",
+        OperationKind::Start,
+        json!({
+            "prepared_id": format!("prep-{}", &sha256_hex("taisan.test.request", b"other")[..16]),
+            "launch_config_digest": launch_config_digest_of(&config),
+        }),
+    )
+    .expect("command");
+    let receipt = issue_command(&fx.service, &start2).expect("receipt");
+    assert_eq!(receipt.result["status"], "refused");
+    assert_eq!(receipt.result["reason"], "limit_exceeded");
+    assert_eq!(fx.port.spawn_calls(), 1);
+}
+
+#[test]
+fn an_unverifiable_descendant_is_never_a_silent_stopped() {
+    let fx = fixture("unknown-descendant");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "started");
+    let leader = fx.port.spawned()[0].pid;
+
+    // A setsid-escaped descendant is merged into the recorded set by
+    // the stop-time snapshot; its liveness read is unverifiable, so
+    // nothing may report `stopped` while it is unaccounted for.
+    let child = fx.port.adopt_child(leader);
+    fx.port
+        .set_inspect_unknown(child, Some("liveness read unavailable".into()));
+
+    let receipt = issue(
+        &fx.service,
+        "op-stop",
+        OperationKind::RequestStop,
+        json!({}),
+    )
+    .expect("stop");
+    assert_eq!(receipt.result["status"], "unknown");
+    assert!(
+        fx.state.stop_proof(REQUEST_ID).expect("proof").is_none(),
+        "no stop proof exists while a recorded identity is unverifiable"
+    );
+    assert_eq!(
+        fx.state
+            .request(REQUEST_ID)
+            .expect("request")
+            .expect("record")
+            .state,
+        "started"
+    );
+}
+
+#[test]
+fn an_unverifiable_group_member_is_never_a_silent_stopped() {
+    let fx = fixture("unknown-group-member");
+    let deadline = now_seconds() + 3600;
+    let _ = prepare(&fx.service, "op-prepare", deadline);
+    fx.port.push_plan(SpawnPlan::Resident);
+    let receipt = start(&fx.service, "op-start", deadline);
+    assert_eq!(receipt.result["status"], "started");
+    let leader = fx.port.spawned()[0].pid;
+
+    // A group member adopted after the launch snapshot is only
+    // visible through group_members; an unverifiable read on it must
+    // keep the leader's own exit from releasing a stop proof.
+    let member = fx.port.adopt_child_in_group(leader, "group-writer");
+    fx.port
+        .set_inspect_unknown(member, Some("liveness read unavailable".into()));
+    fx.port.exit(leader, 0);
+
+    let receipt =
+        issue(&fx.service, "op-observe", OperationKind::Observe, json!({})).expect("observe");
+    assert_eq!(receipt.result["status"], "unknown");
+    assert!(
+        fx.state.stop_proof(REQUEST_ID).expect("proof").is_none(),
+        "no stop proof exists while a group member is unverifiable"
+    );
+    assert_eq!(
+        fx.state
+            .request(REQUEST_ID)
+            .expect("request")
+            .expect("record")
+            .state,
+        "started"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Worker-controlled out/ entries
 // ---------------------------------------------------------------------
@@ -1362,24 +1533,27 @@ fn a_symlinked_out_member_is_refused_not_followed() {
     std::fs::write(&sentinel, b"host-secret-bytes").expect("sentinel");
     symlink(&sentinel, out.join("report.json")).expect("symlink");
 
-    let receipt = issue(
+    let stop = issue(
         &fx.service,
         "op-stop",
         OperationKind::RequestStop,
         json!({}),
     )
     .expect("stop");
-    assert_eq!(receipt.result["status"], "stopped");
+    assert_eq!(stop.result["status"], "stopped");
 
     let receipt = issue(
         &fx.service,
         "op-collect",
         OperationKind::Collect,
-        json!({"stop_proof_receipt": receipt.receipt_digest}),
+        json!({"stop_proof_receipt": stop.receipt_digest}),
     )
     .expect("collect");
     assert_eq!(receipt.result["status"], "invalid");
     assert_eq!(receipt.result["reason"], "collection_invalid");
+    // The needle must be the sentinel's encoding under the same nopad
+    // base64 `data_b64` carries — a padded literal can never occur.
+    let sentinel_b64 = workloop_executor::auth::base64_nopad_encode(b"host-secret-bytes");
     assert!(
         !receipt
             .result
@@ -1387,7 +1561,34 @@ fn a_symlinked_out_member_is_refused_not_followed() {
             .and_then(|i| i.as_array())
             .is_some_and(|items| items.iter().any(|i| i["data_b64"]
                 .as_str()
-                .is_some_and(|b| b.contains("aG9zdC1zZWNyZXQ=")))),
+                .is_some_and(|b| b.contains(&sentinel_b64)))),
+        "the symlink target's bytes never enter the collection"
+    );
+
+    // The same symlink at a name outside the collected whitelist is
+    // never opened — a real `collected` receipt still must not carry
+    // the target's bytes.
+    std::fs::remove_file(out.join("report.json")).expect("remove symlink");
+    std::fs::write(
+        out.join("report.json"),
+        br#"{"format_version":"taisan.worker.report/2","status":"completed"}"#,
+    )
+    .expect("report");
+    symlink(&sentinel, out.join("unlisted")).expect("symlink");
+    let receipt = issue(
+        &fx.service,
+        "op-collect-2",
+        OperationKind::Collect,
+        json!({"stop_proof_receipt": stop.receipt_digest}),
+    )
+    .expect("collect");
+    assert_eq!(receipt.result["status"], "collected");
+    let items = receipt.result["items"].as_array().expect("items");
+    assert!(!items.is_empty());
+    assert!(
+        !items.iter().any(|i| i["data_b64"]
+            .as_str()
+            .is_some_and(|b| b.contains(&sentinel_b64))),
         "the symlink target's bytes never enter the collection"
     );
 }

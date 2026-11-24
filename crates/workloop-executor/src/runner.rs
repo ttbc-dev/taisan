@@ -1066,15 +1066,20 @@ impl Runner {
     /// Every identity the stop path must account for: the recorded
     /// descendant set plus every live member of the leader's group —
     /// orphans that kept the group stay covered. A failed group read
-    /// is an error, never an empty proof set.
+    /// is an error, never an empty proof set, and an inconclusive
+    /// liveness read is uncertainty, never a silent absence.
     fn remaining_identities(
         &self,
         process: &ProcessRecord,
     ) -> Result<Vec<ProcessIdentity>, String> {
         let mut alive: Vec<ProcessIdentity> = Vec::new();
         for identity in &process.descendants {
-            if let ProcessEvidence::Alive { identity } = self.port.inspect(identity) {
-                alive.push(identity);
+            match self.port.inspect(identity) {
+                ProcessEvidence::Alive { identity } => alive.push(identity),
+                ProcessEvidence::Stopped { .. } => {}
+                ProcessEvidence::Unknown { reason } => {
+                    return Err(format!("descendant inspection inconclusive: {reason}"));
+                }
             }
         }
         if let Some(pgid) = process.leader.pgid {
@@ -1084,10 +1089,18 @@ impl Runner {
                         if member.pid == process.leader.pid {
                             continue;
                         }
-                        if let ProcessEvidence::Alive { identity } = self.port.inspect(&member)
-                            && !alive.iter().any(|a| a.pid == identity.pid)
-                        {
-                            alive.push(identity);
+                        match self.port.inspect(&member) {
+                            ProcessEvidence::Alive { identity } => {
+                                if !alive.iter().any(|a| a.pid == identity.pid) {
+                                    alive.push(identity);
+                                }
+                            }
+                            ProcessEvidence::Stopped { .. } => {}
+                            ProcessEvidence::Unknown { reason } => {
+                                return Err(format!(
+                                    "group member inspection inconclusive: {reason}"
+                                ));
+                            }
                         }
                     }
                 }
