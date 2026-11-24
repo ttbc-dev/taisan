@@ -70,8 +70,9 @@ The acceptance record already models the pattern: its §1 records the
 exact `origin/main` HEAD (`git log -1`, full SHA, merge subject) and
 the merges the evidence depends on. The freeze extends it:
 
-1. After the v0.3 acceptance gates (#270/#271 evidence, #365
-   disposition) and the release-blocking fixes (#344, #364 per
+1. After the acceptance gate (#365, which consumes the #270 manual
+   and #271 scheduled evidence) and the release-blocking fixes
+   (#344, #364 per
    [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6) have
    landed, record the candidate:
 
@@ -127,7 +128,8 @@ version that has no candidate behind it.
 ## 5. Changelog generation policy
 
 The release notes ([release-notes-v0.3.md](release-notes-v0.3.md)) are
-the public-facing changelog for 0.3.0. Proposed policy:
+the public-facing changelog for the release (0.3.0 as proposed,
+pending the §6 decision). Proposed policy:
 
 - **Source of truth is the tracker plus merged history**: the notes
   are compiled from milestone-#8 issue titles/states and the merge

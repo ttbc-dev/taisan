@@ -1,18 +1,29 @@
-# Release notes — taisan 0.3.0 (draft)
+# Draft release notes — taisan (release version pending; 0.3.0 proposed)
 
 Status: **draft release materials, pending the frozen candidate**
-(issue #370). These notes are prepared from pre-freeze source
-materials only. The final candidate is not yet frozen — it stays
-blocked on the release-acceptance (#365), clean-install reproduction
-(#367), public-content audit (#368), and license (#369) gates — so no
-commit named here is the release candidate, no tag exists, and every
-TODO below is discharged at freeze. Claims marked **TODO** depend on
-evidence the freeze (#270/#271) must still produce; nothing else in
-this document asserts behavior that is not already verifiable in this
-repository or in the recorded owner-run evidence cited inline. Per
-`AGENTS.md`, private source repositories and the live-run target are
-described by role only; issue/PR numbers and revision SHAs are
-owner-verifiable evidence locators.
+(issue #370). The filename follows the v0.3 milestone unit, not a
+decided release version — the owner still chooses between `0.3.0`
+(proposed) and `1.0.0` per
+[release-versioning.md](release-versioning.md) §6, and the final
+title/version line is stamped at that decision. These notes are
+prepared from pre-freeze source materials only. The final candidate
+is not yet frozen — per #370's sequencing it stays blocked on the
+release-acceptance (#365), clean-install reproduction (#367),
+public-content audit (#368), and license (#369) gates — so no commit
+named here is the release candidate, no tag exists, and every TODO
+below is discharged at freeze. The acceptance gate (#365) itself
+consumes two upstream evidence issues: #270, whose manual-acceptance
+runs already produced the owner-side records summarized in
+[release-acceptance-v0.3.md](release-acceptance-v0.3.md) (with the
+residual gaps that record lists), and #271, whose scheduled-pilot
+evidence does not yet exist. Claims marked **TODO** depend either on
+that unproduced #271 evidence or on exact values held in owner-side
+records the freeze will copy over; nothing else in this document
+asserts behavior that is not already verifiable in this repository or
+in the recorded owner-run evidence cited inline. Per `AGENTS.md`,
+private source repositories and the live-run target are described by
+role only; issue/PR numbers and revision SHAs are owner-verifiable
+evidence locators.
 
 ## What this release is
 
