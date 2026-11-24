@@ -19,9 +19,13 @@ name, which the name-migration analysis necessarily cites.
 > added by the same pull request that adds this file, so it is a
 > proposed disposition pending owner ratification, not a prior owner
 > decision. Committing the file already places the leak index in
-> reachable history — under route A that history must be rewritten, and
-> under routes B and C the file stays out of the published tree;
-> keeping it tracked still requires the review above.
+> reachable history, and merging this pull request puts it on `main`'s
+> history — under route A that history must be rewritten, and under
+> routes B and C the file stays out of the published tree. Accepting
+> the merge is the owner's ratification of keeping this record tracked
+> under the second exception — it does not replace the disclosure
+> review required before publication (§5 item 6, §6), and this record
+> does not make that decision.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -68,7 +72,7 @@ Under the current publication route, everything below becomes public:
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
 the first permitted exception per `AGENTS.md`. It correctly self-declares
 that publication requires a disclosure review covering it and the git
-history (`docs/source-workflow-audit.md:23-33`).
+history (`docs/source-workflow-audit.md:25-35`).
 
 The scan confirms the real names of the ops, worker, selector, and infra
 repos, two ops-side tool names (a terminal multiplexer and a container
@@ -154,7 +158,7 @@ longer exist at HEAD:
 - **Local checkout paths of all four source repos**
   (`/Users/<owner>/.../<repo>` for ops, worker, selector, infra) were
   committed in `d756186` and remain in the audit file's embedded
-  manifest (`docs/source-workflow-audit.md:575-595`).
+  manifest (`docs/source-workflow-audit.md:577-597`).
 - **Owner-local absolute paths** in historical
   `fixtures/v0.3-doc/{profile/config.toml,store.config.json}` and
   `docs/evidence/u8.4.md` (sanitized at HEAD by `331eb5c`, `d27bc52`,
@@ -255,7 +259,10 @@ A clean HEAD certifies nothing here. Divergence table:
    the rename redirect discloses it on publication regardless.
 6. **Release blocker** — this document itself is a map of every
    remaining leak location and must be excluded from the published
-   tree or dispositioned with `source-workflow-audit.md` (§6).
+   tree or dispositioned with `source-workflow-audit.md` (§6); merging
+   this pull request places that map in `main`'s reachable history and
+   ratifies keeping it tracked, without replacing the disclosure
+   review required before publication.
 7. **Release blocker** — milestone #2's description and tracker
    bodies/comments preserve the private names even if the tree and
    history were fully cleaned; metadata cleanup is required under any
@@ -289,7 +296,8 @@ No action was taken. Three routes:
 
 Whichever route is chosen, `docs/source-workflow-audit.md` needs its own
 disclosure review first — it is designed to retain the names this audit
-flags.
+flags — and the same holds for this document, which maps where they
+survive.
 
 ## Appendix — verification commands
 
