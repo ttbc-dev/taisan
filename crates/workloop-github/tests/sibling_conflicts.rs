@@ -25,7 +25,7 @@ use workloop_core::observation::{
 use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_github::adapter::GitHubAdapter;
-use workloop_github::api::GitHubApi;
+use workloop_github::api::{GitHubApi, RemotePull};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
@@ -1674,4 +1674,114 @@ fn same_second_merge_checks_keep_the_scan_rotation_moving() {
         merge_check_facts(&store, &tail_work) > before,
         "the tail pair is re-serviced after a full same-second round ({extra} extra passes)"
     );
+}
+
+#[test]
+fn the_mergeability_verdict_never_guesses_a_conflict_from_the_tristate() {
+    let pull = |mergeable: Option<bool>, state: &str| RemotePull {
+        id: "pr-1".into(),
+        display_number: 1,
+        head_sha: "h".into(),
+        source_branch: "work/w-1".into(),
+        target_branch: "main".into(),
+        title: String::new(),
+        body: String::new(),
+        merged: false,
+        mergeable,
+        mergeable_state: state.into(),
+        base_sha: "b".into(),
+        conflicting_paths: vec![],
+    };
+    // An explicit conflict state is a conflict verdict either way.
+    for mergeable in [None, Some(false)] {
+        for state in ["dirty", "conflicting"] {
+            assert_eq!(
+                pull(mergeable, state).mergeability_state(),
+                MergeabilityState::Conflicting,
+                "{mergeable:?}/{state}"
+            );
+        }
+    }
+    // A negative tri-state without an explicit conflict state is not a
+    // conflict: `mergeable=false` also answers a required-review or
+    // check block, a stale head, and a draft.
+    for state in ["blocked", "behind", "draft", "unknown", ""] {
+        assert_eq!(
+            pull(Some(false), state).mergeability_state(),
+            MergeabilityState::Unknown,
+            "Some(false)/{state} is provisional, never a repair trigger"
+        );
+    }
+    // Positive answers stay mergeable.
+    assert_eq!(
+        pull(Some(true), "clean").mergeability_state(),
+        MergeabilityState::Mergeable
+    );
+    assert_eq!(
+        pull(None, "unstable").mergeability_state(),
+        MergeabilityState::Mergeable
+    );
+    // A contradictory negative tri-state under a positive state is
+    // Unknown, not a clean pass.
+    assert_eq!(
+        pull(Some(false), "clean").mergeability_state(),
+        MergeabilityState::Unknown
+    );
+}
+
+#[test]
+fn a_blocked_sibling_is_unknown_not_a_conflict_trigger() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    let merged_work = submit(&store, &config, "blocked-merged-work");
+    api.seed_branch(&repo(), "work/blocked-merged", "merged-head");
+    let merged_pull = api
+        .open_pull(&repo(), "work/blocked-merged", "main", "merged", "")
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    record_change(&store, &merged_work, &merged);
+    ingest_head(&store, &config, &merged_work, &merged, "merged-head");
+
+    let sibling_work = submit(&store, &config, "blocked-sibling-work");
+    api.seed_branch(&repo(), "work/blocked-sibling", "sibling-head");
+    let sibling_pull = api
+        .open_pull(&repo(), "work/blocked-sibling", "main", "sibling", "")
+        .unwrap();
+    let sibling = change(&sibling_pull.id);
+    record_change(&store, &sibling_work, &sibling);
+    ingest_head(&store, &config, &sibling_work, &sibling, "sibling-head");
+
+    api.seed_branch(&repo(), "main", "new-base");
+    api.set_pull_merged(&repo(), &merged_pull.id);
+    // Required reviews/checks block the sibling: `mergeable=false`
+    // with a non-conflict state is a provisional Unknown, never a
+    // repair trigger.
+    api.set_pull_mergeability(
+        &repo(),
+        &sibling_pull.id,
+        Some(false),
+        "blocked",
+        "new-base",
+        &[],
+    );
+
+    let mut adapter = GitHubAdapter::new(api);
+    let report = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.sibling_conflicts, 0);
+    assert_eq!(mergeability_facts(&store, &sibling_work), 1);
+    assert_eq!(fix_requests(&store, &sibling_work), 0);
+    let state = store
+        .transact(|tx| tx.observations_for_work(&sibling_work))
+        .unwrap()
+        .iter()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Mergeability { state, .. } => Some(*state),
+            _ => None,
+        })
+        .expect("a mergeability fact was recorded");
+    assert_eq!(state, MergeabilityState::Unknown);
 }

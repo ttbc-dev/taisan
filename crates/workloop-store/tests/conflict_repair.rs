@@ -462,6 +462,61 @@ fn an_automatic_time_exhausted_work_escalates_a_conflict_instead_of_failing_term
 }
 
 #[test]
+fn a_fix_budget_exhausted_work_escalates_a_conflict_with_its_paths() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-fix-bound");
+    finish(&store, &work_id);
+    // The Work-wide fix bound is already spent when the merge is
+    // observed: admission would hold the successor under a bare
+    // `fix_budget_exhausted`, but the recorded episode never
+    // re-triggers — the hold must carry the conflict cause and paths.
+    store
+        .transact(|tx| {
+            let mut usage = tx
+                .work_usage(&work_id)?
+                .unwrap_or_else(|| WorkUsage::new(&work_id));
+            usage.fix_invocations_used = config.policy.max_fix_invocations;
+            tx.apply(&Effect::UpdateWorkUsage { usage })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-fix-bound-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/a.rs"],
+        ),
+        NOW,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        0,
+        "no Fix request is admitted past the Work-wide fix bound"
+    );
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap();
+    let current = executions.last().expect("escalation execution");
+    assert_eq!(current.state, ExecutionState::Paused);
+    let reason = current.pause_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("fix invocation"), "{reason}");
+    assert!(reason.contains("src/a.rs"), "{reason}");
+}
+
+#[test]
 fn a_conflict_while_the_active_execution_is_paused_is_recorded_not_dropped() {
     let store = SqliteStore::in_memory(2).unwrap();
     let config = config();

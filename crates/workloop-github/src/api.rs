@@ -88,20 +88,23 @@ pub struct RemotePull {
 }
 
 impl RemotePull {
-    /// The normalized mergeability verdict. `Mergeable` requires a
-    /// positive host answer; an absent or unrecognized state is
-    /// `Unknown`, never a conflict and never a clean pass.
+    /// The normalized mergeability verdict. `Conflicting` requires an
+    /// explicit conflict report: the `mergeable` tri-state also goes
+    /// false for non-conflict blocks (required reviews, checks, a
+    /// stale head), so the state string — not the bare tri-state — is
+    /// what names a conflict. `Mergeable` requires a positive host
+    /// answer; an absent or unrecognized state is `Unknown`, never a
+    /// conflict and never a clean pass.
     pub fn mergeability_state(&self) -> MergeabilityState {
-        if self.mergeable == Some(false)
-            || matches!(self.mergeable_state.as_str(), "dirty" | "conflicting")
-        {
+        if matches!(self.mergeable_state.as_str(), "dirty" | "conflicting") {
             return MergeabilityState::Conflicting;
         }
-        if self.mergeable == Some(true)
-            || matches!(
-                self.mergeable_state.as_str(),
-                "clean" | "has_hooks" | "unstable"
-            )
+        if self.mergeable != Some(false)
+            && (self.mergeable == Some(true)
+                || matches!(
+                    self.mergeable_state.as_str(),
+                    "clean" | "has_hooks" | "unstable"
+                ))
         {
             return MergeabilityState::Mergeable;
         }

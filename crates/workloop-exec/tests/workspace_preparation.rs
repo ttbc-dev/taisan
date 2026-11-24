@@ -709,6 +709,55 @@ fn a_conflict_workspace_contains_the_bound_target_revision() {
 }
 
 #[test]
+fn a_reused_workspace_still_carries_the_bound_conflict_target() {
+    let root = tmp_root("fix-conflict-reuse");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // A non-conflict Fix prepared the managed workspace at the
+    // produced head; no conflict target was bound to that request.
+    let (w, e, rid, src, base, produced, aid) =
+        fix_fixture(&store, &root, "p-reuse-conflict", "m-1");
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(&store, &layout, &src, &w, &e, &aid, &produced, &base, "m-1");
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+    assert_clean_pinned(&ws, &format!("work/{}", w.0), &base, &produced);
+
+    // The post-merge target revision lands in the source only after
+    // the workspace was built — the handoff bare never carries it.
+    std::fs::write(src.join("target.txt"), "target").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "post-merge target"]);
+    let target = git(&src, &["rev-parse", "HEAD"]);
+
+    // The conflict repair binds the same pins under a fresh request
+    // digest, so preparation takes the reuse branch instead of a
+    // fresh build — the workspace must still resolve the target.
+    let rid2 = format!("{}:inv:2", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Fix);
+    let request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task(&aid, "m-1", &produced, &target),
+    );
+    insert_body(&store, &request);
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws, "the existing workspace is reused");
+    assert_eq!(
+        git(&ws, &["cat-file", "-t", &target]),
+        "commit",
+        "the reused workspace resolves the bound conflict target"
+    );
+}
+
+#[test]
 fn a_conflict_target_absent_from_the_source_refuses_before_a_workspace() {
     let root = tmp_root("fix-conflict-missing");
     let store = SqliteStore::in_memory(1).unwrap();

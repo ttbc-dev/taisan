@@ -3136,6 +3136,24 @@ fn trigger_conflict_repair(
             now_unix_seconds,
         );
     }
+    // The Work-wide Fix bound gates at this seam for the same reason:
+    // admission would hold the Execution with a bare
+    // `fix_budget_exhausted` that drops the conflict reason and paths,
+    // and the recorded episode never re-triggers. Escalate while the
+    // exact paths are still in hand.
+    if usage.fix_invocations_used >= work.policy.max_fix_invocations {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "Work-wide fix invocation bound reached; conflict repair requires an operator decision".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
     if let Some(active) = tx.active_execution(work_id)? {
         return match active.state {
             ExecutionState::Queued | ExecutionState::Waiting => {

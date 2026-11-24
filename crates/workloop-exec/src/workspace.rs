@@ -962,6 +962,38 @@ fn unique_staging(control: &Path, work_id: &str) -> PathBuf {
     ))
 }
 
+/// Import the bound conflict target into `repo_dir` from the
+/// configured source — the object exists only there, never in the
+/// handoff bare, and a remote-less workspace must resolve it to merge.
+/// The fresh-build and the workspace-reuse paths run the same import.
+fn import_conflict_target(
+    repo_dir: &Path,
+    source: &RepositorySource,
+    target: &str,
+) -> Result<(), PreparationError> {
+    let src = source.path.to_string_lossy().into_owned();
+    git(
+        repo_dir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            &src,
+            &format!("+{target}"),
+        ],
+    )
+    .map_err(|_| PreparationError::MissingBase {
+        detail: "conflict target could not be imported".into(),
+    })?;
+    if git(repo_dir, &["cat-file", "-t", target])? != "commit" {
+        return Err(PreparationError::MissingBase {
+            detail: "conflict target is not present in the source".into(),
+        });
+    }
+    Ok(())
+}
+
 fn build_staging(
     staging: &Path,
     base: &str,
@@ -1028,26 +1060,7 @@ fn build_staging(
                 // head; the handoff bare does not carry it, so import
                 // the raw object from the configured source repo the
                 // same way the Coding arm imports the base.
-                let src = source.path.to_string_lossy().into_owned();
-                git(
-                    staging,
-                    &[
-                        "fetch",
-                        "--no-tags",
-                        "--no-write-fetch-head",
-                        "--",
-                        &src,
-                        &format!("+{target}"),
-                    ],
-                )
-                .map_err(|_| PreparationError::MissingBase {
-                    detail: "conflict target could not be imported".into(),
-                })?;
-                if git(staging, &["cat-file", "-t", target])? != "commit" {
-                    return Err(PreparationError::MissingBase {
-                        detail: "conflict target is not present in the source".into(),
-                    });
-                }
+                import_conflict_target(staging, source, target)?;
             }
         }
     }
@@ -1218,6 +1231,14 @@ fn prepare_locked(
                         )
                     },
                 )?;
+            }
+            if let Some(target) = &gate.conflict_target {
+                // The reused tree pins the produced head but was built
+                // before this request bound the conflict target — the
+                // object the remote-less worker must merge. Import it
+                // from the configured source exactly as a fresh build
+                // does; the pin checks above already proved the tree.
+                import_conflict_target(&final_path, source, target)?;
             }
             return Ok(PreparedWorkspace {
                 path: final_path,
