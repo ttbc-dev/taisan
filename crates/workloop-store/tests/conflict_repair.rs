@@ -656,3 +656,211 @@ fn a_conflict_escalation_for_a_reclaimed_issue_records_the_hold() {
         "the live Work's claim is untouched by the escalation"
     );
 }
+
+#[test]
+fn a_conflict_while_paused_surfaces_attention_with_the_conflict_detail() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-paused-attention");
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("repair: earlier operator hold".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    // The earlier hold's attention was already acknowledged — the new
+    // conflict episode must still reach the operator with its own
+    // reason and paths.
+    let acknowledged = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found {
+        value: acknowledged,
+        ..
+    } = acknowledged
+    else {
+        panic!("attention projection found");
+    };
+    for view in &acknowledged {
+        assert_eq!(view.reason, "paused_judgment");
+        store
+            .transact(|tx| {
+                tx.apply(&Effect::InsertAttentionAck {
+                    work_id: work_id.clone(),
+                    attention_id: view.attention_id.clone(),
+                    actor_id: "operator".into(),
+                })
+            })
+            .unwrap();
+    }
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-paused-attention-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/c.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 2))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    let conflict = value
+        .iter()
+        .find(|view| view.reason == "conflict_unresolvable")
+        .unwrap_or_else(|| panic!("the escalated conflict surfaces on Attention: {value:?}"));
+    assert!(
+        conflict.evidence.iter().any(|e| e.contains("src/c.rs")),
+        "the surfaced attention carries the conflict paths: {conflict:?}"
+    );
+}
+
+#[test]
+fn a_moved_conflict_escalation_does_not_double_surface() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-moved-attention");
+    // An unbindable conflict on an active Execution escalates by moving
+    // it: the pause reason already carries the detail, so the decision
+    // ledger entry must not mint a second Attention for the same hold.
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: None,
+        target_revision: None,
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-moved-attention-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/e.rs"],
+        ),
+        NOW,
+    )
+    .unwrap();
+
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap();
+    let current = executions.last().expect("escalation execution");
+    assert_eq!(current.state, ExecutionState::Paused);
+    let reason = current.pause_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("src/e.rs"), "{reason}");
+
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert_eq!(value.len(), 1, "one surfaced hold: {value:?}");
+    assert_eq!(value[0].reason, "paused_judgment");
+}
+
+#[test]
+fn a_resolved_conflict_escalation_does_not_resurface_after_resume() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-resume-attention");
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("repair: earlier operator hold".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-resume-attention-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/c.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 2))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert!(
+        value.iter().any(|v| v.reason == "conflict_unresolvable"),
+        "the held escalation surfaces while the Execution stays paused: {value:?}"
+    );
+
+    // The operator resumes the paused Execution: the hold clears, the
+    // execution requeues. The recorded decision no longer describes an
+    // escalation that could not move the Execution, so it must not
+    // resurface as a ghost Attention for the rest of its lifetime.
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Queued;
+            next.pause_reason = None;
+            next.repair_prerequisites = vec![];
+            next.paused_since_unix_seconds = None;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 3))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert!(
+        value.iter().all(|v| v.reason != "conflict_unresolvable"),
+        "a resolved escalation does not resurface after resume: {value:?}"
+    );
+}

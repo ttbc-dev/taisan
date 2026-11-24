@@ -257,21 +257,26 @@ fn attention_views(
         execution_evidence + work_evidence
     );
     let mut out = Vec::new();
-    let mut push = |reason: &str, anchor: String, threshold: Option<u64>, action: &str| {
+    let outcome_evidence: Vec<String> = execution
+        .outcome
+        .as_ref()
+        .map(|o| {
+            o.evidence_refs
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut push = |reason: &str,
+                    anchor: String,
+                    threshold: Option<u64>,
+                    action: &str,
+                    evidence: Vec<String>| {
         out.push(AttentionView {
             attention_id: format!("att:{}:{}:{}:{}", work_id.0, reason, anchor, occurrence),
             work_id: work_id.clone(),
             reason: reason.to_string(),
-            evidence: execution
-                .outcome
-                .as_ref()
-                .map(|o| {
-                    o.evidence_refs
-                        .iter()
-                        .map(|r| r.id.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            evidence,
             investigation_threshold_seconds: threshold,
             next_actor: "operator".into(),
             next_action: action.to_string(),
@@ -288,6 +293,7 @@ fn attention_views(
                 anchor,
                 None,
                 "submit a judgment or resume",
+                outcome_evidence.clone(),
             );
         }
         ExecutionState::Failed => {
@@ -301,6 +307,7 @@ fn attention_views(
                 anchor,
                 None,
                 "decide retry or repair for the failed Execution",
+                outcome_evidence.clone(),
             );
         }
         ExecutionState::Uncertain => {
@@ -314,10 +321,41 @@ fn attention_views(
                     format!("{since}+{threshold}"),
                     Some(threshold),
                     "investigate the unresolved writer and reconcile process evidence",
+                    outcome_evidence.clone(),
                 );
             }
         }
         _ => {}
+    }
+    // A conflict escalation that could not move the Execution — a held
+    // pause or a stop already in flight — is recorded on the decision
+    // ledger instead of the pause reason; the ledger is the only place
+    // its reason and paths live, so Attention derives from it or the
+    // escalation never surfaces. The derivation only holds while the
+    // Execution remains in a state the escalation could not move:
+    // resume clears the hold and the recorded decision must not
+    // resurface as a ghost Attention for the rest of its lifetime. A
+    // decision whose detail is already the recorded pause reason is
+    // carried by `paused_judgment` and is not repeated.
+    if matches!(
+        execution.state,
+        ExecutionState::Paused | ExecutionState::Stopping
+    ) {
+        for decision in tx.recovery_decisions(work_id)? {
+            if decision.execution_id.as_ref() != Some(&execution.id)
+                || decision.classification != "conflict_unresolvable"
+                || execution.pause_reason.as_deref() == Some(decision.detail.as_str())
+            {
+                continue;
+            }
+            push(
+                "conflict_unresolvable",
+                decision.id.clone(),
+                None,
+                "decide the escalated conflict episode or dismiss it",
+                vec![decision.detail.clone()],
+            );
+        }
     }
     // No-progress: durable usage says nothing material happened inside the
     // policy window. Attention only — never proof of termination. A
@@ -342,6 +380,7 @@ fn attention_views(
                         ),
                         Some(work.policy.no_progress_seconds),
                         "investigate progress; the Work has produced no material evidence",
+                        outcome_evidence.clone(),
                     );
                 }
             }
@@ -352,6 +391,7 @@ fn attention_views(
                     format!("{}", usage.last_progress_unix_seconds.unwrap_or(0)),
                     None,
                     "inspect the progress evidence; it cannot be classified and proves neither progress nor termination",
+                    outcome_evidence.clone(),
                 );
             }
         }

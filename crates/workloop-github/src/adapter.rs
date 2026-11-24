@@ -1524,11 +1524,11 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     }
 
     /// The durable ordering record every issued merge-detection read
-    /// leaves behind: the pull-reported head when it is a usable
-    /// revision, else the last recorded head so the check still
-    /// advances the least-recently-checked key. A pair with no usable
-    /// head at all records nothing — there is no truthful head to
-    /// bind.
+    /// and every consumed merge-scan slot leaves behind: the
+    /// pull-reported or recorded head when it is a usable revision,
+    /// else the last recorded head so the pair still advances the
+    /// least-recently-serviced key. A pair with no usable head at all
+    /// records nothing — there is no truthful head to bind.
     #[allow(clippy::too_many_arguments)]
     fn record_merge_check(
         &mut self,
@@ -1583,11 +1583,12 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// [`MAX_CONFLICT_RECHECKS_PER_PASS`] shared across every merge.
     /// Detecting the merge itself is bounded the same way: a recorded
     /// change with no recorded merge pays at most
-    /// [`MAX_MERGE_CHECKS_PER_PASS`] pull reads per pass, least
-    /// recently checked first — a recorded `MergeCheck` is the durable
-    /// ordering key, so a deferred pair is reached on a later pass and
-    /// a terminal Work's never-merged change cannot re-read
-    /// unboundedly.
+    /// [`MAX_MERGE_CHECKS_PER_PASS`] pull reads per pass. Detection
+    /// reads and merge scans share one least-recently-serviced
+    /// ordering — a consumed detection read and a consumed scan slot
+    /// both leave a durable `MergeCheck` record — so a deferred pair
+    /// is reached on a later pass and a terminal Work's change cannot
+    /// re-read unboundedly or starve behind a constant leading set.
     /// The bound orders the candidates, not just their count: siblings
     /// with no recorded verdict for the current `(head, base)` pair and
     /// siblings whose recorded verdict is still provisional are checked
@@ -1615,15 +1616,19 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // budget: sustained merge activity cannot starve detection and
         // a backlog of recorded changes that never merged — terminal
         // Works included, whose change can still merge — cannot make
-        // remote reads unbounded. A recorded merge's scan goes first;
-        // the unrecorded pairs are checked least recently checked
-        // first, so the deferred tail is reached on a later pass.
+        // remote reads unbounded.
         let mut merge_checks = 0usize;
         struct MergeCandidate {
-            /// Sort key: a recorded merge first `(0, 0)`, then unmerged
-            /// pairs by least-recently-checked observed time
-            /// (`i64::MIN` when never checked).
-            key: (u8, i64),
+            /// Sort key: the pair's least-recently-serviced record
+            /// position, shared across recorded merges and unmerged
+            /// pairs — a consumed detection read and a consumed merge
+            /// scan both leave the same durable `MergeCheck` record, so
+            /// a deferred pair is reached on a later pass (`i64::MIN`
+            /// when never serviced). The observation index breaks the
+            /// same-second tie, so once every pair is serviced the
+            /// rotation keeps moving instead of freezing on a constant
+            /// leading set.
+            key: (i64, usize),
             work_id: WorkId,
             change: ChangeRequestRef,
             /// The recorded merge evidence `(head, base, target)` —
@@ -1638,17 +1643,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 continue;
             }
             let recorded = latest_recorded_merge(store, &work_id, &change)?;
-            // A never-checked pair always sorts before a checked one,
-            // so the deferred tail is reached within ceil(N/bound)
-            // passes. The key is second-granular: within one second the
-            // leading checked set is preferred until the key advances.
-            let key = match &recorded {
-                Some(_) => (0, 0),
-                None => (
-                    1,
-                    latest_recorded_merge_check(store, &work_id, &change)?.unwrap_or(i64::MIN),
-                ),
-            };
+            // A never-serviced pair always sorts before a serviced
+            // one, so the deferred tail is reached within ceil(N/bound)
+            // passes; a recorded merge's scan stamps the same ordering
+            // record a detection read does, so no constant leading set
+            // can consume the scan bound on every pass. The key's
+            // second element is the observation's durable append order,
+            // so pairs serviced within the same second still rotate.
+            let key =
+                latest_recorded_merge_check(store, &work_id, &change)?.unwrap_or((i64::MIN, 0));
             candidates.push(MergeCandidate {
                 key,
                 work_id,
@@ -1866,6 +1869,19 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             report.merge_rechecks += 1;
             merge_scans += 1;
             scanned_targets.insert(target_branch.clone(), base.clone());
+            // A consumed scan slot leaves the same durable ordering
+            // record a detection read does: the pair sorts behind the
+            // never-serviced remainder next pass instead of leading
+            // the queue again and starving the deferred tail.
+            self.record_merge_check(
+                store,
+                config,
+                &work_id,
+                &change,
+                Some(&head.object),
+                &check_epoch,
+                now,
+            )?;
             let siblings = match self
                 .client
                 .list_open_pulls_on_base(&change.repository, &target_branch)

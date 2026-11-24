@@ -16,7 +16,8 @@ use workloop_core::identity::{
     RoleBinding,
 };
 use workloop_core::mergeability::{
-    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MergeabilityState,
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
+    MergeabilityState,
 };
 use workloop_core::observation::{
     DeliveryId, DeliveryScope, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
@@ -1416,4 +1417,261 @@ fn the_fixture_bounds_merge_detection_the_same_way() {
             "change {index} was checked"
         );
     }
+}
+
+#[test]
+fn recorded_merges_on_distinct_targets_do_not_starve_the_tail() {
+    // More recorded merges on distinct target branches than the
+    // per-pass scan bound: the leading recorded set must not consume
+    // the bound every pass — detection reads and merge scans share
+    // one least-recently-serviced ordering, so the deferred tail is
+    // reached on a later pass.
+    let store = SqliteStore::in_memory(32).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    let targets = MAX_MERGE_RECHECKS_PER_PASS + 1;
+    let mut tail_sibling_work = None;
+    for index in 0..targets {
+        let target = format!("scan-target-{index}");
+        let merged_work = submit(&store, &config, &format!("scan-merged-{index}"));
+        let sibling_work = submit(&store, &config, &format!("scan-sibling-{index}"));
+        api.seed_branch(
+            &repo(),
+            &format!("work/scan-merged-{index}"),
+            &format!("scan-merged-head-{index}"),
+        );
+        api.seed_branch(
+            &repo(),
+            &format!("work/scan-sibling-{index}"),
+            &format!("scan-sibling-head-{index}"),
+        );
+        api.seed_branch(&repo(), &target, &format!("scan-base-{index}"));
+        let merged_pull = api
+            .open_pull(
+                &repo(),
+                &format!("work/scan-merged-{index}"),
+                &target,
+                &format!("scan-merged-{index}"),
+                "",
+            )
+            .unwrap();
+        let sibling_pull = api
+            .open_pull(
+                &repo(),
+                &format!("work/scan-sibling-{index}"),
+                &target,
+                &format!("scan-sibling-{index}"),
+                "",
+            )
+            .unwrap();
+        let merged = change(&merged_pull.id);
+        let sibling = change(&sibling_pull.id);
+        record_change(&store, &merged_work, &merged);
+        record_change(&store, &sibling_work, &sibling);
+        ingest_head(
+            &store,
+            &config,
+            &merged_work,
+            &merged,
+            &format!("scan-merged-head-{index}"),
+        );
+        ingest_head(
+            &store,
+            &config,
+            &sibling_work,
+            &sibling,
+            &format!("scan-sibling-head-{index}"),
+        );
+        api.set_pull_merged(&repo(), &merged_pull.id);
+        api.set_pull_mergeability(
+            &repo(),
+            &sibling_pull.id,
+            Some(false),
+            "dirty",
+            &format!("scan-base-{index}"),
+            &["src/shared.rs"],
+        );
+        // A merged Work is done: its recorded pair still seeds merge
+        // detection and the sibling scan, and settling it keeps the
+        // queued set under the pending-queue limit.
+        finish_execution(&store, &merged_work);
+        tail_sibling_work = Some(sibling_work);
+    }
+    let tail_sibling_work = tail_sibling_work.unwrap();
+
+    let mut adapter = GitHubAdapter::new(api);
+    // The detection bound services only the leading pairs in the
+    // first pass; the tail merge is not recorded yet and its target's
+    // sibling is unobserved.
+    let first = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    assert_eq!(mergeability_facts(&store, &tail_sibling_work), 0);
+
+    // Serviced pairs sort behind the never-serviced remainder, so the
+    // queue drains toward the tail: within a bounded number of passes
+    // the last merge's detection, scan, and sibling re-check all land
+    // instead of starving behind a constant leading set.
+    let mut passes = 1usize;
+    while mergeability_facts(&store, &tail_sibling_work) == 0 && passes < 4 {
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW + passes as i64, None, None)
+            .unwrap();
+        passes += 1;
+    }
+    assert_eq!(
+        mergeability_facts(&store, &tail_sibling_work),
+        1,
+        "the deferred tail's sibling is observed within {passes} passes"
+    );
+    assert_eq!(fix_requests(&store, &tail_sibling_work), 1);
+
+    // The recorded conflicted pair is settled for its episode: a
+    // steady pass mints no second trigger.
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 10, None, None)
+        .unwrap();
+    assert_eq!(fix_requests(&store, &tail_sibling_work), 1);
+}
+
+#[test]
+fn the_fixture_does_not_starve_deferred_merge_scans() {
+    // The fixture mirrors the production bound: more merged changes on
+    // distinct targets than the scan bound must still reach the
+    // deferred tail on a later pass.
+    let store = SqliteStore::in_memory(32).unwrap();
+    let config = config();
+    let mut fixture = FixtureGithub::new();
+    let targets = MAX_MERGE_RECHECKS_PER_PASS + 1;
+    let mut tail_sibling_work = None;
+    for index in 0..targets {
+        let target = format!("fixture-scan-target-{index}");
+        let merged_work = submit(&store, &config, &format!("fixture-scan-merged-{index}"));
+        let sibling_work = submit(&store, &config, &format!("fixture-scan-sibling-{index}"));
+        let merged = change(&format!("cr-fixture-scan-merged-{index}"));
+        let sibling = change(&format!("cr-fixture-scan-sibling-{index}"));
+        record_change(&store, &merged_work, &merged);
+        record_change(&store, &sibling_work, &sibling);
+        fixture.register_change(
+            &merged,
+            &format!("work/fscan-merged-{index}"),
+            &target,
+            &format!("fscan-merged-head-{index}"),
+            &actor(),
+        );
+        fixture.register_change(
+            &sibling,
+            &format!("work/fscan-sibling-{index}"),
+            &target,
+            &format!("fscan-sibling-head-{index}"),
+            &actor(),
+        );
+        fixture.set_branch(&repo(), &target, &format!("fscan-base-{index}"), &actor());
+        fixture.set_merged(&merged);
+        fixture.set_change_mergeability(
+            &sibling,
+            MergeabilityState::Conflicting,
+            &["src/shared.rs"],
+        );
+        finish_execution(&store, &merged_work);
+        tail_sibling_work = Some(sibling_work);
+    }
+    let tail_sibling_work = tail_sibling_work.unwrap();
+
+    let first = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.sibling_conflicts, MAX_MERGE_RECHECKS_PER_PASS);
+    assert_eq!(mergeability_facts(&store, &tail_sibling_work), 0);
+
+    let second = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(second.sibling_conflicts, 1);
+    assert_eq!(
+        mergeability_facts(&store, &tail_sibling_work),
+        1,
+        "the deferred target's sibling is reached on a later pass"
+    );
+    assert_eq!(fix_requests(&store, &tail_sibling_work), 1);
+}
+
+#[test]
+fn same_second_merge_checks_keep_the_scan_rotation_moving() {
+    // A fixed clock stamps every MergeCheck record in the same second:
+    // without a durable secondary key the stable order would freeze on
+    // the leading set after the first full round and the tail pair
+    // would never be re-scanned.
+    let store = SqliteStore::in_memory(32).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    let targets = MAX_MERGE_RECHECKS_PER_PASS + 1;
+    let mut merged_works = Vec::new();
+    for index in 0..targets {
+        let target = format!("rot-target-{index}");
+        let merged_work = submit(&store, &config, &format!("rot-merged-{index}"));
+        api.seed_branch(
+            &repo(),
+            &format!("work/rot-merged-{index}"),
+            &format!("rot-merged-head-{index}"),
+        );
+        api.seed_branch(&repo(), &target, &format!("rot-base-{index}"));
+        let merged_pull = api
+            .open_pull(
+                &repo(),
+                &format!("work/rot-merged-{index}"),
+                &target,
+                &format!("rot-merged-{index}"),
+                "",
+            )
+            .unwrap();
+        let merged = change(&merged_pull.id);
+        record_change(&store, &merged_work, &merged);
+        ingest_head(
+            &store,
+            &config,
+            &merged_work,
+            &merged,
+            &format!("rot-merged-head-{index}"),
+        );
+        api.set_pull_merged(&repo(), &merged_pull.id);
+        finish_execution(&store, &merged_work);
+        merged_works.push(merged_work);
+    }
+    let tail_work = merged_works.last().unwrap().clone();
+
+    let mut adapter = GitHubAdapter::new(api);
+    // Every stamp lands in the same second, so ordering turns on the
+    // durable record order alone.
+    let mut passes = 0usize;
+    while merged_works
+        .iter()
+        .any(|work| merge_check_facts(&store, work) == 0)
+        && passes < 8
+    {
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW, None, None)
+            .unwrap();
+        passes += 1;
+    }
+    assert!(
+        merged_works
+            .iter()
+            .all(|work| merge_check_facts(&store, work) >= 1),
+        "every recorded merge is serviced once within {passes} passes"
+    );
+
+    let before = merge_check_facts(&store, &tail_work);
+    let mut extra = 0usize;
+    while merge_check_facts(&store, &tail_work) == before && extra < 3 {
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW, None, None)
+            .unwrap();
+        extra += 1;
+    }
+    assert!(
+        merge_check_facts(&store, &tail_work) > before,
+        "the tail pair is re-serviced after a full same-second round ({extra} extra passes)"
+    );
 }
