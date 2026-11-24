@@ -5454,18 +5454,14 @@ fn artifact_fact(
 /// Whether the workspace repository tracks `path` — staged or
 /// committed. Outside a git repository nothing is tracked. A tracked
 /// path is repository content the shim's manifest write path refuses
-/// to rewrite; it is not stale manifest debris.
+/// to rewrite; it is not stale manifest debris. The probe runs
+/// through `workspace::git`'s scrubbed environment — the same
+/// hardened settings workspace preparation uses — so an ambient
+/// `GIT_DIR`, planted config, or transport override can never
+/// redirect the answer; `--error-unmatch` exits nonzero unless the
+/// workspace's own index tracks `path`.
 fn artifact_path_tracked(workspace: &Path, path: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["ls-files", "--error-unmatch", "--", path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::workspace::git(workspace, &["ls-files", "--error-unmatch", "--", path]).is_ok()
 }
 
 /// Recursively copy `source` into `dest` for the invariant check's
@@ -5963,6 +5959,111 @@ mod tests {
             artifact_fact(&dir, &required, &invocation, true),
             ArtifactFact::Missing
         ));
+    }
+
+    /// The tracked-path probe reads the workspace's own index under
+    /// the same scrubbed environment every supervisor-side git call
+    /// uses: ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`
+    /// pointing at a different repository can never redirect the
+    /// `ls-files` answer. The harness re-executes this one test in a
+    /// poisoned child process so the hostile variables never touch
+    /// this binary's other tests.
+    #[test]
+    fn artifact_path_probe_ignores_a_poisoned_ambient_git_env() {
+        const POISON: &str = "TAISAN_TEST_GIT_ENV_POISON";
+        if std::env::var_os(POISON).is_none() {
+            // Parent leg: a decoy repository whose index does NOT
+            // track `artifact.json` — an unhardened probe running
+            // under the redirected env would answer "untracked".
+            let decoy = std::env::temp_dir().join(format!(
+                "artifact-probe-decoy-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&decoy).unwrap();
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&decoy)
+                .args(["init", "-b", "main"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "artifact_path_probe_ignores_a_poisoned_ambient_git_env",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(POISON, "1")
+                .env("GIT_DIR", decoy.join(".git"))
+                .env("GIT_WORK_TREE", &decoy)
+                .env("GIT_INDEX_FILE", decoy.join(".git").join("decoy-index"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "the poisoned-env child run failed");
+            return;
+        }
+        // Child leg: the ambient env redirects git at the decoy. Setup
+        // commands drop the poison explicitly — the probe under test
+        // is the surface that must ignore it on its own.
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-probe-poisoned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("artifact.json"), "tracked repository content").unwrap();
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+
+        assert!(
+            artifact_path_tracked(&dir, "artifact.json"),
+            "the probe answers from the workspace index, not GIT_DIR"
+        );
+        let invocation = Invocation {
+            id: InvocationId("inv-poisoned".into()),
+            request_id: "req-poisoned".into(),
+            execution_id: ExecutionId("e-poisoned".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let required = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(
+            matches!(
+                artifact_fact(&dir, &required, &invocation, true),
+                ArtifactFact::Unfulfillable { .. }
+            ),
+            "a poisoned probe would read a recoverable `missing`, not the collision"
+        );
     }
 
     struct SnapshotFailure;

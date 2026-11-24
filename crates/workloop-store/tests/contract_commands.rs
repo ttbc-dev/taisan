@@ -3529,6 +3529,63 @@ fn sweep_reassessment_settles_a_waiting_execution_whose_evidence_completed_off_p
     );
 }
 
+/// Re-assessment settles in both directions: a Waiting Execution
+/// whose recorded evidence proves a terminal refusal — the producing
+/// writer's `Unfulfillable` artifact collision — fails on the sweep
+/// pass, and the report counts that failure in `terminal_failures`
+/// like any bound exhaustion instead of reporting an unchanged pass.
+#[test]
+fn sweep_reassessment_failure_counts_as_a_terminal_failure() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rf1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "rf1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation },
+            // The collision fact lands as a durable record with no
+            // ingest assessment — the same off-path shape the
+            // completion re-assessment exists for.
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("rf1-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "no ingest assessment ran — the sweep owns the settle"
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.terminal_failures, 1, "{report:?}");
+    assert_eq!(report.completed, 0, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(e.terminal_code.as_deref(), Some("artifact_unfulfillable"));
+}
+
 /// Re-assessment re-applies the same gates: a superseded-target
 /// Assessment and a missing Assessment never succeed, no matter how
 /// often the sweep runs — and the same Execution completes on a later

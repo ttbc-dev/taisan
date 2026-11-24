@@ -5087,16 +5087,18 @@ fn sweep_one(
     // runs only inside observation ingest. Re-running it here
     // re-derives every gate from the durable record under the same
     // transaction; it can never succeed on stale, partial, or
-    // superseded-target evidence. Protective bounds above keep
+    // superseded-target evidence. A re-assessment that instead
+    // settles the Execution terminal — the artifact-collision
+    // refusal, for one — is a terminal outcome the report counts,
+    // never an unchanged pass. Protective bounds above keep
     // precedence: an Execution this sweep stops or fails never
     // reaches re-assessment in the same pass.
     if execution.state == ExecutionState::Waiting {
         assess_completion(tx, &execution)?;
-        if tx
-            .execution(&execution.id)?
-            .is_some_and(|e| e.state == ExecutionState::Succeeded)
-        {
-            return Ok(SweepOutcome::Completed);
+        match tx.execution(&execution.id)?.map(|e| e.state) {
+            Some(ExecutionState::Succeeded) => return Ok(SweepOutcome::Completed),
+            Some(ExecutionState::Failed) => return Ok(SweepOutcome::TerminalFailure),
+            _ => {}
         }
     }
     clear_sweep_conflict(tx, execution_id)?;
