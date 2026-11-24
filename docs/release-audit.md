@@ -3,9 +3,11 @@
 Audit for issue #368, performed 2026-11-24 against `origin/main` at
 `d81f064`. Read-only: no files were modified, no history rewritten, no
 metadata changed, no visibility touched. Raw findings are cited by
-file:line and leak class; no secret value or private repository name is
-reproduced here — names are described by role using the legend in
-`AGENTS.md` / `docs/source-workflow-audit.md`.
+file:line and leak class; no secret value or private source-repository
+name is reproduced here — source names are described by role using the
+legend in `AGENTS.md` / `docs/source-workflow-audit.md`. The one name
+spelled out is `shimpeiws/agent-workloop`, this repository's own former
+name, which the name-migration analysis necessarily cites.
 
 > **Owner-controlled record — not publication-facing.** This document is
 > a map of every remaining leak location; publishing it would hand an
@@ -108,7 +110,7 @@ exception does not hold in practice:
   ids (`docs/evidence/u8.1-live-stage-c.md:52`); repository secret names
   (`S1_REVIEWER_*`, `docs/evidence/u8.1-live-stage-c.md:42`); the
   scenario git identity `s1-worker` hard-coded in
-  `scripts/s1/worker-shim.sh:33-34` and `worker-shim-nc.sh`.
+  `scripts/s1/worker-shim.sh:34-35` and `worker-shim-nc.sh:35-36`.
 - **Internal scripts**: `scripts/s1/mint-app-token.py` is an
   owner-operations tool reading owner-local App credentials; the
   `worker-shim*.sh` scripts clone the private smoke repo
