@@ -20,12 +20,15 @@ name, which the name-migration analysis necessarily cites.
 > proposed disposition pending owner ratification, not a prior owner
 > decision. Committing the file already places the leak index in
 > reachable history, and merging this pull request puts it on `main`'s
-> history — under route A that history must be rewritten, and under
-> routes B and C the file stays out of the published tree. Accepting
-> the merge is the owner's ratification of keeping this record tracked
-> under the second exception — it does not replace the disclosure
-> review required before publication (§5 item 6, §6), and this record
-> does not make that decision.
+> history. Per route (§6): under A the published tree must be scrubbed
+> or the file removed and its blob history rewritten; under B a
+> sanitized snapshot can exclude it; under C the squashed root commit
+> publishes the current tree as-is, so the file must be removed or
+> scrubbed before the squash — it does not stay out by itself.
+> Accepting the merge is the owner's ratification of keeping this
+> record tracked under the second exception — it does not replace the
+> disclosure review required before publication (§5 item 6, §6), and
+> this record does not make that decision.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -77,8 +80,14 @@ history (`docs/source-workflow-audit.md:25-35`).
 The scan confirms the real names of the ops, worker, selector, and infra
 repos, two ops-side tool names (a terminal multiplexer and a container
 manager), and `/Users/<owner>` checkout paths appear inside that file as
-permitted — **but the same identifiers also leak outside it**, so the
-exception does not hold in practice:
+permitted. At HEAD, of those identifiers only the **worker repo's name**
+also leaks outside it — embedded in the smoke repo's name and in
+`~/.config/<worker-repo>/` paths. The ops, selector, and infra repo
+names, both tool names, and real `/Users/<owner>` owner paths do not
+occur outside the sanctioned file in the current tree (`/Users/` hits
+only a test literal — see Appendix); each of them surfaces instead in
+history or tracker metadata (§2.2, §2.3) — but the further leak classes
+below mean the exception still does not hold in practice:
 
 - **`docs/extraction-coverage.json`** — the generated coverage manifest
   redacts source identifiers as `[source-symbol]`/`[source-file]`, but
@@ -148,11 +157,13 @@ longer exist at HEAD:
 - **Source repo names in historical blobs on `origin/main`**
   (`git log -S` hit counts): former name — 11 commits; smoke repo — 44;
   ops repo — 21; selector repo — 17; worker and infra repos — 12 + 12;
-  container-manager references — 4; `launchd` — 4; `/Users/<owner>`
+  container-manager references — 4; terminal-multiplexer references —
+  2; `launchd` — 4; `/Users/<owner>`
   paths — 8 commits / 18 occurrences. Blob-level occurrence counts on
   main history: smoke repo 311, ops repo 35, former name 33, selector
   repo 14, worker repo 12, infra repo 12, six ops-adjacent repo names
-  ~17, owner scratch-clone directory names (one embedding the former
+  ~17, container manager 35, terminal multiplexer 43, owner
+  scratch-clone directory names (one embedding the former
   name) 8.
 - **Pre-scrub document versions**: real source names appeared in
   `docs/source-workflow-audit.md` (introduced `4ff12a5`, `d756186`,
@@ -293,9 +304,11 @@ No action was taken. Three routes:
 - **A — Publish in place, keep history.** Requires first: fix the
   `extraction-coverage.json` redaction misses; decide `name-migration.md`
   and the smoke-repo surface (generalize or accept); then rewrite all
-  1,017 commits to strip names, paths, and author identities; edit
-  milestone #2; edit or delete ~100+ issues/PRs/comments. Highest effort
-  and still leaves residual exposure in unreachable-but-cached objects.
+  1,017 commits to strip names, paths, and author identities; remove or
+  scrub the owner-controlled audit records in the published tree (§5
+  item 6); edit milestone #2; edit or delete ~100+ issues/PRs/comments.
+  Highest effort and still leaves residual exposure in
+  unreachable-but-cached objects.
 - **B — Fresh publication.** Publish a new repository from a sanitized
   snapshot (squashed or grafted history with neutral author identity),
   keep this repository private as the ops record. Milestone #8's
@@ -304,9 +317,12 @@ No action was taken. Three routes:
   loses per-commit history.
 - **C — Publish in place, truncated history.** Force-push a single
   squashed root commit to `main`, delete or archive pushed branches,
-  scrub tracker metadata as in A. Keeps issue/PR numbers meaningful for
-  the audit record while removing blob history. Still requires the
-  metadata pass.
+  scrub tracker metadata as in A. The squashed root publishes the
+  current tree as-is, so the owner-controlled audit records
+  (`docs/source-workflow-audit.md` and this file) must be removed or
+  scrubbed before the squash — otherwise the leak index ships (§5
+  item 6). Keeps issue/PR numbers meaningful for the audit record
+  while removing blob history. Still requires the metadata pass.
 
 Whichever route is chosen, `docs/source-workflow-audit.md` needs its own
 disclosure review first — it is designed to retain the names this audit
