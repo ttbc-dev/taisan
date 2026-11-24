@@ -444,12 +444,34 @@ fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
         assert_eq!(fix_requests(&store, work), 0, "sibling {index} waits");
     }
 
-    // The second pass re-examines the already-recorded siblings, but
-    // those duplicates must not consume the per-pass bound: the
-    // deferred siblings are reached and triggered.
-    fixture
+    // A steady pass re-reads the leading siblings, and every verdict
+    // read consumes the per-pass bound — duplicates included — so the
+    // deferred tail keeps waiting while the leading set is unchanged.
+    let second = fixture
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
+    assert_eq!(second.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
+    for (index, work) in works
+        .iter()
+        .enumerate()
+        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
+    {
+        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
+    }
+
+    // The tail is reached once the leading set leaves the open list:
+    // the first repairs landed and those changes merged, so the next
+    // pass's bound reaches the deferred siblings.
+    for index in 0..MAX_CONFLICT_RECHECKS_PER_PASS {
+        fixture.set_merged(&change(&format!("cr-progress-sibling-{index}")));
+    }
+    let third = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    assert_eq!(
+        third.sibling_conflicts,
+        siblings - MAX_CONFLICT_RECHECKS_PER_PASS
+    );
     for (index, work) in works.iter().enumerate() {
         assert_eq!(
             mergeability_facts(&store, work),
@@ -462,6 +484,44 @@ fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
             "sibling {index} triggers exactly once"
         );
     }
+}
+
+#[test]
+fn the_pass_deadline_defers_the_merge_recheck() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "deadline-merged");
+    let sibling_work = submit(&store, &config, "deadline-sibling");
+    let merged = change("cr-deadline-merged");
+    let sibling = change("cr-deadline-sibling");
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &sibling_work, &sibling);
+
+    let mut fixture = FixtureGithub::new();
+    fixture.set_change_head(&merged, "merged-head", &actor());
+    fixture.set_change_head(&sibling, "sibling-head", &actor());
+    fixture.set_branch(&repo(), "main", "new-base", &actor());
+    fixture.set_merged(&merged);
+    fixture.set_change_mergeability(&sibling, MergeabilityState::Conflicting, &["src/shared.rs"]);
+
+    // The clock advances on every read: the pass begins inside the
+    // deadline and crosses it mid-pass, so the explicit bound must
+    // defer the merge re-check on the live clock — a comparison
+    // against the refresh-start timestamp could never fire.
+    let mut tick = 0i64;
+    let mut clock = move || {
+        tick += 1;
+        NOW + tick
+    };
+    let report = fixture
+        .refresh_sources(&store, &config, &mut clock, Some(NOW + 4), None)
+        .unwrap();
+    assert!(
+        report.deferred.iter().any(|d| d.starts_with("merge:")),
+        "the merge re-check defers once the live clock passes the deadline: {:?}",
+        report.deferred
+    );
+    assert_eq!(mergeability_facts(&store, &sibling_work), 0);
 }
 
 fn ingest_head(
@@ -641,9 +701,34 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
         assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
     }
 
-    adapter
+    // A steady pass re-reads the leading siblings, and every verdict
+    // read consumes the per-pass bound — duplicates included — so the
+    // deferred tail keeps waiting while the leading set is unchanged.
+    let second = adapter
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
+    assert_eq!(second.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
+    for (index, (work, _)) in works
+        .iter()
+        .enumerate()
+        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
+    {
+        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
+    }
+
+    // The tail is reached once the leading set leaves the open list:
+    // the first repairs landed and those pulls merged, so the next
+    // pass's bound reaches the deferred siblings.
+    for (_, pull_id) in works.iter().take(MAX_CONFLICT_RECHECKS_PER_PASS) {
+        adapter.client_mut().set_pull_merged(&repo(), pull_id);
+    }
+    let third = adapter
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    assert_eq!(
+        third.sibling_conflicts,
+        works.len() - MAX_CONFLICT_RECHECKS_PER_PASS
+    );
     for (index, (work, _)) in works.iter().enumerate() {
         assert_eq!(
             mergeability_facts(&store, work),
@@ -656,6 +741,77 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
             "sibling {index} triggers exactly once"
         );
     }
+}
+
+#[test]
+fn the_pass_deadline_defers_sibling_rechecks_mid_scan() {
+    use workloop_github::api::GitHubApi;
+
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "deadline-adapter-merged");
+    let sibling_work = submit(&store, &config, "deadline-adapter-sibling");
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "work/deadline-merged", "merged-head");
+    api.seed_branch(&repo(), "work/deadline-sibling", "sibling-head");
+    api.seed_branch(&repo(), "main", "old-base");
+    let merged_pull = api
+        .open_pull(
+            &repo(),
+            "work/deadline-merged",
+            "main",
+            "deadline-merged",
+            "",
+        )
+        .unwrap();
+    let sibling_pull = api
+        .open_pull(
+            &repo(),
+            "work/deadline-sibling",
+            "main",
+            "deadline-sibling",
+            "",
+        )
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    let sibling = change(&sibling_pull.id);
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &sibling_work, &sibling);
+    ingest_head(&store, &config, &merged_work, &merged, "merged-head");
+    ingest_head(&store, &config, &sibling_work, &sibling, "sibling-head");
+    api.seed_branch(&repo(), "main", "new-base");
+    api.set_pull_merged(&repo(), &merged_pull.id);
+    api.set_pull_mergeability(
+        &repo(),
+        &sibling_pull.id,
+        Some(false),
+        "dirty",
+        "new-base",
+        &["src/shared.rs"],
+    );
+
+    let mut adapter = GitHubAdapter::new(api);
+    // The clock advances on every read: the merge scan itself starts
+    // inside the deadline, but the sibling re-check's live-clock
+    // read lands past it and must defer — a comparison against the
+    // refresh-start timestamp could never fire.
+    let mut tick = 0i64;
+    let mut clock = move || {
+        tick += 1;
+        NOW + tick
+    };
+    let report = adapter
+        .refresh_sources(&store, &config, &mut clock, Some(NOW + 5), None)
+        .unwrap();
+    assert!(
+        report
+            .deferred
+            .iter()
+            .any(|d| d.starts_with("merge-siblings:")),
+        "the sibling re-check defers once the live clock passes the deadline: {:?}",
+        report.deferred
+    );
+    assert_eq!(mergeability_facts(&store, &sibling_work), 0);
 }
 
 #[test]

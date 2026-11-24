@@ -263,6 +263,12 @@ type HostFact =
 	| { kind: "branch"; repository: RepositoryRef; branch: string;
 	    state: { kind: "absent" } | { kind: "at"; revision: CommitRevision } }
 	| { kind: "change_head"; change_request: ChangeRequestRef; head: CommitRevision }
+	| { kind: "change_merged"; change_request: ChangeRequestRef; head: CommitRevision;
+	    base: CommitRevision; target_branch: string }
+	| { kind: "mergeability"; change_request: ChangeRequestRef; head: CommitRevision;
+	    base?: CommitRevision; target_revision?: CommitRevision;
+	    state: "mergeable" | "conflicting" | "unknown";
+	    conflicting_paths?: string[]; reason?: string }
 	| { kind: "check"; change_request: ChangeRequestRef; head: CommitRevision;
 	    check_id: string; producer: HostActorRef; conclusion: CheckResult }
 	| { kind: "review"; change_request: ChangeRequestRef; head: CommitRevision;

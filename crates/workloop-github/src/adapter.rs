@@ -1509,7 +1509,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 report.unchanged += 1;
             }
         }
-        self.recheck_after_recorded_merges(store, config, scope, deadline, now, &mut report)?;
+        self.recheck_after_recorded_merges(
+            store,
+            config,
+            scope,
+            clock,
+            deadline,
+            now,
+            &mut report,
+        )?;
         Ok(report)
     }
 
@@ -1523,16 +1531,17 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// The remainder waits for the next pass. Every observation carries
     /// the exact `(head, new base)` pair, and its stable delivery
     /// identity makes a steady conflicted pair one trigger.
+    #[allow(clippy::too_many_arguments)]
     fn recheck_after_recorded_merges(
         &mut self,
         store: &impl Store,
         config: &WorkloopConfig,
         scope: Option<&WorkId>,
+        clock: &mut dyn FnMut() -> i64,
         deadline: Option<i64>,
         now: i64,
         report: &mut SourceRefreshReport,
     ) -> Result<(), StoreError> {
-        let scan_deadline = deadline;
         let mut scanned_targets: HashMap<String, CommitRevision> = HashMap::new();
         let mut merge_scans = 0usize;
         // The sibling budget is pass-wide, not per merge: accumulated
@@ -1613,7 +1622,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 }
                 continue;
             }
-            if scan_deadline.is_some_and(|d| now >= d) {
+            if deadline.is_some_and(|d| clock() >= d) {
                 report.deferred.push(format!("merge:{change}"));
                 continue;
             }
@@ -1689,7 +1698,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     report.deferred.push(format!("merge-siblings:{change}"));
                     break;
                 }
-                if scan_deadline.is_some_and(|d| now >= d) {
+                if deadline.is_some_and(|d| clock() >= d) {
                     report.deferred.push(format!("merge-siblings:{change}"));
                     break;
                 }
@@ -1734,12 +1743,15 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         reason: Some(format!("mergeability read failed: {}", api_reason(&error))),
                     },
                 };
+                // Every remote verdict read consumes the pass-wide
+                // sibling bound — a re-read of an already-recorded pair
+                // is still a re-check.
+                rechecked += 1;
                 let head_object = if verdict.head_sha.is_empty() {
                     sibling.head_sha.clone()
                 } else {
                     verdict.head_sha.clone()
                 };
-                let records_before = self.poll_records;
                 let sibling_head =
                     CommitRevision::new(sibling_change.repository.clone(), head_object.clone());
                 let sibling_head = match sibling_head {
@@ -1782,9 +1794,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                             now,
                         )?;
                         report.merge_rechecks += 1;
-                        if self.poll_records != records_before {
-                            rechecked += 1;
-                        }
                         continue;
                     }
                 };
@@ -1828,14 +1837,6 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 report.merge_rechecks += 1;
                 if state == MergeabilityState::Conflicting {
                     report.sibling_conflicts += 1;
-                }
-                // Only a newly recorded observation consumes the per-pass
-                // bound. A duplicate is a re-read of a pair this scan has
-                // already minted a fact for; charging the bound for it
-                // would let the same leading siblings starve the deferred
-                // remainder on every pass.
-                if self.poll_records != records_before {
-                    rechecked += 1;
                 }
             }
         }
@@ -3526,11 +3527,6 @@ fn recorded_source_revision(
     })
 }
 
-/// The Work (and its latest Execution) a change request belongs to in
-/// this installation: recorded intents first — the change ids they
-/// carry or the `ChangeOpened` receipts they produced — then an
-/// already-attributed `change_head` Observation. An unattributable
-/// change is never read into this installation's facts.
 /// Render a transport failure without exposing credential material.
 fn api_reason(error: &ApiError) -> &str {
     match error {
@@ -3538,6 +3534,11 @@ fn api_reason(error: &ApiError) -> &str {
     }
 }
 
+/// The Work (and its latest Execution) a change request belongs to in
+/// this installation: recorded intents first — the change ids they
+/// carry or the `ChangeOpened` receipts they produced — then an
+/// already-attributed `change_head` Observation. An unattributable
+/// change is never read into this installation's facts.
 fn attribute_change(
     store: &impl Store,
     change: &ChangeRequestRef,

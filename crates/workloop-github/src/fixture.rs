@@ -2306,7 +2306,7 @@ impl FixtureGithub {
                 continue;
             }
             if let Some(d) = deadline
-                && now >= d
+                && clock() >= d
             {
                 report.deferred.push(format!("merge:{change_id}"));
                 continue;
@@ -2373,12 +2373,17 @@ impl FixtureGithub {
                     break;
                 }
                 if let Some(d) = deadline
-                    && now >= d
+                    && clock() >= d
                 {
                     report.deferred.push(format!("merge-siblings:{change_id}"));
                     break;
                 }
                 if sibling_id == change_id {
+                    continue;
+                }
+                // A merged sibling is no longer open: like the remote's
+                // open-change list, it drops out before any verdict read.
+                if self.merged_changes.contains(sibling_id) {
                     continue;
                 }
                 let sibling_target = self
@@ -2392,12 +2397,13 @@ impl FixtureGithub {
                 let Some((state, paths)) = self.change_mergeability.get(sibling_id) else {
                     continue;
                 };
+                // Every verdict read consumes the pass-wide sibling
+                // bound — a re-read of an already-recorded pair is
+                // still a re-check.
+                rechecked += 1;
                 let Some(sibling_head_object) = self.changes.get(sibling_id).cloned() else {
                     continue;
                 };
-                if self.merged_changes.contains(sibling_id) {
-                    continue;
-                }
                 let Ok(sibling_head) =
                     CommitRevision::new(sibling.repository.clone(), sibling_head_object)
                 else {
@@ -2414,7 +2420,7 @@ impl FixtureGithub {
                     "fixture-mergeability-v1",
                     format!("{state:?}:{paths:?}").as_bytes(),
                 );
-                let receipt = self.emit(
+                self.emit(
                     store,
                     config,
                     Observation {
@@ -2449,14 +2455,6 @@ impl FixtureGithub {
                 report.merge_rechecks += 1;
                 if *state == MergeabilityState::Conflicting {
                     report.sibling_conflicts += 1;
-                }
-                // Only a newly recorded observation consumes the per-pass
-                // bound. A duplicate is a re-read of a pair this scan has
-                // already minted a fact for; charging the bound for it
-                // would let the same leading siblings starve the deferred
-                // remainder on every pass.
-                if matches!(receipt, IngestReceipt::Recorded) {
-                    rechecked += 1;
                 }
             }
         }
