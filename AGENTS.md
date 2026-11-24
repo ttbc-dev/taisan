@@ -16,11 +16,13 @@
   publication of the repository requires a disclosure review covering
   this document and the git history that retains the removed identifiers.
 - `docs/release-audit.md` is a second owner-controlled exception under
-  the same terms: it maps every remaining leak location verbatim, so it
-  is itself a disclosure surface — publication requires the same
-  disclosure review covering this document and the history that retains
-  it. If it is ever to be published, the leak map must first be scrubbed
-  or the file removed from the published tree and its history.
+  the same terms: it maps every remaining leak location by file:line
+  or commit reference, classified by leak class, while withholding
+  private source names behind role placeholders, so it is itself a
+  disclosure surface — publication requires the same disclosure review
+  covering this document and the history that retains it. If it is
+  ever to be published, the leak map must first be scrubbed or the
+  file removed from the published tree and its history.
 
 ## Pull requests
 

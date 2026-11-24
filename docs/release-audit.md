@@ -91,7 +91,11 @@ exception does not hold in practice:
     discloses the ops-side messaging system (line 5372),
   - a private scheduled GitHub Actions workflow name describing a
     nightly runtime job (lines ~3035, ~5386, ~6695, ~26558 —
-    owner-specific ops context).
+    owner-specific ops context),
+  - owner checkout-root paths inside a rationale string: `~/src`,
+    `~/src/[source-file]om/<o>/<r>`, and the derived `~/src/<r>` /
+    `~/<r>` candidate patterns — the owner's `~/src` checkout layout
+    left unredacted (line 6636).
 - **`docs/name-migration.md:15,29`** — records this repository's own
   former name verbatim (`shimpeiws/agent-workloop` →
   `shimpeiws/taisan`). This is the repository's self-rename, not a
@@ -119,8 +123,10 @@ exception does not hold in practice:
   `docs/evidence/u8.2.md:48`, `docs/evidence/u8.3.md:59`, and
   `docs/s1/live-runbook.md:159` — owner-specific operational context;
   the extracted dir names are all `s1-*` scenario names embedding no
-  source names (see Appendix), and they round out the home-relative
-  `~/` owner-path surface at HEAD.
+  source names (see Appendix); together with the `~/src` checkout-root
+  strings in `docs/extraction-coverage.json:6636` (counted above as a
+  redaction miss), they round out the home-relative `~/` owner-path
+  surface at HEAD.
 - **Identifying runtime configuration**: the dedicated reviewer GitHub
   App's slug, app id, installation id, and bot user id
   (`docs/evidence/u8.1-live-stage-c.md:37-42`,
@@ -188,19 +194,26 @@ longer exist at HEAD:
   repo 9, former name 6, smoke repo 5, container-manager references 1,
   reviewer-App slug 1, provider-specific ops context (a private model
   provider name and a public agent runtime) 5, the infra repo's CLI
-  name 1; owner-home paths (`~/.config/…` and
-  an ops-state directory) in 7 issues. Examples: infra-repo and
+  name 1; owner-home paths in 7 issues — `~/.config/…`, an ops-state
+  directory, a `~/.cargo` toolchain dir, and a `~/.taisan-v02-live`
+  live-run state dir. Examples: infra-repo and
   ops-repo issue links, remote-run evidence-bundle paths under the
   ops-state directory, container names prefixed with the worker-repo
   abbreviation.
 - **Issue comments** (search index `in:comments`): worker repo name 40
-  issues, selector repo name 38, former name 28, ops repo name 3.
+  issues, selector repo name 38, former name 28, ops repo name 3;
+  owner-home paths — `~/.config/…`, the ops-state directory, and
+  `~/.taisan-v02-live` run dirs.
 - **PR bodies** (163 PRs): worker repo name 44, selector repo name 39
   (including `<selector-repo> verify` provenance lines and
   `<!-- <selector-repo>-propose {…} -->` machine markers), former name
-  4, ops repo name 4, owner-home paths in 3.
+  4, ops repo name 4, owner-home paths in 4 — `~/.config/…`, the
+  ops-state directory, and generic tool dirs (`~/.local`, `~/.agents`).
 - **PR review comments**: 383 matching lines — selector repo name 327
-  occurrences, worker repo name 6, smoke repo 4.
+  occurrences, worker repo name 6, smoke repo 4; owner-home paths —
+  `~/.config/…` and a quoted `~/s1-u84` store path. (Review-bot finding
+  comments also echo `~/src` / `~/s1-*` strings quoted from this audit;
+  machine-generated metadata, not a further leak class.)
 - **Pushed branch names**: ~73 `origin/*` refs; two carry
   provider/selector hints (`aw-opencode-config`,
   `selector-issue-15-…`). No pushed branch carries a source repo name.
@@ -235,7 +248,7 @@ A clean HEAD certifies nothing here. Divergence table:
 | Four source repo names | sanctioned audit file (canonical); worker-repo name also leaks via `~/.config/<worker-repo>/` paths and inside the smoke-repo name | pre-scrub blobs of 5+ docs; 40+ commits | milestone #2; ~50 issues/PRs |
 | Smoke repo name | 29 files / 161 hits | 311 occurrences | 5 issues, review comments |
 | Former repo name (self-rename — not a source repo) | `name-migration.md` | 33 occurrences | 28 issues (comments), 4 PRs |
-| Owner-local paths | no `/Users/<owner>` absolute paths outside the sanctioned audit file (tree scan: only a test literal, see Appendix); `~/`-relative owner paths do occur — the worker-repo config path (counted above) and `~/s1-*` run dirs in `docs/evidence/` and `docs/s1/` | 18 `/Users/<owner>` occurrences | `~/.config` and an ops-state dir in issues/PRs |
+| Owner-local paths | no `/Users/<owner>` absolute paths outside the sanctioned audit file (tree scan: only a test literal, see Appendix); `~/`-relative owner paths do occur — the worker-repo config path (counted above), `~/s1-*` run dirs in `docs/evidence/` and `docs/s1/`, and `~/src` checkout-root strings in `docs/extraction-coverage.json` | 18 `/Users/<owner>` occurrences | `~/.config`, ops-state dir, `~/` tool dirs, and `~/` run dirs in issues/PRs/comments |
 | Ops-adjacent repo names | `extraction-coverage.json` only | +1 file | none found |
 | Author identities | n/a | **all 1,017 commits** | n/a |
 | Real secrets | none | none | none found |
@@ -252,7 +265,8 @@ A clean HEAD certifies nothing here. Divergence table:
 3. **Release blocker** — `scripts/s1/mint-app-token.py` depends on an
    owner-local config path (`~/.config/<worker-repo>/…`).
 4. **Release blocker** — `docs/extraction-coverage.json` retains
-   partially-redacted and unredacted private names (§2.1).
+   partially-redacted and unredacted private names and owner-local
+   checkout paths (§2.1).
 5. **Owner judgment call, not a release blocker** —
    `docs/name-migration.md` names the former repository (§2.1): the
    repository's own self-rename rather than a source-name leak, and
@@ -309,7 +323,14 @@ survive.
   `crates/workloop-exec/src/containment.rs:1432` (a pattern string, not
   an owner path); `rg -o '~/s1-[A-Za-z0-9._-]+'` extracts only `s1-*`
   scenario names (`s1-stagec-*`, `s1-u82`, `s1-u83`, `s1-success-*`),
-  embedding no source names.
+  embedding no source names; a wider `~/`-relative scan additionally
+  surfaces the `~/src` checkout-root strings in
+  `docs/extraction-coverage.json:6636`, listed as a redaction miss in
+  §2.1. Tracker-side: `gh api repos/shimpeiws/taisan/{issues,pulls,
+  issues/comments,pulls/comments} --paginate` piped to
+  `rg -o '~/[A-Za-z0-9._-]+'` yields `~/.config`, the ops-state dir,
+  `~/.local`, `~/.cargo`, `~/.agents`, `~/.taisan-v02-live`, a quoted
+  `~/s1-u84` path, and review-bot `~/src`/`~/s1-*` echoes (§2.3).
 - History scans: `git log origin/main -S <term> --oneline`,
   `git log -p origin/main | rg -o 'shimpeiws/[A-Za-z0-9._-]+' | sort |
   uniq -c`, `git log --format='%an <%ae>' | sort | uniq -c`.
