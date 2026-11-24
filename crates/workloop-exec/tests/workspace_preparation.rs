@@ -617,6 +617,135 @@ fn fix_fixture_aid(
     (w, e, rid, src, base, produced, aid.into())
 }
 
+fn conflict_fix_task(artifact_id: &str, manifest: &str, produced: &str, target: &str) -> TaskBody {
+    TaskBody::Fix {
+        goal: GoalRef {
+            body_ref: "goal-1".into(),
+            media_type: "text/markdown".into(),
+            bytes: 4,
+            digest: "0".repeat(64),
+        },
+        issues: vec![],
+        predecessor: ArtifactRef {
+            artifact_id: artifact_id.into(),
+            manifest_digest: manifest.into(),
+            produced: produced.into(),
+        },
+        origin: Box::new(FixOrigin::Conflict {
+            change: "cr-1".into(),
+            source_revision: produced.into(),
+            target_revision: target.into(),
+            paths: vec![],
+        }),
+        constraints: vec![],
+        verification_argv: vec![],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conflict_fix_fixture(
+    store: &SqliteStore,
+    root: &Path,
+    key: &str,
+    manifest: &str,
+    aid: &str,
+) -> (
+    WorkId,
+    ExecutionId,
+    String,
+    PathBuf,
+    String,
+    String,
+    String,
+    String,
+) {
+    let (w, e, _rid0) = admit(store, key);
+    let (src, base, _n) = git_source(root);
+    std::fs::write(src.join("fix.txt"), "fix").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "produced"]);
+    let produced = git(&src, &["rev-parse", "HEAD"]);
+    // The post-merge target revision the conflict binds: an object the
+    // source repo carries but the handoff bare never stages on its own.
+    std::fs::write(src.join("target.txt"), "target").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "post-merge target"]);
+    let target = git(&src, &["rev-parse", "HEAD"]);
+    let rid = format!("{}:inv:1", e.0);
+    insert_request_row(store, &w, &e, &rid, InvocationRole::Fix);
+    let request = v2_request(
+        store,
+        &w,
+        &e,
+        &rid,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task(aid, manifest, &produced, &target),
+    );
+    insert_body(store, &request);
+    (w, e, rid, src, base, produced, target, aid.into())
+}
+
+#[test]
+fn a_conflict_workspace_contains_the_bound_target_revision() {
+    let root = tmp_root("fix-conflict");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, rid, src, base, produced, target, aid) =
+        conflict_fix_fixture(&store, &root, "p-conflict", "m-1", "art-1");
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(&store, &layout, &src, &w, &e, &aid, &produced, &base, "m-1");
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.head, produced);
+    let ws = ws_path(&root, &w);
+    assert_clean_pinned(&ws, &format!("work/{}", w.0), &base, &produced);
+    assert_eq!(
+        git(&ws, &["cat-file", "-t", &target]),
+        "commit",
+        "the bound conflict target resolves in the remote-less workspace"
+    );
+}
+
+#[test]
+fn a_conflict_target_absent_from_the_source_refuses_before_a_workspace() {
+    let root = tmp_root("fix-conflict-missing");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, _rid0) = admit(&store, "p-conflict-missing");
+    let (src, base, _n) = git_source(&root);
+    std::fs::write(src.join("fix.txt"), "fix").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "produced"]);
+    let produced = git(&src, &["rev-parse", "HEAD"]);
+    let rid = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid, InvocationRole::Fix);
+    let absent = "1".repeat(40);
+    let request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task("art-1", "m-1", &produced, &absent),
+    );
+    insert_body(&store, &request);
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(
+        &store, &layout, &src, &w, &e, "art-1", &produced, &base, "m-1",
+    );
+
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::MissingBase { .. }),
+        "{err:?}"
+    );
+    assert!(!ws_path(&root, &w).exists());
+}
+
 #[test]
 fn fix_workspace_starts_at_the_exact_acknowledged_predecessor() {
     let root = tmp_root("fix-ok");

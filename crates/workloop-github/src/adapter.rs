@@ -1523,6 +1523,57 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         Ok(report)
     }
 
+    /// The durable ordering record every issued merge-detection read
+    /// leaves behind: the pull-reported head when it is a usable
+    /// revision, else the last recorded head so the check still
+    /// advances the least-recently-checked key. A pair with no usable
+    /// head at all records nothing — there is no truthful head to
+    /// bind.
+    #[allow(clippy::too_many_arguments)]
+    fn record_merge_check(
+        &mut self,
+        store: &impl Store,
+        config: &WorkloopConfig,
+        work_id: &WorkId,
+        change: &ChangeRequestRef,
+        reported_head: Option<&str>,
+        check_epoch: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let head = match reported_head.and_then(|object| {
+            CommitRevision::new(change.repository.clone(), object.to_string()).ok()
+        }) {
+            Some(head) => Some(head),
+            None => latest_recorded_head(store, work_id, change)?
+                .and_then(|object| CommitRevision::new(change.repository.clone(), object).ok()),
+        };
+        let Some(head) = head else { return Ok(()) };
+        self.poll_ingest(
+            store,
+            config,
+            Observation {
+                delivery: Some(DeliveryId {
+                    scope: DeliveryScope::Host {
+                        host: change.repository.host.clone(),
+                    },
+                    source: "github.merge".into(),
+                    event_id: format!(
+                        "merge-check:{}:{}@{}#{check_epoch}",
+                        work_id.0, change, head.object
+                    ),
+                }),
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::MergeCheck {
+                    change: change.clone(),
+                    head,
+                },
+                observed_unix_seconds: now,
+            },
+            now,
+        )
+    }
+
     /// A recorded managed merge triggers bounded mergeability re-checks
     /// for the remaining open managed changes on the same target. Every
     /// historical merge on one branch re-reads the same fresh base and
@@ -1639,48 +1690,55 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         .read_pull(&change.repository, &change.change_request)
                     {
                         Ok(pull) => pull,
-                        // A read outage invents no merge and no conflict;
-                        // the next pass catches up.
-                        Err(_) => continue,
+                        // A read outage invents no merge and no conflict,
+                        // but the read still ran — it must leave the
+                        // durable ordering record or the failing pair
+                        // leads the queue again on every later pass and
+                        // starves the deferred tail.
+                        Err(_) => {
+                            self.record_merge_check(
+                                store,
+                                config,
+                                &work_id,
+                                &change,
+                                None,
+                                &check_epoch,
+                                now,
+                            )?;
+                            continue;
+                        }
                     };
                     if !pull.merged {
                         // The durable check record is the ordering key
                         // the next pass sorts on; without it the same
                         // leading pairs would be re-read every pass and
                         // the deferred tail would never be reached.
-                        if let Ok(head) =
-                            CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
-                        {
-                            self.poll_ingest(
-                                store,
-                                config,
-                                Observation {
-                                    delivery: Some(DeliveryId {
-                                        scope: DeliveryScope::Host {
-                                            host: change.repository.host.clone(),
-                                        },
-                                        source: "github.merge".into(),
-                                        event_id: format!(
-                                            "merge-check:{}:{}@{}#{check_epoch}",
-                                            work_id.0, change, head.object
-                                        ),
-                                    }),
-                                    subject_work_id: Some(work_id.clone()),
-                                    subject_execution_id: None,
-                                    fact: ObservationFact::MergeCheck {
-                                        change: change.clone(),
-                                        head,
-                                    },
-                                    observed_unix_seconds: now,
-                                },
-                                now,
-                            )?;
-                        }
+                        self.record_merge_check(
+                            store,
+                            config,
+                            &work_id,
+                            &change,
+                            Some(&pull.head_sha),
+                            &check_epoch,
+                            now,
+                        )?;
                         continue;
                     }
                     let Ok(head) =
                         CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
                     else {
+                        // A merged pull whose reported head cannot be
+                        // bound still consumed the read — advance the
+                        // ordering key the same way a failed read does.
+                        self.record_merge_check(
+                            store,
+                            config,
+                            &work_id,
+                            &change,
+                            Some(&pull.head_sha),
+                            &check_epoch,
+                            now,
+                        )?;
                         continue;
                     };
                     let hint = (!pull.base_sha.is_empty())
@@ -1749,10 +1807,34 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 .or_else(|| base_hint.map(|base| base.object));
             let Some(base_object) = base_object else {
                 // A merge whose new base cannot be established cannot
-                // bind a repair; nothing is guessed.
+                // bind a repair; nothing is guessed. A detection read
+                // still ran for a newly seen pair, so it advances the
+                // ordering key rather than leading the queue forever.
+                if newly_detected {
+                    self.record_merge_check(
+                        store,
+                        config,
+                        &work_id,
+                        &change,
+                        Some(&head.object),
+                        &check_epoch,
+                        now,
+                    )?;
+                }
                 continue;
             };
             let Ok(base) = CommitRevision::new(change.repository.clone(), base_object) else {
+                if newly_detected {
+                    self.record_merge_check(
+                        store,
+                        config,
+                        &work_id,
+                        &change,
+                        Some(&head.object),
+                        &check_epoch,
+                        now,
+                    )?;
+                }
                 continue;
             };
             self.poll_ingest(

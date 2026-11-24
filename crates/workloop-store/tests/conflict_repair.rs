@@ -12,8 +12,8 @@ use workloop_core::domain::{
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef,
-    DiffTarget, HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId,
-    RepositoryRef, RoleBinding,
+    DiffTarget, HostActorId, HostActorRef, HostCapability, HostInstanceId, IssueId, IssueRef,
+    RepositoryId, RepositoryRef, RoleBinding, SourceSnapshot,
 };
 use workloop_core::mergeability::{
     ConflictDisposition, ConflictEpisode, ConflictFixRequest, MergeabilityState, plan_conflict,
@@ -68,6 +68,7 @@ fn config() -> WorkloopConfig {
             HostCapability::ChangeRequestRead,
             HostCapability::ChecksRead,
             HostCapability::ReviewFindingsRead,
+            HostCapability::IssueRead,
         ]),
         lanes: LanePolicy::default(),
         required_checks: vec![],
@@ -81,10 +82,27 @@ fn config() -> WorkloopConfig {
     }
 }
 
+fn issue(number: u64) -> IssueRef {
+    IssueRef {
+        repository: repo(),
+        issue: IssueId::trusted(format!("issue-{number}")),
+        display_number: Some(number),
+    }
+}
+
 fn submit(
     store: &SqliteStore,
     config: &WorkloopConfig,
     key: &str,
+) -> workloop_core::domain::WorkId {
+    submit_with_sources(store, config, key, vec![])
+}
+
+fn submit_with_sources(
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    key: &str,
+    sources: Vec<SourceSnapshot>,
 ) -> workloop_core::domain::WorkId {
     let decision = handle_command(
         store,
@@ -98,7 +116,7 @@ fn submit(
             idempotency_key: key.into(),
             body: CommandBody::Submit {
                 intent: "conflict repair contract".into(),
-                sources: vec![],
+                sources,
                 constraints: vec![],
                 verification_argv: vec![],
             },
@@ -575,4 +593,66 @@ fn a_conflict_while_the_active_execution_is_stopping_is_recorded_not_dropped() {
     let decision = &decisions[0];
     assert_eq!(decision.classification, "conflict_unresolvable");
     assert!(decision.detail.contains("src/d.rs"), "{}", decision.detail);
+}
+
+#[test]
+fn a_conflict_escalation_for_a_reclaimed_issue_records_the_hold() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let source = |number: u64| SourceSnapshot {
+        issue: issue(number),
+        source_revision: "rev-1".into(),
+        content_digest: "digest-1".into(),
+    };
+    // The completed Work's issue claim was released at terminal
+    // settlement; a newer Work now owns it — the exact state an
+    // escalation arrives into.
+    let owner = submit_with_sources(&store, &config, "conflict-owner-1", vec![source(7)]);
+    finish(&store, &owner);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::ReleaseIssueClaims {
+                work_id: owner.clone(),
+            })
+        })
+        .unwrap();
+    let holder = submit_with_sources(&store, &config, "conflict-owner-2", vec![source(7)]);
+    assert_eq!(
+        store.transact(|tx| tx.issue_claim(&issue(7))).unwrap(),
+        Some(holder.clone()),
+        "the newer Work owns the reclaimed issue"
+    );
+
+    // An unbindable conflict for the completed Work escalates: the
+    // paused successor holds no claims, so the ingest must not roll
+    // back on the owner row — the hold is recorded, the claim stays.
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: None,
+        target_revision: None,
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-owner-esc",
+            &owner,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/a.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+    let executions = store.transact(|tx| tx.executions_for_work(&owner)).unwrap();
+    let current = executions.last().expect("escalation successor");
+    assert_eq!(current.state, ExecutionState::Paused);
+    let reason = current.pause_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("src/a.rs"), "{reason}");
+    assert_eq!(
+        store.transact(|tx| tx.issue_claim(&issue(7))).unwrap(),
+        Some(holder),
+        "the live Work's claim is untouched by the escalation"
+    );
 }

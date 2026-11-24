@@ -3333,7 +3333,6 @@ fn escalate_conflict(
         .ok_or_else(|| StoreError::Internal {
             detail: "conflict escalation Work has no spec".into(),
         })?;
-    let issue_refs = tx.issue_refs(work_id)?;
     let seq = tx.alloc_seq()?;
     let mut input = last.input.clone();
     input.previous_execution_outcome = last.outcome.clone();
@@ -3351,12 +3350,11 @@ fn escalate_conflict(
     paused.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
     paused.paused_since_unix_seconds = Some(now_unix_seconds);
     tx.apply(&Effect::InsertExecution { execution: paused })?;
-    if !issue_refs.is_empty() {
-        tx.apply(&Effect::InsertIssueClaims {
-            work_id: work_id.clone(),
-            issues: issue_refs,
-        })?;
-    }
+    // A paused successor holds no issue claims — only an active
+    // Execution does. Re-acquiring them here would both contradict
+    // that rule and collide with a newer Work already owning a
+    // source (the very case this escalation records), rolling back
+    // the observation instead of recording the hold.
     Ok(())
 }
 

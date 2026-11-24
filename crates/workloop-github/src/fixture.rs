@@ -2528,12 +2528,19 @@ impl FixtureGithub {
             }
             detections += 1;
             report.merge_detections += 1;
-            let Some(head_object) = self.changes.get(change_id).cloned() else {
-                continue;
+            // The same fallback the production adapter applies: a head
+            // that cannot build a revision still consumed the check,
+            // so the ordering record binds the last recorded head —
+            // only a pair with no usable head at all records nothing.
+            let reported = self.changes.get(change_id).and_then(|object| {
+                CommitRevision::new(change.repository.clone(), object.clone()).ok()
+            });
+            let head = match reported {
+                Some(head) => Some(head),
+                None => latest_recorded_head(store, &owner_work, &change)?
+                    .and_then(|object| CommitRevision::new(change.repository.clone(), object).ok()),
             };
-            let Ok(head) = CommitRevision::new(change.repository.clone(), head_object) else {
-                continue;
-            };
+            let Some(head) = head else { continue };
             self.emit(
                 store,
                 config,

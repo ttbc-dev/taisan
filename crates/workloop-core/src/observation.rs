@@ -205,12 +205,15 @@ pub enum ObservationFact {
         base: CommitRevision,
         target_branch: String,
     },
-    /// A merge-detection read observed the change still open — the
-    /// durable "last checked" record the bounded detection set orders
-    /// by, so the deferred tail is reached on a later pass. `head` is
-    /// the revision the pull reported at read time; the fact is
-    /// evidence of the read itself, never of a merge or a
-    /// mergeability verdict.
+    /// A merge-detection read ran for the change — the durable "last
+    /// checked" record the bounded detection set orders by, so the
+    /// deferred tail is reached on a later pass. `head` is the
+    /// revision the pull reported at read time, or the last recorded
+    /// head when the read failed or reported an unusable revision —
+    /// an issued read must always advance the ordering key. The fact
+    /// is evidence of the read itself, never of a merge, a
+    /// mergeability verdict, or new Work evidence: it does not mint
+    /// a new attention occurrence.
     MergeCheck {
         change: ChangeRequestRef,
         head: CommitRevision,

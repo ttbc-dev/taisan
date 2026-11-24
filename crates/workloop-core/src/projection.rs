@@ -240,7 +240,15 @@ fn attention_views(
     let work_evidence = tx
         .observations_for_work(work_id)?
         .into_iter()
-        .filter(|observation| observation.subject_execution_id.is_none())
+        .filter(|observation| {
+            // A merge-detection check is ordering bookkeeping — evidence
+            // of the read itself, minted fresh every pass — so it must
+            // not count as new Work evidence: its per-pass record would
+            // mint a new occurrence id and resurface an acknowledged
+            // Attention on every pass.
+            observation.subject_execution_id.is_none()
+                && !matches!(observation.fact, ObservationFact::MergeCheck { .. })
+        })
         .count();
     let occurrence = format!(
         "{}:{}:{}",

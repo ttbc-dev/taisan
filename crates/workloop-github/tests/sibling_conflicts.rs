@@ -1247,6 +1247,134 @@ fn merge_detection_reaches_the_tail_at_equal_timestamps() {
 }
 
 #[test]
+fn a_failed_detection_read_still_advances_the_ordering_key() {
+    let store = SqliteStore::in_memory(8).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    let unmerged = MAX_MERGE_CHECKS_PER_PASS + 1;
+    let works = unmerged_works(&store, &config, &mut api, "lost-detect", unmerged);
+
+    let mut adapter = GitHubAdapter::new(api);
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    // Exactly one pair was deferred — it is still never-checked, so it
+    // leads the ordering next pass and its read is the first issued.
+    let deferred: Vec<&WorkId> = works
+        .iter()
+        .filter(|w| merge_check_facts(&store, w) == 0)
+        .collect();
+    assert_eq!(deferred.len(), 1, "one pair stayed never-checked");
+    let deferred = deferred[0].clone();
+
+    // The leading read is refused this pass: it consumed the bound and
+    // must leave the durable ordering record — bound to the last
+    // recorded head, the only truthful head the pair has — or the
+    // failing pair would lead the queue forever and starve the tail.
+    adapter.client_mut().lose_response("read_pull");
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    let checks: Vec<String> = store
+        .transact(|tx| tx.observations_for_work(&deferred))
+        .unwrap()
+        .iter()
+        .filter_map(|o| match &o.fact {
+            ObservationFact::MergeCheck { head, .. } => Some(head.object.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "a failed detection read records the check against the last recorded head"
+    );
+    assert!(
+        checks[0].starts_with("lost-detect-head-"),
+        "the record binds the pair's recorded head, got {checks:?}"
+    );
+
+    // The next pass reads the remaining backlog — the failed pair
+    // holds the newest key and waits its turn like any checked pair.
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    for (index, work) in works.iter().enumerate() {
+        assert!(
+            merge_check_facts(&store, work) >= 1,
+            "change {index} was checked within three passes"
+        );
+    }
+}
+
+#[test]
+fn an_unbindable_merged_read_still_advances_the_ordering_key() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    // `main` is never seeded: the merged pull's new base can neither be
+    // read nor hinted, so the merge can never be bound. The detection
+    // read still ran — it must advance the ordering key every pass or
+    // the unbindable pair would lead the queue forever.
+    let merged_work = submit(&store, &config, "unbindable-merge");
+    api.seed_branch(&repo(), "work/unbindable", "unbindable-head");
+    let pull = api
+        .open_pull(&repo(), "work/unbindable", "main", "unbindable", "")
+        .unwrap();
+    let change = change(&pull.id);
+    record_change(&store, &merged_work, &change);
+    ingest_head(&store, &config, &merged_work, &change, "unbindable-head");
+    finish_execution(&store, &merged_work);
+    api.set_pull_merged(&repo(), &pull.id);
+
+    let mut adapter = GitHubAdapter::new(api);
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(
+        merge_check_facts(&store, &merged_work),
+        2,
+        "every issued detection read advances the ordering key"
+    );
+    let merges = store
+        .transact(|tx| tx.observations_for_work(&merged_work))
+        .unwrap()
+        .iter()
+        .filter(|o| matches!(o.fact, ObservationFact::ChangeMerged { .. }))
+        .count();
+    assert_eq!(merges, 0, "an unbindable merge is never recorded");
+}
+
+#[test]
+fn the_fixture_records_a_check_when_no_current_head_exists() {
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let work = submit(&store, &config, "fixture-no-head");
+    let change = change("cr-fixture-no-head");
+    record_change(&store, &work, &change);
+    // The recorded head is the only revision the pair has; the fixture
+    // has no current head for the change, so the issued check must
+    // still leave the ordering record bound to the recorded head.
+    let fixture = FixtureGithub::new();
+    ingest_head(&store, &config, &work, &change, "fixture-no-head");
+    finish_execution(&store, &work);
+
+    let report = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(report.merge_detections, 1);
+    assert_eq!(
+        merge_check_facts(&store, &work),
+        1,
+        "an issued detection check leaves the ordering record even with no current head"
+    );
+}
+
+#[test]
 fn the_fixture_bounds_merge_detection_the_same_way() {
     let store = SqliteStore::in_memory(8).unwrap();
     let config = config();
