@@ -193,7 +193,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
 /// `git merge-base --is-ancestor` distinguishes a real descendant (0)
 /// from a non-descendant (1); any other exit is a transport failure,
 /// never a quiet "no".
-fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
+pub(crate) fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
     let out = git_output(dir, &["merge-base", "--is-ancestor", base, produced])?;
     match out.status.code() {
         Some(0) => Ok(true),

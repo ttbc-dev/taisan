@@ -459,7 +459,7 @@ fn no_symlink_tree(dir: &Path, depth: u32) -> Result<bool, PreparationError> {
     Ok(true)
 }
 
-fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError> {
+pub(crate) fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError> {
     let conflict = |detail: &str| PreparationError::WorkspaceConflict {
         detail: detail.to_string(),
     };
