@@ -166,7 +166,7 @@ fn verified_item(dir: &Path, item: &TransferItemV1) -> Result<Vec<u8>, CollectEr
 /// `collection_invalid` material; `Fault` is transient io/git
 /// infrastructure the caller retries instead of recording.
 enum QuarantineRefusal {
-    Invalid(&'static str),
+    Invalid,
     Fault(CollectError),
 }
 
@@ -204,16 +204,13 @@ fn quarantine_import(
     // transient fault.
     let verified = git_output(repo, &["bundle", "verify", &bundle_arg])?;
     if !verified.status.success() {
-        return Err(QuarantineRefusal::Invalid(
-            "collected bundle fails verification",
-        ));
+        return Err(QuarantineRefusal::Invalid);
     }
     let heads = git(repo, &["bundle", "list-heads", &bundle_arg])?;
     let expect = format!("{produced} refs/heads/{branch}");
     if !heads.lines().any(|l| l.trim() == expect) {
-        return Err(QuarantineRefusal::Invalid(
-            "collected bundle does not pin the produced commit",
-        ));
+        // The bundle does not pin the declared produced commit.
+        return Err(QuarantineRefusal::Invalid);
     }
     // A crashed earlier import may have left the ref; discard and
     // re-import — quarantine is transient transport, never durable.
@@ -611,9 +608,8 @@ fn validate_produced(
     let invalid = |reason: &str| ProducedRefusal::Invalid(reason.to_string());
     // The handoff's descriptor count is bounded by the same immutable
     // `max_item_count` the declared set answered to — never u64::MAX.
-    let handoff = RemoteHandoffV1::parse(handoff_raw, limits.max_item_count).map_err(|e| {
-        ProducedRefusal::Invalid(format!("collection_invalid: handoff manifest refused: {e}"))
-    })?;
+    let handoff = RemoteHandoffV1::parse(handoff_raw, limits.max_item_count)
+        .map_err(|_| invalid("collection_invalid"))?;
     if !handoff
         .identity_violations(request_id, &request.invocation_id)
         .is_empty()
@@ -657,9 +653,10 @@ fn validate_produced(
         quarantine,
     ) {
         return Err(match e {
-            QuarantineRefusal::Invalid(reason) => ProducedRefusal::Invalid(format!(
-                "collection_invalid: quarantine import refused: {reason}"
-            )),
+            // A semantic refusal records the closed `collection_invalid`
+            // token — the durable row's `invalid_reason` is the contract
+            // vocabulary, never free-form detail.
+            QuarantineRefusal::Invalid => invalid("collection_invalid"),
             QuarantineRefusal::Fault(e) => ProducedRefusal::Fault(e),
         });
     }
@@ -668,9 +665,14 @@ fn validate_produced(
     if !ancestor {
         return Err(invalid("stale_base"));
     }
-    // A produced commit that never moved past the base produced
-    // nothing — same verdict as the local handoff.
-    if produced == handoff.base_commit && !invocation.required_artifacts.is_empty() {
+    // A produced commit that never moved past the revision the branch
+    // was started at produced nothing — same verdict as the local
+    // handoff's `branch_start` check. A Fix branch starts at its
+    // predecessor's produced commit, not the request's fork base, so
+    // the comparison reads the role's expected head rather than
+    // `base_commit` (which stays the ancestry pin above).
+    let branch_start = crate::remote_prepare::expected_head(request);
+    if produced == branch_start && !invocation.required_artifacts.is_empty() {
         return Err(invalid("nothing_produced"));
     }
 

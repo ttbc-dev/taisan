@@ -156,8 +156,10 @@ fn expected_head_ref(request: &WorkerRequestV2) -> &'static str {
     }
 }
 
-/// The commit the workspace checks out.
-fn expected_head(request: &WorkerRequestV2) -> String {
+/// The commit the workspace checks out — the branch's recorded
+/// start, which collection also reads for its `nothing_produced`
+/// verdict (a Fix starts at `predecessor.produced`, not `base`).
+pub(crate) fn expected_head(request: &WorkerRequestV2) -> String {
     match &request.task {
         TaskBody::Coding { .. } => request.base.object.clone(),
         TaskBody::Fix { predecessor, .. } => predecessor.produced.clone(),

@@ -2650,3 +2650,502 @@ fn export_fetches_pinned_commits_through_upload_pack() {
         "bundle pins {expect}\n{heads}"
     );
 }
+
+/// Seed a Fix request: same durable plumbing as a Coding request but
+/// the writer role whose branch starts at the predecessor's produced
+/// commit — `base.object` stays the predecessor's fork base, which is
+/// exactly the skew the remote `nothing_produced` check must not
+/// mistake for the branch start.
+fn seed_fix_request(
+    store: &SqliteStore,
+    bodies: &BodyStore,
+    repository: &RepositoryRef,
+    base: &str,
+    predecessor: ArtifactRef,
+    required_artifacts: Vec<RequiredArtifact>,
+) -> Seeded {
+    let (work_id, execution_id) = match handle_command(
+        store,
+        &config(repository),
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: format!("remote-fix-{}", &base[..8]),
+            body: CommandBody::Submit {
+                intent: "fix the thing".into(),
+                sources: vec![],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap()
+    {
+        CommandDecision::Accepted {
+            work_id: Some(work_id),
+            effect:
+                CommandEffect::WorkCreated { execution_id }
+                | CommandEffect::ExecutionCreated { execution_id },
+            ..
+        } => (work_id, execution_id),
+        other => panic!("expected accepted submit, got {other:?}"),
+    };
+    let request_id = format!("{}:inv:0", execution_id.0);
+    let invocation_id = store.transact(|tx| tx.alloc_id("inv")).unwrap();
+
+    let goal_bytes = goal_body_bytes(InvocationRole::Fix, "fix the thing", &[]);
+    let goal_digest = goal_body_digest(&goal_bytes);
+    let goal_path = format!("bodies/goal/{goal_digest}");
+    let catalog = store.body_catalog();
+    bodies
+        .retain_at(catalog, CAS_CATEGORY, &goal_path, &goal_bytes, NOW, None)
+        .unwrap();
+
+    let wire_repo = WireRepository {
+        host: repository.host.as_str().to_string(),
+        repository: repository.repository.as_str().to_string(),
+    };
+    let mut request = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: request_id.clone(),
+        invocation_id: invocation_id.clone(),
+        request_digest: String::new(),
+        store_id: store.transact(|tx| tx.store_id()).unwrap().0,
+        work_id: work_id.0.clone(),
+        execution_id: execution_id.0.clone(),
+        role: InvocationRole::Fix,
+        repository: wire_repo.clone(),
+        base: RequestBase {
+            repository: wire_repo,
+            object: base.into(),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: "a".repeat(64),
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", work_id.0),
+            mount: "/workspace".into(),
+            read_only: false,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1 << 20,
+            max_log_bytes: 1 << 20,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::Fix,
+            protocol_versions: vec![],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::Fix {
+            goal: GoalRef {
+                body_ref: goal_path,
+                media_type: "text/markdown".into(),
+                bytes: goal_bytes.len() as u64,
+                digest: goal_digest,
+            },
+            issues: vec![],
+            predecessor,
+            origin: Box::new(FixOrigin::Prepublication {
+                failed_evidence: vec![],
+            }),
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    };
+    request.request_digest = request.digest();
+
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: request_id.clone(),
+                    work_id: work_id.clone(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Fix,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            })?;
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: WorkerRequestBody {
+                    request_id: request_id.clone(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: request.to_canonical_bytes(),
+                    body_digest: request.digest(),
+                },
+            })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(invocation_id.clone()),
+                    request_id: request_id.clone(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Fix,
+                    state: InvocationState::Running,
+                    process_identity: None,
+                    required_artifacts: required_artifacts.clone(),
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            tx.apply(&Effect::InsertExecutorBinding {
+                binding: ExecutorBinding::new(ExecutorBindingFields {
+                    installation_id: "install-a".into(),
+                    endpoint_id: "executor-a".into(),
+                    endpoint_identity_digest: "e".repeat(64),
+                    bound_incarnation_id: "boot-1".into(),
+                    protocol_version: EXECUTOR_PROTOCOL_V1.into(),
+                    capabilities_digest: "c".repeat(64),
+                    launch_config_digest: "d".repeat(64),
+                    request_id: request_id.clone(),
+                    invocation_id: invocation_id.clone(),
+                    request_digest: request.digest(),
+                    limits: limits(),
+                })
+                .unwrap(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    Seeded {
+        request_id,
+        invocation_id,
+        work_id,
+        request,
+        goal_bytes,
+    }
+}
+
+/// A handoff manifest that cannot even parse is the same closed
+/// `collection_invalid` every semantic refusal records — the durable
+/// `invalid_reason` is the contract's vocabulary, never a free-form
+/// detail string.
+#[test]
+fn a_malformed_handoff_manifest_records_collection_invalid() {
+    let (rig, base) = rig("malformed-manifest");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }],
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    // Replace the manifest with bytes no parser accepts.
+    std::fs::write(prepared.out_dir.join("handoff.json"), b"{not json").unwrap();
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("collection_invalid")
+    );
+}
+
+/// A bundle the quarantine import refuses — `git bundle verify`
+/// failing on the declared bytes — records the same closed
+/// `collection_invalid` a malformed handoff does. The durable
+/// `invalid_reason` is the contract token either way, never a
+/// free-form detail.
+#[test]
+fn a_bundle_the_quarantine_refuses_records_collection_invalid() {
+    let (rig, base) = rig("refused-bundle");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }],
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let mut assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    // The shipped bundle bytes are not a git bundle at all — re-declare
+    // the manifest over the refused body so the transfer layer carries
+    // it honestly and only the quarantine gate can stop it.
+    for item in &mut assembled.items {
+        if item.item_id == "export-bundle" {
+            item.body = b"not a git bundle".to_vec();
+        }
+    }
+    let items = assembled
+        .items
+        .iter()
+        .map(|i| TransferItemV1 {
+            item_id: i.item_id.clone(),
+            path: i.path.clone(),
+            bytes: i.body.len() as u64,
+            digest: item_content_digest(&i.body),
+        })
+        .collect();
+    assembled.manifest =
+        ExecutorTransferV1::declared("tr-out-1", &collection_id, CHUNK, items).unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("collection_invalid")
+    );
+}
+
+/// A Fix whose branch never moved past its start — the predecessor's
+/// produced commit — is `nothing_produced`, not a collection of the
+/// predecessor's own artifacts: the request's `base.object` is the
+/// predecessor's fork point, so comparing `produced` to `base` can
+/// never see a no-op Fix.
+#[test]
+fn a_noop_fix_is_nothing_produced() {
+    let (rig, base) = rig("noop-fix");
+    // The predecessor's produced commit: `dist/result.json` already
+    // exists in its tree, so artifact verification alone would find
+    // it Present.
+    let artifact_bytes = b"RESULT-FROM-PREDECESSOR";
+    std::fs::create_dir_all(rig.source.path.join("dist")).unwrap();
+    std::fs::write(rig.source.path.join("dist/result.json"), artifact_bytes).unwrap();
+    git(&rig.source.path, &["add", "."]);
+    git(&rig.source.path, &["commit", "-qm", "produced"]);
+    let produced = git(&rig.source.path, &["rev-parse", "HEAD"]);
+    assert_ne!(produced, base);
+    // Publish it under the artifact ref the Fix request binds — the
+    // same authority a real acknowledged predecessor holds.
+    let predecessor_ref = handoff::artifact_ref("inv-0/result");
+    git(
+        &rig.source.path,
+        &[
+            "push",
+            rig.handoff_repo.to_str().unwrap(),
+            &format!("{produced}:{predecessor_ref}"),
+        ],
+    );
+    let seeded = seed_fix_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        ArtifactRef {
+            artifact_id: "inv-0/result".into(),
+            manifest_digest: "b".repeat(64),
+            produced: produced.clone(),
+        },
+        vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }],
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    assert_eq!(prepared.head, produced, "a Fix checks out its predecessor");
+
+    // A no-op Worker: out/ carries the handoff naming the unchanged
+    // HEAD, but the branch itself never moved.
+    let request = &prepared.request;
+    let noop_handoff = RemoteHandoffV1 {
+        format_version: workloop_core::executor::REMOTE_HANDOFF_V1_FORMAT.into(),
+        request_id: request.request_id.clone(),
+        invocation_id: request.invocation_id.clone(),
+        repository: workloop_core::executor::HandoffRepository {
+            host: request.repository.host.clone(),
+            repository: request.repository.repository.clone(),
+        },
+        base_commit: base.clone(),
+        produced_commit: produced.clone(),
+        artifacts: vec![workloop_core::executor::HandoffArtifact {
+            path: "dist/result.json".into(),
+            bytes: artifact_bytes.len() as u64,
+            claimed_sha256: sha256_hex("artifact-v1", artifact_bytes),
+        }],
+    };
+    std::fs::write(
+        prepared.out_dir.join("handoff.json"),
+        serde_json::to_vec(&noop_handoff).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(prepared.out_dir.join("report.json"), b"{\"status\":\"ok\"}").unwrap();
+    std::fs::write(prepared.out_dir.join("runtime.log"), b"log line\n").unwrap();
+
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    assert_eq!(assembled.produced, produced);
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(collected.collection.state, ExecutorCollectionState::Invalid);
+    assert_eq!(
+        collected.collection.invalid_reason.as_deref(),
+        Some("nothing_produced")
+    );
+    // A nothing_produced verdict commits no artifact evidence.
+    let artifact_id = format!("{}/result", seeded.invocation_id);
+    let ref_missing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            &handoff::artifact_ref(&artifact_id),
+        ])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false);
+    assert!(ref_missing, "a no-op Fix establishes no artifact ref");
+    assert!(
+        rig.store
+            .transact(|tx| tx.artifact_handoff(&artifact_id))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A crash-orphaned journal temp is never authoritative: resume reads
+/// only the `<hex>.offset` journal, and the finalized surface carries
+/// neither journal nor temp — the completed set is items + manifest.
+#[test]
+fn a_stale_journal_temp_does_not_wedge_or_publish() {
+    let root = tmp_root("journal-temp");
+    let receiver = TransferStore::new(root.join("transfers"));
+    let body: Vec<u8> = (0..3 * CHUNK + 17).map(|i| (i % 251) as u8).collect();
+    let manifest = ExecutorTransferV1::declared(
+        "t-1",
+        "col-1",
+        CHUNK,
+        vec![TransferItemV1 {
+            item_id: "item-1".into(),
+            path: "input/item-1".into(),
+            bytes: body.len() as u64,
+            digest: item_content_digest(&body),
+        }],
+    )
+    .unwrap();
+    receiver.declare(&manifest).unwrap();
+    let frames = item_chunks(&manifest, "item-1", &body);
+    receiver
+        .accept_chunk(&manifest, &frames[0].0, frames[0].1)
+        .unwrap();
+
+    // The crash window: the new journal's temp was written but the
+    // rename never ran — the durable answer is still the old journal.
+    let items_dir = receiver.staging_dir("t-1").join("items");
+    let name = sha256_hex("taisan.executor.item-name.v1", b"item-1");
+    std::fs::write(items_dir.join(format!("{name}.tmp")), b"torn").unwrap();
+    // A `declare` interrupted the same way leaves its own temp at the
+    // staging root.
+    std::fs::write(
+        receiver.staging_dir("t-1").join("manifest.json.tmp"),
+        b"torn",
+    )
+    .unwrap();
+
+    // Resume ignores the orphan: the next chunk lands at the journaled
+    // offset and a fresh advance publishes over it.
+    let progress = receiver.progress(&manifest).unwrap();
+    assert_eq!(progress[0].1, CHUNK);
+    for (chunk, chunk_body) in &frames[1..] {
+        receiver.accept_chunk(&manifest, chunk, chunk_body).unwrap();
+    }
+    let dir = receiver.finalize(&manifest).unwrap();
+    assert!(
+        !dir.join("manifest.json.tmp").exists(),
+        "a crashed declare's temp never publishes"
+    );
+    let leftover: Vec<String> = std::fs::read_dir(dir.join("items"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".offset") || n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "journals leaked into complete: {leftover:?}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("items").join(&name)).unwrap(),
+        body,
+        "the finalized item is byte-exact"
+    );
+}

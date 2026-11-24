@@ -1648,11 +1648,22 @@ impl ExecutorTransferV1 {
         chunk_size: u64,
         items: Vec<TransferItemV1>,
     ) -> Result<Self, EnvelopeError> {
+        // Checked accumulation: an item set whose bytes overflow u64
+        // has no representable extent — refuse it rather than wrap a
+        // `total_bytes` the receiver's limits would then trust.
+        let total_bytes = items
+            .iter()
+            .map(|i| i.bytes)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| EnvelopeError::Invalid {
+                reason: "transfer.invalid",
+                detail: "item byte sum overflows u64".into(),
+            })?;
         let manifest = Self {
             format_version: EXECUTOR_TRANSFER_V1_FORMAT.into(),
             transfer_id: transfer_id.into(),
             collection_id: collection_id.into(),
-            total_bytes: items.iter().map(|i| i.bytes).sum(),
+            total_bytes,
             item_count: items.len() as u64,
             chunk_size,
             items,
@@ -1724,7 +1735,15 @@ impl ExecutorTransferV1 {
                 self.items.len()
             )));
         }
-        let total: u64 = self.items.iter().map(|i| i.bytes).sum();
+        // An item sum that overflows u64 cannot equal any declared
+        // `total_bytes` — refuse it outright instead of wrapping into
+        // a small total a receiver's byte bound would accept.
+        let total: u64 = self
+            .items
+            .iter()
+            .map(|i| i.bytes)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| invalid("item byte sum overflows u64".into()))?;
         if self.total_bytes != total {
             return Err(invalid(format!(
                 "total_bytes {} disagrees with item sum {total}",
@@ -2607,6 +2626,56 @@ mod tests {
             RemoteHandoffV1::parse(&vec![b' '; (MAX_HANDOFF_BYTES + 1) as usize], 8),
             Err(EnvelopeError::Oversize { .. })
         ));
+    }
+
+    // -- transfer manifest -------------------------------------------
+
+    fn transfer_item(item_id: &str, path: &str, bytes: u64) -> TransferItemV1 {
+        TransferItemV1 {
+            item_id: item_id.into(),
+            path: path.into(),
+            bytes,
+            digest: "f".repeat(64),
+        }
+    }
+
+    #[test]
+    fn a_manifest_whose_item_bytes_overflow_u64_is_invalid() {
+        // Each integer only has to fit i64 — two near-i64::MAX items
+        // plus a small third sum past u64, and the wrapped total of 0
+        // must never satisfy the declared `total_bytes` a receiver's
+        // byte bound trusts (in debug this is also a panic).
+        let items = vec![
+            transfer_item("a", "a.bin", i64::MAX as u64),
+            transfer_item("b", "b.bin", i64::MAX as u64),
+            transfer_item("c", "c.bin", 2),
+        ];
+        // Both the constructor and the wire parse refuse with the same
+        // closed `transfer.invalid` token.
+        for err in [
+            ExecutorTransferV1::declared("t-1", "col-1", 1024, items.clone()).unwrap_err(),
+            ExecutorTransferV1::parse(
+                &serde_json::to_vec(&serde_json::json!({
+                    "format_version": EXECUTOR_TRANSFER_V1_FORMAT,
+                    "transfer_id": "t-1",
+                    "collection_id": "col-1",
+                    "total_bytes": 0,
+                    "item_count": 3,
+                    "chunk_size": 1024,
+                    "items": items,
+                }))
+                .unwrap(),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                EnvelopeError::Invalid {
+                    reason: "transfer.invalid",
+                    ..
+                }
+            ));
+        }
     }
 
     // -- durable records ----------------------------------------------

@@ -471,13 +471,19 @@ impl TransferStore {
             file.sync_all()
                 .map_err(|e| fault(format!("sync {}: {e}", body_path.display())))?;
         }
+        // Publish the advance atomically — temp write, fsync, rename —
+        // so a crash leaves the old or the new journal, never a torn
+        // one `next_offset` would read as terminal `Corrupt` and wedge
+        // the transfer id.
         let journal = journal_path(&dir, &chunk.item_id);
         let next = staged + (body.len() - skip) as u64;
-        std::fs::write(&journal, next.to_be_bytes())
+        let tmp = journal.with_extension("tmp");
+        std::fs::write(&tmp, next.to_be_bytes())
             .map_err(|e| fault(format!("write journal: {e}")))?;
-        std::fs::File::open(&journal)
+        std::fs::File::open(&tmp)
             .and_then(|f| f.sync_all())
             .map_err(|e| fault(format!("sync journal: {e}")))?;
+        std::fs::rename(&tmp, &journal).map_err(|e| fault(format!("rename journal: {e}")))?;
         fsync_dir(&dir.join("items"))?;
         Ok(ChunkOutcome::Accepted { next_offset: next })
     }
@@ -538,16 +544,22 @@ impl TransferStore {
         std::fs::create_dir_all(target.parent().expect("complete root"))
             .map_err(|e| fault(format!("create complete root: {e}")))?;
         // Strip the journals — the completed set is items + manifest
-        // only, and a leftover journal is not part of the materialized
-        // surface.
+        // only, and neither a leftover journal nor a crash-orphaned
+        // journal temp is part of the materialized surface.
         let items_dir = dir.join("items");
         if let Ok(entries) = std::fs::read_dir(&items_dir) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().ends_with(".offset") {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".offset") || name.ends_with(".tmp") {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
+        // A `declare` interrupted between the temp write and the rename
+        // leaves `manifest.json.tmp` at the staging root — strip it too
+        // so the published surface stays items + manifest.
+        let _ = std::fs::remove_file(dir.join("manifest.json.tmp"));
         fsync_dir(&items_dir)?;
         fsync_dir(&dir)?;
         if let Err(e) = std::fs::rename(&dir, &target) {
