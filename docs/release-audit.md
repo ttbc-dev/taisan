@@ -9,26 +9,14 @@ legend in `AGENTS.md` / `docs/source-workflow-audit.md`. The one name
 spelled out is `shimpeiws/agent-workloop`, this repository's own former
 name, which the name-migration analysis necessarily cites.
 
-> **Owner-controlled record — not publication-facing.** This document is
-> a map of every remaining leak location; publishing it would hand an
-> adversary the leak index itself. It needs the same disposition as
-> `docs/source-workflow-audit.md` — a disclosure review, or exclusion
-> from the published tree and its reachable history — before the
-> repository goes public (see §6). `AGENTS.md` names it a second
-> owner-controlled exception under the same terms — but that clause is
-> added by the same pull request that adds this file, so it is a
-> proposed disposition pending owner ratification, not a prior owner
-> decision. Committing the file already places the leak index in
-> reachable history, and merging this pull request puts it on `main`'s
-> history. Per route (§6): under A the published tree must be scrubbed
-> or the file removed and its blob history rewritten; under B a
-> sanitized snapshot can exclude it; under C the squashed root commit
-> publishes the current tree as-is, so the file must be removed or
-> scrubbed before the squash — it does not stay out by itself.
-> Accepting the merge is the owner's ratification of keeping this
-> record tracked under the second exception — it does not replace the
-> disclosure review required before publication (§5 item 6, §6), and
-> this record does not make that decision.
+> **Audit record — retained in the published tree.** This document maps
+> every leak location found on 2026-11-24. The owner reviewed §5 and
+> ruled that the private source-repository names and the owner identity
+> recorded here are acceptable to disclose (issue #438), choosing
+> in-place publication with the existing history kept — no squash, no
+> history rewrite, no tracker-metadata scrub. The file therefore stays
+> as the provenance/leak record; §5's items are dispositioned in §7 and
+> §6's route analysis is retained for the record.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -73,9 +61,9 @@ Under the current publication route, everything below becomes public:
 ### 2.1 Current tree — the sanctioned file exists, but leaks occur outside it
 
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
-the first permitted exception per `AGENTS.md`. It correctly self-declares
-that publication requires a disclosure review covering it and the git
-history (`docs/source-workflow-audit.md:25-35`).
+the first of two owner-controlled provenance records per `AGENTS.md`. It
+records the owner disposition that keeps it in the published tree
+(`docs/source-workflow-audit.md:32-38`).
 
 The scan confirms the real names of the ops, worker, selector, and infra
 repos, two ops-side tool names (a terminal multiplexer and a container
@@ -87,7 +75,7 @@ names, both tool names, and real `/Users/<owner>` owner paths do not
 occur outside the sanctioned file in the current tree (`/Users/` hits
 only a test literal — see Appendix); each of them surfaces instead in
 history or tracker metadata (§2.2, §2.3) — but the further leak classes
-below mean the exception still does not hold in practice:
+below mean the sanction still does not hold in practice:
 
 - **`docs/extraction-coverage.json`** — the generated coverage manifest
   redacts source identifiers as `[source-symbol]`/`[source-file]`, but
@@ -113,24 +101,28 @@ below mean the exception still does not hold in practice:
   not a source-name leak. Recorded for completeness, not counted as a
   release blocker.
 - **The smoke repo is pervasive**: its `<owner>/<smoke-repo>` name
-  appears 161 times across 29 files — the sanctioned
-  `docs/source-workflow-audit.md` plus, outside it, `docs/s1/*`
-  (8 files), `docs/evidence/u3.6d.md`, `u3.6e.md`, `u8.1*.md`,
-  `u8.2`–`u8.5`, `docs/remote-executor.md:20`, `fixtures/s1/*`,
-  `scripts/s1/{check-prerequisites.py,worker-shim.sh,worker-shim-nc.sh}`,
+  appears 176 times across 36 files — `docs/s1/*` (10 files),
+  `docs/evidence/*` (11 files),
+  `docs/{provenance,remote-executor:20,u3.6e-authorization,u3.6e-live-runbook}.md`,
+  `AGENTS.md`, `fixtures/s1/*` (3 files),
+  `scripts/s1/{check-prerequisites.py,mint-app-token.py,worker-shim.sh,worker-shim-nc.sh}`,
   `scripts/tests/test_s1_materials.py`,
-  `crates/workloop-cli/src/bin/s1_bridge.rs:1970`,
-  `crates/workloop-github/src/evidence.rs:766-804`.
+  `crates/workloop-cli/src/bin/s1_bridge.rs:1971`,
+  `crates/workloop-github/src/evidence.rs:767-805` — plus 2 bare
+  `<smoke-repo>` mentions inside the sanctioned
+  `docs/source-workflow-audit.md`. (Counts updated after the #438
+  framing pass; owner-only markers added more occurrences rather than
+  removing any.)
 - **Worker-repo config path**: `~/.config/<worker-repo>/github-apps/...`
-  in `scripts/s1/mint-app-token.py:5,28`,
-  `docs/s1/stage-c-runbook.md:46,114`,
-  `docs/evidence/u8.1-live-stage-c.md:41` — discloses the worker repo's
+  in `scripts/s1/mint-app-token.py:9,32`,
+  `docs/s1/stage-c-runbook.md:53,121`,
+  `docs/evidence/u8.1-live-stage-c.md:49` — discloses the worker repo's
   name through a local config path even where the repo itself is not
   named.
 - **Per-run owner state directories**: `~/s1-*` run dirs recorded in
-  `docs/evidence/u8.1-live-stage-c.md:62,71,112,201,211`,
-  `docs/evidence/u8.2.md:48`, `docs/evidence/u8.3.md:59`, and
-  `docs/s1/live-runbook.md:159` — owner-specific operational context;
+  `docs/evidence/u8.1-live-stage-c.md:70,79,120,209,219`,
+  `docs/evidence/u8.2.md:55`, `docs/evidence/u8.3.md:66`, and
+  `docs/s1/live-runbook.md:166` — owner-specific operational context;
   the extracted dir names are all `s1-*` scenario names embedding no
   source names (see Appendix); together with the `~/src` checkout-root
   strings in `docs/extraction-coverage.json:6636` (counted above as a
@@ -138,16 +130,16 @@ below mean the exception still does not hold in practice:
   surface at HEAD.
 - **Identifying runtime configuration**: the dedicated reviewer GitHub
   App's slug, app id, installation id, and bot user id
-  (`docs/evidence/u8.1-live-stage-c.md:37-42`,
-  `docs/s1/stage-c-runbook.md:42-46`); the smoke repo's numeric and node
-  ids (`docs/evidence/u8.1-live-stage-c.md:52`); repository secret names
-  (`S1_REVIEWER_*`, `docs/evidence/u8.1-live-stage-c.md:42`); the
+  (`docs/evidence/u8.1-live-stage-c.md:45-50`,
+  `docs/s1/stage-c-runbook.md:49-53`); the smoke repo's numeric and node
+  ids (`docs/evidence/u8.1-live-stage-c.md:60`); repository secret names
+  (`S1_REVIEWER_*`, `docs/evidence/u8.1-live-stage-c.md:50`); the
   scenario git identity `s1-worker` hard-coded in
-  `scripts/s1/worker-shim.sh:34-35` and `worker-shim-nc.sh:35-36`.
+  `scripts/s1/worker-shim.sh:37-38` and `worker-shim-nc.sh:38-39`.
 - **Internal scripts**: `scripts/s1/mint-app-token.py` is an
   owner-operations tool reading owner-local App credentials; the
   `worker-shim*.sh` scripts clone the private smoke repo
-  (`worker-shim.sh:26`, `worker-shim-nc.sh:27`).
+  (`worker-shim.sh:29`, `worker-shim-nc.sh:30`).
 
 ### 2.2 Git history — extensive, not covered by a clean HEAD
 
@@ -324,10 +316,38 @@ No action was taken. Three routes:
   item 6). Keeps issue/PR numbers meaningful for the audit record
   while removing blob history. Still requires the metadata pass.
 
-Whichever route is chosen, `docs/source-workflow-audit.md` needs its own
-disclosure review first — it is designed to retain the names this audit
-flags — and the same holds for this document, which maps where they
-survive.
+Whichever route is chosen, `docs/source-workflow-audit.md` retains the
+names this audit flags — and the same holds for this document, which
+maps where they survive. The owner's ruling in §7 accepts that
+exposure for both files.
+
+## 7. Owner disposition (2026-11-25, issue #438)
+
+The owner ruled that the private repository names — all four source
+repos, the smoke repo, and ops-adjacent repos — and the owner identity
+are acceptable to disclose, and chose in-place publication with the
+history kept. §5's items resolve under that decision as follows:
+
+1. Smoke-repo links/citations — retained verbatim; the citing documents
+   mark them as private/owner-only references (dead-link honesty, not
+   removal).
+2. `scripts/s1/` scenario tooling — retained; framed as owner-ops
+   tooling that cannot run publicly.
+3. `scripts/s1/mint-app-token.py` — retained; its owner-local
+   credential dependency is documented in the tool header.
+4. `docs/extraction-coverage.json` — redaction retained as written;
+   names are acceptable, no fixes required for disclosure.
+5. `docs/name-migration.md` — kept; the self-rename is disclosed by
+   GitHub's redirect regardless.
+6. This document — kept in the published tree as the leak/provenance
+   record; no disclosure review gates publication under the ruling.
+7. Tracker metadata — no scrub required under the decision.
+8. Owner-operations docs — retained, framed as owner-run records.
+
+§6's route analysis is superseded: none of routes A/B/C was taken as
+written. The chosen route is in-place publication with history kept —
+route A's mechanics with the name/identity exposure explicitly
+accepted rather than remediated.
 
 ## Appendix — verification commands
 

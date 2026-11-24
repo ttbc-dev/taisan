@@ -7,6 +7,12 @@ execute live steps); `operator` = whoever the owner designates to run
 the commands (may be the owner); `agent` = the preparing agent (offline
 work only — never live steps, never authorization).
 
+> **Owner-operations procedure — private references.** This checklist
+> drives live steps only the owner can execute, against the private
+> repository `shimpeiws/coding-worker-smoke`; its links and `#N`
+> citations resolve only for the owner. Retained as a record under the
+> owner publication decision (#438).
+
 Record locations: `RUNBOOK` = [live-runbook.md](live-runbook.md),
 `AUTH` = [live-authorization.md](live-authorization.md), `TEMPLATE` =
 [live-evidence-template.md](live-evidence-template.md), `#113` = issue

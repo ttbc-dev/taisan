@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Owner-operations tooling: clones the private repository
+# shimpeiws/coding-worker-smoke — runnable only by the owner.
+#
 # S1 scenario worker (U8.2): a real worker process the supervisor spawns
 # as `worker_argv` with cwd = the Work's workspace. It performs the
 # seeded issue's deterministic change inside a real clone of the

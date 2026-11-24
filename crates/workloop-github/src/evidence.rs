@@ -759,6 +759,7 @@ mod tests {
             violations.iter().any(|v| v.contains("isolation_scope")),
             "a live_evidenced record without isolation_scope is invalid: {violations:?}"
         );
+        // The isolated live repository is private and owner-only.
         value.as_object_mut().unwrap().insert(
             "isolation_scope".into(),
             serde_json::json!({
