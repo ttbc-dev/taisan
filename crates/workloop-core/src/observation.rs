@@ -205,6 +205,16 @@ pub enum ObservationFact {
         base: CommitRevision,
         target_branch: String,
     },
+    /// A merge-detection read observed the change still open — the
+    /// durable "last checked" record the bounded detection set orders
+    /// by, so the deferred tail is reached on a later pass. `head` is
+    /// the revision the pull reported at read time; the fact is
+    /// evidence of the read itself, never of a merge or a
+    /// mergeability verdict.
+    MergeCheck {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+    },
     /// The host's mergeability verdict for one exact `(head, base)`
     /// pair. A `Conflicting` verdict carries the paths the host could
     /// report; a verdict the host could not establish is `Unknown` with

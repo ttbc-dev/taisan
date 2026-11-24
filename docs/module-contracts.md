@@ -265,6 +265,7 @@ type HostFact =
 	| { kind: "change_head"; change_request: ChangeRequestRef; head: CommitRevision }
 	| { kind: "change_merged"; change_request: ChangeRequestRef; head: CommitRevision;
 	    base: CommitRevision; target_branch: string }
+	| { kind: "merge_check"; change_request: ChangeRequestRef; head: CommitRevision }
 	| { kind: "mergeability"; change_request: ChangeRequestRef; head: CommitRevision;
 	    base?: CommitRevision; target_revision?: CommitRevision;
 	    state: "mergeable" | "conflicting" | "unknown";

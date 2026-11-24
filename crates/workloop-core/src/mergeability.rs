@@ -34,6 +34,18 @@ pub const MAX_CONFLICT_RECHECKS_PER_PASS: usize = 5;
 /// later pass.
 pub const MAX_MERGE_RECHECKS_PER_PASS: usize = 5;
 
+/// The most merge-detection reads one pass may issue for recorded
+/// changes that have no recorded merge. The bound is its own, not
+/// shared with the target scans: sustained merge activity cannot
+/// starve detection, and a backlog of unmerged recorded changes —
+/// terminal Works included, whose change can still merge — cannot
+/// starve the scans. A never-checked pair always sorts before a
+/// checked one, so the whole backlog is reached within
+/// ceil(N/bound) passes; the ordering key is second-granular
+/// observed time, so within one second the leading checked set is
+/// preferred until the key's second advances.
+pub const MAX_MERGE_CHECKS_PER_PASS: usize = 5;
+
 const EPISODE_TAG: &str = "conflict-episode-v1";
 
 /// The host's mergeability verdict for one change at one exact pair.

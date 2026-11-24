@@ -15,13 +15,16 @@ use workloop_core::identity::{
     HostActorId, HostActorRef, HostCapability, HostInstanceId, RepositoryId, RepositoryRef,
     RoleBinding,
 };
-use workloop_core::mergeability::{MAX_CONFLICT_RECHECKS_PER_PASS, MergeabilityState};
+use workloop_core::mergeability::{
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MergeabilityState,
+};
 use workloop_core::observation::{
     DeliveryId, DeliveryScope, HostActionStatus, NormalizedEffectFact, Observation, ObservationFact,
 };
 use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_github::adapter::GitHubAdapter;
+use workloop_github::api::GitHubApi;
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
@@ -156,6 +159,76 @@ fn record_change(store: &SqliteStore, work: &WorkId, change: &ChangeRequestRef) 
             Ok(())
         })
         .unwrap();
+}
+
+fn merge_check_facts(store: &SqliteStore, work: &WorkId) -> usize {
+    store
+        .transact(|tx| tx.observations_for_work(work))
+        .unwrap()
+        .iter()
+        .filter(|o| matches!(o.fact, ObservationFact::MergeCheck { .. }))
+        .count()
+}
+
+/// Settle the Work's active Execution: a terminal Work owes no head
+/// poll, so every pull read it still causes is merge detection.
+fn finish_execution(store: &SqliteStore, work: &WorkId) {
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(work)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Succeeded;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            tx.apply(&Effect::ReleaseSlot {
+                execution_id: execution.id,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Seed `count` terminal Works each holding one recorded, never-merged
+/// open change — the merge-detection backlog the bound must cover.
+fn unmerged_works(
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    api: &mut InMemoryGitHub,
+    prefix: &str,
+    count: usize,
+) -> Vec<WorkId> {
+    (0..count)
+        .map(|index| {
+            let work = submit(store, config, &format!("{prefix}-{index}"));
+            api.seed_branch(
+                &repo(),
+                &format!("work/{prefix}-{index}"),
+                &format!("{prefix}-head-{index}"),
+            );
+            let pull = api
+                .open_pull(
+                    &repo(),
+                    &format!("work/{prefix}-{index}"),
+                    "main",
+                    &format!("{prefix}-{index}"),
+                    "",
+                )
+                .unwrap();
+            let change = change(&pull.id);
+            record_change(store, &work, &change);
+            ingest_head(
+                store,
+                config,
+                &work,
+                &change,
+                &format!("{prefix}-head-{index}"),
+            );
+            finish_execution(store, &work);
+            work
+        })
+        .collect()
 }
 
 fn mergeability_facts(store: &SqliteStore, work: &WorkId) -> usize {
@@ -322,8 +395,6 @@ fn historical_merges_on_one_target_are_scanned_once() {
 
 #[test]
 fn the_production_adapter_does_not_rescan_each_historical_merge() {
-    use workloop_github::api::GitHubApi;
-
     let store = SqliteStore::in_memory(4).unwrap();
     let config = config();
     let mut api = InMemoryGitHub::new();
@@ -612,8 +683,6 @@ fn ingest_head(
 
 #[test]
 fn the_production_adapter_rechecks_siblings_after_a_merged_read() {
-    use workloop_github::api::GitHubApi;
-
     let store = SqliteStore::in_memory(4).unwrap();
     let config = config();
     let merged_work = submit(&store, &config, "adapter-merged-work");
@@ -670,8 +739,6 @@ fn the_production_adapter_rechecks_siblings_after_a_merged_read() {
 
 #[test]
 fn the_production_adapter_makes_progress_on_deferred_siblings() {
-    use workloop_github::api::GitHubApi;
-
     // Enough capacity slots for every sibling's Fix request; the bound
     // under test is the conflict re-check budget.
     let store = SqliteStore::in_memory(32).unwrap();
@@ -796,8 +863,6 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
 
 #[test]
 fn the_pass_deadline_defers_sibling_rechecks_mid_scan() {
-    use workloop_github::api::GitHubApi;
-
     let store = SqliteStore::in_memory(4).unwrap();
     let config = config();
     let merged_work = submit(&store, &config, "deadline-adapter-merged");
@@ -852,7 +917,7 @@ fn the_pass_deadline_defers_sibling_rechecks_mid_scan() {
         NOW + tick
     };
     let report = adapter
-        .refresh_sources(&store, &config, &mut clock, Some(NOW + 5), None)
+        .refresh_sources(&store, &config, &mut clock, Some(NOW + 6), None)
         .unwrap();
     assert!(
         report
@@ -896,8 +961,6 @@ fn a_scoped_refresh_never_rechecks_a_sibling_outside_the_scope() {
 
 #[test]
 fn the_production_adapter_does_not_recheck_an_out_of_scope_sibling() {
-    use workloop_github::api::GitHubApi;
-
     let store = SqliteStore::in_memory(4).unwrap();
     let config = config();
     let merged_work = submit(&store, &config, "adapter-scoped-merged");
@@ -940,8 +1003,6 @@ fn the_production_adapter_does_not_recheck_an_out_of_scope_sibling() {
 
 #[test]
 fn an_unusable_sibling_head_is_bound_to_the_last_recorded_head() {
-    use workloop_github::api::GitHubApi;
-
     let store = SqliteStore::in_memory(4).unwrap();
     let config = config();
     let merged_work = submit(&store, &config, "unknown-head-merged");
@@ -1016,4 +1077,215 @@ fn an_unusable_sibling_head_is_bound_to_the_last_recorded_head() {
         Some("new-base"),
         "the unknown observation must not fabricate a head==base pair"
     );
+}
+
+#[test]
+fn merge_detection_reads_are_bounded_per_pass() {
+    let store = SqliteStore::in_memory(8).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    // More recorded changes than one pass may check. Every Work's
+    // Execution is terminal — the documented detection set still
+    // includes a completed Work's open change — so the bounded
+    // detection loop is the only pull reader this pass.
+    let unmerged = MAX_MERGE_CHECKS_PER_PASS + 2;
+    let works = unmerged_works(&store, &config, &mut api, "detect", unmerged);
+
+    let mut adapter = GitHubAdapter::new(api);
+    let first = adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    assert_eq!(
+        adapter.client().pull_reads(),
+        MAX_MERGE_CHECKS_PER_PASS,
+        "a terminal backlog cannot make remote reads unbounded"
+    );
+    assert_eq!(
+        first
+            .deferred
+            .iter()
+            .filter(|d| d.starts_with("merge-check:"))
+            .count(),
+        unmerged - MAX_MERGE_CHECKS_PER_PASS,
+        "the remainder is deferred, not silently dropped: {:?}",
+        first.deferred
+    );
+    let checked: usize = works.iter().map(|w| merge_check_facts(&store, w)).sum();
+    assert_eq!(checked, MAX_MERGE_CHECKS_PER_PASS);
+
+    // The deferred tail is reached next pass: the pairs already
+    // checked hold the newest durable records, so the never-checked
+    // remainder orders first — the rest of the bound re-reads the
+    // least recently checked pairs.
+    let second = adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(second.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    for (index, work) in works.iter().enumerate() {
+        assert!(
+            merge_check_facts(&store, work) >= 1,
+            "change {index} was checked"
+        );
+    }
+
+    // A steady pass still re-reads inside the bound — least recently
+    // checked first — instead of walking the whole backlog.
+    let third = adapter
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    assert_eq!(third.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    assert_eq!(adapter.client().pull_reads(), 3 * MAX_MERGE_CHECKS_PER_PASS);
+
+    // A scoped pass detects only the scoped Work's pair: one read,
+    // one check record, nothing observed for the other Works.
+    let before = works
+        .iter()
+        .map(|w| merge_check_facts(&store, w))
+        .collect::<Vec<_>>();
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 3, None, Some(&works[0]))
+        .unwrap();
+    assert_eq!(
+        adapter.client().pull_reads(),
+        3 * MAX_MERGE_CHECKS_PER_PASS + 1
+    );
+    for (index, work) in works.iter().enumerate() {
+        let expected = before[index] + usize::from(index == 0);
+        assert_eq!(
+            merge_check_facts(&store, work),
+            expected,
+            "a scoped pass observes only the scoped work's pair"
+        );
+    }
+
+    // The check record is inert: recorded with no subject execution it
+    // resolves nothing and mints no trigger — a merge-detection pass
+    // must leave every work's request ledger and execution state
+    // untouched.
+    for work in &works {
+        assert_eq!(
+            fix_requests(&store, work),
+            0,
+            "a merge check is not a repair trigger"
+        );
+        assert!(
+            store
+                .transact(|tx| tx.active_execution(work))
+                .unwrap()
+                .is_none(),
+            "a merge check resolves no execution"
+        );
+    }
+}
+
+#[test]
+fn the_pass_deadline_defers_merge_detection() {
+    let store = SqliteStore::in_memory(8).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    let unmerged = 2;
+    let _works = unmerged_works(&store, &config, &mut api, "deadline-detect", unmerged);
+
+    let mut adapter = GitHubAdapter::new(api);
+    // The clock advances on every read: detection candidates must check
+    // the live clock before paying a pull read, exactly like the merge
+    // scan and sibling rechecks ahead of them.
+    let mut tick = 0i64;
+    let mut clock = move || {
+        tick += 1;
+        NOW + tick
+    };
+    let report = adapter
+        .refresh_sources(&store, &config, &mut clock, Some(NOW + 2), None)
+        .unwrap();
+    assert_eq!(report.merge_detections, 0);
+    assert_eq!(
+        adapter.client().pull_reads(),
+        0,
+        "the deadline gates every detection read"
+    );
+    assert_eq!(
+        report
+            .deferred
+            .iter()
+            .filter(|d| d.starts_with("merge-check:"))
+            .count(),
+        unmerged,
+        "both unmerged pairs defer on the live clock: {:?}",
+        report.deferred
+    );
+}
+
+#[test]
+fn merge_detection_reaches_the_tail_at_equal_timestamps() {
+    let store = SqliteStore::in_memory(8).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    let unmerged = MAX_MERGE_CHECKS_PER_PASS + 2;
+    let works = unmerged_works(&store, &config, &mut api, "equal-ts", unmerged);
+
+    // Every pass reports the same `now`: the least-recently-checked key
+    // is second-granular, but never-checked pairs always sort first, so
+    // the whole backlog is still reached within ceil(N/bound) passes.
+    let mut adapter = GitHubAdapter::new(api);
+    let passes = unmerged.div_ceil(MAX_MERGE_CHECKS_PER_PASS);
+    for _ in 0..passes {
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW, None, None)
+            .unwrap();
+    }
+    for (index, work) in works.iter().enumerate() {
+        assert!(
+            merge_check_facts(&store, work) >= 1,
+            "change {index} was checked within {passes} passes at equal timestamps"
+        );
+    }
+}
+
+#[test]
+fn the_fixture_bounds_merge_detection_the_same_way() {
+    let store = SqliteStore::in_memory(8).unwrap();
+    let config = config();
+    let unmerged = MAX_MERGE_CHECKS_PER_PASS + 2;
+    let mut works = Vec::new();
+    let mut fixture = FixtureGithub::new();
+    for index in 0..unmerged {
+        let work = submit(&store, &config, &format!("fixture-detect-{index}"));
+        let change = change(&format!("cr-fixture-detect-{index}"));
+        record_change(&store, &work, &change);
+        fixture.set_change_head(&change, &format!("detect-head-{index}"), &actor());
+        works.push(work);
+    }
+
+    let first = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    assert_eq!(
+        first
+            .deferred
+            .iter()
+            .filter(|d| d.starts_with("merge-check:"))
+            .count(),
+        unmerged - MAX_MERGE_CHECKS_PER_PASS,
+        "the remainder is deferred, not silently dropped: {:?}",
+        first.deferred
+    );
+    let checked: usize = works.iter().map(|w| merge_check_facts(&store, w)).sum();
+    assert_eq!(checked, MAX_MERGE_CHECKS_PER_PASS);
+
+    let second = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(second.merge_detections, MAX_MERGE_CHECKS_PER_PASS);
+    for (index, work) in works.iter().enumerate() {
+        assert!(
+            merge_check_facts(&store, work) >= 1,
+            "change {index} was checked"
+        );
+    }
 }

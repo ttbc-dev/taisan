@@ -47,7 +47,8 @@ use workloop_core::identity::{
     HostActorRef, HostCapability, HostInstanceId, RepositoryRef, canonical_host_instance,
 };
 use workloop_core::mergeability::{
-    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS, MergeabilityState,
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
+    MergeabilityState,
 };
 use workloop_core::observation::{
     BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
@@ -78,7 +79,8 @@ enum ProbeCredential {
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
-    latest_recorded_merge, latest_recorded_mergeability, recorded_change_pairs,
+    latest_recorded_merge, latest_recorded_merge_check, latest_recorded_mergeability,
+    recorded_change_pairs,
 };
 
 /// One delivered GitHub webhook: the transport GUID GitHub assigned,
@@ -1528,6 +1530,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// target per pass; it is bounded by the pass deadline, by
     /// [`MAX_MERGE_RECHECKS_PER_PASS`] over the whole pass, and by
     /// [`MAX_CONFLICT_RECHECKS_PER_PASS`] shared across every merge.
+    /// Detecting the merge itself is bounded the same way: a recorded
+    /// change with no recorded merge pays at most
+    /// [`MAX_MERGE_CHECKS_PER_PASS`] pull reads per pass, least
+    /// recently checked first — a recorded `MergeCheck` is the durable
+    /// ordering key, so a deferred pair is reached on a later pass and
+    /// a terminal Work's never-merged change cannot re-read
+    /// unboundedly.
     /// The bound orders the candidates, not just their count: siblings
     /// with no recorded verdict for the current `(head, base)` pair and
     /// siblings whose recorded verdict is still provisional are checked
@@ -1551,19 +1560,80 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // The sibling budget is pass-wide, not per merge: accumulated
         // merge history cannot multiply the remote verdict reads.
         let mut rechecked = 0usize;
+        // The merge-detection reads are bounded on their own pass-wide
+        // budget: sustained merge activity cannot starve detection and
+        // a backlog of recorded changes that never merged — terminal
+        // Works included, whose change can still merge — cannot make
+        // remote reads unbounded. A recorded merge's scan goes first;
+        // the unrecorded pairs are checked least recently checked
+        // first, so the deferred tail is reached on a later pass.
+        let mut merge_checks = 0usize;
+        struct MergeCandidate {
+            /// Sort key: a recorded merge first `(0, 0)`, then unmerged
+            /// pairs by least-recently-checked observed time
+            /// (`i64::MIN` when never checked).
+            key: (u8, i64),
+            work_id: WorkId,
+            change: ChangeRequestRef,
+            /// The recorded merge evidence `(head, base, target)` —
+            /// durable proof that needs no pull re-read.
+            recorded: Option<(CommitRevision, CommitRevision, String)>,
+        }
+        let mut candidates: Vec<MergeCandidate> = Vec::new();
         for (work_id, change) in recorded_change_pairs(store, scope)? {
             if change.repository != config.host.repository
                 || !work_bound_to_config(store, config, self.bound_host.as_ref(), &work_id)?
             {
                 continue;
             }
+            let recorded = latest_recorded_merge(store, &work_id, &change)?;
+            // A never-checked pair always sorts before a checked one,
+            // so the deferred tail is reached within ceil(N/bound)
+            // passes. The key is second-granular: within one second the
+            // leading checked set is preferred until the key advances.
+            let key = match &recorded {
+                Some(_) => (0, 0),
+                None => (
+                    1,
+                    latest_recorded_merge_check(store, &work_id, &change)?.unwrap_or(i64::MIN),
+                ),
+            };
+            candidates.push(MergeCandidate {
+                key,
+                work_id,
+                change,
+                recorded,
+            });
+        }
+        candidates.sort_by_key(|c| c.key);
+        let check_epoch = new_id("merge-check");
+        for MergeCandidate {
+            work_id,
+            change,
+            recorded,
+            ..
+        } in candidates
+        {
             // A merge already recorded needs no pull re-read: its head,
             // base and target branch are durable evidence. Only an
-            // unobserved merge is read to detect it.
-            let recorded = latest_recorded_merge(store, &work_id, &change)?;
+            // unobserved merge is read to detect it — and that read
+            // holds the same deadline and per-pass bound as every other
+            // remote read in this loop.
             let (head, target_branch, base_hint, newly_detected) = match recorded {
                 Some((head, base, target_branch)) => (head, target_branch, Some(base), false),
                 None => {
+                    if deadline.is_some_and(|d| clock() >= d) {
+                        report.deferred.push(format!("merge-check:{change}"));
+                        continue;
+                    }
+                    if merge_checks >= MAX_MERGE_CHECKS_PER_PASS {
+                        report.deferred.push(format!("merge-check:{change}"));
+                        continue;
+                    }
+                    // Every issued detection read consumes the bound —
+                    // a refused or failed call was still a remote read.
+                    merge_checks += 1;
+                    report.merge_detections += 1;
                     let pull = match self
                         .client
                         .read_pull(&change.repository, &change.change_request)
@@ -1574,6 +1644,38 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                         Err(_) => continue,
                     };
                     if !pull.merged {
+                        // The durable check record is the ordering key
+                        // the next pass sorts on; without it the same
+                        // leading pairs would be re-read every pass and
+                        // the deferred tail would never be reached.
+                        if let Ok(head) =
+                            CommitRevision::new(change.repository.clone(), pull.head_sha.clone())
+                        {
+                            self.poll_ingest(
+                                store,
+                                config,
+                                Observation {
+                                    delivery: Some(DeliveryId {
+                                        scope: DeliveryScope::Host {
+                                            host: change.repository.host.clone(),
+                                        },
+                                        source: "github.merge".into(),
+                                        event_id: format!(
+                                            "merge-check:{}:{}@{}#{check_epoch}",
+                                            work_id.0, change, head.object
+                                        ),
+                                    }),
+                                    subject_work_id: Some(work_id.clone()),
+                                    subject_execution_id: None,
+                                    fact: ObservationFact::MergeCheck {
+                                        change: change.clone(),
+                                        head,
+                                    },
+                                    observed_unix_seconds: now,
+                                },
+                                now,
+                            )?;
+                        }
                         continue;
                     }
                     let Ok(head) =

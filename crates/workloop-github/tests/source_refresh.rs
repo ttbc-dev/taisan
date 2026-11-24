@@ -691,7 +691,12 @@ fn refresh_defers_remaining_sources_at_the_deadline() {
     assert_eq!(report.ingested, 0);
     assert_eq!(
         report.deferred,
-        vec!["cr-1".to_string(), "cr-2".to_string()]
+        vec![
+            "cr-1".to_string(),
+            "cr-2".to_string(),
+            "merge-check:cr-1".to_string(),
+            "merge-check:cr-2".to_string()
+        ]
     );
     assert_eq!(
         change_head_observations(&store, &w1).len(),

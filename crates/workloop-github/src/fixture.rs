@@ -10,13 +10,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use workloop_core::domain::{ExecutionId, WorkId};
+use workloop_core::domain::{ExecutionId, WorkId, new_id};
 use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef, DiffTarget, HostActorRef,
     IssueRef, RepositoryRef, SourceSnapshot,
 };
 use workloop_core::mergeability::{
-    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS, MergeabilityState,
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
+    MergeabilityState,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
@@ -398,6 +399,14 @@ pub struct SourceRefreshReport {
     pub merge_rechecks: usize,
     /// Sibling changes observed conflicted against the new base.
     pub sibling_conflicts: usize,
+    /// Merge-detection checks issued this pass for recorded changes
+    /// that have no recorded merge — bounded by
+    /// `MAX_MERGE_CHECKS_PER_PASS` over the whole pass. On the
+    /// production adapter a check is also how an unrecorded merge is
+    /// discovered, so a detection whose read returns merged counts
+    /// here too; the fixture learns merges from its declared state,
+    /// so only checks of unmerged changes appear in this count.
+    pub merge_detections: usize,
     /// Every issue source whose authoritative read completed this
     /// pass, whether or not the recorded observation changed — the
     /// retained body must exist even when the gate already matched.
@@ -2290,9 +2299,21 @@ impl FixtureGithub {
         // The sibling budget is pass-wide, not per merge: accumulated
         // merge history cannot multiply the remote verdict reads.
         let mut rechecked = 0usize;
+        // The same bound the production adapter applies to merge
+        // detection: an unmerged recorded change — terminal Works
+        // included — is checked least recently checked first, bounded
+        // per pass, and the check itself is recorded so the deferred
+        // tail is reached instead of the same leading set re-reading.
+        let mut merge_checks: Vec<(i64, WorkId, ChangeRequestRef)> = Vec::new();
         for (owner_work, change) in owners.values() {
             let change_id = change.change_request.as_str();
             if !self.merged_changes.contains(change_id) {
+                let checked = latest_recorded_merge_check(store, owner_work, change)?;
+                merge_checks.push((
+                    checked.unwrap_or(i64::MIN),
+                    owner_work.clone(),
+                    change.clone(),
+                ));
                 continue;
             }
             let target_branch = self
@@ -2486,6 +2507,57 @@ impl FixtureGithub {
                     report.sibling_conflicts += 1;
                 }
             }
+        }
+        // The bounded merge-detection mirror: the check runs after the
+        // merged scans, least recently checked first, and the durable
+        // record it leaves is the ordering key the next pass reads.
+        merge_checks.sort_by_key(|(checked, ..)| *checked);
+        let check_epoch = new_id("merge-check");
+        let mut detections = 0usize;
+        for (_, owner_work, change) in merge_checks {
+            let change_id = change.change_request.as_str();
+            if let Some(d) = deadline
+                && clock() >= d
+            {
+                report.deferred.push(format!("merge-check:{change_id}"));
+                continue;
+            }
+            if detections >= MAX_MERGE_CHECKS_PER_PASS {
+                report.deferred.push(format!("merge-check:{change_id}"));
+                continue;
+            }
+            detections += 1;
+            report.merge_detections += 1;
+            let Some(head_object) = self.changes.get(change_id).cloned() else {
+                continue;
+            };
+            let Ok(head) = CommitRevision::new(change.repository.clone(), head_object) else {
+                continue;
+            };
+            self.emit(
+                store,
+                config,
+                Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Host {
+                            host: change.repository.host.clone(),
+                        },
+                        source: "fixture.merge".into(),
+                        event_id: format!(
+                            "merge-check:{}:{}@{}#{check_epoch}",
+                            owner_work.0, change_id, head.object
+                        ),
+                    }),
+                    subject_work_id: Some(owner_work.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::MergeCheck {
+                        change: change.clone(),
+                        head: head.clone(),
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
         }
         Ok(report)
     }
@@ -3474,6 +3546,28 @@ pub(crate) fn latest_recorded_merge(
             _ => None,
         })
         .next_back())
+}
+
+/// The time the latest `MergeCheck` observation for one change was
+/// recorded — the "least recently checked" key the bounded
+/// merge-detection set orders by, so the deferred tail is reached.
+/// Ordered by observed time then row order — the same "latest wins"
+/// rule the other recorded-fact lookups use.
+pub(crate) fn latest_recorded_merge_check(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> Result<Option<i64>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            matches!(&o.fact, ObservationFact::MergeCheck { change: c, .. } if c == change)
+                .then_some((o.observed_unix_seconds, index))
+        })
+        .max_by_key(|(observed, index)| (*observed, *index))
+        .map(|(observed, _)| observed))
 }
 
 /// The latest recorded `Mergeability` verdict for one exact

@@ -101,6 +101,9 @@ pub struct InMemoryGitHub {
     /// The credential the adapter bound for the current intent —
     /// `viewer` answers its actor when set.
     active_credential: Option<String>,
+    /// `read_pull` calls since construction — the remote-read volume
+    /// the bounded loops must keep inside their per-pass budgets.
+    pull_reads: usize,
     next_comment: u64,
 }
 
@@ -152,6 +155,12 @@ impl InMemoryGitHub {
         self.branches
             .get(&(repository.to_string(), branch.to_string()))
             .cloned()
+    }
+
+    /// `read_pull` calls since construction — assertions on remote
+    /// read volume for the bounded merge-detection and scan loops.
+    pub fn pull_reads(&self) -> usize {
+        self.pull_reads
     }
 
     /// The stored pull request, for assertions on post-effect state.
@@ -526,6 +535,7 @@ impl GitHubApi for InMemoryGitHub {
         repository: &RepositoryRef,
         change_id: &ChangeRequestId,
     ) -> Result<RemotePull, ApiError> {
+        self.pull_reads += 1;
         if let Some(err) = self.take_lost("read_pull") {
             return Err(err);
         }

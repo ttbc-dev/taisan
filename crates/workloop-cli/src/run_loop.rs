@@ -4285,11 +4285,16 @@ mod tests {
         let mut adapter = production_adapter(fake);
         let settings = settings();
         run_production(&store, &settings, &mut adapter, &mut || NOW);
+        // A merge-detection check is fresh evidence every pass — its
+        // record is the durable least-recently-checked ordering key —
+        // so the no-duplicate count covers every fact kind but it.
         let count = |store: &SqliteStore| {
             store
                 .transact(|tx| tx.observations_for_work(&w))
                 .unwrap()
-                .len()
+                .iter()
+                .filter(|o| !matches!(o.fact, ObservationFact::MergeCheck { .. }))
+                .count()
         };
         let first = count(&store);
         run_production(&store, &settings, &mut adapter, &mut || NOW);
@@ -4298,6 +4303,16 @@ mod tests {
             count(&store),
             first,
             "identical polls record no duplicate facts"
+        );
+        let merge_checks = store
+            .transact(|tx| tx.observations_for_work(&w))
+            .unwrap()
+            .iter()
+            .filter(|o| matches!(o.fact, ObservationFact::MergeCheck { .. }))
+            .count();
+        assert_eq!(
+            merge_checks, 3,
+            "each pass durably records its detection check"
         );
         let rounds = store.transact(|tx| tx.rounds_for_work(&w)).unwrap().len();
         assert_eq!(rounds, 1, "identical polls seal no extra round");
