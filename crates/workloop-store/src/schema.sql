@@ -1,6 +1,6 @@
--- workloop v13 store: current-state tables enforcing structural
+-- workloop v14 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 13` marks the format; a stamped older file with
+-- `PRAGMA user_version = 14` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -9,7 +9,9 @@
 -- recovery_intents.retirement_generation column (#139); v11 added the
 -- worker_request_bodies canonical v2 request-body record (docs/v0.3.md,
 -- #256); v12 added the finding_occurrences.summary column (#264); v13
--- added the observations_execution evidence-lookup index.
+-- added the observations_execution evidence-lookup index; v14 added the
+-- executor_bindings and executor_operations durable remote-binding
+-- tables (#375, docs/executor-transport-contract.md).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -420,6 +422,47 @@ CREATE TABLE IF NOT EXISTS worker_request_bodies (
     canonical_body BLOB NOT NULL,
     body_digest TEXT NOT NULL
 );
+
+-- The immutable executor endpoint binding for one remote request
+-- (`docs/executor-transport-contract.md` §2): endpoint identity and
+-- incarnation, selected protocol version, capability-set digest,
+-- launch-configuration digest, request digest, and transfer limits —
+-- all inside the canonical `binding_body`, recorded before the first
+-- remote operation is sent. Re-recording identical content is a
+-- replay; different content conflicts — a bound request is never
+-- silently migrated to another endpoint, incarnation, payload, or
+-- launch configuration.
+CREATE TABLE IF NOT EXISTS executor_bindings (
+    request_id TEXT PRIMARY KEY REFERENCES invocation_requests(request_id),
+    binding_body BLOB NOT NULL,
+    binding_digest TEXT NOT NULL
+);
+
+-- The coordinator-side durable operation ledger (`docs/executor-
+-- transport-contract.md` §4): each command's full identity and
+-- canonical bytes are committed before the operation is sent, keyed by
+-- request and operation identity. Replay under byte-identical content
+-- is idempotent; differing bytes conflict and perform no effect. The
+-- receipt attaches to its recorded command — a receipt can never
+-- precede the command it answers.
+CREATE TABLE IF NOT EXISTS executor_operations (
+    request_id TEXT NOT NULL REFERENCES executor_bindings(request_id),
+    operation_id TEXT NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN
+        ('prepare', 'start', 'observe', 'request_stop', 'collect', 'acknowledge')),
+    command_digest TEXT NOT NULL,
+    command_body BLOB NOT NULL,
+    receipt_body BLOB,
+    receipt_digest TEXT,
+    PRIMARY KEY (request_id, operation_id)
+);
+
+-- One start slot per request (`docs/executor-transport-contract.md`
+-- §4): a second distinct start command for the same bound request
+-- conflicts — the store never holds two durable start records.
+CREATE UNIQUE INDEX IF NOT EXISTS executor_one_start
+    ON executor_operations (request_id)
+    WHERE operation_kind = 'start';
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.
 -- Phase 1 computes the eligible set and persists it here (bounded by
