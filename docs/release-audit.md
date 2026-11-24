@@ -61,9 +61,9 @@ Under the current publication route, everything below becomes public:
 ### 2.1 Current tree — the sanctioned file exists, but leaks occur outside it
 
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
-the first permitted exception per `AGENTS.md`. It correctly self-declares
-that publication requires a disclosure review covering it and the git
-history (`docs/source-workflow-audit.md:25-35`).
+the first of two owner-controlled provenance records per `AGENTS.md`. It
+records the owner disposition that keeps it in the published tree
+(`docs/source-workflow-audit.md:32-38`).
 
 The scan confirms the real names of the ops, worker, selector, and infra
 repos, two ops-side tool names (a terminal multiplexer and a container
@@ -75,7 +75,7 @@ names, both tool names, and real `/Users/<owner>` owner paths do not
 occur outside the sanctioned file in the current tree (`/Users/` hits
 only a test literal — see Appendix); each of them surfaces instead in
 history or tracker metadata (§2.2, §2.3) — but the further leak classes
-below mean the exception still does not hold in practice:
+below mean the sanction still does not hold in practice:
 
 - **`docs/extraction-coverage.json`** — the generated coverage manifest
   redacts source identifiers as `[source-symbol]`/`[source-file]`, but
@@ -101,24 +101,28 @@ below mean the exception still does not hold in practice:
   not a source-name leak. Recorded for completeness, not counted as a
   release blocker.
 - **The smoke repo is pervasive**: its `<owner>/<smoke-repo>` name
-  appears 161 times across 29 files — the sanctioned
-  `docs/source-workflow-audit.md` plus, outside it, `docs/s1/*`
-  (8 files), `docs/evidence/u3.6d.md`, `u3.6e.md`, `u8.1*.md`,
-  `u8.2`–`u8.5`, `docs/remote-executor.md:20`, `fixtures/s1/*`,
-  `scripts/s1/{check-prerequisites.py,worker-shim.sh,worker-shim-nc.sh}`,
+  appears 176 times across 36 files — `docs/s1/*` (10 files),
+  `docs/evidence/*` (11 files),
+  `docs/{provenance,remote-executor:20,u3.6e-authorization,u3.6e-live-runbook}.md`,
+  `AGENTS.md`, `fixtures/s1/*` (3 files),
+  `scripts/s1/{check-prerequisites.py,mint-app-token.py,worker-shim.sh,worker-shim-nc.sh}`,
   `scripts/tests/test_s1_materials.py`,
-  `crates/workloop-cli/src/bin/s1_bridge.rs:1970`,
-  `crates/workloop-github/src/evidence.rs:766-804`.
+  `crates/workloop-cli/src/bin/s1_bridge.rs:1971`,
+  `crates/workloop-github/src/evidence.rs:767-805` — plus 2 bare
+  `<smoke-repo>` mentions inside the sanctioned
+  `docs/source-workflow-audit.md`. (Counts updated after the #438
+  framing pass; owner-only markers added more occurrences rather than
+  removing any.)
 - **Worker-repo config path**: `~/.config/<worker-repo>/github-apps/...`
-  in `scripts/s1/mint-app-token.py:5,28`,
-  `docs/s1/stage-c-runbook.md:46,114`,
-  `docs/evidence/u8.1-live-stage-c.md:41` — discloses the worker repo's
+  in `scripts/s1/mint-app-token.py:9,32`,
+  `docs/s1/stage-c-runbook.md:53,121`,
+  `docs/evidence/u8.1-live-stage-c.md:49` — discloses the worker repo's
   name through a local config path even where the repo itself is not
   named.
 - **Per-run owner state directories**: `~/s1-*` run dirs recorded in
-  `docs/evidence/u8.1-live-stage-c.md:62,71,112,201,211`,
-  `docs/evidence/u8.2.md:48`, `docs/evidence/u8.3.md:59`, and
-  `docs/s1/live-runbook.md:159` — owner-specific operational context;
+  `docs/evidence/u8.1-live-stage-c.md:70,79,120,209,219`,
+  `docs/evidence/u8.2.md:55`, `docs/evidence/u8.3.md:66`, and
+  `docs/s1/live-runbook.md:166` — owner-specific operational context;
   the extracted dir names are all `s1-*` scenario names embedding no
   source names (see Appendix); together with the `~/src` checkout-root
   strings in `docs/extraction-coverage.json:6636` (counted above as a
@@ -126,16 +130,16 @@ below mean the exception still does not hold in practice:
   surface at HEAD.
 - **Identifying runtime configuration**: the dedicated reviewer GitHub
   App's slug, app id, installation id, and bot user id
-  (`docs/evidence/u8.1-live-stage-c.md:37-42`,
-  `docs/s1/stage-c-runbook.md:42-46`); the smoke repo's numeric and node
-  ids (`docs/evidence/u8.1-live-stage-c.md:52`); repository secret names
-  (`S1_REVIEWER_*`, `docs/evidence/u8.1-live-stage-c.md:42`); the
+  (`docs/evidence/u8.1-live-stage-c.md:45-50`,
+  `docs/s1/stage-c-runbook.md:49-53`); the smoke repo's numeric and node
+  ids (`docs/evidence/u8.1-live-stage-c.md:60`); repository secret names
+  (`S1_REVIEWER_*`, `docs/evidence/u8.1-live-stage-c.md:50`); the
   scenario git identity `s1-worker` hard-coded in
-  `scripts/s1/worker-shim.sh:34-35` and `worker-shim-nc.sh:35-36`.
+  `scripts/s1/worker-shim.sh:37-38` and `worker-shim-nc.sh:38-39`.
 - **Internal scripts**: `scripts/s1/mint-app-token.py` is an
   owner-operations tool reading owner-local App credentials; the
   `worker-shim*.sh` scripts clone the private smoke repo
-  (`worker-shim.sh:26`, `worker-shim-nc.sh:27`).
+  (`worker-shim.sh:29`, `worker-shim-nc.sh:30`).
 
 ### 2.2 Git history — extensive, not covered by a clean HEAD
 

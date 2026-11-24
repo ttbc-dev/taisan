@@ -27,9 +27,13 @@ referred to here by role, using the legend in the audit document:
 | the infra repo | Remote execution infrastructure running bounded worker jobs in isolated containers | Execution-environment evidence: bounded runs, idempotent lifecycle operations, and the observation that a lost acknowledgement is not proof of failure |
 
 All four systems are private. Their names, contents, histories, and
-internal identifiers are not reproduced in this project's
-publication-facing documents and are not consulted at build or runtime;
-the audit document records what was inspected and at which revisions.
+internal identifiers are not consulted at build or runtime and are not
+reproduced in publication-facing documents outside the two
+owner-controlled audit records (`docs/source-workflow-audit.md`,
+`docs/release-audit.md`); the one name that does surface outside them
+is the worker repo's, embedded in the smoke repo's name and owner-local
+config paths described in the next section. The audit document records
+what was inspected and at which revisions.
 
 ## Private references in this repository
 

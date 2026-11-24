@@ -9,7 +9,7 @@ and implementation planning.
 
 The four source repositories are private. Publication-facing documents
 reference them by role, not by name (see `AGENTS.md`). This audit record
-is an owner-controlled exception — the first of two;
+is an owner-controlled provenance record — the first of two;
 `docs/release-audit.md` is the second. This record retains issue
 numbers, revision SHAs, and source-internal module names as
 owner-verifiable evidence locators so each mapping can be re-checked
@@ -62,7 +62,7 @@ Notes on inspection fidelity:
 - Symbol-level locators were collected during inspection. File paths,
   function names, and line numbers are not reproduced; module, command,
   and component names are retained as owner-verifiable locators under
-  the audit-record exception in `AGENTS.md`.
+  the audit-record convention in `AGENTS.md`.
 - The ops repo's converge state-transitions design document is itself a
   design audit pinned to earlier revisions (`839094bb` ops / `e6c16686`
   worker); where this document cites it as evidence, the underlying
